@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 
 mod client;
 pub mod device_room;
+mod pairing;
 mod server;
+mod tls;
 
 pub use client::{RpcClient, connect_ws};
 pub use device_room::{
@@ -28,7 +30,15 @@ pub use device_room::{
     NudgeHandler, StaticToken, TokenSource, decode_device_frame, device_room_ws_url,
     encode_device_frame,
 };
+pub use pairing::{
+    PairingAttempt, PairingLimit, PairingLimiter, PairingSession, PairingTranscript,
+};
 pub use server::{serve_connection, serve_ws_listener};
+pub use tls::{
+    ClientAuthorizer, LanAcceptError, LanConnectError, LanPairingState, MAX_LAN_TEXT_FRAME_BYTES,
+    PairingAuthorizer, PairingError, PinnedServer, TlsIdentity, TlsIdentityError, accept_lan_rpc,
+    connect_lan_rpc, pair_client, serve_pairing,
+};
 
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.

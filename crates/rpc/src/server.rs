@@ -4,9 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::{WebSocketStream, tungstenite::Message as WsMessage};
 
 use crate::{ClientFrame, RpcError, RpcReply, RpcService, ServerFrame};
 
@@ -141,14 +142,40 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>) {
             return;
         }
     };
+    serve_websocket(ws, service).await;
+}
+
+pub(crate) async fn serve_websocket<S>(ws: WebSocketStream<S>, service: Arc<dyn RpcService>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    serve_websocket_guarded(ws, service, None).await;
+}
+
+pub(crate) type ConnectionGuard = Arc<dyn Fn() -> bool + Send + Sync>;
+
+pub(crate) async fn serve_websocket_guarded<S>(
+    ws: WebSocketStream<S>,
+    service: Arc<dyn RpcService>,
+    guard: Option<ConnectionGuard>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (mut sink, mut ws_stream) = ws.split();
     let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
     let (in_tx, in_rx) = mpsc::channel::<String>(256);
 
     // Pump: socket <-> string channels. Ends when either side closes.
     let pump = tokio::spawn(async move {
+        let mut guard_interval = tokio::time::interval(std::time::Duration::from_millis(100));
         loop {
             tokio::select! {
+                _ = guard_interval.tick(), if guard.is_some() => {
+                    if !guard.as_ref().is_some_and(|guard| guard()) {
+                        let _ = sink.send(WsMessage::Close(None)).await;
+                        break;
+                    }
+                },
                 frame = out_rx.recv() => match frame {
                     Some(text) => {
                         if sink.send(WsMessage::Text(text)).await.is_err() {
@@ -162,6 +189,10 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>) {
                 },
                 message = ws_stream.next() => match message {
                     Some(Ok(WsMessage::Text(text))) => {
+                        if guard.as_ref().is_some_and(|guard| !guard()) {
+                            let _ = sink.send(WsMessage::Close(None)).await;
+                            break;
+                        }
                         if in_tx.send(text).await.is_err() {
                             break;
                         }
