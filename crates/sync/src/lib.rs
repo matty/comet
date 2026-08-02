@@ -13,5 +13,5 @@ mod room;
 mod store;
 pub mod wake;
 
-pub use room::{RoomClient, RoomEvent, StaticUrl, SyncError, UrlProvider};
+pub use room::{DocMutationGate, RoomClient, RoomEvent, StaticUrl, SyncError, UrlProvider};
 pub use store::{DocsStore, StoreError};

@@ -325,33 +325,7 @@ pub struct EngineRpc {
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<comet_update::Updater>,
-    mutation_authority: std::sync::Arc<MutationAuthority>,
-}
-
-#[derive(Default)]
-pub(crate) struct MutationAuthority(std::sync::Mutex<()>);
-
-impl MutationAuthority {
-    fn run<T>(&self, mutation: impl FnOnce() -> T) -> T {
-        let _guard = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        mutation()
-    }
-
-    fn local<T>(&self, mutation: impl FnOnce() -> T) -> T {
-        self.run(mutation)
-    }
-
-    fn remote<T>(&self, mutation: impl FnOnce() -> T) -> T {
-        self.run(mutation)
-    }
-
-    #[cfg(test)]
-    fn is_available(&self) -> bool {
-        self.0.try_lock().is_ok()
-    }
+    mutation_authority: comet_sync::DocMutationGate,
 }
 
 impl EngineRpc {
@@ -367,33 +341,7 @@ impl EngineRpc {
         uploads: Uploads,
         agent_accounts: AgentAccounts,
     ) -> Self {
-        Self::new_with_mutation_authority(
-            sessions,
-            doc_host,
-            workspace,
-            registry,
-            repos,
-            terminals,
-            diff_sync,
-            uploads,
-            agent_accounts,
-            std::sync::Arc::new(MutationAuthority::default()),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)] // engine assembly seam, not a public API
-    pub(crate) fn new_with_mutation_authority(
-        sessions: SessionsEngine,
-        doc_host: DocHost,
-        workspace: WorkspaceHost,
-        registry: std::sync::Arc<HarnessRegistry>,
-        repos: Repos,
-        terminals: Terminals,
-        diff_sync: CheckoutDiffSync,
-        uploads: Uploads,
-        agent_accounts: AgentAccounts,
-        mutation_authority: std::sync::Arc<MutationAuthority>,
-    ) -> Self {
+        let mutation_authority = workspace.mutation_gate();
         Self {
             sessions,
             doc_host,
@@ -431,7 +379,7 @@ impl EngineRpc {
 
     #[cfg(test)]
     pub(crate) fn shares_mutation_authority(&self, other: &Self) -> bool {
-        std::sync::Arc::ptr_eq(&self.mutation_authority, &other.mutation_authority)
+        self.mutation_authority.ptr_eq(&other.mutation_authority)
     }
 
     fn auth(&self) -> Result<&Auth, RpcError> {
@@ -613,7 +561,7 @@ impl EngineRpc {
         offset: u64,
         local_device_id: &str,
     ) -> Result<RpcReply, RpcError> {
-        self.mutation_authority.remote(|| {
+        self.mutation_authority.run(|| {
             let chat = self
                 .workspace
                 .doc()
@@ -711,7 +659,7 @@ impl EngineRpc {
         params: serde_json::Value,
         local_device_id: &str,
     ) -> Result<RpcReply, RpcError> {
-        self.mutation_authority.remote(|| {
+        self.mutation_authority.run(|| {
             let params = self.validate_remote_mutation(params, local_device_id)?;
             let mutation: MutateParams = parse_params(params)?;
             self.mutate(mutation)?;
@@ -975,7 +923,7 @@ impl RpcService for EngineRpc {
             }
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params)?;
-                self.mutation_authority.local(|| self.mutate(p))?;
+                self.mutation_authority.run(|| self.mutate(p))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_CHECKOUT_DIFFS => {
@@ -1231,37 +1179,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remote_mutation_gate_stays_locked_through_the_write() {
-        let gate = std::sync::Arc::new(MutationAuthority::default());
-        let owner = std::sync::Arc::new(std::sync::Mutex::new("device-b"));
+    fn crdt_import_cannot_rehome_between_remote_validation_and_write() {
+        use comet_doc::WorkspaceDoc;
+        use comet_proto::Chat;
+        use loro::ExportMode;
+
+        let local = std::sync::Arc::new(WorkspaceDoc::new());
+        local
+            .upsert_chat(&Chat {
+                id: "chat".into(),
+                device_id: "device-b".into(),
+                title: None,
+                archived: false,
+                cwd: None,
+                branch: None,
+                checkout_id: None,
+                config: None,
+                last_message_preview: None,
+                last_message_at: None,
+                created_at: chrono::Utc::now(),
+                harness_session_id: None,
+                harness_session_cwd: None,
+                space_id: None,
+                last_seen_at: None,
+            })
+            .unwrap();
+        let remote_raw = loro::LoroDoc::new();
+        remote_raw
+            .import(&local.export_snapshot().unwrap())
+            .unwrap();
+        let remote = WorkspaceDoc::from_doc(remote_raw.clone());
+        let mut rehomed = remote.chat("chat").unwrap().unwrap();
+        rehomed.device_id = "device-c".into();
+        remote.upsert_chat(&rehomed).unwrap();
+        let update = remote_raw.export(ExportMode::all_updates()).unwrap();
+
+        let gate = std::sync::Arc::new(comet_sync::DocMutationGate::default());
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let local_gate = gate.clone();
-        let local_owner = owner.clone();
-        let rehome = std::thread::spawn(move || {
+        let import_gate = gate.clone();
+        let import_doc = local.doc().clone();
+        let importer = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
-            local_gate.local(|| *local_owner.lock().unwrap() = "device-c");
+            import_gate.import(&import_doc, &update).unwrap();
             done_tx.send(()).unwrap();
         });
 
-        gate.remote(|| {
-            assert_eq!(*owner.lock().unwrap(), "device-b", "validation owner");
+        gate.run(|| {
+            assert_eq!(local.chat("chat").unwrap().unwrap().device_id, "device-b");
             started_rx.recv().unwrap();
             assert!(
                 done_rx
                     .recv_timeout(std::time::Duration::from_millis(50))
                     .is_err(),
-                "IPC re-home interleaved between remote validation and write"
+                "CRDT import interleaved after remote owner validation"
             );
-            assert!(
-                !gate.is_available(),
-                "ownership-changing IPC mutation could interleave after validation"
-            );
-            assert_eq!(*owner.lock().unwrap(), "device-b", "write owner");
+            local.rename_chat("chat", "remote rename").unwrap();
+            assert_eq!(local.chat("chat").unwrap().unwrap().device_id, "device-b");
         });
-        rehome.join().unwrap();
-        assert_eq!(*owner.lock().unwrap(), "device-c");
-        assert!(gate.is_available());
+        importer.join().unwrap();
+        let chat = local.chat("chat").unwrap().unwrap();
+        assert_eq!(chat.device_id, "device-c");
     }
 
     /// The UI's Switch/Forget calls send `{id, accountId, harness}` (+ optional

@@ -119,7 +119,6 @@ pub struct EngineCore {
     /// Release checker (attached by [`Engine::assemble_runtime`]) — the
     /// UpdateStatus stream + ApplyUpdate.
     updater: std::sync::Mutex<Option<comet_update::Updater>>,
-    rpc_mutation_authority: Arc<rpc::MutationAuthority>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
     _instance_lock: InstanceLock,
 }
@@ -217,7 +216,6 @@ impl EngineCore {
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
-            rpc_mutation_authority: Arc::new(rpc::MutationAuthority::default()),
             _instance_lock: lock,
         })
     }
@@ -316,7 +314,7 @@ impl EngineCore {
     }
 
     pub fn rpc_service(&self) -> Arc<EngineRpc> {
-        let mut rpc = EngineRpc::new_with_mutation_authority(
+        let mut rpc = EngineRpc::new(
             self.sessions.clone(),
             self.doc_host.clone(),
             self.workspace.clone(),
@@ -326,7 +324,6 @@ impl EngineCore {
             self.diff_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),
-            self.rpc_mutation_authority.clone(),
         )
         .with_auth(self.auth());
         if let Some(links) = self.links() {

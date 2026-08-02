@@ -98,6 +98,7 @@ struct WorkspaceHostInner {
     sessions_tx: watch::Sender<Vec<Session>>,
     spaces_tx: watch::Sender<Vec<Space>>,
     room: Mutex<Option<RoomClient>>,
+    mutation_gate: comet_sync::DocMutationGate,
     /// Freshest presence heartbeat (ms) we have EVER observed per device. The
     /// ephemeral store forgets entries after its 30s TTL and starts empty on a
     /// room (re)join, so without this cache a receive-side hiccup snaps a
@@ -188,6 +189,7 @@ impl WorkspaceHost {
                 sessions_tx,
                 spaces_tx,
                 room: Mutex::new(None),
+                mutation_gate: comet_sync::DocMutationGate::default(),
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 peer_alive: Mutex::new(None),
                 _sub: sub,
@@ -225,10 +227,19 @@ impl WorkspaceHost {
             // a capped, jittered backoff so a transient edge blip self-heals.
             let mut backoff = JOIN_RETRY_BASE;
             loop {
-                if weak.upgrade().is_none() {
+                let Some(inner) = weak.upgrade() else {
                     return; // host dropped
-                }
-                match RoomClient::connect_via(url.clone(), &room_id, room_doc.clone()).await {
+                };
+                let mutation_gate = inner.mutation_gate.clone();
+                drop(inner);
+                match RoomClient::connect_via_with_gate(
+                    url.clone(),
+                    &room_id,
+                    room_doc.clone(),
+                    mutation_gate,
+                )
+                .await
+                {
                     Ok(client) => {
                         client.ephemeral().set(&presence_key(&device_id), now_ms());
                         let mut events = client.events();
@@ -278,6 +289,10 @@ impl WorkspaceHost {
 
     pub fn device_id(&self) -> &str {
         &self.inner.config.device_id
+    }
+
+    pub(crate) fn mutation_gate(&self) -> comet_sync::DocMutationGate {
+        self.inner.mutation_gate.clone()
     }
 
     pub fn doc(&self) -> &WorkspaceDoc {

@@ -34,7 +34,7 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use futures::{SinkExt, StreamExt};
 use loro::awareness::EphemeralStore;
-use loro::{ExportMode, LoroDoc, VersionVector};
+use loro::{ExportMode, ImportStatus, LoroDoc, VersionVector};
 use loro_protocol::{
     BatchId, CrdtType, JoinErrorCode, Permission, ProtocolMessage, RoomErrorCode, UpdateStatusCode,
     decode, encode,
@@ -302,6 +302,28 @@ pub struct RoomClient {
     _subs: Vec<loro::Subscription>,
 }
 
+/// Serializes authority-sensitive local workspace mutations with remote Loro imports.
+#[derive(Clone, Default)]
+pub struct DocMutationGate(Arc<std::sync::Mutex<()>>);
+
+impl DocMutationGate {
+    pub fn run<T>(&self, mutation: impl FnOnce() -> T) -> T {
+        let _guard = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        mutation()
+    }
+
+    pub fn import(&self, doc: &LoroDoc, update: &[u8]) -> Result<ImportStatus, loro::LoroError> {
+        self.run(|| doc.import(update))
+    }
+
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 impl RoomClient {
     /// Connect to a loro-protocol room and keep `doc` in sync with it.
     ///
@@ -328,13 +350,33 @@ impl RoomClient {
         doc: LoroDoc,
     ) -> Result<Self, SyncError> {
         let connector = Arc::new(WsConnector { url: provider });
-        Self::connect_with(connector, room_id, doc).await
+        Self::connect_with_gate(connector, room_id, doc, None).await
     }
 
+    pub async fn connect_via_with_gate(
+        provider: Arc<dyn UrlProvider>,
+        room_id: &str,
+        doc: LoroDoc,
+        mutation_gate: DocMutationGate,
+    ) -> Result<Self, SyncError> {
+        let connector = Arc::new(WsConnector { url: provider });
+        Self::connect_with_gate(connector, room_id, doc, Some(mutation_gate)).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn connect_with(
         connector: Arc<dyn Connector>,
         room_id: &str,
         doc: LoroDoc,
+    ) -> Result<Self, SyncError> {
+        Self::connect_with_gate(connector, room_id, doc, None).await
+    }
+
+    async fn connect_with_gate(
+        connector: Arc<dyn Connector>,
+        room_id: &str,
+        doc: LoroDoc,
+        mutation_gate: Option<DocMutationGate>,
     ) -> Result<Self, SyncError> {
         let eph = EphemeralStore::new(EPHEMERAL_TIMEOUT_MS);
 
@@ -362,6 +404,7 @@ impl RoomClient {
             eph_rx,
             events: events.clone(),
             shutdown: shutdown_rx,
+            mutation_gate,
         };
         let task = tokio::spawn(actor.run(ready_tx));
 
@@ -438,6 +481,7 @@ struct RoomActor {
     eph_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     events: broadcast::Sender<RoomEvent>,
     shutdown: watch::Receiver<bool>,
+    mutation_gate: Option<DocMutationGate>,
 }
 
 enum SessionEnd {
@@ -536,6 +580,7 @@ impl RoomActor {
 
         let mut sess = Session {
             doc: self.doc.clone(),
+            mutation_gate: self.mutation_gate.clone(),
             eph: self.eph.clone(),
             room_id: self.room_id.clone(),
             tx: pipe.tx.clone(),
@@ -694,6 +739,7 @@ struct FragmentBuffer {
 
 struct Session {
     doc: LoroDoc,
+    mutation_gate: Option<DocMutationGate>,
     eph: EphemeralStore,
     room_id: String,
     tx: mpsc::Sender<Vec<u8>>,
@@ -963,7 +1009,11 @@ impl Session {
                     if update.is_empty() {
                         continue;
                     }
-                    match self.doc.import(&update) {
+                    let imported_update = match &self.mutation_gate {
+                        Some(gate) => gate.import(&self.doc, &update),
+                        None => self.doc.import(&update),
+                    };
+                    match imported_update {
                         Ok(_) => imported = true,
                         Err(err) => {
                             tracing::warn!(room = %self.room_id, error = %err, "remote update import failed");
