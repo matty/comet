@@ -119,6 +119,7 @@ pub struct EngineCore {
     /// Release checker (attached by [`Engine::assemble_runtime`]) — the
     /// UpdateStatus stream + ApplyUpdate.
     updater: std::sync::Mutex<Option<comet_update::Updater>>,
+    rpc_mutation_authority: Arc<rpc::MutationAuthority>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
     _instance_lock: InstanceLock,
 }
@@ -216,6 +217,7 @@ impl EngineCore {
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
+            rpc_mutation_authority: Arc::new(rpc::MutationAuthority::default()),
             _instance_lock: lock,
         })
     }
@@ -314,7 +316,7 @@ impl EngineCore {
     }
 
     pub fn rpc_service(&self) -> Arc<EngineRpc> {
-        let mut rpc = EngineRpc::new(
+        let mut rpc = EngineRpc::new_with_mutation_authority(
             self.sessions.clone(),
             self.doc_host.clone(),
             self.workspace.clone(),
@@ -324,6 +326,7 @@ impl EngineCore {
             self.diff_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),
+            self.rpc_mutation_authority.clone(),
         )
         .with_auth(self.auth());
         if let Some(links) = self.links() {
@@ -742,5 +745,26 @@ fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
             std::fs::write(&path, &id)?;
             Ok(id)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rpc_services_from_one_core_share_mutation_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = EngineCore::assemble(
+            dir.path(),
+            Arc::new(HarnessRegistry::new()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let first = core.rpc_service();
+        let second = core.rpc_service();
+        assert!(first.shares_mutation_authority(&second));
+        core.shutdown().await;
     }
 }

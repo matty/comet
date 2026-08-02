@@ -50,7 +50,7 @@ pub fn remote_method_allowed(method: &str) -> bool {
 pub struct RemoteRpcService {
     inner: Arc<EngineRpc>,
     local_device_id: String,
-    terminal_chats: Mutex<HashMap<String, String>>,
+    terminal_chats: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl RemoteRpcService {
@@ -58,7 +58,7 @@ impl RemoteRpcService {
         Self {
             inner,
             local_device_id: local_device_id.into(),
-            terminal_chats: Mutex::new(HashMap::new()),
+            terminal_chats: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -109,6 +109,51 @@ impl RemoteRpcService {
                 .boxed(),
         ))
     }
+
+    fn guard_chat_stream(
+        reply: RpcReply,
+        inner: Arc<EngineRpc>,
+        local_device_id: String,
+        chat_id: String,
+    ) -> Result<RpcReply, RpcError> {
+        let RpcReply::Stream(stream) = reply else {
+            return Err(RpcError::Failed("expected stream response".into()));
+        };
+        Ok(RpcReply::Stream(
+            stream
+                .take_while(move |_| {
+                    futures::future::ready(inner.owns_remote_chat(&chat_id, &local_device_id))
+                })
+                .boxed(),
+        ))
+    }
+
+    fn guard_terminal_stream(
+        reply: RpcReply,
+        inner: Arc<EngineRpc>,
+        local_device_id: String,
+        terminal_chats: Arc<Mutex<HashMap<String, String>>>,
+        terminal_id: String,
+        chat_id: String,
+    ) -> Result<RpcReply, RpcError> {
+        let RpcReply::Stream(stream) = reply else {
+            return Err(RpcError::Failed("expected stream response".into()));
+        };
+        Ok(RpcReply::Stream(
+            stream
+                .take_while(move |_| {
+                    let mapped = terminal_chats
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .get(&terminal_id)
+                        == Some(&chat_id);
+                    futures::future::ready(
+                        mapped && inner.owns_remote_chat(&chat_id, &local_device_id),
+                    )
+                })
+                .boxed(),
+        ))
+    }
 }
 
 #[derive(Deserialize)]
@@ -128,6 +173,8 @@ struct TerminalParams {
 struct AttachmentParams {
     chat_id: String,
     path: String,
+    #[serde(default)]
+    offset: u64,
 }
 
 #[async_trait]
@@ -148,11 +195,16 @@ impl RpcService for RemoteRpcService {
         }
 
         let mut opened_chat = None;
+        let mut watched_chat = None;
         let mut terminal_id = None;
+        let mut terminal_chat = None;
         match method {
             methods::QUEUE_COMMAND | methods::WATCH_DOC_MESSAGES => {
                 let parsed: ChatParams = parse_params(params.clone())?;
                 self.require_local_chat(&parsed.chat_id)?;
+                if method == methods::WATCH_DOC_MESSAGES {
+                    watched_chat = Some(parsed.chat_id);
+                }
             }
             methods::OPEN_TERMINAL => {
                 let parsed: ChatParams = parse_params(params.clone())?;
@@ -165,28 +217,43 @@ impl RpcService for RemoteRpcService {
             | methods::CLOSE_TERMINAL => {
                 let parsed: TerminalParams = parse_params(params.clone())?;
                 self.require_remote_terminal(&parsed.terminal_id)?;
+                terminal_chat = self.terminals().get(&parsed.terminal_id).cloned();
                 terminal_id = Some(parsed.terminal_id);
             }
             methods::READ_ATTACHMENT_CHUNK => {
                 let parsed: AttachmentParams = parse_params(params.clone())?;
-                self.inner.validate_remote_attachment(
+                return self.inner.read_remote_attachment(
                     &parsed.chat_id,
                     &parsed.path,
+                    parsed.offset,
                     &self.local_device_id,
-                )?;
+                );
             }
             _ => {}
         }
 
-        let params = if method == methods::MUTATE {
-            self.inner
-                .validate_remote_mutation(params, &self.local_device_id)?
-        } else {
-            params
-        };
+        if method == methods::MUTATE {
+            return self
+                .inner
+                .handle_remote_mutation(params, &self.local_device_id);
+        }
         let reply = self.inner.handle(method, params).await?;
 
         match method {
+            methods::WATCH_DOC_MESSAGES => Self::guard_chat_stream(
+                reply,
+                self.inner.clone(),
+                self.local_device_id.clone(),
+                watched_chat.expect("chat id parsed before delegation"),
+            ),
+            methods::SUBSCRIBE_TERMINAL => Self::guard_terminal_stream(
+                reply,
+                self.inner.clone(),
+                self.local_device_id.clone(),
+                self.terminal_chats.clone(),
+                terminal_id.expect("terminal id parsed before delegation"),
+                terminal_chat.expect("terminal ownership checked before delegation"),
+            ),
             methods::WATCH_DEVICES => {
                 Self::filter_stream(reply, "id", self.local_device_id.clone())
             }

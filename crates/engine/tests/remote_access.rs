@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use futures::stream::BoxStream;
 use futures::{StreamExt, stream};
 
@@ -210,6 +211,120 @@ async fn orphaned_foreign_transcript_is_not_remotely_addressable() {
 }
 
 #[tokio::test]
+async fn transcript_watch_ends_when_chat_loses_local_ownership() {
+    let fixture = fixture_remote_service("device-b");
+    fixture
+        .core
+        .workspace
+        .create_space("local-space", "device-b", "/local", None, false)
+        .unwrap();
+    fixture
+        .core
+        .workspace
+        .create_chat("local-chat", "local-space", None, None)
+        .unwrap();
+    let handle = fixture.core.doc_host.open("local-chat").unwrap();
+    let RpcReply::Stream(mut stream) = fixture
+        .service
+        .handle(
+            methods::WATCH_DOC_MESSAGES,
+            serde_json::json!({"chatId":"local-chat"}),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected transcript stream");
+    };
+    assert!(stream.next().await.unwrap().as_array().unwrap().is_empty());
+
+    fixture.core.workspace.delete_chat("local-chat").unwrap();
+    handle
+        .write_user_message("after-delete", "must not escape", 1)
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("ownership loss closes transcript stream")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn terminal_watch_ends_when_its_chat_loses_local_ownership() {
+    let fixture = fixture_remote_service("device-b");
+    let cwd = fixture._dir.path().join("terminal-cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    fixture
+        .core
+        .workspace
+        .create_space(
+            "local-space",
+            "device-b",
+            &cwd.to_string_lossy(),
+            None,
+            false,
+        )
+        .unwrap();
+    fixture
+        .core
+        .workspace
+        .create_chat("local-chat", "local-space", None, None)
+        .unwrap();
+    let RpcReply::Value(session) = fixture
+        .service
+        .handle(
+            methods::OPEN_TERMINAL,
+            serde_json::json!({"chatId":"local-chat", "cols":80, "rows":24}),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected terminal session");
+    };
+    let terminal_id = session["id"].as_str().unwrap();
+    let RpcReply::Stream(mut stream) = fixture
+        .service
+        .handle(
+            methods::SUBSCRIBE_TERMINAL,
+            serde_json::json!({"terminalId":terminal_id}),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected terminal stream");
+    };
+    fixture
+        .core
+        .terminals
+        .write(
+            terminal_id,
+            &base64::engine::general_purpose::STANDARD.encode("echo before-loss\r\n"),
+        )
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("initial terminal output")
+        .expect("stream initially open");
+
+    fixture.core.workspace.delete_chat("local-chat").unwrap();
+    fixture
+        .core
+        .terminals
+        .write(
+            terminal_id,
+            &base64::engine::general_purpose::STANDARD.encode("echo after-loss\r\n"),
+        )
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("ownership loss closes terminal stream")
+            .is_none()
+    );
+    fixture.core.terminals.close(terminal_id).unwrap();
+}
+
+#[tokio::test]
 async fn workspace_watches_expose_only_receiver_owned_rows() {
     let fixture = fixture_remote_service("device-b");
     fixture
@@ -363,7 +478,7 @@ async fn attachment_path_must_belong_to_the_named_local_chat() {
             )
             .await,
     );
-    assert!(err.to_string().contains("not owned by this server"));
+    assert!(err.to_string().contains("outside the upload cache"));
 }
 
 #[tokio::test]
