@@ -96,6 +96,17 @@ pub mod methods {
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).
     pub const APPLY_UPDATE: &str = "ApplyUpdate";
+    // Localhost-only administration for direct LAN remotes and trust.
+    pub const SERVER_HELLO: &str = "ServerHello";
+    pub const WATCH_REMOTES: &str = "WatchRemotes";
+    pub const PUT_REMOTE: &str = "PutRemote";
+    pub const REMOVE_REMOTE: &str = "RemoveRemote";
+    pub const REPORT_REMOTE_STATUS: &str = "ReportRemoteStatus";
+    pub const GET_LAN_SETTINGS: &str = "GetLanSettings";
+    pub const SET_LAN_SETTINGS: &str = "SetLanSettings";
+    pub const BEGIN_PAIRING: &str = "BeginPairing";
+    pub const WATCH_TRUSTED_CLIENTS: &str = "WatchTrustedClients";
+    pub const REVOKE_TRUSTED_CLIENT: &str = "RevokeTrustedClient";
 }
 
 #[derive(Debug, thiserror::Error)]
