@@ -8,7 +8,7 @@ use comet_proto::ServerId;
 use data_encoding::HEXLOWER;
 use futures::{SinkExt, StreamExt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
+use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{
@@ -166,6 +166,22 @@ impl LanPairingState {
             }
         });
         Self { session, on_paired }
+    }
+
+    fn active_deadline(&self, now: std::time::Instant) -> Option<(std::time::Instant, u64)> {
+        let mut session = self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session = session.as_mut()?;
+        session
+            .expire_if_needed(now)
+            .then(|| (session.expires_at(), session.generation()))
+    }
+
+    fn generation_is_active(&self, generation: u64, now: std::time::Instant) -> bool {
+        self.active_deadline(now)
+            .is_some_and(|(_, active_generation)| active_generation == generation)
     }
 }
 
@@ -365,7 +381,7 @@ pub async fn accept_lan_rpc(
         }
         Some(LanRoute::Pair) => {
             let pairing = pairing.expect("pair route requires pairing state");
-            serve_pairing_websocket(ws, peer, identity, pairing.session, pairing.on_paired)
+            serve_pairing_websocket(ws, peer, identity, pairing)
                 .await
                 .map_err(|error| LanAcceptError::Transport(error.to_string()))
         }
@@ -448,8 +464,7 @@ pub async fn serve_pairing(
     stream: TcpStream,
     peer: SocketAddr,
     identity: &TlsIdentity,
-    session: Arc<std::sync::Mutex<Option<PairingSession>>>,
-    on_paired: PairingAuthorizer,
+    pairing: LanPairingState,
 ) -> Result<(), PairingError> {
     let config = optional_client_server_config(identity)
         .map_err(|error| PairingError::Transport(error.to_string()))?;
@@ -458,13 +473,11 @@ pub async fn serve_pairing(
         .await
         .map_err(|error| PairingError::Transport(error.to_string()))?;
     let client_certificate_absent = tls.get_ref().1.peer_certificates().is_none();
-    let callback_session = session.clone();
+    let callback_pairing = pairing.clone();
     let callback = move |request: &Request, response: Response| {
-        let pairing_active = callback_session
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_mut()
-            .is_some_and(|session| session.expire_if_needed(std::time::Instant::now()));
+        let pairing_active = callback_pairing
+            .active_deadline(std::time::Instant::now())
+            .is_some();
         if request.uri().path() == "/pair" && client_certificate_absent && pairing_active {
             Ok(response)
         } else {
@@ -481,33 +494,44 @@ pub async fn serve_pairing(
     )
     .await
     .map_err(|error| PairingError::Transport(error.to_string()))?;
-    serve_pairing_websocket(ws, peer, identity, session, on_paired).await
+    serve_pairing_websocket(ws, peer, identity, pairing).await
 }
 
 async fn serve_pairing_websocket<S>(
     mut ws: tokio_tungstenite::WebSocketStream<S>,
     peer: SocketAddr,
     identity: &TlsIdentity,
-    session: Arc<std::sync::Mutex<Option<PairingSession>>>,
-    on_paired: PairingAuthorizer,
+    pairing: LanPairingState,
 ) -> Result<(), PairingError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let now = std::time::Instant::now();
-    if !session
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_mut()
-        .is_some_and(|session| session.expire_if_needed(now))
-    {
+    let Some((deadline, generation)) = pairing.active_deadline(std::time::Instant::now()) else {
         tracing::warn!(%peer, "lan pairing: rejected inactive session");
         let _ = ws.close(None).await;
         return Err(PairingError::Rejected);
-    }
+    };
     let server_nonce = rand::random();
     send_pairing_json(&mut ws, &PairingServerHello { server_nonce }).await?;
-    let hello: PairingClientHello = match receive_pairing_json(&mut ws).await {
+    let hello_result = {
+        let receive = receive_pairing_json(&mut ws);
+        futures::pin_mut!(receive);
+        let deadline = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(deadline);
+        let mut active_check = tokio::time::interval(std::time::Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                result = &mut receive => break result,
+                _ = &mut deadline => break Err(PairingError::Rejected),
+                _ = active_check.tick() => {
+                    if !pairing.generation_is_active(generation, std::time::Instant::now()) {
+                        break Err(PairingError::Rejected);
+                    }
+                }
+            }
+        }
+    };
+    let hello: PairingClientHello = match hello_result {
         Ok(hello) => hello,
         Err(error) => {
             tracing::warn!(%peer, "lan pairing: rejected malformed frame");
@@ -523,7 +547,8 @@ where
         server_nonce,
         hello.client_nonce,
     );
-    let attempt = session
+    let attempt = pairing
+        .session
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_mut()
@@ -542,7 +567,7 @@ where
         return Err(PairingError::Rejected);
     };
     let client_id = ServerId::new(format!("sha256:{}", HEXLOWER.encode(&client_fingerprint)));
-    if let Err(error) = on_paired(client_id, hello.certificate) {
+    if let Err(error) = (pairing.on_paired)(client_id, hello.certificate) {
         tracing::warn!(%peer, "lan pairing: trust persistence failed");
         let _ = ws.close(None).await;
         return Err(PairingError::Transport(error));
@@ -632,17 +657,24 @@ fn verify_signature(
     dss: &DigitallySignedStruct,
     algorithms: &WebPkiSupportedAlgorithms,
 ) -> Result<HandshakeSignatureValid, TlsError> {
-    let cert = webpki::EndEntityCert::try_from(cert)
-        .map_err(|_| TlsError::InvalidCertificate(CertificateError::BadEncoding))?;
-    let algorithm = algorithms
-        .mapping
-        .iter()
-        .find(|(scheme, _)| *scheme == dss.scheme)
-        .and_then(|(_, algorithms)| algorithms.first())
-        .ok_or_else(|| TlsError::General("unsupported signature scheme".into()))?;
-    cert.verify_signature(*algorithm, message, dss.signature())
-        .map_err(|_| TlsError::InvalidCertificate(CertificateError::BadSignature))?;
-    Ok(HandshakeSignatureValid::assertion())
+    verify_tls13_signature(message, cert, dss, algorithms)
+}
+
+fn tls13_supported_schemes(algorithms: &WebPkiSupportedAlgorithms) -> Vec<SignatureScheme> {
+    algorithms
+        .supported_schemes()
+        .into_iter()
+        .filter(|scheme| {
+            !matches!(
+                scheme,
+                SignatureScheme::RSA_PKCS1_SHA1
+                    | SignatureScheme::RSA_PKCS1_SHA256
+                    | SignatureScheme::RSA_PKCS1_SHA384
+                    | SignatureScheme::RSA_PKCS1_SHA512
+                    | SignatureScheme::ECDSA_SHA1_Legacy
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -690,7 +722,7 @@ impl ServerCertVerifier for UnpinnedPairingVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.algorithms.supported_schemes()
+        tls13_supported_schemes(&self.algorithms)
     }
 }
 
@@ -733,7 +765,7 @@ impl ServerCertVerifier for PinnedServerVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.algorithms.supported_schemes()
+        tls13_supported_schemes(&self.algorithms)
     }
 }
 
@@ -782,6 +814,26 @@ impl ClientCertVerifier for OptionalClientVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.algorithms.supported_schemes()
+        tls13_supported_schemes(&self.algorithms)
+    }
+}
+
+#[cfg(test)]
+mod tls13_scheme_tests {
+    use super::*;
+
+    #[test]
+    fn tls13_verifiers_do_not_advertise_rsa_pkcs1_schemes() {
+        let verifier = UnpinnedPairingVerifier {
+            algorithms: supported_algorithms(),
+        };
+        let schemes = verifier.supported_verify_schemes();
+
+        assert!(!schemes.contains(&SignatureScheme::RSA_PKCS1_SHA1));
+        assert!(!schemes.contains(&SignatureScheme::RSA_PKCS1_SHA256));
+        assert!(!schemes.contains(&SignatureScheme::RSA_PKCS1_SHA384));
+        assert!(!schemes.contains(&SignatureScheme::RSA_PKCS1_SHA512));
+        assert!(!schemes.contains(&SignatureScheme::ECDSA_SHA1_Legacy));
+        assert!(schemes.contains(&SignatureScheme::ED25519));
     }
 }

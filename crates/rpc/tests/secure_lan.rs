@@ -397,18 +397,61 @@ async fn standalone_inactive_pairing_is_rejected_before_upgrade() {
     let endpoint = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
         let (stream, peer) = listener.accept().await.unwrap();
-        let _ = serve_pairing(
-            stream,
-            peer,
-            &server_identity,
-            session,
-            Arc::new(|_, _| Ok(())),
-        )
-        .await;
+        let pairing = LanPairingState::new(session, Arc::new(|_, _| Ok(())));
+        let _ = serve_pairing(stream, peer, &server_identity, pairing).await;
     });
 
     assert!(open_unauthenticated_ws(endpoint, "/pair").await.is_err());
     task.abort();
+}
+
+async fn spawn_standalone_pairing_near_expiry() -> (
+    SocketAddr,
+    Arc<std::sync::Mutex<Option<PairingSession>>>,
+    tokio::task::JoinHandle<Result<(), comet_rpc::PairingError>>,
+) {
+    let server_identity = identity();
+    let session = Arc::new(std::sync::Mutex::new(Some(PairingSession::new_at(
+        Instant::now() - Duration::from_millis(4 * 60 * 1000 + 59_800),
+    ))));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let server_session = session.clone();
+    let pairing = LanPairingState::new(server_session, Arc::new(|_, _| Ok(())));
+    let task = tokio::spawn(async move {
+        let (stream, peer) = listener.accept().await.unwrap();
+        serve_pairing(stream, peer, &server_identity, pairing).await
+    });
+    (endpoint, session, task)
+}
+
+#[tokio::test]
+async fn standalone_pairing_zeroizes_without_client_traffic() {
+    let (endpoint, session, task) = spawn_standalone_pairing_near_expiry().await;
+    let mut ws = open_unauthenticated_ws(endpoint, "/pair").await.unwrap();
+    assert!(matches!(ws.next().await, Some(Ok(WsMessage::Text(_)))));
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(session.lock().unwrap().is_none());
+    task.abort();
+}
+
+#[tokio::test]
+async fn stalled_pairing_socket_closes_at_the_session_deadline() {
+    let (endpoint, _session, task) = spawn_standalone_pairing_near_expiry().await;
+    let mut ws = open_unauthenticated_ws(endpoint, "/pair").await.unwrap();
+    assert!(matches!(ws.next().await, Some(Ok(WsMessage::Text(_)))));
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), ws.next())
+            .await
+            .is_ok()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
