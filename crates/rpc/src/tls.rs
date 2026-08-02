@@ -183,6 +183,27 @@ impl LanPairingState {
         self.active_deadline(now)
             .is_some_and(|(_, active_generation)| active_generation == generation)
     }
+
+    fn verify_generation_from(
+        &self,
+        generation: u64,
+        source: std::net::IpAddr,
+        transcript: &PairingTranscript,
+        confirmation: &[u8; 32],
+        now: std::time::Instant,
+    ) -> PairingAttempt {
+        let mut session = self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(session) = session.as_mut() else {
+            return PairingAttempt::Inactive;
+        };
+        if session.generation() != generation {
+            return PairingAttempt::Inactive;
+        }
+        session.verify_from(source, transcript, confirmation, now)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -547,20 +568,13 @@ where
         server_nonce,
         hello.client_nonce,
     );
-    let attempt = pairing
-        .session
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_mut()
-        .map(|session| {
-            session.verify_from(
-                peer.ip(),
-                &transcript,
-                &hello.confirmation,
-                std::time::Instant::now(),
-            )
-        })
-        .unwrap_or(PairingAttempt::Inactive);
+    let attempt = pairing.verify_generation_from(
+        generation,
+        peer.ip(),
+        &transcript,
+        &hello.confirmation,
+        std::time::Instant::now(),
+    );
     let PairingAttempt::Accepted(server_confirmation) = attempt else {
         tracing::warn!(%peer, outcome = ?attempt, "lan pairing: confirmation rejected");
         let _ = ws.close(None).await;
@@ -819,8 +833,96 @@ impl ClientCertVerifier for OptionalClientVerifier {
 }
 
 #[cfg(test)]
-mod tls13_scheme_tests {
+mod tests {
     use super::*;
+
+    #[test]
+    fn stale_pairing_generation_cannot_affect_replacement_session_or_limiter() {
+        let session = Arc::new(std::sync::Mutex::new(Some(PairingSession::new())));
+        let pairing = LanPairingState {
+            session: session.clone(),
+            on_paired: Arc::new(|_, _| Ok(())),
+        };
+        let (_, stale_generation) = pairing.active_deadline(std::time::Instant::now()).unwrap();
+        let source = "127.0.0.1".parse().unwrap();
+        let transcript = PairingTranscript::new(&[1], &[2], [3; 32], [4; 32]);
+
+        let replacement_generation = loop {
+            let replacement = PairingSession::new();
+            if replacement.generation() != stale_generation {
+                let generation = replacement.generation();
+                *session.lock().unwrap() = Some(replacement);
+                break generation;
+            }
+        };
+        let invalid_confirmation = [0; 32];
+        assert_eq!(
+            pairing.verify_generation_from(
+                stale_generation,
+                source,
+                &transcript,
+                &invalid_confirmation,
+                std::time::Instant::now(),
+            ),
+            PairingAttempt::Inactive
+        );
+
+        for _ in 0..5 {
+            assert_eq!(
+                pairing.verify_generation_from(
+                    replacement_generation,
+                    source,
+                    &transcript,
+                    &invalid_confirmation,
+                    std::time::Instant::now(),
+                ),
+                PairingAttempt::Rejected
+            );
+        }
+        assert_eq!(
+            pairing.verify_generation_from(
+                replacement_generation,
+                source,
+                &transcript,
+                &invalid_confirmation,
+                std::time::Instant::now(),
+            ),
+            PairingAttempt::Limited
+        );
+
+        let replacement_generation = loop {
+            let replacement = PairingSession::new();
+            if replacement.generation() != stale_generation {
+                let generation = replacement.generation();
+                *session.lock().unwrap() = Some(replacement);
+                break generation;
+            }
+        };
+        let valid_confirmation = {
+            let session = session.lock().unwrap();
+            transcript.confirm_client(session.as_ref().unwrap().secret())
+        };
+        assert_eq!(
+            pairing.verify_generation_from(
+                stale_generation,
+                source,
+                &transcript,
+                &valid_confirmation,
+                std::time::Instant::now(),
+            ),
+            PairingAttempt::Inactive
+        );
+        assert!(matches!(
+            pairing.verify_generation_from(
+                replacement_generation,
+                source,
+                &transcript,
+                &valid_confirmation,
+                std::time::Instant::now(),
+            ),
+            PairingAttempt::Accepted(_)
+        ));
+    }
 
     #[test]
     fn tls13_verifiers_do_not_advertise_rsa_pkcs1_schemes() {
