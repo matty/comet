@@ -538,6 +538,116 @@ impl EngineRpc {
             }
         }
     }
+
+    pub(crate) fn owns_remote_chat(&self, chat_id: &str, local_device_id: &str) -> bool {
+        matches!(
+            self.workspace.doc().chat(chat_id),
+            Ok(Some(chat)) if chat.device_id == local_device_id
+        )
+    }
+
+    pub(crate) fn validate_remote_attachment(
+        &self,
+        chat_id: &str,
+        path: &str,
+        local_device_id: &str,
+    ) -> Result<(), RpcError> {
+        let chat = self
+            .workspace
+            .doc()
+            .chat(chat_id)
+            .map_err(|error| RpcError::Failed(error.to_string()))?
+            .filter(|chat| chat.device_id == local_device_id)
+            .ok_or_else(|| {
+                RpcError::Failed(format!("chat {chat_id} is not owned by this server"))
+            })?;
+        let resolved = std::fs::canonicalize(path)
+            .map_err(|_| RpcError::Failed("attachment path is not owned by this server".into()))?;
+        let allowed = std::iter::once(self.uploads.dir().to_path_buf())
+            .chain(chat.cwd.map(std::path::PathBuf::from))
+            .filter_map(|root| std::fs::canonicalize(root).ok())
+            .any(|root| resolved.starts_with(&root) && resolved != root);
+        if !allowed {
+            return Err(RpcError::Failed(
+                "attachment path is not owned by this server".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn owns_remote_space(&self, space_id: &str, local_device_id: &str) -> bool {
+        matches!(
+            self.workspace.doc().space(space_id),
+            Ok(Some(space)) if space.device_id == local_device_id
+        )
+    }
+
+    pub(crate) fn validate_remote_mutation(
+        &self,
+        params: serde_json::Value,
+        local_device_id: &str,
+    ) -> Result<serde_json::Value, RpcError> {
+        let mutation: MutateParams = parse_params(params.clone())?;
+        let ownership_error = |kind: &str, id: &str| {
+            RpcError::Failed(format!("{kind} {id} is not owned by this server"))
+        };
+        match &mutation {
+            MutateParams::CreateSpace {
+                space_id,
+                device_id,
+                ..
+            } => {
+                if device_id != local_device_id {
+                    return Err(RpcError::BadParams(format!(
+                        "deviceId must match {local_device_id}"
+                    )));
+                }
+                if matches!(self.workspace.doc().space(space_id), Ok(Some(space)) if space.device_id != local_device_id)
+                {
+                    return Err(ownership_error("space", space_id));
+                }
+            }
+            MutateParams::CreateChat {
+                chat_id, space_id, ..
+            } => {
+                if !self.owns_remote_space(space_id, local_device_id) {
+                    return Err(ownership_error("space", space_id));
+                }
+                if matches!(self.workspace.doc().chat(chat_id), Ok(Some(chat)) if chat.device_id != local_device_id)
+                {
+                    return Err(ownership_error("chat", chat_id));
+                }
+            }
+            MutateParams::RenameSpace { space_id, .. } | MutateParams::DeleteSpace { space_id } => {
+                if !self.owns_remote_space(space_id, local_device_id) {
+                    return Err(ownership_error("space", space_id));
+                }
+            }
+            MutateParams::RenameChat { chat_id, .. }
+            | MutateParams::SetChatBranch { chat_id, .. }
+            | MutateParams::SetChatCwd { chat_id, .. }
+            | MutateParams::SetChatActivity { chat_id, .. }
+            | MutateParams::SetChatArchived { chat_id, .. }
+            | MutateParams::SetChatConfig { chat_id, .. }
+            | MutateParams::DeleteChat { chat_id }
+            | MutateParams::MarkChatSeen { chat_id, .. } => {
+                if !self.owns_remote_chat(chat_id, local_device_id) {
+                    return Err(ownership_error("chat", chat_id));
+                }
+            }
+            MutateParams::SetChatHost { .. } => {
+                return Err(RpcError::BadParams(
+                    "setChatHost is not allowed over LAN".into(),
+                ));
+            }
+            MutateParams::RenameDevice { .. } => {
+                return Err(RpcError::BadParams(
+                    "renameDevice is not allowed over LAN".into(),
+                ));
+            }
+        }
+        Ok(params)
+    }
 }
 
 /// ControlRpc methods that honor `targetDeviceId` (feature-inventory §2.1). Extend this
