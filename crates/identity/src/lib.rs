@@ -41,8 +41,8 @@ impl DeviceIdentity {
     pub fn load_or_create(data_dir: &Path) -> Result<Arc<Self>, IdentityError> {
         std::fs::create_dir_all(data_dir)?;
         let path = data_dir.join(IDENTITY_FILE);
-        match std::fs::read_to_string(&path) {
-            Ok(pem) => Self::from_pem(&pem).map(Arc::new),
+        match permissions::read_private(&path) {
+            Ok(bytes) => Self::from_private_bytes(bytes).map(Arc::new),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let key_pair = KeyPair::generate_for(&PKCS_ED25519)?;
                 let certificate = CertificateParams::new(vec!["comet.local".to_string()])?
@@ -56,7 +56,7 @@ impl DeviceIdentity {
                 if permissions::write_private_atomic_new(&path, pem.as_bytes())? {
                     Ok(Arc::new(created))
                 } else {
-                    Self::from_pem(&std::fs::read_to_string(path)?).map(Arc::new)
+                    Self::from_private_bytes(permissions::read_private(&path)?).map(Arc::new)
                 }
             }
             Err(error) => Err(error.into()),
@@ -68,7 +68,15 @@ impl DeviceIdentity {
         let private_key_der = pem_block(pem, "PRIVATE KEY")?;
         let key_der = PrivatePkcs8KeyDer::from(private_key_der.as_slice());
         let key_pair = KeyPair::from_pkcs8_der_and_sign_algo(&key_der, &PKCS_ED25519)?;
-        let (_, certificate) = x509_parser::parse_x509_certificate(&certificate_der)
+        let (remainder, certificate) = x509_parser::parse_x509_certificate(&certificate_der)
+            .map_err(|error| IdentityError::InvalidCertificate(error.to_string()))?;
+        if !remainder.is_empty() {
+            return Err(IdentityError::InvalidCertificate(
+                "trailing data after certificate".into(),
+            ));
+        }
+        certificate
+            .verify_signature(None)
             .map_err(|error| IdentityError::InvalidCertificate(error.to_string()))?;
         let certificate_public_key = certificate.public_key().raw.to_vec();
         let private_public_key = key_pair.subject_public_key_info();
@@ -76,6 +84,12 @@ impl DeviceIdentity {
             return Err(IdentityError::CertificateKeyMismatch);
         }
         Self::from_parts(certificate_der, private_key_der, certificate_public_key)
+    }
+
+    fn from_private_bytes(bytes: Vec<u8>) -> Result<Self, IdentityError> {
+        let pem = String::from_utf8(bytes)
+            .map_err(|error| IdentityError::InvalidCertificate(error.to_string()))?;
+        Self::from_pem(&pem)
     }
 
     fn from_parts(
@@ -111,6 +125,10 @@ impl DeviceIdentity {
 
 pub fn write_private_file_atomic(path: &Path, contents: &[u8]) -> Result<(), AtomicWriteError> {
     permissions::write_private_atomic(path, contents)
+}
+
+pub fn read_private_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    permissions::read_private(path)
 }
 
 fn pem_block(pem: &str, label: &'static str) -> Result<Vec<u8>, IdentityError> {
@@ -166,6 +184,42 @@ mod tests {
     }
 
     #[test]
+    fn identity_rejects_a_certificate_with_an_invalid_self_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        DeviceIdentity::load_or_create(dir.path()).unwrap();
+        let path = dir.path().join("device-identity.pem");
+        let pem = std::fs::read_to_string(&path).unwrap();
+        let certificate_text = pem_text_block(&pem, "CERTIFICATE");
+        let mut certificate_der = pem_block(&pem, "CERTIFICATE").unwrap();
+        *certificate_der.last_mut().unwrap() ^= 1;
+        std::fs::write(
+            &path,
+            pem.replace(certificate_text, &certificate_pem(&certificate_der)),
+        )
+        .unwrap();
+
+        assert!(DeviceIdentity::load_or_create(dir.path()).is_err());
+    }
+
+    #[test]
+    fn identity_rejects_trailing_certificate_der() {
+        let dir = tempfile::tempdir().unwrap();
+        DeviceIdentity::load_or_create(dir.path()).unwrap();
+        let path = dir.path().join("device-identity.pem");
+        let pem = std::fs::read_to_string(&path).unwrap();
+        let certificate_text = pem_text_block(&pem, "CERTIFICATE");
+        let mut certificate_der = pem_block(&pem, "CERTIFICATE").unwrap();
+        certificate_der.push(0);
+        std::fs::write(
+            &path,
+            pem.replace(certificate_text, &certificate_pem(&certificate_der)),
+        )
+        .unwrap();
+
+        assert!(DeviceIdentity::load_or_create(dir.path()).is_err());
+    }
+
+    #[test]
     fn concurrent_first_loads_converge_on_one_identity() {
         let dir = tempfile::tempdir().unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
@@ -216,11 +270,52 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn identity_load_fails_closed_when_existing_acl_is_broad() {
+        let dir = tempfile::tempdir().unwrap();
+        DeviceIdentity::load_or_create(dir.path()).unwrap();
+        let path = dir.path().join("device-identity.pem");
+        grant_everyone_access(&path);
+
+        assert!(DeviceIdentity::load_or_create(dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_load_fails_closed_when_existing_mode_is_broad() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        DeviceIdentity::load_or_create(dir.path()).unwrap();
+        let path = dir.path().join("device-identity.pem");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(DeviceIdentity::load_or_create(dir.path()).is_err());
+    }
+
     fn pem_text_block<'a>(pem: &'a str, label: &str) -> &'a str {
         let begin = format!("-----BEGIN {label}-----");
         let end = format!("-----END {label}-----");
         let start = pem.find(&begin).unwrap();
         let end = pem[start..].find(&end).unwrap() + start + end.len();
         &pem[start..end]
+    }
+
+    fn certificate_pem(der: &[u8]) -> String {
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----",
+            BASE64.encode(der)
+        )
+    }
+
+    #[cfg(windows)]
+    fn grant_everyone_access(path: &Path) {
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/grant", "*S-1-1-0:(F)"])
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }

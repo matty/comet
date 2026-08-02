@@ -66,7 +66,7 @@ impl RemoteConfigStore {
     pub fn open(data_dir: &Path) -> Result<Self, EngineError> {
         std::fs::create_dir_all(data_dir)?;
         let path = data_dir.join(CONFIG_FILE);
-        let document = match std::fs::read(&path) {
+        let document = match comet_identity::read_private_file(&path) {
             Ok(bytes) => serde_json::from_slice::<RemoteConfigDocument>(&bytes)
                 .map_err(|error| EngineError::Other(format!("remote config: {error}")))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -448,5 +448,46 @@ mod tests {
             0
         );
         assert_ne!(control & SE_DACL_PROTECTED, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_config_open_fails_closed_when_existing_acl_is_broad() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RemoteConfigStore::open(dir.path()).unwrap();
+        store
+            .set_lan_settings(LanSettings {
+                enabled: true,
+                bind: "0.0.0.0:27655".parse().unwrap(),
+            })
+            .unwrap();
+        let path = dir.path().join("remote-access.json");
+        let status = std::process::Command::new("icacls")
+            .arg(&path)
+            .args(["/grant", "*S-1-1-0:(F)"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        assert!(RemoteConfigStore::open(dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_config_open_fails_closed_when_existing_mode_is_broad() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = RemoteConfigStore::open(dir.path()).unwrap();
+        store
+            .set_lan_settings(LanSettings {
+                enabled: true,
+                bind: "0.0.0.0:27655".parse().unwrap(),
+            })
+            .unwrap();
+        let path = dir.path().join("remote-access.json");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        assert!(RemoteConfigStore::open(dir.path()).is_err());
     }
 }

@@ -1313,6 +1313,7 @@ version = "0.1.9"
 dependencies = [
  "comet-proto",
  "data-encoding",
+ "libc",
  "rcgen",
  "rustls-pki-types",
  "sha2",

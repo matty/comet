@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -80,6 +80,158 @@ pub(crate) fn write_private_atomic_new(
     })();
     let _ = std::fs::remove_file(&temporary);
     result
+}
+
+pub(crate) fn read_private(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = open_private_for_read(path)?;
+    let metadata = file.metadata()?;
+    if !is_regular_file(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private path is not a regular file",
+        ));
+    }
+    verify_open_file_permissions(path, &file, &metadata)?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+    Ok(contents)
+}
+
+#[cfg(windows)]
+fn is_regular_file(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_type().is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
+#[cfg(not(windows))]
+fn is_regular_file(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_file()
+}
+
+#[cfg(unix)]
+fn verify_open_file_permissions(
+    path: &Path,
+    _file: &std::fs::File,
+    metadata: &std::fs::Metadata,
+) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode == 0o600 {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} must have mode 0600, found {mode:04o}", path.display()),
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn verify_open_file_permissions(
+    path: &Path,
+    file: &std::fs::File,
+    _metadata: &std::fs::Metadata,
+) -> io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+    let mut actual: PSECURITY_DESCRIPTOR = null_mut();
+    // SAFETY: the file handle is live and actual points to output storage.
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle() as HANDLE,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut actual,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let expected = private_security_descriptor()?;
+    let actual_sddl = dacl_sddl(actual);
+    let expected_sddl = dacl_sddl(expected);
+    // SAFETY: GetSecurityInfo allocates actual with LocalAlloc.
+    unsafe { LocalFree(actual.cast::<c_void>()) };
+    // SAFETY: expected was allocated by the SDDL conversion API.
+    unsafe { LocalFree(expected.cast::<c_void>()) };
+    let actual_sddl = actual_sddl?;
+    let expected_sddl = expected_sddl?;
+    if actual_sddl == expected_sddl {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} does not have the private Comet DACL", path.display()),
+        ))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn verify_open_file_permissions(
+    _path: &Path,
+    _file: &std::fs::File,
+    _metadata: &std::fs::Metadata,
+) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_private_for_read(path: &Path) -> io::Result<std::fs::File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_private_for_read(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, OPEN_EXISTING,
+    };
+
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: path is a live NUL-terminated UTF-16 buffer for this call.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: ownership of the newly opened handle transfers to File.
+        Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_private_for_read(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -266,6 +418,34 @@ fn private_security_descriptor() -> io::Result<windows_sys::Win32::Security::PSE
     // SAFETY: token was initialized by OpenProcessToken.
     unsafe { CloseHandle(token) };
     result
+}
+
+#[cfg(windows)]
+fn dacl_sddl(descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR) -> io::Result<String> {
+    use std::ffi::c_void;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+    use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+
+    let mut value = null_mut();
+    // SAFETY: descriptor is valid and value points to output storage.
+    if unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            1,
+            DACL_SECURITY_INFORMATION,
+            &mut value,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let result = wide_ptr_to_string(value);
+    // SAFETY: the conversion API allocates value with LocalAlloc.
+    unsafe { LocalFree(value.cast::<c_void>()) };
+    Ok(result)
 }
 
 #[cfg(windows)]
