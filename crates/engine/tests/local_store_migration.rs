@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
-use comet_doc::WorkspaceDoc;
+use comet_doc::{SessionDoc, WorkspaceDoc};
 use comet_engine::{LegacyProfile, WORKSPACE_DOC_ID, prepare_local_store};
 use comet_proto::Space;
 use comet_sync::DocsStore;
 use loro::LoroDoc;
+use loro::LoroMap;
 use tempfile::TempDir;
 
 struct LegacyFixture {
@@ -90,6 +91,16 @@ impl LegacyFixture {
         let journals = self.legacy_store().join("journals");
         std::fs::create_dir_all(&journals).unwrap();
         std::fs::write(journals.join(name), bytes).unwrap();
+    }
+
+    fn write_session_with_malformed_row(&self, chat_id: &str, container: &str) {
+        let doc = SessionDoc::init(chat_id).unwrap();
+        doc.doc()
+            .get_list(container)
+            .push_container(LoroMap::new())
+            .unwrap();
+        doc.doc().commit();
+        self.write_snapshot(chat_id, &doc.export_snapshot().unwrap());
     }
 
     fn read_migrated_workspace(
@@ -297,6 +308,46 @@ fn corrupt_journal_blocks_marker_and_session_removal() {
         .to_string();
 
     assert!(err.contains("chat-corrupt.jsonl"));
+    assert!(fixture.root().join("session.json").exists());
+    assert!(
+        !fixture
+            .root()
+            .join("local-store/migration-complete.json")
+            .exists()
+    );
+}
+
+#[test]
+fn malformed_session_message_row_blocks_marker_and_session_removal() {
+    let fixture = LegacyFixture::new();
+    fixture.write_session("org-a", "user-a");
+    fixture.write_session_with_malformed_row("chat-bad-message", "messages");
+
+    let err = prepare_local_store(fixture.root(), None)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("invalid message row 0"));
+    assert!(fixture.root().join("session.json").exists());
+    assert!(
+        !fixture
+            .root()
+            .join("local-store/migration-complete.json")
+            .exists()
+    );
+}
+
+#[test]
+fn malformed_session_command_row_blocks_marker_and_session_removal() {
+    let fixture = LegacyFixture::new();
+    fixture.write_session("org-a", "user-a");
+    fixture.write_session_with_malformed_row("chat-bad-command", "commands");
+
+    let err = prepare_local_store(fixture.root(), None)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("invalid command row 0"));
     assert!(fixture.root().join("session.json").exists());
     assert!(
         !fixture

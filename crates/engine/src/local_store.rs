@@ -176,8 +176,7 @@ fn verify_store(root: &Path) -> Result<(), EngineError> {
                     "snapshot {doc_id} contains session document for {chat_id}"
                 )));
             }
-            session.read_entries()?;
-            session.read_commands()?;
+            session.validate_strict()?;
         }
     }
     RunJournal::open(root.join("journals"))?.validate_all()?;

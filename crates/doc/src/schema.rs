@@ -248,6 +248,58 @@ impl SessionDoc {
             .collect())
     }
 
+    /// Validate every persisted session row without the runtime readers' tolerant
+    /// skip policy. Used before migration makes copied snapshots authoritative.
+    pub fn validate_strict(&self) -> Result<(), DocError> {
+        let value = self.doc.get_deep_value().to_json_value();
+        let messages: Vec<serde_json::Value> = serde_json::from_value(
+            value
+                .get("messages")
+                .cloned()
+                .unwrap_or(serde_json::json!([])),
+        )
+        .map_err(|err| DocError::Schema(format!("invalid messages container: {err}")))?;
+        for (index, row) in messages.into_iter().enumerate() {
+            validate_message_parts(&row)
+                .map_err(|err| DocError::Schema(format!("invalid message row {index}: {err}")))?;
+            entry_from_json(row)
+                .map_err(|err| DocError::Schema(format!("invalid message row {index}: {err}")))?;
+        }
+
+        let commands: Vec<serde_json::Value> = serde_json::from_value(
+            value
+                .get("commands")
+                .cloned()
+                .unwrap_or(serde_json::json!([])),
+        )
+        .map_err(|err| DocError::Schema(format!("invalid commands container: {err}")))?;
+        for (index, row) in commands.into_iter().enumerate() {
+            let stored_kind = row
+                .get("kind")
+                .cloned()
+                .ok_or_else(|| {
+                    DocError::Schema(format!("invalid command row {index}: missing field `kind`"))
+                })
+                .and_then(|value| {
+                    serde_json::from_value::<crate::commands::SessionCommandKind>(value).map_err(
+                        |err| {
+                            DocError::Schema(format!(
+                                "invalid command row {index}: invalid kind: {err}"
+                            ))
+                        },
+                    )
+                })?;
+            let entry = serde_json::from_value::<SessionCommandEntry>(row)
+                .map_err(|err| DocError::Schema(format!("invalid command row {index}: {err}")))?;
+            if stored_kind != entry.kind() {
+                return Err(DocError::Schema(format!(
+                    "invalid command row {index}: kind does not match payload"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Append a command entry (rule 1: own entries only, append-only).
     pub fn queue_command(&self, entry: &SessionCommandEntry) -> Result<(), DocError> {
         let commands = self.doc.get_list("commands");
@@ -530,6 +582,40 @@ fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError
         status: raw.status,
         continuation_of: raw.continuation_of,
     })
+}
+
+fn validate_message_parts(row: &serde_json::Value) -> Result<(), DocError> {
+    let parts = row
+        .get("parts")
+        .cloned()
+        .ok_or_else(|| DocError::Schema("missing field `parts`".into()))?;
+    let parts: Vec<DocPartJson> = serde_json::from_value(parts)?;
+    for (index, part) in parts.into_iter().enumerate() {
+        let invalid = |reason: &str| {
+            DocError::Schema(format!("invalid part {index} ({}): {reason}", part.kind))
+        };
+        match part.kind.as_str() {
+            "text" if part.text.is_some() => {}
+            "tool" => {
+                let call = part.call.ok_or_else(|| invalid("missing call"))?;
+                serde_json::from_value::<comet_proto::ToolCall>(call)
+                    .map_err(|err| invalid(&format!("invalid call: {err}")))?;
+            }
+            "input" => {
+                let questions = part.questions.ok_or_else(|| invalid("missing questions"))?;
+                serde_json::from_value::<Vec<comet_proto::UserInputQuestion>>(questions)
+                    .map_err(|err| invalid(&format!("invalid questions: {err}")))?;
+                if part.resolved.is_none() {
+                    return Err(invalid("missing resolved"));
+                }
+            }
+            "error" if part.message.is_some() => {}
+            "text" => return Err(invalid("missing text")),
+            "error" => return Err(invalid("missing message")),
+            _ => return Err(invalid("unknown part kind")),
+        }
+    }
+    Ok(())
 }
 
 /// Render-time continuation join at the entry level (`joinContinuations` in TS):
@@ -971,6 +1057,89 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].status, SessionCommandStatus::Applied);
         assert_eq!(commands[0].payload, entry.payload);
+    }
+
+    #[test]
+    fn strict_validation_rejects_malformed_message_rows() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let row = doc
+            .doc()
+            .get_list("messages")
+            .push_container(LoroMap::new())
+            .unwrap();
+        row.insert("role", "user").unwrap();
+        doc.doc().commit();
+
+        assert!(doc.read_entries().unwrap().is_empty());
+        let err = doc.validate_strict().unwrap_err().to_string();
+        assert!(err.contains("invalid message row 0"));
+    }
+
+    #[test]
+    fn strict_validation_rejects_malformed_command_rows() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.doc()
+            .get_list("commands")
+            .push_container(LoroMap::new())
+            .unwrap();
+        doc.doc().commit();
+
+        assert!(doc.read_commands().unwrap().is_empty());
+        let err = doc.validate_strict().unwrap_err().to_string();
+        assert!(err.contains("invalid command row 0"));
+    }
+
+    #[test]
+    fn strict_validation_accepts_typed_session_rows() {
+        use crate::commands::{SessionCommandPayload, SessionCommandStatus};
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&user_entry("m1", "hello")).unwrap();
+        doc.queue_command(&SessionCommandEntry {
+            id: "c1".into(),
+            payload: SessionCommandPayload::Steer {
+                prompt: "focus".into(),
+                message_id: None,
+            },
+            issued_by: "dev-b".into(),
+            issued_at: 10,
+            based_on: None,
+            expires_at: None,
+            status: SessionCommandStatus::Pending,
+            resolution: None,
+        })
+        .unwrap();
+
+        doc.validate_strict().unwrap();
+    }
+
+    #[test]
+    fn strict_validation_rejects_command_kind_mismatch() {
+        use crate::commands::{SessionCommandPayload, SessionCommandStatus};
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.queue_command(&SessionCommandEntry {
+            id: "c1".into(),
+            payload: SessionCommandPayload::Steer {
+                prompt: "focus".into(),
+                message_id: None,
+            },
+            issued_by: "dev-b".into(),
+            issued_at: 10,
+            based_on: None,
+            expires_at: None,
+            status: SessionCommandStatus::Pending,
+            resolution: None,
+        })
+        .unwrap();
+        let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) =
+            doc.doc().get_list("commands").get(0)
+        else {
+            panic!("command row missing");
+        };
+        row.insert("kind", "interrupt").unwrap();
+        doc.doc().commit();
+
+        let err = doc.validate_strict().unwrap_err().to_string();
+        assert!(err.contains("kind does not match payload"));
     }
 
     #[test]
