@@ -26,6 +26,8 @@ pub enum JournalError {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid journal {path}: {reason}")]
+    Invalid { path: PathBuf, reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +187,32 @@ impl RunJournal {
         Ok(stale)
     }
 
+    /// Strictly validate every persisted journal and resume counter in this store.
+    /// Migration uses this stronger check before making copied data authoritative;
+    /// normal replay remains tolerant of a torn trailing line after a crash.
+    pub fn validate_all(&self) -> Result<(), JournalError> {
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file() {
+                return Err(invalid_journal(&path, "expected a regular file"));
+            }
+            match path.extension().and_then(|extension| extension.to_str()) {
+                Some("jsonl") => validate_journal_file(&path)?,
+                Some("resume") => {
+                    let value = std::fs::read_to_string(&path)
+                        .map_err(|err| invalid_journal(&path, err.to_string()))?;
+                    value
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|err| invalid_journal(&path, err.to_string()))?;
+                }
+                _ => return Err(invalid_journal(&path, "unsupported journal file")),
+            }
+        }
+        Ok(())
+    }
+
     /// Remove a chat's journal file entirely (tests / future compaction).
     pub fn discard(&self, chat_id: &str) -> Result<(), JournalError> {
         self.lock().remove(chat_id);
@@ -193,6 +221,34 @@ impl RunJournal {
             std::fs::remove_file(path)?;
         }
         Ok(())
+    }
+}
+
+fn validate_journal_file(path: &Path) -> Result<(), JournalError> {
+    let value =
+        std::fs::read_to_string(path).map_err(|err| invalid_journal(path, err.to_string()))?;
+    let mut expected_seq = 1;
+    for (index, line) in value.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed: JournalLine = serde_json::from_str(line)
+            .map_err(|err| invalid_journal(path, format!("line {}: {err}", index + 1)))?;
+        if parsed.seq != expected_seq {
+            return Err(invalid_journal(
+                path,
+                format!("expected sequence {expected_seq}, found {}", parsed.seq),
+            ));
+        }
+        expected_seq += 1;
+    }
+    Ok(())
+}
+
+fn invalid_journal(path: &Path, reason: impl Into<String>) -> JournalError {
+    JournalError::Invalid {
+        path: path.to_path_buf(),
+        reason: reason.into(),
     }
 }
 
@@ -306,6 +362,38 @@ mod tests {
         // Closing the stale journal with a Done clears the flag.
         journal.append("dead", &done()).unwrap();
         assert!(journal.stale_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn validation_rejects_malformed_journal_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chat-bad.jsonl"), b"not json\n").unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+
+        let err = journal.validate_all().unwrap_err().to_string();
+
+        assert!(err.contains("chat-bad.jsonl"));
+    }
+
+    #[test]
+    fn validation_rejects_malformed_resume_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chat-bad.resume"), b"not a number").unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+
+        let err = journal.validate_all().unwrap_err().to_string();
+
+        assert!(err.contains("chat-bad.resume"));
+    }
+
+    #[test]
+    fn validation_accepts_complete_journals_and_resume_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.append("chat-ok", &text("hello")).unwrap();
+        journal.note_resume_attempt("chat-ok");
+
+        journal.validate_all().unwrap();
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use comet_doc::WorkspaceDoc;
+use comet_doc::{SessionDoc, WorkspaceDoc};
 use comet_sync::DocsStore;
 use loro::LoroDoc;
 use serde::{Deserialize, Serialize};
@@ -108,7 +108,9 @@ fn stage_store(
 ) -> Result<(), EngineError> {
     let destination = DocsStore::open(staging_root)?;
     if let Some(source_root) = migrated_from {
-        let source = DocsStore::open(source_root)?;
+        let source_copy_root = staging_root.join(".legacy-source-copy");
+        copy_legacy_database(source_root, &source_copy_root)?;
+        let source = DocsStore::open(&source_copy_root)?;
         source.copy_snapshots_to(&destination)?;
         if let Some(bytes) = destination.load_snapshot(WORKSPACE_DOC_ID)? {
             let device_id = device_id.ok_or_else(|| {
@@ -124,10 +126,30 @@ fn stage_store(
             &source_root.join("journals"),
             &staging_root.join("journals"),
         )?;
+        drop(source);
+        std::fs::remove_dir_all(source_copy_root)?;
     }
     drop(destination);
     RunJournal::open(staging_root.join("journals"))?;
     verify_store(staging_root)
+}
+
+fn copy_legacy_database(source_root: &Path, destination_root: &Path) -> Result<(), EngineError> {
+    std::fs::create_dir_all(destination_root)?;
+    let database = source_root.join("docs.sqlite3");
+    if !database.is_file() {
+        return Err(EngineError::Other(format!(
+            "legacy store database does not exist: {}",
+            database.display()
+        )));
+    }
+    for name in ["docs.sqlite3", "docs.sqlite3-wal", "docs.sqlite3-shm"] {
+        let source = source_root.join(name);
+        if source.is_file() {
+            std::fs::copy(source, destination_root.join(name))?;
+        }
+    }
+    Ok(())
 }
 
 fn verify_store(root: &Path) -> Result<(), EngineError> {
@@ -138,14 +160,27 @@ fn verify_store(root: &Path) -> Result<(), EngineError> {
                 "snapshot disappeared during verification: {doc_id}"
             ))
         })?;
-        if doc_id == WORKSPACE_DOC_ID {
-            let doc = LoroDoc::new();
-            doc.import(&bytes)
-                .map_err(|err| EngineError::Other(format!("workspace verification: {err}")))?;
+        let doc = LoroDoc::new();
+        doc.import(&bytes).map_err(|err| {
+            EngineError::Other(format!("snapshot {doc_id} failed to import: {err}"))
+        })?;
+        if doc_id == WORKSPACE_DOC_ID || doc_id == "workspace" {
             WorkspaceDoc::from_doc(doc).read_all()?;
+        } else {
+            let session = SessionDoc::from_doc(doc);
+            let chat_id = session.chat_id().ok_or_else(|| {
+                EngineError::Other(format!("snapshot {doc_id} is not a session document"))
+            })?;
+            if chat_id != doc_id {
+                return Err(EngineError::Other(format!(
+                    "snapshot {doc_id} contains session document for {chat_id}"
+                )));
+            }
+            session.read_entries()?;
+            session.read_commands()?;
         }
     }
-    RunJournal::open(root.join("journals"))?;
+    RunJournal::open(root.join("journals"))?.validate_all()?;
     Ok(())
 }
 

@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use comet_doc::WorkspaceDoc;
@@ -10,6 +12,13 @@ use tempfile::TempDir;
 
 struct LegacyFixture {
     dir: TempDir,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SourceFileState {
+    bytes: Vec<u8>,
+    modified: SystemTime,
+    readonly: bool,
 }
 
 impl LegacyFixture {
@@ -70,6 +79,19 @@ impl LegacyFixture {
             .unwrap();
     }
 
+    fn write_snapshot(&self, doc_id: &str, bytes: &[u8]) {
+        DocsStore::open(self.legacy_store())
+            .unwrap()
+            .save_snapshot(doc_id, bytes)
+            .unwrap();
+    }
+
+    fn write_journal(&self, name: &str, bytes: &[u8]) {
+        let journals = self.legacy_store().join("journals");
+        std::fs::create_dir_all(&journals).unwrap();
+        std::fs::write(journals.join(name), bytes).unwrap();
+    }
+
     fn read_migrated_workspace(
         &self,
         local: &comet_engine::LocalStore,
@@ -82,6 +104,33 @@ impl LegacyFixture {
         let doc = LoroDoc::new();
         doc.import(&bytes).unwrap();
         WorkspaceDoc::from_doc(doc).read_all().unwrap()
+    }
+
+    fn source_manifest(&self, org_id: &str, user_id: &str) -> BTreeMap<PathBuf, SourceFileState> {
+        fn collect(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, SourceFileState>) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    collect(root, &entry.path(), out);
+                } else if kind.is_file() {
+                    let metadata = entry.metadata().unwrap();
+                    out.insert(
+                        entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                        SourceFileState {
+                            bytes: std::fs::read(entry.path()).unwrap(),
+                            modified: metadata.modified().unwrap(),
+                            readonly: metadata.permissions().readonly(),
+                        },
+                    );
+                }
+            }
+        }
+
+        let root = self.profile(org_id, user_id);
+        let mut out = BTreeMap::new();
+        collect(&root, &root, &mut out);
+        out
     }
 }
 
@@ -171,6 +220,84 @@ fn workspace_migration_without_device_id_does_not_publish_foreign_rows() {
 
     assert!(err.contains("device-id"));
     assert!(fixture.legacy_store().exists());
+    assert!(
+        !fixture
+            .root()
+            .join("local-store/migration-complete.json")
+            .exists()
+    );
+}
+
+#[test]
+fn migration_does_not_change_legacy_source_files_or_metadata() {
+    let fixture = LegacyFixture::new();
+    let database = fixture.legacy_store().join("docs.sqlite3");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .pragma_update(None, "journal_mode", "DELETE")
+        .unwrap();
+    drop(connection);
+    let before = fixture.source_manifest("org-a", "user-a");
+
+    prepare_local_store(fixture.root(), None).unwrap();
+
+    assert_eq!(fixture.source_manifest("org-a", "user-a"), before);
+}
+
+#[test]
+fn corrupt_chat_snapshot_blocks_marker_and_session_removal() {
+    let fixture = LegacyFixture::new();
+    fixture.write_session("org-a", "user-a");
+    fixture.write_snapshot("chat-corrupt", b"not a loro snapshot");
+
+    let err = prepare_local_store(fixture.root(), None)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("chat-corrupt"));
+    assert!(fixture.root().join("session.json").exists());
+    assert!(
+        !fixture
+            .root()
+            .join("local-store/migration-complete.json")
+            .exists()
+    );
+}
+
+#[test]
+fn workspace_snapshot_under_chat_id_is_rejected_as_wrong_document_type() {
+    let fixture = LegacyFixture::new();
+    fixture.write_session("org-a", "user-a");
+    let bytes = WorkspaceDoc::new().export_snapshot().unwrap();
+    fixture.write_snapshot("chat-wrong-type", &bytes);
+
+    let err = prepare_local_store(fixture.root(), None)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("chat-wrong-type"));
+    assert!(err.contains("not a session document"));
+    assert!(fixture.root().join("session.json").exists());
+    assert!(
+        !fixture
+            .root()
+            .join("local-store/migration-complete.json")
+            .exists()
+    );
+}
+
+#[test]
+fn corrupt_journal_blocks_marker_and_session_removal() {
+    let fixture = LegacyFixture::new();
+    fixture.write_session("org-a", "user-a");
+    fixture.write_journal("chat-corrupt.jsonl", b"not json\n");
+
+    let err = prepare_local_store(fixture.root(), None)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("chat-corrupt.jsonl"));
+    assert!(fixture.root().join("session.json").exists());
     assert!(
         !fixture
             .root()
