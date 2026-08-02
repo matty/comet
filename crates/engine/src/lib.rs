@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub use comet_identity::DeviceIdentity;
 pub use comet_proto::HarnessId;
 
 use comet_sync::DocsStore;
@@ -19,6 +20,7 @@ pub mod doc_host;
 pub mod instance_lock;
 pub mod local_store;
 pub mod registry;
+pub mod remote_config;
 pub mod repos;
 pub mod rpc;
 pub mod run_journal;
@@ -50,6 +52,8 @@ pub use workspace_host::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
+    #[error("identity: {0}")]
+    Identity(#[from] comet_identity::IdentityError),
     #[error("doc: {0}")]
     Doc(#[from] comet_doc::DocError),
     #[error("journal: {0}")]

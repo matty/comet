@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/identity",
     "crates/proto",
     "crates/doc",
     "crates/sync",
@@ -21,6 +22,7 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
+comet-identity = { path = "crates/identity" }
 comet-proto = { path = "crates/proto" }
 comet-doc = { path = "crates/doc" }
 comet-sync = { path = "crates/sync" }
@@ -95,6 +97,24 @@ alacritty_terminal = "0.26"
 pulldown-cmark = "0.12"
 unicode-segmentation = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rustls = "0.23"
+rustls-pki-types = "1"
+tokio-rustls = "0.26"
+rcgen = { version = "0.14", features = ["crypto", "pem", "zeroize"] }
+hmac = "0.12"
+rand = "0.10"
+data-encoding = "2"
+subtle = "2"
+zeroize = "1"
+x509-parser = "0.18"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
 
 [profile.release]
 # Distribution profile (scripts/package-linux.sh): thin LTO buys most of fat

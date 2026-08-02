@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+comet-identity.workspace = true
 comet-proto.workspace = true
 comet-doc.workspace = true
 comet-sync.workspace = true
@@ -30,6 +31,9 @@ base64 = "0.22"
 libc.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
