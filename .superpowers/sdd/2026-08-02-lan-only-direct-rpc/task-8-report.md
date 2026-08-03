@@ -39,6 +39,34 @@ Result: exit 1. The pre-federation TUI failed compilation at its obsolete single
 
 ## Risks / follow-up
 
-- The current Task 7 `FederationCommand::Call` API is fire-and-forget. Existing model/ref picker calls can be routed correctly but cannot return typed reply payloads to the TUI through that API yet.
-- Draft creation that requires a newly-created worktree path cannot preserve the old dependent reply chain through fire-and-forget federation calls; current-checkout and already-materialized paths remain routable. A reply-bearing federation command is needed to restore that workflow fully without bypassing federation.
+- Fix Round 1 added the reply-bearing path needed by model/ref pickers and dependent draft creation; those original implementation risks are resolved below.
 - The smoke harness itself needs a Windows implementation or must run on Unix CI; the requested command cannot execute in this environment.
+
+## Fix Round 1
+
+Commit: `35b78eb482c7652789bbf9f2696a86172884372e`
+
+### RED evidence
+
+- Reply success/error tests failed compilation because `SupervisorCommand::Request` did not exist.
+- `cargo test -p comet-tui --test render remote_ -- --nocapture` produced two behavioral failures: equal raw chat IDs suppressed the cross-server transcript watch, and a remote cursor action routed through the previously selected server.
+- `cargo test -p comet-tui --test render new_session_adopts -- --nocapture` failed because the draft/ref request retained the previous server.
+- `cargo test -p comet-tui --test render duplicate_remote_row_cursor -- --nocapture` failed because row rebuild anchoring compared only raw IDs.
+- The first full TUI regression run exposed three echo failures after qualification; tracing showed legacy local fixtures and qualified maps used different fallback identities.
+
+### GREEN evidence
+
+- Added a bounded reply-bearing federation request path returning `Value`/`RpcError` through the existing one-active + 32-entry FIFO. Tests cover success, server error, offline error, reconnect cancellation, and overflow.
+- Models, refs, sends, and session creation now await federation replies. Adapter tests cover current checkout, reused worktree, new worktree reply-derived cwd, exact ordered calls, and failure stopping before queue/start notification.
+- Full `ServerRef` switching now clears stale transcript state and emits the new qualified watch.
+- Menu/prompt targets, cursor row actions, new-session cursor adoption, cursor identity, last-visited state, echoes, and asynchronous send failures are server-qualified.
+- `cargo test -p comet-client`: 26 unit + 23 integration tests passed.
+- `cargo test -p comet-tui`: 84 unit/adapter + 72 render tests passed; one intentional frame dump ignored; doc tests passed.
+- `cargo clippy -p comet-client -p comet-tui --tests -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- Smoke was attempted again and remains environment-blocked before launch by Unix-only `fcntl` on Windows.
+
+### Self-review / residual risk
+
+- Request responders are cancelled structurally: reconnect drains active/queued requests with `RpcError::Closed`; shutdown or supervisor loss drops the oneshot and the public adapter maps that to `Closed`.
+- TUI adapter tests exercise the actual `FederationCommand::Request` channel boundary and ordered reply handling. They do not launch a real daemon-backed `EngineLink`; the full daemon smoke path remains unavailable on this Windows worker.
