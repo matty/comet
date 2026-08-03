@@ -178,6 +178,17 @@ impl Shell {
         if self.space_drag.is_some() && !cx.has_active_drag() {
             self.space_drag = None;
         }
+        let (server_headers, active_server) = {
+            let state = self.state.read(cx);
+            (
+                state
+                    .server_order
+                    .iter()
+                    .filter_map(|id| state.servers.get(id).cloned())
+                    .collect::<Vec<_>>(),
+                state.selected_server_id().cloned(),
+            )
+        };
         let (spaces, selected, device_names, offline_devices, attention): (
             Vec<Space>,
             Option<String>,
@@ -236,7 +247,7 @@ impl Shell {
             }
             (
                 spaces,
-                state.selected_space.clone(),
+                state.selected_space.clone().map(|id| id.local_id),
                 device_names,
                 offline_devices,
                 attention,
@@ -291,6 +302,57 @@ impl Shell {
             );
 
         let mut column = div().flex().flex_col().child(header);
+        for (index, server) in server_headers.into_iter().enumerate() {
+            let id = server.id.clone();
+            let online = server.connection == comet_proto::RemoteConnectionState::Online;
+            let selected_server = active_server.as_ref() == Some(&id);
+            let status = match server.connection {
+                comet_proto::RemoteConnectionState::Connecting => "Connecting".to_string(),
+                comet_proto::RemoteConnectionState::Online => "Online".to_string(),
+                comet_proto::RemoteConnectionState::Offline => "Offline".to_string(),
+                comet_proto::RemoteConnectionState::Unreachable { message } => {
+                    format!("Unreachable · {message}")
+                }
+                comet_proto::RemoteConnectionState::IdentityChanged => {
+                    "Identity changed".to_string()
+                }
+                comet_proto::RemoteConnectionState::IncompatibleVersion { remote } => {
+                    format!("Incompatible v{remote}")
+                }
+            };
+            column = column.child(
+                div()
+                    .id(SharedString::from(format!("server-header-{index}")))
+                    .mx(px(Theme::SPACE_SM))
+                    .mt(px(4.0))
+                    .px(px(Theme::SPACE_SM))
+                    .py(px(4.0))
+                    .rounded(px(6.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_size(px(11.0))
+                    .text_color(if online {
+                        theme.text_muted
+                    } else {
+                        theme.warning
+                    })
+                    .when(selected_server, |row| {
+                        row.bg(crate::theme::glass_selected_bg())
+                    })
+                    .when(online, |row| {
+                        row.cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.state.update(cx, |state, cx| {
+                                    state.select_server_bucket(id.clone());
+                                    cx.notify();
+                                });
+                            }))
+                    })
+                    .child(SharedString::from(server.name))
+                    .child(SharedString::from(status)),
+            );
+        }
         if spaces.is_empty() {
             // Ghost row: the empty-state affordance mirrors a space row.
             column = column.child(
@@ -594,7 +656,12 @@ impl Shell {
                 })
                 .collect()
         };
-        let selected = self.state.read(cx).selected_chat.clone();
+        let selected = self
+            .state
+            .read(cx)
+            .selected_chat
+            .clone()
+            .map(|id| id.local_id);
         rows.into_iter()
             .map(|(status, chat, folder, branch)| {
                 let time_ago: SharedString =
@@ -744,14 +811,12 @@ impl Shell {
 
     /// ListFolders on the flow's device (relay-forwarded when remote).
     pub(super) fn load_space_folders(&mut self, path: Option<String>, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             return;
         };
-        let local = self.state.read(cx).local_device_id.clone();
         let Some(flow) = self.add_space.as_mut() else {
             return;
         };
-        let device_id = flow.device.as_ref().map(|d| d.id.clone());
         let went_home = path.is_none();
         flow.browser_path = path.clone();
         flow.browser = Loadable::Loading;
@@ -761,15 +826,6 @@ impl Shell {
             let mut params = serde_json::Map::new();
             if let Some(p) = &path {
                 params.insert("path".into(), serde_json::Value::String(p.clone()));
-            }
-            // Only target remote devices — local calls skip the relay.
-            if let (Some(target), local) = (&device_id, &local)
-                && local.as_deref() != Some(target.as_str())
-            {
-                params.insert(
-                    "targetDeviceId".into(),
-                    serde_json::Value::String(target.clone()),
-                );
             }
             let result = engine
                 .client()
@@ -801,7 +857,7 @@ impl Shell {
 
     /// Create the space for the browser's current folder.
     fn submit_add_space(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             return;
         };
         let Some(flow) = self.add_space.as_ref() else {

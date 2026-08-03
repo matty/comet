@@ -7,7 +7,7 @@ use comet_rpc::{RpcClient, RpcError, RpcStream, methods};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 
-use crate::{FederationEvent, ServerState};
+use crate::{FederationEvent, FederationStream, ServerState};
 
 pub(crate) enum SupervisorCommand {
     Call(&'static str, serde_json::Value),
@@ -15,6 +15,11 @@ pub(crate) enum SupervisorCommand {
         method: &'static str,
         params: serde_json::Value,
         reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, RpcError>>,
+    },
+    Subscribe {
+        method: &'static str,
+        params: serde_json::Value,
+        reply: tokio::sync::oneshot::Sender<Result<FederationStream, RpcError>>,
     },
     WatchTranscript {
         chat_id: Option<String>,
@@ -120,6 +125,9 @@ async fn await_initial<T>(
                 Some(SupervisorCommand::Request { method, reply, .. }) => {
                     let _ = reply.send(Err(RpcError::Failed(format!("cannot call {method} while server is connecting"))));
                 }
+                Some(SupervisorCommand::Subscribe { method, reply, .. }) => {
+                    let _ = reply.send(Err(RpcError::Failed(format!("cannot subscribe to {method} while server is connecting"))));
+                }
             }
         }
     }
@@ -157,6 +165,9 @@ async fn replace_transcript(
                     }
                     Some(SupervisorCommand::Request { method, reply, .. }) => {
                         let _ = reply.send(Err(RpcError::Failed(format!("cannot call {method} while transcript subscription is changing"))));
+                    }
+                    Some(SupervisorCommand::Subscribe { method, reply, .. }) => {
+                        let _ = reply.send(Err(RpcError::Failed(format!("cannot subscribe to {method} while transcript subscription is changing"))));
                     }
                 }
             }
@@ -201,6 +212,13 @@ pub(crate) async fn supervise_connected(
         };
     let mut active_call = None;
     let mut queued_calls = VecDeque::<GenericCall>::new();
+    struct SubscriptionTask(tokio::task::JoinHandle<()>);
+    impl Drop for SubscriptionTask {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut subscriptions = Vec::<SubscriptionTask>::new();
 
     let mut state = ServerState::empty(
         hello.server_id.clone(),
@@ -263,6 +281,23 @@ pub(crate) async fn supervise_connected(
                         let _ = reply.send(Err(RpcError::Failed(format!(
                             "cannot call {method}: generic RPC queue is full ({MAX_QUEUED_CALLS})"
                         ))));
+                    }
+                    continue;
+                }
+                Some(SupervisorCommand::Subscribe { method, params, reply }) => {
+                    match client.subscribe(method, params).await {
+                        Ok(mut source) => {
+                            let (send, receive) = mpsc::unbounded_channel();
+                            subscriptions.push(SubscriptionTask(tokio::spawn(async move {
+                                while let Some(value) = source.recv().await {
+                                    if send.send(value).is_err() {
+                                        break;
+                                    }
+                                }
+                            })));
+                            let _ = reply.send(Ok(receive));
+                        }
+                        Err(error) => { let _ = reply.send(Err(error)); }
                     }
                     continue;
                 }
@@ -395,6 +430,12 @@ mod tests {
                     RpcReply::value(&true)
                 }
                 "Fail" => Err(RpcError::Failed("ordered failure".into())),
+                "Events" => Ok(RpcReply::Stream(
+                    futures::stream::once(async { serde_json::json!({"seq": 1}) })
+                        .chain(futures::stream::pending())
+                        .boxed(),
+                )),
+                "FailStream" => Err(RpcError::Failed("stream failure".into())),
                 other => Err(RpcError::UnknownMethod(other.into())),
             }
         }
@@ -768,5 +809,53 @@ mod tests {
         release_first.notify_one();
         commands.send(SupervisorCommand::Shutdown).unwrap();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_returns_the_server_stream_and_errors() {
+        let (task, commands, mut events, ..) = spawn_ordered();
+        wait_online(&mut events).await;
+        let (reply, received) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Subscribe {
+                method: "Events",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+        let mut stream = received.await.unwrap().unwrap();
+        assert_eq!(stream.recv().await, Some(serde_json::json!({"seq": 1})));
+
+        let (reply, received) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Subscribe {
+                method: "FailStream",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+        let mut failed = received.await.unwrap().unwrap();
+        assert_eq!(failed.recv().await, None);
+        commands.send(SupervisorCommand::Shutdown).unwrap();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_closes_a_returned_subscription() {
+        let (task, commands, mut events, ..) = spawn_ordered();
+        wait_online(&mut events).await;
+        let (reply, received) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Subscribe {
+                method: "Events",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+        let mut stream = received.await.unwrap().unwrap();
+        assert!(stream.recv().await.is_some());
+        commands.send(SupervisorCommand::Reconnect).unwrap();
+        assert!(matches!(task.await, Ok(Ok(ConnectedExit::Reconnect))));
+        assert_eq!(stream.recv().await, None);
     }
 }

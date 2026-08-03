@@ -21,6 +21,7 @@ use gpui::{
     Task, Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
+use comet_proto::ServerId;
 use comet_rpc::methods;
 use gpui_tokio::Tokio;
 
@@ -494,6 +495,9 @@ pub struct Shell {
     /// Session-scoped panel open flags (terminal / changes per chat; §1.10-1.11
     /// parity — heights stay in [`UiSettings`]).
     panels: SessionPanels,
+    /// Authoritative owner of the raw-id shell caches below. Switching servers
+    /// clears them before an equal local id can inherit another server's UI.
+    transient_server: Option<ServerId>,
     /// The panel key of the chat currently shown ("" = new-chat canvas).
     active_chat: String,
     /// Last rendered sidebar order (key + estimated height) — the FLIP baseline
@@ -570,8 +574,7 @@ impl Shell {
                 let alive = this.update(cx, |shell: &mut Shell, cx| {
                     let live = {
                         let s = shell.state.read(cx);
-                        s.selected_chat
-                            .as_deref()
+                        s.selected_chat_id()
                             .is_some_and(|id| s.indicator_for(id, Utc::now()) != Indicator::None)
                     };
                     if live {
@@ -666,6 +669,7 @@ impl Shell {
             data_dir,
             settings,
             panels: SessionPanels::default(),
+            transient_server: None,
             active_chat: String::new(),
             sidebar_prev_order: Vec::new(),
             sidebar_resort: std::collections::HashMap::new(),
@@ -696,6 +700,26 @@ impl Shell {
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        let selected_server = state.read(cx).selected_server_id().cloned();
+        if selected_server != self.transient_server {
+            self.transient_server = selected_server;
+            self.chat_menu = None;
+            self.rename_dialog = None;
+            self.delete_confirm = None;
+            self.space_menu = None;
+            self.rename_space_dialog = None;
+            self.delete_space_confirm = None;
+            self.add_space = None;
+            self.space_last_chat.clear();
+            self.tab_hover = None;
+            self.tab_drag = None;
+            self.space_drag = None;
+            self.tabs_scrolled_to = None;
+            self.sound_prev.clear();
+            self.panels = SessionPanels::default();
+            self.active_chat.clear();
+            self.nav = NavHistory::new(NavEntry::Chat(String::new()));
+        }
         // Capture knob: the add-space palette needs only the device registry.
         if self.debug_dialog.as_deref() == Some("add-space") && !state.read(cx).devices.is_empty() {
             self.debug_dialog = None;
@@ -774,8 +798,8 @@ impl Shell {
                 let s = state.read(cx);
                 let chat_space = s.selected_chat_row().and_then(|c| c.space_id.clone());
                 (
-                    s.selected_space.clone(),
-                    s.selected_chat.clone(),
+                    s.selected_space.clone().map(|id| id.local_id),
+                    s.selected_chat.clone().map(|id| id.local_id),
                     chat_space,
                 )
             };
@@ -789,7 +813,11 @@ impl Shell {
         }
         // Chat switch: restore THAT chat's panel state (per-session open flags;
         // snap, no tween — the panels belong to the destination chat).
-        let selected = state.read(cx).selected_chat.clone().unwrap_or_default();
+        let selected = state
+            .read(cx)
+            .selected_chat_id()
+            .unwrap_or_default()
+            .to_string();
         if selected != self.active_chat {
             self.active_chat = selected;
             // Route history: a chat switch is a navigation. The very first
@@ -865,8 +893,8 @@ impl Shell {
             let space = self
                 .state
                 .read(cx)
-                .selected_space
-                .clone()
+                .selected_space_id()
+                .map(str::to_string)
                 .unwrap_or_default();
             format!("space-canvas:{space}")
         } else {
@@ -1092,7 +1120,7 @@ impl Shell {
             NavEntry::Chat(chat_id) => {
                 self.route = Route::Chat;
                 let target = (!chat_id.is_empty()).then_some(chat_id);
-                if self.state.read(cx).selected_chat != target {
+                if self.state.read(cx).selected_chat_id() != target.as_deref() {
                     self.state.update(cx, |s, cx| s.select_chat(target, cx));
                 }
             }
@@ -1168,7 +1196,7 @@ impl Shell {
 
     /// Fire a Mutate op; failures surface in the sidebar notice strip.
     fn mutate(&mut self, params: serde_json::Value, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             self.sidebar_notice = Some("Engine not connected".into());
             cx.notify();
             return;
@@ -1235,7 +1263,7 @@ impl Shell {
 
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.delete_confirm = None;
-        if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
+        if self.state.read(cx).selected_chat_id() == Some(chat_id.as_str()) {
             self.state.update(cx, |s, cx| s.select_chat(None, cx));
         }
         self.mutate(
@@ -2942,7 +2970,7 @@ impl Shell {
             .px(px(Theme::SPACE_LG + 8.0))
             .text_size(px(11.0));
 
-        let Some(chat_id) = state.selected_chat.clone() else {
+        let Some(chat_id) = state.selected_chat.clone().map(|id| id.local_id) else {
             return strip.into_any_element();
         };
         let indicator = state.indicator_for(&chat_id, now);

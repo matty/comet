@@ -22,12 +22,12 @@ use gpui::{
     ScrollDelta, SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
 };
 
-use comet_proto::{TerminalEvent, TerminalSession};
+use comet_proto::{ServerRef, TerminalEvent, TerminalSession};
 use comet_rpc::methods;
 
 use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
 use crate::settings::{TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT};
-use crate::state::{AppState, EngineHandle};
+use crate::state::{AppState, ServerClient};
 use crate::theme::Theme;
 
 use super::emulator::{CellSnapshot, CursorSnapshot, Emulator};
@@ -113,15 +113,7 @@ pub fn active_after_reorder(active: usize, from: usize, to: usize) -> usize {
     }
 }
 
-/// Merge the `targetDeviceId` passthrough into RPC params (no-op for chats on
-/// the connected engine's own device).
-fn with_target(mut params: serde_json::Value, target: &Option<String>) -> serde_json::Value {
-    if let (Some(target), Some(object)) = (target, params.as_object_mut()) {
-        object.insert(
-            "targetDeviceId".into(),
-            serde_json::Value::String(target.clone()),
-        );
-    }
+fn with_target(params: serde_json::Value, _target: &Option<String>) -> serde_json::Value {
     params
 }
 
@@ -204,7 +196,7 @@ struct DragState {
 
 /// The dragged-tab payload (gpui drag-and-drop).
 struct TabDragPayload {
-    chat: String,
+    chat: ServerRef,
     from: usize,
     title: SharedString,
 }
@@ -236,12 +228,12 @@ impl Render for TabGhost {
 pub struct TerminalPanel {
     state: Entity<AppState>,
     focus_handle: FocusHandle,
-    chats: HashMap<String, ChatTabs>,
+    chats: HashMap<ServerRef, ChatTabs>,
     /// Shell-driven visibility gate: no RPC happens while closed (lazy).
     open: bool,
     tab_seq: u64,
     drag: Option<DragState>,
-    last_selected: Option<String>,
+    last_selected: Option<ServerRef>,
     _observe: Subscription,
 }
 
@@ -292,23 +284,24 @@ impl TerminalPanel {
         }
     }
 
-    fn engine(&self, cx: &App) -> Option<EngineHandle> {
-        self.state.read(cx).engine().cloned()
+    fn engine(&self, cx: &App) -> Option<ServerClient> {
+        self.state.read(cx).selected_client()
     }
 
-    /// The chat's host device when it differs from the connected engine's own —
-    /// the PTY lives on the chat's device (feature-inventory §2.1 "terminals
-    /// live on the chat's host device"), so every terminal RPC for a remote
-    /// chat needs the `targetDeviceId` passthrough. Without it the local
-    /// engine checks the chat's cwd against its OWN filesystem and fails with
-    /// "Session working directory is unavailable" (user report).
-    fn chat_target(&self, chat: &str, cx: &App) -> Option<String> {
+    /// Legacy device identity used only for cache labelling; RPC authority is
+    /// selected by the qualified server client.
+    fn chat_target(&self, chat: &ServerRef, cx: &App) -> Option<String> {
         let state = self.state.read(cx);
-        let device = state.chats.iter().find(|c| c.id == chat)?.device_id.clone();
+        let device = state
+            .chats
+            .iter()
+            .find(|c| c.id == chat.local_id)?
+            .device_id
+            .clone();
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }
 
-    fn selected_chat(&self, cx: &App) -> Option<String> {
+    fn selected_chat(&self, cx: &App) -> Option<ServerRef> {
         self.state.read(cx).selected_chat.clone()
     }
 
@@ -321,7 +314,7 @@ impl TerminalPanel {
         }
     }
 
-    fn tab_mut(&mut self, chat: &str, key: u64) -> Option<&mut TerminalTab> {
+    fn tab_mut(&mut self, chat: &ServerRef, key: u64) -> Option<&mut TerminalTab> {
         self.chats
             .get_mut(chat)?
             .tabs
@@ -337,7 +330,7 @@ impl TerminalPanel {
 
     // ---- open / stream lifecycle ----
 
-    fn open_tab(&mut self, chat: String, cx: &mut Context<Self>) {
+    fn open_tab(&mut self, chat: ServerRef, cx: &mut Context<Self>) {
         let Some(engine) = self.engine(cx) else {
             return;
         };
@@ -369,9 +362,9 @@ impl TerminalPanel {
 
     /// OpenTerminal, then pump SubscribeTerminal with reconnect backoff.
     fn spawn_session(
-        chat: String,
+        chat: ServerRef,
         key: u64,
-        engine: EngineHandle,
+        engine: ServerClient,
         target: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
@@ -390,7 +383,7 @@ impl TerminalPanel {
                 .call_as::<TerminalSession>(
                     methods::OPEN_TERMINAL,
                     with_target(
-                        serde_json::json!({ "chatId": chat, "cols": cols, "rows": rows }),
+                        serde_json::json!({ "chatId": chat.local_id, "cols": cols, "rows": rows }),
                         &target,
                     ),
                 )
@@ -508,9 +501,9 @@ impl TerminalPanel {
 
     fn apply_stream_event(
         &mut self,
-        chat: &str,
+        chat: &ServerRef,
         key: u64,
-        engine: &EngineHandle,
+        engine: &ServerClient,
         event: TerminalEvent,
         cx: &mut Context<Self>,
     ) -> StreamDisposition {
@@ -582,7 +575,7 @@ impl TerminalPanel {
         }
     }
 
-    fn schedule_flush(chat: String, key: u64, cx: &mut Context<Self>) -> Task<()> {
+    fn schedule_flush(chat: ServerRef, key: u64, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(COALESCE_MS))
@@ -591,7 +584,7 @@ impl TerminalPanel {
         })
     }
 
-    fn flush_input(&mut self, chat: String, key: u64, cx: &mut Context<Self>) {
+    fn flush_input(&mut self, chat: ServerRef, key: u64, cx: &mut Context<Self>) {
         let Some(engine) = self.engine(cx) else {
             return;
         };
@@ -741,7 +734,7 @@ impl TerminalPanel {
 
     // ---- tab management ----
 
-    fn select_tab(&mut self, chat: &str, ix: usize, cx: &mut Context<Self>) {
+    fn select_tab(&mut self, chat: &ServerRef, ix: usize, cx: &mut Context<Self>) {
         if let Some(tabs) = self.chats.get_mut(chat)
             && ix < tabs.tabs.len()
         {
@@ -750,7 +743,13 @@ impl TerminalPanel {
         }
     }
 
-    fn close_tab(&mut self, chat: &str, key: u64, window: &mut Window, cx: &mut Context<Self>) {
+    fn close_tab(
+        &mut self,
+        chat: &ServerRef,
+        key: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let engine = self.engine(cx);
         let target = self.chat_target(chat, cx);
         let Some(tabs) = self.chats.get_mut(chat) else {
@@ -783,7 +782,7 @@ impl TerminalPanel {
         cx.notify();
     }
 
-    fn commit_reorder(&mut self, chat: &str, from: usize, to: usize, cx: &mut Context<Self>) {
+    fn commit_reorder(&mut self, chat: &ServerRef, from: usize, to: usize, cx: &mut Context<Self>) {
         if let Some(tabs) = self.chats.get_mut(chat) {
             let active = tabs.active;
             reorder_tabs(&mut tabs.tabs, from, to);
@@ -816,7 +815,11 @@ impl TerminalPanel {
 
     // ---- render ----
 
-    fn render_tab_bar(&mut self, chat: &str, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_tab_bar(
+        &mut self,
+        chat: &ServerRef,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let theme = Theme::of(cx).clone();
         let tabs = self.chats.get(chat);
         let (active, count) = tabs.map(|t| (t.active, t.tabs.len())).unwrap_or((0, 0));
@@ -824,7 +827,7 @@ impl TerminalPanel {
             .drag
             .as_ref()
             .map(|d| (d.from, d.over, d.epoch, d.prev_over));
-        let chat_owned = chat.to_string();
+        let chat_owned = chat.clone();
 
         let tab_elements: Vec<_> = tabs
             .map(|tabs| {

@@ -27,9 +27,13 @@ use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
+use comet_client::{Federation, FederationCommand, FederationEvent, ServerState};
 use comet_doc::SessionMessageEntry;
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
-use comet_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space};
+use comet_proto::{
+    AuthState, Chat, ChatIndicator, Device, HarnessId, RemoteConnectionState, ServerId, ServerRef,
+    Session, Space,
+};
 use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
 // ---------------------------------------------------------------------------
@@ -69,7 +73,7 @@ pub enum EngineMode {
 /// teardown.
 #[async_trait]
 trait EngineBackend: Send + Sync {
-    fn client(&self) -> &RpcClient;
+    fn client(&self) -> Arc<RpcClient>;
     fn mode(&self) -> EngineMode;
     /// Graceful teardown (drains runs / flushes docs for the in-process engine).
     async fn shutdown(&self);
@@ -83,13 +87,13 @@ struct InProcessEngine {
     /// Serves this engine to other viewports over the IPC port. `None` when the
     /// port was already taken — the window still works over its own transport.
     ipc_task: Option<tokio::task::JoinHandle<()>>,
-    client: RpcClient,
+    client: Arc<RpcClient>,
 }
 
 #[async_trait]
 impl EngineBackend for InProcessEngine {
-    fn client(&self) -> &RpcClient {
-        &self.client
+    fn client(&self) -> Arc<RpcClient> {
+        self.client.clone()
     }
     fn mode(&self) -> EngineMode {
         EngineMode::InProcess
@@ -147,14 +151,14 @@ impl RpcService for DeferredEngineRpc {
 
 /// External daemon over `ws://127.0.0.1:{port}`.
 struct RemoteEngine {
-    client: RpcClient,
+    client: Arc<RpcClient>,
     url: String,
 }
 
 #[async_trait]
 impl EngineBackend for RemoteEngine {
-    fn client(&self) -> &RpcClient {
-        &self.client
+    fn client(&self) -> Arc<RpcClient> {
+        self.client.clone()
     }
     fn mode(&self) -> EngineMode {
         EngineMode::Remote {
@@ -170,6 +174,120 @@ impl EngineBackend for RemoteEngine {
 #[derive(Clone)]
 pub struct EngineHandle {
     inner: Arc<dyn EngineBackend>,
+}
+
+/// Cloneable command side of the client federation. UI effects use this for
+/// every resource operation; raw object ids remain inside `params` while the
+/// authoritative server id travels out-of-band.
+#[derive(Clone)]
+pub struct FederatedClient {
+    commands: tokio::sync::mpsc::UnboundedSender<FederationCommand>,
+}
+
+#[derive(Clone)]
+pub struct ServerClient {
+    federation: FederatedClient,
+    server_id: ServerId,
+}
+
+impl ServerClient {
+    pub fn client(&self) -> &Self {
+        self
+    }
+
+    pub async fn call(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        self.federation
+            .request(self.server_id.clone(), method, params)
+            .await
+    }
+
+    pub async fn call_as<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> Result<T, RpcError> {
+        self.federation
+            .request_as(self.server_id.clone(), method, params)
+            .await
+    }
+
+    pub fn server_id(&self) -> &ServerId {
+        &self.server_id
+    }
+
+    pub async fn subscribe(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> Result<comet_client::FederationStream, RpcError> {
+        self.federation
+            .subscribe(self.server_id.clone(), method, params)
+            .await
+    }
+}
+
+impl FederatedClient {
+    pub fn call(&self, server_id: ServerId, method: &'static str, params: serde_json::Value) {
+        let _ = self.commands.send(FederationCommand::Call {
+            server_id,
+            method,
+            params,
+        });
+    }
+
+    pub async fn request(
+        &self,
+        server_id: ServerId,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        let (reply, received) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(FederationCommand::Request {
+                server_id,
+                method,
+                params,
+                reply,
+            })
+            .map_err(|_| RpcError::Closed)?;
+        received.await.unwrap_or(Err(RpcError::Closed))
+    }
+
+    pub async fn request_as<T: serde::de::DeserializeOwned>(
+        &self,
+        server_id: ServerId,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> Result<T, RpcError> {
+        serde_json::from_value(self.request(server_id, method, params).await?)
+            .map_err(|error| RpcError::Failed(error.to_string()))
+    }
+
+    pub async fn subscribe(
+        &self,
+        server_id: ServerId,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> Result<comet_client::FederationStream, RpcError> {
+        let (reply, received) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(FederationCommand::Subscribe {
+                server_id,
+                method,
+                params,
+                reply,
+            })
+            .map_err(|_| RpcError::Closed)?;
+        received.await.unwrap_or(Err(RpcError::Closed))
+    }
+
+    fn watch_transcript(&self, chat: Option<ServerRef>) {
+        let _ = self.commands.send(FederationCommand::WatchTranscript(chat));
+    }
 }
 
 impl EngineHandle {
@@ -188,7 +306,10 @@ impl EngineHandle {
             match connect_ws(&url).await {
                 Ok(client) => {
                     return Ok(EngineHandle {
-                        inner: Arc::new(RemoteEngine { client, url }),
+                        inner: Arc::new(RemoteEngine {
+                            client: Arc::new(client),
+                            url,
+                        }),
                     });
                 }
                 // Something is on the port but it is not an engine (or it is
@@ -267,12 +388,12 @@ impl EngineHandle {
                 boot_task,
                 refresh_task,
                 ipc_task,
-                client,
+                client: Arc::new(client),
             }),
         })
     }
 
-    pub fn client(&self) -> &RpcClient {
+    pub fn client(&self) -> Arc<RpcClient> {
         self.inner.client()
     }
 
@@ -354,17 +475,22 @@ pub struct AppState {
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
     pub sessions: Vec<Session>,
+    /// Authoritative per-server snapshots in federation registry order. The
+    /// flat vectors above are only the active server's render projection.
+    pub servers: HashMap<ServerId, ServerState>,
+    pub server_order: Vec<ServerId>,
+    active_server: Option<ServerId>,
     /// The space whose tabs fill the main area. Healed by [`Self::apply_spaces`]
     /// when the row vanishes; selecting a chat implies its space.
-    pub selected_space: Option<String>,
-    pub selected_chat: Option<String>,
+    pub selected_space: Option<ServerRef>,
+    pub selected_chat: Option<ServerRef>,
     /// Boot auto-select happened (or a manual selection superseded it).
     pub auto_selected: bool,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
-    echoes: HashMap<String, Vec<SessionMessageEntry>>,
+    echoes: HashMap<ServerRef, Vec<SessionMessageEntry>>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
@@ -374,8 +500,8 @@ pub struct AppState {
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
     engine: Option<EngineHandle>,
+    federation: Option<FederatedClient>,
     watch_tasks: Vec<Task<()>>,
-    transcript_task: Option<Task<()>>,
 }
 
 impl Default for AppState {
@@ -393,6 +519,9 @@ impl AppState {
             spaces: Vec::new(),
             chats: Vec::new(),
             sessions: Vec::new(),
+            servers: HashMap::new(),
+            server_order: Vec::new(),
+            active_server: None,
             selected_space: None,
             selected_chat: None,
             transcript: Vec::new(),
@@ -401,24 +530,216 @@ impl AppState {
             update: None,
             data_dir: None,
             engine: None,
+            federation: None,
             watch_tasks: Vec::new(),
-            transcript_task: None,
             auto_selected: false,
         }
     }
 
     // ---- reducers (pure) ----
 
+    /// Fold one federation event into authoritative server buckets. Any
+    /// non-online snapshot is already child-free by contract; selected remote
+    /// loss heals to the local (first) bucket and cannot retain stale content.
+    pub fn apply_federation(&mut self, event: FederationEvent) {
+        match event {
+            FederationEvent::ServerChanged(mut server) => {
+                if server.connection != RemoteConnectionState::Online {
+                    server.devices.clear();
+                    server.spaces.clear();
+                    server.chats.clear();
+                    server.sessions.clear();
+                }
+                let id = server.id.clone();
+                if !self.servers.contains_key(&id) {
+                    self.server_order.push(id.clone());
+                }
+                self.servers.insert(id.clone(), server);
+                if self.active_server.is_none() {
+                    self.active_server = self.server_order.first().cloned();
+                }
+                if self.active_server.as_ref() == Some(&id)
+                    && self
+                        .servers
+                        .get(&id)
+                        .is_some_and(|s| s.connection != RemoteConnectionState::Online)
+                {
+                    self.heal_to_local();
+                } else if self.active_server.as_ref() == Some(&id) {
+                    self.project_active_server();
+                    self.heal_resource_selection();
+                }
+            }
+            FederationEvent::ServerRemoved(id) => {
+                self.purge_server(&id);
+                self.servers.remove(&id);
+                self.server_order.retain(|candidate| candidate != &id);
+                if self.active_server.as_ref() == Some(&id) {
+                    self.heal_to_local();
+                }
+            }
+            FederationEvent::Transcript { chat, entries } => {
+                if self.selected_chat.as_ref() == Some(&chat) {
+                    self.apply_transcript(entries);
+                }
+            }
+            FederationEvent::Notice { server_id, message } => {
+                tracing::warn!(server = ?server_id, %message, "federation notice");
+            }
+        }
+    }
+
+    fn purge_server(&mut self, server_id: &ServerId) {
+        self.echoes.retain(|key, _| &key.server_id != server_id);
+        if self
+            .selected_chat
+            .as_ref()
+            .is_some_and(|key| &key.server_id == server_id)
+        {
+            self.selected_chat = None;
+            self.transcript.clear();
+        }
+        if self
+            .selected_space
+            .as_ref()
+            .is_some_and(|key| &key.server_id == server_id)
+        {
+            self.selected_space = None;
+        }
+    }
+
+    fn heal_to_local(&mut self) {
+        if let Some(previous) = self.active_server.clone() {
+            self.purge_server(&previous);
+        }
+        self.active_server = self.server_order.first().cloned();
+        self.selected_chat = None;
+        self.selected_space = None;
+        self.transcript.clear();
+        self.project_active_server();
+    }
+
+    fn project_active_server(&mut self) {
+        let Some(server) = self
+            .active_server
+            .as_ref()
+            .and_then(|id| self.servers.get(id))
+        else {
+            self.devices.clear();
+            self.spaces.clear();
+            self.chats.clear();
+            self.sessions.clear();
+            return;
+        };
+        self.devices = server.devices.clone();
+        self.spaces = server.spaces.clone();
+        sort_spaces(&mut self.spaces);
+        self.chats = server.chats.clone();
+        sort_chats(&mut self.chats);
+        self.sessions = server.sessions.clone();
+    }
+
+    fn heal_resource_selection(&mut self) {
+        if self
+            .selected_chat
+            .as_ref()
+            .is_some_and(|selected| !self.chats.iter().any(|chat| chat.id == selected.local_id))
+        {
+            self.selected_chat = None;
+            self.transcript.clear();
+        }
+        if self.selected_space.as_ref().is_some_and(|selected| {
+            !self
+                .spaces
+                .iter()
+                .any(|space| space.id == selected.local_id)
+        }) {
+            self.selected_space = self.spaces.first().and_then(|space| {
+                self.active_server
+                    .clone()
+                    .map(|server| ServerRef::new(server, space.id.clone()))
+            });
+        }
+    }
+
+    pub fn selected_server_id(&self) -> Option<&ServerId> {
+        self.active_server.as_ref()
+    }
+
+    pub fn call_for(
+        &self,
+        owner: &ServerRef,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> FederationCommand {
+        FederationCommand::Call {
+            server_id: owner.server_id.clone(),
+            method,
+            params,
+        }
+    }
+
+    pub fn subscribe_for(
+        &self,
+        owner: &ServerRef,
+        method: &'static str,
+        params: serde_json::Value,
+        reply: tokio::sync::oneshot::Sender<Result<comet_client::FederationStream, RpcError>>,
+    ) -> FederationCommand {
+        FederationCommand::Subscribe {
+            server_id: owner.server_id.clone(),
+            method,
+            params,
+            reply,
+        }
+    }
+
+    pub fn selected_chat_id(&self) -> Option<&str> {
+        self.selected_chat.as_ref().map(ServerRef::local_id)
+    }
+
+    pub fn selected_space_id(&self) -> Option<&str> {
+        self.selected_space.as_ref().map(ServerRef::local_id)
+    }
+
+    pub fn select_server_chat(&mut self, chat: ServerRef) {
+        self.active_server = Some(chat.server_id.clone());
+        self.project_active_server();
+        self.selected_space = self
+            .chats
+            .iter()
+            .find(|row| row.id == chat.local_id)
+            .and_then(|row| row.space_id.clone())
+            .map(|space| ServerRef::new(chat.server_id.clone(), space));
+        self.selected_chat = Some(chat);
+        self.auto_selected = true;
+        self.transcript.clear();
+    }
+
+    pub fn select_server_bucket(&mut self, server_id: ServerId) {
+        if self
+            .servers
+            .get(&server_id)
+            .is_none_or(|server| server.connection != RemoteConnectionState::Online)
+        {
+            return;
+        }
+        self.active_server = Some(server_id);
+        self.selected_space = None;
+        self.selected_chat = None;
+        self.transcript.clear();
+        self.project_active_server();
+    }
+
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         sort_chats(&mut chats);
         self.chats = chats;
         if let Some(selected) = &self.selected_chat
-            && !self.chats.iter().any(|c| &c.id == selected)
+            && !self.chats.iter().any(|c| c.id == selected.local_id)
         {
             // Selected chat vanished (deleted elsewhere): drop selection + transcript.
             self.selected_chat = None;
             self.transcript.clear();
-            self.transcript_task = None;
         }
     }
 
@@ -433,14 +754,20 @@ impl AppState {
         // first space; its chats died with it, so a matching chat selection is
         // healed by the accompanying chats frame (`apply_chats`).
         if let Some(selected) = &self.selected_space
-            && !self.spaces.iter().any(|s| &s.id == selected)
+            && !self.spaces.iter().any(|s| s.id == selected.local_id)
         {
-            self.selected_space = self.spaces.first().map(|s| s.id.clone());
+            self.selected_space = self
+                .spaces
+                .first()
+                .map(|s| ServerRef::new(self.current_server_id(), s.id.clone()));
         }
         // First frame with no selection yet: pick the first space so the shell
         // never renders an empty main area while spaces exist.
         if self.selected_space.is_none() {
-            self.selected_space = self.spaces.first().map(|s| s.id.clone());
+            self.selected_space = self
+                .spaces
+                .first()
+                .map(|s| ServerRef::new(self.current_server_id(), s.id.clone()));
         }
     }
 
@@ -483,7 +810,7 @@ impl AppState {
 
     pub fn apply_transcript(&mut self, entries: Vec<SessionMessageEntry>) {
         // Doc frames supersede optimistic echoes carrying the same id.
-        if let Some(chat_id) = self.selected_chat.as_deref()
+        if let Some(chat_id) = self.selected_chat.as_ref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)
         {
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
@@ -493,7 +820,24 @@ impl AppState {
 
     /// Add an optimistic user echo (composer send path).
     pub fn push_echo(&mut self, chat_id: &str, entry: SessionMessageEntry) {
-        let echoes = self.echoes.entry(chat_id.to_string()).or_default();
+        let key = self
+            .selected_chat
+            .as_ref()
+            .filter(|selected| selected.local_id == chat_id)
+            .cloned()
+            .or_else(|| {
+                self.active_server
+                    .clone()
+                    .map(|server| ServerRef::new(server, chat_id))
+            });
+        let Some(key) = key else {
+            return;
+        };
+        self.push_echo_for(key, entry);
+    }
+
+    pub fn push_echo_for(&mut self, chat: ServerRef, entry: SessionMessageEntry) {
+        let echoes = self.echoes.entry(chat).or_default();
         if !echoes.iter().any(|e| e.id == entry.id) {
             echoes.push(entry);
         }
@@ -501,7 +845,23 @@ impl AppState {
 
     /// Drop an echo (send failed — the prompt returns to the draft).
     pub fn remove_echo(&mut self, chat_id: &str, message_id: &str) {
-        if let Some(echoes) = self.echoes.get_mut(chat_id) {
+        let key = self
+            .selected_chat
+            .as_ref()
+            .filter(|selected| selected.local_id == chat_id)
+            .cloned()
+            .or_else(|| {
+                self.active_server
+                    .clone()
+                    .map(|server| ServerRef::new(server, chat_id))
+            });
+        if let Some(key) = key {
+            self.remove_echo_for(&key, message_id);
+        }
+    }
+
+    pub fn remove_echo_for(&mut self, chat: &ServerRef, message_id: &str) {
+        if let Some(echoes) = self.echoes.get_mut(chat) {
             echoes.retain(|e| e.id != message_id);
         }
     }
@@ -509,7 +869,7 @@ impl AppState {
     /// Unconfirmed echoes for the selected chat, in send order.
     pub fn pending_echoes(&self) -> &[SessionMessageEntry] {
         self.selected_chat
-            .as_deref()
+            .as_ref()
             .and_then(|id| self.echoes.get(id))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
@@ -523,7 +883,7 @@ impl AppState {
     }
 
     pub fn selected_space_row(&self) -> Option<&Space> {
-        let id = self.selected_space.as_deref()?;
+        let id = self.selected_space_id()?;
         self.spaces.iter().find(|s| s.id == id)
     }
 
@@ -605,7 +965,7 @@ impl AppState {
     }
 
     pub fn selected_chat_row(&self) -> Option<&Chat> {
-        let id = self.selected_chat.as_deref()?;
+        let id = self.selected_chat_id()?;
         self.chats.iter().find(|c| c.id == id)
     }
 
@@ -615,6 +975,24 @@ impl AppState {
 
     pub fn engine(&self) -> Option<&EngineHandle> {
         self.engine.as_ref()
+    }
+
+    pub fn federation(&self) -> Option<&FederatedClient> {
+        self.federation.as_ref()
+    }
+
+    pub fn client_for(&self, owner: &ServerRef) -> Option<ServerClient> {
+        Some(ServerClient {
+            federation: self.federation.clone()?,
+            server_id: owner.server_id.clone(),
+        })
+    }
+
+    pub fn selected_client(&self) -> Option<ServerClient> {
+        Some(ServerClient {
+            federation: self.federation.clone()?,
+            server_id: self.current_server_id(),
+        })
     }
 
     // ---- gpui glue ----
@@ -656,26 +1034,9 @@ impl AppState {
     fn attach_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
         self.connection = ConnectionStatus::Ready;
         self.engine = Some(handle.clone());
+        let federation_handle = handle.clone();
+        let federation_data_dir = self.data_dir.clone();
         self.watch_tasks = vec![
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::WATCH_SESSIONS,
-                AppState::apply_sessions,
-            ),
-            spawn_chats_watch(cx, handle.clone()),
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::WATCH_DEVICES,
-                AppState::apply_devices,
-            ),
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::WATCH_SPACES,
-                AppState::apply_spaces,
-            ),
             // Auth frames parse tolerantly — engine and proto tags differ today.
             spawn_watch(
                 cx,
@@ -691,11 +1052,57 @@ impl AppState {
             ),
             spawn_local_device_probe(cx, handle.clone()),
         ];
-        // Re-subscribe the transcript if a chat was already selected (reconnect path).
-        if let Some(chat_id) = self.selected_chat.clone() {
-            self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
+        if let Some(data_dir) = federation_data_dir {
+            let start = Tokio::spawn(cx, async move {
+                Federation::new_shared(federation_handle.client(), data_dir).await
+            });
+            cx.spawn(async move |this, cx| match start.await {
+                Ok(Ok(federation)) => {
+                    this.update(cx, |state, cx| state.attach_federation(federation, cx))
+                        .ok();
+                }
+                Ok(Err(error)) => tracing::warn!(%error, "federation unavailable"),
+                Err(error) => tracing::warn!(%error, "federation startup task failed"),
+            })
+            .detach();
         }
         cx.notify();
+    }
+
+    fn attach_federation(&mut self, mut federation: Federation, cx: &mut Context<Self>) {
+        self.federation = Some(FederatedClient {
+            commands: federation.command_sender(),
+        });
+        if let (Some(client), Some(chat)) = (&self.federation, self.selected_chat.clone()) {
+            client.watch_transcript(Some(chat));
+        }
+        self.watch_tasks.push(cx.spawn(async move |this, cx| {
+            while let Some(event) = federation.recv().await {
+                let alive = this.update(cx, |state, cx| {
+                    state.apply_federation(event);
+                    if state.selected_chat.is_none() && !state.auto_selected {
+                        let first = state.server_order.iter().find_map(|server_id| {
+                            let server = state.servers.get(server_id)?;
+                            server
+                                .chats
+                                .iter()
+                                .find(|chat| !chat.archived)
+                                .map(|chat| ServerRef::new(server_id.clone(), chat.id.clone()))
+                        });
+                        if let Some(chat) = first {
+                            state.select_server_chat(chat.clone());
+                            if let Some(client) = &state.federation {
+                                client.watch_transcript(Some(chat));
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        }));
     }
 
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
@@ -703,17 +1110,19 @@ impl AppState {
     /// watch server-side. Selecting a chat also lands in its space and marks it
     /// seen (a global-list click must switch the tab strip too).
     pub fn select_chat(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
-        if self.selected_chat == chat_id {
+        let qualified = chat_id
+            .as_ref()
+            .map(|id| ServerRef::new(self.current_server_id(), id));
+        if self.selected_chat == qualified {
             // Re-selecting still clears a fresh "completed" badge.
             if let Some(id) = chat_id {
                 self.mark_chat_seen(&id, cx);
             }
             return;
         }
-        self.selected_chat = chat_id.clone();
+        self.selected_chat = qualified;
         self.auto_selected = true;
         self.transcript.clear();
-        self.transcript_task = None;
         if let Some(id) = chat_id.as_deref() {
             // A chat implies its space; `select_chat(None)` (the new-session
             // canvas) stays within the current space.
@@ -723,23 +1132,31 @@ impl AppState {
                 .find(|c| c.id == id)
                 .and_then(|c| c.space_id.clone())
             {
-                self.selected_space = Some(space_id);
+                self.selected_space = Some(ServerRef::new(self.current_server_id(), space_id));
             }
             self.mark_chat_seen(id, cx);
         }
-        if let (Some(chat_id), Some(handle)) = (chat_id, self.engine.clone()) {
-            self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
+        if let Some(client) = &self.federation {
+            client.watch_transcript(self.selected_chat.clone());
         }
         cx.notify();
     }
 
     /// Select a space; the caller (shell) decides which chat to land on.
     pub fn select_space(&mut self, space_id: Option<String>, cx: &mut Context<Self>) {
-        if self.selected_space == space_id {
+        let qualified = space_id.map(|id| ServerRef::new(self.current_server_id(), id));
+        if self.selected_space == qualified {
             return;
         }
-        self.selected_space = space_id;
+        self.selected_space = qualified;
         cx.notify();
+    }
+
+    fn current_server_id(&self) -> ServerId {
+        self.active_server
+            .clone()
+            .or_else(|| self.server_order.first().cloned())
+            .unwrap_or_else(|| ServerId::new("local"))
     }
 
     /// Synced seen marker: only fires when the chat is currently unseen
@@ -754,68 +1171,20 @@ impl AppState {
         }
         chat.last_seen_at = Some(Utc::now());
         cx.notify();
-        let Some(handle) = self.engine.clone() else {
+        let Some(client) = self.federation.clone() else {
             return;
         };
+        let server_id = self.current_server_id();
         let chat_id = chat_id.to_string();
-        cx.spawn(async move |_, _| {
-            let params = serde_json::json!({ "op": "markChatSeen", "chatId": chat_id });
-            if let Err(err) = handle.client().call(methods::MUTATE, params).await {
-                tracing::warn!(chat = %chat_id, error = %err, "markChatSeen failed");
-            }
-        })
-        .detach();
+        client.call(
+            server_id,
+            methods::MUTATE,
+            serde_json::json!({ "op": "markChatSeen", "chatId": chat_id }),
+        );
     }
 }
 
 /// Subscribe to a watch method and pump each frame through `apply`. Runs on the
-/// gpui executor; ends when the stream closes or the entity is released.
-/// Chats watch with boot auto-select: comet's `/` route redirected to the
-/// last-used chat; we approximate by selecting the most recent unarchived chat
-/// on the first frame when nothing is selected yet (manual selection wins).
-fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
-    cx.spawn(async move |this, cx| {
-        let mut rx = match handle
-            .client()
-            .subscribe(methods::WATCH_CHATS, serde_json::json!({}))
-            .await
-        {
-            Ok(rx) => rx,
-            Err(err) => {
-                tracing::debug!(error = %err, "chats watch unavailable");
-                return;
-            }
-        };
-        while let Some(value) = rx.recv().await {
-            let parsed: Vec<Chat> = match serde_json::from_value(value) {
-                Ok(parsed) => parsed,
-                Err(err) => {
-                    tracing::warn!(error = %err, "dropping malformed chats frame");
-                    continue;
-                }
-            };
-            let alive = this.update(cx, |state, cx| {
-                state.apply_chats(parsed);
-                if state.selected_chat.is_none() && !state.auto_selected {
-                    let most_recent = state
-                        .chats
-                        .iter()
-                        .find(|c| !c.archived)
-                        .map(|c| c.id.clone());
-                    if let Some(chat_id) = most_recent {
-                        state.auto_selected = true;
-                        state.select_chat(Some(chat_id), cx);
-                    }
-                }
-                cx.notify();
-            });
-            if alive.is_err() {
-                break;
-            }
-        }
-    })
-}
-
 fn spawn_watch<T: DeserializeOwned + 'static>(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
@@ -880,54 +1249,142 @@ fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) ->
     })
 }
 
-fn spawn_transcript_watch(
-    cx: &mut Context<AppState>,
-    handle: EngineHandle,
-    chat_id: String,
-) -> Task<()> {
-    cx.spawn(async move |this, cx| {
-        let params = serde_json::json!({ "chatId": chat_id });
-        let mut rx = match handle
-            .client()
-            .subscribe(methods::WATCH_DOC_MESSAGES, params)
-            .await
-        {
-            Ok(rx) => rx,
-            Err(err) => {
-                tracing::warn!(%chat_id, error = %err, "transcript watch failed");
-                return;
-            }
-        };
-        while let Some(value) = rx.recv().await {
-            let entries: Vec<SessionMessageEntry> = match serde_json::from_value(value) {
-                Ok(entries) => entries,
-                Err(err) => {
-                    tracing::warn!(error = %err, "dropping malformed transcript frame");
-                    continue;
-                }
-            };
-            let alive = this.update(cx, |state, cx| {
-                // Guard against a stale pump racing a newer selection.
-                if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
-                    state.apply_transcript(entries);
-                    cx.notify();
-                }
-            });
-            if alive.is_err() {
-                break;
-            }
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeDelta;
+    use comet_client::{FederationCommand, FederationEvent, ServerState};
     use comet_engine::{EngineCore, default_registry};
     // `SessionStatus` is only needed to build the fixtures below — the module
     // itself derives everything through `comet_proto::view`.
     use comet_proto::{SessionStatus, UserProfile};
+
+    fn server(id: &str) -> comet_proto::ServerId {
+        comet_proto::ServerId::new(format!("sha256:{id}"))
+    }
+
+    fn remote_chat(id: &str, space_id: &str) -> Chat {
+        Chat {
+            id: id.into(),
+            device_id: "dev".into(),
+            title: Some(format!("chat on {space_id}")),
+            archived: false,
+            cwd: Some("/dev/comet".into()),
+            branch: Some("main".into()),
+            checkout_id: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: Some(Utc::now()),
+            created_at: Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: Some(space_id.into()),
+            last_seen_at: None,
+        }
+    }
+
+    #[test]
+    fn remote_offline_heals_qualified_selection_to_local() {
+        let local = server("local");
+        let remote = server("b");
+        let mut state = AppState::new();
+        state.apply_federation(FederationEvent::ServerChanged(ServerState::empty(
+            local.clone(),
+            "This device",
+            comet_proto::RemoteConnectionState::Online,
+        )));
+        let mut b = ServerState::empty(
+            remote.clone(),
+            "Build box",
+            comet_proto::RemoteConnectionState::Online,
+        );
+        b.chats.push(remote_chat("chat-1", "space-1"));
+        state.apply_federation(FederationEvent::ServerChanged(b));
+        state.select_server_chat(comet_proto::ServerRef::new(remote.clone(), "chat-1"));
+
+        state.apply_federation(FederationEvent::ServerChanged(ServerState::offline(
+            remote,
+            "Build box",
+        )));
+
+        assert_eq!(state.selected_server_id(), Some(&local));
+        assert!(state.selected_chat.is_none());
+        assert!(state.transcript.is_empty());
+    }
+
+    #[test]
+    fn duplicate_raw_chat_ids_route_to_the_qualified_server() {
+        let mut state = AppState::new();
+        for id in ["b", "c"] {
+            let mut bucket =
+                ServerState::empty(server(id), id, comet_proto::RemoteConnectionState::Online);
+            bucket.chats.push(remote_chat("chat-1", "space-1"));
+            state.apply_federation(FederationEvent::ServerChanged(bucket));
+        }
+        let chat = comet_proto::ServerRef::new(server("c"), "chat-1");
+
+        let command = state.call_for(
+            &chat,
+            methods::QUEUE_COMMAND,
+            serde_json::json!({ "chatId": chat.local_id(), "text": "hello" }),
+        );
+
+        assert!(matches!(command,
+            FederationCommand::Call { server_id, method, params }
+                if server_id == server("c")
+                    && method == methods::QUEUE_COMMAND
+                    && params["chatId"] == "chat-1"
+                    && params.get("targetDeviceId").is_none()));
+    }
+
+    #[test]
+    fn terminal_subscription_command_uses_the_chat_server() {
+        let state = AppState::new();
+        let chat = comet_proto::ServerRef::new(server("c"), "chat-1");
+        let (reply, _received) = tokio::sync::oneshot::channel();
+        let command = state.subscribe_for(
+            &chat,
+            methods::SUBSCRIBE_TERMINAL,
+            serde_json::json!({"terminalId": "term-1", "afterSeq": 7}),
+            reply,
+        );
+        assert!(matches!(command,
+            FederationCommand::Subscribe { server_id, method, params, .. }
+                if server_id == server("c")
+                    && method == methods::SUBSCRIBE_TERMINAL
+                    && params["terminalId"] == "term-1"
+                    && params.get("targetDeviceId").is_none()));
+    }
+
+    #[test]
+    fn duplicate_chat_transients_are_isolated_and_removal_is_scoped() {
+        let mut state = AppState::new();
+        for id in ["b", "c"] {
+            let mut bucket =
+                ServerState::empty(server(id), id, comet_proto::RemoteConnectionState::Online);
+            bucket.chats.push(remote_chat("chat-1", "space-1"));
+            state.apply_federation(FederationEvent::ServerChanged(bucket));
+        }
+        let echo = |id: &str| SessionMessageEntry {
+            id: id.into(),
+            role: comet_doc::MessageRole::User,
+            parts: Vec::new(),
+            created_at: 0,
+            device_id: "local".into(),
+            status: None,
+            continuation_of: None,
+        };
+        state.select_server_chat(ServerRef::new(server("b"), "chat-1"));
+        state.push_echo("chat-1", echo("from-b"));
+        state.select_server_chat(ServerRef::new(server("c"), "chat-1"));
+        state.push_echo("chat-1", echo("from-c"));
+        assert_eq!(state.pending_echoes()[0].id, "from-c");
+
+        state.apply_federation(FederationEvent::ServerRemoved(server("b")));
+
+        assert_eq!(state.pending_echoes()[0].id, "from-c");
+        assert!(state.echoes.keys().all(|key| key.server_id != server("b")));
+    }
 
     /// A localhost port that was just free (bind :0, read, drop).
     async fn free_port() -> u16 {
@@ -1325,11 +1782,11 @@ mod tests {
         let ids: Vec<&str> = state.spaces.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["s1", "s2"]);
         // First frame auto-selects the first space.
-        assert_eq!(state.selected_space.as_deref(), Some("s1"));
-        state.selected_space = Some("s2".into());
+        assert_eq!(state.selected_space_id(), Some("s1"));
+        state.selected_space = Some(ServerRef::new(state.current_server_id(), "s2"));
         // Vanished selection heals to the first space.
         state.apply_spaces(vec![space("s1", "dev", "/a", 1)]);
-        assert_eq!(state.selected_space.as_deref(), Some("s1"));
+        assert_eq!(state.selected_space_id(), Some("s1"));
         // No spaces at all: selection clears.
         state.apply_spaces(vec![]);
         assert_eq!(state.selected_space, None);
@@ -1371,14 +1828,14 @@ mod tests {
     fn apply_chats_drops_vanished_selection() {
         let mut state = AppState::new();
         state.apply_chats(vec![chat("a", 0, None), chat("b", 1, None)]);
-        state.selected_chat = Some("a".into());
+        state.selected_chat = Some(ServerRef::new(state.current_server_id(), "a"));
         state.transcript = vec![];
         state.apply_chats(vec![chat("b", 1, None)]);
         assert_eq!(state.selected_chat, None);
         // Still-present selection survives.
-        state.selected_chat = Some("b".into());
+        state.selected_chat = Some(ServerRef::new(state.current_server_id(), "b"));
         state.apply_chats(vec![chat("b", 1, None), chat("c", 2, None)]);
-        assert_eq!(state.selected_chat.as_deref(), Some("b"));
+        assert_eq!(state.selected_chat_id(), Some("b"));
     }
 
     #[test]
@@ -1432,7 +1889,7 @@ mod tests {
     #[test]
     fn echoes_show_until_doc_frame_confirms() {
         let mut state = AppState::new();
-        state.selected_chat = Some("c1".into());
+        state.selected_chat = Some(ServerRef::new(state.current_server_id(), "c1"));
         let echo = SessionMessageEntry {
             id: "m1".into(),
             role: comet_doc::MessageRole::User,

@@ -23,7 +23,7 @@ use gpui::{
     StyledImage as _, div, img, prelude::*, px,
 };
 
-use crate::state::EngineHandle;
+use crate::state::ServerClient;
 use crate::theme::white_alpha;
 use comet_rpc::methods;
 
@@ -259,13 +259,6 @@ pub fn stage_clipboard_image(image: Image) -> StagedAttachment {
 // Upload (state.ts uploadAttachment) + read-back (state.ts readAttachmentImage)
 // ---------------------------------------------------------------------------
 
-fn with_target(mut params: serde_json::Value, target_device_id: Option<&str>) -> serde_json::Value {
-    if let (Some(target), Some(map)) = (target_device_id, params.as_object_mut()) {
-        map.insert("targetDeviceId".into(), target.into());
-    }
-    params
-}
-
 /// Per-call deadlines (desktop state.ts): a stalled-but-open relay link never
 /// fails an RPC on its own, so every attachment call races a timer. The first
 /// chunk gets 90s (a cold dial to a remote device), later chunks 30s; commit
@@ -278,9 +271,9 @@ const READ_CHUNK_TIMEOUT: Duration = Duration::from_secs(20);
 /// Race an RPC against `timeout` on the gpui background executor (these
 /// futures run under `cx.spawn`, so tokio's timer reactor isn't available).
 async fn call_with_timeout(
-    engine: &EngineHandle,
+    engine: &ServerClient,
     executor: &BackgroundExecutor,
-    method: &str,
+    method: &'static str,
     params: serde_json::Value,
     timeout: Duration,
 ) -> Result<serde_json::Value, String> {
@@ -298,9 +291,8 @@ async fn call_with_timeout(
 /// `UploadCommit{uploadId,fileName}` → the durable absolute path on the target
 /// device. Errors return the raw cause (the composer shows friendly copy).
 pub async fn upload_attachment(
-    engine: &EngineHandle,
+    engine: &ServerClient,
     executor: &BackgroundExecutor,
-    target_device_id: Option<&str>,
     attachment: &StagedAttachment,
 ) -> Result<String, String> {
     let b64 = BASE64.encode(attachment.bytes());
@@ -309,10 +301,8 @@ pub async fn upload_attachment(
     let mut seq = 0u64;
     loop {
         let end = (start + UPLOAD_CHUNK_B64_CHARS).min(b64.len());
-        let params = with_target(
-            serde_json::json!({ "uploadId": upload_id, "seq": seq, "data": &b64[start..end] }),
-            target_device_id,
-        );
+        let params =
+            serde_json::json!({ "uploadId": upload_id, "seq": seq, "data": &b64[start..end] });
         let timeout = if seq == 0 {
             FIRST_CHUNK_TIMEOUT
         } else {
@@ -346,10 +336,7 @@ pub async fn upload_attachment(
             break;
         }
     }
-    let params = with_target(
-        serde_json::json!({ "uploadId": upload_id, "fileName": attachment.name }),
-        target_device_id,
-    );
+    let params = serde_json::json!({ "uploadId": upload_id, "fileName": attachment.name });
     let reply = call_with_timeout(
         engine,
         executor,
@@ -374,9 +361,8 @@ pub struct LoadedAttachmentImage {
 /// `ReadAttachmentChunk` loop: 45KB base64 chunks until `done` (bounded, with
 /// the same stuck-offset guard as comet's `readAttachmentImage`).
 pub async fn read_attachment_image(
-    engine: &EngineHandle,
+    engine: &ServerClient,
     executor: &BackgroundExecutor,
-    target_device_id: Option<&str>,
     path: &str,
 ) -> Option<LoadedAttachmentImage> {
     let mut name = String::new();
@@ -385,10 +371,7 @@ pub async fn read_attachment_image(
     let mut offset = 0u64;
     let mut done = false;
     for _ in 0..MAX_READ_CHUNKS {
-        let params = with_target(
-            serde_json::json!({ "path": path, "offset": offset }),
-            target_device_id,
-        );
+        let params = serde_json::json!({ "path": path, "offset": offset });
         let chunk = call_with_timeout(
             engine,
             executor,

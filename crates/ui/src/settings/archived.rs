@@ -42,7 +42,7 @@ impl ArchivedPage {
     }
 
     fn unarchive(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             return;
         };
         self.busy = Some(chat_id.clone());

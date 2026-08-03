@@ -127,12 +127,24 @@ impl Shell {
     /// last tab lands on the new-session canvas.
     pub(super) fn close_session_tab(&mut self, chat_id: String, cx: &mut Context<Self>) {
         let (selected, order) = {
-            let space = self.state.read(cx).selected_space.clone();
+            let space = self
+                .state
+                .read(cx)
+                .selected_space
+                .clone()
+                .map(|id| id.local_id);
             let order = space
                 .as_deref()
                 .map(|space| self.tab_ids(space, cx))
                 .unwrap_or_default();
-            (self.state.read(cx).selected_chat.clone(), order)
+            (
+                self.state
+                    .read(cx)
+                    .selected_chat
+                    .clone()
+                    .map(|id| id.local_id),
+                order,
+            )
         };
         if selected.as_deref() == Some(chat_id.as_str()) {
             let next = next_after_close(&order, &chat_id);
@@ -186,7 +198,12 @@ impl Shell {
         if self.tab_drag.is_some() && !cx.has_active_drag() {
             self.tab_drag = None;
         }
-        let space_id = self.state.read(cx).selected_space.clone();
+        let space_id = self
+            .state
+            .read(cx)
+            .selected_space
+            .clone()
+            .map(|id| id.local_id);
         let order: Vec<String> = space_id
             .as_deref()
             .map(|space| self.tab_ids(space, cx))
@@ -213,7 +230,12 @@ impl Shell {
                 })
                 .collect()
         };
-        let selected = self.state.read(cx).selected_chat.clone();
+        let selected = self
+            .state
+            .read(cx)
+            .selected_chat
+            .clone()
+            .map(|id| id.local_id);
         // Keep the selected tab visible: on selection change, scroll it into
         // view (minimal movement — a new session's tab materializes at the far
         // right of an overflowing strip and would otherwise be stranded

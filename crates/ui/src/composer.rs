@@ -24,7 +24,7 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use comet_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
-use comet_proto::{RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion};
+use comet_proto::{RunRequest, SandboxLevel, ServerRef, UserInputAnswer, UserInputQuestion};
 use comet_rpc::methods;
 
 use crate::attachments::{self, StagedAttachment};
@@ -2096,15 +2096,15 @@ pub struct Composer {
     /// Composer actions row: repo/branch/harness-model/traits (§1.7).
     pickers: Entity<Pickers>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
-    drafts: HashMap<String, String>,
+    drafts: HashMap<Option<ServerRef>, String>,
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
     /// navigating away and back restores them; memory-only, like the original.
-    attachments: HashMap<String, Vec<StagedAttachment>>,
+    attachments: HashMap<Option<ServerRef>, Vec<StagedAttachment>>,
     /// The staged attachment being viewed full-size (click a thumbnail).
     preview: Option<attachments::PreviewImage>,
     /// In-flight file-picker prompt (paperclip).
     picker_task: Option<Task<()>>,
-    current_key: String,
+    current_key: Option<ServerRef>,
     sending: bool,
     failure: Option<SharedString>,
     wizard: Option<Wizard>,
@@ -2171,7 +2171,7 @@ impl Composer {
             }
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
         });
-        let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
+        let current_key = state.read(cx).selected_chat.clone();
         let mut composer = Self {
             state,
             input,
@@ -2397,7 +2397,7 @@ impl Composer {
         let (key, pending) = {
             let s = self.state.read(cx);
             (
-                s.selected_chat.clone().unwrap_or_default(),
+                s.selected_chat.clone(),
                 pending_input_request(&s.transcript),
             )
         };
@@ -2474,7 +2474,7 @@ impl Composer {
 
     fn run_live(&self, cx: &App) -> bool {
         let s = self.state.read(cx);
-        let Some(chat_id) = s.selected_chat.as_deref() else {
+        let Some(chat_id) = s.selected_chat_id() else {
             return false;
         };
         matches!(
@@ -2514,17 +2514,21 @@ impl Composer {
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
     fn send(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             self.failure = Some("Engine not connected".into());
             cx.notify();
             return;
         };
         // Chat id: existing selection, or client-minted for the new-chat canvas
         // (the chat then appears from the doc host once the doc materializes).
-        let (chat_id, is_new) = match self.state.read(cx).selected_chat.clone() {
+        let (chat_owner, is_new) = match self.state.read(cx).selected_chat.clone() {
             Some(id) => (id, false),
-            None => (uuid::Uuid::new_v4().to_string(), true),
+            None => (
+                ServerRef::new(engine.server_id().clone(), uuid::Uuid::new_v4().to_string()),
+                true,
+            ),
         };
+        let chat_id = chat_owner.local_id.clone();
         // Where the new session runs (Current checkout / reuse an existing
         // worktree / fresh worktree off the picked base) — resolved NOW so
         // the async block needs no picker access.
@@ -2575,9 +2579,6 @@ impl Composer {
         };
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
-        let space_remote = space
-            .as_ref()
-            .is_some_and(|s| local_device_id.as_deref() != Some(s.device_id.as_str()));
         // Snapshot-and-clear NOW (use-attachments.ts takeAttachments): the
         // strip empties the instant you hit send; a failure hands the files
         // back into the chat's stash.
@@ -2611,11 +2612,12 @@ impl Composer {
             status: None,
             continuation_of: None,
         };
+        let echo_owner = chat_owner.clone();
         self.state.update(cx, |s, cx| {
             if is_new {
                 s.select_chat(Some(chat_id.clone()), cx);
             }
-            s.push_echo(&chat_id, echo);
+            s.push_echo_for(echo_owner, echo);
             cx.notify();
         });
 
@@ -2630,7 +2632,8 @@ impl Composer {
 
         let steer_cmd = steer && !is_new;
         let restore_text = text.clone();
-        let err_chat_id = chat_id.clone();
+        let err_chat_key = Some(chat_owner.clone());
+        let async_chat_owner = chat_owner;
         let err_message_id = message_id.clone();
         self.send_task = Some(cx.spawn(async move |this, cx| {
             let result: Result<(), String> = async {
@@ -2665,18 +2668,10 @@ impl Composer {
                         crate::pickers::CheckoutPlan::NewWorktree { base } => {
                             chat_branch = base.clone();
                             if let (Some(repo_path), Some(base)) = (&space_path, base) {
-                                let mut params = serde_json::json!({
+                                let params = serde_json::json!({
                                     "repoPath": repo_path,
                                     "branch": base,
                                 });
-                                if space_remote
-                                    && let Some(object) = params.as_object_mut()
-                                {
-                                    object.insert(
-                                        "targetDeviceId".into(),
-                                        serde_json::Value::String(device_id.clone()),
-                                    );
-                                }
                                 let value = engine
                                     .client()
                                     .call(methods::CREATE_WORKTREE, params)
@@ -2736,7 +2731,6 @@ impl Composer {
                         match attachments::upload_attachment(
                             &engine,
                             cx.background_executor(),
-                            host_device_id.as_deref(),
                             att,
                         )
                         .await
@@ -2777,11 +2771,11 @@ impl Composer {
                         status: None,
                         continuation_of: None,
                     };
-                    let echo_chat_id = chat_id.clone();
+                    let echo_chat_owner = async_chat_owner.clone();
                     this.update(cx, |composer, cx| {
                         composer.state.update(cx, |s, cx| {
-                            s.remove_echo(&echo_chat_id, &message_id);
-                            s.push_echo(&echo_chat_id, refreshed);
+                            s.remove_echo_for(&echo_chat_owner, &message_id);
+                            s.push_echo_for(echo_chat_owner, refreshed);
                             cx.notify();
                         });
                     })
@@ -2825,16 +2819,20 @@ impl Composer {
                 if let Err(message) = result {
                     // Failure: red banner, echo removed, prompt back in the
                     // draft, staged files back in the chat's stash.
-                    composer.failure = Some(message.into());
                     composer.state.update(cx, |s, cx| {
-                        s.remove_echo(&err_chat_id, &err_message_id);
+                        s.remove_echo_for(&async_chat_owner, &err_message_id);
                         cx.notify();
                     });
-                    composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                    if composer.current_key == err_chat_key {
+                        composer.failure = Some(message.into());
+                        composer
+                            .input
+                            .update(cx, |input, cx| input.set_text(restore_text, cx));
+                    }
                     if !staged.is_empty() {
                         // Merge by id (stashAttachments): files the user staged
                         // while the send was in flight survive the hand-back.
-                        let slot = composer.attachments.entry(err_chat_id.clone()).or_default();
+                        let slot = composer.attachments.entry(err_chat_key.clone()).or_default();
                         let mut merged = staged.clone();
                         merged.extend(
                             slot.drain(..)
@@ -2850,10 +2848,16 @@ impl Composer {
     }
 
     fn interrupt(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             return;
         };
-        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+        let Some(chat_id) = self
+            .state
+            .read(cx)
+            .selected_chat
+            .clone()
+            .map(|id| id.local_id)
+        else {
             return;
         };
         let params = serde_json::json!({
@@ -2941,10 +2945,16 @@ impl Composer {
             // The panel borrowed the composer input; hand back its identity.
             input.set_placeholder("Do anything…", cx);
         });
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             return;
         };
-        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+        let Some(chat_id) = self
+            .state
+            .read(cx)
+            .selected_chat
+            .clone()
+            .map(|id| id.local_id)
+        else {
             return;
         };
         let request_id = wizard.request_id.clone();

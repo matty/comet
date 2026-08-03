@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use crate::server::{
     ConnectedExit, SupervisorCommand, clear_selected_transcript, supervise_connected,
 };
-use crate::{FederationCommand, FederationEvent, ServerState};
+use crate::{FederationCommand, FederationEvent, FederationStream, ServerState};
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 const STABLE_CONNECTION_DURATION: Duration = Duration::from_secs(1);
@@ -120,14 +120,28 @@ impl Federation {
         Self::with_connector(local, data_dir, Arc::new(LanConnector)).await
     }
 
+    pub async fn new_shared(
+        local: Arc<RpcClient>,
+        data_dir: impl AsRef<Path>,
+    ) -> Result<Self, FederationError> {
+        Self::with_connector_shared(local, data_dir, Arc::new(LanConnector)).await
+    }
+
     pub async fn with_connector(
         local: RpcClient,
         data_dir: impl AsRef<Path>,
         connector: Arc<dyn RemoteConnector>,
     ) -> Result<Self, FederationError> {
+        Self::with_connector_shared(Arc::new(local), data_dir, connector).await
+    }
+
+    async fn with_connector_shared(
+        local: Arc<RpcClient>,
+        data_dir: impl AsRef<Path>,
+        connector: Arc<dyn RemoteConnector>,
+    ) -> Result<Self, FederationError> {
         let identity = DeviceIdentity::load_or_create(data_dir.as_ref())?;
         let tls = Arc::new(TlsIdentity::from_device_identity(&identity)?);
-        let local = Arc::new(local);
         let hello: ServerHello = local
             .call_as(methods::SERVER_HELLO, serde_json::Value::Null)
             .await?;
@@ -172,6 +186,23 @@ impl Federation {
     ) -> Result<serde_json::Value, comet_rpc::RpcError> {
         let (reply, received) = tokio::sync::oneshot::channel();
         self.send(FederationCommand::Request {
+            server_id,
+            method,
+            params,
+            reply,
+        })
+        .map_err(|_| comet_rpc::RpcError::Closed)?;
+        received.await.unwrap_or(Err(comet_rpc::RpcError::Closed))
+    }
+
+    pub async fn subscribe(
+        &self,
+        server_id: ServerId,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> Result<FederationStream, comet_rpc::RpcError> {
+        let (reply, received) = tokio::sync::oneshot::channel();
+        self.send(FederationCommand::Subscribe {
             server_id,
             method,
             params,
@@ -280,6 +311,19 @@ async fn run_manager(
                     } else if let Some(supervisor) = supervisors.get(&server_id) {
                         if let Err(error) = supervisor.commands.send(SupervisorCommand::Request { method, params, reply })
                             && let SupervisorCommand::Request { reply, .. } = error.0
+                        {
+                            let _ = reply.send(Err(comet_rpc::RpcError::Closed));
+                        }
+                    } else {
+                        let _ = reply.send(Err(comet_rpc::RpcError::Failed("server is offline".into())));
+                    }
+                }
+                Some(FederationCommand::Subscribe { server_id, method, params, reply }) => {
+                    if server_id != local_id && is_local_admin(method) {
+                        let _ = reply.send(Err(comet_rpc::RpcError::UnknownMethod(method.into())));
+                    } else if let Some(supervisor) = supervisors.get(&server_id) {
+                        if let Err(error) = supervisor.commands.send(SupervisorCommand::Subscribe { method, params, reply })
+                            && let SupervisorCommand::Subscribe { reply, .. } = error.0
                         {
                             let _ = reply.send(Err(comet_rpc::RpcError::Closed));
                         }
@@ -843,6 +887,11 @@ fn handle_offline_command(
         SupervisorCommand::Request { method, reply, .. } => {
             let _ = reply.send(Err(comet_rpc::RpcError::Failed(format!(
                 "cannot call {method} while server is offline"
+            ))));
+        }
+        SupervisorCommand::Subscribe { method, reply, .. } => {
+            let _ = reply.send(Err(comet_rpc::RpcError::Failed(format!(
+                "cannot subscribe to {method} while server is offline"
             ))));
         }
         SupervisorCommand::Reconnect | SupervisorCommand::Shutdown => {}

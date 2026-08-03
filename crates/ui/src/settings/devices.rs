@@ -99,7 +99,7 @@ impl DevicesPage {
             cx.notify();
             return;
         }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             return;
         };
         let params = serde_json::json!({

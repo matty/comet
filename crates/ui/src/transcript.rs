@@ -1181,7 +1181,7 @@ impl Transcript {
         let (selected, entries, echoes) = {
             let s = self.state.read(cx);
             (
-                s.selected_chat.clone(),
+                s.selected_chat.clone().map(|id| id.local_id),
                 s.transcript.clone(),
                 s.pending_echoes().to_vec(),
             )
@@ -1395,19 +1395,13 @@ impl Transcript {
 
     fn spawn_attachment_load(&mut self, device_id: String, path: String, cx: &mut Context<Self>) {
         use crate::attachments::{read_attachment_image, store_error, store_loaded};
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             store_error(&device_id, &path);
             return;
         };
-        let local = self.state.read(cx).local_device_id.clone();
-        // Relay-forward only for a genuinely remote owner; the local device's
-        // files are served directly.
-        let target = (local.as_deref() != Some(device_id.as_str())).then(|| device_id.clone());
         let key = (device_id.clone(), path.clone());
         let task = cx.spawn(async move |this, cx| {
-            match read_attachment_image(&engine, cx.background_executor(), target.as_deref(), &path)
-                .await
-            {
+            match read_attachment_image(&engine, cx.background_executor(), &path).await {
                 Some(loaded) => store_loaded(&device_id, &path, loaded.name.into(), loaded.image),
                 None => store_error(&device_id, &path),
             }

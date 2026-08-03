@@ -2,8 +2,7 @@
 //! (Claude Code, Codex) with account rows — email, plan badge, Active, usage
 //! meters (indigo → amber ≥80% → red ≥95%, reset time), Switch / Forget — plus
 //! the add-account dialogs (paste-code and browser-poll flows) and
-//! account-shaped loading skeletons. Comet retargets devices from the settings
-//! sidebar (`targetDeviceId` passthrough kept plumbed, unused single-device).
+//! account-shaped loading skeletons.
 //!
 //! The accounts RPC surface is being implemented engine-side in parallel —
 //! every call here surfaces failures as inline UI states rather than assuming
@@ -174,7 +173,7 @@ pub struct AccountsPage {
     /// Which device's logins are shown; `None` = this device (no passthrough).
     /// Retargeted by the page-header device switcher (comet parity: the
     /// accounts RPCs are relay-forwardable, CLI logins are per-device).
-    target_device: Option<String>,
+    selected_device: Option<String>,
     device_menu_open: bool,
     /// Outside-click dismissal instant — suppresses the trigger click that
     /// follows the same mouse-down from instantly reopening the menu.
@@ -203,7 +202,7 @@ impl AccountsPage {
         });
         let mut page = Self {
             state,
-            target_device: None,
+            selected_device: None,
             device_menu_open: false,
             device_menu_dismissed_at: None,
             snapshot: Loadable::Idle,
@@ -229,13 +228,13 @@ impl AccountsPage {
     /// Retarget the page at another device's logins: every accounts RPC is
     /// relay-forwardable, so the whole page — list, usage probes, switch,
     /// forget, login flows — follows the passthrough.
-    fn set_target_device(&mut self, target: Option<String>, cx: &mut Context<Self>) {
+    fn set_selected_device(&mut self, target: Option<String>, cx: &mut Context<Self>) {
         self.device_menu_open = false;
-        if self.target_device == target {
+        if self.selected_device == target {
             cx.notify();
             return;
         }
-        self.target_device = target;
+        self.selected_device = target;
         // A different device = a different accounts world: drop in-flight
         // login/action state and reload with a forced usage probe (the new
         // device's cache is cold).
@@ -245,12 +244,7 @@ impl AccountsPage {
         self.load(force_usage_for(LoadTrigger::Mount), cx);
     }
 
-    /// Params with the `targetDeviceId` passthrough merged in.
     fn params(&self, value: serde_json::Value) -> serde_json::Value {
-        let mut value = value;
-        if let (Some(target), Some(object)) = (&self.target_device, value.as_object_mut()) {
-            object.insert("targetDeviceId".into(), serde_json::json!(target));
-        }
         value
     }
 
@@ -270,7 +264,7 @@ impl AccountsPage {
                 .cmp(&b.created_at)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        let effective = self.target_device.clone().or_else(|| local_id.clone());
+        let effective = self.selected_device.clone().or_else(|| local_id.clone());
         let selected = devices
             .iter()
             .find(|d| Some(d.id.as_str()) == effective.as_deref())
@@ -374,7 +368,7 @@ impl AccountsPage {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             // Local device = no passthrough (calls stay direct).
                             let target = (!pick_local).then(|| pick_id.clone());
-                            this.set_target_device(target, cx);
+                            this.set_selected_device(target, cx);
                         }))
                         .child(
                             icon(glyph)
@@ -412,7 +406,7 @@ impl AccountsPage {
     }
 
     fn load(&mut self, force_usage: bool, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             self.snapshot = Loadable::Error("Engine not connected".into());
             return;
         };
@@ -445,7 +439,7 @@ impl AccountsPage {
         account: &AgentAccount,
         cx: &mut Context<Self>,
     ) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             return;
         };
         self.busy_account = Some(account.id.clone());
@@ -474,7 +468,7 @@ impl AccountsPage {
     // ---- add-account flows ----
 
     fn start_login(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             return;
         };
         self.login = Some(LoginFlow::Starting { harness });
@@ -542,7 +536,7 @@ impl AccountsPage {
         }
         let login_id = start.login_id.clone();
         *submitting = true;
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             return;
         };
         let params = self.params(serde_json::json!({ "loginId": login_id, "code": code }));
@@ -580,7 +574,7 @@ impl AccountsPage {
             return;
         };
         let login_id = start.login_id.clone();
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             return;
         };
         let params = self.params(serde_json::json!({ "loginId": login_id }));
@@ -652,7 +646,7 @@ impl AccountsPage {
         };
         self.login = None;
         self.poll_task = None;
-        if let (Some(login_id), Some(engine)) = (login_id, self.state.read(cx).engine().cloned()) {
+        if let (Some(login_id), Some(engine)) = (login_id, self.state.read(cx).selected_client()) {
             let params = self.params(serde_json::json!({ "loginId": login_id }));
             self.action_task = Some(cx.spawn(async move |_, _| {
                 if let Err(err) = engine
