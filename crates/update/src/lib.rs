@@ -84,6 +84,21 @@ pub struct FileMeta {
     pub sha256: Option<String>,
 }
 
+fn expected_release_sha256<'a>(manifest: &'a Manifest, file: &str) -> anyhow::Result<&'a str> {
+    let metadata = manifest
+        .files
+        .get(file)
+        .with_context(|| format!("release manifest is missing artifact metadata for {file}"))?;
+    let checksum = metadata
+        .sha256
+        .as_deref()
+        .with_context(|| format!("release manifest is missing SHA-256 for {file}"))?;
+    if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("release manifest has an invalid SHA-256 for {file}");
+    }
+    Ok(checksum)
+}
+
 /// Artifact-name platform pair — `uname`-style strings matching the packaging
 /// scripts: `linux-x86_64`, `linux-aarch64`, `macos-arm64`.
 pub fn platform_key() -> (&'static str, &'static str) {
@@ -115,23 +130,24 @@ pub fn mac_app_artifact(version: &str) -> String {
 /// Unparseable versions never count as newer — malformed release metadata must
 /// not trigger an update loop.
 pub fn version_newer(latest: &str, current: &str) -> bool {
-    fn parts(v: &str) -> Option<Vec<u64>> {
-        let nums: Vec<u64> = v
-            .trim()
-            .trim_start_matches('v')
-            .split('.')
-            .map(|p| p.parse().ok())
-            .collect::<Option<_>>()?;
-        (!nums.is_empty()).then_some(nums)
-    }
-    match (parts(latest), parts(current)) {
+    match (version_parts(latest), version_parts(current)) {
         (Some(l), Some(c)) => l > c,
         _ => false,
     }
 }
 
+fn version_parts(version: &str) -> Option<Vec<u64>> {
+    let parts: Vec<u64> = version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .map(|part| part.parse().ok())
+        .collect::<Option<_>>()?;
+    (!parts.is_empty()).then_some(parts)
+}
+
 fn parse_manifest(bytes: &[u8]) -> anyhow::Result<Manifest> {
-    let manifest: Manifest = serde_json::from_slice(bytes).context("parsing manifest.json")?;
+    let mut manifest: Manifest = serde_json::from_slice(bytes).context("parsing manifest.json")?;
     if manifest.repository.trim().is_empty() {
         bail!("release repository is missing; expected {EXPECTED_RELEASE_REPOSITORY}");
     }
@@ -144,15 +160,17 @@ fn parse_manifest(bytes: &[u8]) -> anyhow::Result<Manifest> {
             manifest.repository
         );
     }
-    if manifest.version.trim().is_empty() {
-        bail!("manifest.json has an empty version");
+    let version = manifest.version.trim();
+    if version_parts(version).is_none() {
+        bail!("manifest.json has an invalid dotted-numeric version");
     }
+    manifest.version = version.to_string();
     Ok(manifest)
 }
 
 /// Fetch the newest release metadata. Repository provenance is mandatory; a
 /// missing, malformed, or mismatched manifest is never replaced with legacy
-/// unprovenanced `latest.txt` metadata.
+/// unprovenanced version-only metadata.
 pub async fn fetch_latest(releases_url: &str) -> anyhow::Result<Manifest> {
     let base = releases_url.trim_end_matches('/');
     let client = http_client()?;
@@ -235,13 +253,7 @@ pub async fn download_release_file(
     dest: &Path,
 ) -> anyhow::Result<()> {
     let url = format!("{}/releases/{file}", releases_url.trim_end_matches('/'));
-    let expected = manifest.files.get(file).and_then(|m| m.sha256.as_deref());
-    if expected.is_none() {
-        tracing::warn!(
-            file,
-            "no checksum in release metadata; skipping verification"
-        );
-    }
+    let expected = expected_release_sha256(manifest, file)?;
     let partial = dest.with_extension("partial");
     let resp = http_client()?
         .get(&url)
@@ -262,12 +274,10 @@ pub async fn download_release_file(
     }
     out.flush().await.ok();
     drop(out);
-    if let Some(expected) = expected {
-        let actual = format!("{:x}", hasher.finalize());
-        if !actual.eq_ignore_ascii_case(expected.trim()) {
-            tokio::fs::remove_file(&partial).await.ok();
-            bail!("checksum mismatch for {file}: expected {expected}, got {actual}");
-        }
+    let actual = format!("{:x}", hasher.finalize());
+    if !actual.eq_ignore_ascii_case(expected) {
+        tokio::fs::remove_file(&partial).await.ok();
+        bail!("checksum mismatch for {file}: expected {expected}, got {actual}");
     }
     tokio::fs::rename(&partial, dest)
         .await
@@ -308,6 +318,7 @@ pub async fn stage_headless(
         return Ok(dest);
     }
     let file = headless_artifact(version);
+    expected_release_sha256(manifest, &file)?;
     let stage = app_root.join(format!(".stage-{version}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage).with_context(|| format!("creating {}", stage.display()))?;
@@ -401,9 +412,10 @@ pub async fn stage_mac_app(
     if staged.join("Contents/MacOS/comet").exists() {
         return Ok(staged);
     }
+    let file = mac_app_artifact(version);
+    expected_release_sha256(manifest, &file)?;
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let file = mac_app_artifact(version);
     let tarball = dir.join(&file);
     download_release_file(releases_url, manifest, &file, &tarball).await?;
     run(
@@ -792,6 +804,89 @@ mod tests {
             .unwrap_err();
         assert!(wrong.to_string().contains("someone/other-comet"));
         assert!(wrong.to_string().contains("matty/comet"));
+    }
+
+    #[test]
+    fn manifest_rejects_non_numeric_or_path_versions() {
+        for version in [
+            "../../evil",
+            "1.2 3",
+            "nightly",
+            "1..2",
+            "18446744073709551616.1",
+        ] {
+            let json =
+                format!(r#"{{"repository":"matty/comet","version":"{version}","files":{{}}}}"#);
+            assert!(
+                parse_manifest(json.as_bytes()).is_err(),
+                "accepted {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_artifact_requires_valid_sha256() {
+        let mut manifest =
+            parse_manifest(br#"{"repository":"matty/comet","version":"1.2.3","files":{}}"#)
+                .unwrap();
+        let file = "comet-1.2.3-linux-x86_64.tar.gz";
+
+        assert!(expected_release_sha256(&manifest, file).is_err());
+        manifest
+            .files
+            .insert(file.to_string(), FileMeta { sha256: None });
+        assert!(expected_release_sha256(&manifest, file).is_err());
+        manifest.files.get_mut(file).unwrap().sha256 = Some("not-a-checksum".into());
+        assert!(expected_release_sha256(&manifest, file).is_err());
+        manifest.files.get_mut(file).unwrap().sha256 = Some("a".repeat(64));
+        assert_eq!(
+            expected_release_sha256(&manifest, file).unwrap(),
+            "a".repeat(64)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_checksum_creates_no_staged_artifact() {
+        let manifest =
+            parse_manifest(br#"{"repository":"matty/comet","version":"1.2.3","files":{}}"#)
+                .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("release.tar.gz");
+
+        let error = download_release_file(
+            "http://127.0.0.1:1",
+            &manifest,
+            "comet-1.2.3-linux-x86_64.tar.gz",
+            &destination,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("missing artifact metadata"));
+        assert!(!destination.exists());
+        assert!(!destination.with_extension("partial").exists());
+    }
+
+    #[tokio::test]
+    async fn missing_checksum_does_not_create_install_staging() {
+        let manifest =
+            parse_manifest(br#"{"repository":"matty/comet","version":"1.2.3","files":{}}"#)
+                .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+
+        assert!(
+            stage_headless("http://127.0.0.1:1", &manifest, temp.path())
+                .await
+                .is_err()
+        );
+        assert!(std::fs::read_dir(temp.path()).unwrap().next().is_none());
+
+        assert!(
+            stage_mac_app("http://127.0.0.1:1", &manifest, temp.path())
+                .await
+                .is_err()
+        );
+        assert!(!temp.path().join("updates/1.2.3").exists());
     }
 
     #[tokio::test]

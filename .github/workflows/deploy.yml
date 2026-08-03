@@ -61,6 +61,11 @@ jobs:
         if: steps.changed.outputs.changed == 'true'
         working-directory: edge
         run: npm test
+      - name: remove obsolete WorkOS secret
+        if: steps.changed.outputs.changed == 'true' && env.CLOUDFLARE_API_TOKEN != ''
+        continue-on-error: true
+        working-directory: edge
+        run: npx wrangler secret delete WORKOS_API_KEY
       - name: deploy
         if: steps.changed.outputs.changed == 'true' && env.CLOUDFLARE_API_TOKEN != ''
         working-directory: edge

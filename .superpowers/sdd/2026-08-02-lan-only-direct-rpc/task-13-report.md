@@ -44,8 +44,9 @@ immediately.
 ## Removed hosted surface
 
 - WorkOS/JWT auth modules and secrets.
-- Session/workspace and device-relay Durable Objects, bindings, migrations, and
-  all related tests/scripts.
+- Session/workspace and device-relay Durable Object implementations, bindings,
+  and runtime tests/scripts. Wrangler retains the original `v1` migration only
+  as deployment history and adds `v2-distribution-only` to delete both classes.
 - Runtime attachment R2 binding and code.
 - `jose`, `loro-crdt`, `loro-protocol`, `loro-adaptors`, and `loro-websocket`
   dependencies.
@@ -54,7 +55,7 @@ immediately.
 
 ## Verification
 
-- `cargo test -p comet-update` — 9 passed, including release independence and
+- `cargo test -p comet-update` — 13 passed, including release independence and
   unreachable-distribution status behavior.
 - `cargo test -p comet --bin comet` — 14 passed.
 - `npm test --prefix edge` — 7 Worker assertions plus the real-installer
@@ -70,8 +71,9 @@ immediately.
 - Fresh `npm ci` followed by `npm ls --all --depth=0` shows only the Cloudflare
   types, TypeScript, Vitest, and Wrangler direct dependencies.
 - `bash -n edge/src/install.sh` and `git diff --check` passed.
-- Edge source/config scans found no WorkOS, auth mode, Durable Object, runtime
-  blob, Loro, or removed edge URL references.
+- Edge source/config scans found no WorkOS/auth mode, active Durable Object or
+  runtime blob bindings, Loro runtime, or removed edge URL references; the only
+  class names retained are migration history and deletion tombstones.
 
 Provenance follow-up verification:
 
@@ -83,6 +85,26 @@ Provenance follow-up verification:
   and showed it continued into artifact download/tar. GREEN rejects missing and
   wrong repository identities before choosing a version or downloading an
   artifact. This harness is part of `npm test`.
+
+Review fix round 1 adds defense at every distribution boundary:
+
+- The Worker deployment preserves the original DO migration record, applies one
+  uniquely tagged deletion migration for `SessionRoom` and `DeviceRoom`, and
+  idempotently attempts to delete the obsolete `WORKOS_API_KEY` before deploy.
+  An executable config/workflow check also proves only the two distribution
+  routes and `RELEASES` binding remain.
+- The installer uses a real JSON parser: strict Python decoding rejects duplicate
+  keys, with a jq parser path when Python is unavailable and a clear failure when
+  neither exists. Parsed repository, dotted-numeric version, selected artifact,
+  and 64-hex checksum are validated before any path interpolation or download.
+  Attack regressions cover duplicate keys, escaped JSON identity, whitespace,
+  path traversal, missing metadata, malformed checksums, and checksum mismatch.
+- Both Rust staging paths validate selected-artifact metadata before creating a
+  staging directory. Downloaded bytes must match the manifest SHA-256 before any
+  unpack or swap.
+- Release publication runs only in `matty/comet` and writes that literal identity,
+  preventing a fork workflow from populating the canonical bucket under its own
+  repository identity.
 
 ## Residual risks and scope notes
 
@@ -96,4 +118,6 @@ Provenance follow-up verification:
 - Backward compatibility is intentionally stricter: legacy release endpoints
   that provide only `latest.txt`, or manifests without `repository`, no longer
   update or install. Operators of intentional mirrors must republish a current
-  manifest with `repository: "matty/comet"`.
+  manifest with `repository: "matty/comet"`, complete selected-artifact metadata,
+  and a valid SHA-256. Shell installation also now requires `python3` or `jq` plus
+  `sha256sum` or `shasum`, and fails closed when those tools are unavailable.

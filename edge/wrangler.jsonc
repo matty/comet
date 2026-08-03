@@ -10,6 +10,16 @@
     { "pattern": "comet.zeron.sh/releases/*", "zone_name": "zeron.sh" }
   ],
   "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["SessionRoom", "DeviceRoom"]
+    },
+    {
+      "tag": "v2-distribution-only",
+      "deleted_classes": ["SessionRoom", "DeviceRoom"]
+    }
+  ],
   "r2_buckets": [
     {
       "binding": "RELEASES",

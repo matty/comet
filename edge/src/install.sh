@@ -39,26 +39,103 @@ case "$arch" in
 esac
 
 # --- download ----------------------------------------------------------------
-manifest="$(curl -fsSL "$BASE/releases/manifest.json")"
-compact_manifest="$(printf '%s' "$manifest" | tr -d '[:space:]')"
-repository_fields="$(printf '%s' "$compact_manifest" | grep -o '"repository":"[^"]*"' || true)"
-repository_count="$(printf '%s\n' "$repository_fields" | grep -c . || true)"
-if [ "$repository_count" -eq 0 ]; then
-  echo "comet install: missing release repository (expected matty/comet)" >&2
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+manifest_file="$tmp/manifest.json"
+parsed_file="$tmp/manifest-fields"
+curl -fsSL "$BASE/releases/manifest.json" -o "$manifest_file"
+
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$manifest_file" "$plat" "$arch" > "$parsed_file" <<'PY'
+import json
+import re
+import sys
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+def fail(message):
+    print(f"comet install: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as source:
+        manifest = json.load(source, object_pairs_hook=unique_object)
+except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+    fail(str(error))
+
+if not isinstance(manifest, dict):
+    fail("manifest JSON must be an object")
+if manifest.get("repository") != "matty/comet":
+    if "repository" not in manifest:
+        fail("missing release repository (expected matty/comet)")
+    fail(f"release repository mismatch (expected matty/comet, got {manifest.get('repository')!r})")
+version = manifest.get("version")
+if not isinstance(version, str):
+    fail("invalid release version")
+version = version.strip()
+if not re.fullmatch(r"v*[0-9]+(?:\.[0-9]+)*", version):
+    fail("invalid release version")
+if any(int(part) > 18446744073709551615 for part in version.lstrip("v").split(".")):
+    fail("invalid release version")
+artifact = f"comet-{version}-{sys.argv[2]}-{sys.argv[3]}.tar.gz"
+files = manifest.get("files")
+metadata = files.get(artifact) if isinstance(files, dict) else None
+if not isinstance(metadata, dict):
+    fail(f"missing artifact metadata for {artifact}")
+checksum = metadata.get("sha256")
+if not isinstance(checksum, str) or not re.fullmatch(r"[0-9A-Fa-f]{64}", checksum):
+    fail(f"invalid SHA-256 for {artifact}")
+print(version)
+print(artifact)
+print(checksum.lower())
+PY
+elif command -v jq >/dev/null 2>&1; then
+  if ! jq -e empty "$manifest_file" >/dev/null 2>&1; then
+    echo "comet install: invalid manifest JSON" >&2
+    exit 1
+  fi
+  if ! jq --stream -s -e 'map(.[0] | tojson) | length == (unique | length)' \
+    "$manifest_file" >/dev/null; then
+    echo "comet install: duplicate JSON key" >&2
+    exit 1
+  fi
+  jq -er --arg plat "$plat" --arg arch "$arch" '
+    def fail($message): error($message);
+    def valid_u64:
+      (sub("^0+"; "") | if . == "" then "0" else . end) as $part
+      | (($part | length) < 20 or (($part | length) == 20 and $part <= "18446744073709551615"));
+    if type != "object" then fail("manifest JSON must be an object") else . end
+    | if has("repository") | not then fail("missing release repository (expected matty/comet)")
+      elif .repository != "matty/comet" then fail("release repository mismatch") else . end
+    | (.version | if type == "string" then gsub("^\\s+|\\s+$"; "") else "" end) as $version
+    | if ($version | test("^v*[0-9]+(\\.[0-9]+)*$") | not)
+        or ($version | sub("^v*"; "") | split(".") | all(valid_u64) | not)
+      then fail("invalid release version") else . end
+    | ("comet-" + $version + "-" + $plat + "-" + $arch + ".tar.gz") as $artifact
+    | if (.files | type) != "object" or (.files[$artifact] | type) != "object"
+      then fail("missing artifact metadata for " + $artifact) else . end
+    | (.files[$artifact].sha256 // "") as $checksum
+    | if ($checksum | type) != "string" or ($checksum | test("^[0-9A-Fa-f]{64}$") | not)
+      then fail("invalid SHA-256 for " + $artifact) else . end
+    | $version, $artifact, ($checksum | ascii_downcase)
+  ' "$manifest_file" > "$parsed_file" || {
+    echo "comet install: invalid release manifest" >&2
+    exit 1
+  }
+else
+  echo "comet install: strict manifest validation requires python3 or jq" >&2
   exit 1
 fi
-if [ "$repository_count" -ne 1 ]; then
-  echo "comet install: invalid release repository metadata" >&2
-  exit 1
-fi
-repository="$(printf '%s' "$repository_fields" | sed -n 's/^"repository":"\([^"]*\)"$/\1/p')"
-if [ "$repository" != "matty/comet" ]; then
-  echo "comet install: release repository mismatch (expected matty/comet, got $repository)" >&2
-  exit 1
-fi
-ver="$(printf '%s' "$compact_manifest" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
-[ -n "$ver" ] || { echo "comet install: manifest has no release version" >&2; exit 1; }
-file="comet-$ver-$plat-$arch.tar.gz"
+
+ver="$(sed -n '1p' "$parsed_file")"
+file="$(sed -n '2p' "$parsed_file")"
+expected_sha256="$(sed -n '3p' "$parsed_file")"
 data_root="$HOME/.comet-native"
 app_root="$data_root/app"
 dest="$app_root/$ver"
@@ -66,10 +143,20 @@ dest="$app_root/$ver"
 if [ -x "$dest/comet" ]; then
   echo "comet $ver already downloaded — relinking."
 else
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
   echo "downloading comet $ver ($plat-$arch)…"
   curl -fSL --progress-bar "$BASE/releases/$file" -o "$tmp/$file"
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_sha256="$(sha256sum "$tmp/$file" | awk '{print tolower($1)}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual_sha256="$(shasum -a 256 "$tmp/$file" | awk '{print tolower($1)}')"
+  else
+    echo "comet install: SHA-256 verification requires sha256sum or shasum" >&2
+    exit 1
+  fi
+  if [ "$actual_sha256" != "$expected_sha256" ]; then
+    echo "comet install: checksum mismatch for $file" >&2
+    exit 1
+  fi
   mkdir -p "$dest"
   tar -xzf "$tmp/$file" -C "$dest" --strip-components=1
 fi
