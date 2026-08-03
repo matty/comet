@@ -163,6 +163,26 @@ impl RemoteConfigStore {
         Ok(removed)
     }
 
+    pub fn rename_remote(&self, server_id: &ServerId, name: &str) -> Result<bool, EngineError> {
+        let mut found = false;
+        self.update(
+            |document| {
+                if let Some(remote) = document
+                    .remotes
+                    .iter_mut()
+                    .find(|remote| &remote.server_id == server_id)
+                {
+                    remote.name = name.to_string();
+                    found = true;
+                }
+            },
+            |document| {
+                self.inner.remotes_tx.send_replace(document.remotes.clone());
+            },
+        )?;
+        Ok(found)
+    }
+
     pub fn update_remote_status(
         &self,
         server_id: &ServerId,
@@ -459,6 +479,43 @@ mod tests {
         assert_eq!(row.last_state, RemoteConnectionState::Online);
         assert_eq!(row.protocol_version, PROTOCOL_VERSION);
         assert!(row.last_connected_at.is_some());
+    }
+
+    #[test]
+    fn rename_remote_preserves_a_concurrent_status_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RemoteConfigStore::open(dir.path()).unwrap();
+        let remote = RemoteEntry {
+            server_id: ServerId::new("sha256:remote"),
+            endpoint: RemoteEndpoint::parse("buildbox.local:27655").unwrap(),
+            name: "Build box".into(),
+            pinned_spki_sha256: "remote-pin".into(),
+            protocol_version: 0,
+            last_state: RemoteConnectionState::Connecting,
+            created_at: Utc::now(),
+            last_connected_at: None,
+        };
+        let server_id = remote.server_id.clone();
+        store.put_remote(remote.clone()).unwrap();
+        let connected_at = Utc::now();
+        store
+            .update_remote_status(
+                &server_id,
+                RemoteConnectionState::Online,
+                PROTOCOL_VERSION,
+                Some(connected_at),
+            )
+            .unwrap();
+
+        assert!(store.rename_remote(&server_id, "Renamed box").unwrap());
+        let rows = store.watch_remotes();
+        let renamed = &rows.borrow()[0];
+        assert_eq!(renamed.name, "Renamed box");
+        assert_eq!(renamed.last_state, RemoteConnectionState::Online);
+        assert_eq!(renamed.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(renamed.last_connected_at, Some(connected_at));
+        assert_eq!(renamed.endpoint, remote.endpoint);
+        assert_eq!(renamed.pinned_spki_sha256, remote.pinned_spki_sha256);
     }
 
     #[cfg(unix)]

@@ -287,6 +287,57 @@ async fn remote_status_updates_only_the_named_rows_connection_fields() {
 }
 
 #[tokio::test]
+async fn local_rename_remote_preserves_latest_connection_metadata() {
+    let fixture = EngineFixture::start().await;
+    let server_id = ServerId::new("sha256:remote");
+    let connected_at = Utc::now();
+    fixture
+        .local_call(
+            methods::PUT_REMOTE,
+            serde_json::to_value(RemoteEntry {
+                server_id: server_id.clone(),
+                endpoint: RemoteEndpoint::parse("host.local:27655").unwrap(),
+                name: "Old".into(),
+                pinned_spki_sha256: "pin".into(),
+                protocol_version: 0,
+                last_state: RemoteConnectionState::Connecting,
+                created_at: Utc::now(),
+                last_connected_at: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    fixture
+        .local_call(
+            methods::REPORT_REMOTE_STATUS,
+            serde_json::json!({
+                "serverId": server_id,
+                "lastState": "online",
+                "protocolVersion": PROTOCOL_VERSION,
+                "lastConnectedAt": connected_at,
+            }),
+        )
+        .await
+        .unwrap();
+
+    fixture
+        .local_call(
+            methods::RENAME_REMOTE,
+            serde_json::json!({"serverId": server_id, "name": "Renamed"}),
+        )
+        .await
+        .unwrap();
+    let rows = fixture.core.remote_config().watch_remotes();
+    let row = &rows.borrow()[0];
+    assert_eq!(row.name, "Renamed");
+    assert_eq!(row.last_state, RemoteConnectionState::Online);
+    assert_eq!(row.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(row.last_connected_at, Some(connected_at));
+    fixture.core.shutdown().await;
+}
+
+#[tokio::test]
 async fn persisted_online_remote_is_offline_when_engine_opens() {
     let dir = tempfile::tempdir().unwrap();
     let store = RemoteConfigStore::open(dir.path()).unwrap();
@@ -382,6 +433,7 @@ async fn host_relay_service_denies_local_administration() {
     for method in [
         methods::WATCH_REMOTES,
         methods::PUT_REMOTE,
+        methods::RENAME_REMOTE,
         methods::REMOVE_REMOTE,
         methods::REPORT_REMOTE_STATUS,
         methods::GET_LAN_SETTINGS,
@@ -430,6 +482,7 @@ fn administrative_and_proxy_methods_are_denied() {
     for method in [
         methods::WATCH_REMOTES,
         methods::PUT_REMOTE,
+        methods::RENAME_REMOTE,
         methods::REMOVE_REMOTE,
         methods::REPORT_REMOTE_STATUS,
         methods::GET_LAN_SETTINGS,

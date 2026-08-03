@@ -110,6 +110,7 @@ pub mod methods {
     pub const SERVER_HELLO: &str = "ServerHello";
     pub const WATCH_REMOTES: &str = "WatchRemotes";
     pub const PUT_REMOTE: &str = "PutRemote";
+    pub const RENAME_REMOTE: &str = "RenameRemote";
     pub const REMOVE_REMOTE: &str = "RemoveRemote";
     pub const REPORT_REMOTE_STATUS: &str = "ReportRemoteStatus";
     pub const GET_LAN_SETTINGS: &str = "GetLanSettings";

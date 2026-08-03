@@ -1497,6 +1497,7 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

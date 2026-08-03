@@ -3,7 +3,10 @@ use comet_proto::{LanSettings, RemoteConnectionState, RemoteEntry, TrustedClient
 use comet_rpc::{RpcClient, TlsIdentity, methods, pair_client};
 use data_encoding::BASE32_NOPAD;
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::Path;
+use zeroize::Zeroizing;
 
 use gpui::{
     AnyElement, Context, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px,
@@ -15,10 +18,46 @@ use crate::theme::Theme;
 
 pub const PAIRING_WARNING: &str = "Pairing grants trusted devices full authority to read locally hosted chats, run agents, control terminals, and change repositories on this computer.";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingSecret {
-    pub secret: String,
+    secret: SecretText,
     pub expires_at: DateTime<Utc>,
+}
+
+impl PairingSecret {
+    pub fn new(secret: String, expires_at: DateTime<Utc>) -> Self {
+        Self {
+            secret: SecretText(Zeroizing::new(secret)),
+            expires_at,
+        }
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.secret.0
+    }
+}
+
+impl fmt::Debug for PairingSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PairingSecret")
+            .field("secret", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+struct SecretText(Zeroizing<String>);
+
+impl fmt::Debug for SecretText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl PartialEq<&str> for SecretText {
+    fn eq(&self, other: &&str) -> bool {
+        self.0.as_str() == *other
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -34,7 +73,6 @@ pub enum ListenerStatus {
     },
 }
 
-#[derive(Debug, Clone)]
 pub struct RemoteSettingsState {
     pub lan: LanSettings,
     pub listener: ListenerStatus,
@@ -43,7 +81,10 @@ pub struct RemoteSettingsState {
     pub remotes: Vec<RemoteEntry>,
     pub pairing_error: Option<String>,
     pub add_error: Option<String>,
+    pub partial_success: Option<PartialPairing>,
     pub listener_error: Option<String>,
+    pub remotes_watch: WatchRecovery,
+    pub trusted_watch: WatchRecovery,
     pairing_generation: u64,
     add_generation: u64,
 }
@@ -61,7 +102,10 @@ impl Default for RemoteSettingsState {
             remotes: Vec::new(),
             pairing_error: None,
             add_error: None,
+            partial_success: None,
             listener_error: None,
+            remotes_watch: WatchRecovery::default(),
+            trusted_watch: WatchRecovery::default(),
             pairing_generation: 0,
             add_generation: 0,
         }
@@ -107,16 +151,46 @@ impl RemoteSettingsState {
     pub fn begin_add_request(&mut self) -> u64 {
         self.add_generation = self.add_generation.wrapping_add(1);
         self.add_error = None;
+        self.partial_success = None;
         self.add_generation
     }
 
-    pub fn finish_add_request(&mut self, generation: u64, result: Result<(), String>) {
+    pub fn finish_add_request(&mut self, generation: u64, result: Result<(), AddRemoteError>) {
         if generation != self.add_generation {
             return;
         }
-        if let Err(error) = result {
-            self.add_error = Some(error);
+        match result {
+            Ok(()) => {}
+            Err(AddRemoteError::PartialSuccess {
+                remote,
+                recovery,
+                source,
+            }) => {
+                self.partial_success = Some(PartialPairing {
+                    remote,
+                    recovery,
+                    source,
+                });
+            }
+            Err(error) => self.add_error = Some(error.to_string()),
         }
+    }
+}
+
+impl fmt::Debug for RemoteSettingsState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteSettingsState")
+            .field("lan", &self.lan)
+            .field("listener", &self.listener)
+            .field("pairing", &self.pairing)
+            .field("trusted_clients", &self.trusted_clients)
+            .field("remotes", &self.remotes)
+            .field("pairing_error", &self.pairing_error)
+            .field("add_error", &self.add_error)
+            .field("partial_success", &self.partial_success)
+            .field("listener_error", &self.listener_error)
+            .finish_non_exhaustive()
     }
 }
 
@@ -145,25 +219,72 @@ pub fn listener_status_label(status: &ListenerStatus) -> String {
     }
 }
 
-pub fn decode_pairing_secret(encoded: &str) -> Result<[u8; 16], String> {
-    let compact = encoded
-        .chars()
-        .filter(|character| !character.is_whitespace() && *character != '-')
-        .flat_map(char::to_uppercase)
-        .collect::<String>();
-    let bytes = BASE32_NOPAD
-        .decode(compact.as_bytes())
-        .map_err(|_| "pairing secret must be grouped Base32 text".to_string())?;
-    bytes
+pub fn decode_pairing_secret(encoded: &str) -> Result<SecretBytes, String> {
+    let compact = Zeroizing::new(
+        encoded
+            .chars()
+            .filter(|character| !character.is_whitespace() && *character != '-')
+            .flat_map(char::to_uppercase)
+            .collect::<String>(),
+    );
+    let bytes = Zeroizing::new(
+        BASE32_NOPAD
+            .decode(compact.as_bytes())
+            .map_err(|_| "pairing secret must be grouped Base32 text".to_string())?,
+    );
+    let bytes: [u8; 16] = bytes
+        .as_slice()
         .try_into()
-        .map_err(|_| "pairing secret must encode exactly 128 bits".to_string())
+        .map_err(|_| "pairing secret must encode exactly 128 bits".to_string())?;
+    Ok(SecretBytes(Zeroizing::new(bytes)))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddRemoteRequest {
     pub endpoint: String,
     pub name: String,
-    pub secret: [u8; 16],
+    secret: SecretBytes,
+}
+
+impl AddRemoteRequest {
+    pub fn new(endpoint: impl Into<String>, name: impl Into<String>, secret: [u8; 16]) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            name: name.into(),
+            secret: SecretBytes(Zeroizing::new(secret)),
+        }
+    }
+
+    fn from_secret(
+        endpoint: impl Into<String>,
+        name: impl Into<String>,
+        secret: SecretBytes,
+    ) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            name: name.into(),
+            secret,
+        }
+    }
+}
+
+pub struct SecretBytes(Zeroizing<[u8; 16]>);
+
+impl SecretBytes {
+    fn expose(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl PartialEq<[u8; 16]> for SecretBytes {
+    fn eq(&self, other: &[u8; 16]) -> bool {
+        self.0.as_ref() == other
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,13 +293,241 @@ pub struct PinnedRemote {
     pub pinned_spki_sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicRemoteDetails {
+    pub server_id: comet_proto::ServerId,
+    pub endpoint: comet_proto::RemoteEndpoint,
+    pub name: String,
+    pub pinned_spki_sha256: String,
+}
+
+pub const PARTIAL_PAIRING_RECOVERY: &str = "Pairing succeeded on the remote, but this computer could not save it. On the remote computer, revoke this device, then start a fresh pairing session and add it again.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialPairing {
+    pub remote: PublicRemoteDetails,
+    pub recovery: &'static str,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddRemoteError {
+    Pairing(String),
+    PartialSuccess {
+        remote: PublicRemoteDetails,
+        recovery: &'static str,
+        source: String,
+    },
+}
+
+impl fmt::Display for AddRemoteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pairing(error) => formatter.write_str(error),
+            Self::PartialSuccess {
+                recovery, source, ..
+            } => {
+                write!(formatter, "{recovery} Save error: {source}")
+            }
+        }
+    }
+}
+
+impl From<String> for AddRemoteError {
+    fn from(error: String) -> Self {
+        Self::Pairing(error)
+    }
+}
+
+impl From<&str> for AddRemoteError {
+    fn from(error: &str) -> Self {
+        Self::Pairing(error.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum OperationKind {
+    Rename,
+    Remove,
+    Revoke,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OperationKey {
+    kind: OperationKind,
+    server_id: comet_proto::ServerId,
+}
+
+impl OperationKey {
+    pub fn rename(server_id: comet_proto::ServerId) -> Self {
+        Self {
+            kind: OperationKind::Rename,
+            server_id,
+        }
+    }
+
+    pub fn remove(server_id: comet_proto::ServerId) -> Self {
+        Self {
+            kind: OperationKind::Remove,
+            server_id,
+        }
+    }
+
+    pub fn revoke(server_id: comet_proto::ServerId) -> Self {
+        Self {
+            kind: OperationKind::Revoke,
+            server_id,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct OperationTracker {
+    pending: HashSet<OperationKey>,
+    errors: HashMap<OperationKey, String>,
+}
+
+impl OperationTracker {
+    pub fn begin(&mut self, key: OperationKey) -> bool {
+        if !self.pending.insert(key.clone()) {
+            return false;
+        }
+        self.errors.remove(&key);
+        true
+    }
+
+    pub fn finish(&mut self, key: OperationKey, result: Result<(), String>) {
+        self.pending.remove(&key);
+        if let Err(error) = result {
+            self.errors.insert(key, error);
+        }
+    }
+
+    pub fn is_pending(&self, key: &OperationKey) -> bool {
+        self.pending.contains(key)
+    }
+
+    pub fn error(&self, key: &OperationKey) -> Option<&str> {
+        self.errors.get(key).map(String::as_str)
+    }
+
+    fn first_error(&self) -> Option<String> {
+        self.errors.values().next().cloned()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DestructiveAction {
+    RemoveRemote { server_id: comet_proto::ServerId },
+    RevokeClient { server_id: comet_proto::ServerId },
+}
+
+#[derive(Debug, Default)]
+pub struct DestructiveConfirmation {
+    pending: Option<(DestructiveAction, String)>,
+    confirmed: bool,
+}
+
+impl DestructiveConfirmation {
+    pub fn request_remove(&mut self, server_id: comet_proto::ServerId, name: &str, endpoint: &str) {
+        self.pending = Some((
+            DestructiveAction::RemoveRemote { server_id },
+            format!(
+                "Remove {name} ({endpoint}) from this computer? This does not revoke this device on the remote computer."
+            ),
+        ));
+        self.confirmed = false;
+    }
+
+    pub fn request_revoke(&mut self, server_id: comet_proto::ServerId, name: &str) {
+        self.pending = Some((
+            DestructiveAction::RevokeClient { server_id },
+            format!(
+                "Revoke {name}? Its active connection will close and future connections will be rejected."
+            ),
+        ));
+        self.confirmed = false;
+    }
+
+    pub fn copy(&self) -> Option<&str> {
+        self.pending.as_ref().map(|(_, copy)| copy.as_str())
+    }
+
+    pub fn confirm(&mut self) {
+        self.confirmed = self.pending.is_some();
+    }
+
+    pub fn cancel(&mut self) {
+        self.pending = None;
+        self.confirmed = false;
+    }
+
+    pub fn take_confirmed(&mut self) -> Option<DestructiveAction> {
+        if !self.confirmed {
+            return None;
+        }
+        self.confirmed = false;
+        self.pending.take().map(|(action, _)| action)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchHealth {
+    Loading,
+    Live,
+    Stale { error: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchRecovery {
+    pub health: WatchHealth,
+    failures: u32,
+}
+
+impl Default for WatchRecovery {
+    fn default() -> Self {
+        Self {
+            health: WatchHealth::Loading,
+            failures: 0,
+        }
+    }
+}
+
+impl WatchRecovery {
+    pub fn connected(&mut self) {
+        self.health = WatchHealth::Live;
+        self.failures = 0;
+    }
+
+    pub fn disconnected(&mut self, error: impl Into<String>) {
+        self.health = WatchHealth::Stale {
+            error: error.into(),
+        };
+        self.failures = self.failures.saturating_add(1);
+    }
+
+    pub fn retry_delay(&self) -> std::time::Duration {
+        let exponent = self.failures.saturating_sub(1).min(4);
+        std::time::Duration::from_millis(250 * (1_u64 << exponent))
+    }
+}
+
+fn watch_status_message(label: &str, watch: &WatchRecovery) -> Option<String> {
+    match &watch.health {
+        WatchHealth::Stale { error } => Some(format!(
+            "{label} is offline; showing last known data and reconnecting: {error}"
+        )),
+        WatchHealth::Loading | WatchHealth::Live => None,
+    }
+}
+
 #[async_trait::async_trait]
 pub trait RemotePairer: Send + Sync {
     async fn pair(
         &self,
         data_dir: &Path,
         endpoint: &comet_proto::RemoteEndpoint,
-        secret: [u8; 16],
+        secret: &[u8; 16],
     ) -> Result<PinnedRemote, String>;
 }
 
@@ -195,7 +544,7 @@ impl RemotePairer for InstallationRemotePairer {
         &self,
         data_dir: &Path,
         endpoint: &comet_proto::RemoteEndpoint,
-        secret: [u8; 16],
+        secret: &[u8; 16],
     ) -> Result<PinnedRemote, String> {
         // The private key is loaded only in this controller and is never part
         // of AddRemoteRequest, RemoteSettingsState, or any GPUI entity.
@@ -203,7 +552,12 @@ impl RemotePairer for InstallationRemotePairer {
             .map_err(|error| error.to_string())?;
         let tls =
             TlsIdentity::from_device_identity(&identity).map_err(|error| error.to_string())?;
-        let pinned = pair_client(format!("{}:{}", endpoint.host, endpoint.port), &tls, secret)
+        let address = if endpoint.host.contains(':') {
+            format!("[{}]:{}", endpoint.host, endpoint.port)
+        } else {
+            format!("{}:{}", endpoint.host, endpoint.port)
+        };
+        let pinned = pair_client(address, &tls, *secret)
             .await
             .map_err(|error| error.to_string())?;
         Ok(PinnedRemote {
@@ -231,13 +585,17 @@ pub async fn pair_and_persist_remote<P, A>(
     local_admin: &A,
     data_dir: &Path,
     request: AddRemoteRequest,
-) -> Result<RemoteEntry, String>
+) -> Result<RemoteEntry, AddRemoteError>
 where
     P: RemotePairer + ?Sized,
     A: LocalRemoteAdmin + ?Sized,
 {
-    let endpoint = comet_proto::RemoteEndpoint::parse(request.endpoint.trim())?;
-    let pinned = pairer.pair(data_dir, &endpoint, request.secret).await?;
+    let endpoint =
+        comet_proto::RemoteEndpoint::parse(&request.endpoint).map_err(AddRemoteError::Pairing)?;
+    let pinned = pairer
+        .pair(data_dir, &endpoint, request.secret.expose())
+        .await
+        .map_err(AddRemoteError::Pairing)?;
     let now = Utc::now();
     let entry = RemoteEntry {
         server_id: pinned.server_id,
@@ -253,7 +611,18 @@ where
         created_at: now,
         last_connected_at: None,
     };
-    local_admin.put_remote(&entry).await?;
+    if let Err(source) = local_admin.put_remote(&entry).await {
+        return Err(AddRemoteError::PartialSuccess {
+            remote: PublicRemoteDetails {
+                server_id: entry.server_id.clone(),
+                endpoint: entry.endpoint.clone(),
+                name: entry.name.clone(),
+                pinned_spki_sha256: entry.pinned_spki_sha256.clone(),
+            },
+            recovery: PARTIAL_PAIRING_RECOVERY,
+            source,
+        });
+    }
     Ok(entry)
 }
 
@@ -272,7 +641,7 @@ struct BeginPairingReply {
 }
 
 struct RenameRemote {
-    entry: RemoteEntry,
+    server_id: comet_proto::ServerId,
     input: Entity<ComposerInput>,
     _events: Subscription,
 }
@@ -289,11 +658,12 @@ pub struct RemoteConnectionsPage {
     name_input: Entity<ComposerInput>,
     secret_input: Entity<ComposerInput>,
     rename: Option<RenameRemote>,
+    confirmation: DestructiveConfirmation,
+    operations: OperationTracker,
     trusted_loaded: bool,
     listener_task: Option<Task<()>>,
     pairing_task: Option<Task<()>>,
     add_task: Option<Task<()>>,
-    mutation_task: Option<Task<()>>,
     _watch_tasks: Vec<Task<()>>,
     _input_events: Vec<Subscription>,
     _app_observation: Subscription,
@@ -343,11 +713,12 @@ impl RemoteConnectionsPage {
             name_input,
             secret_input,
             rename: None,
+            confirmation: DestructiveConfirmation::default(),
+            operations: OperationTracker::default(),
             trusted_loaded: false,
             listener_task: None,
             pairing_task: None,
             add_task: None,
-            mutation_task: None,
             _watch_tasks: Vec::new(),
             _input_events: input_events,
             _app_observation: app_observation,
@@ -410,81 +781,121 @@ impl RemoteConnectionsPage {
 
         let remote_client = local.clone();
         self._watch_tasks.push(cx.spawn(async move |this, cx| {
-            let stream = remote_client
-                .subscribe(methods::WATCH_REMOTES, serde_json::Value::Null)
-                .await;
-            match stream {
-                Ok(mut stream) => {
-                    while let Some(value) = stream.recv().await {
-                        let parsed = serde_json::from_value::<Vec<RemoteEntry>>(value)
-                            .map_err(|error| error.to_string());
+            loop {
+                let mut disconnected = match remote_client
+                    .subscribe(methods::WATCH_REMOTES, serde_json::Value::Null)
+                    .await
+                {
+                    Ok(mut stream) => {
                         if this
                             .update(cx, |page, cx| {
-                                match parsed {
-                                    Ok(remotes) => page.model.remotes = remotes,
-                                    Err(error) => page.model.add_error = Some(error),
-                                }
+                                page.model.remotes_watch.connected();
                                 cx.notify();
                             })
                             .is_err()
                         {
                             return;
                         }
+                        let mut reason = "Remote registry stream closed".to_string();
+                        while let Some(value) = stream.recv().await {
+                            match serde_json::from_value::<Vec<RemoteEntry>>(value) {
+                                Ok(remotes) => {
+                                    if this
+                                        .update(cx, |page, cx| {
+                                            page.model.remotes = remotes;
+                                            cx.notify();
+                                        })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                Err(error) => {
+                                    reason = format!("Invalid remote registry snapshot: {error}");
+                                    break;
+                                }
+                            }
+                        }
+                        reason
                     }
-                }
-                Err(error) => {
-                    this.update(cx, |page, cx| {
-                        page.model.add_error = Some(error.to_string());
-                        cx.notify();
-                    })
-                    .ok();
-                }
+                    Err(error) => error.to_string(),
+                };
+                let delay = match this.update(cx, |page, cx| {
+                    page.model
+                        .remotes_watch
+                        .disconnected(std::mem::take(&mut disconnected));
+                    cx.notify();
+                    page.model.remotes_watch.retry_delay()
+                }) {
+                    Ok(delay) => delay,
+                    Err(_) => return,
+                };
+                cx.background_executor().timer(delay).await;
             }
         }));
 
         self._watch_tasks.push(cx.spawn(async move |this, cx| {
-            let stream = local
-                .subscribe(methods::WATCH_TRUSTED_CLIENTS, serde_json::Value::Null)
-                .await;
-            match stream {
-                Ok(mut stream) => {
-                    while let Some(value) = stream.recv().await {
-                        let parsed = serde_json::from_value::<Vec<TrustedClient>>(value)
-                            .map_err(|error| error.to_string());
+            loop {
+                let mut disconnected = match local
+                    .subscribe(methods::WATCH_TRUSTED_CLIENTS, serde_json::Value::Null)
+                    .await
+                {
+                    Ok(mut stream) => {
                         if this
                             .update(cx, |page, cx| {
-                                match parsed {
-                                    Ok(clients) => {
-                                        let paired =
-                                            page.trusted_loaded
+                                page.model.trusted_watch.connected();
+                                cx.notify();
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let mut reason = "Trusted-client stream closed".to_string();
+                        while let Some(value) = stream.recv().await {
+                            match serde_json::from_value::<Vec<TrustedClient>>(value) {
+                                Ok(clients) => {
+                                    if this
+                                        .update(cx, |page, cx| {
+                                            let paired = page.trusted_loaded
                                                 && clients.iter().any(|candidate| {
                                                     !page.model.trusted_clients.iter().any(|old| {
                                                         old.server_id == candidate.server_id
                                                     })
                                                 });
-                                        page.model.trusted_clients = clients;
-                                        page.trusted_loaded = true;
-                                        if paired {
-                                            page.model.pairing_succeeded();
-                                        }
+                                            page.model.trusted_clients = clients;
+                                            page.trusted_loaded = true;
+                                            if paired {
+                                                page.model.pairing_succeeded();
+                                            }
+                                            cx.notify();
+                                        })
+                                        .is_err()
+                                    {
+                                        return;
                                     }
-                                    Err(error) => page.model.pairing_error = Some(error),
                                 }
-                                cx.notify();
-                            })
-                            .is_err()
-                        {
-                            return;
+                                Err(error) => {
+                                    reason = format!("Invalid trusted-client snapshot: {error}");
+                                    break;
+                                }
+                            }
                         }
+                        reason
                     }
-                }
-                Err(error) => {
-                    this.update(cx, |page, cx| {
-                        page.model.pairing_error = Some(error.to_string());
-                        cx.notify();
-                    })
-                    .ok();
-                }
+                    Err(error) => error.to_string(),
+                };
+                let delay = match this.update(cx, |page, cx| {
+                    page.trusted_loaded = false;
+                    page.model
+                        .trusted_watch
+                        .disconnected(std::mem::take(&mut disconnected));
+                    cx.notify();
+                    page.model.trusted_watch.retry_delay()
+                }) {
+                    Ok(delay) => delay,
+                    Err(_) => return,
+                };
+                cx.background_executor().timer(delay).await;
             }
         }));
 
@@ -587,10 +998,7 @@ impl RemoteConnectionsPage {
             let result = local
                 .call_as::<BeginPairingReply>(methods::BEGIN_PAIRING, serde_json::Value::Null)
                 .await
-                .map(|reply| PairingSecret {
-                    secret: reply.secret,
-                    expires_at: reply.expires_at,
-                })
+                .map(|reply| PairingSecret::new(reply.secret, reply.expires_at))
                 .map_err(|error| error.to_string());
             this.update(cx, |page, cx| {
                 page.model.finish_pairing_request(generation, result);
@@ -602,9 +1010,12 @@ impl RemoteConnectionsPage {
     }
 
     fn add_remote(&mut self, cx: &mut Context<Self>) {
-        let endpoint = self.endpoint_input.read(cx).text().trim().to_string();
+        let endpoint = self.endpoint_input.read(cx).text().to_string();
         let name = self.name_input.read(cx).text().trim().to_string();
-        let secret = match decode_pairing_secret(self.secret_input.read(cx).text()) {
+        let decoded = decode_pairing_secret(self.secret_input.read(cx).text());
+        self.secret_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        let secret = match decoded {
             Ok(secret) => secret,
             Err(error) => {
                 self.model.add_error = Some(error);
@@ -622,27 +1033,17 @@ impl RemoteConnectionsPage {
             return;
         };
         let generation = self.model.begin_add_request();
-        let secret_input = self.secret_input.clone();
         self.add_task = Some(cx.spawn(async move |this, cx| {
             let result = pair_and_persist_remote(
                 &InstallationRemotePairer,
                 local.as_ref(),
                 &data_dir,
-                AddRemoteRequest {
-                    endpoint,
-                    name,
-                    secret,
-                },
+                AddRemoteRequest::from_secret(endpoint, name, secret),
             )
             .await
-            .map(|_| ())
-            .map_err(|error| error.to_string());
-            let succeeded = result.is_ok();
+            .map(|_| ());
             this.update(cx, |page, cx| {
                 page.model.finish_add_request(generation, result);
-                if succeeded && generation == page.model.add_generation {
-                    secret_input.update(cx, |input, cx| input.set_text("", cx));
-                }
                 cx.notify();
             })
             .ok();
@@ -659,7 +1060,7 @@ impl RemoteConnectionsPage {
             }
         });
         self.rename = Some(RenameRemote {
-            entry,
+            server_id: entry.server_id,
             input,
             _events: events,
         });
@@ -667,7 +1068,7 @@ impl RemoteConnectionsPage {
     }
 
     fn submit_rename(&mut self, cx: &mut Context<Self>) {
-        let Some(mut rename) = self.rename.take() else {
+        let Some(rename) = self.rename.take() else {
             return;
         };
         let name = rename.input.read(cx).text().trim().to_string();
@@ -676,64 +1077,114 @@ impl RemoteConnectionsPage {
             cx.notify();
             return;
         }
-        rename.entry.name = name;
         let Some(local) = self.local_client(cx) else {
             return;
         };
-        let entry = rename.entry;
-        self.mutation_task = Some(cx.spawn(async move |this, cx| {
-            let result = local.put_remote(&entry).await;
+        let server_id = rename.server_id;
+        let operation = OperationKey::rename(server_id.clone());
+        if !self.operations.begin(operation.clone()) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let result = local
+                .call(
+                    methods::RENAME_REMOTE,
+                    serde_json::json!({"serverId": server_id, "name": name}),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
             this.update(cx, |page, cx| {
-                if let Err(error) = result {
-                    page.model.add_error = Some(error);
-                }
+                page.operations.finish(operation, result);
                 cx.notify();
             })
             .ok();
-        }));
+        })
+        .detach();
         cx.notify();
+    }
+
+    fn request_remove(&mut self, entry: &RemoteEntry, cx: &mut Context<Self>) {
+        self.confirmation.request_remove(
+            entry.server_id.clone(),
+            &entry.name,
+            &format!("{}:{}", entry.endpoint.host, entry.endpoint.port),
+        );
+        cx.notify();
+    }
+
+    fn request_revoke(&mut self, client: &TrustedClient, cx: &mut Context<Self>) {
+        self.confirmation
+            .request_revoke(client.server_id.clone(), &client.name);
+        cx.notify();
+    }
+
+    fn cancel_destructive(&mut self, cx: &mut Context<Self>) {
+        self.confirmation.cancel();
+        cx.notify();
+    }
+
+    fn confirm_destructive(&mut self, cx: &mut Context<Self>) {
+        self.confirmation.confirm();
+        let Some(action) = self.confirmation.take_confirmed() else {
+            return;
+        };
+        match action {
+            DestructiveAction::RemoveRemote { server_id } => self.remove_remote(server_id, cx),
+            DestructiveAction::RevokeClient { server_id } => self.revoke_client(server_id, cx),
+        }
     }
 
     fn remove_remote(&mut self, server_id: comet_proto::ServerId, cx: &mut Context<Self>) {
         let Some(local) = self.local_client(cx) else {
             return;
         };
-        self.mutation_task = Some(cx.spawn(async move |this, cx| {
+        let operation = OperationKey::remove(server_id.clone());
+        if !self.operations.begin(operation.clone()) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
             let result = local
                 .call(
                     methods::REMOVE_REMOTE,
                     serde_json::json!({"serverId": server_id}),
                 )
-                .await;
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
             this.update(cx, |page, cx| {
-                if let Err(error) = result {
-                    page.model.add_error = Some(error.to_string());
-                }
+                page.operations.finish(operation, result);
                 cx.notify();
             })
             .ok();
-        }));
+        })
+        .detach();
     }
 
     fn revoke_client(&mut self, server_id: comet_proto::ServerId, cx: &mut Context<Self>) {
         let Some(local) = self.local_client(cx) else {
             return;
         };
-        self.mutation_task = Some(cx.spawn(async move |this, cx| {
+        let operation = OperationKey::revoke(server_id.clone());
+        if !self.operations.begin(operation.clone()) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
             let result = local
                 .call(
                     methods::REVOKE_TRUSTED_CLIENT,
                     serde_json::json!({"serverId": server_id}),
                 )
-                .await;
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
             this.update(cx, |page, cx| {
-                if let Err(error) = result {
-                    page.model.pairing_error = Some(error.to_string());
-                }
+                page.operations.finish(operation, result);
                 cx.notify();
             })
             .ok();
-        }));
+        })
+        .detach();
     }
 
     fn reconnect(&mut self, server_id: comet_proto::ServerId, cx: &mut Context<Self>) {
@@ -767,7 +1218,7 @@ impl gpui::Render for RemoteConnectionsPage {
         self.model.expire_pairing(Utc::now());
         let listener_label = listener_status_label(&self.model.listener);
         let listener_enabled = self.model.lan.enabled;
-        let pairing = self.model.pairing.clone();
+        let pairing = self.model.pairing.as_ref();
         let remote_rows: Vec<AnyElement> = self
             .model
             .remotes
@@ -777,7 +1228,7 @@ impl gpui::Render for RemoteConnectionsPage {
             .map(|(ix, entry)| {
                 let rename_entry = entry.clone();
                 let reconnect_id = entry.server_id.clone();
-                let remove_id = entry.server_id.clone();
+                let remove_entry = entry.clone();
                 widgets::card_row(&theme, ix == 0)
                     .child(widgets::row_tile(&theme, crate::icons::GLOBAL))
                     .child(
@@ -820,7 +1271,7 @@ impl gpui::Render for RemoteConnectionsPage {
                         action_button(&theme, "Remove")
                             .id(("remote-remove", ix))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.remove_remote(remove_id.clone(), cx)
+                                this.request_remove(&remove_entry, cx)
                             })),
                     )
                     .into_any_element()
@@ -833,7 +1284,7 @@ impl gpui::Render for RemoteConnectionsPage {
             .into_iter()
             .enumerate()
             .map(|(ix, client)| {
-                let revoke_id = client.server_id.clone();
+                let revoke_client = client.clone();
                 widgets::card_row(&theme, ix == 0)
                     .child(widgets::row_tile(&theme, crate::icons::MONITOR))
                     .child(
@@ -857,7 +1308,7 @@ impl gpui::Render for RemoteConnectionsPage {
                         action_button(&theme, "Revoke")
                             .id(("trusted-revoke", ix))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.revoke_client(revoke_id.clone(), cx)
+                                this.request_revoke(&revoke_client, cx)
                             })),
                     )
                     .into_any_element()
@@ -916,7 +1367,7 @@ impl gpui::Render for RemoteConnectionsPage {
                         .mt(px(6.0))
                         .font_family(theme.font_mono.clone())
                         .text_size(px(15.0))
-                        .child(SharedString::from(pairing.secret)),
+                        .child(SharedString::from(pairing.expose().to_string())),
                 )
                 .child(
                     div()
@@ -1000,6 +1451,53 @@ impl gpui::Render for RemoteConnectionsPage {
                 )
                 .into_any_element()
         });
+        let confirmation = self.confirmation.copy().map(str::to_string).map(|copy| {
+            widgets::section_card(&theme)
+                .child(
+                    div()
+                        .px(px(20.0))
+                        .pt(px(14.0))
+                        .child(widgets::warning_strip(copy)),
+                )
+                .child(
+                    widgets::card_row(&theme, false)
+                        .child(div().flex_1())
+                        .child(
+                            action_button(&theme, "Cancel")
+                                .id("destructive-cancel")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.cancel_destructive(cx)),
+                                ),
+                        )
+                        .child(
+                            action_button(&theme, "Confirm")
+                                .id("destructive-confirm")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.confirm_destructive(cx)),
+                                ),
+                        ),
+                )
+                .into_any_element()
+        });
+        let partial_success = self.model.partial_success.clone().map(|partial| {
+            let endpoint = format!(
+                "{}:{}",
+                partial.remote.endpoint.host, partial.remote.endpoint.port
+            );
+            widgets::warning_strip(format!(
+                "{} ({endpoint}, pin {}). {} Save error: {}",
+                partial.remote.name,
+                partial.remote.pinned_spki_sha256,
+                partial.recovery,
+                partial.source
+            ))
+            .into_any_element()
+        });
+        let operation_error = self.operations.first_error();
+        let trusted_watch_error =
+            watch_status_message("Trusted clients", &self.model.trusted_watch);
+        let remotes_watch_error =
+            watch_status_message("Remote registry", &self.model.remotes_watch);
 
         div().id("remote-connections-page").size_full().overflow_y_scroll().child(
             widgets::page_column()
@@ -1009,10 +1507,15 @@ impl gpui::Render for RemoteConnectionsPage {
                 .child(listener_card)
                 .when_some(self.model.pairing_error.clone(), |el, error| el.child(widgets::error_strip(error)))
                 .child(pairing_card)
+                .when_some(trusted_watch_error, |el, error| el.child(widgets::error_strip(error)))
                 .child(trusted_card)
                 .when_some(self.model.add_error.clone(), |el, error| el.child(widgets::error_strip(error)))
+                .when_some(operation_error, |el, error| el.child(widgets::error_strip(error)))
+                .when_some(partial_success, |el, partial| el.child(partial))
                 .child(add_card)
                 .when_some(rename, |el, rename| el.child(rename))
+                .when_some(confirmation, |el, confirmation| el.child(confirmation))
+                .when_some(remotes_watch_error, |el, error| el.child(widgets::error_strip(error)))
                 .child(remote_card)
         )
     }
@@ -1046,10 +1549,10 @@ mod tests {
         let first = state.begin_pairing_request();
         state.finish_pairing_request(
             first,
-            Ok(PairingSecret {
-                secret: "AAAA-BBBB".into(),
-                expires_at: now + TimeDelta::minutes(5),
-            }),
+            Ok(PairingSecret::new(
+                "AAAA-BBBB".into(),
+                now + TimeDelta::minutes(5),
+            )),
         );
         assert_eq!(state.pairing.as_ref().unwrap().secret, "AAAA-BBBB");
 
@@ -1057,10 +1560,10 @@ mod tests {
         assert!(state.pairing.is_none(), "replacement clears the old secret");
         state.finish_pairing_request(
             second,
-            Ok(PairingSecret {
-                secret: "CCCC-DDDD".into(),
-                expires_at: now + TimeDelta::seconds(1),
-            }),
+            Ok(PairingSecret::new(
+                "CCCC-DDDD".into(),
+                now + TimeDelta::seconds(1),
+            )),
         );
         state.expire_pairing(now + TimeDelta::seconds(2));
         assert!(state.pairing.is_none());
@@ -1068,10 +1571,10 @@ mod tests {
         let third = state.begin_pairing_request();
         state.finish_pairing_request(
             third,
-            Ok(PairingSecret {
-                secret: "EEEE-FFFF".into(),
-                expires_at: now + TimeDelta::minutes(5),
-            }),
+            Ok(PairingSecret::new(
+                "EEEE-FFFF".into(),
+                now + TimeDelta::minutes(5),
+            )),
         );
         state.pairing_succeeded();
         assert!(state.pairing.is_none());
@@ -1085,18 +1588,18 @@ mod tests {
         let current_pairing = state.begin_pairing_request();
         state.finish_pairing_request(
             stale_pairing,
-            Ok(PairingSecret {
-                secret: "STALE".into(),
-                expires_at: now + TimeDelta::minutes(5),
-            }),
+            Ok(PairingSecret::new(
+                "STALE".into(),
+                now + TimeDelta::minutes(5),
+            )),
         );
         assert!(state.pairing.is_none());
         state.finish_pairing_request(
             current_pairing,
-            Ok(PairingSecret {
-                secret: "CURRENT".into(),
-                expires_at: now + TimeDelta::minutes(5),
-            }),
+            Ok(PairingSecret::new(
+                "CURRENT".into(),
+                now + TimeDelta::minutes(5),
+            )),
         );
         assert_eq!(state.pairing.as_ref().unwrap().secret, "CURRENT");
 
@@ -1126,9 +1629,10 @@ mod tests {
 
     #[test]
     fn pairing_secret_parser_accepts_grouped_base32_and_rejects_wrong_length() {
+        let decoded = decode_pairing_secret("AEBA-GBAF-AYDQ-QCIK-BMGA-2DQP-CA").unwrap();
         assert_eq!(
-            decode_pairing_secret("AEBA-GBAF-AYDQ-QCIK-BMGA-2DQP-CA"),
-            Ok([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+            decoded.expose(),
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
         assert!(decode_pairing_secret("AAAA").is_err());
     }
@@ -1141,10 +1645,10 @@ mod tests {
             &self,
             _data_dir: &std::path::Path,
             endpoint: &comet_proto::RemoteEndpoint,
-            secret: [u8; 16],
+            secret: &[u8; 16],
         ) -> Result<PinnedRemote, String> {
             assert_eq!(endpoint.host, "buildbox.local");
-            assert_eq!(secret, [1; 16]);
+            assert_eq!(secret, &[1; 16]);
             Ok(PinnedRemote {
                 server_id: comet_proto::ServerId::new(format!("sha256:{}", "ab".repeat(32))),
                 pinned_spki_sha256: "ab".repeat(32),
@@ -1173,11 +1677,7 @@ mod tests {
             &FakePairer,
             &admin,
             std::path::Path::new("private-installation-dir"),
-            AddRemoteRequest {
-                endpoint: "buildbox.local:27655".into(),
-                name: "Build box".into(),
-                secret: [1; 16],
-            },
+            AddRemoteRequest::new("buildbox.local:27655", "Build box", [1; 16]),
         )
         .await
         .unwrap();
@@ -1191,5 +1691,169 @@ mod tests {
         let wire = serde_json::to_string(&entry).unwrap();
         assert!(!wire.contains("private-installation-dir"));
         assert!(!wire.contains("privateKey"));
+    }
+
+    struct FailingLocalAdmin {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LocalRemoteAdmin for FailingLocalAdmin {
+        async fn put_remote(&self, _entry: &comet_proto::RemoteEntry) -> Result<(), String> {
+            *self.calls.lock().unwrap() += 1;
+            Err("disk full".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_success_then_store_failure_is_partial_success_without_retry() {
+        let calls = Arc::new(Mutex::new(0));
+        let error = pair_and_persist_remote(
+            &FakePairer,
+            &FailingLocalAdmin {
+                calls: calls.clone(),
+            },
+            std::path::Path::new("private-installation-dir"),
+            AddRemoteRequest::new("buildbox.local:27655", "Build box", [1; 16]),
+        )
+        .await
+        .unwrap_err();
+
+        let AddRemoteError::PartialSuccess {
+            remote,
+            recovery,
+            source,
+        } = error
+        else {
+            panic!("expected partial success");
+        };
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "controller never retries PUT_REMOTE"
+        );
+        assert_eq!(remote.name, "Build box");
+        assert!(source.contains("disk full"));
+        assert!(recovery.contains("revoke this device"));
+        assert!(recovery.contains("start a fresh pairing session"));
+        assert!(!recovery.to_lowercase().contains("retry"));
+    }
+
+    #[test]
+    fn partial_success_is_preserved_in_ui_state_with_public_recovery_details() {
+        let mut state = RemoteSettingsState::default();
+        let generation = state.begin_add_request();
+        let remote = PublicRemoteDetails {
+            server_id: comet_proto::ServerId::new("sha256:remote"),
+            endpoint: comet_proto::RemoteEndpoint::parse("buildbox.local:27655").unwrap(),
+            name: "Build box".into(),
+            pinned_spki_sha256: "ab".repeat(32),
+        };
+        state.finish_add_request(
+            generation,
+            Err(AddRemoteError::PartialSuccess {
+                remote: remote.clone(),
+                recovery: PARTIAL_PAIRING_RECOVERY,
+                source: "disk full".into(),
+            }),
+        );
+        let partial = state
+            .partial_success
+            .as_ref()
+            .expect("visible recovery state");
+        assert_eq!(partial.remote, remote);
+        assert!(partial.recovery.contains("revoke this device"));
+        assert!(state.add_error.is_none());
+    }
+
+    #[test]
+    fn pairing_secret_debug_is_redacted_and_cleanup_removes_it() {
+        let now = Utc::now();
+        let mut state = RemoteSettingsState::default();
+        let generation = state.begin_pairing_request();
+        state.finish_pairing_request(
+            generation,
+            Ok(PairingSecret::new(
+                "TOPS-ECRE-T123".into(),
+                now + TimeDelta::seconds(1),
+            )),
+        );
+        assert!(!format!("{:?}", state).contains("TOPS-ECRE-T123"));
+        state.expire_pairing(now + TimeDelta::seconds(2));
+        assert!(state.pairing.is_none());
+    }
+
+    #[test]
+    fn destructive_confirmation_cancel_emits_no_action_and_confirm_is_qualified() {
+        let mut confirmation = DestructiveConfirmation::default();
+        let server_id = comet_proto::ServerId::new("sha256:remote");
+        confirmation.request_remove(server_id.clone(), "Build box", "buildbox.local:27655");
+        assert!(confirmation.take_confirmed().is_none());
+        assert!(confirmation.copy().unwrap().contains("Build box"));
+        assert!(
+            confirmation
+                .copy()
+                .unwrap()
+                .contains("buildbox.local:27655")
+        );
+        confirmation.cancel();
+        assert!(confirmation.take_confirmed().is_none());
+
+        confirmation.request_revoke(server_id.clone(), "Laptop");
+        confirmation.confirm();
+        assert_eq!(
+            confirmation.take_confirmed(),
+            Some(DestructiveAction::RevokeClient { server_id })
+        );
+    }
+
+    #[test]
+    fn independent_operations_do_not_cancel_or_overwrite_each_other() {
+        let mut operations = OperationTracker::default();
+        let rename = OperationKey::rename(comet_proto::ServerId::new("sha256:a"));
+        let remove = OperationKey::remove(comet_proto::ServerId::new("sha256:b"));
+        let revoke = OperationKey::revoke(comet_proto::ServerId::new("sha256:c"));
+        assert!(operations.begin(rename.clone()));
+        assert!(operations.begin(remove.clone()));
+        assert!(operations.begin(revoke.clone()));
+        assert!(
+            !operations.begin(rename.clone()),
+            "same operation is bounded"
+        );
+
+        operations.finish(remove.clone(), Err("remove failed".into()));
+        operations.finish(rename.clone(), Ok(()));
+        operations.finish(revoke.clone(), Err("revoke failed".into()));
+        assert!(!operations.is_pending(&rename));
+        assert_eq!(operations.error(&remove), Some("remove failed"));
+        assert_eq!(operations.error(&revoke), Some("revoke failed"));
+    }
+
+    #[test]
+    fn watch_close_marks_stale_and_recovery_resets_bounded_backoff() {
+        let mut watch = WatchRecovery::default();
+        watch.connected();
+        watch.disconnected("stream closed");
+        assert!(matches!(watch.health, WatchHealth::Stale { .. }));
+        assert_eq!(watch.retry_delay(), std::time::Duration::from_millis(250));
+        watch.disconnected("closed again");
+        assert_eq!(watch.retry_delay(), std::time::Duration::from_millis(500));
+        watch.connected();
+        assert_eq!(watch.health, WatchHealth::Live);
+        assert_eq!(watch.retry_delay(), std::time::Duration::from_millis(250));
+    }
+
+    #[test]
+    fn stale_watch_message_explains_cached_state_and_recovery() {
+        let mut watch = WatchRecovery::default();
+        watch.connected();
+        watch.disconnected("connection reset");
+
+        let message =
+            watch_status_message("Remote registry", &watch).expect("stale watches are visible");
+        assert!(message.contains("last known data"));
+        assert!(message.contains("reconnecting"));
+        assert!(message.contains("connection reset"));
+        assert!(watch_status_message("Remote registry", &WatchRecovery::default()).is_none());
     }
 }

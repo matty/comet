@@ -42,10 +42,27 @@ pub struct RemoteEndpoint {
 
 impl RemoteEndpoint {
     pub fn parse(value: &str) -> Result<Self, String> {
-        let (host, port) = value
-            .split_once(':')
-            .ok_or_else(|| "endpoint must be host:port".to_string())?;
-        if host.is_empty() || port.contains(':') {
+        let (host, port) = if let Some(bracketed) = value.strip_prefix('[') {
+            let (host, port) = bracketed
+                .split_once("]:")
+                .ok_or_else(|| "IPv6 endpoints must be [address]:port".to_string())?;
+            if port.contains(':') {
+                return Err("IPv6 endpoints must be [address]:port".into());
+            }
+            (host, port)
+        } else {
+            let (host, port) = value
+                .rsplit_once(':')
+                .ok_or_else(|| "endpoint must be host:port".to_string())?;
+            if host.contains(':') {
+                return Err("IPv6 endpoints must be [address]:port".into());
+            }
+            (host, port)
+        };
+        if host.is_empty()
+            || host.chars().any(char::is_whitespace)
+            || host.contains(['/', '[', ']'])
+        {
             return Err("endpoint must be host:port".to_string());
         }
         let port = port
@@ -121,6 +138,21 @@ mod tests {
         assert!(RemoteEndpoint::parse("192.168.1.20:27655").is_ok());
         assert!(RemoteEndpoint::parse("host.local:0").is_err());
         assert!(RemoteEndpoint::parse("https://host.local:27655").is_err());
+    }
+
+    #[test]
+    fn endpoint_accepts_bracketed_ipv6_and_rejects_ambiguous_or_whitespace_hosts() {
+        assert_eq!(
+            RemoteEndpoint::parse("[fe80::1]:27655").unwrap(),
+            RemoteEndpoint {
+                host: "fe80::1".into(),
+                port: 27655,
+            }
+        );
+        assert!(RemoteEndpoint::parse("fe80::1:27655").is_err());
+        assert!(RemoteEndpoint::parse(" buildbox.local:27655").is_err());
+        assert!(RemoteEndpoint::parse("build box.local:27655").is_err());
+        assert!(RemoteEndpoint::parse("[]:27655").is_err());
     }
 
     #[test]

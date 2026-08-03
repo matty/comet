@@ -559,6 +559,7 @@ fn is_local_admin(method: &str) -> bool {
         method,
         methods::WATCH_REMOTES
             | methods::PUT_REMOTE
+            | methods::RENAME_REMOTE
             | methods::REMOVE_REMOTE
             | methods::REPORT_REMOTE_STATUS
             | methods::GET_LAN_SETTINGS
@@ -1136,6 +1137,7 @@ mod tests {
         for method in [
             methods::WATCH_REMOTES,
             methods::PUT_REMOTE,
+            methods::RENAME_REMOTE,
             methods::REMOVE_REMOTE,
             methods::REPORT_REMOTE_STATUS,
             methods::GET_LAN_SETTINGS,

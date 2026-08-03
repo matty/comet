@@ -40,3 +40,33 @@ Coverage includes default-off listening, warning content, pairing-secret lifecyc
 - Remote and trusted-client rows come from their localhost watch streams, so offline, unreachable, identity-changed, protocol mismatch, rename, revoke, and remove updates reconcile authoritatively.
 - Initial trusted-client hydration cannot be mistaken for a newly paired client, and pairing cannot begin until that baseline is loaded.
 - Pairing and add task replacement is cancellation-safe and also generation-gated; authoritative watch streams reconcile server-side operations that completed near cancellation.
+
+## Review fix round 1
+
+- A successful TLS pairing followed by a failed local `PUT_REMOTE` is now a distinct partial-success result. It exposes only public remote details and directs the user to revoke this device on the remote computer before starting a fresh pairing session. The controller performs exactly one persistence attempt and never presents a simple retry.
+- Rename is now a dedicated local-only `RENAME_REMOTE` RPC backed by an atomic locked `rename_remote` store mutation. It sends only server ID and name, preserving connection state, protocol version, timestamps, endpoint, and pin changed concurrently.
+- Remove and revoke now require an explicit target-and-consequence confirmation. Cancel emits no action; confirm emits a server-ID-qualified action.
+- Rename, remove, and revoke use independent, server-qualified operation tracking. Duplicate operations are bounded without cancellation or error-state collisions between unrelated mutations.
+- Remote and trusted-client watches now reconnect after subscription failure, malformed data, or stream close. They expose stale/offline state, retain last-known data, and use capped exponential backoff from 250 ms through 4 seconds. The page owns all watch tasks, so navigation/drop cancels the loops and their stream receivers.
+- Pairing text and decoded bytes are zeroized. Secret-bearing state and requests no longer derive `Clone` or revealing `Debug`; custom debug output is redacted. Secrets clear on replacement, RPC failure, expiry, successful pairing, add submission outcomes, and page drop.
+- Endpoint parsing accepts bracketed IPv6 and rejects ambiguous bare IPv6 and hosts containing whitespace.
+
+### Fix-round TDD evidence
+
+The initial UI regression test failed compilation on 16 intentionally absent contracts for partial success, redacted secret construction, destructive confirmation, qualified operation tracking, and watch recovery. The protocol test then failed with `endpoint must be host:port` for bracketed IPv6. Store and RPC tests failed compilation on absent `rename_remote` and `RENAME_REMOTE`. Each production path was added only after its focused failure.
+
+Focused results after the fixes:
+
+- `cargo test -p comet-ui remotes -- --nocapture`: 13 passed before the final stale-visibility case; the resulting full UI library suite contains 14 remote-settings tests.
+- `cargo test -p comet-ui stale_watch_message_explains_cached_state_and_recovery -- --nocapture`: 1 passed.
+- `cargo test -p comet-proto endpoint -- --nocapture`: 2 passed.
+- `cargo test -p comet-client every_local_administration_method_is_blocked_from_generic_remote_calls -- --nocapture`: 1 passed.
+- `cargo test -p comet-engine --test remote_access -- --nocapture`: 20 passed.
+
+### Fix-round verification
+
+- `cargo test -p comet-proto -p comet-rpc -p comet-client -p comet-engine -p comet-ui --lib`: 446 passed, 0 failed (36 client + 36 engine + 16 protocol + 15 RPC + 343 UI).
+- `cargo test -p comet-engine --test remote_access -- --nocapture`: 20 passed, 0 failed.
+- `cargo fmt --all -- --check`: passed after formatting.
+- `git diff --check`: passed.
+- Strict multi-package clippy remains blocked before affected code by the pre-existing `crates/update/src/lib.rs:543` `collapsible_if`. `cargo clippy -p comet-ui --lib --no-deps -- -D warnings` reaches the UI and reports 15 pre-existing baseline findings in other files; it reports none in `remotes.rs`.

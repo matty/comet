@@ -798,6 +798,26 @@ impl RpcService for LocalRpcService {
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
+            methods::RENAME_REMOTE => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    server_id: ServerId,
+                    name: String,
+                }
+                let p: P = parse_params(params)?;
+                if p.name.trim().is_empty() {
+                    return Err(RpcError::BadParams("remote name cannot be empty".into()));
+                }
+                let renamed = self
+                    .store
+                    .rename_remote(&p.server_id, p.name.trim())
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                if !renamed {
+                    return Err(RpcError::Failed("remote registry row not found".into()));
+                }
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
             methods::REMOVE_REMOTE => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]
