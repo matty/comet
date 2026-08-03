@@ -8,7 +8,9 @@ use comet_identity::DeviceIdentity;
 use comet_proto::{
     PROTOCOL_VERSION, RemoteConnectionState, RemoteEntry, ServerHello, ServerId, ServerRef,
 };
-use comet_rpc::{LanConnectError, PinnedServer, RpcClient, TlsIdentity, connect_lan_rpc, methods};
+use comet_rpc::{
+    LanConnectError, PinnedServer, RpcClient, RpcStream, TlsIdentity, connect_lan_rpc, methods,
+};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 
@@ -19,13 +21,38 @@ use crate::{FederationCommand, FederationEvent, ServerState};
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 const STABLE_CONNECTION_DURATION: Duration = Duration::from_secs(1);
-const TRANSCRIPT_HANDOFF_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RetryWake {
     Timer,
     ExplicitReconnect,
     Shutdown,
+}
+
+enum PhaseResult<T> {
+    Ready(T),
+    Reconnect,
+    Shutdown,
+}
+
+async fn await_supervisor_phase<T>(
+    operation: impl std::future::Future<Output = T>,
+    commands: &mut mpsc::UnboundedReceiver<SupervisorCommand>,
+    selected_chat: &mut Option<String>,
+    server_id: &ServerId,
+    events: &mpsc::UnboundedSender<FederationEvent>,
+) -> PhaseResult<T> {
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            value = &mut operation => return PhaseResult::Ready(value),
+            command = commands.recv() => match command {
+                Some(SupervisorCommand::Reconnect) => return PhaseResult::Reconnect,
+                Some(SupervisorCommand::Shutdown) | None => return PhaseResult::Shutdown,
+                Some(command) => handle_offline_command(command, selected_chat, server_id, events),
+            }
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -161,7 +188,7 @@ struct RemoteContext {
 async fn run_manager(
     local: Arc<RpcClient>,
     local_hello: ServerHello,
-    mut registry: mpsc::UnboundedReceiver<serde_json::Value>,
+    mut registry: RpcStream,
     tls: Arc<TlsIdentity>,
     connector: Arc<dyn RemoteConnector>,
     events: mpsc::UnboundedSender<FederationEvent>,
@@ -300,10 +327,7 @@ async fn set_supervisor_transcript(supervisor: &Supervisor, chat_id: Option<Stri
     {
         return false;
     }
-    matches!(
-        tokio::time::timeout(TRANSCRIPT_HANDOFF_TIMEOUT, received).await,
-        Ok(Ok(()))
-    )
+    received.await.is_ok()
 }
 
 fn queue_supervisor_transcript(supervisor: &Supervisor, chat_id: Option<String>) -> bool {
@@ -502,21 +526,40 @@ async fn supervise_remote(
     let mut delay = INITIAL_RETRY_DELAY;
     let mut selected_chat = None;
     loop {
+        macro_rules! phase {
+            ($operation:expr) => {
+                match await_supervisor_phase(
+                    $operation,
+                    &mut commands,
+                    &mut selected_chat,
+                    &entry.server_id,
+                    &events,
+                )
+                .await
+                {
+                    PhaseResult::Ready(value) => value,
+                    PhaseResult::Reconnect => {
+                        delay = INITIAL_RETRY_DELAY;
+                        continue;
+                    }
+                    PhaseResult::Shutdown => return,
+                }
+            };
+        }
         let _ = events.send(FederationEvent::ServerChanged(ServerState::empty(
             entry.server_id.clone(),
             entry.name.clone(),
             RemoteConnectionState::Connecting,
         )));
-        let client = match connector.connect(&entry, &tls).await {
+        let client = match phase!(connector.connect(&entry, &tls)) {
             Ok(client) => client,
             Err(RemoteConnectError::IdentityChanged) => {
-                publish_failure(
+                phase!(publish_failure(
                     &entry,
                     RemoteConnectionState::IdentityChanged,
                     &local,
                     &events,
-                )
-                .await;
+                ));
                 let wake =
                     wait_terminal(&mut commands, &mut selected_chat, &entry.server_id, &events)
                         .await;
@@ -531,13 +574,12 @@ async fn supervise_remote(
                     server_id: entry.server_id.clone(),
                     message,
                 });
-                publish_failure(
+                phase!(publish_failure(
                     &entry,
                     RemoteConnectionState::IdentityChanged,
                     &local,
                     &events,
-                )
-                .await;
+                ));
                 let wake =
                     wait_terminal(&mut commands, &mut selected_chat, &entry.server_id, &events)
                         .await;
@@ -548,13 +590,12 @@ async fn supervise_remote(
                 continue;
             }
             Err(RemoteConnectError::Transport(message)) => {
-                publish_failure(
+                phase!(publish_failure(
                     &entry,
                     RemoteConnectionState::Unreachable { message },
                     &local,
                     &events,
-                )
-                .await;
+                ));
                 let wake = wait_transient(
                     delay,
                     &mut commands,
@@ -570,44 +611,40 @@ async fn supervise_remote(
                 continue;
             }
         };
-        let hello: ServerHello = match client
-            .call_as(methods::SERVER_HELLO, serde_json::Value::Null)
-            .await
-        {
-            Ok(hello) => hello,
-            Err(error) => {
-                publish_failure(
-                    &entry,
-                    RemoteConnectionState::Unreachable {
-                        message: error.to_string(),
-                    },
-                    &local,
-                    &events,
-                )
-                .await;
-                let wake = wait_transient(
-                    delay,
-                    &mut commands,
-                    &mut selected_chat,
-                    &entry.server_id,
-                    &events,
-                )
-                .await;
-                if wake == RetryWake::Shutdown {
-                    return;
+        let hello: ServerHello =
+            match phase!(client.call_as(methods::SERVER_HELLO, serde_json::Value::Null,)) {
+                Ok(hello) => hello,
+                Err(error) => {
+                    phase!(publish_failure(
+                        &entry,
+                        RemoteConnectionState::Unreachable {
+                            message: error.to_string(),
+                        },
+                        &local,
+                        &events,
+                    ));
+                    let wake = wait_transient(
+                        delay,
+                        &mut commands,
+                        &mut selected_chat,
+                        &entry.server_id,
+                        &events,
+                    )
+                    .await;
+                    if wake == RetryWake::Shutdown {
+                        return;
+                    }
+                    delay = retry_delay_after_wake(delay, wake);
+                    continue;
                 }
-                delay = retry_delay_after_wake(delay, wake);
-                continue;
-            }
-        };
+            };
         if hello.server_id != entry.server_id {
-            publish_failure(
+            phase!(publish_failure(
                 &entry,
                 RemoteConnectionState::IdentityChanged,
                 &local,
                 &events,
-            )
-            .await;
+            ));
             let wake =
                 wait_terminal(&mut commands, &mut selected_chat, &entry.server_id, &events).await;
             if wake == RetryWake::Shutdown {
@@ -625,7 +662,7 @@ async fn supervise_remote(
                 entry.name.clone(),
                 state.clone(),
             )));
-            report(&entry, state, hello.protocol_version, &local).await;
+            phase!(report(&entry, state, hello.protocol_version, &local));
             let wake =
                 wait_terminal(&mut commands, &mut selected_chat, &entry.server_id, &events).await;
             if wake == RetryWake::Shutdown {
@@ -634,13 +671,12 @@ async fn supervise_remote(
             delay = retry_delay_after_wake(delay, wake);
             continue;
         }
-        report(
+        phase!(report(
             &entry,
             RemoteConnectionState::Online,
             hello.protocol_version,
             &local,
-        )
-        .await;
+        ));
         let session_started = std::time::Instant::now();
         let connected = supervise_connected(
             Arc::new(client),
@@ -656,13 +692,23 @@ async fn supervise_remote(
             Ok(ConnectedExit::Reconnect) => {
                 delay = INITIAL_RETRY_DELAY;
                 clear_selected_transcript(&entry.server_id, &selected_chat, &events);
-                publish_failure(&entry, RemoteConnectionState::Offline, &local, &events).await;
+                phase!(publish_failure(
+                    &entry,
+                    RemoteConnectionState::Offline,
+                    &local,
+                    &events
+                ));
                 continue;
             }
             Err(_) => {
                 delay = retry_delay_after_session(delay, session_started.elapsed());
                 clear_selected_transcript(&entry.server_id, &selected_chat, &events);
-                publish_failure(&entry, RemoteConnectionState::Offline, &local, &events).await;
+                phase!(publish_failure(
+                    &entry,
+                    RemoteConnectionState::Offline,
+                    &local,
+                    &events
+                ));
                 let wake = wait_transient(
                     delay,
                     &mut commands,
@@ -806,7 +852,90 @@ async fn report(
 mod tests {
     use super::*;
     use comet_proto::RemoteEndpoint;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct PhaseDrop(Arc<AtomicBool>);
+    impl Drop for PhaseDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct PhaseService {
+        hello: ServerHello,
+        stalled_method: Option<&'static str>,
+        started: Arc<tokio::sync::Notify>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl comet_rpc::RpcService for PhaseService {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<comet_rpc::RpcReply, comet_rpc::RpcError> {
+            if self.stalled_method == Some(method) {
+                let _guard = PhaseDrop(self.dropped.clone());
+                self.started.notify_waiters();
+                return futures::future::pending().await;
+            }
+            match method {
+                methods::SERVER_HELLO => comet_rpc::RpcReply::value(&self.hello),
+                methods::REPORT_REMOTE_STATUS => {
+                    comet_rpc::RpcReply::value(&serde_json::json!({"ok": true}))
+                }
+                other => Err(comet_rpc::RpcError::UnknownMethod(other.into())),
+            }
+        }
+    }
+
+    struct FirstClientConnector {
+        first: std::sync::Mutex<Option<RpcClient>>,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl RemoteConnector for FirstClientConnector {
+        fn connect<'a>(
+            &'a self,
+            _entry: &'a RemoteEntry,
+            _identity: &'a TlsIdentity,
+        ) -> BoxFuture<'a, Result<RpcClient, RemoteConnectError>> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let first = self.first.lock().unwrap().take();
+            Box::pin(async move {
+                match first {
+                    Some(client) => Ok(client),
+                    None => futures::future::pending().await,
+                }
+            })
+        }
+    }
+
+    fn phase_hello() -> ServerHello {
+        ServerHello {
+            protocol_version: PROTOCOL_VERSION,
+            server_id: ServerId::new(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+            device_id: "device-b".into(),
+            name: "Build".into(),
+            capabilities: Vec::new(),
+        }
+    }
+
+    fn phase_client(
+        stalled_method: Option<&'static str>,
+        started: Arc<tokio::sync::Notify>,
+        dropped: Arc<AtomicBool>,
+    ) -> RpcClient {
+        comet_rpc::memory_client(Arc::new(PhaseService {
+            hello: phase_hello(),
+            stalled_method,
+            started,
+            dropped,
+        }))
+    }
 
     fn entry(pin: &str, state: RemoteConnectionState) -> RemoteEntry {
         RemoteEntry {
@@ -1028,6 +1157,179 @@ mod tests {
             })
         );
         assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reconnect_interrupts_an_in_flight_transport_connect() {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        struct PendingConnector {
+            attempts: Arc<AtomicUsize>,
+            started: Arc<tokio::sync::Notify>,
+            first_dropped: Arc<AtomicBool>,
+        }
+        impl RemoteConnector for PendingConnector {
+            fn connect<'a>(
+                &'a self,
+                _entry: &'a RemoteEntry,
+                _identity: &'a TlsIdentity,
+            ) -> BoxFuture<'a, Result<RpcClient, RemoteConnectError>> {
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                self.started.notify_waiters();
+                let dropped = (attempt == 0).then(|| DropFlag(self.first_dropped.clone()));
+                Box::pin(async move {
+                    let _dropped = dropped;
+                    futures::future::pending().await
+                })
+            }
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let first_dropped = Arc::new(AtomicBool::new(false));
+        let connector = Arc::new(PendingConnector {
+            attempts: attempts.clone(),
+            started: started.clone(),
+            first_dropped: first_dropped.clone(),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let identity = DeviceIdentity::load_or_create(directory.path()).unwrap();
+        let tls = Arc::new(TlsIdentity::from_device_identity(&identity).unwrap());
+        struct UnusedService;
+        #[async_trait::async_trait]
+        impl comet_rpc::RpcService for UnusedService {
+            async fn handle(
+                &self,
+                method: &str,
+                _params: serde_json::Value,
+            ) -> Result<comet_rpc::RpcReply, comet_rpc::RpcError> {
+                Err(comet_rpc::RpcError::UnknownMethod(method.into()))
+            }
+        }
+        let local = Arc::new(comet_rpc::memory_client(Arc::new(UnusedService)));
+        let (events, _received) = mpsc::unbounded_channel();
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let task = tokio::spawn(supervise_remote(
+            entry(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                RemoteConnectionState::Offline,
+            ),
+            local,
+            tls,
+            connector,
+            events,
+            receiver,
+        ));
+        started.notified().await;
+        commands.send(SupervisorCommand::Reconnect).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(100), async {
+            while attempts.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        task.abort();
+        result.expect("reconnect did not interrupt the transport connect");
+        assert!(first_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn reconnect_interrupts_server_hello_and_cancels_server_work() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let connector = Arc::new(FirstClientConnector {
+            first: std::sync::Mutex::new(Some(phase_client(
+                Some(methods::SERVER_HELLO),
+                started.clone(),
+                dropped.clone(),
+            ))),
+            attempts: attempts.clone(),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let identity = DeviceIdentity::load_or_create(directory.path()).unwrap();
+        let tls = Arc::new(TlsIdentity::from_device_identity(&identity).unwrap());
+        let local = Arc::new(phase_client(
+            None,
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let (events, _received) = mpsc::unbounded_channel();
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let task = tokio::spawn(supervise_remote(
+            entry(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                RemoteConnectionState::Offline,
+            ),
+            local,
+            tls,
+            connector,
+            events,
+            receiver,
+        ));
+        started.notified().await;
+        commands.send(SupervisorCommand::Reconnect).unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(100), async {
+            while attempts.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        task.abort();
+        result.expect("reconnect did not interrupt SERVER_HELLO");
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn reconnect_interrupts_status_report_and_cancels_server_work() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let connector = Arc::new(FirstClientConnector {
+            first: std::sync::Mutex::new(Some(phase_client(
+                None,
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+            ))),
+            attempts: attempts.clone(),
+        });
+        let local = Arc::new(phase_client(
+            Some(methods::REPORT_REMOTE_STATUS),
+            started.clone(),
+            dropped.clone(),
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        let identity = DeviceIdentity::load_or_create(directory.path()).unwrap();
+        let tls = Arc::new(TlsIdentity::from_device_identity(&identity).unwrap());
+        let (events, _received) = mpsc::unbounded_channel();
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let task = tokio::spawn(supervise_remote(
+            entry(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                RemoteConnectionState::Offline,
+            ),
+            local,
+            tls,
+            connector,
+            events,
+            receiver,
+        ));
+        started.notified().await;
+        commands.send(SupervisorCommand::Reconnect).unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(100), async {
+            while attempts.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        task.abort();
+        result.expect("reconnect did not interrupt status reporting");
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
