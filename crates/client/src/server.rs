@@ -1,10 +1,10 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use comet_doc::SessionMessageEntry;
 use comet_proto::{Chat, Device, RemoteConnectionState, ServerHello, ServerRef, Session, Space};
 use comet_rpc::{RpcClient, RpcError, RpcStream, methods};
 use futures::future::BoxFuture;
-use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
 
 use crate::{FederationEvent, ServerState};
@@ -22,6 +22,25 @@ pub(crate) enum SupervisorCommand {
 pub(crate) enum ConnectedExit {
     Reconnect,
     Shutdown,
+}
+
+const MAX_QUEUED_CALLS: usize = 32;
+type GenericCall = (&'static str, serde_json::Value);
+
+fn start_call(
+    client: Arc<RpcClient>,
+    call: GenericCall,
+) -> BoxFuture<'static, Result<(), RpcError>> {
+    Box::pin(async move { client.call(call.0, call.1).await.map(|_| ()) })
+}
+
+async fn active_call_next(
+    active: &mut Option<BoxFuture<'static, Result<(), RpcError>>>,
+) -> Result<(), RpcError> {
+    match active {
+        Some(call) => call.await,
+        None => futures::future::pending().await,
+    }
 }
 
 fn decode<T: serde::de::DeserializeOwned>(
@@ -162,8 +181,8 @@ pub(crate) async fn supervise_connected(
             Phase::Ready(transcript) => transcript,
             Phase::Exit(exit) => return Ok(exit),
         };
-    let mut calls: FuturesUnordered<BoxFuture<'static, Result<(), RpcError>>> =
-        FuturesUnordered::new();
+    let mut active_call = None;
+    let mut queued_calls = VecDeque::<GenericCall>::new();
 
     let mut state = ServerState::empty(
         hello.server_id.clone(),
@@ -184,19 +203,33 @@ pub(crate) async fn supervise_connected(
                 let _ = events.send(FederationEvent::Transcript { chat: chat.clone(), entries });
                 continue;
             }
-            result = calls.next(), if !calls.is_empty() => {
-                if let Some(Err(error)) = result {
+            result = active_call_next(&mut active_call) => {
+                if let Err(error) = result {
                     let _ = events.send(FederationEvent::Notice {
                         server_id: hello.server_id.clone(),
                         message: error.to_string(),
                     });
                 }
+                active_call = queued_calls
+                    .pop_front()
+                    .map(|call| start_call(client.clone(), call));
                 continue;
             }
             command = commands.recv() => match command {
                 Some(SupervisorCommand::Call(method, params)) => {
-                    let client = client.clone();
-                    calls.push(Box::pin(async move { client.call(method, params).await.map(|_| ()) }));
+                    let call = (method, params);
+                    if active_call.is_none() {
+                        active_call = Some(start_call(client.clone(), call));
+                    } else if queued_calls.len() < MAX_QUEUED_CALLS {
+                        queued_calls.push_back(call);
+                    } else {
+                        let _ = events.send(FederationEvent::Notice {
+                            server_id: hello.server_id.clone(),
+                            message: format!(
+                                "cannot call {method}: generic RPC queue is full ({MAX_QUEUED_CALLS})"
+                            ),
+                        });
+                    }
                     continue;
                 }
                 Some(SupervisorCommand::WatchTranscript { chat_id, acknowledged }) => {
@@ -255,6 +288,14 @@ mod tests {
         Arc<tokio::sync::Notify>,
         Arc<AtomicBool>,
     );
+    type OrderedFixture = (
+        SupervisorTask,
+        mpsc::UnboundedSender<SupervisorCommand>,
+        mpsc::UnboundedReceiver<FederationEvent>,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    );
 
     struct DropFlag(Arc<AtomicBool>);
     impl Drop for DropFlag {
@@ -267,6 +308,43 @@ mod tests {
         stalled_method: &'static str,
         started: Arc<tokio::sync::Notify>,
         dropped: Arc<AtomicBool>,
+    }
+
+    struct OrderedCallService {
+        first_started: Arc<tokio::sync::Notify>,
+        release_first: Arc<tokio::sync::Notify>,
+        second_started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcService for OrderedCallService {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            match method {
+                methods::WATCH_DEVICES
+                | methods::WATCH_SPACES
+                | methods::WATCH_CHATS
+                | methods::WATCH_SESSIONS => Ok(RpcReply::Stream(
+                    futures::stream::once(async { serde_json::json!([]) })
+                        .chain(futures::stream::pending())
+                        .boxed(),
+                )),
+                "First" => {
+                    self.first_started.notify_one();
+                    self.release_first.notified().await;
+                    RpcReply::value(&true)
+                }
+                "Second" | "Queued" => {
+                    self.second_started.notify_one();
+                    RpcReply::value(&true)
+                }
+                "Fail" => Err(RpcError::Failed("ordered failure".into())),
+                other => Err(RpcError::UnknownMethod(other.into())),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -357,6 +435,26 @@ mod tests {
         (task, commands, event_rx)
     }
 
+    fn spawn_ordered() -> OrderedFixture {
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let second_started = Arc::new(tokio::sync::Notify::new());
+        let client = comet_rpc::memory_client(Arc::new(OrderedCallService {
+            first_started: first_started.clone(),
+            release_first: release_first.clone(),
+            second_started: second_started.clone(),
+        }));
+        let (task, commands, events) = spawn_with_client(client);
+        (
+            task,
+            commands,
+            events,
+            first_started,
+            release_first,
+            second_started,
+        )
+    }
+
     fn backpressured_client(capacity: usize, prefill: usize) -> RpcClient {
         let (out, outbound) = mpsc::channel(capacity);
         for _ in 0..prefill {
@@ -425,5 +523,113 @@ mod tests {
             matches!(result, Ok(Ok(Ok(ConnectedExit::Shutdown)))),
             "shutdown did not interrupt transcript subscription"
         );
+    }
+
+    #[tokio::test]
+    async fn generic_calls_preserve_fifo_execution_order() {
+        let (task, commands, mut events, first_started, release_first, second_started) =
+            spawn_ordered();
+        wait_online(&mut events).await;
+        commands
+            .send(SupervisorCommand::Call("First", serde_json::Value::Null))
+            .unwrap();
+        commands
+            .send(SupervisorCommand::Call("Second", serde_json::Value::Null))
+            .unwrap();
+        first_started.notified().await;
+        let second_was_early = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            second_started.notified(),
+        )
+        .await
+        .is_ok();
+        release_first.notify_one();
+        if !second_was_early {
+            second_started.notified().await;
+        }
+        commands.send(SupervisorCommand::Shutdown).unwrap();
+        let _ = task.await;
+        assert!(
+            !second_was_early,
+            "second call started before first completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_call_queue_overflow_emits_a_notice() {
+        let (task, commands, mut events, first_started, release_first, _second_started) =
+            spawn_ordered();
+        wait_online(&mut events).await;
+        commands
+            .send(SupervisorCommand::Call("First", serde_json::Value::Null))
+            .unwrap();
+        first_started.notified().await;
+        for _ in 0..65 {
+            commands
+                .send(SupervisorCommand::Call("Queued", serde_json::Value::Null))
+                .unwrap();
+        }
+        let overflow = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                if matches!(events.recv().await, Some(FederationEvent::Notice { message, .. }) if message.contains("queue is full")) {
+                    return;
+                }
+            }
+        })
+        .await;
+        release_first.notify_one();
+        commands.send(SupervisorCommand::Shutdown).unwrap();
+        let _ = task.await;
+        overflow.expect("unbounded generic call queue emitted no overflow notice");
+    }
+
+    #[tokio::test]
+    async fn reconnect_cancels_the_active_call_and_discards_its_fifo_queue() {
+        let (task, commands, mut events, first_started, _release_first, second_started) =
+            spawn_ordered();
+        wait_online(&mut events).await;
+        commands
+            .send(SupervisorCommand::Call("First", serde_json::Value::Null))
+            .unwrap();
+        commands
+            .send(SupervisorCommand::Call("Second", serde_json::Value::Null))
+            .unwrap();
+        first_started.notified().await;
+        commands.send(SupervisorCommand::Reconnect).unwrap();
+        assert!(matches!(task.await, Ok(Ok(ConnectedExit::Reconnect))));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                second_started.notified()
+            )
+            .await
+            .is_err(),
+            "queued call reached the server after reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_generic_call_emits_notice_then_promotes_the_fifo_head() {
+        let (task, commands, mut events, _first_started, _release_first, second_started) =
+            spawn_ordered();
+        wait_online(&mut events).await;
+        commands
+            .send(SupervisorCommand::Call("Fail", serde_json::Value::Null))
+            .unwrap();
+        commands
+            .send(SupervisorCommand::Call("Second", serde_json::Value::Null))
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                if matches!(events.recv().await, Some(FederationEvent::Notice { message, .. }) if message.contains("ordered failure")) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("failed generic call emitted no Notice");
+        second_started.notified().await;
+        commands.send(SupervisorCommand::Shutdown).unwrap();
+        let _ = task.await;
     }
 }

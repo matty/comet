@@ -20,26 +20,78 @@ struct Shared {
     pending: Mutex<HashMap<u64, Pending>>,
 }
 
+struct WriteRequest {
+    frame: String,
+    delivered: oneshot::Sender<Result<(), RpcError>>,
+}
+
 struct PendingGuard {
     id: u64,
     shared: Arc<Shared>,
-    out: mpsc::Sender<String>,
+    cancels: mpsc::Sender<String>,
+    writer: tokio::task::AbortHandle,
+    delivered: bool,
 }
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         let removed = self.shared.lock().remove(&self.id).is_some();
-        if removed && let Ok(frame) = cancel_frame(self.id) {
-            match self.out.try_send(frame) {
-                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-                Err(mpsc::error::TrySendError::Full(frame)) => {
-                    let out = self.out.clone();
-                    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                        runtime.spawn(async move {
-                            let _ = out.send(frame).await;
-                        });
-                    } else {
-                        let _ = out.blocking_send(frame);
+        if !removed {
+            return;
+        }
+        if !self.delivered {
+            self.writer.abort();
+            return;
+        }
+        if let Ok(frame) = cancel_frame(self.id)
+            && matches!(
+                self.cancels.try_send(frame),
+                Err(mpsc::error::TrySendError::Full(_))
+            )
+        {
+            self.writer.abort();
+        }
+    }
+}
+
+async fn run_writer(
+    transport: mpsc::Sender<String>,
+    mut requests: mpsc::Receiver<WriteRequest>,
+    mut cancels: mpsc::Receiver<String>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            cancel = cancels.recv() => match cancel {
+                Some(frame) => {
+                    if transport.try_send(frame).is_err() { return; }
+                    continue;
+                }
+                None => return,
+            },
+            request = requests.recv() => {
+                let Some(request) = request else { return; };
+                let WriteRequest { frame, delivered } = request;
+                let request_transport = transport.clone();
+                let send = request_transport.send(frame);
+                tokio::pin!(send);
+                loop {
+                    tokio::select! {
+                        biased;
+                        cancel = cancels.recv() => match cancel {
+                            Some(frame) if transport.try_send(frame.clone()).is_ok() => continue,
+                            Some(_) | None => {
+                                let _ = delivered.send(Err(RpcError::Closed));
+                                return;
+                            }
+                        },
+                        result = &mut send => {
+                            let result = result.map_err(|_| RpcError::Closed);
+                            let failed = result.is_err();
+                            let _ = delivered.send(result);
+                            if failed { return; }
+                            break;
+                        }
                     }
                 }
             }
@@ -67,10 +119,12 @@ impl Shared {
 /// A multiplexing RPC client over any string-frame duplex ([`crate::memory_client`] or
 /// [`connect_ws`]). Cheap to clone-by-Arc internally; use one per connection.
 pub struct RpcClient {
-    out: mpsc::Sender<String>,
+    requests: mpsc::Sender<WriteRequest>,
+    cancels: mpsc::Sender<String>,
     shared: Arc<Shared>,
     next_id: AtomicU64,
     reader: tokio::task::JoinHandle<()>,
+    writer: tokio::task::JoinHandle<()>,
 }
 
 impl RpcClient {
@@ -79,8 +133,10 @@ impl RpcClient {
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
         });
+        let (requests, request_rx) = mpsc::channel(256);
+        let (cancels, cancel_rx) = mpsc::channel(64);
+        let writer = tokio::spawn(run_writer(out, request_rx, cancel_rx));
         let reader_shared = shared.clone();
-        let reader_out = out.clone();
         let reader = tokio::spawn(async move {
             while let Some(payload) = inbound.recv().await {
                 for line in payload.lines() {
@@ -95,7 +151,7 @@ impl RpcClient {
                             continue;
                         }
                     };
-                    route_frame(&reader_shared, &reader_out, frame).await;
+                    route_frame(&reader_shared, frame);
                 }
             }
             // Connection closed: fail everything still pending.
@@ -111,10 +167,12 @@ impl RpcClient {
             }
         });
         Self {
-            out,
+            requests,
+            cancels,
             shared,
             next_id: AtomicU64::new(1),
             reader,
+            writer,
         }
     }
 
@@ -126,10 +184,12 @@ impl RpcClient {
     ) -> Result<serde_json::Value, RpcError> {
         let (tx, rx) = oneshot::channel();
         let id = self.register(Pending::Call(tx));
-        let _guard = PendingGuard {
+        let mut guard = PendingGuard {
             id,
             shared: self.shared.clone(),
-            out: self.out.clone(),
+            cancels: self.cancels.clone(),
+            writer: self.writer.abort_handle(),
+            delivered: false,
         };
         self.send(ClientFrame {
             id,
@@ -141,6 +201,7 @@ impl RpcClient {
         .inspect_err(|_| {
             self.shared.lock().remove(&id);
         })?;
+        guard.delivered = true;
         rx.await.map_err(|_| RpcError::Closed)?
     }
 
@@ -167,7 +228,9 @@ impl RpcClient {
         let guard = PendingGuard {
             id,
             shared: self.shared.clone(),
-            out: self.out.clone(),
+            cancels: self.cancels.clone(),
+            writer: self.writer.abort_handle(),
+            delivered: false,
         };
         self.send(ClientFrame {
             id,
@@ -179,6 +242,8 @@ impl RpcClient {
         .inspect_err(|_| {
             self.shared.lock().remove(&id);
         })?;
+        let mut guard = guard;
+        guard.delivered = true;
         Ok(RpcStream {
             inbound: rx,
             _guard: guard,
@@ -201,7 +266,15 @@ impl RpcClient {
     async fn send(&self, frame: ClientFrame) -> Result<(), RpcError> {
         let json = serde_json::to_string(&frame)
             .map_err(|e| RpcError::Transport(format!("serialize frame: {e}")))?;
-        self.out.send(json).await.map_err(|_| RpcError::Closed)
+        let (delivered, received) = oneshot::channel();
+        self.requests
+            .send(WriteRequest {
+                frame: json,
+                delivered,
+            })
+            .await
+            .map_err(|_| RpcError::Closed)?;
+        received.await.map_err(|_| RpcError::Closed)?
     }
 }
 
@@ -217,10 +290,11 @@ fn cancel_frame(id: u64) -> Result<String, serde_json::Error> {
 impl Drop for RpcClient {
     fn drop(&mut self) {
         self.reader.abort();
+        self.writer.abort();
     }
 }
 
-async fn route_frame(shared: &Arc<Shared>, out: &mpsc::Sender<String>, frame: ServerFrame) {
+fn route_frame(shared: &Arc<Shared>, frame: ServerFrame) {
     let id = frame.id;
     if let Some(err) = frame.err {
         match shared.lock().remove(&id) {
@@ -241,19 +315,8 @@ async fn route_frame(shared: &Arc<Shared>, out: &mpsc::Sender<String>, frame: Se
         return;
     }
     if let Some(item) = frame.item {
-        let dead = {
-            let pending = shared.lock();
-            match pending.get(&id) {
-                Some(Pending::Stream(tx)) => tx.send(item).is_err(),
-                _ => false,
-            }
-        };
-        if dead {
-            // Receiver was dropped — cancel server-side and forget the stream.
-            shared.lock().remove(&id);
-            if let Ok(json) = cancel_frame(id) {
-                let _ = out.send(json).await;
-            }
+        if let Some(Pending::Stream(tx)) = shared.lock().get(&id) {
+            let _ = tx.send(item);
         }
         return;
     }
@@ -306,4 +369,92 @@ pub async fn connect_ws(url: &str) -> Result<RpcClient, RpcError> {
         }
     });
     Ok(RpcClient::new(out_tx, in_rx))
+}
+
+#[cfg(test)]
+mod cancellation_backpressure_tests {
+    use std::future::Future;
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
+
+    use futures::task::noop_waker;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn dropping_many_calls_on_a_full_transport_is_prompt_and_closes_it() {
+        let (out, mut outbound) = mpsc::channel(1);
+        out.try_send("occupied".into()).unwrap();
+        let (inbound_sender, inbound) = mpsc::channel(1);
+        let client = RpcClient::new(out, inbound);
+        let mut calls: Vec<_> = (0..32)
+            .map(|_| Box::pin(client.call("Never", serde_json::Value::Null)))
+            .collect();
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+        for call in &mut calls {
+            assert!(matches!(call.as_mut().poll(&mut context), Poll::Pending));
+        }
+        let streams: Vec<_> = (0..32)
+            .map(|_| {
+                let (sender, inbound) = mpsc::unbounded_channel();
+                let id = client.register(Pending::Stream(sender));
+                RpcStream {
+                    inbound,
+                    _guard: PendingGuard {
+                        id,
+                        shared: client.shared.clone(),
+                        cancels: client.cancels.clone(),
+                        writer: client.writer.abort_handle(),
+                        delivered: true,
+                    },
+                }
+            })
+            .collect();
+        assert_eq!(client.shared.lock().len(), calls.len() + streams.len());
+
+        let started = Instant::now();
+        drop(calls);
+        drop(streams);
+        assert!(started.elapsed() < Duration::from_millis(20));
+        assert!(client.shared.lock().is_empty());
+        assert_eq!(outbound.recv().await.as_deref(), Some("occupied"));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(50), outbound.recv())
+                .await
+                .expect("full cancel queue did not close the transport"),
+            None
+        );
+        drop(inbound_sender);
+    }
+
+    #[test]
+    fn dropping_with_a_full_transport_outside_a_runtime_is_prompt() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let writer = runtime.spawn(futures::future::pending::<()>());
+        let (cancels, _cancel_rx) = mpsc::channel(1);
+        cancels.try_send("occupied".into()).unwrap();
+        let shared = Arc::new(Shared {
+            pending: Mutex::new(HashMap::from([(
+                1,
+                Pending::Stream(mpsc::unbounded_channel().0),
+            )])),
+        });
+        let guard = PendingGuard {
+            id: 1,
+            shared,
+            cancels,
+            writer: writer.abort_handle(),
+            delivered: true,
+        };
+        let (finished, received) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            drop(guard);
+            let _ = finished.send(());
+        });
+
+        let prompt = received.recv_timeout(Duration::from_millis(50)).is_ok();
+        thread.join().unwrap();
+        assert!(prompt, "PendingGuard::drop blocked outside a runtime");
+    }
 }
