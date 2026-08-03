@@ -4,9 +4,9 @@
 //! already knows how to run without a UI (`comet headless`, ARCHITECTURE §1
 //! "Headed / headless"), so the TUI never embeds one the way the gpui app can:
 //! it is always a thin client over localhost RPC. That single decision buys the
-//! herdr property — agents keep running, docs keep syncing, and the DeviceRoom
-//! stays joined when you close the terminal, because the process doing that
-//! work was never the process drawing frames.
+//! desired property — agents keep running in the authoritative local engine
+//! when you close the terminal, because the process doing that work was never
+//! the process drawing frames.
 //!
 //! Two paths:
 //!

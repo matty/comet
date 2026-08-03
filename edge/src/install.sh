@@ -3,10 +3,11 @@
 #
 #   curl -fsSL https://comet.zeron.sh/install.sh | sh
 #
-# Uses Python 3 only while installing to strictly validate signed release
-# metadata. Installs the self-contained native binary (no runtime deps) to
-# ~/.comet-native/app, puts `comet` on PATH, and runs it as a systemd user
-# service that survives reboots. Re-running
+# Uses Python 3 only while installing to strictly validate release metadata.
+# Installs the self-contained native binary (no runtime deps) to
+# ~/.comet-native/app, puts `comet` on PATH, and, because this installer targets
+# headless Linux hosts, installs it as a systemd user service. Desktop and TUI
+# use do not otherwise require an installed daemon. Re-running
 # upgrades in place; ~/.comet-native state is preserved.
 #
 # Release distribution is separate from local/LAN operation. Override only the

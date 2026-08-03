@@ -612,10 +612,12 @@ impl Updater {
         tokio::time::sleep(CHECK_INITIAL_DELAY).await;
         loop {
             let ok = self.check_once().await;
-            if ok && self.status_tx.borrow().update_available && auto_update_enabled() {
-                if let InstallKind::Managed { .. } = detect_install() {
-                    self.auto_apply_when_idle().await;
-                }
+            if ok
+                && self.status_tx.borrow().update_available
+                && auto_update_enabled()
+                && let InstallKind::Managed { .. } = detect_install()
+            {
+                self.auto_apply_when_idle().await;
             }
             tokio::time::sleep(if ok { CHECK_INTERVAL } else { CHECK_RETRY }).await;
         }

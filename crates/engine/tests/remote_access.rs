@@ -427,9 +427,9 @@ async fn revoking_a_trusted_client_closes_its_active_connection() {
 }
 
 #[tokio::test]
-async fn host_relay_service_denies_local_administration() {
+async fn lan_service_denies_local_administration() {
     let fixture = EngineFixture::start().await;
-    let relay = fixture.core.remote_rpc_service();
+    let lan = fixture.core.remote_rpc_service();
     for method in [
         methods::WATCH_REMOTES,
         methods::PUT_REMOTE,
@@ -442,12 +442,11 @@ async fn host_relay_service_denies_local_administration() {
         methods::WATCH_TRUSTED_CLIENTS,
         methods::REVOKE_TRUSTED_CLIENT,
     ] {
-        let error = rpc_error(relay.handle(method, serde_json::json!({})).await);
+        let error = rpc_error(lan.handle(method, serde_json::json!({})).await);
         assert!(matches!(error, RpcError::UnknownMethod(ref denied) if denied == method));
     }
     assert!(
-        relay
-            .handle(methods::LOCAL_DEVICE, serde_json::json!({}))
+        lan.handle(methods::LOCAL_DEVICE, serde_json::json!({}))
             .await
             .is_ok()
     );

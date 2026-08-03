@@ -15,8 +15,8 @@
 //! you close it, the SSH session drops, the laptop lid shuts. So `comet-tui`
 //! attaches to a daemon and starts a detached one if there isn't one
 //! ([`daemon`]). Quitting the viewport is then genuinely *detaching* — agents
-//! keep running, docs keep syncing, the DeviceRoom stays joined — and
-//! reattaching is instant because nothing had to be rebuilt.
+//! keep running in the authoritative local engine, and reattaching is instant
+//! because nothing had to be rebuilt.
 //!
 //! ## Where the performance comes from
 //!
