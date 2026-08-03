@@ -70,3 +70,28 @@ Commit: `35b78eb482c7652789bbf9f2696a86172884372e`
 
 - Request responders are cancelled structurally: reconnect drains active/queued requests with `RpcError::Closed`; shutdown or supervisor loss drops the oneshot and the public adapter maps that to `Closed`.
 - TUI adapter tests exercise the actual `FederationCommand::Request` channel boundary and ordered reply handling. They do not launch a real daemon-backed `EngineLink`; the full daemon smoke path remains unavailable on this Windows worker.
+
+## Fix Round 2
+
+Commit: `14e6f7643abde3ae077c165f94a0c5fddb7e4547`
+
+### RED evidence
+
+- `cargo test -p comet-tui --test render action_open_on_duplicate -- --nocapture`: the chat case failed because `open_row` changed `selected_server_id` before calling raw `select_chat`, whose equal raw ID early-returned without a transcript watch.
+- Delayed completion/reply tests failed compilation because `StartSession`, `ListModels`, and `ListRefs` had no request generation and the corresponding server-qualified update variants did not exist.
+- A stale request-error test failed compilation because model/ref failures still used unqualified `Update::Notice`.
+
+### GREEN changes
+
+- `Action::Open` and click now route chat rows through `select_server_chat` and space rows through `activate_server_space`; no qualified row is split into a server mutation followed by raw selection.
+- Drafts and picker/ref requests mint UUID generations. Runtime `SessionStarted`, model, ref, request-failure, and start-failure updates carry both authoritative server/chat and the exact generation.
+- The reducer accepts a completion only while its originating pending start, overlay, or draft request is still current. Delayed B results cannot clear or populate a newer C draft/picker, including stale failures.
+- Session-start failure removes only its qualified optimistic echo/pending target and never clears another server's draft.
+
+### Verification
+
+- `cargo test -p comet-client`: 26 unit + 23 integration tests passed.
+- `cargo test -p comet-tui`: 84 unit/adapter + 77 render tests passed; one intentional frame dump ignored; doc tests passed.
+- `cargo clippy -p comet-client -p comet-tui --tests -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- Smoke was attempted again and remains blocked before startup by the Windows worker lacking Unix `fcntl`.
