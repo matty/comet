@@ -219,6 +219,7 @@ pub enum Hit {
 /// choice is made *before* anything exists to be wrong about.
 #[derive(Debug, Clone)]
 pub struct Draft {
+    pub server_id: ServerId,
     pub generation: String,
     pub refs_request_id: Option<String>,
     pub space_id: String,
@@ -420,7 +421,7 @@ pub struct App {
 
     /// A chat this viewport just created, with when it asked. Exempt from
     /// selection healing until its row arrives — see `heal_chat_selection`.
-    pending_chat: Option<(String, std::time::Instant)>,
+    pending_chat: Option<(ServerRef, std::time::Instant)>,
     /// Starts may be in flight on several servers at once. The request UUID is
     /// the identity; the qualified chat/space keep late replies scoped to the
     /// provisional context that originated them.
@@ -597,7 +598,10 @@ impl App {
                 // The draft became real: adopt it as the open session. The chats
                 // frame that materializes the row follows.
                 self.draft = None;
-                self.pending_chat = Some((chat_id.clone(), std::time::Instant::now()));
+                self.pending_chat = Some((
+                    ServerRef::new(self.current_server_id(), chat_id.clone()),
+                    std::time::Instant::now(),
+                ));
                 let effects = self.select_chat(Some(chat_id));
                 self.rebuild_rows();
                 effects
@@ -613,7 +617,7 @@ impl App {
                 let pending = self.pending_starts.remove(&request_id).unwrap();
                 debug_assert_eq!(pending.space.server_id, chat.server_id);
                 if self.selected_chat_ref().as_ref() == Some(&chat) {
-                    self.pending_chat = Some((chat.local_id.clone(), std::time::Instant::now()));
+                    self.pending_chat = Some((chat.clone(), std::time::Instant::now()));
                     self.rebuild_rows();
                 }
                 Vec::new()
@@ -675,12 +679,11 @@ impl App {
                 message_id,
                 error,
             } => {
-                let restored = self.drop_echo_ref(&chat, &message_id);
-                if self.selected_chat_ref().as_ref() == Some(&chat)
-                    && let Some(text) = restored
-                    && self.composer.is_empty()
-                {
-                    self.composer.set_text(text);
+                let Some(restored) = self.drop_echo_ref(&chat, &message_id) else {
+                    return Vec::new();
+                };
+                if self.selected_chat_ref().as_ref() == Some(&chat) && self.composer.is_empty() {
+                    self.composer.set_text(restored);
                 }
                 self.transcript_stale = true;
                 self.notify(format!("Couldn't send: {error}"));
@@ -761,11 +764,11 @@ impl App {
                 self.heal_chat_selection()
             }
             FederationEvent::ServerRemoved(id) => {
+                let effects = self.purge_server_state(&id);
                 self.servers
                     .apply(FederationEvent::ServerRemoved(id.clone()));
                 if self.selected_server_id.as_ref() == Some(&id) {
                     self.selected_server_id = self.servers.servers().next().map(|s| s.id.clone());
-                    self.selected_space = None;
                     if self.selected_server_id.is_some() {
                         self.load_selected_server();
                     } else {
@@ -774,13 +777,11 @@ impl App {
                         self.chats.clear();
                         self.sessions.clear();
                     }
-                    self.doc_entries.clear();
-                    let effects = self.select_chat(None);
                     self.rebuild_rows();
                     return effects;
                 }
                 self.rebuild_rows();
-                Vec::new()
+                effects
             }
             FederationEvent::Transcript { chat, entries } => {
                 if self.selected_chat_ref().as_ref() == Some(&chat) {
@@ -810,6 +811,77 @@ impl App {
         self.spaces.clone_from(&server.spaces);
         self.chats.clone_from(&server.chats);
         self.sessions.clone_from(&server.sessions);
+    }
+
+    /// Forget every UI-owned context whose authority was the removed server.
+    /// This runs while the old server is still selected, before choosing a
+    /// fallback bucket, so raw IDs can never make state migrate between peers.
+    fn purge_server_state(&mut self, server_id: &ServerId) -> Effects {
+        let selected_removed = self.selected_server_id.as_ref() == Some(server_id);
+        let draft_removed = self
+            .draft
+            .as_ref()
+            .is_some_and(|draft| &draft.server_id == server_id);
+
+        self.last_visited
+            .retain(|space, chat| &space.server_id != server_id && &chat.server_id != server_id);
+        self.echoes.retain(|chat, _| &chat.server_id != server_id);
+        self.pending_starts.retain(|_, pending| {
+            &pending.chat.server_id != server_id && &pending.space.server_id != server_id
+        });
+        if self
+            .pending_chat
+            .as_ref()
+            .is_some_and(|(chat, _)| &chat.server_id == server_id)
+        {
+            self.pending_chat = None;
+        }
+        // Hit indices point into the pre-removal row list. Even removing an
+        // unselected server can shift every following row.
+        self.hits.clear();
+
+        let overlay_removed = match self.overlay.as_ref() {
+            Some(Overlay::Models {
+                server_id: owner, ..
+            }) => owner == server_id,
+            Some(Overlay::Prompt { action, .. }) => match action {
+                PromptAction::RenameChat(target) | PromptAction::RenameSpace(target) => {
+                    &target.server_id == server_id
+                }
+            },
+            Some(Overlay::Menu { items, .. }) => items.iter().any(|item| match &item.action {
+                MenuAction::RenameChat(target)
+                | MenuAction::SetArchived(target, _)
+                | MenuAction::DeleteChat(target)
+                | MenuAction::RenameSpace(target)
+                | MenuAction::DeleteSpace(target) => &target.server_id == server_id,
+                MenuAction::PickModel => false,
+            }),
+            Some(Overlay::Refs { .. } | Overlay::Checkout { .. } | Overlay::Reasoning { .. }) => {
+                draft_removed || selected_removed
+            }
+            None => false,
+        };
+        if overlay_removed {
+            self.overlay = None;
+        }
+        if draft_removed {
+            self.draft = None;
+        }
+
+        if !selected_removed {
+            return Vec::new();
+        }
+        self.selected_space = None;
+        self.doc_entries.clear();
+        self.transcript_stale = true;
+        self.composer = Composer::default();
+        if self.selected_chat.is_some() {
+            self.select_chat(None)
+        } else {
+            self.transcript.retarget(None);
+            vec![Command::WatchTranscript(None)]
+        }
     }
 
     fn current_server_id(&self) -> ServerId {
@@ -1224,13 +1296,14 @@ impl App {
         // user off the session they just opened and back onto the previous one —
         // so the pending id is exempt until it appears (or the wait times out,
         // which is how a *failed* createChat still recovers).
-        if let Some((id, since)) = &self.pending_chat {
+        if let Some((pending, since)) = &self.pending_chat {
             // Settled either way once the row lands or the wait runs out.
-            let settled = self.chats.iter().any(|chat| &chat.id == id)
+            let settled = (pending.server_id == self.current_server_id()
+                && self.chats.iter().any(|chat| chat.id == pending.local_id))
                 || since.elapsed() > PENDING_CHAT_GRACE;
             if settled {
                 self.pending_chat = None;
-            } else if self.selected_chat.as_deref() == Some(id.as_str()) {
+            } else if self.selected_chat_ref().as_ref() == Some(pending) {
                 return Vec::new();
             }
         }
@@ -1293,6 +1366,7 @@ impl App {
     fn new_session_in(&mut self, space_id: String) -> Effects {
         self.selected_space = Some(space_id.clone());
         self.draft = Some(Draft {
+            server_id: self.current_server_id(),
             generation: uuid::Uuid::new_v4().to_string(),
             refs_request_id: None,
             space_id: space_id.clone(),
@@ -1552,7 +1626,10 @@ impl App {
         // Show the echo under the id the session will have, so the transcript
         // does not blink when the row arrives.
         self.draft = None;
-        self.pending_chat = Some((chat_id.clone(), std::time::Instant::now()));
+        self.pending_chat = Some((
+            ServerRef::new(self.current_server_id(), chat_id.clone()),
+            std::time::Instant::now(),
+        ));
         let chat_ref = ServerRef::new(self.current_server_id(), chat_id.clone());
         self.pending_starts.insert(
             draft.generation.clone(),
@@ -2807,7 +2884,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comet_proto::{SessionStatus, view::ConnectionStatus};
+    use comet_client::ServerState;
+    use comet_proto::{RemoteConnectionState, SessionStatus, view::ConnectionStatus};
 
     /// Long enough that it wraps differently at 60 and at 30 columns, which is
     /// what the resize-invalidation test actually needs to observe.
@@ -2866,6 +2944,237 @@ mod tests {
             chat("c2", "s1", 2),
         ]));
         app
+    }
+
+    fn remote_state(id: &str, space_id: &str, chats: Vec<Chat>) -> ServerState {
+        let mut state = ServerState::empty(
+            ServerId::new(id),
+            format!("server {id}"),
+            RemoteConnectionState::Online,
+        );
+        state.spaces.push(space(space_id, "/dev/comet", 0));
+        state.chats = chats;
+        state
+    }
+
+    fn command_request_ids(effects: Effects) -> (Option<String>, Option<String>) {
+        let mut refs = None;
+        let mut models = None;
+        for effect in effects {
+            match effect {
+                Command::ListRefs { request_id, .. } => refs = Some(request_id),
+                Command::ListModels { request_id, .. } => models = Some(request_id),
+                _ => {}
+            }
+        }
+        (refs, models)
+    }
+
+    #[test]
+    fn removing_a_drafts_server_cannot_migrate_it_to_a_duplicate_fallback_space() {
+        let mut app = App::with_theme(crate::theme::Theme::dark());
+        app.apply(FederationEvent::ServerChanged(remote_state(
+            "c",
+            "space-x",
+            Vec::new(),
+        )));
+        app.apply(FederationEvent::ServerChanged(remote_state(
+            "b",
+            "space-x",
+            Vec::new(),
+        )));
+        app.activate_server_space(ServerRef::new(ServerId::new("b"), "space-x"));
+        app.composer.set_text("must not migrate");
+        app.open_model_picker();
+
+        let effects = app.apply(FederationEvent::ServerRemoved(ServerId::new("b")));
+
+        assert_eq!(app.selected_server_id.as_ref(), Some(&ServerId::new("c")));
+        assert_eq!(app.selected_chat_ref(), None);
+        assert!(app.selected_space.is_none());
+        assert!(app.draft.is_none());
+        assert!(app.overlay.is_none());
+        assert!(app.composer.is_empty());
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Command::WatchTranscript(None)))
+        );
+
+        app.composer.set_text("still must not migrate");
+        let send = app.act(Action::Send);
+        assert!(
+            !send
+                .iter()
+                .any(|effect| matches!(effect, Command::StartSession(_) | Command::Send { .. }))
+        );
+        assert!(app.draft.is_none());
+    }
+
+    #[test]
+    fn removal_purges_only_the_removed_servers_qualified_transients() {
+        let mut app = App::with_theme(crate::theme::Theme::dark());
+        let b = ServerId::new("b");
+        let c = ServerId::new("c");
+        app.apply(FederationEvent::ServerChanged(remote_state(
+            "c",
+            "s1",
+            vec![chat("c-chat", "s1", 0)],
+        )));
+        app.apply(FederationEvent::ServerChanged(remote_state(
+            "b",
+            "s1",
+            vec![chat("b-chat", "s1", 0)],
+        )));
+        app.act(Action::NewSession);
+        app.composer.set_text("keep c draft");
+
+        let b_space = ServerRef::new(b.clone(), "s1");
+        let b_chat = ServerRef::new(b.clone(), "b-chat");
+        let c_space = ServerRef::new(c.clone(), "s1");
+        let c_chat = ServerRef::new(c.clone(), "c-chat");
+        app.last_visited.insert(b_space.clone(), b_chat.clone());
+        app.last_visited.insert(c_space.clone(), c_chat.clone());
+        app.last_visited
+            .insert(ServerRef::new(c.clone(), "foreign"), b_chat.clone());
+        app.echoes.insert(b_chat.clone(), Vec::new());
+        app.echoes.insert(c_chat.clone(), Vec::new());
+        app.pending_starts.insert(
+            "b-request".into(),
+            PendingStart {
+                chat: b_chat.clone(),
+                message_id: "b-message".into(),
+                space: b_space.clone(),
+            },
+        );
+        app.pending_starts.insert(
+            "c-request".into(),
+            PendingStart {
+                chat: c_chat.clone(),
+                message_id: "c-message".into(),
+                space: c_space.clone(),
+            },
+        );
+        app.pending_chat = Some((b_chat.clone(), std::time::Instant::now()));
+        app.overlay = Some(Overlay::Prompt {
+            title: "Rename session".into(),
+            input: Composer::default(),
+            action: PromptAction::RenameChat(b_chat.clone()),
+        });
+        app.hits
+            .push((ratatui::layout::Rect::new(0, 0, 1, 1), Hit::Overlay));
+
+        app.apply(FederationEvent::ServerRemoved(b.clone()));
+
+        assert!(
+            !app.last_visited
+                .iter()
+                .any(|(key, value)| key.server_id == b || value.server_id == b)
+        );
+        assert!(!app.echoes.keys().any(|key| key.server_id == b));
+        assert!(
+            !app.pending_starts
+                .values()
+                .any(|pending| pending.chat.server_id == b || pending.space.server_id == b)
+        );
+        assert!(app.pending_chat.is_none());
+        assert!(app.overlay.is_none());
+        assert!(app.hits.is_empty());
+        assert_eq!(app.draft.as_ref().map(|draft| &draft.server_id), Some(&c));
+        assert_eq!(app.composer.text(), "keep c draft");
+        assert!(app.last_visited.get(&c_space) == Some(&c_chat));
+        assert!(app.echoes.contains_key(&c_chat));
+        assert!(app.pending_starts.contains_key("c-request"));
+    }
+
+    #[test]
+    fn readded_server_ignores_replies_from_its_removed_incarnation() {
+        let mut app = App::with_theme(crate::theme::Theme::dark());
+        let b = ServerId::new("b");
+        app.apply(FederationEvent::ServerChanged(remote_state(
+            "b",
+            "s1",
+            Vec::new(),
+        )));
+        app.activate_server_space(ServerRef::new(b.clone(), "s1"));
+        app.open_ref_picker();
+        let old_refs = app
+            .draft
+            .as_ref()
+            .and_then(|draft| draft.refs_request_id.clone())
+            .unwrap();
+        let (_, old_models) = command_request_ids(app.open_model_picker());
+        let old_models = old_models.unwrap();
+        app.close_overlay();
+        app.composer.set_text("old start");
+        let (old_chat, old_start, old_message) = app
+            .act(Action::Send)
+            .into_iter()
+            .find_map(|effect| match effect {
+                Command::StartSession(start) => Some((
+                    ServerRef::new(start.server_id.clone(), start.chat_id.clone()),
+                    start.request_id.clone(),
+                    start.message_id.clone(),
+                )),
+                _ => None,
+            })
+            .unwrap();
+
+        app.apply(FederationEvent::ServerRemoved(b.clone()));
+        let mut reincarnated = remote_state("b", "s1", Vec::new());
+        let mut materialized = chat(&old_chat.local_id, "s1", 0);
+        materialized.title = Some("new incarnation".into());
+        reincarnated.chats.push(materialized);
+        app.apply(FederationEvent::ServerChanged(reincarnated));
+        app.select_server_chat(old_chat.clone());
+        app.composer.set_text("new context");
+
+        app.apply(Update::FederatedStartFailed {
+            chat: old_chat.clone(),
+            request_id: old_start.clone(),
+            message_id: old_message.clone(),
+            error: "late start failure".into(),
+        });
+        app.apply(Update::FederatedSessionStarted {
+            chat: old_chat.clone(),
+            request_id: old_start,
+        });
+        app.apply(Update::FederatedSendFailed {
+            chat: old_chat.clone(),
+            message_id: old_message,
+            error: "late send failure".into(),
+        });
+        assert_eq!(app.selected_chat_ref(), Some(old_chat));
+        assert_eq!(app.composer.text(), "new context");
+        assert!(app.notice.is_none());
+
+        app.act(Action::NewSession);
+        let new_refs = app.draft.as_ref().unwrap().refs_request_id.clone().unwrap();
+        let (_, new_models) = command_request_ids(app.open_model_picker());
+        let new_models = new_models.unwrap();
+        assert_ne!(new_refs, old_refs);
+        assert_ne!(new_models, old_models);
+        app.apply(Update::FederatedRefs {
+            server_id: b.clone(),
+            request_id: old_refs,
+            refs: Vec::new(),
+        });
+        app.apply(Update::FederatedModels {
+            server_id: b.clone(),
+            request_id: old_models,
+            models: Vec::new(),
+        });
+        app.apply(Update::FederatedRequestFailed {
+            server_id: b,
+            request_id: "removed-request".into(),
+            message: "late request failure".into(),
+        });
+        assert!(app.draft.as_ref().unwrap().refs.is_none());
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Models { models: None, .. })
+        ));
+        assert!(app.notice.is_none());
     }
 
     fn is_watch(command: &Command, expected: Option<&str>) -> bool {
