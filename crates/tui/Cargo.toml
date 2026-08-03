@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 comet-proto.workspace = true
+comet-client.workspace = true
 comet-doc.workspace = true
 comet-rpc.workspace = true
 tokio.workspace = true

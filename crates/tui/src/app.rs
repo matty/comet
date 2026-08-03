@@ -16,13 +16,15 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
+use comet_client::{FederationEvent, ServerSnapshot};
 use comet_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use comet_proto::view::{
     self, CheckoutKind, CheckoutPlan, ConnectionStatus, GatePhase, Indicator, display_status,
     format_time_ago,
 };
 use comet_proto::{
-    AuthState, Chat, ChatIndicator, Device, RunRequest, SandboxLevel, Session, Space,
+    AuthState, Chat, ChatIndicator, Device, RunRequest, SandboxLevel, ServerId, ServerRef, Session,
+    Space,
 };
 use comet_rpc::methods;
 
@@ -104,6 +106,8 @@ const PENDING_CHAT_GRACE: std::time::Duration = std::time::Duration::from_secs(1
 /// transcript ([`App::tabs`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
+    /// An authoritative engine. Remote rows persist while their children do not.
+    Server { name: String, status: String },
     /// A section header: label left, optional affordance right.
     Section {
         label: String,
@@ -111,6 +115,7 @@ pub enum Row {
     },
     /// A space: folder name plus the device hosting it.
     Space {
+        server_id: Option<ServerId>,
         id: String,
         label: String,
         device: String,
@@ -121,6 +126,7 @@ pub enum Row {
     },
     /// A session: dot + title + time, then an indented "space@device".
     Chat {
+        server_id: Option<ServerId>,
         id: String,
         space_id: Option<String>,
         title: String,
@@ -363,6 +369,10 @@ pub struct App {
     pub sessions: Vec<Session>,
     pub local_device_id: Option<String>,
 
+    /// Authoritative per-server buckets in local-first registry order.
+    pub servers: ServerSnapshot,
+    selected_server_id: Option<ServerId>,
+
     pub selected_space: Option<String>,
     pub selected_chat: Option<String>,
     /// A session being composed. Mutually exclusive with `selected_chat`.
@@ -436,6 +446,8 @@ impl App {
             chats: Vec::new(),
             sessions: Vec::new(),
             local_device_id: None,
+            servers: ServerSnapshot::default(),
+            selected_server_id: None,
             selected_space: None,
             selected_chat: None,
             draft: None,
@@ -470,8 +482,10 @@ impl App {
     // Engine updates
     // -----------------------------------------------------------------------
 
-    pub fn apply(&mut self, update: Update) -> Effects {
+    pub fn apply(&mut self, update: impl Into<Update>) -> Effects {
+        let update = update.into();
         match update {
+            Update::Federation(event) => self.apply_federation(event),
             Update::Connection(status) => {
                 self.connection = status;
                 // The device row's presence dot follows the connection.
@@ -588,6 +602,94 @@ impl App {
         }
     }
 
+    fn apply_federation(&mut self, event: FederationEvent) -> Effects {
+        match event {
+            FederationEvent::ServerChanged(mut server) => {
+                view::sort_spaces(&mut server.spaces);
+                view::sort_chats(&mut server.chats);
+                let id = server.id.clone();
+                self.servers.apply(FederationEvent::ServerChanged(server));
+                if self.selected_server_id.is_none() {
+                    self.selected_server_id = Some(id.clone());
+                }
+                if self.selected_server_id.as_ref() == Some(&id) {
+                    self.load_selected_server();
+                }
+                self.rebuild_rows();
+                self.heal_space_selection();
+                self.heal_chat_selection()
+            }
+            FederationEvent::ServerRemoved(id) => {
+                self.servers
+                    .apply(FederationEvent::ServerRemoved(id.clone()));
+                if self.selected_server_id.as_ref() == Some(&id) {
+                    self.selected_server_id = self.servers.servers().next().map(|s| s.id.clone());
+                    self.selected_space = None;
+                    self.selected_chat = None;
+                    self.load_selected_server();
+                }
+                self.rebuild_rows();
+                Vec::new()
+            }
+            FederationEvent::Transcript { chat, entries } => {
+                if self.selected_chat_ref().as_ref() == Some(&chat) {
+                    self.apply(Update::Transcript {
+                        chat_id: chat.local_id,
+                        entries,
+                    })
+                } else {
+                    Vec::new()
+                }
+            }
+            FederationEvent::Notice { message, .. } => {
+                self.notify(message);
+                Vec::new()
+            }
+        }
+    }
+
+    fn load_selected_server(&mut self) {
+        let Some(id) = self.selected_server_id.as_ref() else {
+            return;
+        };
+        let Some(server) = self.servers.server(id) else {
+            return;
+        };
+        self.devices.clone_from(&server.devices);
+        self.spaces.clone_from(&server.spaces);
+        self.chats.clone_from(&server.chats);
+        self.sessions.clone_from(&server.sessions);
+    }
+
+    fn current_server_id(&self) -> ServerId {
+        self.selected_server_id
+            .clone()
+            .unwrap_or_else(|| ServerId::new("local"))
+    }
+
+    pub fn selected_chat_ref(&self) -> Option<ServerRef> {
+        Some(ServerRef::new(
+            self.selected_server_id.clone()?,
+            self.selected_chat.clone()?,
+        ))
+    }
+
+    pub fn select_server_chat(&mut self, chat: ServerRef) -> Effects {
+        self.selected_server_id = Some(chat.server_id.clone());
+        self.load_selected_server();
+        if let Some(space_id) = self
+            .chats
+            .iter()
+            .find(|row| row.id == chat.local_id)
+            .and_then(|row| row.space_id.clone())
+        {
+            self.selected_space = Some(space_id);
+        }
+        let effects = self.select_chat(Some(chat.local_id));
+        self.rebuild_rows();
+        effects
+    }
+
     // -----------------------------------------------------------------------
     // Actions
     // -----------------------------------------------------------------------
@@ -654,7 +756,7 @@ impl App {
                 }
                 Vec::new()
             }
-            Action::Reconnect => vec![Command::Reconnect],
+            Action::Reconnect => vec![Command::Reconnect(self.current_server_id())],
 
             // Blanks, section headers and the user row are decoration: the
             // cursor steps over them rather than stopping on nothing.
@@ -780,15 +882,31 @@ impl App {
 
     fn open_row(&mut self) -> Effects {
         match self.rows.get(self.cursor).cloned() {
-            Some(Row::Space { id, .. }) => self.activate_space(id),
+            Some(Row::Space { server_id, id, .. }) => {
+                if let Some(server_id) = server_id {
+                    self.selected_server_id = Some(server_id);
+                    self.load_selected_server();
+                }
+                self.activate_space(id)
+            }
             // Decoration isn't selectable, so nothing else can be under the
             // cursor; a defensive arm keeps this total.
             Some(Row::Blank)
+            | Some(Row::Server { .. })
             | Some(Row::Section { .. })
             | Some(Row::Empty { .. })
             | Some(Row::User { .. })
             | None => Vec::new(),
-            Some(Row::Chat { id, space_id, .. }) => {
+            Some(Row::Chat {
+                server_id,
+                id,
+                space_id,
+                ..
+            }) => {
+                if let Some(server_id) = server_id {
+                    self.selected_server_id = Some(server_id);
+                    self.load_selected_server();
+                }
                 if space_id.is_some() {
                     self.selected_space = space_id.clone();
                 }
@@ -860,7 +978,11 @@ impl App {
         }
         self.transcript.retarget(chat_id.clone());
         self.transcript_stale = true;
-        let mut effects = vec![Command::WatchTranscript(chat_id.clone())];
+        let mut effects = vec![Command::WatchTranscript(
+            chat_id
+                .clone()
+                .map(|id| ServerRef::new(self.current_server_id(), id)),
+        )];
         // Clear the "completed (unseen)" badge everywhere — the marker is a
         // synced LWW field, so reading here reads on every device.
         if let Some(chat_id) = chat_id
@@ -870,6 +992,7 @@ impl App {
                 .any(|chat| chat.id == chat_id && chat.unseen())
         {
             effects.push(Command::Call {
+                server_id: self.current_server_id(),
                 method: methods::MUTATE,
                 params: serde_json::json!({ "op": "markChatSeen", "chatId": chat_id }),
                 context: "Couldn't mark the session read",
@@ -981,20 +1104,11 @@ impl App {
             && space.git_detected
         {
             effects.push(Command::ListRefs {
+                server_id: self.current_server_id(),
                 repo_path: space.path.clone(),
-                target_device: self.remote_device(&space.device_id),
             });
         }
         effects
-    }
-
-    /// The device id to address a call to, or `None` when the space is hosted
-    /// here (the engine refuses to forward a call to itself).
-    fn remote_device(&self, device_id: &str) -> Option<String> {
-        match self.local_device_id.as_deref() {
-            Some(local) if local == device_id => None,
-            _ => Some(device_id.to_string()),
-        }
     }
 
     /// The draft's space, if it still exists.
@@ -1024,6 +1138,7 @@ impl App {
         };
         let (chat_id, archived) = (id.clone(), *archived);
         vec![Command::Call {
+            server_id: self.current_server_id(),
             method: methods::MUTATE,
             params: serde_json::json!({
                 "op": "setChatArchived",
@@ -1043,6 +1158,7 @@ impl App {
             Err(_) => return Vec::new(),
         };
         vec![Command::Call {
+            server_id: self.current_server_id(),
             method: methods::QUEUE_COMMAND,
             params: serde_json::json!({ "chatId": chat_id, "command": command }),
             context: "Couldn't interrupt the run",
@@ -1133,6 +1249,7 @@ impl App {
         self.focus = Focus::Composer;
 
         vec![Command::Send {
+            server_id: self.current_server_id(),
             chat_id: chat_id.clone(),
             message_id,
             params: serde_json::json!({ "chatId": chat_id, "command": command }),
@@ -1229,10 +1346,10 @@ impl App {
             sandbox: SandboxLevel::WorkspaceWrite,
         });
         effects.push(Command::StartSession(Box::new(crate::link::StartSession {
+            server_id: self.current_server_id(),
             chat_id,
             space_id: space.id.clone(),
             repo_path: space.path.clone(),
-            target_device: self.remote_device(&space.device_id),
             plan,
             config: config.and_then(|c| serde_json::to_value(&c).ok()),
             message_id,
@@ -1323,6 +1440,7 @@ impl App {
         }
         for space in &self.spaces {
             rows.push(Row::Space {
+                server_id: self.selected_server_id.clone(),
                 id: space.id.clone(),
                 label: space.display_name().to_string(),
                 device: self.device_label(&space.device_id),
@@ -1352,6 +1470,7 @@ impl App {
         }
         for (indicator, chat) in active {
             rows.push(Row::Chat {
+                server_id: self.selected_server_id.clone(),
                 id: chat.id.clone(),
                 space_id: chat.space_id.clone(),
                 title: chat
@@ -1372,6 +1491,97 @@ impl App {
             // position has already answered.
             rows.push(Row::Blank);
             rows.push(Row::User { name, email });
+        }
+
+        if self.servers.servers().next().is_some() {
+            let selected_rows = rows;
+            let mut grouped = Vec::new();
+            for server in self.servers.servers() {
+                let status = match &server.connection {
+                    comet_proto::RemoteConnectionState::Connecting => "Connecting",
+                    comet_proto::RemoteConnectionState::Online => "Online",
+                    comet_proto::RemoteConnectionState::Offline => "Offline",
+                    comet_proto::RemoteConnectionState::Unreachable { .. } => "Unreachable",
+                    comet_proto::RemoteConnectionState::IdentityChanged => "Identity changed",
+                    comet_proto::RemoteConnectionState::IncompatibleVersion { .. } => {
+                        "Incompatible version"
+                    }
+                };
+                grouped.push(Row::Server {
+                    name: server.name.clone(),
+                    status: status.to_string(),
+                });
+                if !matches!(
+                    server.connection,
+                    comet_proto::RemoteConnectionState::Online
+                ) {
+                    continue;
+                }
+                if self.selected_server_id.as_ref() == Some(&server.id) {
+                    grouped.extend(selected_rows.iter().cloned());
+                    continue;
+                }
+                grouped.push(Row::Section {
+                    label: "Spaces".into(),
+                    action: None,
+                });
+                for space in &server.spaces {
+                    let device = server
+                        .devices
+                        .iter()
+                        .find(|device| device.id == space.device_id)
+                        .map(|device| device.name.clone())
+                        .unwrap_or_else(|| server.name.clone());
+                    grouped.push(Row::Space {
+                        server_id: Some(server.id.clone()),
+                        id: space.id.clone(),
+                        label: space.display_name().to_string(),
+                        device,
+                        attention: None,
+                        offline: false,
+                    });
+                }
+                grouped.push(Row::Blank);
+                grouped.push(Row::Section {
+                    label: "Sessions".into(),
+                    action: None,
+                });
+                for chat in server
+                    .chats
+                    .iter()
+                    .filter(|chat| self.show_archived || !chat.archived)
+                {
+                    let indicator = display_status(
+                        chat,
+                        server
+                            .sessions
+                            .iter()
+                            .find(|session| session.chat_id == chat.id),
+                        now,
+                    );
+                    grouped.push(Row::Chat {
+                        server_id: Some(server.id.clone()),
+                        id: chat.id.clone(),
+                        space_id: chat.space_id.clone(),
+                        title: chat
+                            .title
+                            .clone()
+                            .filter(|title| !title.trim().is_empty())
+                            .unwrap_or_else(|| "New session".to_string()),
+                        location: chat.space_id.as_deref().and_then(|space_id| {
+                            server
+                                .spaces
+                                .iter()
+                                .find(|space| space.id == space_id)
+                                .map(|space| space.display_name().to_string())
+                        }),
+                        indicator,
+                        archived: chat.archived,
+                        activity: chat.last_message_at.or(Some(chat.created_at)),
+                    });
+                }
+            }
+            rows = grouped;
         }
 
         self.rows = rows;
@@ -1944,7 +2154,10 @@ impl App {
             models: None,
             active: 0,
         });
-        vec![Command::ListModels { harness }]
+        vec![Command::ListModels {
+            server_id: self.current_server_id(),
+            harness,
+        }]
     }
 
     /// Move the selection inside whichever overlay is up.
@@ -2048,6 +2261,7 @@ impl App {
                 }
                 match action {
                     PromptAction::RenameChat(chat_id) => vec![Command::Call {
+                        server_id: self.current_server_id(),
                         method: methods::MUTATE,
                         params: serde_json::json!({
                             "op": "renameChat", "chatId": chat_id, "title": text,
@@ -2055,6 +2269,7 @@ impl App {
                         context: "Couldn't rename the session",
                     }],
                     PromptAction::RenameSpace(space_id) => vec![Command::Call {
+                        server_id: self.current_server_id(),
                         method: methods::MUTATE,
                         params: serde_json::json!({
                             "op": "renameSpace", "spaceId": space_id, "name": text,
@@ -2102,6 +2317,7 @@ impl App {
                 Vec::new()
             }
             MenuAction::SetArchived(chat_id, archived) => vec![Command::Call {
+                server_id: self.current_server_id(),
                 method: methods::MUTATE,
                 params: serde_json::json!({
                     "op": "setChatArchived", "chatId": chat_id, "archived": archived,
@@ -2109,11 +2325,13 @@ impl App {
                 context: "Couldn't archive the session",
             }],
             MenuAction::DeleteChat(chat_id) => vec![Command::Call {
+                server_id: self.current_server_id(),
                 method: methods::MUTATE,
                 params: serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
                 context: "Couldn't delete the session",
             }],
             MenuAction::DeleteSpace(space_id) => vec![Command::Call {
+                server_id: self.current_server_id(),
                 method: methods::MUTATE,
                 params: serde_json::json!({ "op": "deleteSpace", "spaceId": space_id }),
                 context: "Couldn't remove the space",
@@ -2143,6 +2361,7 @@ impl App {
             row.config = Some(config);
         }
         vec![Command::Call {
+            server_id: self.current_server_id(),
             method: methods::MUTATE,
             params: serde_json::json!({
                 "op": "setChatConfig", "chatId": chat_id, "config": value,
@@ -2180,6 +2399,7 @@ impl App {
             row.config = Some(config);
         }
         vec![Command::Call {
+            server_id: self.current_server_id(),
             method: methods::MUTATE,
             params: serde_json::json!({
                 "op": "setChatConfig", "chatId": chat_id, "config": value,
@@ -2379,7 +2599,7 @@ mod tests {
 
     fn is_watch(command: &Command, expected: Option<&str>) -> bool {
         matches!(command, Command::WatchTranscript(target)
-            if target.as_deref() == expected)
+            if target.as_ref().map(|target| target.local_id.as_str()) == expected)
     }
 
     fn mutate_op(command: &Command) -> Option<&str> {
@@ -2470,6 +2690,7 @@ mod tests {
             chat_id,
             params,
             message_id,
+            ..
         }) = effects.iter().find(|c| matches!(c, Command::Send { .. }))
         else {
             panic!("expected a Send, got {effects:?}");

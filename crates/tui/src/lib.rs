@@ -1,7 +1,9 @@
 //! comet-tui — the terminal viewport.
 //!
 //! A peer of the gpui app in `comet-ui`, not a subset of it: both are thin
-//! clients over the same typed RPC (ARCHITECTURE §1), and both derive their row
+//! clients over the same typed RPC (ARCHITECTURE §1). The TUI attaches or
+//! spawns only the trusted local daemon, then delegates its local-first and
+//! configured-remote model to `comet_client::Federation`; both viewports derive their row
 //! order, status dots and gates from the same pure functions in
 //! `comet_proto::view`. What differs is the renderer and one deliberate
 //! architectural choice — **the TUI never embeds an engine**.

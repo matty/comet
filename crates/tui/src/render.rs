@@ -313,6 +313,23 @@ fn draw_sidebar_row(
         ..area
     };
     match row {
+        Row::Server { name, status } => {
+            let status_width = wrap::width_of(status) as u16;
+            frame.render_widget(
+                Paragraph::new(Span::styled(name.clone(), theme.body())),
+                area,
+            );
+            if status_width < area.width {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(status.clone(), theme.hint())),
+                    Rect {
+                        x: area.x + area.width - status_width,
+                        width: status_width,
+                        ..area
+                    },
+                );
+            }
+        }
         // Label left, affordance right — herdr's header row.
         Row::Section { label, action } => {
             frame.render_widget(

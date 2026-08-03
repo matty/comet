@@ -1441,6 +1441,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "comet-client",
  "comet-doc",
  "comet-proto",
  "comet-rpc",

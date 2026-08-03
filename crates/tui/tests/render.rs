@@ -8,9 +8,13 @@
 //! bugs, and this is where geometry is checked.
 
 use chrono::Utc;
+use comet_client::{FederationEvent, ServerState};
 use comet_doc::{MessagePart, MessageRole, SessionMessageEntry};
 use comet_proto::view::ConnectionStatus;
-use comet_proto::{AuthState, Chat, Session, SessionStatus, Space, ToolCall, UserProfile};
+use comet_proto::{
+    AuthState, Chat, RemoteConnectionState, ServerId, ServerRef, Session, SessionStatus, Space,
+    ToolCall, UserProfile,
+};
 use comet_tui::app::App;
 use comet_tui::keys::{Action, Focus};
 use comet_tui::link::Update;
@@ -151,6 +155,42 @@ fn snapshot(app: &mut App, width: u16, height: u16) -> Vec<String> {
 
 fn joined(rows: &[String]) -> String {
     rows.join("\n")
+}
+
+fn server(id: &str) -> ServerId {
+    ServerId::new(format!("sha256:{id}"))
+}
+
+#[test]
+fn offline_remote_stays_visible_without_cached_children() {
+    let mut app = App::with_theme(Theme::dark());
+    let mut online = ServerState::empty(server("b"), "Build box", RemoteConnectionState::Online);
+    online.spaces.push(space("b-space", "/build/comet"));
+    online.chats.push(chat("b-chat", "B's cached chat"));
+    app.apply(FederationEvent::ServerChanged(online));
+    app.apply(FederationEvent::ServerChanged(ServerState::offline(
+        server("b"),
+        "Build box",
+    )));
+
+    let screen = joined(&snapshot(&mut app, 100, 30));
+    assert!(screen.contains("Build box"));
+    assert!(screen.contains("Offline"));
+    assert!(!screen.contains("B's cached chat"));
+}
+
+#[test]
+fn duplicate_remote_chat_ids_route_to_selected_server() {
+    let mut app = App::with_theme(Theme::dark());
+    for (id, name) in [("b", "Build box"), ("c", "Test box")] {
+        let mut state = ServerState::empty(server(id), name, RemoteConnectionState::Online);
+        state.spaces.push(space("s1", "/dev/comet"));
+        state.chats.push(chat("chat-1", name));
+        app.apply(FederationEvent::ServerChanged(state));
+    }
+
+    app.select_server_chat(ServerRef::new(server("c"), "chat-1"));
+    assert_eq!(app.selected_chat_ref().unwrap().server_id, server("c"));
 }
 
 /// The sidebar's columns of a drawn frame.
@@ -976,7 +1016,7 @@ fn clicking_a_session_row_opens_it() {
     assert_eq!(app.focus, Focus::Composer, "opening focuses the prompt");
     assert!(
         effects.iter().any(
-            |c| matches!(c, comet_tui::link::Command::WatchTranscript(Some(id)) if id == "c2")
+            |c| matches!(c, comet_tui::link::Command::WatchTranscript(Some(id)) if id.local_id == "c2")
         ),
         "and resubscribes its transcript"
     );
