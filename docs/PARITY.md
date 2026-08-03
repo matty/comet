@@ -45,7 +45,7 @@ runtime. It is not a compatibility promise for the former cloud architecture.
 
 | Requirement | Status | Notes |
 | --- | --- | --- |
-| Runtime works offline | done | Release endpoint is not used for engine authority, LAN connections, or local RPC. |
+| No Comet-operated runtime service | done | Release endpoint is not used for engine authority, LAN connections, or local RPC; agent providers remain separate integrations. |
 | Optional updater | done | `COMET_RELEASES_URL` affects release traffic only; failure is non-fatal. |
 | Repository provenance | done | Release workflow, updater, and installer require `matty/comet` manifest attribution and checksums. |
 | Distribution-only worker | done | Serves installer and `/releases/*`; hosted auth, rooms, relays, and runtime attachments are absent. |

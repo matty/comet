@@ -1,9 +1,11 @@
-//! Acceptance coverage for direct, explicitly configured LAN remotes.
+//! In-memory acceptance coverage for direct federation topology.
 //!
-//! Pairing/TLS failure cases live in `comet-rpc/tests/secure_lan.rs`; the
-//! authoritative operational allowlist and resource ownership cases live in
-//! `comet-engine/tests/remote_access.rs`. This test exercises the client-level
-//! A/B/C topology and the offline-without-cache contract.
+//! This test exercises the client-level A/B/C topology and the
+//! offline-without-cache contract using memory-backed RPC clients and a fixture
+//! connector. It does not exercise sockets, the production `LanConnector`, TLS
+//! or pairing, persisted remote registries, or real engine processes. Those
+//! boundaries have focused lower-level suites, while their combined behavior
+//! remains a physical two/three-machine release-candidate gate.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -176,7 +178,7 @@ async fn receive_until(
 }
 
 #[tokio::test]
-async fn direct_connections_are_operational_and_non_transitive() {
+async fn in_memory_federation_is_operational_and_non_transitive() {
     let a_id = server('a');
     let b_id = server('b');
     let c_id = server('c');

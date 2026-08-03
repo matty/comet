@@ -91,16 +91,21 @@ LAN control is intended for local networks. Operators must permit the selected
 listener port through the server host's firewall and should not publish it to
 the internet. Comet has no relay or traversal service.
 
-The only optional online path is release distribution. The engine does not
-depend on it: update failures affect update status only. The distribution
-worker serves the installer and release artifacts, and manifests/checksums are
-pinned to `matty/comet`. `COMET_RELEASES_URL` overrides only where release files
-are fetched; it grants no runtime authority.
+Release distribution is the only optional Comet-operated online infrastructure
+path. The engine does not depend on it: update failures affect update status
+only. The distribution worker serves the installer and release artifacts, and
+manifests/checksums are pinned to `matty/comet`. `COMET_RELEASES_URL` overrides
+only where release files are fetched; it grants no runtime authority. Agent
+CLIs, provider OAuth, and provider usage APIs are separate integrations and may
+contact Claude, OpenAI, or another configured agent provider.
 
 ## Verification boundaries
 
-- `crates/client/tests/lan_e2e.rs` proves direct A/B/C behavior, operational
-  calls, explicit A-to-C configuration, and offline-without-cache state.
+- `crates/client/tests/federation_topology.rs` uses memory-backed RPC fixtures to
+  prove client-level A/B/C topology, operational routing, explicit A-to-C
+  configuration, and offline-without-cache state. It does not exercise network
+  sockets, production `LanConnector`, pairing/TLS, persisted registries, or real
+  engines.
 - `crates/rpc/tests/secure_lan.rs` covers pins, pairing expiry/consumption,
   malformed frames, authentication, and identity changes.
 - `crates/engine/tests/remote_access.rs` covers opt-in/bind behavior, port
@@ -110,3 +115,7 @@ are fetched; it grants no runtime authority.
   operations themselves; Desktop and TUI tests cover server grouping/routing.
 
 The iOS client is outside the LAN-remote scope for this release.
+
+A physical two/three-machine pairing, TLS, reconnect, and host-firewall smoke
+test remains a release-candidate gate because no in-memory topology test can
+validate those deployed boundaries together.

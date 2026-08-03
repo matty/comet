@@ -88,10 +88,12 @@ C, A cannot see or control C. A must configure and pair C separately.
 
 ## Updates are separate
 
-Local and LAN operation requires no internet connection. Installer and update
-traffic is a separate optional distribution path. Release manifests are pinned
-to the `matty/comet` repository. `COMET_RELEASES_URL` may select a mirror, but
-the mirror must still serve a correctly attributed and checksummed manifest.
+Comet's local and LAN control path requires no Comet-operated online service.
+Installer and update traffic is a separate optional distribution path. Release
+manifests are pinned to the `matty/comet` repository. `COMET_RELEASES_URL` may
+select a mirror, but the mirror must still serve a correctly attributed and
+checksummed manifest. Agent CLIs and provider account/usage integrations may
+separately contact their configured providers.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the trust and process boundaries and
 [docs/PARITY.md](docs/PARITY.md) for the implemented feature surface.
