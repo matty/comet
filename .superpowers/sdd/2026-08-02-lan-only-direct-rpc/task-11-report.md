@@ -57,3 +57,9 @@ Subsequent full package reruns hit MSVC `LNK1318 Unexpected PDB error; LIMIT`; c
 - No dependency was migration-CLI-only after removal: `comet-engine` remains the engine/runtime dependency and `tempfile` remains required by remote CLI safety tests.
 - Task 12 removal candidates with no non-migration production callers are: profile selection/copy/marker and `LegacyProfile` / `migrated_from` in `crates/engine/src/local_store.rs`; `crates/engine/tests/local_store_migration.rs`; `DocsStore::snapshot_ids` / `copy_snapshots_to`; and `WorkspaceDoc::owned_by`. `prepare_local_store` currently has only migration-test callers on this branch, but Task 12 must trace startup wiring and retain or replace the local-store initializer rather than deleting it blindly.
 - Scope-correction verification: format and diff checks passed; source scans found no migration module, command variant, or dispatch, and found only the intentional parser rejection reference. `cargo test` and `cargo check --tests` were both stopped after bounded waits in the already-recorded degraded MSVC PDB/link environment.
+
+Task 12's executable plan was subsequently reconciled with this scope: it no
+longer consumes `prepare_local_store`, explicitly traces and deletes Task 2's
+legacy selection/copy/marker/recovery surface, replaces it with fixed-root
+local-only initialization, forbids reintroducing `comet migrate` guidance, and
+keeps release URL/download behavior separate.

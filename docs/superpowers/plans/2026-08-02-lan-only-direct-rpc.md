@@ -1078,6 +1078,8 @@ git commit -m "feat: replace account CLI with LAN remotes"
 ### Task 12: Cut the engine and UI over to local-only authority
 
 **Files:**
+- Modify: `crates/engine/src/local_store.rs`
+- Delete: `crates/engine/tests/local_store_migration.rs`
 - Delete: `crates/engine/src/auth.rs`
 - Delete: `crates/engine/tests/auth.rs`
 - Delete: `crates/engine/tests/device_routing.rs`
@@ -1093,6 +1095,7 @@ git commit -m "feat: replace account CLI with LAN remotes"
 - Delete: `crates/rpc/tests/device_room.rs`
 - Modify: `crates/rpc/Cargo.toml`
 - Modify: `crates/sync/src/lib.rs`
+- Modify: `crates/sync/src/store.rs`
 - Modify: `crates/sync/Cargo.toml`
 - Delete: `crates/sync/src/room.rs`
 - Delete: `crates/sync/src/room/`
@@ -1100,13 +1103,15 @@ git commit -m "feat: replace account CLI with LAN remotes"
 - Delete: `crates/sync/tests/edge_convergence.rs`
 - Modify: `crates/proto/src/entities.rs`
 - Modify: `crates/proto/src/view.rs`
+- Modify: `crates/doc/src/workspace.rs`
 - Modify: `crates/ui/src/state.rs`
 - Modify: `crates/ui/src/shell.rs`
 - Modify: `crates/tui/src/link.rs`
 
 **Interfaces:**
-- Consumes: Task 2 `prepare_local_store`; Tasks 3–6 remote runtime; existing `comet-update` release checker.
-- Produces: an `EngineConfig` containing only local data, IPC, LAN, harness, and release settings; startup has no account gate.
+- Consumes: Tasks 3–6 remote runtime and the existing `comet-update` release checker. It does not consume Task 2's migration API.
+- Produces: an `EngineConfig` containing only local data, IPC, LAN, harness, and release settings; startup has no account gate, cloud-profile selection, copy, marker, or recovery-command path.
+- Removes: `LegacyProfile`, `migrated_from`, `prepare_local_store`, migration staging/marker/profile-selection code, migration-only tests, and migration-only `DocsStore` / `WorkspaceDoc` helpers when the initial usage trace confirms no independent caller.
 
 - [ ] **Step 1: Add a failing no-runtime-cloud engine test**
 
@@ -1123,13 +1128,31 @@ async fn fresh_engine_starts_without_account_or_runtime_edge() {
 
 Also add a source/config regression test that fails if runtime code references `/auth/`, `/workspace/`, `/session/`, `/device/`, `COMET_EDGE_`, or WorkOS.
 
+Add a second source/API regression that fails if normal startup or user-facing
+errors reference `comet migrate`, `LegacyProfile`, `migrated_from`,
+`prepare_local_store`, or the legacy recovery command. This is a deletion
+boundary: do not replace the removed command with differently worded migration
+guidance.
+
 - [ ] **Step 2: Run focused tests and verify they fail under the auth gate**
 
 Run: `cargo test -p comet-engine no_runtime_cloud -- --nocapture`
 
 Expected: the new API/signature is missing or startup still requires auth configuration.
 
-- [ ] **Step 3: Simplify engine assembly around the migrated local store**
+- [ ] **Step 3: Trace startup and replace migration with local-only initialization**
+
+First trace every production and test caller of `prepare_local_store`,
+`LegacyProfile`, `migrated_from`, `DocsStore::copy_snapshots_to`,
+`DocsStore::snapshot_ids`, and `WorkspaceDoc::owned_by`. Confirm which APIs are
+migration-only before deleting them. Then remove legacy session/profile
+selection, copying/filtering, staging, marker, and recovery-guidance logic.
+
+Replace `prepare_local_store` with a narrowly named local-only initializer, or
+open the fixed local root directly in assembly if the trace shows no separate
+abstraction is useful. The initializer may create/open an empty local store; it
+must never inspect `session.json` or `orgs/`, copy cloud-cached rows, expose a
+manual selector, or emit `comet migrate` guidance.
 
 Replace identity-scoped `assemble_with_identity` with:
 
@@ -1141,15 +1164,25 @@ pub struct EngineConfig {
     pub releases_url: String,
 }
 
+pub fn initialize_local_store(data_dir: &Path) -> Result<PathBuf, EngineError> {
+    let root = data_dir.join("local-store");
+    DocsStore::open(&root)?;
+    Ok(root)
+}
+
 pub async fn assemble_runtime(config: &EngineConfig) -> anyhow::Result<EngineRuntime> {
-    let local = prepare_local_store(&config.data_dir, None)?;
-    let core = EngineCore::assemble_local(&config.data_dir, &local.root, config.default_harness)?;
+    let local_root = initialize_local_store(&config.data_dir)?;
+    let core = EngineCore::assemble_local(&config.data_dir, &local_root, config.default_harness)?;
     let lan = LanServer::spawn(core.remote_rpc_service(), core.remote_access()).await;
     Ok(EngineRuntime::new(core, lan))
 }
 ```
 
-Keep updater initialization independent and non-fatal when the release endpoint is unreachable.
+The exact helper name is not normative; direct `DocsStore::open` is preferred
+if a wrapper adds no invariant. Keep updater initialization independent and
+non-fatal when the release endpoint is unreachable. `COMET_RELEASES_URL` and
+release downloads remain separate from runtime/cloud removal and must not be
+removed in this task.
 
 - [ ] **Step 4: Remove cloud transports and relay forwarding**
 
@@ -1163,11 +1196,26 @@ Delete auth RPC method constants, `AuthState`, organization parsing, sign-in gat
 
 Delete `device_room` exports/tests. Reduce `comet-sync` to `DocsStore`: delete `room`, `wake`, and the live edge convergence test, then remove its Loro WebSocket/Tungstenite dependencies. Retain `reqwest` in `comet-engine` because `agent_accounts.rs` uses it for Claude/Codex account and usage APIs; remove the cloud-runtime HTTP fields and calls from `doc_host.rs`, `workspace_host.rs`, `diff_sync.rs`, and `uploads.rs`.
 
+Delete the legacy local-store migration integration test. Remove
+`DocsStore::copy_snapshots_to`, migration-only snapshot enumeration, and
+`WorkspaceDoc::owned_by` only after the Step 3 usage trace confirms they have no
+non-migration caller. Remove migration marker/staging constants and stored
+session selector types. No replacement error may instruct users to run `comet
+migrate`.
+
 - [ ] **Step 7: Run core workspace tests**
 
 Run: `cargo test -p comet-proto && cargo test -p comet-rpc && cargo test -p comet-engine && cargo test -p comet-client && cargo test -p comet-tui && cargo test -p comet-ui --lib`
 
 Expected: all tests pass with no login/org/relay test surface.
+
+Also run:
+
+```bash
+rg -n "comet migrate|LegacyProfile|migrated_from|prepare_local_store|RECOVERY_COMMAND" crates apps/comet
+```
+
+Expected: no runtime, API, test, or user-facing migration path remains.
 
 - [ ] **Step 8: Commit runtime-cloud removal**
 
@@ -1299,7 +1347,7 @@ Expected: all tests pass; A cannot observe C until explicitly paired.
 
 - [ ] **Step 4: Rewrite user and architecture documentation**
 
-Document local authority, manual endpoint configuration, listener opt-in, pairing/revocation, the power granted to trusted devices, server grouping, offline-without-cache behavior, non-transitivity, firewall considerations, removed login commands, migration behavior, and optional release internet access. Remove instructions that say runtime sync or control requires WorkOS/Cloudflare.
+Document local authority, manual endpoint configuration, listener opt-in, pairing/revocation, the power granted to trusted devices, server grouping, offline-without-cache behavior, non-transitivity, firewall considerations, removed login commands, the absence of any cloud-to-local migration command/path, and optional release internet access. Remove instructions that say runtime sync or control requires WorkOS/Cloudflare.
 
 - [ ] **Step 5: Audit for forbidden hosted-runtime remnants**
 
