@@ -32,9 +32,23 @@ pub enum Update {
     },
     LocalDevice(String),
     Models(Vec<comet_proto::Model>),
+    FederatedModels {
+        server_id: ServerId,
+        request_id: String,
+        models: Vec<comet_proto::Model>,
+    },
     Refs(Vec<comet_proto::RepoRef>),
+    FederatedRefs {
+        server_id: ServerId,
+        request_id: String,
+        refs: Vec<comet_proto::RepoRef>,
+    },
     SessionStarted {
         chat_id: String,
+    },
+    FederatedSessionStarted {
+        chat: ServerRef,
+        request_id: String,
     },
     Notice(String),
     SendFailed {
@@ -44,6 +58,17 @@ pub enum Update {
     },
     FederatedSendFailed {
         chat: ServerRef,
+        message_id: String,
+        error: String,
+    },
+    FederatedRequestFailed {
+        server_id: ServerId,
+        request_id: String,
+        message: String,
+    },
+    FederatedStartFailed {
+        chat: ServerRef,
+        request_id: String,
         message_id: String,
         error: String,
     },
@@ -72,10 +97,12 @@ pub enum Command {
     },
     ListModels {
         server_id: ServerId,
+        request_id: String,
         harness: comet_proto::HarnessId,
     },
     ListRefs {
         server_id: ServerId,
+        request_id: String,
         repo_path: String,
     },
     StartSession(Box<StartSession>),
@@ -86,6 +113,7 @@ pub enum Command {
 #[derive(Debug)]
 pub struct StartSession {
     pub server_id: ServerId,
+    pub request_id: String,
     pub chat_id: String,
     pub space_id: String,
     pub repo_path: String,
@@ -247,13 +275,17 @@ fn forward(command: Command, federation: &Federation, updates: &mpsc::UnboundedS
                 }
             });
         }
-        Command::ListModels { server_id, harness } => {
+        Command::ListModels {
+            server_id,
+            request_id,
+            harness,
+        } => {
             let commands = federation.command_sender();
             let updates = updates.clone();
             tokio::spawn(async move {
                 match request(
                     &commands,
-                    server_id,
+                    server_id.clone(),
                     methods::LIST_MODELS,
                     serde_json::json!({ "harness": harness }),
                 )
@@ -263,17 +295,25 @@ fn forward(command: Command, federation: &Federation, updates: &mpsc::UnboundedS
                         .map_err(|error| comet_rpc::RpcError::Failed(error.to_string()))
                 }) {
                     Ok(models) => {
-                        let _ = updates.send(Update::Models(models));
+                        let _ = updates.send(Update::FederatedModels {
+                            server_id,
+                            request_id,
+                            models,
+                        });
                     }
                     Err(error) => {
-                        let _ =
-                            updates.send(Update::Notice(format!("Couldn't list models: {error}")));
+                        let _ = updates.send(Update::FederatedRequestFailed {
+                            server_id,
+                            request_id,
+                            message: format!("Couldn't list models: {error}"),
+                        });
                     }
                 }
             });
         }
         Command::ListRefs {
             server_id,
+            request_id,
             repo_path,
         } => {
             let commands = federation.command_sender();
@@ -281,7 +321,7 @@ fn forward(command: Command, federation: &Federation, updates: &mpsc::UnboundedS
             tokio::spawn(async move {
                 match request(
                     &commands,
-                    server_id,
+                    server_id.clone(),
                     methods::LIST_REFS,
                     serde_json::json!({ "repoPath": repo_path }),
                 )
@@ -291,11 +331,18 @@ fn forward(command: Command, federation: &Federation, updates: &mpsc::UnboundedS
                         .map_err(|error| comet_rpc::RpcError::Failed(error.to_string()))
                 }) {
                     Ok(refs) => {
-                        let _ = updates.send(Update::Refs(refs));
+                        let _ = updates.send(Update::FederatedRefs {
+                            server_id,
+                            request_id,
+                            refs,
+                        });
                     }
                     Err(error) => {
-                        let _ =
-                            updates.send(Update::Notice(format!("Couldn't list refs: {error}")));
+                        let _ = updates.send(Update::FederatedRequestFailed {
+                            server_id,
+                            request_id,
+                            message: format!("Couldn't list refs: {error}"),
+                        });
                     }
                 }
             });
@@ -304,10 +351,17 @@ fn forward(command: Command, federation: &Federation, updates: &mpsc::UnboundedS
         Command::StartSession(start) => {
             let commands = federation.command_sender();
             let updates = updates.clone();
+            let failed_chat = ServerRef::new(start.server_id.clone(), start.chat_id.clone());
+            let failed_request = start.request_id.clone();
+            let failed_message = start.message_id.clone();
             tokio::spawn(async move {
                 if let Err(error) = start_session(&commands, &updates, *start).await {
-                    let _ =
-                        updates.send(Update::Notice(format!("Couldn't start session: {error}")));
+                    let _ = updates.send(Update::FederatedStartFailed {
+                        chat: failed_chat,
+                        request_id: failed_request,
+                        message_id: failed_message,
+                        error: error.to_string(),
+                    });
                 }
             });
         }
@@ -389,19 +443,13 @@ async fn start_session(
     .await;
     match queue {
         Ok(_) => {
-            let _ = updates.send(Update::SessionStarted {
-                chat_id: start.chat_id,
+            let _ = updates.send(Update::FederatedSessionStarted {
+                chat: ServerRef::new(start.server_id, start.chat_id),
+                request_id: start.request_id,
             });
             Ok(())
         }
-        Err(error) => {
-            let _ = updates.send(Update::FederatedSendFailed {
-                chat: ServerRef::new(start.server_id, start.chat_id),
-                message_id: start.message_id,
-                error: error.to_string(),
-            });
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -453,6 +501,7 @@ mod tests {
             &updates,
             StartSession {
                 server_id: ServerId::new("server-b"),
+                request_id: "request-1".into(),
                 chat_id: "chat-1".into(),
                 space_id: "space-1".into(),
                 repo_path: "/repo".into(),

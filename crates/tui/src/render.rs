@@ -1379,7 +1379,7 @@ fn draw_overlay(
             list_card(frame, body, theme, "Effort", &rows, true, *active)
         }
 
-        Overlay::Models { models, active } => {
+        Overlay::Models { models, active, .. } => {
             let rows: Vec<(String, Option<String>)> = match models {
                 Some(list) if !list.is_empty() => list
                     .iter()

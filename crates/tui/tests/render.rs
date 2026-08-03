@@ -287,6 +287,163 @@ fn duplicate_remote_row_cursor_survives_other_server_rebuild() {
         comet_tui::app::Row::Chat { server_id: Some(id), .. } if id == &server("c")));
 }
 
+#[test]
+fn action_open_on_duplicate_remote_chat_uses_full_row_identity() {
+    let mut app = App::with_theme(Theme::dark());
+    for (id, name) in [("b", "Build box"), ("c", "Test box")] {
+        let mut state = ServerState::empty(server(id), name, RemoteConnectionState::Online);
+        state.spaces.push(space("s1", "/dev/comet"));
+        state.chats.push(chat("chat-1", name));
+        app.apply(FederationEvent::ServerChanged(state));
+    }
+    app.cursor = app
+        .rows
+        .iter()
+        .position(|row| {
+            matches!(row,
+        comet_tui::app::Row::Chat { server_id: Some(id), .. } if id == &server("c"))
+        })
+        .unwrap();
+    let effects = app.act(Action::Open);
+    assert_eq!(
+        app.selected_chat_ref(),
+        Some(ServerRef::new(server("c"), "chat-1"))
+    );
+    assert!(effects.iter().any(|effect| matches!(effect,
+        comet_tui::link::Command::WatchTranscript(Some(chat)) if chat == &ServerRef::new(server("c"), "chat-1"))));
+}
+
+#[test]
+fn clicking_duplicate_remote_chat_uses_full_row_identity() {
+    let mut app = App::with_theme(Theme::dark());
+    for (id, name, title) in [
+        ("b", "Build box", "B session"),
+        ("c", "Test box", "C session"),
+    ] {
+        let mut state = ServerState::empty(server(id), name, RemoteConnectionState::Online);
+        state.spaces.push(space("s1", "/dev/comet"));
+        state.chats.push(chat("chat-1", title));
+        app.apply(FederationEvent::ServerChanged(state));
+    }
+    let (x, y) = cell_of(&mut app, 100, 30, "C session");
+    let effects = app.click(x, y);
+    assert_eq!(
+        app.selected_chat_ref(),
+        Some(ServerRef::new(server("c"), "chat-1"))
+    );
+    assert!(effects.iter().any(|effect| matches!(effect,
+        comet_tui::link::Command::WatchTranscript(Some(chat)) if chat == &ServerRef::new(server("c"), "chat-1"))));
+}
+
+#[test]
+fn action_open_on_duplicate_remote_space_navigates_inside_that_server() {
+    let mut app = App::with_theme(Theme::dark());
+    for (id, name, chat_id) in [("b", "Build box", "b-chat"), ("c", "Test box", "c-chat")] {
+        let mut state = ServerState::empty(server(id), name, RemoteConnectionState::Online);
+        state.spaces.push(space("s1", "/dev/comet"));
+        state.chats.push(chat(chat_id, name));
+        app.apply(FederationEvent::ServerChanged(state));
+    }
+    app.cursor = app
+        .rows
+        .iter()
+        .position(|row| {
+            matches!(row,
+        comet_tui::app::Row::Space { server_id: Some(id), .. } if id == &server("c"))
+        })
+        .unwrap();
+    let effects = app.act(Action::Open);
+    assert_eq!(
+        app.selected_chat_ref(),
+        Some(ServerRef::new(server("c"), "c-chat"))
+    );
+    assert!(effects.iter().any(|effect| matches!(effect,
+        comet_tui::link::Command::WatchTranscript(Some(chat)) if chat == &ServerRef::new(server("c"), "c-chat"))));
+}
+
+#[test]
+fn delayed_session_started_cannot_replace_another_server_draft() {
+    let mut app = App::with_theme(Theme::dark());
+    for (id, name) in [("b", "Build box"), ("c", "Test box")] {
+        let mut state = ServerState::empty(server(id), name, RemoteConnectionState::Online);
+        state.spaces.push(space("s1", "/dev/comet"));
+        app.apply(FederationEvent::ServerChanged(state));
+    }
+    app.activate_server_space(ServerRef::new(server("b"), "s1"));
+    app.act(Action::NewSession);
+    app.composer.set_text("build");
+    let sent = app.act(Action::Send);
+    let (chat, request_id) = sent
+        .iter()
+        .find_map(|effect| match effect {
+            comet_tui::link::Command::StartSession(start) => Some((
+                ServerRef::new(start.server_id.clone(), start.chat_id.clone()),
+                start.request_id.clone(),
+            )),
+            _ => None,
+        })
+        .unwrap();
+    app.activate_server_space(ServerRef::new(server("c"), "s1"));
+    app.act(Action::NewSession);
+    let effects = app.apply(Update::FederatedSessionStarted { chat, request_id });
+    assert!(
+        app.draft.is_some(),
+        "C draft must survive stale B completion"
+    );
+    assert_eq!(app.selected_chat_ref(), None);
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn stale_model_and_ref_replies_are_ignored_by_request_generation() {
+    let mut app = App::with_theme(Theme::dark());
+    for (id, name) in [("b", "Build box"), ("c", "Test box")] {
+        let mut state = ServerState::empty(server(id), name, RemoteConnectionState::Online);
+        state.spaces.push(space("s1", "/dev/comet"));
+        app.apply(FederationEvent::ServerChanged(state));
+    }
+    app.activate_server_space(ServerRef::new(server("b"), "s1"));
+    let b_refs = app
+        .act(Action::NewSession)
+        .into_iter()
+        .find_map(|effect| match effect {
+            comet_tui::link::Command::ListRefs { request_id, .. } => Some(request_id),
+            _ => None,
+        })
+        .unwrap();
+    let b_models = app
+        .open_model_picker()
+        .into_iter()
+        .find_map(|effect| match effect {
+            comet_tui::link::Command::ListModels { request_id, .. } => Some(request_id),
+            _ => None,
+        })
+        .unwrap();
+    app.activate_server_space(ServerRef::new(server("c"), "s1"));
+    app.act(Action::NewSession);
+    app.open_model_picker();
+    app.apply(Update::FederatedRefs {
+        server_id: server("b"),
+        request_id: b_refs,
+        refs: vec![],
+    });
+    app.apply(Update::FederatedModels {
+        server_id: server("b"),
+        request_id: b_models,
+        models: vec![],
+    });
+    app.apply(Update::FederatedRequestFailed {
+        server_id: server("b"),
+        request_id: "older-failed-request".into(),
+        message: "failed".into(),
+    });
+    assert!(app.draft.as_ref().unwrap().refs.is_none());
+    assert!(matches!(
+        &app.overlay,
+        Some(comet_tui::app::Overlay::Models { models: None, .. })
+    ));
+}
+
 /// The sidebar's columns of a drawn frame.
 ///
 /// There is no divider to split on any more — the sidebar is a filled region and

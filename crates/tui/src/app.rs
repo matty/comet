@@ -219,6 +219,8 @@ pub enum Hit {
 /// choice is made *before* anything exists to be wrong about.
 #[derive(Debug, Clone)]
 pub struct Draft {
+    pub generation: String,
+    pub refs_request_id: Option<String>,
     pub space_id: String,
     pub checkout: CheckoutKind,
     /// Index into `refs` of the picked base ref.
@@ -289,6 +291,8 @@ pub enum Overlay {
     },
     /// Model picker for the open session's harness.
     Models {
+        server_id: ServerId,
+        request_id: String,
         /// `None` until `ListModels` answers.
         models: Option<Vec<comet_proto::Model>>,
         active: usize,
@@ -410,6 +414,7 @@ pub struct App {
     /// A chat this viewport just created, with when it asked. Exempt from
     /// selection healing until its row arrives — see `heal_chat_selection`.
     pending_chat: Option<(String, std::time::Instant)>,
+    pending_start: Option<(String, ServerRef)>,
     /// Optimistic user messages per chat, shown until the doc frame with the
     /// same id arrives. Client-minted ids make the dedupe exact.
     echoes: HashMap<ServerRef, Vec<SessionMessageEntry>>,
@@ -471,6 +476,7 @@ impl App {
             started: std::time::Instant::now(),
             quit: false,
             pending_chat: None,
+            pending_start: None,
             echoes: HashMap::new(),
             doc_entries: Vec::new(),
             transcript_width: 0,
@@ -564,6 +570,19 @@ impl App {
                 }
                 Vec::new()
             }
+            Update::FederatedRefs {
+                server_id,
+                request_id,
+                refs,
+            } => {
+                if self.selected_server_id.as_ref() == Some(&server_id)
+                    && let Some(draft) = &mut self.draft
+                    && draft.refs_request_id.as_deref() == Some(&request_id)
+                {
+                    draft.refs = Some(refs);
+                }
+                Vec::new()
+            }
             Update::SessionStarted { chat_id } => {
                 // The draft became real: adopt it as the open session. The chats
                 // frame that materializes the row follows.
@@ -573,10 +592,45 @@ impl App {
                 self.rebuild_rows();
                 effects
             }
+            Update::FederatedSessionStarted { chat, request_id } => {
+                let expected = self
+                    .pending_start
+                    .as_ref()
+                    .is_some_and(|(id, target)| id == &request_id && target == &chat);
+                if !expected || self.selected_chat_ref().as_ref() != Some(&chat) {
+                    if expected {
+                        self.pending_start = None;
+                    }
+                    return Vec::new();
+                }
+                self.pending_start = None;
+                self.draft = None;
+                self.pending_chat = Some((chat.local_id.clone(), std::time::Instant::now()));
+                self.rebuild_rows();
+                Vec::new()
+            }
             Update::Models(models) => {
                 // Only fills a picker that is still open — a slow reply must not
                 // pop one back up after it was dismissed.
                 if let Some(Overlay::Models { models: slot, .. }) = &mut self.overlay {
+                    *slot = Some(models);
+                }
+                Vec::new()
+            }
+            Update::FederatedModels {
+                server_id,
+                request_id,
+                models,
+            } => {
+                if let Some(Overlay::Models {
+                    server_id: expected_server,
+                    request_id: expected_request,
+                    models: slot,
+                    ..
+                }) = &mut self.overlay
+                    && expected_server == &server_id
+                    && expected_request == &request_id
+                {
                     *slot = Some(models);
                 }
                 Vec::new()
@@ -620,6 +674,59 @@ impl App {
                 }
                 self.transcript_stale = true;
                 self.notify(format!("Couldn't send: {error}"));
+                Vec::new()
+            }
+            Update::FederatedRequestFailed {
+                server_id,
+                request_id,
+                message,
+            } => {
+                let model_request = matches!(&self.overlay,
+                    Some(Overlay::Models { server_id: expected_server, request_id: expected_request, .. })
+                        if expected_server == &server_id && expected_request == &request_id);
+                let refs_request = self.selected_server_id.as_ref() == Some(&server_id)
+                    && self.draft.as_ref().is_some_and(|draft| {
+                        draft.refs_request_id.as_deref() == Some(request_id.as_str())
+                    });
+                if model_request {
+                    self.overlay = None;
+                }
+                if refs_request && let Some(draft) = &mut self.draft {
+                    draft.refs_request_id = None;
+                }
+                if model_request || refs_request {
+                    self.notify(message);
+                }
+                Vec::new()
+            }
+            Update::FederatedStartFailed {
+                chat,
+                request_id,
+                message_id,
+                error,
+            } => {
+                let expected = self
+                    .pending_start
+                    .as_ref()
+                    .is_some_and(|(id, target)| id == &request_id && target == &chat);
+                if !expected {
+                    return Vec::new();
+                }
+                self.pending_start = None;
+                let restored = self.drop_echo_ref(&chat, &message_id);
+                if self.selected_chat_ref().as_ref() == Some(&chat) {
+                    self.pending_chat = None;
+                    self.selected_chat = None;
+                    self.transcript.retarget(None);
+                    if let Some(text) = restored
+                        && self.composer.is_empty()
+                    {
+                        self.composer.set_text(text);
+                    }
+                }
+                self.transcript_stale = true;
+                self.notify(format!("Couldn't start session: {error}"));
+                self.rebuild_rows();
                 Vec::new()
             }
         }
@@ -911,13 +1018,12 @@ impl App {
 
     fn open_row(&mut self) -> Effects {
         match self.rows.get(self.cursor).cloned() {
-            Some(Row::Space { server_id, id, .. }) => {
-                if let Some(server_id) = server_id {
-                    self.selected_server_id = Some(server_id);
-                    self.load_selected_server();
-                }
-                self.activate_space(id)
-            }
+            Some(Row::Space {
+                server_id: Some(server_id),
+                id,
+                ..
+            }) => self.activate_server_space(ServerRef::new(server_id, id)),
+            Some(Row::Space { id, .. }) => self.activate_space(id),
             // Decoration isn't selectable, so nothing else can be under the
             // cursor; a defensive arm keeps this total.
             Some(Row::Blank)
@@ -933,10 +1039,10 @@ impl App {
                 ..
             }) => {
                 if let Some(server_id) = server_id {
-                    self.selected_server_id = Some(server_id);
-                    self.load_selected_server();
-                }
-                if space_id.is_some() {
+                    let effects = self.select_server_chat(ServerRef::new(server_id, id));
+                    self.focus = Focus::Composer;
+                    return effects;
+                } else if space_id.is_some() {
                     self.selected_space = space_id.clone();
                 }
                 let effects = self.select_chat(Some(id));
@@ -983,6 +1089,12 @@ impl App {
             // return to, and a blank pane would be a dead end.
             None => self.new_session_in(space_id),
         }
+    }
+
+    pub fn activate_server_space(&mut self, space: ServerRef) -> Effects {
+        self.selected_server_id = Some(space.server_id);
+        self.load_selected_server();
+        self.activate_space(space.local_id)
     }
 
     /// Point the transcript at a chat, subscribing its doc and clearing its
@@ -1133,6 +1245,8 @@ impl App {
     fn new_session_in(&mut self, space_id: String) -> Effects {
         self.selected_space = Some(space_id.clone());
         self.draft = Some(Draft {
+            generation: uuid::Uuid::new_v4().to_string(),
+            refs_request_id: None,
             space_id: space_id.clone(),
             checkout: CheckoutKind::default(),
             picked_ref: None,
@@ -1148,8 +1262,13 @@ impl App {
         if let Some(space) = self.spaces.iter().find(|space| space.id == space_id)
             && space.git_detected
         {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            if let Some(draft) = &mut self.draft {
+                draft.refs_request_id = Some(request_id.clone());
+            }
             effects.push(Command::ListRefs {
                 server_id: self.current_server_id(),
+                request_id,
                 repo_path: space.path.clone(),
             });
         }
@@ -1386,6 +1505,10 @@ impl App {
         // does not blink when the row arrives.
         self.draft = None;
         self.pending_chat = Some((chat_id.clone(), std::time::Instant::now()));
+        self.pending_start = Some((
+            draft.generation.clone(),
+            ServerRef::new(self.current_server_id(), chat_id.clone()),
+        ));
         let mut effects = self.select_chat(Some(chat_id.clone()));
         self.transcript.to_bottom();
         self.rebuild_rows();
@@ -1401,6 +1524,7 @@ impl App {
         });
         effects.push(Command::StartSession(Box::new(crate::link::StartSession {
             server_id: self.current_server_id(),
+            request_id: draft.generation,
             chat_id,
             space_id: space.id.clone(),
             repo_path: space.path.clone(),
@@ -2233,12 +2357,17 @@ impl App {
                 return Vec::new();
             }
         };
+        let server_id = self.current_server_id();
+        let request_id = uuid::Uuid::new_v4().to_string();
         self.overlay = Some(Overlay::Models {
+            server_id: server_id.clone(),
+            request_id: request_id.clone(),
             models: None,
             active: 0,
         });
         vec![Command::ListModels {
-            server_id: self.current_server_id(),
+            server_id,
+            request_id,
             harness,
         }]
     }
@@ -2256,7 +2385,7 @@ impl App {
             ),
             Some(Overlay::Checkout { active }) => (active, 2),
             Some(Overlay::Reasoning { active, levels }) => (active, levels.len()),
-            Some(Overlay::Models { active, models }) => {
+            Some(Overlay::Models { active, models, .. }) => {
                 (active, models.as_ref().map_or(0, Vec::len))
             }
             _ => return,
@@ -2301,7 +2430,7 @@ impl App {
                 }
                 Vec::new()
             }
-            Some(Overlay::Models { models, active }) => {
+            Some(Overlay::Models { models, active, .. }) => {
                 let Some(model) = models.and_then(|list| list.get(active).cloned()) else {
                     return Vec::new();
                 };
