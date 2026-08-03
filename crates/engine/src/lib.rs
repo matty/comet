@@ -155,6 +155,7 @@ impl EngineCore {
         let local_root = initialize_local_store(data_dir)?;
         let store = Arc::new(DocsStore::open(&local_root)?);
         let journal = Arc::new(RunJournal::open(local_root.join("journals"))?);
+        let detected_device_name = local_device_name();
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
         let doc_host = DocHost::new(
             store.clone(),
@@ -167,7 +168,7 @@ impl EngineCore {
             store,
             WorkspaceHostConfig {
                 device_id: device_id.clone(),
-                device_name: local_device_name(),
+                device_name: detected_device_name,
                 platform: std::env::consts::OS.to_string(),
             },
         )?;
@@ -234,7 +235,7 @@ impl EngineCore {
                     protocol_version: comet_proto::PROTOCOL_VERSION,
                     server_id: self.device_identity.server_id().clone(),
                     device_id: self.device_id.clone(),
-                    name: local_device_name(),
+                    name: self.workspace.device_name().to_string(),
                     capabilities: vec!["authoritative-rpc".into(), "pairing".into()],
                 };
                 let mut rpc = EngineRpc::new(
@@ -482,6 +483,18 @@ mod tests {
             || Some("file-host".into()),
         );
         assert_eq!(hostname, "linux-box");
+    }
+
+    #[test]
+    fn local_name_uses_hostname_file_after_empty_environment() {
+        let name = local_device_name_from(|_| Some("   ".into()), || Some(" file-host\n".into()));
+        assert_eq!(name, "file-host");
+    }
+
+    #[test]
+    fn local_name_uses_unknown_device_as_the_final_fallback() {
+        let name = local_device_name_from(|_| None, || Some("  \n".into()));
+        assert_eq!(name, "unknown-device");
     }
 
     #[tokio::test]

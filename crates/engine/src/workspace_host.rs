@@ -78,7 +78,10 @@ pub struct WorkspaceHost {
 impl WorkspaceHost {
     /// Load (or initialize) the workspace doc, upsert this device's registry row,
     /// and start the change-driven persistence task.
-    pub fn open(store: Arc<DocsStore>, config: WorkspaceHostConfig) -> Result<Self, EngineError> {
+    pub fn open(
+        store: Arc<DocsStore>,
+        mut config: WorkspaceHostConfig,
+    ) -> Result<Self, EngineError> {
         let doc = match store.load_snapshot(WORKSPACE_DOC_ID)? {
             Some(bytes) => {
                 let raw = loro::LoroDoc::new();
@@ -103,12 +106,13 @@ impl WorkspaceHost {
             .read_devices()?
             .into_iter()
             .find(|d| d.id == config.device_id);
+        let effective_device_name = startup_device_name(
+            existing.as_ref().map(|device| device.name.as_str()),
+            &config.device_name,
+        );
         doc.upsert_device(&Device {
             id: config.device_id.clone(),
-            name: startup_device_name(
-                existing.as_ref().map(|device| device.name.as_str()),
-                &config.device_name,
-            ),
+            name: effective_device_name.clone(),
             platform: config.platform.clone(),
             last_seen_at: Some(now),
             // First registration stamps `createdAt`; restarts keep the original
@@ -118,6 +122,7 @@ impl WorkspaceHost {
             // on the Devices page; workspace version — same for every crate).
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
         })?;
+        config.device_name = effective_device_name;
 
         let (changed_tx, changed_rx) = watch::channel(0u64);
         let sub = doc.doc().subscribe_root(Arc::new(move |_diff| {
@@ -148,6 +153,11 @@ impl WorkspaceHost {
 
     pub fn device_id(&self) -> &str {
         &self.inner.config.device_id
+    }
+
+    /// Effective name written to this device's workspace row at startup.
+    pub fn device_name(&self) -> &str {
+        &self.inner.config.device_name
     }
 
     pub(crate) fn mutation_gate(&self) -> DocMutationGate {

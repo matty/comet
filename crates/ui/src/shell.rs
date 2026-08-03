@@ -3646,8 +3646,45 @@ mod tests {
     }
 
     #[test]
-    fn bottom_settings_button_targets_devices() {
+    fn bottom_settings_button_rendering_targets_devices_without_account_menu() {
         assert_eq!(BOTTOM_SETTINGS_SECTION, SettingsSection::Devices);
         assert_eq!(BOTTOM_SETTINGS_SECTION.label(), "Devices");
+
+        let source = include_str!("shell.rs");
+        let production_source = source
+            .split_once("#[cfg(test)]")
+            .expect("shell test-module boundary")
+            .0;
+        let settings_renderer = production_source
+            .split_once("fn render_settings_button")
+            .expect("settings button renderer")
+            .1
+            .split_once("\n    fn ")
+            .expect("next shell method")
+            .0;
+        let listener_token = ["this.", "open_settings", "(BOTTOM_SETTINGS_SECTION, cx)"].concat();
+
+        assert!(
+            production_source.contains(".child(settings_button)"),
+            "the rendered sidebar must include the bottom Settings button"
+        );
+        assert!(settings_renderer.contains(".id(\"sidebar-settings\")"));
+        assert!(
+            settings_renderer.contains(&listener_token),
+            "the actual click listener must open the configured settings section"
+        );
+        for obsolete in [
+            "user_menu_open",
+            "user_menu_dismissed_at",
+            "render_user_menu",
+            "user-menu-settings",
+            "Sign out",
+            "Alpha",
+        ] {
+            assert!(
+                !production_source.contains(obsolete),
+                "obsolete account-menu token remains: {obsolete}"
+            );
+        }
     }
 }

@@ -64,17 +64,22 @@ struct Fixture {
 
 fn fixture_remote_service(device_id: &str) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::write(dir.path().join("device-id"), device_id).expect("device id");
-    let registry = HarnessRegistry::new();
-    registry.register(Arc::new(EmptyHarness));
-    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
-        .expect("engine assembles");
+    let core = assemble_core(dir.path(), device_id);
     let service = RemoteRpcService::new(core.remote_rpc_service(), device_id);
     Fixture {
         _dir: dir,
         core,
         service,
     }
+}
+
+fn assemble_core(data_dir: &std::path::Path, device_id: &str) -> EngineCore {
+    std::fs::create_dir_all(data_dir).expect("data dir");
+    std::fs::write(data_dir.join("device-id"), device_id).expect("device id");
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(EmptyHarness));
+    EngineCore::assemble(data_dir, Arc::new(registry), HarnessId::Mock, None)
+        .expect("engine assembles")
 }
 
 struct EngineFixture {
@@ -238,6 +243,66 @@ async fn server_hello_is_stable_and_pairing_returns_an_expiry() {
     assert!(expires_at > before);
     assert!(expires_at <= before + chrono::Duration::minutes(6));
     fixture.core.shutdown().await;
+}
+
+#[tokio::test]
+async fn generated_workspace_name_matches_server_hello() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble_core(dir.path(), "generated-name-device");
+    let workspace_name = core
+        .workspace
+        .doc()
+        .read_devices()
+        .unwrap()
+        .into_iter()
+        .find(|device| device.id == core.device_id)
+        .unwrap()
+        .name;
+    let hello = core
+        .rpc_service()
+        .handle(methods::SERVER_HELLO, serde_json::json!({}))
+        .await
+        .unwrap();
+    let RpcReply::Value(hello) = hello else {
+        panic!("expected ServerHello value")
+    };
+
+    assert_eq!(hello["name"], workspace_name);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn preserved_custom_workspace_name_matches_server_hello_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble_core(dir.path(), "custom-name-device");
+    core.workspace
+        .rename_device(&core.device_id, "Rendering workstation")
+        .unwrap();
+    core.shutdown().await;
+    drop(core);
+
+    let restarted = assemble_core(dir.path(), "custom-name-device");
+    let workspace_name = restarted
+        .workspace
+        .doc()
+        .read_devices()
+        .unwrap()
+        .into_iter()
+        .find(|device| device.id == restarted.device_id)
+        .unwrap()
+        .name;
+    let hello = restarted
+        .rpc_service()
+        .handle(methods::SERVER_HELLO, serde_json::json!({}))
+        .await
+        .unwrap();
+    let RpcReply::Value(hello) = hello else {
+        panic!("expected ServerHello value")
+    };
+
+    assert_eq!(workspace_name, "Rendering workstation");
+    assert_eq!(hello["name"], workspace_name);
+    restarted.shutdown().await;
 }
 
 #[tokio::test]
