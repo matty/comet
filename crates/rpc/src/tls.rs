@@ -250,6 +250,7 @@ pub async fn connect_lan_rpc<A>(
 where
     A: ToSocketAddrs,
 {
+    let _provider = selected_crypto_provider();
     let mismatch = Arc::new(AtomicBool::new(false));
     let verifier = Arc::new(PinnedServerVerifier {
         expected: pin.spki_sha256,
@@ -418,6 +419,7 @@ pub async fn pair_client<A>(
 where
     A: ToSocketAddrs,
 {
+    let _provider = selected_crypto_provider();
     let secret = Zeroizing::new(secret);
     let verifier = Arc::new(UnpinnedPairingVerifier {
         algorithms: supported_algorithms(),
@@ -639,6 +641,7 @@ fn lan_websocket_config() -> WebSocketConfig {
 }
 
 fn optional_client_server_config(identity: &TlsIdentity) -> Result<ServerConfig, TlsError> {
+    let _provider = selected_crypto_provider();
     ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_client_cert_verifier(Arc::new(OptionalClientVerifier {
             hints: Vec::new(),
@@ -659,10 +662,19 @@ fn certificate_fingerprint(certificate_der: &[u8]) -> Result<[u8; 32], TlsIdenti
 }
 
 fn supported_algorithms() -> WebPkiSupportedAlgorithms {
+    selected_crypto_provider().signature_verification_algorithms
+}
+
+fn selected_crypto_provider() -> Arc<CryptoProvider> {
+    if let Some(installed) = CryptoProvider::get_default() {
+        return installed.clone();
+    }
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    // A failed install means another thread won the process-wide race. Honor
+    // whichever provider is installed instead of overriding it.
     CryptoProvider::get_default()
         .cloned()
-        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
-        .signature_verification_algorithms
+        .expect("a CryptoProvider installation succeeded")
 }
 
 fn verify_signature(

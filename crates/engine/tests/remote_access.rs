@@ -5,10 +5,19 @@ use base64::Engine as _;
 use futures::stream::BoxStream;
 use futures::{StreamExt, stream};
 
-use comet_engine::{EngineCore, HarnessRegistry, RemoteRpcService, remote_method_allowed};
+use chrono::Utc;
+use comet_engine::{
+    EngineCore, HarnessRegistry, LanServerStatus, RemoteConfigStore, RemoteRpcService,
+    remote_method_allowed,
+};
 use comet_harness::{Harness, HarnessError, RunControls};
-use comet_proto::{AgentEvent, Device, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode};
-use comet_rpc::{RpcError, RpcReply, RpcService, methods};
+use comet_identity::DeviceIdentity;
+use comet_proto::{
+    AgentEvent, Device, HarnessId, Model, PROTOCOL_VERSION, ReasoningLevel, RemoteConnectionState,
+    RemoteEndpoint, RemoteEntry, RunRequest, ServerId, SteeringMode, TrustedClient,
+};
+use comet_rpc::{RpcError, RpcReply, RpcService, TlsIdentity, connect_lan_rpc, methods};
+use tokio::net::{TcpListener, TcpStream};
 
 struct EmptyHarness;
 
@@ -66,6 +75,304 @@ fn fixture_remote_service(device_id: &str) -> Fixture {
         core,
         service,
     }
+}
+
+struct EngineFixture {
+    _dir: tempfile::TempDir,
+    core: EngineCore,
+    lan_addr: std::net::SocketAddr,
+}
+
+impl EngineFixture {
+    async fn start() -> Self {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lan_addr = probe.local_addr().unwrap();
+        drop(probe);
+        let dir = tempfile::tempdir().unwrap();
+        RemoteConfigStore::open(dir.path())
+            .unwrap()
+            .set_lan_settings(comet_proto::LanSettings {
+                enabled: false,
+                bind: lan_addr,
+            })
+            .unwrap();
+        let core = EngineCore::assemble(
+            dir.path(),
+            Arc::new(HarnessRegistry::new()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        Self {
+            _dir: dir,
+            core,
+            lan_addr,
+        }
+    }
+
+    async fn local_call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        match self.core.rpc_service().handle(method, params).await? {
+            RpcReply::Value(value) => Ok(value),
+            RpcReply::Stream(_) => panic!("expected value reply"),
+        }
+    }
+
+    async fn enable_lan(&self) -> Result<serde_json::Value, RpcError> {
+        self.local_call(
+            methods::SET_LAN_SETTINGS,
+            serde_json::json!({"enabled": true, "bind": self.lan_addr}),
+        )
+        .await
+    }
+
+    async fn wait_for_status(&self, wanted: fn(&LanServerStatus) -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if wanted(&self.core.lan_status()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("LAN status transition");
+    }
+}
+
+#[tokio::test]
+async fn listener_is_closed_by_default_and_rebinds_after_enable() {
+    let fixture = EngineFixture::start().await;
+    assert!(TcpStream::connect(fixture.lan_addr).await.is_err());
+    fixture.enable_lan().await.unwrap();
+    fixture
+        .wait_for_status(|status| matches!(status, LanServerStatus::Listening { .. }))
+        .await;
+    assert!(TcpStream::connect(fixture.lan_addr).await.is_ok());
+    fixture.core.shutdown().await;
+    assert!(TcpStream::connect(fixture.lan_addr).await.is_err());
+}
+
+#[tokio::test]
+async fn bind_failure_does_not_stop_local_rpc() {
+    let fixture = EngineFixture::start().await;
+    let occupied = TcpListener::bind(fixture.lan_addr).await.unwrap();
+    fixture.enable_lan().await.unwrap();
+    fixture
+        .wait_for_status(|status| matches!(status, LanServerStatus::BindFailed { .. }))
+        .await;
+    assert!(
+        fixture
+            .local_call(methods::LOCAL_DEVICE, serde_json::json!({}))
+            .await
+            .is_ok()
+    );
+    drop(occupied);
+    fixture.core.shutdown().await;
+}
+
+#[tokio::test]
+async fn changing_the_bind_address_replaces_the_listener() {
+    let fixture = EngineFixture::start().await;
+    fixture.enable_lan().await.unwrap();
+    fixture
+        .wait_for_status(|status| matches!(status, LanServerStatus::Listening { .. }))
+        .await;
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let replacement = probe.local_addr().unwrap();
+    drop(probe);
+    fixture
+        .local_call(
+            methods::SET_LAN_SETTINGS,
+            serde_json::json!({"enabled": true, "bind": replacement}),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                fixture.core.lan_status(),
+                LanServerStatus::Listening { bind } if bind == replacement
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("listener rebinds");
+    assert!(TcpStream::connect(fixture.lan_addr).await.is_err());
+    assert!(TcpStream::connect(replacement).await.is_ok());
+    fixture.core.shutdown().await;
+}
+
+#[tokio::test]
+async fn server_hello_is_stable_and_pairing_returns_an_expiry() {
+    let fixture = EngineFixture::start().await;
+    let first = fixture
+        .local_call(methods::SERVER_HELLO, serde_json::json!({}))
+        .await
+        .unwrap();
+    let second = fixture
+        .local_call(methods::SERVER_HELLO, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first["protocolVersion"], PROTOCOL_VERSION);
+    assert_eq!(first["deviceId"], fixture.core.device_id);
+
+    let before = Utc::now();
+    let pairing = fixture
+        .local_call(methods::BEGIN_PAIRING, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(pairing["secret"].as_str().unwrap().contains('-'));
+    let expires_at = pairing["expiresAt"]
+        .as_str()
+        .unwrap()
+        .parse::<chrono::DateTime<Utc>>()
+        .unwrap();
+    assert!(expires_at > before);
+    assert!(expires_at <= before + chrono::Duration::minutes(6));
+    fixture.core.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_status_updates_only_the_named_rows_connection_fields() {
+    let fixture = EngineFixture::start().await;
+    let original = RemoteEntry {
+        server_id: ServerId::new("sha256:remote"),
+        endpoint: RemoteEndpoint::parse("host.local:27655").unwrap(),
+        name: "Build box".into(),
+        pinned_spki_sha256: "pin".into(),
+        protocol_version: 0,
+        last_state: RemoteConnectionState::Connecting,
+        created_at: Utc::now(),
+        last_connected_at: None,
+    };
+    fixture
+        .local_call(
+            methods::PUT_REMOTE,
+            serde_json::to_value(&original).unwrap(),
+        )
+        .await
+        .unwrap();
+    let connected_at = Utc::now();
+    fixture
+        .local_call(
+            methods::REPORT_REMOTE_STATUS,
+            serde_json::json!({
+                "serverId": original.server_id,
+                "lastState": "online",
+                "protocolVersion": PROTOCOL_VERSION,
+                "lastConnectedAt": connected_at,
+                "name": "must not replace the row",
+                "pinnedSpkiSha256": "must-not-change"
+            }),
+        )
+        .await
+        .unwrap();
+    let rows = fixture.core.remote_config().watch_remotes();
+    let row = &rows.borrow()[0];
+    assert_eq!(row.name, original.name);
+    assert_eq!(row.endpoint, original.endpoint);
+    assert_eq!(row.pinned_spki_sha256, original.pinned_spki_sha256);
+    assert_eq!(row.last_state, RemoteConnectionState::Online);
+    assert_eq!(row.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(row.last_connected_at, Some(connected_at));
+    fixture.core.shutdown().await;
+}
+
+#[tokio::test]
+async fn persisted_online_remote_is_offline_when_engine_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = RemoteConfigStore::open(dir.path()).unwrap();
+    store
+        .put_remote(RemoteEntry {
+            server_id: ServerId::new("sha256:remote"),
+            endpoint: RemoteEndpoint::parse("host.local:27655").unwrap(),
+            name: "Build box".into(),
+            pinned_spki_sha256: "pin".into(),
+            protocol_version: PROTOCOL_VERSION,
+            last_state: RemoteConnectionState::Online,
+            created_at: Utc::now(),
+            last_connected_at: Some(Utc::now()),
+        })
+        .unwrap();
+    drop(store);
+    let core = EngineCore::assemble(
+        dir.path(),
+        Arc::new(HarnessRegistry::new()),
+        HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        core.remote_config().watch_remotes().borrow()[0].last_state,
+        RemoteConnectionState::Offline
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn revoking_a_trusted_client_closes_its_active_connection() {
+    let fixture = EngineFixture::start().await;
+    let client_dir = tempfile::tempdir().unwrap();
+    let client_identity = DeviceIdentity::load_or_create(client_dir.path()).unwrap();
+    let client_tls = TlsIdentity::from_device_identity(&client_identity).unwrap();
+    fixture
+        .core
+        .remote_config()
+        .trust_client(TrustedClient {
+            server_id: client_tls.server_id().clone(),
+            name: "Test client".into(),
+            pinned_spki_sha256: serde_json::to_value(client_tls.server_id())
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string(),
+            paired_at: Utc::now(),
+        })
+        .unwrap();
+    fixture.enable_lan().await.unwrap();
+    fixture
+        .wait_for_status(|status| matches!(status, LanServerStatus::Listening { .. }))
+        .await;
+    let server_tls = TlsIdentity::from_device_identity(fixture.core.device_identity()).unwrap();
+    let client = connect_lan_rpc(fixture.lan_addr, &client_tls, &server_tls.pinned_server())
+        .await
+        .unwrap();
+    assert!(
+        client
+            .call(methods::SERVER_HELLO, serde_json::json!({}))
+            .await
+            .is_ok()
+    );
+    fixture
+        .local_call(
+            methods::REVOKE_TRUSTED_CLIENT,
+            serde_json::json!({"serverId": client_tls.server_id()}),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if client
+                .call(methods::SERVER_HELLO, serde_json::json!({}))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("revocation closes the active connection");
+    fixture.core.shutdown().await;
 }
 
 async fn first_nonempty_stream_item(reply: RpcReply) -> serde_json::Value {

@@ -18,6 +18,7 @@ pub mod auth;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
+pub mod lan_server;
 pub mod local_store;
 pub mod registry;
 pub mod remote_config;
@@ -37,8 +38,10 @@ pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
 pub use diff_sync::{CheckoutDiffSync, DiffSidecar, DiffSnapshot, capture_diff};
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
+pub use lan_server::{LanServer, LanServerHandle, LanServerStatus};
 pub use local_store::{LegacyProfile, LocalStore, prepare_local_store};
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
+pub use remote_config::RemoteConfigStore;
 pub use remote_rpc::{RemoteRpcService, remote_method_allowed};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
@@ -112,6 +115,10 @@ pub struct EngineCore {
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
+    device_identity: Arc<DeviceIdentity>,
+    remote_config: RemoteConfigStore,
+    lan_server: LanServerHandle,
+    rpc: std::sync::OnceLock<Arc<EngineRpc>>,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
     /// Peer link cache for `targetDeviceId` routing (attached when edge+auth are ready).
@@ -153,6 +160,16 @@ impl EngineCore {
         // port binds; held (and kernel-released on crash) for the engine's life.
         let lock = InstanceLock::acquire(data_dir)?;
         let device_id = load_or_create_device_id(data_dir)?;
+        let device_identity = DeviceIdentity::load_or_create(data_dir)?;
+        let remote_config = RemoteConfigStore::open(data_dir)?;
+        let persisted_remotes = remote_config.watch_remotes().borrow().clone();
+        for mut remote in persisted_remotes {
+            if remote.last_state == comet_proto::RemoteConnectionState::Online {
+                remote.last_state = comet_proto::RemoteConnectionState::Offline;
+                remote_config.put_remote(remote)?;
+            }
+        }
+        let lan_server = LanServerHandle::new(remote_config.clone(), device_identity.clone());
         // Identity-scoped storage: snapshots, the command ledger, and run
         // journals live under `orgs/{orgId}/{userId}/` so switching accounts or
         // orgs on one machine never reuses another identity's cached docs.
@@ -213,6 +230,10 @@ impl EngineCore {
             uploads,
             agent_accounts,
             device_id,
+            device_identity,
+            remote_config,
+            lan_server,
+            rpc: std::sync::OnceLock::new(),
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
@@ -314,31 +335,67 @@ impl EngineCore {
     }
 
     pub fn rpc_service(&self) -> Arc<EngineRpc> {
-        let mut rpc = EngineRpc::new(
-            self.sessions.clone(),
-            self.doc_host.clone(),
-            self.workspace.clone(),
-            self.registry.clone(),
-            self.repos.clone(),
-            self.terminals.clone(),
-            self.diff_sync.clone(),
-            self.uploads.clone(),
-            self.agent_accounts.clone(),
-        )
-        .with_auth(self.auth());
-        if let Some(links) = self.links() {
-            rpc = rpc.with_links(links);
-        }
-        if let Some(updater) = self.updater() {
-            rpc = rpc.with_updater(updater);
-        }
-        Arc::new(rpc)
+        let rpc = self
+            .rpc
+            .get_or_init(|| {
+                let hello = comet_proto::ServerHello {
+                    protocol_version: comet_proto::PROTOCOL_VERSION,
+                    server_id: self.device_identity.server_id().clone(),
+                    device_id: self.device_id.clone(),
+                    name: local_device_name(),
+                    capabilities: vec!["authoritative-rpc".into(), "pairing".into()],
+                };
+                let mut rpc = EngineRpc::new(
+                    self.sessions.clone(),
+                    self.doc_host.clone(),
+                    self.workspace.clone(),
+                    self.registry.clone(),
+                    self.repos.clone(),
+                    self.terminals.clone(),
+                    self.diff_sync.clone(),
+                    self.uploads.clone(),
+                    self.agent_accounts.clone(),
+                )
+                .with_auth(self.auth())
+                .with_remote_admin(
+                    self.remote_config.clone(),
+                    self.lan_server.clone(),
+                    hello,
+                );
+                if let Some(links) = self.links() {
+                    rpc = rpc.with_links(links);
+                }
+                if let Some(updater) = self.updater() {
+                    rpc = rpc.with_updater(updater);
+                }
+                Arc::new(rpc)
+            })
+            .clone();
+        self.lan_server
+            .ensure_started(Arc::new(RemoteRpcService::new(
+                rpc.clone(),
+                self.device_id.clone(),
+            )));
+        rpc
+    }
+
+    pub fn remote_config(&self) -> &RemoteConfigStore {
+        &self.remote_config
+    }
+
+    pub fn device_identity(&self) -> &DeviceIdentity {
+        &self.device_identity
+    }
+
+    pub fn lan_status(&self) -> LanServerStatus {
+        self.lan_server.status()
     }
 
     /// Graceful teardown: settle live runs (streaming entries stamped `aborted`),
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
     pub async fn shutdown(&self) {
+        self.lan_server.shutdown().await;
         self.sessions.shutdown().await;
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
