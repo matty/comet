@@ -170,6 +170,8 @@ impl SettingsSection {
     }
 }
 
+const BOTTOM_SETTINGS_SECTION: SettingsSection = SettingsSection::Devices;
+
 /// What the main outlet shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
@@ -462,10 +464,6 @@ pub struct Shell {
     /// Last seen session status per chat — the chime trigger compares against
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, comet_proto::SessionStatus>,
-    user_menu_open: bool,
-    /// Outside-click dismissal instant — suppresses the trigger click that
-    /// follows the same mouse-down from instantly reopening the menu.
-    user_menu_dismissed_at: Option<std::time::Instant>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
@@ -647,8 +645,6 @@ impl Shell {
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
-            user_menu_open: false,
-            user_menu_dismissed_at: None,
             sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
@@ -1085,7 +1081,6 @@ impl Shell {
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
-        self.user_menu_open = false;
         self.chat_menu = None;
         cx.notify();
     }
@@ -1126,7 +1121,6 @@ impl Shell {
                 self.route = Route::Settings(section);
             }
         }
-        self.user_menu_open = false;
         self.chat_menu = None;
         cx.notify();
     }
@@ -1887,17 +1881,7 @@ impl Shell {
         let glass = Theme::GLASS_ALPHA < 1.0;
         let sidebar_fade = theme.surface;
 
-        let user_line: SharedString = {
-            let state = self.state.read(cx);
-            state
-                .local_device_id
-                .as_ref()
-                .and_then(|id| state.devices.iter().find(|device| &device.id == id))
-                .map(|device| device.name.clone().into())
-                .unwrap_or_else(|| SharedString::from("This machine"))
-        };
-        let user_email: Option<SharedString> = None;
-        let user_menu = self.render_user_menu(user_line.clone(), user_email.clone(), theme, cx);
+        let settings_button = self.render_settings_button(theme, cx);
 
         let spaces_section = self.render_spaces_section(theme, cx);
 
@@ -1982,7 +1966,7 @@ impl Shell {
                         )
                     }),
             ))
-            // Update strip (above the user menu; below the lists).
+            // Update strip (above the settings button; below the lists).
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
                 el.child(strip)
             })
@@ -2008,11 +1992,16 @@ impl Shell {
                         .child(notice),
                 )
             })
-            .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
+            .child(
+                div()
+                    .p(px(Theme::SPACE_SM))
+                    .flex_none()
+                    .child(settings_button),
+            )
             .into_any_element()
     }
 
-    /// Update strip: shown above the user menu whenever the engine's
+    /// Update strip: shown above the settings button whenever the engine's
     /// UpdateStatus stream reports a newer release. On a macOS bundle install
     /// it drives the whole flow — click to download, then click to restart into
     /// the staged bundle. Elsewhere (managed/source installs) it is advisory
@@ -2055,7 +2044,7 @@ impl Shell {
         let mut strip = div()
             .id("update-strip")
             .mx(px(Theme::SPACE_SM))
-            // No bottom margin: the user-menu block below carries its own
+            // No bottom margin: the settings-button block below carries its own
             // SPACE_SM padding — doubling it read as a hole (user report).
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
@@ -2158,26 +2147,9 @@ impl Shell {
         }
     }
 
-    /// UserMenu (§1.6): name/email trigger row; menu with plan badge, Open
-    /// settings, Sign out.
-    fn render_user_menu(
-        &mut self,
-        user_line: SharedString,
-        user_email: Option<SharedString>,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let open = self.user_menu_open;
-        // Bottom-of-sidebar identity (comet user-menu.tsx): avatar circle +
-        // name with the plan label underneath, Alpha badge chip on the right.
-        let initial: SharedString = user_line
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".into())
-            .into();
-        let mut trigger = div()
-            .id("user-menu")
+    fn render_settings_button(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("sidebar-settings")
             .flex_none()
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
@@ -2187,113 +2159,21 @@ impl Shell {
             .items_center()
             .gap(px(10.0))
             .cursor_pointer()
-            // user-menu.tsx trigger: hover `bg-white/[0.04]`, open state
-            // (`data-[state=open]`) the slightly stronger `bg-white/[0.06]`;
-            // the hover wash fades over `transition-colors`.
-            .bg(if open {
-                theme.element_hover
-            } else {
-                motion::hover_blend(
-                    "user-menu-trigger",
-                    crate::theme::wash(0.0),
-                    crate::theme::wash(0.11),
-                )
-            })
-            .on_hover(motion::hover_listener("user-menu-trigger"))
-            .on_click(cx.listener(|this, _, _, cx| {
-                // A click that just dismissed the menu (outside-click on the
-                // trigger) must not instantly reopen it.
-                let just_dismissed = this
-                    .user_menu_dismissed_at
-                    .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
-                this.user_menu_open = !this.user_menu_open && !just_dismissed;
-                this.user_menu_dismissed_at = None;
-                cx.notify();
-            }))
+            .hover(|style| style.bg(theme.element_hover))
+            .on_click(cx.listener(|this, _, _, cx| this.open_settings(BOTTOM_SETTINGS_SECTION, cx)))
             .child(
-                // Avatar: white circle, initial in near-black (comet user-menu.tsx).
-                div()
-                    .size(px(28.0))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(theme.text)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.bg)
-                    .child(initial),
+                icon(icons::SETTINGS_MINIMALISTIC)
+                    .size(px(18.0))
+                    .text_color(theme.text_muted),
             )
             .child(
-                // Name with the plan label underneath — no chip on the right.
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .line_height(px(17.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .truncate()
-                            .child(user_line.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .line_height(px(15.0))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from("Alpha")),
-                    ),
-            );
-        if open {
-            // user-menu.tsx content: `w-[--radix-dropdown-menu-trigger-width]`
-            // (exactly as wide as the trigger row — sidebar minus its p-2
-            // gutters), `flex-col gap-0.5`, then: one small muted email line
-            // (`px-2 pb-1 pt-1.5 text-[11px] text-muted-foreground/70`),
-            // "Settings", separator, "Sign out". Both rows are plain
-            // `menuItem`s with muted 16px icons — sign-out carries NO
-            // destructive tone in the original.
-            let menu = popover::popover_card(theme)
-                .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.user_menu_open = false;
-                    this.user_menu_dismissed_at = Some(std::time::Instant::now());
-                    cx.notify();
-                }))
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .child(
-                    div()
-                        .px(px(8.0))
-                        .pt(px(6.0))
-                        .pb(px(4.0))
-                        .text_size(px(11.0))
-                        .text_color(theme.text_muted.opacity(0.7))
-                        .truncate()
-                        .child(user_email.unwrap_or(user_line)),
-                )
-                .child(
-                    popover::menu_row(theme, false, "user-menu-settings")
-                        .id("user-menu-settings")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.open_settings(SettingsSection::Devices, cx)
-                        }))
-                        .child(
-                            icon(icons::SETTINGS_MINIMALISTIC)
-                                .size(px(16.0))
-                                .text_color(theme.text_muted),
-                        )
-                        .child(SharedString::from("Settings")),
-                )
-                .into_any_element();
-            trigger = trigger.child(popover::anchored_menu_above("user-menu-popover", menu));
-        }
-        trigger.into_any_element()
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child("Settings"),
+            )
+            .into_any_element()
     }
 
     /// Floating layers owned by the shell: the session context menu and the
@@ -3763,5 +3643,11 @@ mod tests {
             SettingsSection::RemoteConnections.label(),
             "Remote connections"
         );
+    }
+
+    #[test]
+    fn bottom_settings_button_targets_devices() {
+        assert_eq!(BOTTOM_SETTINGS_SECTION, SettingsSection::Devices);
+        assert_eq!(BOTTOM_SETTINGS_SECTION.label(), "Devices");
     }
 }
