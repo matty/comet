@@ -99,6 +99,35 @@ fn expected_release_sha256<'a>(manifest: &'a Manifest, file: &str) -> anyhow::Re
     Ok(checksum)
 }
 
+const STAGE_MARKER_FILE: &str = ".comet-release";
+
+fn validated_release_version(manifest: &Manifest) -> anyhow::Result<&str> {
+    if manifest.repository != EXPECTED_RELEASE_REPOSITORY {
+        bail!(
+            "release repository mismatch: expected {EXPECTED_RELEASE_REPOSITORY}, got {}",
+            manifest.repository
+        );
+    }
+    let version = manifest.version.trim();
+    if version_parts(version).is_none() {
+        bail!("release manifest has an invalid dotted-numeric version");
+    }
+    Ok(version)
+}
+
+fn stage_marker(manifest: &Manifest, file: &str) -> anyhow::Result<String> {
+    let version = validated_release_version(manifest)?;
+    let checksum = expected_release_sha256(manifest, file)?;
+    Ok(format!(
+        "repository={EXPECTED_RELEASE_REPOSITORY}\nversion={version}\nartifact={file}\nsha256={}\n",
+        checksum.to_ascii_lowercase()
+    ))
+}
+
+fn stage_marker_matches(directory: &Path, expected: &str) -> bool {
+    std::fs::read_to_string(directory.join(STAGE_MARKER_FILE)).is_ok_and(|value| value == expected)
+}
+
 /// Artifact-name platform pair — `uname`-style strings matching the packaging
 /// scripts: `linux-x86_64`, `linux-aarch64`, `macos-arm64`.
 pub fn platform_key() -> (&'static str, &'static str) {
@@ -151,10 +180,7 @@ fn parse_manifest(bytes: &[u8]) -> anyhow::Result<Manifest> {
     if manifest.repository.trim().is_empty() {
         bail!("release repository is missing; expected {EXPECTED_RELEASE_REPOSITORY}");
     }
-    if !manifest
-        .repository
-        .eq_ignore_ascii_case(EXPECTED_RELEASE_REPOSITORY)
-    {
+    if manifest.repository != EXPECTED_RELEASE_REPOSITORY {
         bail!(
             "release repository mismatch: expected {EXPECTED_RELEASE_REPOSITORY}, got {}",
             manifest.repository
@@ -312,13 +338,19 @@ pub async fn stage_headless(
     manifest: &Manifest,
     app_root: &Path,
 ) -> anyhow::Result<PathBuf> {
-    let version = &manifest.version;
+    let version = validated_release_version(manifest)?;
     let dest = app_root.join(version);
-    if dest.join("comet").exists() {
-        return Ok(dest);
-    }
     let file = headless_artifact(version);
-    expected_release_sha256(manifest, &file)?;
+    let marker = stage_marker(manifest, &file)?;
+    if dest.join("comet").exists() {
+        if stage_marker_matches(&dest, &marker) {
+            return Ok(dest);
+        }
+        bail!(
+            "existing staged release {} is unverified; remove it before retrying",
+            dest.display()
+        );
+    }
     let stage = app_root.join(format!(".stage-{version}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage).with_context(|| format!("creating {}", stage.display()))?;
@@ -342,6 +374,8 @@ pub async fn stage_headless(
         if !unpacked.join("comet").is_file() {
             bail!("tarball {file} did not contain a comet binary");
         }
+        std::fs::write(unpacked.join(STAGE_MARKER_FILE), &marker)
+            .context("writing release verification marker")?;
         match std::fs::rename(&unpacked, &dest) {
             Ok(()) => {}
             // Lost a race with another stager — the staged copy is equivalent.
@@ -406,14 +440,18 @@ pub async fn stage_mac_app(
     manifest: &Manifest,
     data_dir: &Path,
 ) -> anyhow::Result<PathBuf> {
-    let version = &manifest.version;
+    let version = validated_release_version(manifest)?;
     let dir = data_dir.join("updates").join(version);
     let staged = dir.join("Comet.app");
-    if staged.join("Contents/MacOS/comet").exists() {
-        return Ok(staged);
-    }
     let file = mac_app_artifact(version);
-    expected_release_sha256(manifest, &file)?;
+    let marker = stage_marker(manifest, &file)?;
+    if staged.join("Contents/MacOS/comet").exists() {
+        if stage_marker_matches(&dir, &marker) {
+            return Ok(staged);
+        }
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("removing unverified stage {}", dir.display()))?;
+    }
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let tarball = dir.join(&file);
@@ -431,6 +469,8 @@ pub async fn stage_mac_app(
     if !staged.join("Contents/MacOS/comet").exists() {
         bail!("app tarball {file} did not contain Comet.app");
     }
+    std::fs::write(dir.join(STAGE_MARKER_FILE), marker)
+        .context("writing release verification marker")?;
     Ok(staged)
 }
 
@@ -887,6 +927,112 @@ mod tests {
                 .is_err()
         );
         assert!(!temp.path().join("updates/1.2.3").exists());
+    }
+
+    #[tokio::test]
+    async fn existing_headless_stage_requires_metadata_and_matching_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("1.2.3");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("comet"), "unverified").unwrap();
+
+        let missing =
+            parse_manifest(br#"{"repository":"matty/comet","version":"1.2.3","files":{}}"#)
+                .unwrap();
+        assert!(
+            stage_headless("http://127.0.0.1:1", &missing, temp.path())
+                .await
+                .is_err()
+        );
+
+        let file = headless_artifact("1.2.3");
+        let valid = parse_manifest(
+            format!(
+                r#"{{"repository":"matty/comet","version":"1.2.3","files":{{"{file}":{{"sha256":"{}"}}}}}}"#,
+                "a".repeat(64)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert!(
+            stage_headless("http://127.0.0.1:1", &valid, temp.path())
+                .await
+                .is_err()
+        );
+        std::fs::write(destination.join(".comet-release"), "wrong marker").unwrap();
+        assert!(
+            stage_headless("http://127.0.0.1:1", &valid, temp.path())
+                .await
+                .is_err()
+        );
+        std::fs::write(
+            destination.join(STAGE_MARKER_FILE),
+            stage_marker(&valid, &file).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            stage_headless("http://127.0.0.1:1", &valid, temp.path())
+                .await
+                .unwrap(),
+            destination
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_mac_stage_requires_metadata_and_matching_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("updates/1.2.3/Comet.app/Contents/MacOS");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("comet"), "unverified").unwrap();
+
+        let missing =
+            parse_manifest(br#"{"repository":"matty/comet","version":"1.2.3","files":{}}"#)
+                .unwrap();
+        assert!(
+            stage_mac_app("http://127.0.0.1:1", &missing, temp.path())
+                .await
+                .is_err()
+        );
+
+        let file = mac_app_artifact("1.2.3");
+        let valid = parse_manifest(
+            format!(
+                r#"{{"repository":"matty/comet","version":"1.2.3","files":{{"{file}":{{"sha256":"{}"}}}}}}"#,
+                "a".repeat(64)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert!(
+            stage_mac_app("http://127.0.0.1:1", &valid, temp.path())
+                .await
+                .is_err()
+        );
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("comet"), "unverified").unwrap();
+        std::fs::write(
+            temp.path().join("updates/1.2.3/.comet-release"),
+            "wrong marker",
+        )
+        .unwrap();
+        assert!(
+            stage_mac_app("http://127.0.0.1:1", &valid, temp.path())
+                .await
+                .is_err()
+        );
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("comet"), "verified").unwrap();
+        std::fs::write(
+            temp.path().join("updates/1.2.3").join(STAGE_MARKER_FILE),
+            stage_marker(&valid, &file).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            stage_mac_app("http://127.0.0.1:1", &valid, temp.path())
+                .await
+                .unwrap(),
+            temp.path().join("updates/1.2.3/Comet.app")
+        );
     }
 
     #[tokio::test]

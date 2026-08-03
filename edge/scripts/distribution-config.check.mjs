@@ -28,8 +28,17 @@ if (
 ) {
   throw new Error("distribution Worker retains an obsolete route");
 }
-if (!workflow.includes("wrangler secret delete WORKOS_API_KEY") || !workflow.includes("continue-on-error: true")) {
-  throw new Error("deployment does not idempotently clean up obsolete WORKOS_API_KEY");
+const deployStep = workflow.indexOf("- name: deploy");
+const cleanupStep = workflow.indexOf("- name: remove obsolete WorkOS secret");
+if (
+  deployStep < 0 ||
+  cleanupStep <= deployStep ||
+  !workflow.includes("wrangler secret list --format json") ||
+  !workflow.includes("wrangler secret delete WORKOS_API_KEY") ||
+  workflow.includes("continue-on-error: true") ||
+  workflow.includes("|| true")
+) {
+  throw new Error("secret cleanup is not ordered after deploy with fail-closed list/delete semantics");
 }
 if (!release.includes("github.repository == 'matty/comet'") || !release.includes("--arg repository \"matty/comet\"")) {
   throw new Error("release publishing is not pinned to the canonical repository");

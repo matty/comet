@@ -55,7 +55,7 @@ immediately.
 
 ## Verification
 
-- `cargo test -p comet-update` — 13 passed, including release independence and
+- `cargo test -p comet-update` — 15 passed, including release independence and
   unreachable-distribution status behavior.
 - `cargo test -p comet --bin comet` — 14 passed.
 - `npm test --prefix edge` — 7 Worker assertions plus the real-installer
@@ -89,22 +89,41 @@ Provenance follow-up verification:
 Review fix round 1 adds defense at every distribution boundary:
 
 - The Worker deployment preserves the original DO migration record, applies one
-  uniquely tagged deletion migration for `SessionRoom` and `DeviceRoom`, and
-  idempotently attempts to delete the obsolete `WORKOS_API_KEY` before deploy.
+  uniquely tagged deletion migration for `SessionRoom` and `DeviceRoom`, deploys
+  that distribution-only version first, then lists secrets and deletes the
+  obsolete `WORKOS_API_KEY` only when present. List/auth/parse/delete failures
+  fail the workflow; an absent secret succeeds without a blanket error waiver.
   An executable config/workflow check also proves only the two distribution
   routes and `RELEASES` binding remain.
-- The installer uses a real JSON parser: strict Python decoding rejects duplicate
-  keys, with a jq parser path when Python is unavailable and a clear failure when
-  neither exists. Parsed repository, dotted-numeric version, selected artifact,
+- The installer uses a real JSON parser: Python decoding rejects duplicate keys
+  and a tested preflight gives a clear dependency error when Python 3 is absent.
+  Parsed repository, dotted-numeric version, selected artifact,
   and 64-hex checksum are validated before any path interpolation or download.
   Attack regressions cover duplicate keys, escaped JSON identity, whitespace,
   path traversal, missing metadata, malformed checksums, and checksum mismatch.
 - Both Rust staging paths validate selected-artifact metadata before creating a
   staging directory. Downloaded bytes must match the manifest SHA-256 before any
-  unpack or swap.
+  unpack or swap. Fresh Rust and shell stages persist a provenance/checksum
+  marker; existing headless/mac/shell destinations are reusable only when that
+  marker exactly matches current canonical metadata. Unverified headless/shell
+  installs fail closed, while the macOS staging cache is discarded and restaged.
 - Release publication runs only in `matty/comet` and writes that literal identity,
   preventing a fork workflow from populating the canonical bucket under its own
   repository identity.
+
+Review fix round 2 tightened lifecycle and reuse semantics:
+
+- The jq fallback was removed in favor of one explicitly documented Python 3
+  dependency. The executable installer harness hides Python and proves the
+  installer fails before artifact selection, eliminating untested differences
+  between JSON parsers while retaining strict duplicate-key handling.
+- Secret cleanup now occurs after the distribution-only deploy. Wrangler secret
+  listing and JSON parsing must succeed; deletion is conditional on the key's
+  presence and deletion failures propagate. The workflow check asserts ordering
+  and rejects blanket `continue-on-error` or `|| true` handling.
+- Existing headless, macOS-cache, and shell stages now require an exact
+  repository/version/artifact/checksum marker. Tests cover missing metadata,
+  missing and mismatched markers, secure verified reuse, and macOS restaging.
 
 ## Residual risks and scope notes
 
@@ -119,5 +138,8 @@ Review fix round 1 adds defense at every distribution boundary:
   that provide only `latest.txt`, or manifests without `repository`, no longer
   update or install. Operators of intentional mirrors must republish a current
   manifest with `repository: "matty/comet"`, complete selected-artifact metadata,
-  and a valid SHA-256. Shell installation also now requires `python3` or `jq` plus
+  and a valid SHA-256. Shell installation also now requires Python 3 plus
   `sha256sum` or `shasum`, and fails closed when those tools are unavailable.
+  Existing installs/staging caches created before verification markers were
+  introduced are not silently reused; headless/shell users must remove the
+  explicitly reported unverified version, while macOS update caches restage.

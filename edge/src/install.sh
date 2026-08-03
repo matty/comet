@@ -3,7 +3,8 @@
 #
 #   curl -fsSL https://comet.zeron.sh/install.sh | sh
 #
-# Installs the self-contained native binary (no runtime deps) to
+# Uses Python 3 only while installing to strictly validate signed release
+# metadata. Installs the self-contained native binary (no runtime deps) to
 # ~/.comet-native/app, puts `comet` on PATH, and runs it as a systemd user
 # service that survives reboots. Re-running
 # upgrades in place; ~/.comet-native state is preserved.
@@ -45,8 +46,12 @@ manifest_file="$tmp/manifest.json"
 parsed_file="$tmp/manifest-fields"
 curl -fsSL "$BASE/releases/manifest.json" -o "$manifest_file"
 
-if command -v python3 >/dev/null 2>&1; then
-  python3 - "$manifest_file" "$plat" "$arch" > "$parsed_file" <<'PY'
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import json' >/dev/null 2>&1; then
+  echo "comet install: strict manifest validation requires python3" >&2
+  exit 1
+fi
+
+python3 - "$manifest_file" "$plat" "$arch" > "$parsed_file" <<'PY'
 import json
 import re
 import sys
@@ -95,52 +100,27 @@ print(version)
 print(artifact)
 print(checksum.lower())
 PY
-elif command -v jq >/dev/null 2>&1; then
-  if ! jq -e empty "$manifest_file" >/dev/null 2>&1; then
-    echo "comet install: invalid manifest JSON" >&2
-    exit 1
-  fi
-  if ! jq --stream -s -e 'map(.[0] | tojson) | length == (unique | length)' \
-    "$manifest_file" >/dev/null; then
-    echo "comet install: duplicate JSON key" >&2
-    exit 1
-  fi
-  jq -er --arg plat "$plat" --arg arch "$arch" '
-    def fail($message): error($message);
-    def valid_u64:
-      (sub("^0+"; "") | if . == "" then "0" else . end) as $part
-      | (($part | length) < 20 or (($part | length) == 20 and $part <= "18446744073709551615"));
-    if type != "object" then fail("manifest JSON must be an object") else . end
-    | if has("repository") | not then fail("missing release repository (expected matty/comet)")
-      elif .repository != "matty/comet" then fail("release repository mismatch") else . end
-    | (.version | if type == "string" then gsub("^\\s+|\\s+$"; "") else "" end) as $version
-    | if ($version | test("^v*[0-9]+(\\.[0-9]+)*$") | not)
-        or ($version | sub("^v*"; "") | split(".") | all(valid_u64) | not)
-      then fail("invalid release version") else . end
-    | ("comet-" + $version + "-" + $plat + "-" + $arch + ".tar.gz") as $artifact
-    | if (.files | type) != "object" or (.files[$artifact] | type) != "object"
-      then fail("missing artifact metadata for " + $artifact) else . end
-    | (.files[$artifact].sha256 // "") as $checksum
-    | if ($checksum | type) != "string" or ($checksum | test("^[0-9A-Fa-f]{64}$") | not)
-      then fail("invalid SHA-256 for " + $artifact) else . end
-    | $version, $artifact, ($checksum | ascii_downcase)
-  ' "$manifest_file" > "$parsed_file" || {
-    echo "comet install: invalid release manifest" >&2
-    exit 1
-  }
-else
-  echo "comet install: strict manifest validation requires python3 or jq" >&2
-  exit 1
-fi
 
 ver="$(sed -n '1p' "$parsed_file")"
 file="$(sed -n '2p' "$parsed_file")"
 expected_sha256="$(sed -n '3p' "$parsed_file")"
+expected_marker="repository=matty/comet
+version=$ver
+artifact=$file
+sha256=$expected_sha256"
 data_root="$HOME/.comet-native"
 app_root="$data_root/app"
 dest="$app_root/$ver"
 
-if [ -x "$dest/comet" ]; then
+if [ -f "$dest/comet" ]; then
+  actual_marker=
+  if [ -f "$dest/.comet-release" ]; then
+    actual_marker="$(cat "$dest/.comet-release")"
+  fi
+  if [ "$actual_marker" != "$expected_marker" ]; then
+    echo "comet install: unverified existing install at $dest; remove it before retrying" >&2
+    exit 1
+  fi
   echo "comet $ver already downloaded — relinking."
 else
   echo "downloading comet $ver ($plat-$arch)…"
@@ -159,6 +139,12 @@ else
   fi
   mkdir -p "$dest"
   tar -xzf "$tmp/$file" -C "$dest" --strip-components=1
+  [ -f "$dest/comet" ] || {
+    echo "comet install: verified archive did not contain a comet binary" >&2
+    rm -rf "$dest"
+    exit 1
+  }
+  printf '%s\n' "$expected_marker" > "$dest/.comet-release"
 fi
 
 ln -sfn "$dest" "$app_root/current"
