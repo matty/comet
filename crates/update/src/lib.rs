@@ -3,8 +3,8 @@
 //! (the sidebar update strip + macOS bundle swap).
 //!
 //! Release layout (see `.github/workflows/release.yml` and `edge/src/install.sh`):
-//! artifacts live in the `comet-native-releases` R2 bucket, served pre-auth at
-//! `{edge}/releases/*`. `manifest.json` carries the latest version plus a
+//! artifacts live in the `comet-native-releases` R2 bucket, served publicly at
+//! `{releases_url}/releases/*`. `manifest.json` carries the latest version plus a
 //! sha256 per artifact; `latest.txt` (version only) remains as the fallback for
 //! releases published before the manifest existed.
 //!
@@ -28,6 +28,22 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::watch;
 
+/// Public release distribution endpoint. It serves installer and signed release
+/// metadata/artifacts only; local and LAN operation never depend on it.
+pub const DEFAULT_RELEASES_URL: &str = "https://comet.zeron.sh";
+
+/// Resolve the optional release-distribution override from the process
+/// environment. No removed runtime/edge variable participates in this lookup.
+pub fn releases_url_from_env() -> String {
+    releases_url_from(|key| std::env::var(key).ok())
+}
+
+fn releases_url_from(getenv: impl Fn(&str) -> Option<String>) -> String {
+    getenv("COMET_RELEASES_URL")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_RELEASES_URL.to_string())
+}
+
 /// The version compiled into this binary (the workspace version).
 pub const fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -35,7 +51,7 @@ pub const fn current_version() -> &'static str {
 
 /// Background check cadence.
 const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
-/// Retry sooner after a failed check (offline boot, transient edge error).
+/// Retry sooner after a failed check (offline boot, transient distribution error).
 const CHECK_RETRY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 /// First check waits out engine boot (room joins, doc re-sync).
 const CHECK_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
@@ -47,7 +63,7 @@ const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60)
 // Release metadata
 // ---------------------------------------------------------------------------
 
-/// `{edge}/releases/manifest.json` — written by the release workflow.
+/// `{releases_url}/releases/manifest.json` — written by the release workflow.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
@@ -111,8 +127,8 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
 
 /// Fetch the newest release metadata: `manifest.json`, falling back to
 /// `latest.txt` (version only, no checksums) for pre-manifest releases.
-pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
-    let base = edge_url.trim_end_matches('/');
+pub async fn fetch_latest(releases_url: &str) -> anyhow::Result<Manifest> {
+    let base = releases_url.trim_end_matches('/');
     let client = http_client()?;
     let manifest_url = format!("{base}/releases/manifest.json");
     match client.get(&manifest_url).send().await {
@@ -205,16 +221,16 @@ fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
 // Download + verify
 // ---------------------------------------------------------------------------
 
-/// Stream `{edge}/releases/<file>` to `dest`, verifying the manifest sha256 when
+/// Stream `{releases_url}/releases/<file>` to `dest`, verifying the manifest sha256 when
 /// present. Writes through a `.partial` sidecar so an interrupted download never
 /// leaves a plausible-looking artifact behind.
 pub async fn download_release_file(
-    edge_url: &str,
+    releases_url: &str,
     manifest: &Manifest,
     file: &str,
     dest: &Path,
 ) -> anyhow::Result<()> {
-    let url = format!("{}/releases/{file}", edge_url.trim_end_matches('/'));
+    let url = format!("{}/releases/{file}", releases_url.trim_end_matches('/'));
     let expected = manifest.files.get(file).and_then(|m| m.sha256.as_deref());
     if expected.is_none() {
         tracing::warn!(
@@ -278,7 +294,7 @@ fn run(program: &str, args: &[&str]) -> anyhow::Result<()> {
 /// Download + unpack the headless tarball into `app_root/<ver>` (idempotent —
 /// an already-staged version is reused). Returns the versioned dir.
 pub async fn stage_headless(
-    edge_url: &str,
+    releases_url: &str,
     manifest: &Manifest,
     app_root: &Path,
 ) -> anyhow::Result<PathBuf> {
@@ -293,7 +309,7 @@ pub async fn stage_headless(
     std::fs::create_dir_all(&stage).with_context(|| format!("creating {}", stage.display()))?;
     let result = async {
         let tarball = stage.join(&file);
-        download_release_file(edge_url, manifest, &file, &tarball).await?;
+        download_release_file(releases_url, manifest, &file, &tarball).await?;
         let unpacked = stage.join("unpacked");
         std::fs::create_dir_all(&unpacked)?;
         // Tarball root is the versioned stage dir (see scripts/package-linux.sh);
@@ -371,7 +387,7 @@ pub fn restart_service() -> anyhow::Result<()> {
 /// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Comet.app`
 /// (idempotent). Returns the staged bundle path.
 pub async fn stage_mac_app(
-    edge_url: &str,
+    releases_url: &str,
     manifest: &Manifest,
     data_dir: &Path,
 ) -> anyhow::Result<PathBuf> {
@@ -385,7 +401,7 @@ pub async fn stage_mac_app(
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let file = mac_app_artifact(version);
     let tarball = dir.join(&file);
-    download_release_file(edge_url, manifest, &file, &tarball).await?;
+    download_release_file(releases_url, manifest, &file, &tarball).await?;
     run(
         "tar",
         &[
@@ -502,24 +518,24 @@ fn auto_update_enabled() -> bool {
 /// to its live-run and open-terminal registries. `None` = no gate.
 pub type QuiescentCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// Background release checker: polls `{edge}/releases` on a 6h cadence and
+/// Background release checker: polls `{releases_url}/releases` on a 6h cadence and
 /// publishes [`UpdateStatus`] over a watch channel (the `UpdateStatus` RPC
 /// stream). Managed installs with `COMET_AUTO_UPDATE` set stage + apply + service
 /// restart on their own — but only in a quiet window: while `quiescent` reports
 /// activity, the apply defers and re-probes every [`IDLE_RECHECK`].
 #[derive(Clone)]
 pub struct Updater {
-    edge_url: String,
+    releases_url: String,
     status_tx: Arc<watch::Sender<UpdateStatus>>,
     quiescent: Option<QuiescentCheck>,
 }
 
 impl Updater {
     /// Spawn the check loop (must run on a tokio runtime).
-    pub fn spawn(edge_url: String, quiescent: Option<QuiescentCheck>) -> Self {
+    pub fn spawn(releases_url: String, quiescent: Option<QuiescentCheck>) -> Self {
         let (status_tx, _) = watch::channel(UpdateStatus::initial());
         let updater = Self {
-            edge_url,
+            releases_url,
             status_tx: Arc::new(status_tx),
             quiescent,
         };
@@ -556,9 +572,10 @@ impl Updater {
     /// idle→restart gap to well under a second.
     async fn auto_apply_when_idle(&self) {
         if let InstallKind::Managed { app_root } = detect_install() {
-            match fetch_latest(&self.edge_url).await {
+            match fetch_latest(&self.releases_url).await {
                 Ok(manifest) if version_newer(&manifest.version, current_version()) => {
-                    if let Err(err) = stage_headless(&self.edge_url, &manifest, &app_root).await {
+                    if let Err(err) = stage_headless(&self.releases_url, &manifest, &app_root).await
+                    {
                         tracing::warn!(error = %err, "auto-update staging failed");
                         return;
                     }
@@ -588,7 +605,7 @@ impl Updater {
 
     /// One check; returns false on fetch failure (retry sooner).
     async fn check_once(&self) -> bool {
-        match fetch_latest(&self.edge_url).await {
+        match fetch_latest(&self.releases_url).await {
             Ok(manifest) => {
                 let status = UpdateStatus {
                     current_version: current_version().to_string(),
@@ -626,11 +643,11 @@ impl Updater {
                  source builds update via git"
             );
         };
-        let manifest = fetch_latest(&self.edge_url).await?;
+        let manifest = fetch_latest(&self.releases_url).await?;
         if !version_newer(&manifest.version, current_version()) {
             bail!("already up to date ({})", current_version());
         }
-        stage_headless(&self.edge_url, &manifest, &app_root).await?;
+        stage_headless(&self.releases_url, &manifest, &app_root).await?;
         apply_headless(&app_root, &manifest.version)?;
         tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
@@ -652,6 +669,39 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn releases_url_is_independent_of_removed_edge_variables() {
+        let lookup = |key: &str| match key {
+            "COMET_RELEASES_URL" => Some("https://downloads.example".to_string()),
+            "COMET_EDGE_URL" => Some("https://must-not-be-read.example".to_string()),
+            _ => None,
+        };
+
+        assert_eq!(releases_url_from(lookup), "https://downloads.example");
+    }
+
+    #[test]
+    fn releases_url_defaults_when_override_is_missing_or_blank() {
+        assert_eq!(releases_url_from(|_| None), DEFAULT_RELEASES_URL);
+        assert_eq!(
+            releases_url_from(|key| (key == "COMET_RELEASES_URL").then(|| "  ".to_string())),
+            DEFAULT_RELEASES_URL
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_distribution_only_changes_update_status() {
+        let updater = Updater::spawn("http://127.0.0.1:1".to_string(), None);
+        let ok = updater.check_once().await;
+        let status = updater.watch().borrow().clone();
+
+        assert!(!ok);
+        assert_eq!(status.current_version, current_version());
+        assert!(!status.update_available);
+        assert!(status.latest_version.is_none());
+        assert!(status.error.is_some());
+    }
 
     #[test]
     fn version_compare() {

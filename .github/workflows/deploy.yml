@@ -1,7 +1,7 @@
 name: deploy
 
-# Autodeploy the edge Worker + Durable Objects (session/device rooms, R2,
-# WorkOS auth routes) on every push to main that touches edge/. Skips
+# Autodeploy the release-distribution Worker on every push to main that touches
+# edge/. It serves only the installer and release artifacts from R2. Skips
 # gracefully until the CLOUDFLARE_API_TOKEN secret is configured (until then:
 # `npm -C edge run deploy` from a wrangler-authenticated machine).
 #

@@ -58,8 +58,6 @@ enum DaemonCommand {
     Status,
 }
 
-const DEFAULT_RELEASES_URL: &str = "https://edge.comet.zeron.sh";
-
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // The TUI owns its own tracing (to a file — a line on stdout would land
@@ -104,7 +102,10 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(update_cli::update(&releases_url_from_env(), check))
+            runtime.block_on(update_cli::update(
+                &comet_update::releases_url_from_env(),
+                check,
+            ))
         }
         Some(Command::Daemon { command }) => match command {
             DaemonCommand::Install => daemon::install(&engine_config_from_env().data_dir),
@@ -125,7 +126,7 @@ fn main() -> anyhow::Result<()> {
                     .ok()
                     .and_then(|p| p.parse().ok())
                     .unwrap_or(27654),
-                releases_url: releases_url_from_env(),
+                releases_url: comet_update::releases_url_from_env(),
                 default_harness: comet_ui::HarnessId::ClaudeCode,
             });
             Ok(())
@@ -145,7 +146,7 @@ fn engine_config_from_env() -> comet_engine::EngineConfig {
             .and_then(|p| p.parse().ok())
             .unwrap_or(27654),
         default_harness: harness_from_env(),
-        releases_url: releases_url_from_env(),
+        releases_url: comet_update::releases_url_from_env(),
     }
 }
 
@@ -163,13 +164,6 @@ fn harness_from_env() -> comet_engine::HarnessId {
 fn dirs_data_dir() -> std::path::PathBuf {
     let home = std::env::var_os("HOME").expect("HOME not set");
     std::path::PathBuf::from(home).join(".comet-native")
-}
-
-fn releases_url_from_env() -> String {
-    std::env::var("COMET_RELEASES_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_RELEASES_URL.into())
 }
 
 #[cfg(test)]
