@@ -95,3 +95,36 @@ Commit: `14e6f7643abde3ae077c165f94a0c5fddb7e4547`
 - `cargo clippy -p comet-client -p comet-tui --tests -- -D warnings`: passed.
 - `cargo fmt --all -- --check` and `git diff --check`: passed.
 - Smoke was attempted again and remains blocked before startup by the Windows worker lacking Unix `fcntl`.
+
+## Fix Round 3
+
+Commit: `cc34afb98890211687d00345c7904a8233a5da77`
+
+### Chosen concurrency behavior
+
+Concurrent starts across server/space contexts are allowed. Each start is keyed by its request UUID and retains its qualified provisional chat, originating space, and optimistic message ID. A reply always cleans its own record; only a reply for the exact live provisional chat may change navigation, pending-chat state, or the composer.
+
+### RED evidence
+
+- `duplicate_space_activation_with_duplicate_target_chat_retargets_qualified_chat` failed because switching from B/`chat-1` to C/`chat-1` changed the server first and then raw-ID selection returned early without `WatchTranscript(C/chat-1)`.
+- `current_start_failure_unsubscribes_and_removes_provisional_context` failed because rollback directly cleared `selected_chat` and emitted no `WatchTranscript(None)`.
+- `stale_send_failure_cleans_origin_without_overwriting_current_composer` failed because a late B failure restored B's text into C's empty composer.
+- `reordered_concurrent_starts_clean_only_their_own_request` failed because the singleton pending start discarded B when C began, so B's later failure was not independently handled.
+- The direct-assignment audit added `removing_the_selected_server_unsubscribes_its_transcript`; it failed because server removal directly cleared the raw selection without unsubscribing.
+
+### GREEN changes
+
+- Qualified space activation computes a qualified target from the destination server bucket before mutating selection, then uses the same `select_server_chat` path as qualified chat rows. Keyboard and click activation therefore retarget correctly even when B and C share raw space and chat IDs.
+- Pending starts are a request-UUID map containing qualified chat, qualified space, and message ID. Reordered successes/failures remove only their own record and stale completions cannot mutate the live context.
+- Current start failure clears the provisional echo and transcript through `select_chat(None)`, returning `WatchTranscript(None)` and restoring the prompt only for the exact live failed chat.
+- Federated send failure always removes the qualified origin echo but restores text only when that same qualified chat is currently selected and the composer is empty.
+- Removing the selected server now clears transcript data and unsubscribes through the normal selection/effect path; removing the last server also clears the loaded bucket.
+
+### Verification
+
+- Focused Round 3 regressions: 5 passed, 0 failed.
+- `cargo test -p comet-client`: 26 unit + 23 integration tests passed.
+- `cargo test -p comet-tui`: 84 unit/adapter + 82 render tests passed; one intentional frame dump ignored; doc tests passed.
+- `cargo clippy -p comet-client -p comet-tui --tests -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- `python scripts/tui-smoke.py` was attempted and remains blocked before TUI startup on Windows: `scripts/tui_capture.py` imports unavailable Unix-only `fcntl`.
