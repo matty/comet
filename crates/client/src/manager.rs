@@ -19,6 +19,14 @@ use crate::{FederationCommand, FederationEvent, ServerState};
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 const STABLE_CONNECTION_DURATION: Duration = Duration::from_secs(1);
+const TRANSCRIPT_HANDOFF_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryWake {
+    Timer,
+    ExplicitReconnect,
+    Shutdown,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteConnectError {
@@ -144,6 +152,7 @@ struct Supervisor {
 
 struct RemoteContext {
     local: Arc<RpcClient>,
+    local_hello: ServerHello,
     tls: Arc<TlsIdentity>,
     connector: Arc<dyn RemoteConnector>,
     events: mpsc::UnboundedSender<FederationEvent>,
@@ -162,6 +171,7 @@ async fn run_manager(
     let (local_tx, local_rx) = mpsc::unbounded_channel();
     let local_id = local_hello.server_id.clone();
     let local_name = local_hello.name.clone();
+    let local_hello_for_restart = local_hello.clone();
     let _ = events.send(FederationEvent::ServerChanged(ServerState::empty(
         local_id.clone(),
         local_name.clone(),
@@ -184,6 +194,7 @@ async fn run_manager(
     );
     let remote_context = RemoteContext {
         local: local.clone(),
+        local_hello: local_hello_for_restart,
         tls,
         connector,
         events: events.clone(),
@@ -222,7 +233,14 @@ async fn run_manager(
                 Some(FederationCommand::WatchTranscript(chat)) => {
                     if let Some(previous) = selected.take() {
                         if let Some(supervisor) = supervisors.get(&previous.server_id) {
-                            set_supervisor_transcript(supervisor, None).await;
+                            if !set_supervisor_transcript(supervisor, None).await {
+                                restart_unresponsive_owner(
+                                    &mut supervisors,
+                                    &previous,
+                                    &remote_context,
+                                )
+                                .await;
+                            }
                         } else {
                             let _ = events.send(FederationEvent::Transcript { chat: previous, entries: Vec::new() });
                         }
@@ -282,7 +300,10 @@ async fn set_supervisor_transcript(supervisor: &Supervisor, chat_id: Option<Stri
     {
         return false;
     }
-    received.await.is_ok()
+    matches!(
+        tokio::time::timeout(TRANSCRIPT_HANDOFF_TIMEOUT, received).await,
+        Ok(Ok(()))
+    )
 }
 
 fn queue_supervisor_transcript(supervisor: &Supervisor, chat_id: Option<String>) -> bool {
@@ -293,6 +314,50 @@ fn queue_supervisor_transcript(supervisor: &Supervisor, chat_id: Option<String>)
             acknowledged: None,
         })
         .is_ok()
+}
+
+async fn restart_unresponsive_owner(
+    supervisors: &mut HashMap<ServerId, Supervisor>,
+    previous: &ServerRef,
+    context: &RemoteContext,
+) {
+    let Some(old) = supervisors.remove(&previous.server_id) else {
+        let _ = context.events.send(FederationEvent::Transcript {
+            chat: previous.clone(),
+            entries: Vec::new(),
+        });
+        return;
+    };
+    let entry = old.entry.clone();
+    stop_supervisor_then_clear(old, Some(previous.clone()), &context.events).await;
+    let replacement = spawn_owned_supervisor(entry, context);
+    supervisors.insert(previous.server_id.clone(), replacement);
+}
+
+fn spawn_owned_supervisor(entry: Option<RemoteEntry>, context: &RemoteContext) -> Supervisor {
+    let (commands, receiver) = mpsc::unbounded_channel();
+    let task = match entry.clone() {
+        Some(remote) => tokio::spawn(supervise_remote(
+            remote,
+            context.local.clone(),
+            context.tls.clone(),
+            context.connector.clone(),
+            context.events.clone(),
+            receiver,
+        )),
+        None => spawn_local_resources(
+            context.local.clone(),
+            context.local_hello.clone(),
+            context.local_hello.name.clone(),
+            context.events.clone(),
+            receiver,
+        ),
+    };
+    Supervisor {
+        entry,
+        commands,
+        task,
+    }
 }
 
 fn spawn_local_resources(
@@ -452,11 +517,13 @@ async fn supervise_remote(
                     &events,
                 )
                 .await;
-                if !wait_terminal(&mut commands, &mut selected_chat, &entry.server_id, &events)
-                    .await
-                {
+                let wake =
+                    wait_terminal(&mut commands, &mut selected_chat, &entry.server_id, &events)
+                        .await;
+                if wake == RetryWake::Shutdown {
                     return;
                 }
+                delay = retry_delay_after_wake(delay, wake);
                 continue;
             }
             Err(RemoteConnectError::InvalidConfiguration(message)) => {
@@ -471,11 +538,13 @@ async fn supervise_remote(
                     &events,
                 )
                 .await;
-                if !wait_terminal(&mut commands, &mut selected_chat, &entry.server_id, &events)
-                    .await
-                {
+                let wake =
+                    wait_terminal(&mut commands, &mut selected_chat, &entry.server_id, &events)
+                        .await;
+                if wake == RetryWake::Shutdown {
                     return;
                 }
+                delay = retry_delay_after_wake(delay, wake);
                 continue;
             }
             Err(RemoteConnectError::Transport(message)) => {
@@ -486,18 +555,18 @@ async fn supervise_remote(
                     &events,
                 )
                 .await;
-                if !wait_transient(
+                let wake = wait_transient(
                     delay,
                     &mut commands,
                     &mut selected_chat,
                     &entry.server_id,
                     &events,
                 )
-                .await
-                {
+                .await;
+                if wake == RetryWake::Shutdown {
                     return;
                 }
-                delay = (delay * 2).min(Duration::from_secs(5));
+                delay = retry_delay_after_wake(delay, wake);
                 continue;
             }
         };
@@ -516,18 +585,18 @@ async fn supervise_remote(
                     &events,
                 )
                 .await;
-                if !wait_transient(
+                let wake = wait_transient(
                     delay,
                     &mut commands,
                     &mut selected_chat,
                     &entry.server_id,
                     &events,
                 )
-                .await
-                {
+                .await;
+                if wake == RetryWake::Shutdown {
                     return;
                 }
-                delay = (delay * 2).min(Duration::from_secs(5));
+                delay = retry_delay_after_wake(delay, wake);
                 continue;
             }
         };
@@ -539,9 +608,12 @@ async fn supervise_remote(
                 &events,
             )
             .await;
-            if !wait_terminal(&mut commands, &mut selected_chat, &entry.server_id, &events).await {
+            let wake =
+                wait_terminal(&mut commands, &mut selected_chat, &entry.server_id, &events).await;
+            if wake == RetryWake::Shutdown {
                 return;
             }
+            delay = retry_delay_after_wake(delay, wake);
             continue;
         }
         if hello.protocol_version != PROTOCOL_VERSION {
@@ -554,9 +626,12 @@ async fn supervise_remote(
                 state.clone(),
             )));
             report(&entry, state, hello.protocol_version, &local).await;
-            if !wait_terminal(&mut commands, &mut selected_chat, &entry.server_id, &events).await {
+            let wake =
+                wait_terminal(&mut commands, &mut selected_chat, &entry.server_id, &events).await;
+            if wake == RetryWake::Shutdown {
                 return;
             }
+            delay = retry_delay_after_wake(delay, wake);
             continue;
         }
         report(
@@ -588,18 +663,18 @@ async fn supervise_remote(
                 delay = retry_delay_after_session(delay, session_started.elapsed());
                 clear_selected_transcript(&entry.server_id, &selected_chat, &events);
                 publish_failure(&entry, RemoteConnectionState::Offline, &local, &events).await;
-                if !wait_transient(
+                let wake = wait_transient(
                     delay,
                     &mut commands,
                     &mut selected_chat,
                     &entry.server_id,
                     &events,
                 )
-                .await
-                {
+                .await;
+                if wake == RetryWake::Shutdown {
                     return;
                 }
-                delay = (delay * 2).min(Duration::from_secs(5));
+                delay = retry_delay_after_wake(delay, wake);
             }
         }
     }
@@ -619,16 +694,24 @@ fn retry_delay_after_session(current: Duration, connected_for: Duration) -> Dura
     }
 }
 
+fn retry_delay_after_wake(current: Duration, wake: RetryWake) -> Duration {
+    match wake {
+        RetryWake::Timer => (current * 2).min(Duration::from_secs(5)),
+        RetryWake::ExplicitReconnect => INITIAL_RETRY_DELAY,
+        RetryWake::Shutdown => current,
+    }
+}
+
 async fn wait_terminal(
     commands: &mut mpsc::UnboundedReceiver<SupervisorCommand>,
     selected_chat: &mut Option<String>,
     server_id: &ServerId,
     events: &mpsc::UnboundedSender<FederationEvent>,
-) -> bool {
+) -> RetryWake {
     loop {
         match commands.recv().await {
-            Some(SupervisorCommand::Reconnect) => return true,
-            Some(SupervisorCommand::Shutdown) | None => return false,
+            Some(SupervisorCommand::Reconnect) => return RetryWake::ExplicitReconnect,
+            Some(SupervisorCommand::Shutdown) | None => return RetryWake::Shutdown,
             Some(command) => handle_offline_command(command, selected_chat, server_id, events),
         }
     }
@@ -640,7 +723,7 @@ async fn wait_transient(
     selected_chat: &mut Option<String>,
     server_id: &ServerId,
     events: &mpsc::UnboundedSender<FederationEvent>,
-) -> bool {
+) -> RetryWake {
     let entropy = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.subsec_nanos())
@@ -649,10 +732,10 @@ async fn wait_transient(
     tokio::pin!(sleep);
     loop {
         tokio::select! {
-            () = &mut sleep => return true,
+            () = &mut sleep => return RetryWake::Timer,
             command = commands.recv() => match command {
-                Some(SupervisorCommand::Reconnect) => return true,
-                Some(SupervisorCommand::Shutdown) | None => return false,
+                Some(SupervisorCommand::Reconnect) => return RetryWake::ExplicitReconnect,
+                Some(SupervisorCommand::Shutdown) | None => return RetryWake::Shutdown,
                 Some(command) => handle_offline_command(command, selected_chat, server_id, events),
             }
         }
@@ -807,6 +890,54 @@ mod tests {
             retry_delay_after_session(accumulated, STABLE_CONNECTION_DURATION),
             INITIAL_RETRY_DELAY
         );
+    }
+
+    #[test]
+    fn explicit_reconnect_resets_near_max_backoff_without_growth() {
+        let near_max = Duration::from_secs(4);
+        assert_eq!(
+            retry_delay_after_wake(near_max, RetryWake::ExplicitReconnect),
+            INITIAL_RETRY_DELAY
+        );
+        assert_eq!(
+            retry_delay_after_wake(near_max, RetryWake::Timer),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_reconnect_wakes_transient_and_terminal_waits_promptly() {
+        let server_id = ServerId::new(
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let (events, _received) = mpsc::unbounded_channel();
+
+        let (transient_tx, mut transient_rx) = mpsc::unbounded_channel();
+        transient_tx.send(SupervisorCommand::Reconnect).unwrap();
+        let mut selected = None;
+        let transient = tokio::time::timeout(
+            Duration::from_millis(20),
+            wait_transient(
+                Duration::from_secs(5),
+                &mut transient_rx,
+                &mut selected,
+                &server_id,
+                &events,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(transient, RetryWake::ExplicitReconnect);
+
+        let (terminal_tx, mut terminal_rx) = mpsc::unbounded_channel();
+        terminal_tx.send(SupervisorCommand::Reconnect).unwrap();
+        let terminal = tokio::time::timeout(
+            Duration::from_millis(20),
+            wait_terminal(&mut terminal_rx, &mut selected, &server_id, &events),
+        )
+        .await
+        .unwrap();
+        assert_eq!(terminal, RetryWake::ExplicitReconnect);
     }
 
     #[tokio::test]

@@ -166,6 +166,36 @@ struct DisconnectAfterTranscriptService {
     calls: Arc<Mutex<Vec<String>>>,
 }
 
+struct BlockingCallService {
+    hello: ServerHello,
+    block_started: Arc<tokio::sync::Notify>,
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl RpcService for BlockingCallService {
+    async fn handle(&self, method: &str, _params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        self.calls.lock().unwrap().push(method.to_string());
+        match method {
+            methods::SERVER_HELLO => RpcReply::value(&self.hello),
+            methods::WATCH_DEVICES
+            | methods::WATCH_SPACES
+            | methods::WATCH_CHATS
+            | methods::WATCH_SESSIONS
+            | methods::WATCH_DOC_MESSAGES => Ok(RpcReply::Stream(
+                futures::stream::once(async { serde_json::json!([]) })
+                    .chain(futures::stream::pending())
+                    .boxed(),
+            )),
+            "Block" => {
+                self.block_started.notify_waiters();
+                futures::future::pending().await
+            }
+            other => Err(RpcError::UnknownMethod(other.into())),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl RpcService for DisconnectAfterTranscriptService {
     async fn handle(&self, method: &str, _params: serde_json::Value) -> Result<RpcReply, RpcError> {
@@ -1223,4 +1253,153 @@ async fn shutdown_clears_selected_transcript_after_supervisors_stop() {
         }
     }
     assert!(saw_clear);
+}
+
+#[tokio::test]
+async fn stalled_prior_owner_cannot_block_selection_handoff_or_shutdown() {
+    let a_id = secure_server('a');
+    let b_id = secure_server('b');
+    let c_id = secure_server('c');
+    let local = service(
+        a_id,
+        "A",
+        vec![
+            remote(b_id.clone(), "B", 'b'),
+            remote(c_id.clone(), "C", 'c'),
+        ],
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let block_started = Arc::new(tokio::sync::Notify::new());
+    let remote_client = comet_rpc::memory_client(Arc::new(BlockingCallService {
+        hello: ServerHello {
+            protocol_version: PROTOCOL_VERSION,
+            server_id: b_id.clone(),
+            device_id: "b-device".into(),
+            name: "B".into(),
+            capabilities: Vec::new(),
+        },
+        block_started: block_started.clone(),
+        calls: Arc::new(Mutex::new(Vec::new())),
+    }));
+    let c_calls = Arc::new(Mutex::new(Vec::new()));
+    let c_block_started = Arc::new(tokio::sync::Notify::new());
+    let c = comet_rpc::memory_client(Arc::new(BlockingCallService {
+        hello: ServerHello {
+            protocol_version: PROTOCOL_VERSION,
+            server_id: c_id.clone(),
+            device_id: "c-device".into(),
+            name: "C".into(),
+            capabilities: Vec::new(),
+        },
+        block_started: c_block_started.clone(),
+        calls: c_calls.clone(),
+    }));
+    let connector = Arc::new(FixtureConnector(Mutex::new(HashMap::from([
+        (b_id.clone(), VecDeque::from([Ok(remote_client)])),
+        (c_id.clone(), VecDeque::from([Ok(c)])),
+    ]))));
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut federation = Federation::with_connector(local, data_dir.path(), connector)
+        .await
+        .unwrap();
+    let mut snapshot = ServerSnapshot::default();
+    wait_for_state(
+        &mut federation,
+        &mut snapshot,
+        &b_id,
+        &RemoteConnectionState::Online,
+    )
+    .await;
+    wait_for_state(
+        &mut federation,
+        &mut snapshot,
+        &c_id,
+        &RemoteConnectionState::Online,
+    )
+    .await;
+    let selected = comet_client::ServerRef::new(b_id.clone(), "chat-1");
+    federation
+        .send(comet_client::FederationCommand::WatchTranscript(Some(
+            selected.clone(),
+        )))
+        .unwrap();
+    loop {
+        if matches!(federation.recv().await, Some(FederationEvent::Transcript { chat, .. }) if chat == selected)
+        {
+            break;
+        }
+    }
+    federation
+        .send(comet_client::FederationCommand::Call {
+            server_id: b_id,
+            method: "Block",
+            params: serde_json::Value::Null,
+        })
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), block_started.notified())
+        .await
+        .unwrap();
+
+    let new_selected = comet_client::ServerRef::new(c_id.clone(), "chat-1");
+    federation
+        .send(comet_client::FederationCommand::WatchTranscript(Some(
+            new_selected.clone(),
+        )))
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        while !c_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|method| method == methods::WATCH_DOC_MESSAGES)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("stalled prior owner blocked the new transcript subscription");
+    let mut saw_old_clear = false;
+    loop {
+        match federation.recv().await.unwrap() {
+            FederationEvent::Transcript { chat, entries }
+                if chat == selected && entries.is_empty() =>
+            {
+                saw_old_clear = true
+            }
+            FederationEvent::Transcript { chat, .. } if chat == new_selected => break,
+            _ => {}
+        }
+    }
+    federation
+        .send(comet_client::FederationCommand::Call {
+            server_id: c_id,
+            method: "Block",
+            params: serde_json::Value::Null,
+        })
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        c_block_started.notified(),
+    )
+    .await
+    .unwrap();
+    federation
+        .send(comet_client::FederationCommand::WatchTranscript(None))
+        .unwrap();
+    federation
+        .send(comet_client::FederationCommand::Shutdown)
+        .unwrap();
+    let mut saw_new_clear = false;
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        while let Some(event) = federation.recv().await {
+            if matches!(event, FederationEvent::Transcript { chat, entries } if chat == new_selected && entries.is_empty()) {
+                saw_new_clear = true;
+            }
+        }
+    })
+    .await
+    .expect("stalled transcript owner blocked manager shutdown");
+    assert!(saw_old_clear);
+    assert!(saw_new_clear);
 }
