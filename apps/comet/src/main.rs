@@ -3,7 +3,6 @@
 //! configuration only when no engine owns the data directory.
 
 mod daemon;
-mod migration_cli;
 mod remote_cli;
 mod update_cli;
 
@@ -27,8 +26,6 @@ enum Command {
         #[command(subcommand)]
         command: remote_cli::RemoteCommand,
     },
-    /// Explicitly migrate one legacy online profile into the local store.
-    Migrate(migration_cli::MigrateArgs),
     /// Manage `comet headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -133,9 +130,6 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             let config = engine_config_from_env();
             runtime.block_on(remote_cli::run(command, &config.data_dir, config.ipc_port))
-        }
-        Some(Command::Migrate(args)) => {
-            migration_cli::run(&engine_config_from_env().data_dir, &args.from)
         }
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
@@ -242,9 +236,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_explicit_legacy_profile_selection() {
-        let cli = Cli::try_parse_from(["comet", "migrate", "--from", "org-a/user-a"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Migrate { .. })));
+    fn migrate_is_not_a_command() {
+        assert!(Cli::try_parse_from(["comet", "migrate", "--from", "org-a/user-a"]).is_err());
     }
 
     #[test]

@@ -201,6 +201,12 @@ git commit -m "feat: define direct remote protocol"
 
 ### Task 2: Build the conservative local-store migration
 
+**Scope correction:** Cloud-to-local migration is no longer a product path.
+There is no manual profile selector or recovery command. The implementation
+steps below are retained as historical context for code already landed, but
+Task 12 must audit that legacy selection/copy/marker code for removal while
+preserving a valid local-store startup path.
+
 **Files:**
 - Create: `crates/engine/src/local_store.rs`
 - Create: `crates/engine/tests/local_store_migration.rs`
@@ -989,9 +995,13 @@ git commit -m "feat: manage LAN remotes from desktop"
 
 ### Task 11: Add remote CLI and replace auth-oriented status
 
+**Scope correction:** There is no cloud-to-local migration command or manually
+selected profile path. `comet migrate` must be rejected. The earlier migration
+CLI steps below are superseded; internal startup compatibility is left intact
+for a focused Task 12 removal audit.
+
 **Files:**
 - Create: `apps/comet/src/remote_cli.rs`
-- Create: `apps/comet/src/migration_cli.rs`
 - Modify: `apps/comet/src/main.rs`
 - Delete: `apps/comet/src/auth_cli.rs`
 - Modify: `apps/comet/src/daemon.rs`
@@ -999,7 +1009,7 @@ git commit -m "feat: manage LAN remotes from desktop"
 - Test: `apps/comet/src/remote_cli.rs`
 
 **Interfaces:**
-- Produces: `comet remote add|list|remove|listen|pair|clients|revoke`, `comet migrate --from <org>/<user>`, and local/LAN-oriented `comet status`.
+- Produces: `comet remote add|list|remove|listen|pair|clients|revoke` and local/LAN-oriented `comet status`.
 - Consumes: local admin RPC when the engine is running; otherwise the same identity/config types under an exclusive engine lock.
 
 - [ ] **Step 1: Write CLI parser and output tests**
@@ -1018,9 +1028,8 @@ fn parses_manual_remote_endpoint() {
 }
 
 #[test]
-fn parses_explicit_legacy_profile_selection() {
-    let cli = Cli::try_parse_from(["comet", "migrate", "--from", "org-a/user-a"]).unwrap();
-    assert!(matches!(cli.command, Some(Command::Migrate { .. })));
+fn migrate_is_not_a_command() {
+    assert!(Cli::try_parse_from(["comet", "migrate"]).is_err());
 }
 
 #[test]
@@ -1044,7 +1053,9 @@ Add `comet-identity`, `comet-proto`, `comet-rpc`, and `rpassword = "7"` to `apps
 
 `comet status` prints data directory, engine/IPC state, LAN listener state/address/error, paired-client count, and each configured remote's name/endpoint/status. It does not print Edge, WorkOS, user, or organization fields.
 
-Implement `comet migrate --from <org>/<user>` in `migration_cli.rs`. It refuses to run while an engine holds `InstanceLock`, splits the value into `org_id` and `user_id`, validates both as single safe path segments, validates that the exact legacy directory exists under `orgs/`, and calls `prepare_local_store(data_dir, Some(&LegacyProfile { org_id, user_id }))`; it never accepts a filesystem path outside the data directory.
+Do not implement or advertise a migration command. `comet migrate` is rejected
+by the parser. Preserve existing internal local-store startup behavior in this
+task; report legacy migration candidates for removal in Task 12.
 
 - [ ] **Step 5: Remove obsolete daemon environment capture**
 
@@ -1059,7 +1070,7 @@ Expected: all parser, status, daemon rendering, and remote CLI tests pass.
 - [ ] **Step 7: Commit CLI cutover**
 
 ```bash
-git add apps/comet/Cargo.toml apps/comet/src/main.rs apps/comet/src/remote_cli.rs apps/comet/src/migration_cli.rs apps/comet/src/daemon.rs
+git add apps/comet/Cargo.toml apps/comet/src/main.rs apps/comet/src/remote_cli.rs apps/comet/src/daemon.rs
 git rm apps/comet/src/auth_cli.rs
 git commit -m "feat: replace account CLI with LAN remotes"
 ```

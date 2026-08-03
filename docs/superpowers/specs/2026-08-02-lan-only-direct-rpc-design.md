@@ -329,6 +329,13 @@ it no longer denotes a WorkOS organization or cloud document namespace.
 
 ## Existing-data migration
 
+Scope correction: Comet does not expose or support a cloud-to-local migration
+command or manually selected profile path. In particular, there is no `comet
+migrate` command. Existing internal local-store startup compatibility remains
+temporarily unchanged so this CLI correction does not alter startup behavior;
+Task 12 audits the legacy profile-selection/copy implementation for removal.
+It is not a user-facing recovery path and must not be advertised as one.
+
 The existing store is scoped under `orgs/{org_id}/{user_id}` and may contain
 cloud-replicated rows from several devices. Migration must not expose those
 cached rows as if they were authoritative local data.
@@ -338,9 +345,8 @@ On first local-only startup:
 1. Select the source profile referenced by the existing `session.json`.
 2. If no usable session exists and exactly one legacy profile exists, select
    that profile.
-3. If several profiles exist and none can be selected safely, stop with an
-   actionable command that explicitly selects the source profile. Never merge
-   profiles automatically.
+3. If several profiles exist and none can be selected safely, stop rather than
+   merging profiles automatically. Do not direct the user to a migration CLI.
 4. Copy the selected source into a new local-authoritative store. Keep the
    legacy source untouched for rollback.
 5. Rebuild the local workspace index to include only spaces, chats, device rows,
