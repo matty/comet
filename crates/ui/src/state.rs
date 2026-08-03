@@ -231,6 +231,10 @@ impl ServerClient {
 }
 
 impl FederatedClient {
+    pub fn reconnect(&self, server_id: ServerId) {
+        let _ = self.commands.send(FederationCommand::Reconnect(server_id));
+    }
+
     pub fn call(&self, server_id: ServerId, method: &'static str, params: serde_json::Value) {
         let _ = self.commands.send(FederationCommand::Call {
             server_id,
@@ -2236,5 +2240,17 @@ mod tests {
             1
         );
         assert!(parse_orgs(&serde_json::json!("nope")).is_empty());
+    }
+
+    #[test]
+    fn explicit_remote_reconnect_targets_the_named_federation_server() {
+        let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let client = FederatedClient { commands };
+        let wanted = ServerId::new("sha256:remote");
+        client.reconnect(wanted.clone());
+        assert!(matches!(
+            received.try_recv(),
+            Ok(FederationCommand::Reconnect(server_id)) if server_id == wanted
+        ));
     }
 }

@@ -32,6 +32,7 @@ use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT};
 use crate::popover::{self, Loadable};
 use crate::rail;
+use crate::remotes::RemoteConnectionsPage;
 use crate::settings::accounts::AccountsPage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
@@ -142,14 +143,16 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Devices,
+    RemoteConnections,
     Agents,
     Shortcuts,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 4] = [
+    pub const ALL: [SettingsSection; 5] = [
         SettingsSection::Devices,
+        SettingsSection::RemoteConnections,
         SettingsSection::Agents,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
@@ -160,6 +163,7 @@ impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
             SettingsSection::Devices => "Devices",
+            SettingsSection::RemoteConnections => "Remote connections",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
@@ -429,6 +433,7 @@ pub struct Shell {
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
     devices_page: Option<Entity<DevicesPage>>,
+    remote_connections_page: Option<Entity<RemoteConnectionsPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
@@ -598,6 +603,7 @@ impl Shell {
                 Route::Settings(SettingsSection::Devices)
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
+            Some("settings/remotes") => Route::Settings(SettingsSection::RemoteConnections),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
@@ -635,6 +641,7 @@ impl Shell {
             route,
             nav,
             devices_page: None,
+            remote_connections_page: None,
             archived_page: None,
             shortcuts_page: None,
             accounts_page: None,
@@ -1150,6 +1157,17 @@ impl Shell {
                     self.devices_page = Some(cx.new(|cx| DevicesPage::new(state, cx)));
                 }
                 match &self.devices_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::RemoteConnections => {
+                if self.remote_connections_page.is_none() {
+                    let state = self.state.clone();
+                    self.remote_connections_page =
+                        Some(cx.new(|cx| RemoteConnectionsPage::new(state, cx)));
+                }
+                match &self.remote_connections_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -1695,6 +1713,7 @@ impl Shell {
     ) -> AnyElement {
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
+            SettingsSection::RemoteConnections => icons::GLOBAL,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
@@ -4198,5 +4217,14 @@ mod tests {
             Some(NavEntry::Settings(SettingsSection::Devices))
         );
         assert_eq!(nav.back(), Some(chat("a")));
+    }
+
+    #[test]
+    fn remote_connections_is_a_first_class_settings_section() {
+        assert!(SettingsSection::ALL.contains(&SettingsSection::RemoteConnections));
+        assert_eq!(
+            SettingsSection::RemoteConnections.label(),
+            "Remote connections"
+        );
     }
 }
