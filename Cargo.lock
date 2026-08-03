@@ -1273,6 +1273,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "comet-client"
+version = "0.1.9"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "comet-doc",
+ "comet-identity",
+ "comet-proto",
+ "comet-rpc",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "comet-doc"
 version = "0.1.9"
 dependencies = [

@@ -91,7 +91,37 @@ pub struct PinnedServer {
     spki_sha256: [u8; 32],
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum PinnedServerError {
+    #[error("pinned SPKI SHA-256 must be exactly 64 canonical lowercase hexadecimal characters")]
+    InvalidFingerprint,
+    #[error("server identity does not match pinned SPKI SHA-256")]
+    ServerIdMismatch,
+}
+
 impl PinnedServer {
+    pub fn from_spki_sha256(server_id: ServerId, encoded: &str) -> Result<Self, PinnedServerError> {
+        if encoded.len() != 64 {
+            return Err(PinnedServerError::InvalidFingerprint);
+        }
+        let decoded = HEXLOWER
+            .decode(encoded.as_bytes())
+            .map_err(|_| PinnedServerError::InvalidFingerprint)?;
+        if HEXLOWER.encode(&decoded) != encoded {
+            return Err(PinnedServerError::InvalidFingerprint);
+        }
+        let spki_sha256: [u8; 32] = decoded
+            .try_into()
+            .map_err(|_| PinnedServerError::InvalidFingerprint)?;
+        if server_id != ServerId::new(format!("sha256:{encoded}")) {
+            return Err(PinnedServerError::ServerIdMismatch);
+        }
+        Ok(Self {
+            server_id,
+            spki_sha256,
+        })
+    }
+
     pub fn server_id(&self) -> &ServerId {
         &self.server_id
     }

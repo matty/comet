@@ -8,8 +8,9 @@ use async_trait::async_trait;
 use comet_identity::DeviceIdentity;
 use comet_proto::ServerId;
 use comet_rpc::{
-    LanConnectError, LanPairingState, PairingLimiter, PairingSession, PairingTranscript, RpcError,
-    RpcReply, RpcService, TlsIdentity, accept_lan_rpc, connect_lan_rpc, pair_client, serve_pairing,
+    LanConnectError, LanPairingState, PairingLimiter, PairingSession, PairingTranscript,
+    PinnedServer, PinnedServerError, RpcError, RpcReply, RpcService, TlsIdentity, accept_lan_rpc,
+    connect_lan_rpc, pair_client, serve_pairing,
 };
 use data_encoding::BASE32_NOPAD;
 use futures::{SinkExt, StreamExt};
@@ -18,6 +19,41 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+#[test]
+fn persisted_pin_requires_canonical_matching_server_identity() {
+    let fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let server_id = ServerId::new(format!("sha256:{fingerprint}"));
+    let pin = PinnedServer::from_spki_sha256(server_id.clone(), fingerprint).unwrap();
+
+    assert_eq!(pin.server_id(), &server_id);
+    assert_eq!(
+        pin.spki_sha256(),
+        &[
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
+            0x89, 0xab, 0xcd, 0xef
+        ]
+    );
+}
+
+#[test]
+fn persisted_pin_rejects_malformed_or_divergent_identity() {
+    let fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    assert!(matches!(
+        PinnedServer::from_spki_sha256(ServerId::new(format!("sha256:{fingerprint}")), "ABCDEF"),
+        Err(PinnedServerError::InvalidFingerprint)
+    ));
+    assert!(matches!(
+        PinnedServer::from_spki_sha256(
+            ServerId::new(
+                "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            ),
+            fingerprint
+        ),
+        Err(PinnedServerError::ServerIdMismatch)
+    ));
+}
 
 #[test]
 fn pairing_confirmation_binds_both_keys_and_nonces() {

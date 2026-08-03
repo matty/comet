@@ -36,8 +36,8 @@ pub use pairing::{
 pub use server::{serve_connection, serve_ws_listener};
 pub use tls::{
     ClientAuthorizer, LanAcceptError, LanConnectError, LanPairingState, MAX_LAN_TEXT_FRAME_BYTES,
-    PairingAuthorizer, PairingError, PinnedServer, TlsIdentity, TlsIdentityError, accept_lan_rpc,
-    connect_lan_rpc, pair_client, serve_pairing,
+    PairingAuthorizer, PairingError, PinnedServer, PinnedServerError, TlsIdentity,
+    TlsIdentityError, accept_lan_rpc, connect_lan_rpc, pair_client, serve_pairing,
 };
 
 /// RPC method names — single source of truth for both ends.

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/client",
     "crates/identity",
     "crates/proto",
     "crates/doc",
@@ -22,6 +23,7 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
+comet-client = { path = "crates/client" }
 comet-identity = { path = "crates/identity" }
 comet-proto = { path = "crates/proto" }
 comet-doc = { path = "crates/doc" }
