@@ -5,8 +5,8 @@
 //! Release layout (see `.github/workflows/release.yml` and `edge/src/install.sh`):
 //! artifacts live in the `comet-native-releases` R2 bucket, served publicly at
 //! `{releases_url}/releases/*`. `manifest.json` carries the latest version plus a
-//! sha256 per artifact; `latest.txt` (version only) remains as the fallback for
-//! releases published before the manifest existed.
+//! repository identity and a sha256 per artifact. Manifests from another fork,
+//! and legacy metadata without repository provenance, are rejected.
 //!
 //! Install kinds and their update paths:
 //! - **Managed** (`~/.comet-native/app/<ver>` + `current` symlink — the curl|sh
@@ -31,6 +31,9 @@ use tokio::sync::watch;
 /// Public release distribution endpoint. It serves installer and signed release
 /// metadata/artifacts only; local and LAN operation never depend on it.
 pub const DEFAULT_RELEASES_URL: &str = "https://comet.zeron.sh";
+/// Repository identity every official endpoint or intentional mirror must
+/// publish in its release manifest.
+pub const EXPECTED_RELEASE_REPOSITORY: &str = "matty/comet";
 
 /// Resolve the optional release-distribution override from the process
 /// environment. No removed runtime/edge variable participates in this lookup.
@@ -66,9 +69,11 @@ const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60)
 /// `{releases_url}/releases/manifest.json` — written by the release workflow.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
+    /// GitHub `owner/repository` that built these artifacts.
+    #[serde(default)]
+    pub repository: String,
     pub version: String,
-    /// Artifact file name → metadata. Empty for pre-manifest releases resolved
-    /// via `latest.txt` — downloads then skip checksum verification (with a log).
+    /// Artifact file name → checksum metadata.
     #[serde(default)]
     pub files: BTreeMap<String, FileMeta>,
 }
@@ -107,8 +112,8 @@ pub fn mac_app_artifact(version: &str) -> String {
 }
 
 /// Strictly-newer dotted-numeric compare (`0.1.10` > `0.1.9` > `0.1`).
-/// Unparseable versions never count as newer — a garbage `latest.txt` must not
-/// trigger an update loop.
+/// Unparseable versions never count as newer — malformed release metadata must
+/// not trigger an update loop.
 pub fn version_newer(latest: &str, current: &str) -> bool {
     fn parts(v: &str) -> Option<Vec<u64>> {
         let nums: Vec<u64> = v
@@ -125,45 +130,44 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
     }
 }
 
-/// Fetch the newest release metadata: `manifest.json`, falling back to
-/// `latest.txt` (version only, no checksums) for pre-manifest releases.
+fn parse_manifest(bytes: &[u8]) -> anyhow::Result<Manifest> {
+    let manifest: Manifest = serde_json::from_slice(bytes).context("parsing manifest.json")?;
+    if manifest.repository.trim().is_empty() {
+        bail!("release repository is missing; expected {EXPECTED_RELEASE_REPOSITORY}");
+    }
+    if !manifest
+        .repository
+        .eq_ignore_ascii_case(EXPECTED_RELEASE_REPOSITORY)
+    {
+        bail!(
+            "release repository mismatch: expected {EXPECTED_RELEASE_REPOSITORY}, got {}",
+            manifest.repository
+        );
+    }
+    if manifest.version.trim().is_empty() {
+        bail!("manifest.json has an empty version");
+    }
+    Ok(manifest)
+}
+
+/// Fetch the newest release metadata. Repository provenance is mandatory; a
+/// missing, malformed, or mismatched manifest is never replaced with legacy
+/// unprovenanced `latest.txt` metadata.
 pub async fn fetch_latest(releases_url: &str) -> anyhow::Result<Manifest> {
     let base = releases_url.trim_end_matches('/');
     let client = http_client()?;
     let manifest_url = format!("{base}/releases/manifest.json");
-    match client.get(&manifest_url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let manifest: Manifest = resp.json().await.context("parsing manifest.json")?;
-            if manifest.version.trim().is_empty() {
-                bail!("manifest.json has an empty version");
-            }
-            return Ok(manifest);
-        }
-        Ok(resp) => {
-            tracing::debug!(status = %resp.status(), "manifest.json unavailable; trying latest.txt")
-        }
-        Err(err) => tracing::debug!(error = %err, "manifest.json fetch failed; trying latest.txt"),
-    }
-    let latest_url = format!("{base}/releases/latest.txt");
-    let version = client
-        .get(&latest_url)
+    let bytes = client
+        .get(&manifest_url)
         .send()
         .await
-        .context("fetching latest.txt")?
+        .context("fetching manifest.json")?
         .error_for_status()
-        .context("fetching latest.txt")?
-        .text()
+        .context("fetching manifest.json")?
+        .bytes()
         .await
-        .context("reading latest.txt")?
-        .trim()
-        .to_string();
-    if version.is_empty() {
-        bail!("latest.txt is empty");
-    }
-    Ok(Manifest {
-        version,
-        files: BTreeMap::new(),
-    })
+        .context("reading manifest.json")?;
+    parse_manifest(&bytes)
 }
 
 fn http_client() -> anyhow::Result<reqwest::Client> {
@@ -764,8 +768,8 @@ mod tests {
 
     #[test]
     fn manifest_parses_with_and_without_files() {
-        let full: Manifest = serde_json::from_str(
-            r#"{"version":"0.1.1","files":{"comet-0.1.1-linux-x86_64.tar.gz":{"sha256":"abc"}}}"#,
+        let full = parse_manifest(
+            br#"{"repository":"matty/comet","version":"0.1.1","files":{"comet-0.1.1-linux-x86_64.tar.gz":{"sha256":"abc"}}}"#,
         )
         .unwrap();
         assert_eq!(full.version, "0.1.1");
@@ -775,8 +779,63 @@ mod tests {
                 .as_deref(),
             Some("abc")
         );
-        let bare: Manifest = serde_json::from_str(r#"{"version":"0.1.1"}"#).unwrap();
+        let bare = parse_manifest(br#"{"repository":"matty/comet","version":"0.1.1"}"#).unwrap();
         assert!(bare.files.is_empty());
+    }
+
+    #[test]
+    fn manifest_rejects_missing_or_wrong_repository() {
+        let missing = parse_manifest(br#"{"version":"0.1.1"}"#).unwrap_err();
+        assert!(missing.to_string().contains("release repository"));
+
+        let wrong = parse_manifest(br#"{"repository":"someone/other-comet","version":"0.1.1"}"#)
+            .unwrap_err();
+        assert!(wrong.to_string().contains("someone/other-comet"));
+        assert!(wrong.to_string().contains("matty/comet"));
+    }
+
+    #[tokio::test]
+    async fn provenance_failure_does_not_fallback_to_latest_txt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok(Ok((mut socket, _))) =
+                    tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
+                        .await
+                else {
+                    break;
+                };
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 2048];
+                let read = socket.read(&mut request).await.unwrap();
+                let path = String::from_utf8_lossy(&request[..read]);
+                let body = if path.contains("/releases/manifest.json") {
+                    r#"{"repository":"someone/other-comet","version":"9.9.9"}"#
+                } else {
+                    "9.9.9"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let error = fetch_latest(&format!("http://{address}"))
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.to_string().contains("release repository mismatch"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(unix)]

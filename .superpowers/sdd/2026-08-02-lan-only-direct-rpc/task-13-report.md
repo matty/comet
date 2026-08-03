@@ -16,6 +16,15 @@ resolver; removed edge/auth variables are not consulted. An unreachable release
 endpoint updates only `UpdateStatus.error`; it does not prevent updater creation
 or local/LAN engine assembly.
 
+Release metadata is additionally pinned to the canonical fork identity
+`matty/comet`. The release workflow writes `$GITHUB_REPOSITORY` into every
+manifest, and both the Rust updater and shell installer reject missing or
+mismatched repository identity. `COMET_RELEASES_URL` mirrors remain supported,
+but must mirror a manifest identifying the same fork. A provenance failure is
+terminal for that check; the updater no longer falls back to unprovenanced
+`latest.txt` metadata. The workspace currently has no Cargo repository metadata,
+so the expected fork is an explicit release-policy constant.
+
 The installer no longer checks `session.json` or instructs users to run removed
 login commands. A systemd-capable install starts the local headless service
 immediately.
@@ -45,10 +54,11 @@ immediately.
 
 ## Verification
 
-- `cargo test -p comet-update` — 7 passed, including release independence and
+- `cargo test -p comet-update` — 9 passed, including release independence and
   unreachable-distribution status behavior.
 - `cargo test -p comet --bin comet` — 14 passed.
-- `npm test --prefix edge` — 7 passed; only `distribution.test.ts` remains.
+- `npm test --prefix edge` — 7 Worker assertions plus the real-installer
+  provenance harness passed.
 - `npm run typecheck --prefix edge` — passed.
 - `npm run build --prefix edge` — dry-run passed; upload exposes only the
   `RELEASES` R2 binding.
@@ -63,6 +73,17 @@ immediately.
 - Edge source/config scans found no WorkOS, auth mode, Durable Object, runtime
   blob, Loro, or removed edge URL references.
 
+Provenance follow-up verification:
+
+- Rust RED failed because the provenance parser did not exist; GREEN covers
+  accepted canonical manifests and rejection of both missing and wrong
+  repositories. An HTTP-boundary regression also proves a provenance failure
+  makes one manifest request and never probes `latest.txt`.
+- The installer RED executed the real `install.sh` against controlled manifests
+  and showed it continued into artifact download/tar. GREEN rejects missing and
+  wrong repository identities before choosing a version or downloading an
+  artifact. This harness is part of `npm test`.
+
 ## Residual risks and scope notes
 
 - `npm ci` reports three high-severity advisories in the retained build/test
@@ -72,3 +93,7 @@ immediately.
   the removed hosted API. The approved product scope for this cutover is Desktop
   and TUI only; Task 14 should keep that limitation explicit or remove/archive
   the stale iOS material.
+- Backward compatibility is intentionally stricter: legacy release endpoints
+  that provide only `latest.txt`, or manifests without `repository`, no longer
+  update or install. Operators of intentional mirrors must republish a current
+  manifest with `repository: "matty/comet"`.

@@ -103,10 +103,12 @@ jobs:
             npx wrangler@4 r2 object put "comet-native-releases/$(basename "$f")" \
               --file "$f" --remote
           done
-          # manifest.json: version + per-artifact sha256 — the auto-updater
-          # (crates/update) verifies downloads against it. Published before
-          # latest.txt so no client ever sees a version without its checksums.
-          manifest=$(jq -n --arg version "$VERSION" '{version: $version, files: {}}')
+          # manifest.json: canonical repository + version + per-artifact sha256
+          # — the auto-updater verifies provenance and downloads against it.
+          # Published before latest.txt so no client ever sees a version without
+          # its checksums.
+          manifest=$(jq -n --arg repository "$GITHUB_REPOSITORY" --arg version "$VERSION" \
+            '{repository: $repository, version: $version, files: {}}')
           for f in dist/*; do
             sha=$(sha256sum "$f" | cut -d' ' -f1)
             manifest=$(jq --arg name "$(basename "$f")" --arg sha "$sha" \

@@ -21,7 +21,7 @@ case "$os" in
   Linux) plat=linux ;;
   Darwin)
     echo "comet install: on macOS, download the desktop app instead:" >&2
-    echo "  $BASE/releases/latest.txt → $BASE/releases/comet-<version>-macos-arm64.dmg" >&2
+    echo "  see $BASE/releases/manifest.json for the current macOS artifact" >&2
     exit 1
     ;;
   *)
@@ -39,8 +39,25 @@ case "$arch" in
 esac
 
 # --- download ----------------------------------------------------------------
-ver="$(curl -fsSL "$BASE/releases/latest.txt" | tr -d '[:space:]')"
-[ -n "$ver" ] || { echo "comet install: could not resolve latest version" >&2; exit 1; }
+manifest="$(curl -fsSL "$BASE/releases/manifest.json")"
+compact_manifest="$(printf '%s' "$manifest" | tr -d '[:space:]')"
+repository_fields="$(printf '%s' "$compact_manifest" | grep -o '"repository":"[^"]*"' || true)"
+repository_count="$(printf '%s\n' "$repository_fields" | grep -c . || true)"
+if [ "$repository_count" -eq 0 ]; then
+  echo "comet install: missing release repository (expected matty/comet)" >&2
+  exit 1
+fi
+if [ "$repository_count" -ne 1 ]; then
+  echo "comet install: invalid release repository metadata" >&2
+  exit 1
+fi
+repository="$(printf '%s' "$repository_fields" | sed -n 's/^"repository":"\([^"]*\)"$/\1/p')"
+if [ "$repository" != "matty/comet" ]; then
+  echo "comet install: release repository mismatch (expected matty/comet, got $repository)" >&2
+  exit 1
+fi
+ver="$(printf '%s' "$compact_manifest" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+[ -n "$ver" ] || { echo "comet install: manifest has no release version" >&2; exit 1; }
 file="comet-$ver-$plat-$arch.tar.gz"
 data_root="$HOME/.comet-native"
 app_root="$data_root/app"

@@ -4,7 +4,7 @@ vi.mock("./install.sh", () => ({ default: "#!/bin/sh\necho install\n" }));
 
 import worker, { type Env } from "./index";
 
-const body = new TextEncoder().encode('{"version":"1.2.3"}');
+const body = new TextEncoder().encode('{"repository":"matty/comet","version":"1.2.3"}');
 const releaseObject = {
   body,
   size: body.byteLength,
