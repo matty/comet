@@ -135,9 +135,9 @@ Add:
 
 ```rust
 fn startup_device_name(existing: Option<&str>, detected: &str) -> String {
-    match existing.map(str::trim) {
-        Some(name) if !name.is_empty()
-            && !matches!(name, "unknown-default" | "unknown-device") => name.to_string(),
+    match existing {
+        Some(name) if !name.trim().is_empty()
+            && !matches!(name.trim(), "unknown-default" | "unknown-device") => name.to_string(),
         _ => detected.to_string(),
     }
 }
