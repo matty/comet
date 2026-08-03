@@ -162,7 +162,7 @@ impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
             SettingsSection::Devices => "Devices",
-            SettingsSection::RemoteConnections => "Remote connections",
+            SettingsSection::RemoteConnections => "Remote",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
@@ -3639,10 +3639,7 @@ mod tests {
     #[test]
     fn remote_connections_is_a_first_class_settings_section() {
         assert!(SettingsSection::ALL.contains(&SettingsSection::RemoteConnections));
-        assert_eq!(
-            SettingsSection::RemoteConnections.label(),
-            "Remote connections"
-        );
+        assert_eq!(SettingsSection::RemoteConnections.label(), "Remote");
     }
 
     #[test]
