@@ -126,31 +126,29 @@ impl Shell {
     /// Close a tab = archive the session. Selection moves to a neighbor; the
     /// last tab lands on the new-session canvas.
     pub(super) fn close_session_tab(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        let (selected, order) = {
-            let space = self
-                .state
-                .read(cx)
+        let (owner, selected, order) = {
+            let state = self.state.read(cx);
+            let server_id = state
                 .selected_space
-                .clone()
-                .map(|id| id.local_id);
+                .as_ref()
+                .map(|space| space.server_id.clone())
+                .or_else(|| state.selected_server_id().cloned())
+                .expect("session tabs require a server bucket");
+            let space = state.selected_space.clone().map(|id| id.local_id);
             let order = space
                 .as_deref()
                 .map(|space| self.tab_ids(space, cx))
                 .unwrap_or_default();
-            (self.state.read(cx).selected_chat.clone(), order)
+            (
+                comet_proto::ServerRef::new(server_id, chat_id.clone()),
+                state.selected_chat.clone(),
+                order,
+            )
         };
         if selected.as_ref().map(|chat| chat.local_id.as_str()) == Some(chat_id.as_str()) {
             let next = next_after_close(&order, &chat_id);
             self.state.update(cx, |s, cx| s.select_chat(next, cx));
         }
-        let owner = comet_proto::ServerRef::new(
-            self.state
-                .read(cx)
-                .selected_server_id()
-                .cloned()
-                .expect("session tabs require a server bucket"),
-            chat_id,
-        );
         self.archive_chat(owner, cx);
     }
 

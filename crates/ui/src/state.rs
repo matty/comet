@@ -999,6 +999,22 @@ impl AppState {
         })
     }
 
+    /// Resolve a captured resource owner for a final mutation. Unlike
+    /// `selected_client`, this never falls back to whichever server is active,
+    /// and it rejects owners that disappeared or went offline after the UI was
+    /// opened.
+    pub fn mutation_client_for(&self, owner: &ServerRef) -> Result<ServerClient, RpcError> {
+        let online = self
+            .servers
+            .get(&owner.server_id)
+            .is_some_and(|server| server.connection == RemoteConnectionState::Online);
+        if !online {
+            return Err(RpcError::Failed("server is offline".into()));
+        }
+        self.client_for(owner)
+            .ok_or_else(|| RpcError::Failed("engine not connected".into()))
+    }
+
     pub fn selected_client(&self) -> Option<ServerClient> {
         Some(ServerClient {
             federation: self.federation.clone()?,
@@ -1352,6 +1368,79 @@ mod tests {
                     && method == methods::QUEUE_COMMAND
                     && params["chatId"] == "chat-1"
                     && params.get("targetDeviceId").is_none()));
+    }
+
+    #[tokio::test]
+    async fn owner_bound_mutations_route_to_b_without_changing_selected_a() {
+        let mut state = AppState::new();
+        for id in ["a", "b"] {
+            let mut bucket = ServerState::empty(server(id), id, RemoteConnectionState::Online);
+            bucket.chats.push(remote_chat("chat-1", "space-1"));
+            state.apply_federation(FederationEvent::ServerChanged(bucket));
+        }
+        let selected = ServerRef::new(server("a"), "chat-1");
+        let owner = ServerRef::new(server("b"), "chat-1");
+        state.select_server_chat(selected.clone());
+        let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
+        state.federation = Some(FederatedClient { commands });
+
+        for params in [
+            serde_json::json!({ "op": "renameChat", "chatId": "chat-1", "title": "B" }),
+            serde_json::json!({ "op": "setChatArchived", "chatId": "chat-1", "archived": true }),
+            serde_json::json!({ "op": "deleteChat", "chatId": "chat-1" }),
+        ] {
+            let client = state.mutation_client_for(&owner).unwrap();
+            let request = tokio::spawn(async move { client.call(methods::MUTATE, params).await });
+            let FederationCommand::Request {
+                server_id,
+                method,
+                params,
+                reply,
+            } = received.recv().await.unwrap()
+            else {
+                panic!("expected an owner-bound request");
+            };
+            assert_eq!(server_id, server("b"));
+            assert_eq!(method, methods::MUTATE);
+            assert_eq!(params["chatId"], "chat-1");
+            reply.send(Ok(serde_json::Value::Null)).unwrap();
+            request.await.unwrap().unwrap();
+            assert_eq!(state.selected_chat.as_ref(), Some(&selected));
+        }
+    }
+
+    #[test]
+    fn owner_bound_mutations_reject_offline_or_removed_b_without_falling_back_to_a() {
+        let mut state = AppState::new();
+        for id in ["a", "b"] {
+            let mut bucket = ServerState::empty(server(id), id, RemoteConnectionState::Online);
+            bucket.chats.push(remote_chat("chat-1", "space-1"));
+            state.apply_federation(FederationEvent::ServerChanged(bucket));
+        }
+        let selected = ServerRef::new(server("a"), "chat-1");
+        let owner = ServerRef::new(server("b"), "chat-1");
+        state.select_server_chat(selected.clone());
+        let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
+        state.federation = Some(FederatedClient { commands });
+
+        state.apply_federation(FederationEvent::ServerChanged(ServerState::offline(
+            server("b"),
+            "b",
+        )));
+        assert!(matches!(
+            state.mutation_client_for(&owner),
+            Err(RpcError::Failed(message)) if message.contains("offline")
+        ));
+        assert_eq!(state.selected_chat.as_ref(), Some(&selected));
+        assert!(received.try_recv().is_err());
+
+        state.apply_federation(FederationEvent::ServerRemoved(server("b")));
+        assert!(matches!(
+            state.mutation_client_for(&owner),
+            Err(RpcError::Failed(message)) if message.contains("offline")
+        ));
+        assert_eq!(state.selected_chat.as_ref(), Some(&selected));
+        assert!(received.try_recv().is_err());
     }
 
     #[test]

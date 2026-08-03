@@ -1220,19 +1220,43 @@ impl Shell {
         }));
     }
 
+    /// Mutate the server that owned a menu/dialog/tab when it was opened.
+    /// Selection is deliberately irrelevant: it may have changed while the
+    /// confirmation UI was open.
+    fn mutate_for(
+        &mut self,
+        owner: comet_proto::ServerRef,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let engine = match self.state.read(cx).mutation_client_for(&owner) {
+            Ok(engine) => engine,
+            Err(err) => {
+                self.sidebar_notice = Some(format!("{err}").into());
+                cx.notify();
+                return;
+            }
+        };
+        self.mutate_task = Some(cx.spawn(async move |this, cx| {
+            if let Err(err) = engine.client().call(methods::MUTATE, params).await {
+                this.update(cx, |shell, cx| {
+                    shell.sidebar_notice = Some(format!("{err}").into());
+                    cx.notify();
+                })
+                .ok();
+            }
+        }));
+    }
+
     fn open_rename_chat(&mut self, chat_id: comet_proto::ServerRef, cx: &mut Context<Self>) {
         self.chat_menu = None;
-        if self.state.read(cx).selected_server_id() != Some(&chat_id.server_id) {
-            self.state.update(cx, |state, cx| {
-                state.select_server_bucket(chat_id.server_id.clone());
-                cx.notify();
-            });
-        }
         let current = self
             .state
             .read(cx)
-            .chats
-            .iter()
+            .servers
+            .get(&chat_id.server_id)
+            .into_iter()
+            .flat_map(|server| &server.chats)
             .find(|c| c.id == chat_id.local_id)
             .and_then(|c| c.title.clone())
             .unwrap_or_default();
@@ -1258,8 +1282,10 @@ impl Shell {
         };
         let title = dialog.input.read(cx).text().trim().to_string();
         if !title.is_empty() {
-            self.mutate(
-                serde_json::json!({ "op": "renameChat", "chatId": dialog.chat_id.local_id, "title": title }),
+            let owner = dialog.chat_id;
+            self.mutate_for(
+                owner.clone(),
+                serde_json::json!({ "op": "renameChat", "chatId": owner.local_id, "title": title }),
                 cx,
             );
         }
@@ -1268,13 +1294,8 @@ impl Shell {
 
     fn archive_chat(&mut self, chat_id: comet_proto::ServerRef, cx: &mut Context<Self>) {
         self.chat_menu = None;
-        if self.state.read(cx).selected_server_id() != Some(&chat_id.server_id) {
-            self.state.update(cx, |state, cx| {
-                state.select_server_bucket(chat_id.server_id.clone());
-                cx.notify();
-            });
-        }
-        self.mutate(
+        self.mutate_for(
+            chat_id.clone(),
             serde_json::json!({ "op": "setChatArchived", "chatId": chat_id.local_id, "archived": true }),
             cx,
         );
@@ -1283,16 +1304,11 @@ impl Shell {
 
     fn delete_chat(&mut self, chat_id: comet_proto::ServerRef, cx: &mut Context<Self>) {
         self.delete_confirm = None;
-        if self.state.read(cx).selected_server_id() != Some(&chat_id.server_id) {
-            self.state.update(cx, |state, cx| {
-                state.select_server_bucket(chat_id.server_id.clone());
-                cx.notify();
-            });
-        }
         if self.state.read(cx).selected_chat.as_ref() == Some(&chat_id) {
             self.state.update(cx, |s, cx| s.select_chat(None, cx));
         }
-        self.mutate(
+        self.mutate_for(
+            chat_id.clone(),
             serde_json::json!({ "op": "deleteChat", "chatId": chat_id.local_id }),
             cx,
         );

@@ -95,3 +95,21 @@
 - `cargo test -p comet-ui --lib`: 325 passed, 0 failed.
 - `cargo clippy -p comet-client --tests -- -D warnings`: passed.
 - `cargo fmt --all -- --check`, `git diff --check`, and the `targetDeviceId` audit passed (only two negative test assertions match).
+
+## Fix Round 3
+
+### Captured-owner final mutations
+
+- RED added duplicate-ID A/B coverage for rename, archive, and delete while A remains selected. The focused build failed because the owner-checked mutation resolver did not exist.
+- `Shell::mutate_for(ServerRef, ...)` resolves the captured owner directly and never consults or changes current selection. `AppState::mutation_client_for` rejects an offline or removed owner with `server is offline`, so the shell displays the error and cannot fall through to A.
+- Rename reads its initial title from the captured server bucket. Rename submit, grouped and flat menu archive/delete, delete confirmation, and tab-close archive all retain and use the qualified owner.
+- Tab close now captures its owner before moving selection to a neighboring tab. The audit found no other captured-owner chat mutation that still routes through `selected_client()`.
+
+### Fix-round verification
+
+- Focused RED/GREEN: 2 owner-routing tests passed. Online B receives all three mutations and A stays selected; offline and removed B produce no federation command and never mutate A.
+- `cargo test -p comet-client`: 36 unit + 23 integration tests passed; doc tests passed.
+- `cargo test -p comet-ui --lib`: 327 passed, 0 failed.
+- `cargo clippy -p comet-client --all-targets -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- Strict UI clippy remains blocked by the pre-existing lint baseline: the normal command first fails in `comet-update` (`collapsible_if`), while `--no-deps` reaches `comet-ui` and reports the existing 15 UI findings. None is in the owner-routing changes.
