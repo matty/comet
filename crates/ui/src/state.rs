@@ -36,6 +36,11 @@ use comet_proto::{
 };
 use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
+use crate::remotes::{
+    AddRemoteRequest, InstallationRemotePairer, RemoteAddCoordinator, RemoteAddState,
+    run_remote_add_operation,
+};
+
 // ---------------------------------------------------------------------------
 // Engine handle
 // ---------------------------------------------------------------------------
@@ -506,6 +511,8 @@ pub struct AppState {
     engine: Option<EngineHandle>,
     federation: Option<FederatedClient>,
     watch_tasks: Vec<Task<()>>,
+    remote_add: RemoteAddCoordinator,
+    remote_add_task: Option<Task<()>>,
 }
 
 impl Default for AppState {
@@ -536,6 +543,8 @@ impl AppState {
             engine: None,
             federation: None,
             watch_tasks: Vec::new(),
+            remote_add: RemoteAddCoordinator::default(),
+            remote_add_task: None,
             auto_selected: false,
         }
     }
@@ -992,6 +1001,49 @@ impl AppState {
         self.engine.as_ref()
     }
 
+    pub fn local_rpc_client(&self) -> Option<Arc<RpcClient>> {
+        self.engine.as_ref().map(EngineHandle::client)
+    }
+
+    pub fn remote_add_state(&self) -> RemoteAddState {
+        self.remote_add.state()
+    }
+
+    pub fn start_remote_add(
+        &mut self,
+        request: AddRemoteRequest,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if matches!(self.remote_add.state(), RemoteAddState::InFlight) {
+            return Err("A remote is already being added".into());
+        }
+        let local = self
+            .engine()
+            .map(|engine| engine.client())
+            .ok_or_else(|| "Local engine is not connected".to_string())?;
+        let data_dir = self
+            .data_dir
+            .clone()
+            .ok_or_else(|| "Installation identity is unavailable".to_string())?;
+        if !self.remote_add.begin() {
+            return Err("A remote is already being added".into());
+        }
+        let coordinator = self.remote_add.clone();
+        self.remote_add_task = Some(cx.spawn(async move |this, cx| {
+            run_remote_add_operation(
+                coordinator,
+                InstallationRemotePairer,
+                local,
+                data_dir,
+                request,
+            )
+            .await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        }));
+        cx.notify();
+        Ok(())
+    }
+
     pub fn federation(&self) -> Option<&FederatedClient> {
         self.federation.as_ref()
     }
@@ -1292,6 +1344,37 @@ mod tests {
 
     fn server(id: &str) -> comet_proto::ServerId {
         comet_proto::ServerId::new(format!("sha256:{id}"))
+    }
+
+    struct ClosedService;
+
+    #[async_trait]
+    impl RpcService for ClosedService {
+        async fn handle(&self, _: &str, _: serde_json::Value) -> Result<RpcReply, RpcError> {
+            Err(RpcError::Closed)
+        }
+    }
+
+    #[tokio::test]
+    async fn local_watch_client_provider_observes_engine_replacement() {
+        let first = Arc::new(memory_client(Arc::new(ClosedService)));
+        let second = Arc::new(memory_client(Arc::new(ClosedService)));
+        let mut state = AppState::new();
+        state.engine = Some(EngineHandle {
+            inner: Arc::new(RemoteEngine {
+                client: first.clone(),
+                url: "ws://first".into(),
+            }),
+        });
+        assert!(Arc::ptr_eq(&state.local_rpc_client().unwrap(), &first));
+
+        state.engine = Some(EngineHandle {
+            inner: Arc::new(RemoteEngine {
+                client: second.clone(),
+                url: "ws://second".into(),
+            }),
+        });
+        assert!(Arc::ptr_eq(&state.local_rpc_client().unwrap(), &second));
     }
 
     fn remote_chat(id: &str, space_id: &str) -> Chat {

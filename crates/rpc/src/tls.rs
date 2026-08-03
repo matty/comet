@@ -449,8 +449,18 @@ pub async fn pair_client<A>(
 where
     A: ToSocketAddrs,
 {
+    pair_client_zeroizing(endpoint, identity, Zeroizing::new(secret)).await
+}
+
+pub async fn pair_client_zeroizing<A>(
+    endpoint: A,
+    identity: &TlsIdentity,
+    secret: Zeroizing<[u8; 16]>,
+) -> Result<PinnedServer, PairingError>
+where
+    A: ToSocketAddrs,
+{
     let _provider = selected_crypto_provider();
-    let secret = Zeroizing::new(secret);
     let verifier = Arc::new(UnpinnedPairingVerifier {
         algorithms: supported_algorithms(),
     });

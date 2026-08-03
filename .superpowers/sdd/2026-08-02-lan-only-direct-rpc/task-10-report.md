@@ -70,3 +70,36 @@ Focused results after the fixes:
 - `cargo fmt --all -- --check`: passed after formatting.
 - `git diff --check`: passed.
 - Strict multi-package clippy remains blocked before affected code by the pre-existing `crates/update/src/lib.rs:543` `collapsible_if`. `cargo clippy -p comet-ui --lib --no-deps -- -D warnings` reaches the UI and reports 15 pre-existing baseline findings in other files; it reports none in `remotes.rs`.
+
+## Review fix round 2
+
+- Remote add is now a single-flight operation owned by `AppState`, not by the settings page. The app-owned task runs pairing and local persistence as one future, and its `RemoteAddCoordinator` retains a public terminal result for a newly attached page. Dropping the page after remote trust succeeds cannot cancel `PUT_REMOTE`; a persistence failure remains retrievable as `PartialSuccess` and is logged with public server/endpoint/error fields only.
+- A second add is rejected while the coordinator is in flight. App/runtime shutdown remains the explicit residual risk: process exit can end a task after remote trust but before local persistence, while ordinary page navigation cannot.
+- Remove and revoke confirmations now include the stable server ID as well as the friendly name (and endpoint for remove), so duplicate friendly names are distinguishable.
+- Remote and trusted-client watch loops resolve `AppState.local_rpc_client()` before every subscribe attempt. They do not retain an old `EngineHandle` or client between attempts, so engine replacement is observed on retry. Page-owned task handles still cancel subscriptions and retry loops on page drop.
+- Subscribe success no longer resets watch backoff. Close, subscribe failure, and malformed-frame cycles accumulate 250, 500, 1000, 2000, and 4000 ms delays capped at 4000 ms. Only a valid decoded snapshot marks the watch live and resets the sequence.
+- Remote pairing text no longer enters `ComposerInput`. A dedicated single-line `SecretInput` stores plaintext only in `Zeroizing<String>`, mutates it directly for edit/paste, exposes redacted `Debug`, explicitly clears it on submission, and renders only grouped bullets. Server pairing secrets remain zeroizing and masked; `Copy secret` uses a short-lived zeroizing source, keeps no plaintext copy status, expires that status after ten seconds, and tells the user that the value remains in the system clipboard until replaced. The framework clipboard necessarily owns the copied plaintext; no stronger zeroization claim is made.
+- The RPC pairing boundary now accepts `Zeroizing<[u8; 16]>` through `pair_client_zeroizing`; the legacy array entry point wraps immediately for compatibility. The UI creates the protected copy directly at that narrow boundary.
+- Endpoint parsing validates bracketed contents as `Ipv6Addr`, accepts valid IPv4 literals, and enforces DNS total/label length, character, and edge rules. Malformed numeric IPv4-like hosts, underscores, empty labels, edge hyphens, whitespace, ambiguous bare IPv6, and invalid bracketed IPv6 are rejected.
+
+### Round-2 TDD evidence
+
+- Endpoint RED: `[not-ipv6]:27655` was accepted before bracket validation; the malformed IPv6/DNS matrix now passes.
+- UI RED: the regression batch failed compilation on absent `RemoteAddCoordinator`, `run_remote_add_operation`, `SecretInputModel`, and valid-snapshot watch methods. The minimal contracts and production integrations were then added.
+- Engine replacement fixture initially failed outside a Tokio reactor; converting it to an async test made the transport fixture valid, after which it proved that a replaced engine yields a different current local client.
+- The durable-add test gates local persistence: it waits until pairing returned and `PUT_REMOTE` began, drops the page-level observer, releases the failing PUT, then verifies one persistence attempt and retrievable revoke/fresh-pairing recovery.
+
+Focused results:
+
+- `cargo test -p comet-ui remotes -- --nocapture`: 17 passed, 0 failed.
+- `cargo test -p comet-proto endpoint -- --nocapture`: 3 passed, 0 failed.
+- `cargo test -p comet-ui local_watch_client_provider_observes_engine_replacement -- --nocapture`: 1 passed, 0 failed.
+- `cargo test -p comet-ui durable_remote_add -- --nocapture`: 1 passed, 0 failed.
+
+### Round-2 verification
+
+- `cargo test -p comet-proto -p comet-rpc -p comet-client -p comet-engine -p comet-ui --lib`: 451 passed, 0 failed (36 client + 36 engine + 17 protocol + 15 RPC + 347 UI).
+- `cargo test -p comet-engine --test remote_access -- --nocapture`: 20 passed, 0 failed.
+- `cargo clippy -p comet-proto -p comet-rpc --lib -- -D warnings`: passed.
+- `cargo clippy -p comet-ui --lib --no-deps -- -D warnings`: remains blocked by 15 pre-existing findings outside `remotes.rs` and `state.rs`; after fixing the one new lazy-evaluation finding, the rerun reports no Task 10 finding.
+- Formatting and diff checks are run again immediately before commit.

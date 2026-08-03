@@ -49,6 +49,8 @@ impl RemoteEndpoint {
             if port.contains(':') {
                 return Err("IPv6 endpoints must be [address]:port".into());
             }
+            host.parse::<std::net::Ipv6Addr>()
+                .map_err(|_| "bracketed host must be a valid IPv6 address".to_string())?;
             (host, port)
         } else {
             let (host, port) = value
@@ -65,6 +67,9 @@ impl RemoteEndpoint {
         {
             return Err("endpoint must be host:port".to_string());
         }
+        if !value.starts_with('[') {
+            validate_unbracketed_host(host)?;
+        }
         let port = port
             .parse::<u16>()
             .map_err(|_| "endpoint port must be a number from 1 to 65535".to_string())?;
@@ -76,6 +81,35 @@ impl RemoteEndpoint {
             port,
         })
     }
+}
+
+fn validate_unbracketed_host(host: &str) -> Result<(), String> {
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Ok(());
+    }
+    if host
+        .chars()
+        .all(|character| character.is_ascii_digit() || character == '.')
+    {
+        return Err("endpoint host is not a valid IPv4 address".into());
+    }
+    if host.len() > 253 {
+        return Err("DNS host must be at most 253 characters".into());
+    }
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err("DNS labels must contain 1 to 63 characters".into());
+        }
+        if !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || !label.as_bytes()[0].is_ascii_alphanumeric()
+            || !label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+        {
+            return Err("DNS labels must use alphanumerics with internal hyphens only".into());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +187,37 @@ mod tests {
         assert!(RemoteEndpoint::parse(" buildbox.local:27655").is_err());
         assert!(RemoteEndpoint::parse("build box.local:27655").is_err());
         assert!(RemoteEndpoint::parse("[]:27655").is_err());
+    }
+
+    #[test]
+    fn endpoint_rejects_malformed_ipv6_and_dns_labels() {
+        for invalid in [
+            "[not-ipv6]:27655",
+            "[12345::1]:27655",
+            "bad_name.local:27655",
+            "-leading.local:27655",
+            "trailing-.local:27655",
+            "empty..label:27655",
+            "999.2.3.4:27655",
+        ] {
+            assert!(
+                RemoteEndpoint::parse(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+        let long_label = "a".repeat(64);
+        assert!(RemoteEndpoint::parse(&format!("{long_label}.local:27655")).is_err());
+        let long_host = format!("{}.com:27655", "a.".repeat(126));
+        assert!(RemoteEndpoint::parse(&long_host).is_err());
+
+        for valid in [
+            "localhost:27655",
+            "build-box.local:27655",
+            "192.168.1.20:27655",
+            "[2001:db8::1]:27655",
+        ] {
+            assert!(RemoteEndpoint::parse(valid).is_ok(), "rejected {valid}");
+        }
     }
 
     #[test]

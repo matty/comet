@@ -1,15 +1,18 @@
 use chrono::{DateTime, Utc};
 use comet_proto::{LanSettings, RemoteConnectionState, RemoteEntry, TrustedClient};
-use comet_rpc::{RpcClient, TlsIdentity, methods, pair_client};
+use comet_rpc::{RpcClient, TlsIdentity, methods, pair_client_zeroizing};
 use data_encoding::BASE32_NOPAD;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
 
 use gpui::{
-    AnyElement, Context, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px,
+    AnyElement, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
+    Focusable, Pixels, Point, SharedString, Subscription, Task, UTF16Selection, Window, canvas,
+    div, prelude::*, px,
 };
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -34,6 +37,17 @@ impl PairingSecret {
     pub fn expose(&self) -> &str {
         &self.secret.0
     }
+
+    pub fn masked_text(&self) -> String {
+        self.expose()
+            .chars()
+            .map(|character| if character == '-' { '-' } else { '•' })
+            .collect()
+    }
+
+    pub fn copy_secret(&self) -> SecretCopy {
+        SecretCopy(Zeroizing::new(self.expose().to_string()))
+    }
 }
 
 impl fmt::Debug for PairingSecret {
@@ -57,6 +71,314 @@ impl fmt::Debug for SecretText {
 impl PartialEq<&str> for SecretText {
     fn eq(&self, other: &&str) -> bool {
         self.0.as_str() == *other
+    }
+}
+
+pub struct SecretInputModel {
+    content: Zeroizing<String>,
+    copy_status: Option<&'static str>,
+}
+
+impl Default for SecretInputModel {
+    fn default() -> Self {
+        Self {
+            content: Zeroizing::new(String::new()),
+            copy_status: None,
+        }
+    }
+}
+
+impl fmt::Debug for SecretInputModel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SecretInputModel")
+            .field("content", &"[REDACTED]")
+            .field("copy_status", &self.copy_status)
+            .finish()
+    }
+}
+
+impl SecretInputModel {
+    pub fn replace(&mut self, range: std::ops::Range<usize>, text: &str) {
+        self.content.replace_range(range, text);
+    }
+
+    pub fn masked_text(&self) -> String {
+        self.content
+            .chars()
+            .map(|character| if character == '-' { '-' } else { '•' })
+            .collect()
+    }
+
+    pub fn copy_secret(&mut self) -> SecretCopy {
+        self.copy_status =
+            Some("Copied. The value remains in the system clipboard until it is replaced.");
+        SecretCopy(Zeroizing::new(self.content.to_string()))
+    }
+
+    pub fn copy_status(&self) -> Option<&str> {
+        self.copy_status
+    }
+
+    pub fn expire_copy_status(&mut self) {
+        self.copy_status = None;
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.content
+    }
+
+    pub fn clear(&mut self) {
+        self.content.clear();
+        self.copy_status = None;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.content.is_empty()
+    }
+}
+
+pub struct SecretInput {
+    model: SecretInputModel,
+    focus_handle: FocusHandle,
+    selection: std::ops::Range<usize>,
+}
+
+impl SecretInput {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            model: SecretInputModel::default(),
+            focus_handle: cx.focus_handle(),
+            selection: 0..0,
+        }
+    }
+
+    pub fn secret(&self) -> &str {
+        self.model.expose()
+    }
+
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.model.clear();
+        self.selection = 0..0;
+        cx.notify();
+    }
+
+    fn replace_selection(&mut self, text: &str, cx: &mut Context<Self>) {
+        let filtered: Zeroizing<String> = Zeroizing::new(
+            text.chars()
+                .filter(|character| {
+                    character.is_ascii_alphanumeric()
+                        || *character == '-'
+                        || character.is_ascii_whitespace()
+                })
+                .collect(),
+        );
+        self.model
+            .replace(self.selection.clone(), filtered.as_str());
+        let cursor = self.selection.start + filtered.len();
+        self.selection = cursor..cursor;
+        cx.notify();
+    }
+
+    fn backspace(
+        &mut self,
+        _: &crate::composer::Backspace,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selection.start != self.selection.end {
+            self.replace_selection("", cx);
+        } else if self.selection.start > 0 {
+            self.selection = self.selection.start - 1..self.selection.end;
+            self.replace_selection("", cx);
+        }
+    }
+
+    fn delete(&mut self, _: &crate::composer::Delete, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selection.start != self.selection.end {
+            self.replace_selection("", cx);
+        } else if self.selection.end < self.model.expose().len() {
+            self.selection = self.selection.start..self.selection.end + 1;
+            self.replace_selection("", cx);
+        }
+    }
+
+    fn select_all(
+        &mut self,
+        _: &crate::composer::SelectAll,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selection = 0..self.model.expose().len();
+        cx.notify();
+    }
+
+    fn paste(&mut self, _: &crate::composer::Paste, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let text = Zeroizing::new(text);
+        self.replace_selection(text.as_str(), cx);
+    }
+}
+
+impl fmt::Debug for SecretInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SecretInput")
+            .field("model", &self.model)
+            .field("selection", &self.selection)
+            .finish()
+    }
+}
+
+impl Focusable for SecretInput {
+    fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EntityInputHandler for SecretInput {
+    fn text_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        _: &mut Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self.selection.clone(),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        None
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(range) = range {
+            self.selection = range;
+        }
+        self.replace_selection(text, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _: Option<std::ops::Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.replace_text_in_range(range, text, window, cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        bounds: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.model.expose().len())
+    }
+}
+
+impl gpui::Render for SecretInput {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        let masked = if self.model.is_empty() {
+            SharedString::from("Pairing secret")
+        } else {
+            SharedString::from(self.model.masked_text())
+        };
+        let input = cx.entity();
+        let input_for_canvas = input.clone();
+        div()
+            .relative()
+            .key_context("Composer")
+            .track_focus(&self.focus_handle)
+            .cursor(gpui::CursorStyle::IBeam)
+            .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::paste))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                    let cursor = this.model.expose().len();
+                    this.selection = cursor..cursor;
+                }),
+            )
+            .w_full()
+            .text_size(px(13.0))
+            .text_color(if self.model.is_empty() {
+                theme.text_faint
+            } else {
+                theme.text
+            })
+            .child(masked)
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, cx| {
+                        let focus = input_for_canvas.read(cx).focus_handle.clone();
+                        window.handle_input(
+                            &focus,
+                            ElementInputHandler::new(bounds, input_for_canvas.clone()),
+                            cx,
+                        );
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+    }
+}
+
+pub struct SecretCopy(Zeroizing<String>);
+
+impl SecretCopy {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretCopy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
     }
 }
 
@@ -320,6 +642,90 @@ pub enum AddRemoteError {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteAddState {
+    Idle,
+    InFlight,
+    Succeeded(PublicRemoteDetails),
+    Failed(String),
+    PartialSuccess(PartialPairing),
+}
+
+#[derive(Clone)]
+pub struct RemoteAddCoordinator {
+    state: Arc<Mutex<RemoteAddState>>,
+}
+
+impl Default for RemoteAddCoordinator {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RemoteAddState::Idle)),
+        }
+    }
+}
+
+impl fmt::Debug for RemoteAddCoordinator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteAddCoordinator")
+            .field("state", &self.state())
+            .finish()
+    }
+}
+
+impl RemoteAddCoordinator {
+    pub fn begin(&self) -> bool {
+        let mut state = self.state.lock().expect("remote add state lock poisoned");
+        if matches!(*state, RemoteAddState::InFlight) {
+            return false;
+        }
+        *state = RemoteAddState::InFlight;
+        true
+    }
+
+    pub fn finish(&self, result: Result<RemoteEntry, AddRemoteError>) {
+        let terminal = match result {
+            Ok(entry) => RemoteAddState::Succeeded(public_remote_details(&entry)),
+            Err(AddRemoteError::Pairing(error)) => RemoteAddState::Failed(error),
+            Err(AddRemoteError::PartialSuccess {
+                remote,
+                recovery,
+                source,
+            }) => {
+                tracing::warn!(
+                    server_id = ?remote.server_id,
+                    endpoint_host = %remote.endpoint.host,
+                    endpoint_port = remote.endpoint.port,
+                    error = %source,
+                    "remote trusted but local registry persistence failed"
+                );
+                RemoteAddState::PartialSuccess(PartialPairing {
+                    remote,
+                    recovery,
+                    source,
+                })
+            }
+        };
+        *self.state.lock().expect("remote add state lock poisoned") = terminal;
+    }
+
+    pub fn state(&self) -> RemoteAddState {
+        self.state
+            .lock()
+            .expect("remote add state lock poisoned")
+            .clone()
+    }
+}
+
+fn public_remote_details(entry: &RemoteEntry) -> PublicRemoteDetails {
+    PublicRemoteDetails {
+        server_id: entry.server_id.clone(),
+        endpoint: entry.endpoint.clone(),
+        name: entry.name.clone(),
+        pinned_spki_sha256: entry.pinned_spki_sha256.clone(),
+    }
+}
+
 impl fmt::Display for AddRemoteError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -430,20 +836,22 @@ pub struct DestructiveConfirmation {
 
 impl DestructiveConfirmation {
     pub fn request_remove(&mut self, server_id: comet_proto::ServerId, name: &str, endpoint: &str) {
+        let stable_id = server_id_text(&server_id);
         self.pending = Some((
             DestructiveAction::RemoveRemote { server_id },
             format!(
-                "Remove {name} ({endpoint}) from this computer? This does not revoke this device on the remote computer."
+                "Remove {name} ({endpoint}, server {stable_id}) from this computer? This does not revoke this device on the remote computer."
             ),
         ));
         self.confirmed = false;
     }
 
     pub fn request_revoke(&mut self, server_id: comet_proto::ServerId, name: &str) {
+        let stable_id = server_id_text(&server_id);
         self.pending = Some((
             DestructiveAction::RevokeClient { server_id },
             format!(
-                "Revoke {name}? Its active connection will close and future connections will be rejected."
+                "Revoke {name} (server {stable_id})? Its active connection will close and future connections will be rejected."
             ),
         ));
         self.confirmed = false;
@@ -471,6 +879,13 @@ impl DestructiveConfirmation {
     }
 }
 
+fn server_id_text(server_id: &comet_proto::ServerId) -> String {
+    serde_json::to_value(server_id)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchHealth {
     Loading,
@@ -494,7 +909,13 @@ impl Default for WatchRecovery {
 }
 
 impl WatchRecovery {
-    pub fn connected(&mut self) {
+    pub fn subscribed(&mut self) {
+        if self.failures == 0 {
+            self.health = WatchHealth::Loading;
+        }
+    }
+
+    pub fn valid_snapshot(&mut self) {
         self.health = WatchHealth::Live;
         self.failures = 0;
     }
@@ -557,7 +978,8 @@ impl RemotePairer for InstallationRemotePairer {
         } else {
             format!("{}:{}", endpoint.host, endpoint.port)
         };
-        let pinned = pair_client(address, &tls, *secret)
+        let protected_secret = Zeroizing::new(*secret);
+        let pinned = pair_client_zeroizing(address, &tls, protected_secret)
             .await
             .map_err(|error| error.to_string())?;
         Ok(PinnedRemote {
@@ -577,6 +999,13 @@ impl LocalRemoteAdmin for RpcClient {
         .await
         .map(|_| ())
         .map_err(|error| error.to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl LocalRemoteAdmin for Arc<RpcClient> {
+    async fn put_remote(&self, entry: &RemoteEntry) -> Result<(), String> {
+        self.as_ref().put_remote(entry).await
     }
 }
 
@@ -626,6 +1055,20 @@ where
     Ok(entry)
 }
 
+pub async fn run_remote_add_operation<P, A>(
+    coordinator: RemoteAddCoordinator,
+    pairer: P,
+    local_admin: A,
+    data_dir: std::path::PathBuf,
+    request: AddRemoteRequest,
+) where
+    P: RemotePairer,
+    A: LocalRemoteAdmin,
+{
+    let result = pair_and_persist_remote(&pairer, &local_admin, data_dir.as_path(), request).await;
+    coordinator.finish(result);
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LanSnapshot {
@@ -656,14 +1099,15 @@ pub struct RemoteConnectionsPage {
     port_input: Entity<ComposerInput>,
     endpoint_input: Entity<ComposerInput>,
     name_input: Entity<ComposerInput>,
-    secret_input: Entity<ComposerInput>,
+    secret_input: Entity<SecretInput>,
     rename: Option<RenameRemote>,
     confirmation: DestructiveConfirmation,
     operations: OperationTracker,
     trusted_loaded: bool,
     listener_task: Option<Task<()>>,
     pairing_task: Option<Task<()>>,
-    add_task: Option<Task<()>>,
+    pairing_copy_task: Option<Task<()>>,
+    pairing_copy_status: bool,
     _watch_tasks: Vec<Task<()>>,
     _input_events: Vec<Subscription>,
     _app_observation: Subscription,
@@ -683,26 +1127,20 @@ impl RemoteConnectionsPage {
         port_input.update(cx, |input, cx| input.set_text("27655", cx));
         let endpoint_input = cx.new(|cx| ComposerInput::new("hostname-or-ip:port", cx));
         let name_input = cx.new(|cx| ComposerInput::new("Friendly name (optional)", cx));
-        let secret_input = cx.new(|cx| ComposerInput::new("Pairing secret", cx));
-        let input_events = [
-            &bind_input,
-            &port_input,
-            &endpoint_input,
-            &name_input,
-            &secret_input,
-        ]
-        .into_iter()
-        .map(|input| {
-            cx.subscribe(input, |_: &mut Self, _, event, cx| {
-                if matches!(
-                    event,
-                    ComposerInputEvent::Edited | ComposerInputEvent::Submitted
-                ) {
-                    cx.notify();
-                }
+        let secret_input = cx.new(SecretInput::new);
+        let input_events = [&bind_input, &port_input, &endpoint_input, &name_input]
+            .into_iter()
+            .map(|input| {
+                cx.subscribe(input, |_: &mut Self, _, event, cx| {
+                    if matches!(
+                        event,
+                        ComposerInputEvent::Edited | ComposerInputEvent::Submitted
+                    ) {
+                        cx.notify();
+                    }
+                })
             })
-        })
-        .collect();
+            .collect();
 
         let mut page = Self {
             app,
@@ -718,7 +1156,8 @@ impl RemoteConnectionsPage {
             trusted_loaded: false,
             listener_task: None,
             pairing_task: None,
-            add_task: None,
+            pairing_copy_task: None,
+            pairing_copy_status: false,
             _watch_tasks: Vec::new(),
             _input_events: input_events,
             _app_observation: app_observation,
@@ -728,7 +1167,7 @@ impl RemoteConnectionsPage {
     }
 
     fn local_client(&self, cx: &Context<Self>) -> Option<std::sync::Arc<RpcClient>> {
-        self.app.read(cx).engine().map(|engine| engine.client())
+        self.app.read(cx).local_rpc_client()
     }
 
     fn start_local_watches(&mut self, cx: &mut Context<Self>) {
@@ -779,9 +1218,26 @@ impl RemoteConnectionsPage {
             }
         }));
 
-        let remote_client = local.clone();
         self._watch_tasks.push(cx.spawn(async move |this, cx| {
             loop {
+                let remote_client = match this.update(cx, |page, cx| page.local_client(cx)) {
+                    Ok(Some(client)) => client,
+                    Ok(None) => {
+                        let delay = match this.update(cx, |page, cx| {
+                            page.model
+                                .remotes_watch
+                                .disconnected("Local engine is not connected");
+                            cx.notify();
+                            page.model.remotes_watch.retry_delay()
+                        }) {
+                            Ok(delay) => delay,
+                            Err(_) => return,
+                        };
+                        cx.background_executor().timer(delay).await;
+                        continue;
+                    }
+                    Err(_) => return,
+                };
                 let mut disconnected = match remote_client
                     .subscribe(methods::WATCH_REMOTES, serde_json::Value::Null)
                     .await
@@ -789,7 +1245,7 @@ impl RemoteConnectionsPage {
                     Ok(mut stream) => {
                         if this
                             .update(cx, |page, cx| {
-                                page.model.remotes_watch.connected();
+                                page.model.remotes_watch.subscribed();
                                 cx.notify();
                             })
                             .is_err()
@@ -803,6 +1259,7 @@ impl RemoteConnectionsPage {
                                     if this
                                         .update(cx, |page, cx| {
                                             page.model.remotes = remotes;
+                                            page.model.remotes_watch.valid_snapshot();
                                             cx.notify();
                                         })
                                         .is_err()
@@ -836,14 +1293,33 @@ impl RemoteConnectionsPage {
 
         self._watch_tasks.push(cx.spawn(async move |this, cx| {
             loop {
-                let mut disconnected = match local
+                let trusted_client = match this.update(cx, |page, cx| page.local_client(cx)) {
+                    Ok(Some(client)) => client,
+                    Ok(None) => {
+                        let delay = match this.update(cx, |page, cx| {
+                            page.trusted_loaded = false;
+                            page.model
+                                .trusted_watch
+                                .disconnected("Local engine is not connected");
+                            cx.notify();
+                            page.model.trusted_watch.retry_delay()
+                        }) {
+                            Ok(delay) => delay,
+                            Err(_) => return,
+                        };
+                        cx.background_executor().timer(delay).await;
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                let mut disconnected = match trusted_client
                     .subscribe(methods::WATCH_TRUSTED_CLIENTS, serde_json::Value::Null)
                     .await
                 {
                     Ok(mut stream) => {
                         if this
                             .update(cx, |page, cx| {
-                                page.model.trusted_watch.connected();
+                                page.model.trusted_watch.subscribed();
                                 cx.notify();
                             })
                             .is_err()
@@ -864,6 +1340,7 @@ impl RemoteConnectionsPage {
                                                 });
                                             page.model.trusted_clients = clients;
                                             page.trusted_loaded = true;
+                                            page.model.trusted_watch.valid_snapshot();
                                             if paired {
                                                 page.model.pairing_succeeded();
                                             }
@@ -1009,12 +1486,31 @@ impl RemoteConnectionsPage {
         cx.notify();
     }
 
+    fn copy_pairing_secret(&mut self, cx: &mut Context<Self>) {
+        let Some(pairing) = self.model.pairing.as_ref() else {
+            return;
+        };
+        let secret = pairing.copy_secret();
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(secret.expose().to_owned()));
+        self.pairing_copy_status = true;
+        self.pairing_copy_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(10))
+                .await;
+            this.update(cx, |page, cx| {
+                page.pairing_copy_status = false;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     fn add_remote(&mut self, cx: &mut Context<Self>) {
         let endpoint = self.endpoint_input.read(cx).text().to_string();
         let name = self.name_input.read(cx).text().trim().to_string();
-        let decoded = decode_pairing_secret(self.secret_input.read(cx).text());
-        self.secret_input
-            .update(cx, |input, cx| input.set_text("", cx));
+        let decoded = decode_pairing_secret(self.secret_input.read(cx).secret());
+        self.secret_input.update(cx, SecretInput::clear);
         let secret = match decoded {
             Ok(secret) => secret,
             Err(error) => {
@@ -1023,31 +1519,16 @@ impl RemoteConnectionsPage {
                 return;
             }
         };
-        let Some(local) = self.local_client(cx) else {
-            self.model.add_error = Some("Local engine is not connected".into());
-            return;
-        };
-        let Some(data_dir) = self.app.read(cx).data_dir.clone() else {
-            self.model.add_error = Some("Installation identity is unavailable".into());
-            cx.notify();
-            return;
-        };
-        let generation = self.model.begin_add_request();
-        self.add_task = Some(cx.spawn(async move |this, cx| {
-            let result = pair_and_persist_remote(
-                &InstallationRemotePairer,
-                local.as_ref(),
-                &data_dir,
-                AddRemoteRequest::from_secret(endpoint, name, secret),
-            )
-            .await
-            .map(|_| ());
-            this.update(cx, |page, cx| {
-                page.model.finish_add_request(generation, result);
-                cx.notify();
-            })
-            .ok();
-        }));
+        let request = AddRemoteRequest::from_secret(endpoint, name, secret);
+        let result = self
+            .app
+            .update(cx, |state, cx| state.start_remote_add(request, cx));
+        if let Err(error) = result {
+            self.model.add_error = Some(error);
+        } else {
+            self.model.add_error = None;
+            self.model.partial_success = None;
+        }
         cx.notify();
     }
 
@@ -1205,6 +1686,14 @@ fn field(input: Entity<ComposerInput>) -> AnyElement {
         .into_any_element()
 }
 
+fn secret_field(input: Entity<SecretInput>) -> AnyElement {
+    div()
+        .min_w(px(120.0))
+        .flex_1()
+        .child(crate::popover::dialog_field(input.into_any_element()))
+        .into_any_element()
+}
+
 fn action_button(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div {
     crate::settings::widgets::ghost_action(theme)
         .hover(crate::settings::widgets::ghost_hover)
@@ -1218,7 +1707,16 @@ impl gpui::Render for RemoteConnectionsPage {
         self.model.expire_pairing(Utc::now());
         let listener_label = listener_status_label(&self.model.listener);
         let listener_enabled = self.model.lan.enabled;
-        let pairing = self.model.pairing.as_ref();
+        let pairing_display = self.model.pairing.as_ref().map(|pairing| {
+            (
+                SharedString::from(pairing.masked_text()),
+                SharedString::from(format!(
+                    "Expires {}",
+                    pairing.expires_at.format("%H:%M:%S UTC")
+                )),
+            )
+        });
+        let has_pairing = pairing_display.is_some();
         let remote_rows: Vec<AnyElement> = self
             .model
             .remotes
@@ -1361,23 +1859,20 @@ impl gpui::Render for RemoteConnectionsPage {
         let pairing_details = div()
             .flex_1()
             .child(widgets::row_title(&theme, "Pair a trusted client"))
-            .when_some(pairing, |el, pairing| {
+            .when_some(pairing_display, |el, (masked, expiry)| {
                 el.child(
                     div()
                         .mt(px(6.0))
                         .font_family(theme.font_mono.clone())
                         .text_size(px(15.0))
-                        .child(SharedString::from(pairing.expose().to_string())),
+                        .child(masked),
                 )
                 .child(
                     div()
                         .mt(px(3.0))
                         .text_size(px(11.5))
                         .text_color(theme.text_muted)
-                        .child(SharedString::from(format!(
-                            "Expires {}",
-                            pairing.expires_at.format("%H:%M:%S UTC")
-                        ))),
+                        .child(expiry),
                 )
             });
         let pairing_card = widgets::section_card(&theme)
@@ -1390,12 +1885,31 @@ impl gpui::Render for RemoteConnectionsPage {
             .child(
                 widgets::card_row(&theme, false)
                     .child(pairing_details)
+                    .when(has_pairing, |el| {
+                        el.child(
+                            action_button(&theme, "Copy secret")
+                                .id("copy-pairing-secret")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.copy_pairing_secret(cx)
+                                })),
+                        )
+                    })
                     .child(
                         action_button(&theme, "Begin pairing")
                             .id("begin-pairing")
                             .on_click(cx.listener(|this, _, _, cx| this.begin_pairing(cx))),
                     ),
-            );
+            )
+            .when(self.pairing_copy_status, |el| {
+                el.child(
+                    div()
+                        .px(px(20.0))
+                        .pb(px(14.0))
+                        .text_size(px(11.5))
+                        .text_color(theme.text_muted)
+                        .child("Copied. The value remains in the system clipboard until it is replaced."),
+                )
+            });
 
         let add_card = widgets::section_card(&theme)
             .child(
@@ -1405,7 +1919,7 @@ impl gpui::Render for RemoteConnectionsPage {
             )
             .child(
                 widgets::card_row(&theme, false)
-                    .child(field(self.secret_input.clone()))
+                    .child(secret_field(self.secret_input.clone()))
                     .child(
                         action_button(&theme, "Add remote")
                             .id("add-remote")
@@ -1479,7 +1993,12 @@ impl gpui::Render for RemoteConnectionsPage {
                 )
                 .into_any_element()
         });
-        let partial_success = self.model.partial_success.clone().map(|partial| {
+        let app_add_state = self.app.read(cx).remote_add_state();
+        let partial_success = match &app_add_state {
+            RemoteAddState::PartialSuccess(partial) => Some(partial.clone()),
+            _ => self.model.partial_success.clone(),
+        }
+        .map(|partial| {
             let endpoint = format!(
                 "{}:{}",
                 partial.remote.endpoint.host, partial.remote.endpoint.port
@@ -1493,7 +2012,10 @@ impl gpui::Render for RemoteConnectionsPage {
             ))
             .into_any_element()
         });
-        let operation_error = self.operations.first_error();
+        let operation_error = self.operations.first_error().or(match app_add_state {
+            RemoteAddState::Failed(error) => Some(error),
+            _ => None,
+        });
         let trusted_watch_error =
             watch_status_message("Trusted clients", &self.model.trusted_watch);
         let remotes_watch_error =
@@ -1705,6 +2227,27 @@ mod tests {
         }
     }
 
+    struct GatedFailingLocalAdmin {
+        calls: Arc<Mutex<usize>>,
+        put_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release_put: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LocalRemoteAdmin for GatedFailingLocalAdmin {
+        async fn put_remote(&self, _entry: &comet_proto::RemoteEntry) -> Result<(), String> {
+            *self.calls.lock().unwrap() += 1;
+            if let Some(started) = self.put_started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            let release = self.release_put.lock().unwrap().take();
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+            Err("disk full".into())
+        }
+    }
+
     #[tokio::test]
     async fn pair_success_then_store_failure_is_partial_success_without_retry() {
         let calls = Arc::new(Mutex::new(0));
@@ -1778,6 +2321,17 @@ mod tests {
                 now + TimeDelta::seconds(1),
             )),
         );
+        let pairing = state.pairing.as_ref().unwrap();
+        assert!(!pairing.masked_text().contains("TOPS-ECRE-T123"));
+        assert!(
+            pairing
+                .masked_text()
+                .chars()
+                .all(|character| character == '•' || character == '-')
+        );
+        let copied = pairing.copy_secret();
+        assert_eq!(copied.expose(), "TOPS-ECRE-T123");
+        assert!(!format!("{copied:?}").contains("TOPS-ECRE-T123"));
         assert!(!format!("{:?}", state).contains("TOPS-ECRE-T123"));
         state.expire_pairing(now + TimeDelta::seconds(2));
         assert!(state.pairing.is_none());
@@ -1808,6 +2362,18 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_names_have_distinct_revoke_confirmations() {
+        let mut first = DestructiveConfirmation::default();
+        first.request_revoke(comet_proto::ServerId::new("sha256:first"), "Laptop");
+        let mut second = DestructiveConfirmation::default();
+        second.request_revoke(comet_proto::ServerId::new("sha256:second"), "Laptop");
+
+        assert_ne!(first.copy(), second.copy());
+        assert!(first.copy().unwrap().contains("sha256:first"));
+        assert!(second.copy().unwrap().contains("sha256:second"));
+    }
+
+    #[test]
     fn independent_operations_do_not_cancel_or_overwrite_each_other() {
         let mut operations = OperationTracker::default();
         let rename = OperationKey::rename(comet_proto::ServerId::new("sha256:a"));
@@ -1830,15 +2396,24 @@ mod tests {
     }
 
     #[test]
-    fn watch_close_marks_stale_and_recovery_resets_bounded_backoff() {
+    fn watch_close_and_malformed_cycles_accumulate_until_a_valid_snapshot() {
         let mut watch = WatchRecovery::default();
-        watch.connected();
+        watch.subscribed();
         watch.disconnected("stream closed");
         assert!(matches!(watch.health, WatchHealth::Stale { .. }));
         assert_eq!(watch.retry_delay(), std::time::Duration::from_millis(250));
+        watch.subscribed();
         watch.disconnected("closed again");
         assert_eq!(watch.retry_delay(), std::time::Duration::from_millis(500));
-        watch.connected();
+        watch.disconnected("malformed");
+        assert_eq!(watch.retry_delay(), std::time::Duration::from_millis(1000));
+        watch.disconnected("closed");
+        assert_eq!(watch.retry_delay(), std::time::Duration::from_millis(2000));
+        watch.disconnected("closed");
+        assert_eq!(watch.retry_delay(), std::time::Duration::from_millis(4000));
+        watch.disconnected("closed");
+        assert_eq!(watch.retry_delay(), std::time::Duration::from_millis(4000));
+        watch.valid_snapshot();
         assert_eq!(watch.health, WatchHealth::Live);
         assert_eq!(watch.retry_delay(), std::time::Duration::from_millis(250));
     }
@@ -1846,7 +2421,7 @@ mod tests {
     #[test]
     fn stale_watch_message_explains_cached_state_and_recovery() {
         let mut watch = WatchRecovery::default();
-        watch.connected();
+        watch.valid_snapshot();
         watch.disconnected("connection reset");
 
         let message =
@@ -1855,5 +2430,59 @@ mod tests {
         assert!(message.contains("reconnecting"));
         assert!(message.contains("connection reset"));
         assert!(watch_status_message("Remote registry", &WatchRecovery::default()).is_none());
+    }
+
+    #[test]
+    fn secret_input_model_masks_redacts_copies_and_clears() {
+        let mut secret = SecretInputModel::default();
+        secret.replace(0..0, "TOPS-ECRE-T123");
+        assert!(!secret.masked_text().contains("TOPS-ECRE-T123"));
+        assert!(secret.masked_text().chars().all(|c| c == '•' || c == '-'));
+        assert!(!format!("{secret:?}").contains("TOPS-ECRE-T123"));
+
+        let copied = secret.copy_secret();
+        assert_eq!(copied.expose(), "TOPS-ECRE-T123");
+        assert!(!format!("{copied:?}").contains("TOPS-ECRE-T123"));
+        assert!(!secret.copy_status().unwrap().contains("TOPS-ECRE-T123"));
+        assert!(secret.copy_status().unwrap().contains("system clipboard"));
+        secret.expire_copy_status();
+        assert!(secret.copy_status().is_none());
+
+        secret.clear();
+        assert!(secret.is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_remote_add_blocks_second_submit_and_retains_partial_after_observer_drop() {
+        let coordinator = RemoteAddCoordinator::default();
+        assert!(coordinator.begin());
+        assert!(!coordinator.begin(), "only one add may be in flight");
+        let page_observer = coordinator.clone();
+        let calls = Arc::new(Mutex::new(0));
+        let (put_started_tx, put_started_rx) = tokio::sync::oneshot::channel();
+        let (release_put_tx, release_put_rx) = tokio::sync::oneshot::channel();
+        let operation = tokio::spawn(run_remote_add_operation(
+            coordinator.clone(),
+            FakePairer,
+            GatedFailingLocalAdmin {
+                calls: calls.clone(),
+                put_started: Mutex::new(Some(put_started_tx)),
+                release_put: Mutex::new(Some(release_put_rx)),
+            },
+            std::path::PathBuf::from("private-installation-dir"),
+            AddRemoteRequest::new("buildbox.local:27655", "Build box", [1; 16]),
+        ));
+        put_started_rx
+            .await
+            .expect("pairing succeeded and PUT_REMOTE began");
+        drop(page_observer);
+        let _ = release_put_tx.send(());
+        operation.await.unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), 1);
+        let RemoteAddState::PartialSuccess(partial) = coordinator.state() else {
+            panic!("partial recovery must remain retrievable");
+        };
+        assert!(partial.recovery.contains("revoke this device"));
     }
 }
