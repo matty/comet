@@ -69,7 +69,7 @@ fn fixture_remote_service(device_id: &str) -> Fixture {
     registry.register(Arc::new(EmptyHarness));
     let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
         .expect("engine assembles");
-    let service = RemoteRpcService::new(core.rpc_service(), device_id);
+    let service = RemoteRpcService::new(core.host_relay_rpc_service(), device_id);
     Fixture {
         _dir: dir,
         core,
@@ -372,6 +372,33 @@ async fn revoking_a_trusted_client_closes_its_active_connection() {
     })
     .await
     .expect("revocation closes the active connection");
+    fixture.core.shutdown().await;
+}
+
+#[tokio::test]
+async fn host_relay_service_denies_local_administration() {
+    let fixture = EngineFixture::start().await;
+    let relay = fixture.core.host_relay_rpc_service();
+    for method in [
+        methods::WATCH_REMOTES,
+        methods::PUT_REMOTE,
+        methods::REMOVE_REMOTE,
+        methods::REPORT_REMOTE_STATUS,
+        methods::GET_LAN_SETTINGS,
+        methods::SET_LAN_SETTINGS,
+        methods::BEGIN_PAIRING,
+        methods::WATCH_TRUSTED_CLIENTS,
+        methods::REVOKE_TRUSTED_CLIENT,
+    ] {
+        let error = rpc_error(relay.handle(method, serde_json::json!({})).await);
+        assert!(matches!(error, RpcError::UnknownMethod(ref denied) if denied == method));
+    }
+    assert!(
+        relay
+            .handle(methods::LOCAL_DEVICE, serde_json::json!({}))
+            .await
+            .is_ok()
+    );
     fixture.core.shutdown().await;
 }
 

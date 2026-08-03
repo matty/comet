@@ -328,15 +328,15 @@ pub struct EngineRpc {
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<comet_update::Updater>,
-    remote_admin: Option<RemoteAdmin>,
+    server_hello: Option<ServerHello>,
     mutation_authority: comet_sync::DocMutationGate,
 }
 
 #[derive(Clone)]
-struct RemoteAdmin {
+pub struct LocalRpcService {
+    inner: std::sync::Arc<EngineRpc>,
     store: RemoteConfigStore,
     lan: LanServerHandle,
-    hello: ServerHello,
 }
 
 impl EngineRpc {
@@ -366,7 +366,7 @@ impl EngineRpc {
             auth: None,
             links: None,
             updater: None,
-            remote_admin: None,
+            server_hello: None,
             mutation_authority,
         }
     }
@@ -389,20 +389,15 @@ impl EngineRpc {
         self
     }
 
-    pub fn with_remote_admin(
-        mut self,
-        store: RemoteConfigStore,
-        lan: LanServerHandle,
-        hello: ServerHello,
-    ) -> Self {
-        self.remote_admin = Some(RemoteAdmin { store, lan, hello });
+    pub fn with_server_hello(mut self, hello: ServerHello) -> Self {
+        self.server_hello = Some(hello);
         self
     }
 
-    fn remote_admin(&self) -> Result<&RemoteAdmin, RpcError> {
-        self.remote_admin
+    fn server_hello(&self) -> Result<&ServerHello, RpcError> {
+        self.server_hello
             .as_ref()
-            .ok_or_else(|| RpcError::Failed("remote administration unavailable".into()))
+            .ok_or_else(|| RpcError::Failed("server identity unavailable".into()))
     }
 
     #[cfg(test)]
@@ -774,6 +769,112 @@ where
     .boxed()
 }
 
+impl LocalRpcService {
+    pub fn new(
+        inner: std::sync::Arc<EngineRpc>,
+        store: RemoteConfigStore,
+        lan: LanServerHandle,
+    ) -> Self {
+        Self { inner, store, lan }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_mutation_authority(&self, other: &Self) -> bool {
+        self.inner.shares_mutation_authority(&other.inner)
+    }
+}
+
+#[async_trait]
+impl RpcService for LocalRpcService {
+    async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        match method {
+            methods::WATCH_REMOTES => {
+                Ok(RpcReply::Stream(watch_stream(self.store.watch_remotes())))
+            }
+            methods::PUT_REMOTE => {
+                let remote: RemoteEntry = parse_params(params)?;
+                self.store
+                    .put_remote(remote)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::REMOVE_REMOTE => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    server_id: ServerId,
+                }
+                let p: P = parse_params(params)?;
+                let removed = self
+                    .store
+                    .remove_remote(&p.server_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "removed": removed }))
+            }
+            methods::REPORT_REMOTE_STATUS => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    server_id: ServerId,
+                    last_state: RemoteConnectionState,
+                    protocol_version: u32,
+                    last_connected_at: Option<chrono::DateTime<chrono::Utc>>,
+                }
+                let p: P = parse_params(params)?;
+                let found = self
+                    .store
+                    .update_remote_status(
+                        &p.server_id,
+                        p.last_state,
+                        p.protocol_version,
+                        p.last_connected_at,
+                    )
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                if !found {
+                    return Err(RpcError::Failed("remote registry row not found".into()));
+                }
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::GET_LAN_SETTINGS => RpcReply::value(&serde_json::json!({
+                "settings": self.store.lan_settings(),
+                "status": self.lan.status(),
+            })),
+            methods::SET_LAN_SETTINGS => {
+                let settings: LanSettings = parse_params(params)?;
+                self.lan
+                    .apply_settings(settings)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::BEGIN_PAIRING => {
+                let (secret, expires_at) = self.lan.begin_pairing();
+                RpcReply::value(&serde_json::json!({
+                    "secret": secret,
+                    "expiresAt": expires_at,
+                }))
+            }
+            methods::WATCH_TRUSTED_CLIENTS => Ok(RpcReply::Stream(watch_stream(
+                self.store.watch_trusted_clients(),
+            ))),
+            methods::REVOKE_TRUSTED_CLIENT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    server_id: ServerId,
+                }
+                let p: P = parse_params(params)?;
+                let removed = self
+                    .store
+                    .revoke_client(&p.server_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                self.lan.close_client(&p.server_id);
+                RpcReply::value(&serde_json::json!({ "removed": removed }))
+            }
+            _ => self.inner.handle(method, params).await,
+        }
+    }
+}
+
 /// Authentication-only RPC surface used while the headed app is waiting for a
 /// production WorkOS session. Keeping this independent from [`EngineRpc`] lets
 /// the UI show its sign-in and organization gates before identity-scoped Loro
@@ -892,100 +993,7 @@ impl RpcService for EngineRpc {
                 .await;
         }
         match method {
-            methods::SERVER_HELLO => RpcReply::value(&self.remote_admin()?.hello),
-            methods::WATCH_REMOTES => Ok(RpcReply::Stream(watch_stream(
-                self.remote_admin()?.store.watch_remotes(),
-            ))),
-            methods::PUT_REMOTE => {
-                let remote: RemoteEntry = parse_params(params)?;
-                self.remote_admin()?
-                    .store
-                    .put_remote(remote)
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "ok": true }))
-            }
-            methods::REMOVE_REMOTE => {
-                #[derive(Deserialize)]
-                #[serde(rename_all = "camelCase")]
-                struct P {
-                    server_id: ServerId,
-                }
-                let p: P = parse_params(params)?;
-                let removed = self
-                    .remote_admin()?
-                    .store
-                    .remove_remote(&p.server_id)
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "removed": removed }))
-            }
-            methods::REPORT_REMOTE_STATUS => {
-                #[derive(Deserialize)]
-                #[serde(rename_all = "camelCase")]
-                struct P {
-                    server_id: ServerId,
-                    last_state: RemoteConnectionState,
-                    protocol_version: u32,
-                    last_connected_at: Option<chrono::DateTime<chrono::Utc>>,
-                }
-                let p: P = parse_params(params)?;
-                let mut remote = self
-                    .remote_admin()?
-                    .store
-                    .watch_remotes()
-                    .borrow()
-                    .iter()
-                    .find(|remote| remote.server_id == p.server_id)
-                    .cloned()
-                    .ok_or_else(|| RpcError::Failed("remote registry row not found".into()))?;
-                remote.last_state = p.last_state;
-                remote.protocol_version = p.protocol_version;
-                remote.last_connected_at = p.last_connected_at;
-                self.remote_admin()?
-                    .store
-                    .put_remote(remote)
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "ok": true }))
-            }
-            methods::GET_LAN_SETTINGS => {
-                let admin = self.remote_admin()?;
-                RpcReply::value(&serde_json::json!({
-                    "settings": admin.store.lan_settings(),
-                    "status": admin.lan.status(),
-                }))
-            }
-            methods::SET_LAN_SETTINGS => {
-                let settings: LanSettings = parse_params(params)?;
-                self.remote_admin()?
-                    .lan
-                    .apply_settings(settings)
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "ok": true }))
-            }
-            methods::BEGIN_PAIRING => {
-                let (secret, expires_at) = self.remote_admin()?.lan.begin_pairing();
-                RpcReply::value(&serde_json::json!({
-                    "secret": secret,
-                    "expiresAt": expires_at,
-                }))
-            }
-            methods::WATCH_TRUSTED_CLIENTS => Ok(RpcReply::Stream(watch_stream(
-                self.remote_admin()?.store.watch_trusted_clients(),
-            ))),
-            methods::REVOKE_TRUSTED_CLIENT => {
-                #[derive(Deserialize)]
-                #[serde(rename_all = "camelCase")]
-                struct P {
-                    server_id: ServerId,
-                }
-                let p: P = parse_params(params)?;
-                let admin = self.remote_admin()?;
-                let removed = admin
-                    .store
-                    .revoke_client(&p.server_id)
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
-                admin.lan.close_client(&p.server_id);
-                RpcReply::value(&serde_json::json!({ "removed": removed }))
-            }
+            methods::SERVER_HELLO => RpcReply::value(self.server_hello()?),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;

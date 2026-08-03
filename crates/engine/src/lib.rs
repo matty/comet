@@ -44,7 +44,7 @@ pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use remote_config::RemoteConfigStore;
 pub use remote_rpc::{RemoteRpcService, remote_method_allowed};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
-pub use rpc::EngineRpc;
+pub use rpc::{EngineRpc, LocalRpcService};
 pub use run_journal::{JournalError, RunJournal};
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
@@ -119,6 +119,7 @@ pub struct EngineCore {
     remote_config: RemoteConfigStore,
     lan_server: LanServerHandle,
     rpc: std::sync::OnceLock<Arc<EngineRpc>>,
+    local_rpc: std::sync::OnceLock<Arc<LocalRpcService>>,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
     /// Peer link cache for `targetDeviceId` routing (attached when edge+auth are ready).
@@ -234,6 +235,7 @@ impl EngineCore {
             remote_config,
             lan_server,
             rpc: std::sync::OnceLock::new(),
+            local_rpc: std::sync::OnceLock::new(),
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
@@ -331,12 +333,11 @@ impl EngineCore {
                 }
             }
         });
-        comet_rpc::HostRelay::spawn(config, self.rpc_service(), on_nudge)
+        comet_rpc::HostRelay::spawn(config, self.host_relay_rpc_service(), on_nudge)
     }
 
-    pub fn rpc_service(&self) -> Arc<EngineRpc> {
-        let rpc = self
-            .rpc
+    fn engine_rpc_service(&self) -> Arc<EngineRpc> {
+        self.rpc
             .get_or_init(|| {
                 let hello = comet_proto::ServerHello {
                     protocol_version: comet_proto::PROTOCOL_VERSION,
@@ -357,11 +358,7 @@ impl EngineCore {
                     self.agent_accounts.clone(),
                 )
                 .with_auth(self.auth())
-                .with_remote_admin(
-                    self.remote_config.clone(),
-                    self.lan_server.clone(),
-                    hello,
-                );
+                .with_server_hello(hello);
                 if let Some(links) = self.links() {
                     rpc = rpc.with_links(links);
                 }
@@ -370,13 +367,31 @@ impl EngineCore {
                 }
                 Arc::new(rpc)
             })
+            .clone()
+    }
+
+    pub fn host_relay_rpc_service(&self) -> Arc<EngineRpc> {
+        self.engine_rpc_service()
+    }
+
+    pub fn rpc_service(&self) -> Arc<LocalRpcService> {
+        let engine_rpc = self.engine_rpc_service();
+        let local = self
+            .local_rpc
+            .get_or_init(|| {
+                Arc::new(LocalRpcService::new(
+                    engine_rpc.clone(),
+                    self.remote_config.clone(),
+                    self.lan_server.clone(),
+                ))
+            })
             .clone();
         self.lan_server
             .ensure_started(Arc::new(RemoteRpcService::new(
-                rpc.clone(),
+                engine_rpc,
                 self.device_id.clone(),
             )));
-        rpc
+        local
     }
 
     pub fn remote_config(&self) -> &RemoteConfigStore {

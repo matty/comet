@@ -123,11 +123,23 @@ pub struct LanServer;
 
 impl LanServer {
     pub fn spawn(handle: LanServerHandle, service: Arc<dyn RpcService>) {
+        let tls =
+            TlsIdentity::from_device_identity(&handle.identity).map_err(|error| error.to_string());
+        Self::spawn_resolved(handle, service, tls);
+    }
+
+    fn spawn_resolved(
+        handle: LanServerHandle,
+        service: Arc<dyn RpcService>,
+        tls: Result<TlsIdentity, String>,
+    ) {
         tokio::spawn(async move {
-            let tls = match TlsIdentity::from_device_identity(&handle.identity) {
+            let tls = match tls {
                 Ok(tls) => tls,
                 Err(error) => {
                     tracing::error!(error = %error, "LAN identity unavailable");
+                    handle.status_tx.send_replace(LanServerStatus::Disabled);
+                    handle.stopped_tx.send_replace(true);
                     return;
                 }
             };
@@ -268,5 +280,51 @@ async fn supervise(
     if let Some(task) = accept_task {
         task.abort();
         let _ = tokio::time::timeout(CLEANUP_TIMEOUT, task).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use comet_rpc::{RpcError, RpcReply};
+
+    use super::*;
+
+    struct DenyAll;
+
+    #[async_trait]
+    impl RpcService for DenyAll {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            Err(RpcError::UnknownMethod(method.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_identity_failure_publishes_stopped_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RemoteConfigStore::open(dir.path()).unwrap();
+        let identity = DeviceIdentity::load_or_create(dir.path()).unwrap();
+        let handle = LanServerHandle::new(store, identity);
+        handle.stopped_tx.send_replace(false);
+        let mut stopped = handle.stopped_tx.subscribe();
+
+        LanServer::spawn_resolved(handle.clone(), Arc::new(DenyAll), Err("invalid TLS".into()));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let is_stopped = *stopped.borrow_and_update();
+                if is_stopped {
+                    break;
+                }
+                stopped.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("failed startup publishes completion");
+        assert_eq!(handle.status(), LanServerStatus::Disabled);
     }
 }

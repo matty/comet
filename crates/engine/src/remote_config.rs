@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use comet_proto::{LanSettings, RemoteEntry, ServerId, TrustedClient};
+use chrono::{DateTime, Utc};
+use comet_proto::{LanSettings, RemoteConnectionState, RemoteEntry, ServerId, TrustedClient};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
@@ -160,6 +161,34 @@ impl RemoteConfigStore {
             },
         )?;
         Ok(removed)
+    }
+
+    pub fn update_remote_status(
+        &self,
+        server_id: &ServerId,
+        last_state: RemoteConnectionState,
+        protocol_version: u32,
+        last_connected_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, EngineError> {
+        let mut found = false;
+        self.update(
+            |document| {
+                if let Some(remote) = document
+                    .remotes
+                    .iter_mut()
+                    .find(|remote| &remote.server_id == server_id)
+                {
+                    remote.last_state = last_state;
+                    remote.protocol_version = protocol_version;
+                    remote.last_connected_at = last_connected_at;
+                    found = true;
+                }
+            },
+            |document| {
+                self.inner.remotes_tx.send_replace(document.remotes.clone());
+            },
+        )?;
+        Ok(found)
     }
 
     pub fn trust_client(&self, client: TrustedClient) -> Result<(), EngineError> {
@@ -365,6 +394,71 @@ mod tests {
         let persisted = RemoteConfigStore::open(dir.path()).unwrap().lan_settings();
         assert_eq!(*settings.borrow(), store.lan_settings());
         assert_eq!(persisted, store.lan_settings());
+    }
+
+    #[test]
+    fn concurrent_metadata_edit_survives_named_status_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RemoteConfigStore::open(dir.path()).unwrap();
+        let original = RemoteEntry {
+            server_id: ServerId::new("sha256:remote"),
+            endpoint: RemoteEndpoint::parse("old.local:27655").unwrap(),
+            name: "Old name".into(),
+            pinned_spki_sha256: "old-pin".into(),
+            protocol_version: 0,
+            last_state: RemoteConnectionState::Connecting,
+            created_at: Utc::now(),
+            last_connected_at: None,
+        };
+        store.put_remote(original.clone()).unwrap();
+
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let metadata_done = Arc::new(std::sync::Barrier::new(2));
+        let editor = {
+            let store = store.clone();
+            let start = start.clone();
+            let metadata_done = metadata_done.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                let mut edited = original;
+                edited.endpoint = RemoteEndpoint::parse("new.local:30000").unwrap();
+                edited.name = "New name".into();
+                edited.pinned_spki_sha256 = "new-pin".into();
+                store.put_remote(edited).unwrap();
+                metadata_done.wait();
+            })
+        };
+        let reporter = {
+            let store = store.clone();
+            let start = start.clone();
+            let metadata_done = metadata_done.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                metadata_done.wait();
+                store
+                    .update_remote_status(
+                        &ServerId::new("sha256:remote"),
+                        RemoteConnectionState::Online,
+                        PROTOCOL_VERSION,
+                        Some(Utc::now()),
+                    )
+                    .unwrap();
+            })
+        };
+        start.wait();
+        editor.join().unwrap();
+        reporter.join().unwrap();
+
+        let row = store.watch_remotes().borrow()[0].clone();
+        assert_eq!(
+            row.endpoint,
+            RemoteEndpoint::parse("new.local:30000").unwrap()
+        );
+        assert_eq!(row.name, "New name");
+        assert_eq!(row.pinned_spki_sha256, "new-pin");
+        assert_eq!(row.last_state, RemoteConnectionState::Online);
+        assert_eq!(row.protocol_version, PROTOCOL_VERSION);
+        assert!(row.last_connected_at.is_some());
     }
 
     #[cfg(unix)]
