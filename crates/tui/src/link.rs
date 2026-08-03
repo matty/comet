@@ -9,7 +9,7 @@ use std::time::Duration;
 use comet_client::{Federation, FederationCommand, FederationEvent};
 use comet_doc::SessionMessageEntry;
 use comet_proto::view::ConnectionStatus;
-use comet_proto::{AuthState, ServerId, ServerRef};
+use comet_proto::{ServerId, ServerRef};
 use comet_rpc::methods;
 use tokio::sync::mpsc;
 
@@ -20,8 +20,6 @@ pub enum Update {
     Connection(ConnectionStatus),
     Attached(Attachment),
     Federation(FederationEvent),
-    // Retained for the existing auth gate until the cloud-removal task.
-    Auth(Box<AuthState>),
     Devices(Vec<comet_proto::Device>),
     Spaces(Vec<comet_proto::Space>),
     Chats(Vec<comet_proto::Chat>),

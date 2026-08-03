@@ -95,41 +95,6 @@ impl WorkspaceDoc {
             .map_err(|e| DocError::Schema(e.to_string()))
     }
 
-    /// Rebuild this workspace index with only rows owned by `device_id`.
-    pub fn owned_by(&self, device_id: &str) -> Result<Self, DocError> {
-        let state = self.read_all()?;
-        let owned_spaces: std::collections::HashSet<_> = state
-            .spaces
-            .iter()
-            .filter(|space| space.device_id == device_id)
-            .map(|space| space.id.clone())
-            .collect();
-        let out = WorkspaceDoc::new();
-        for device in state.devices.iter().filter(|row| row.id == device_id) {
-            out.upsert_device(device)?;
-        }
-        for space in state.spaces.iter().filter(|row| row.device_id == device_id) {
-            out.upsert_space(space)?;
-        }
-        for chat in state.chats.iter().filter(|row| {
-            row.device_id == device_id
-                && row
-                    .space_id
-                    .as_ref()
-                    .is_none_or(|id| owned_spaces.contains(id))
-        }) {
-            out.upsert_chat(chat)?;
-        }
-        for session in state
-            .sessions
-            .iter()
-            .filter(|row| row.device_id == device_id)
-        {
-            out.upsert_session(session)?;
-        }
-        Ok(out)
-    }
-
     // ── devices ─────────────────────────────────────────────────────────────
 
     /// Upsert a full device row (writer discipline: callers pass their OWN device).
@@ -1090,46 +1055,5 @@ mod tests {
         ));
         // Everything else on the row survived the conflict.
         assert_eq!(a.chat("chat-1").unwrap().unwrap().device_id, "dev-a");
-    }
-
-    #[test]
-    fn owned_projection_keeps_only_rows_locally_authoritative() {
-        let ws = WorkspaceDoc::new();
-        ws.upsert_device(&device("dev-a", "laptop")).unwrap();
-        ws.upsert_device(&device("dev-b", "desktop")).unwrap();
-        ws.upsert_space(&space("space-a", "dev-a", "/tmp/a"))
-            .unwrap();
-        ws.upsert_space(&space("space-b", "dev-b", "/tmp/b"))
-            .unwrap();
-
-        let mut owned_chat = chat("chat-a", "dev-a");
-        owned_chat.space_id = Some("space-a".into());
-        ws.upsert_chat(&owned_chat).unwrap();
-        ws.upsert_chat(&chat("chat-no-space", "dev-a")).unwrap();
-        let mut cross_device_space = chat("chat-cross-space", "dev-a");
-        cross_device_space.space_id = Some("space-b".into());
-        ws.upsert_chat(&cross_device_space).unwrap();
-        ws.upsert_chat(&chat("chat-b", "dev-b")).unwrap();
-        ws.upsert_session(&session("chat-a", "dev-a", SessionStatus::Idle))
-            .unwrap();
-        ws.upsert_session(&session("chat-b", "dev-b", SessionStatus::Working))
-            .unwrap();
-
-        let state = ws.owned_by("dev-a").unwrap().read_all().unwrap();
-
-        assert_eq!(state.devices, vec![device("dev-a", "laptop")]);
-        assert_eq!(state.spaces, vec![space("space-a", "dev-a", "/tmp/a")]);
-        assert_eq!(
-            state
-                .chats
-                .iter()
-                .map(|row| row.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["chat-a", "chat-no-space"]
-        );
-        assert_eq!(
-            state.sessions,
-            vec![session("chat-a", "dev-a", SessionStatus::Idle)]
-        );
     }
 }

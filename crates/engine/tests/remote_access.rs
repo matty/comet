@@ -69,7 +69,7 @@ fn fixture_remote_service(device_id: &str) -> Fixture {
     registry.register(Arc::new(EmptyHarness));
     let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
         .expect("engine assembles");
-    let service = RemoteRpcService::new(core.host_relay_rpc_service(), device_id);
+    let service = RemoteRpcService::new(core.remote_rpc_service(), device_id);
     Fixture {
         _dir: dir,
         core,
@@ -429,7 +429,7 @@ async fn revoking_a_trusted_client_closes_its_active_connection() {
 #[tokio::test]
 async fn host_relay_service_denies_local_administration() {
     let fixture = EngineFixture::start().await;
-    let relay = fixture.core.host_relay_rpc_service();
+    let relay = fixture.core.remote_rpc_service();
     for method in [
         methods::WATCH_REMOTES,
         methods::PUT_REMOTE,

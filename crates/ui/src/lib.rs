@@ -80,15 +80,8 @@ pub struct UiConfig {
     pub data_dir: PathBuf,
     /// Localhost IPC port: connect if an engine daemon is listening, embed if not.
     pub ipc_port: u16,
-    /// Edge base URL for the embedded engine.
-    pub edge_url: String,
-    /// Edge bearer; `None` runs offline.
-    pub edge_token: Option<String>,
-    /// Workspace org override for explicit dev-mode runs.
-    pub org_id: Option<String>,
-    /// WorkOS client id; `Some` makes the embedded headed engine require a
-    /// production session before opening identity-scoped stores.
-    pub workos_client_id: Option<String>,
+    /// Release metadata/download origin; independent from runtime authority.
+    pub releases_url: String,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
 }
@@ -98,10 +91,7 @@ impl UiConfig {
         EngineBootConfig {
             data_dir: self.data_dir.clone(),
             ipc_port: self.ipc_port,
-            edge_url: self.edge_url.clone(),
-            edge_token: self.edge_token.clone(),
-            org_id: self.org_id.clone(),
-            workos_client_id: self.workos_client_id.clone(),
+            releases_url: self.releases_url.clone(),
             default_harness: self.default_harness,
         }
     }

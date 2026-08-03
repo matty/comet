@@ -775,7 +775,7 @@ mod tests {
     fn equal_device_paths_on_different_servers_have_separate_cache_entries() {
         let b = comet_proto::ServerId::new("server-b");
         let c = comet_proto::ServerId::new("server-c");
-        let path = "/same/device/path.png";
+        let path = "/same/host/path.png";
 
         assert!(begin_load(&b, "device-1", path));
         assert!(begin_load(&c, "device-1", path));
@@ -795,7 +795,7 @@ mod tests {
     fn offline_server_cache_is_purged_and_late_results_are_ignored() {
         let b = comet_proto::ServerId::new("purge-server-b");
         let c = comet_proto::ServerId::new("preserve-server-c");
-        let path = "/same/device/purge.png";
+        let path = "/same/host/purge.png";
         mark_server_attachments_online(&b);
         mark_server_attachments_online(&c);
         assert!(begin_load(&b, "device-1", path));

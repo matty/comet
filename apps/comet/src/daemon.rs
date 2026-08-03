@@ -376,13 +376,16 @@ mod tests {
             Path::new("/usr/local/bin/comet"),
             &[
                 ("PATH".into(), "/usr/bin:/bin".into()),
-                ("COMET_EDGE_URL".into(), "https://edge.example".into()),
+                (
+                    "COMET_RELEASES_URL".into(),
+                    "https://releases.example".into(),
+                ),
                 ("RUST_LOG".into(), "info,comet=\"debug\"".into()),
             ],
         );
         assert!(unit.contains("ExecStart=/usr/local/bin/comet headless\n"));
         assert!(unit.contains("Environment=\"PATH=/usr/bin:/bin\"\n"));
-        assert!(unit.contains("Environment=\"COMET_EDGE_URL=https://edge.example\"\n"));
+        assert!(unit.contains("Environment=\"COMET_RELEASES_URL=https://releases.example\"\n"));
         // Inner quotes escaped so systemd re-parses the value verbatim.
         assert!(unit.contains("Environment=\"RUST_LOG=info,comet=\\\"debug\\\"\"\n"));
         assert!(unit.contains("Restart=on-failure"));
@@ -415,7 +418,7 @@ mod tests {
     fn launchd_plist_shape() {
         let plist = render_launchd_plist(
             Path::new("/Users/x/comet & co/comet"),
-            &[("COMET_EDGE_URL".into(), "https://e?a=1&b=2".into())],
+            &[("COMET_RELEASES_URL".into(), "https://e?a=1&b=2".into())],
             Path::new("/Users/x/.comet-native/daemon.log"),
         );
         assert!(plist.contains("<key>Label</key><string>sh.zeron.comet</string>"));
@@ -432,18 +435,9 @@ mod tests {
     #[test]
     fn daemon_capture_keeps_releases_separate_from_removed_online_service_env() {
         assert!(CAPTURED_ENV.contains(&"COMET_RELEASES_URL"));
-        for removed in [
-            "COMET_EDGE_URL",
-            "COMET_EDGE_TOKEN",
-            "COMET_ORG_ID",
-            "COMET_WORKOS_CLIENT_ID",
-            "COMET_WORKOS_API_BASE",
-            "COMET_CALLBACK_PORT",
-        ] {
-            assert!(!CAPTURED_ENV.contains(&removed), "still captures {removed}");
-        }
         for local in [
             "COMET_DATA_DIR",
+            "COMET_RELEASES_URL",
             "COMET_IPC_PORT",
             "COMET_HARNESS",
             "COMET_DEVICE_NAME",

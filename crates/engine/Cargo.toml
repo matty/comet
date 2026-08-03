@@ -37,4 +37,3 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio-tungstenite.workspace = true

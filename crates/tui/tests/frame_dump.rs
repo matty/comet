@@ -9,9 +9,7 @@ use chrono::Utc;
 use comet_client::{FederationEvent, ServerState};
 use comet_doc::{MessagePart, MessageRole, SessionMessageEntry};
 use comet_proto::view::ConnectionStatus;
-use comet_proto::{
-    AuthState, Chat, RemoteConnectionState, ServerId, ServerRef, Space, UserProfile,
-};
+use comet_proto::{Chat, RemoteConnectionState, ServerId, ServerRef, Space};
 use comet_tui::app::App;
 use comet_tui::link::Update;
 use comet_tui::render;
@@ -74,14 +72,6 @@ fn entry(id: &str, role: MessageRole, parts: Vec<MessagePart>) -> SessionMessage
 fn scene() -> App {
     let mut app = App::with_theme(Theme::dark());
     app.apply(Update::Connection(ConnectionStatus::Ready));
-    app.apply(Update::Auth(Box::new(AuthState::SignedIn {
-        user: UserProfile {
-            id: "u1".into(),
-            email: "imisterlee@gmail.com".into(),
-            name: Some("Wing Lee".into()),
-        },
-        org_id: Some("org".into()),
-    })));
     let server_id = ServerId::new("sha256:local");
     let mut local = ServerState::empty(
         server_id.clone(),

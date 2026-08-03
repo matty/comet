@@ -79,25 +79,6 @@ impl DocsStore {
         Ok(())
     }
 
-    /// All persisted snapshot document ids, in stable lexical order.
-    pub fn snapshot_ids(&self) -> Result<Vec<String>, StoreError> {
-        let conn = self.conn();
-        let mut statement = conn.prepare("SELECT doc_id FROM snapshots ORDER BY doc_id")?;
-        let rows = statement.query_map([], |row| row.get(0))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
-    }
-
-    /// Copy every persisted snapshot into another store.
-    pub fn copy_snapshots_to(&self, destination: &DocsStore) -> Result<(), StoreError> {
-        for doc_id in self.snapshot_ids()? {
-            if let Some(bytes) = self.load_snapshot(&doc_id)? {
-                destination.save_snapshot(&doc_id, &bytes)?;
-            }
-        }
-        Ok(())
-    }
-
     /// Delete the snapshot row for `doc_id` (destructive schema breaks: the
     /// legacy `workspace` row is dropped on open). Missing rows are a no-op.
     pub fn delete_snapshot(&self, doc_id: &str) -> Result<(), StoreError> {
@@ -229,32 +210,5 @@ mod tests {
         );
         assert!(store.is_processed("cmd-1").unwrap());
         assert!(!store.mark_processed("cmd-1").unwrap());
-    }
-
-    #[test]
-    fn snapshot_copy_enumerates_and_copies_only_snapshots() {
-        let source_dir = tempfile::tempdir().unwrap();
-        let destination_dir = tempfile::tempdir().unwrap();
-        let source = DocsStore::open(source_dir.path()).unwrap();
-        let destination = DocsStore::open(destination_dir.path()).unwrap();
-        source.save_snapshot("workspace2", b"workspace").unwrap();
-        source.save_snapshot("chat-1", b"chat").unwrap();
-        source.mark_processed("command-1").unwrap();
-
-        assert_eq!(
-            source.snapshot_ids().unwrap(),
-            vec!["chat-1".to_string(), "workspace2".to_string()]
-        );
-        source.copy_snapshots_to(&destination).unwrap();
-
-        assert_eq!(
-            destination.load_snapshot("workspace2").unwrap().as_deref(),
-            Some(&b"workspace"[..])
-        );
-        assert_eq!(
-            destination.load_snapshot("chat-1").unwrap().as_deref(),
-            Some(&b"chat"[..])
-        );
-        assert!(!destination.is_processed("command-1").unwrap());
     }
 }
