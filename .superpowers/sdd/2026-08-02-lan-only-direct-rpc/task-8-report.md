@@ -128,3 +128,30 @@ Concurrent starts across server/space contexts are allowed. Each start is keyed 
 - `cargo clippy -p comet-client -p comet-tui --tests -- -D warnings`: passed.
 - `cargo fmt --all -- --check` and `git diff --check`: passed.
 - `python scripts/tui-smoke.py` was attempted and remains blocked before TUI startup on Windows: `scripts/tui_capture.py` imports unavailable Unix-only `fcntl`.
+
+## Fix Round 4
+
+Commit: `47ba59ed53d1e2706586c5d3a0da45d01f0a9ddd`
+
+### RED evidence
+
+- `removing_a_drafts_server_cannot_migrate_it_to_a_duplicate_fallback_space` failed because removing B left B's draft alive after selecting fallback C; duplicate raw `space-x` identity made a later send eligible to create on the wrong authority.
+- `removal_purges_only_the_removed_servers_qualified_transients` failed first on stale B entries in `last_visited`, then its qualified-hit-anchor subcase failed because pre-removal hit indices survived a row rebuild.
+- `readded_server_ignores_replies_from_its_removed_incarnation` failed because B's pending start survived removal; after re-adding B, the old start failure cleared the new incarnation's identically named selected chat.
+
+### GREEN changes
+
+- Added one `purge_server_state(server_id)` lifecycle boundary, invoked before the removed server is dropped or a fallback bucket is selected.
+- Drafts now record their owning `ServerId`, and provisional pending chats use `ServerRef`, removing the remaining raw transient identities.
+- The purge removes only matching `last_visited` keys or values, optimistic echoes, pending starts/chats, draft/ref context, model context, context menus/prompts/pickers, selected space/chat, transcript/doc cache, composer state, and stale hit-map anchors. Unrelated C draft/composer, history, echoes, and pending starts remain intact.
+- A selected removed server is unsubscribed while it is still authoritative with `WatchTranscript(None)`; no draft can migrate into a fallback server with duplicate raw space/chat IDs.
+- Federated send failures without a still-owned optimistic echo are ignored. Together with request UUID checks for starts/models/refs, late replies from a removed B incarnation cannot mutate a newly re-added B.
+
+### Verification
+
+- Focused removal/re-add regressions: 3 passed, 0 failed, including the hit-anchor RED/GREEN subcase.
+- `cargo test -p comet-client`: 26 unit + 23 integration tests passed.
+- `cargo test -p comet-tui`: 87 unit/adapter + 82 render tests passed; one intentional frame dump ignored; doc tests passed.
+- `cargo clippy -p comet-client -p comet-tui --tests -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- `python scripts/tui-smoke.py` was attempted and remains blocked before TUI startup on Windows by the Unix-only `fcntl` import.
