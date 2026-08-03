@@ -362,6 +362,158 @@ fn action_open_on_duplicate_remote_space_navigates_inside_that_server() {
 }
 
 #[test]
+fn duplicate_space_activation_with_duplicate_target_chat_retargets_qualified_chat() {
+    let mut app = App::with_theme(Theme::dark());
+    for (id, name) in [("b", "Build box"), ("c", "Test box")] {
+        let mut state = ServerState::empty(server(id), name, RemoteConnectionState::Online);
+        state.spaces.push(space("s1", "/dev/comet"));
+        state.chats.push(chat("chat-1", name));
+        app.apply(FederationEvent::ServerChanged(state));
+    }
+    app.select_server_chat(ServerRef::new(server("b"), "chat-1"));
+    app.cursor = app
+        .rows
+        .iter()
+        .position(|row| {
+            matches!(row,
+        comet_tui::app::Row::Space { server_id: Some(id), .. } if id == &server("c"))
+        })
+        .unwrap();
+    let effects = app.act(Action::Open);
+    assert_eq!(
+        app.selected_chat_ref(),
+        Some(ServerRef::new(server("c"), "chat-1"))
+    );
+    assert!(effects.iter().any(|effect| matches!(effect,
+        comet_tui::link::Command::WatchTranscript(Some(chat)) if chat == &ServerRef::new(server("c"), "chat-1"))));
+}
+
+#[test]
+fn removing_the_selected_server_unsubscribes_its_transcript() {
+    let mut app = App::with_theme(Theme::dark());
+    for (id, name) in [("b", "Build box"), ("c", "Test box")] {
+        let mut state = ServerState::empty(server(id), name, RemoteConnectionState::Online);
+        state.spaces.push(space("s1", "/dev/comet"));
+        state.chats.push(chat("chat-1", name));
+        app.apply(FederationEvent::ServerChanged(state));
+    }
+    app.select_server_chat(ServerRef::new(server("b"), "chat-1"));
+    let effects = app.apply(FederationEvent::ServerRemoved(server("b")));
+    assert_eq!(app.selected_chat_ref(), None);
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, comet_tui::link::Command::WatchTranscript(None)))
+    );
+}
+
+fn begin_remote_start(app: &mut App, server_id: &str, prompt: &str) -> (ServerRef, String, String) {
+    app.activate_server_space(ServerRef::new(server(server_id), "s1"));
+    app.act(Action::NewSession);
+    app.composer.set_text(prompt);
+    app.act(Action::Send)
+        .into_iter()
+        .find_map(|effect| match effect {
+            comet_tui::link::Command::StartSession(start) => Some((
+                ServerRef::new(start.server_id.clone(), start.chat_id.clone()),
+                start.request_id.clone(),
+                start.message_id.clone(),
+            )),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn current_start_failure_unsubscribes_and_removes_provisional_context() {
+    let mut app = App::with_theme(Theme::dark());
+    let mut state = ServerState::empty(server("b"), "Build box", RemoteConnectionState::Online);
+    state.spaces.push(space("s1", "/dev/comet"));
+    app.apply(FederationEvent::ServerChanged(state));
+    let (chat, request_id, message_id) = begin_remote_start(&mut app, "b", "rollback me");
+    let effects = app.apply(Update::FederatedStartFailed {
+        chat: chat.clone(),
+        request_id,
+        message_id,
+        error: "failed".into(),
+    });
+    assert_eq!(app.selected_chat_ref(), None);
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, comet_tui::link::Command::WatchTranscript(None)))
+    );
+    assert_eq!(app.composer.text(), "rollback me");
+}
+
+#[test]
+fn stale_send_failure_cleans_origin_without_overwriting_current_composer() {
+    let mut app = App::with_theme(Theme::dark());
+    for (id, name) in [("b", "Build box"), ("c", "Test box")] {
+        let mut state = ServerState::empty(server(id), name, RemoteConnectionState::Online);
+        state.spaces.push(space("s1", "/dev/comet"));
+        state.chats.push(chat("chat-1", name));
+        app.apply(FederationEvent::ServerChanged(state));
+    }
+    app.select_server_chat(ServerRef::new(server("b"), "chat-1"));
+    app.composer.set_text("B optimistic");
+    let (message_id, _) = app
+        .act(Action::Send)
+        .into_iter()
+        .find_map(|effect| match effect {
+            comet_tui::link::Command::Send {
+                message_id,
+                chat_id,
+                ..
+            } => Some((message_id, chat_id)),
+            _ => None,
+        })
+        .unwrap();
+    app.select_server_chat(ServerRef::new(server("c"), "chat-1"));
+    app.composer.set_text("");
+    app.apply(Update::FederatedSendFailed {
+        chat: ServerRef::new(server("b"), "chat-1"),
+        message_id,
+        error: "failed".into(),
+    });
+    assert!(app.composer.is_empty());
+    app.select_server_chat(ServerRef::new(server("b"), "chat-1"));
+    assert!(!joined(&snapshot(&mut app, 100, 30)).contains("B optimistic"));
+}
+
+#[test]
+fn reordered_concurrent_starts_clean_only_their_own_request() {
+    let mut app = App::with_theme(Theme::dark());
+    for (id, name) in [("b", "Build box"), ("c", "Test box")] {
+        let mut state = ServerState::empty(server(id), name, RemoteConnectionState::Online);
+        state.spaces.push(space("s1", "/dev/comet"));
+        app.apply(FederationEvent::ServerChanged(state));
+    }
+    let (b_chat, b_request, b_message) = begin_remote_start(&mut app, "b", "old start");
+    let (c_chat, c_request, _c_message) = begin_remote_start(&mut app, "c", "new start");
+    app.apply(Update::FederatedStartFailed {
+        chat: b_chat.clone(),
+        request_id: b_request,
+        message_id: b_message,
+        error: "old failed".into(),
+    });
+    assert_eq!(app.selected_chat_ref(), Some(c_chat.clone()));
+    assert_eq!(
+        app.notice.as_ref().map(|notice| notice.text.as_str()),
+        Some("Couldn't start session: old failed")
+    );
+    app.select_server_chat(b_chat);
+    assert!(!joined(&snapshot(&mut app, 100, 30)).contains("old start"));
+    app.select_server_chat(c_chat.clone());
+    app.apply(Update::FederatedSessionStarted {
+        chat: c_chat.clone(),
+        request_id: c_request,
+    });
+    assert_eq!(app.selected_chat_ref(), Some(c_chat));
+    assert!(app.composer.is_empty());
+}
+
+#[test]
 fn delayed_session_started_cannot_replace_another_server_draft() {
     let mut app = App::with_theme(Theme::dark());
     for (id, name) in [("b", "Build box"), ("c", "Test box")] {

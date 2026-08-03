@@ -367,6 +367,13 @@ pub struct Notice {
     pub until: std::time::Instant,
 }
 
+#[derive(Debug, Clone)]
+struct PendingStart {
+    chat: ServerRef,
+    message_id: String,
+    space: ServerRef,
+}
+
 pub struct App {
     pub focus: Focus,
     pub connection: ConnectionStatus,
@@ -414,7 +421,10 @@ pub struct App {
     /// A chat this viewport just created, with when it asked. Exempt from
     /// selection healing until its row arrives — see `heal_chat_selection`.
     pending_chat: Option<(String, std::time::Instant)>,
-    pending_start: Option<(String, ServerRef)>,
+    /// Starts may be in flight on several servers at once. The request UUID is
+    /// the identity; the qualified chat/space keep late replies scoped to the
+    /// provisional context that originated them.
+    pending_starts: HashMap<String, PendingStart>,
     /// Optimistic user messages per chat, shown until the doc frame with the
     /// same id arrives. Client-minted ids make the dedupe exact.
     echoes: HashMap<ServerRef, Vec<SessionMessageEntry>>,
@@ -476,7 +486,7 @@ impl App {
             started: std::time::Instant::now(),
             quit: false,
             pending_chat: None,
-            pending_start: None,
+            pending_starts: HashMap::new(),
             echoes: HashMap::new(),
             doc_entries: Vec::new(),
             transcript_width: 0,
@@ -594,19 +604,18 @@ impl App {
             }
             Update::FederatedSessionStarted { chat, request_id } => {
                 let expected = self
-                    .pending_start
-                    .as_ref()
-                    .is_some_and(|(id, target)| id == &request_id && target == &chat);
-                if !expected || self.selected_chat_ref().as_ref() != Some(&chat) {
-                    if expected {
-                        self.pending_start = None;
-                    }
+                    .pending_starts
+                    .get(&request_id)
+                    .is_some_and(|pending| pending.chat == chat);
+                if !expected {
                     return Vec::new();
                 }
-                self.pending_start = None;
-                self.draft = None;
-                self.pending_chat = Some((chat.local_id.clone(), std::time::Instant::now()));
-                self.rebuild_rows();
+                let pending = self.pending_starts.remove(&request_id).unwrap();
+                debug_assert_eq!(pending.space.server_id, chat.server_id);
+                if self.selected_chat_ref().as_ref() == Some(&chat) {
+                    self.pending_chat = Some((chat.local_id.clone(), std::time::Instant::now()));
+                    self.rebuild_rows();
+                }
                 Vec::new()
             }
             Update::Models(models) => {
@@ -667,7 +676,8 @@ impl App {
                 error,
             } => {
                 let restored = self.drop_echo_ref(&chat, &message_id);
-                if let Some(text) = restored
+                if self.selected_chat_ref().as_ref() == Some(&chat)
+                    && let Some(text) = restored
                     && self.composer.is_empty()
                 {
                     self.composer.set_text(text);
@@ -705,19 +715,20 @@ impl App {
                 message_id,
                 error,
             } => {
-                let expected = self
-                    .pending_start
-                    .as_ref()
-                    .is_some_and(|(id, target)| id == &request_id && target == &chat);
+                let expected = self.pending_starts.get(&request_id).is_some_and(|pending| {
+                    pending.chat == chat && pending.message_id == message_id
+                });
                 if !expected {
                     return Vec::new();
                 }
-                self.pending_start = None;
-                let restored = self.drop_echo_ref(&chat, &message_id);
+                let pending = self.pending_starts.remove(&request_id).unwrap();
+                debug_assert_eq!(pending.space.server_id, chat.server_id);
+                let restored = self.drop_echo_ref(&chat, &pending.message_id);
+                let mut effects = Vec::new();
                 if self.selected_chat_ref().as_ref() == Some(&chat) {
                     self.pending_chat = None;
-                    self.selected_chat = None;
-                    self.transcript.retarget(None);
+                    self.doc_entries.clear();
+                    effects = self.select_chat(None);
                     if let Some(text) = restored
                         && self.composer.is_empty()
                     {
@@ -727,7 +738,7 @@ impl App {
                 self.transcript_stale = true;
                 self.notify(format!("Couldn't start session: {error}"));
                 self.rebuild_rows();
-                Vec::new()
+                effects
             }
         }
     }
@@ -755,8 +766,18 @@ impl App {
                 if self.selected_server_id.as_ref() == Some(&id) {
                     self.selected_server_id = self.servers.servers().next().map(|s| s.id.clone());
                     self.selected_space = None;
-                    self.selected_chat = None;
-                    self.load_selected_server();
+                    if self.selected_server_id.is_some() {
+                        self.load_selected_server();
+                    } else {
+                        self.devices.clear();
+                        self.spaces.clear();
+                        self.chats.clear();
+                        self.sessions.clear();
+                    }
+                    self.doc_entries.clear();
+                    let effects = self.select_chat(None);
+                    self.rebuild_rows();
+                    return effects;
                 }
                 self.rebuild_rows();
                 Vec::new()
@@ -1092,9 +1113,36 @@ impl App {
     }
 
     pub fn activate_server_space(&mut self, space: ServerRef) -> Effects {
+        let target = self.servers.server(&space.server_id).and_then(|server| {
+            self.last_visited
+                .get(&space)
+                .filter(|remembered| {
+                    server.chats.iter().any(|chat| {
+                        chat.id == remembered.local_id
+                            && !chat.archived
+                            && chat.space_id.as_deref() == Some(space.local_id.as_str())
+                    })
+                })
+                .cloned()
+                .or_else(|| {
+                    server
+                        .chats
+                        .iter()
+                        .find(|chat| {
+                            !chat.archived
+                                && chat.space_id.as_deref() == Some(space.local_id.as_str())
+                        })
+                        .map(|chat| ServerRef::new(space.server_id.clone(), chat.id.clone()))
+                })
+        });
+
+        if let Some(chat) = target {
+            return self.select_server_chat(chat);
+        }
+
         self.selected_server_id = Some(space.server_id);
         self.load_selected_server();
-        self.activate_space(space.local_id)
+        self.new_session_in(space.local_id)
     }
 
     /// Point the transcript at a chat, subscribing its doc and clearing its
@@ -1505,10 +1553,15 @@ impl App {
         // does not blink when the row arrives.
         self.draft = None;
         self.pending_chat = Some((chat_id.clone(), std::time::Instant::now()));
-        self.pending_start = Some((
+        let chat_ref = ServerRef::new(self.current_server_id(), chat_id.clone());
+        self.pending_starts.insert(
             draft.generation.clone(),
-            ServerRef::new(self.current_server_id(), chat_id.clone()),
-        ));
+            PendingStart {
+                chat: chat_ref,
+                message_id: message_id.clone(),
+                space: ServerRef::new(self.current_server_id(), space.id.clone()),
+            },
+        );
         let mut effects = self.select_chat(Some(chat_id.clone()));
         self.transcript.to_bottom();
         self.rebuild_rows();
