@@ -163,6 +163,23 @@ impl Federation {
     pub fn send(&self, command: FederationCommand) -> Result<(), FederationCommand> {
         self.commands.send(command).map_err(|error| error.0)
     }
+
+    pub async fn request(
+        &self,
+        server_id: ServerId,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, comet_rpc::RpcError> {
+        let (reply, received) = tokio::sync::oneshot::channel();
+        self.send(FederationCommand::Request {
+            server_id,
+            method,
+            params,
+            reply,
+        })
+        .map_err(|_| comet_rpc::RpcError::Closed)?;
+        received.await.unwrap_or(Err(comet_rpc::RpcError::Closed))
+    }
 }
 
 impl Drop for Federation {
@@ -255,6 +272,19 @@ async fn run_manager(
                         let _ = events.send(FederationEvent::Notice { server_id, message: format!("{method} is available only on trusted local IPC") });
                     } else if let Some(supervisor) = supervisors.get(&server_id) {
                         let _ = supervisor.commands.send(SupervisorCommand::Call(method, params));
+                    }
+                }
+                Some(FederationCommand::Request { server_id, method, params, reply }) => {
+                    if server_id != local_id && is_local_admin(method) {
+                        let _ = reply.send(Err(comet_rpc::RpcError::UnknownMethod(method.into())));
+                    } else if let Some(supervisor) = supervisors.get(&server_id) {
+                        if let Err(error) = supervisor.commands.send(SupervisorCommand::Request { method, params, reply })
+                            && let SupervisorCommand::Request { reply, .. } = error.0
+                        {
+                            let _ = reply.send(Err(comet_rpc::RpcError::Closed));
+                        }
+                    } else {
+                        let _ = reply.send(Err(comet_rpc::RpcError::Failed("server is offline".into())));
                     }
                 }
                 Some(FederationCommand::WatchTranscript(chat)) => {
@@ -809,6 +839,11 @@ fn handle_offline_command(
                 server_id: server_id.clone(),
                 message: format!("cannot call {method} while server is offline"),
             });
+        }
+        SupervisorCommand::Request { method, reply, .. } => {
+            let _ = reply.send(Err(comet_rpc::RpcError::Failed(format!(
+                "cannot call {method} while server is offline"
+            ))));
         }
         SupervisorCommand::Reconnect | SupervisorCommand::Shutdown => {}
     }
@@ -1367,5 +1402,26 @@ mod tests {
             Ok(FederationEvent::Notice { message, .. }) if message == "prior owner drained"
         ));
         stop_supervisor(supervisor).await;
+    }
+
+    #[tokio::test]
+    async fn offline_reply_call_returns_an_error_to_its_caller() {
+        let server_id = ServerId::new("server-b");
+        let (events, _received) = mpsc::unbounded_channel();
+        let (reply, received) = tokio::sync::oneshot::channel();
+        let mut selected = None;
+        handle_offline_command(
+            SupervisorCommand::Request {
+                method: "ListModels",
+                params: serde_json::Value::Null,
+                reply,
+            },
+            &mut selected,
+            &server_id,
+            &events,
+        );
+        assert!(
+            matches!(received.await.unwrap(), Err(comet_rpc::RpcError::Failed(message)) if message.contains("offline"))
+        );
     }
 }

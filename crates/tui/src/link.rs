@@ -42,6 +42,11 @@ pub enum Update {
         message_id: String,
         error: String,
     },
+    FederatedSendFailed {
+        chat: ServerRef,
+        message_id: String,
+        error: String,
+    },
 }
 
 impl From<FederationEvent> for Update {
@@ -223,59 +228,311 @@ fn forward(command: Command, federation: &Federation, updates: &mpsc::UnboundedS
             });
         }
         Command::Send {
-            server_id, params, ..
+            server_id,
+            chat_id,
+            message_id,
+            params,
         } => {
-            send(FederationCommand::Call {
-                server_id,
-                method: methods::QUEUE_COMMAND,
-                params,
+            let commands = federation.command_sender();
+            let updates = updates.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    request(&commands, server_id.clone(), methods::QUEUE_COMMAND, params).await
+                {
+                    let _ = updates.send(Update::FederatedSendFailed {
+                        chat: ServerRef::new(server_id, chat_id),
+                        message_id,
+                        error: error.to_string(),
+                    });
+                }
             });
         }
-        Command::ListModels { server_id, harness } => send(FederationCommand::Call {
-            server_id,
-            method: methods::LIST_MODELS,
-            params: serde_json::json!({ "harness": harness }),
-        }),
+        Command::ListModels { server_id, harness } => {
+            let commands = federation.command_sender();
+            let updates = updates.clone();
+            tokio::spawn(async move {
+                match request(
+                    &commands,
+                    server_id,
+                    methods::LIST_MODELS,
+                    serde_json::json!({ "harness": harness }),
+                )
+                .await
+                .and_then(|value| {
+                    serde_json::from_value(value)
+                        .map_err(|error| comet_rpc::RpcError::Failed(error.to_string()))
+                }) {
+                    Ok(models) => {
+                        let _ = updates.send(Update::Models(models));
+                    }
+                    Err(error) => {
+                        let _ =
+                            updates.send(Update::Notice(format!("Couldn't list models: {error}")));
+                    }
+                }
+            });
+        }
         Command::ListRefs {
             server_id,
             repo_path,
-        } => send(FederationCommand::Call {
-            server_id,
-            method: methods::LIST_REFS,
-            params: serde_json::json!({ "repoPath": repo_path }),
-        }),
+        } => {
+            let commands = federation.command_sender();
+            let updates = updates.clone();
+            tokio::spawn(async move {
+                match request(
+                    &commands,
+                    server_id,
+                    methods::LIST_REFS,
+                    serde_json::json!({ "repoPath": repo_path }),
+                )
+                .await
+                .and_then(|value| {
+                    serde_json::from_value(value)
+                        .map_err(|error| comet_rpc::RpcError::Failed(error.to_string()))
+                }) {
+                    Ok(refs) => {
+                        let _ = updates.send(Update::Refs(refs));
+                    }
+                    Err(error) => {
+                        let _ =
+                            updates.send(Update::Notice(format!("Couldn't list refs: {error}")));
+                    }
+                }
+            });
+        }
         Command::Reconnect(server_id) => send(FederationCommand::Reconnect(server_id)),
         Command::StartSession(start) => {
-            // Calls remain explicitly server-qualified. Worktree creation that
-            // needs a returned path is left to a later richer federation RPC;
-            // current-checkout and existing-worktree drafts preserve behavior.
-            let chat = ServerRef::new(start.server_id.clone(), start.chat_id.clone());
-            let mut params = serde_json::json!({
-                "op": "createChat", "chatId": start.chat_id, "spaceId": start.space_id,
-            });
-            if let Some(config) = start.config
-                && let Some(object) = params.as_object_mut()
-            {
-                object.insert("config".into(), config);
-            }
-            send(FederationCommand::Call {
-                server_id: start.server_id.clone(),
-                method: methods::MUTATE,
-                params,
-            });
-            send(FederationCommand::Call {
-                server_id: start.server_id,
-                method: methods::QUEUE_COMMAND,
-                params: serde_json::json!({ "chatId": start.chat_id, "command": start.command }),
-            });
-            let _ = updates.send(Update::SessionStarted {
-                chat_id: chat.local_id,
+            let commands = federation.command_sender();
+            let updates = updates.clone();
+            tokio::spawn(async move {
+                if let Err(error) = start_session(&commands, &updates, *start).await {
+                    let _ =
+                        updates.send(Update::Notice(format!("Couldn't start session: {error}")));
+                }
             });
         }
         Command::Shutdown => {}
     }
 }
 
+async fn request(
+    commands: &mpsc::UnboundedSender<FederationCommand>,
+    server_id: ServerId,
+    method: &'static str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, comet_rpc::RpcError> {
+    let (reply, received) = tokio::sync::oneshot::channel();
+    commands
+        .send(FederationCommand::Request {
+            server_id,
+            method,
+            params,
+            reply,
+        })
+        .map_err(|_| comet_rpc::RpcError::Closed)?;
+    received.await.unwrap_or(Err(comet_rpc::RpcError::Closed))
+}
+
+async fn start_session(
+    commands: &mpsc::UnboundedSender<FederationCommand>,
+    updates: &mpsc::UnboundedSender<Update>,
+    start: StartSession,
+) -> Result<(), comet_rpc::RpcError> {
+    use comet_proto::view::CheckoutPlan;
+    let (mut cwd, branch) = match &start.plan {
+        CheckoutPlan::CurrentCheckout { branch } => (None, branch.clone()),
+        CheckoutPlan::ReuseWorktree { path, branch } => (Some(path.clone()), Some(branch.clone())),
+        CheckoutPlan::NewWorktree { base } => (None, base.clone()),
+    };
+    if let CheckoutPlan::NewWorktree { base: Some(base) } = &start.plan {
+        let value = request(
+            commands,
+            start.server_id.clone(),
+            methods::CREATE_WORKTREE,
+            serde_json::json!({ "repoPath": start.repo_path, "branch": base }),
+        )
+        .await?;
+        cwd = Some(
+            serde_json::from_value::<comet_proto::Worktree>(value)
+                .map_err(|error| comet_rpc::RpcError::Failed(error.to_string()))?
+                .path,
+        );
+    }
+    let mut mutate = serde_json::json!({ "op": "createChat", "chatId": start.chat_id, "spaceId": start.space_id });
+    if let Some(object) = mutate.as_object_mut() {
+        if let Some(cwd) = &cwd {
+            object.insert("cwd".into(), serde_json::Value::String(cwd.clone()));
+        }
+        if let Some(branch) = &branch {
+            object.insert("branch".into(), serde_json::Value::String(branch.clone()));
+        }
+        if let Some(config) = start.config {
+            object.insert("config".into(), config);
+        }
+    }
+    request(commands, start.server_id.clone(), methods::MUTATE, mutate).await?;
+    let mut command = start.command;
+    if let (Some(cwd), Some(request)) = (
+        &cwd,
+        command
+            .get_mut("request")
+            .and_then(|value| value.as_object_mut()),
+    ) {
+        request.insert("cwd".into(), serde_json::Value::String(cwd.clone()));
+    }
+    let queue = request(
+        commands,
+        start.server_id.clone(),
+        methods::QUEUE_COMMAND,
+        serde_json::json!({ "chatId": start.chat_id, "command": command }),
+    )
+    .await;
+    match queue {
+        Ok(_) => {
+            let _ = updates.send(Update::SessionStarted {
+                chat_id: start.chat_id,
+            });
+            Ok(())
+        }
+        Err(error) => {
+            let _ = updates.send(Update::FederatedSendFailed {
+                chat: ServerRef::new(start.server_id, start.chat_id),
+                message_id: start.message_id,
+                error: error.to_string(),
+            });
+            Err(error)
+        }
+    }
+}
+
 // Kept public through Update's transcript payload type documentation.
 #[allow(dead_code)]
 fn _typed_transcript(_: Vec<SessionMessageEntry>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use comet_proto::view::CheckoutPlan;
+    use std::sync::{Arc, Mutex};
+
+    async fn run_start(
+        plan: CheckoutPlan,
+        fail_mutate: bool,
+    ) -> (
+        Result<(), comet_rpc::RpcError>,
+        Vec<(&'static str, serde_json::Value)>,
+        Vec<Update>,
+    ) {
+        let (commands, mut receiver) = mpsc::unbounded_channel();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        tokio::spawn(async move {
+            while let Some(FederationCommand::Request {
+                method,
+                params,
+                reply,
+                ..
+            }) = receiver.recv().await
+            {
+                recorded.lock().unwrap().push((method, params));
+                let result = if method == methods::MUTATE && fail_mutate {
+                    Err(comet_rpc::RpcError::Failed("mutate failed".into()))
+                } else if method == methods::CREATE_WORKTREE {
+                    Ok(
+                        serde_json::json!({"repoPath":"/repo","path":"/worktree","branch":"feature","name":"feature","checkoutId":null}),
+                    )
+                } else {
+                    Ok(serde_json::Value::Null)
+                };
+                let _ = reply.send(result);
+            }
+        });
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        let result = start_session(
+            &commands,
+            &updates,
+            StartSession {
+                server_id: ServerId::new("server-b"),
+                chat_id: "chat-1".into(),
+                space_id: "space-1".into(),
+                repo_path: "/repo".into(),
+                plan,
+                config: None,
+                message_id: "message-1".into(),
+                command: serde_json::json!({"request":{}}),
+            },
+        )
+        .await;
+        drop(commands);
+        let mut emitted = Vec::new();
+        while let Ok(update) = update_rx.try_recv() {
+            emitted.push(update);
+        }
+        let calls = calls.lock().unwrap().clone();
+        (result, calls, emitted)
+    }
+
+    #[tokio::test]
+    async fn start_session_preserves_each_checkout_plan_and_call_order() {
+        let (_, current, _) = run_start(
+            CheckoutPlan::CurrentCheckout {
+                branch: Some("main".into()),
+            },
+            false,
+        )
+        .await;
+        assert_eq!(
+            current.iter().map(|call| call.0).collect::<Vec<_>>(),
+            [methods::MUTATE, methods::QUEUE_COMMAND]
+        );
+        assert_eq!(current[0].1["branch"], "main");
+
+        let (_, reuse, _) = run_start(
+            CheckoutPlan::ReuseWorktree {
+                path: "/existing".into(),
+                branch: "topic".into(),
+            },
+            false,
+        )
+        .await;
+        assert_eq!(
+            reuse.iter().map(|call| call.0).collect::<Vec<_>>(),
+            [methods::MUTATE, methods::QUEUE_COMMAND]
+        );
+        assert_eq!(reuse[0].1["cwd"], "/existing");
+        assert_eq!(reuse[0].1["branch"], "topic");
+
+        let (_, created, _) = run_start(
+            CheckoutPlan::NewWorktree {
+                base: Some("main".into()),
+            },
+            false,
+        )
+        .await;
+        assert_eq!(
+            created.iter().map(|call| call.0).collect::<Vec<_>>(),
+            [
+                methods::CREATE_WORKTREE,
+                methods::MUTATE,
+                methods::QUEUE_COMMAND
+            ]
+        );
+        assert_eq!(created[1].1["cwd"], "/worktree");
+    }
+
+    #[tokio::test]
+    async fn failed_create_chat_never_queues_or_emits_started() {
+        let (result, calls, updates) =
+            run_start(CheckoutPlan::CurrentCheckout { branch: None }, true).await;
+        assert!(result.is_err());
+        assert_eq!(
+            calls.iter().map(|call| call.0).collect::<Vec<_>>(),
+            [methods::MUTATE]
+        );
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update, Update::SessionStarted { .. }))
+        );
+    }
+}

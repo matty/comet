@@ -193,6 +193,100 @@ fn duplicate_remote_chat_ids_route_to_selected_server() {
     assert_eq!(app.selected_chat_ref().unwrap().server_id, server("c"));
 }
 
+#[test]
+fn duplicate_remote_chat_switch_retargets_and_clears_transcript() {
+    let mut app = App::with_theme(Theme::dark());
+    for (id, name) in [("b", "Build box"), ("c", "Test box")] {
+        let mut state = ServerState::empty(server(id), name, RemoteConnectionState::Online);
+        state.spaces.push(space("s1", "/dev/comet"));
+        state.chats.push(chat("chat-1", name));
+        app.apply(FederationEvent::ServerChanged(state));
+    }
+    app.select_server_chat(ServerRef::new(server("b"), "chat-1"));
+    app.apply(FederationEvent::Transcript {
+        chat: ServerRef::new(server("b"), "chat-1"),
+        entries: vec![entry(
+            "b1",
+            MessageRole::Assistant,
+            vec![text("t", "from B")],
+        )],
+    });
+    let effects = app.select_server_chat(ServerRef::new(server("c"), "chat-1"));
+    assert!(effects.iter().any(|effect| matches!(effect,
+        comet_tui::link::Command::WatchTranscript(Some(chat)) if chat.server_id == server("c") && chat.local_id == "chat-1")));
+    assert!(!joined(&snapshot(&mut app, 100, 30)).contains("from B"));
+}
+
+#[test]
+fn remote_cursor_action_uses_the_rows_server() {
+    let mut app = App::with_theme(Theme::dark());
+    for (id, name) in [("b", "Build box"), ("c", "Test box")] {
+        let mut state = ServerState::empty(server(id), name, RemoteConnectionState::Online);
+        state.spaces.push(space("s1", "/dev/comet"));
+        state.chats.push(chat("chat-1", name));
+        app.apply(FederationEvent::ServerChanged(state));
+    }
+    app.cursor = app
+        .rows
+        .iter()
+        .position(|row| {
+            matches!(row,
+        comet_tui::app::Row::Chat { server_id: Some(id), .. } if id == &server("c"))
+        })
+        .unwrap();
+    let effects = app.act(Action::ToggleArchive);
+    assert!(
+        matches!(&effects[0], comet_tui::link::Command::Call { server_id, .. } if server_id == &server("c"))
+    );
+}
+
+#[test]
+fn new_session_adopts_the_cursor_rows_server() {
+    let mut app = App::with_theme(Theme::dark());
+    for (id, name) in [("b", "Build box"), ("c", "Test box")] {
+        let mut state = ServerState::empty(server(id), name, RemoteConnectionState::Online);
+        state.spaces.push(space("s1", "/dev/comet"));
+        app.apply(FederationEvent::ServerChanged(state));
+    }
+    app.cursor = app
+        .rows
+        .iter()
+        .position(|row| {
+            matches!(row,
+        comet_tui::app::Row::Space { server_id: Some(id), .. } if id == &server("c"))
+        })
+        .unwrap();
+    let effects = app.act(Action::NewSession);
+    assert!(
+        matches!(&effects[0], comet_tui::link::Command::ListRefs { server_id, .. } if server_id == &server("c"))
+    );
+}
+
+#[test]
+fn duplicate_remote_row_cursor_survives_other_server_rebuild() {
+    let mut app = App::with_theme(Theme::dark());
+    for (id, name) in [("b", "Build box"), ("c", "Test box")] {
+        let mut state = ServerState::empty(server(id), name, RemoteConnectionState::Online);
+        state.spaces.push(space("s1", "/dev/comet"));
+        state.chats.push(chat("chat-1", name));
+        app.apply(FederationEvent::ServerChanged(state));
+    }
+    app.cursor = app
+        .rows
+        .iter()
+        .position(|row| {
+            matches!(row,
+        comet_tui::app::Row::Chat { server_id: Some(id), .. } if id == &server("c"))
+        })
+        .unwrap();
+    let mut b = ServerState::empty(server("b"), "Build box", RemoteConnectionState::Online);
+    b.spaces.push(space("s1", "/dev/comet"));
+    b.chats.push(chat("chat-1", "B updated"));
+    app.apply(FederationEvent::ServerChanged(b));
+    assert!(matches!(&app.rows[app.cursor],
+        comet_tui::app::Row::Chat { server_id: Some(id), .. } if id == &server("c")));
+}
+
 /// The sidebar's columns of a drawn frame.
 ///
 /// There is no divider to split on any more — the sidebar is a filled region and

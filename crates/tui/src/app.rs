@@ -144,6 +144,13 @@ pub enum Row {
 }
 
 impl Row {
+    fn identity(&self) -> Option<(Option<&ServerId>, &str, bool)> {
+        match self {
+            Row::Space { server_id, id, .. } => Some((server_id.as_ref(), id, false)),
+            Row::Chat { server_id, id, .. } => Some((server_id.as_ref(), id, true)),
+            _ => None,
+        }
+    }
     /// Row id, for the identity-preserving cursor. Decoration has none.
     pub fn id(&self) -> Option<&str> {
         match self {
@@ -333,19 +340,19 @@ pub struct MenuItem {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MenuAction {
-    RenameChat(String),
-    SetArchived(String, bool),
-    DeleteChat(String),
-    RenameSpace(String),
-    DeleteSpace(String),
+    RenameChat(ServerRef),
+    SetArchived(ServerRef, bool),
+    DeleteChat(ServerRef),
+    RenameSpace(ServerRef),
+    DeleteSpace(ServerRef),
     PickModel,
 }
 
 /// What a [`Overlay::Prompt`] does with its text on Enter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptAction {
-    RenameChat(String),
-    RenameSpace(String),
+    RenameChat(ServerRef),
+    RenameSpace(ServerRef),
 }
 
 pub struct Notice {
@@ -380,7 +387,7 @@ pub struct App {
     /// Last session opened in each space. Switching spaces returns you where
     /// you were, as the desktop app does — a space is a place you come back to,
     /// not a filter you re-navigate every time.
-    last_visited: HashMap<String, String>,
+    last_visited: HashMap<ServerRef, ServerRef>,
 
     /// Flattened sidebar rows. Rebuilt on data change, not per frame.
     pub rows: Vec<Row>,
@@ -405,7 +412,7 @@ pub struct App {
     pending_chat: Option<(String, std::time::Instant)>,
     /// Optimistic user messages per chat, shown until the doc frame with the
     /// same id arrives. Client-minted ids make the dedupe exact.
-    echoes: HashMap<String, Vec<SessionMessageEntry>>,
+    echoes: HashMap<ServerRef, Vec<SessionMessageEntry>>,
     /// The selected chat's latest doc snapshot. Held (rather than pushed
     /// straight into the transcript) so a burst of watch frames between two
     /// draws costs one layout pass instead of one per frame.
@@ -534,10 +541,11 @@ impl App {
             Update::Transcript { chat_id, entries } => {
                 // A frame for a chat we've since navigated away from is stale.
                 if self.selected_chat.as_deref() == Some(chat_id.as_str()) {
-                    if let Some(echoes) = self.echoes.get_mut(&chat_id) {
+                    let chat_ref = ServerRef::new(self.current_server_id(), chat_id.clone());
+                    if let Some(echoes) = self.echoes.get_mut(&chat_ref) {
                         echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
                         if echoes.is_empty() {
-                            self.echoes.remove(&chat_id);
+                            self.echoes.remove(&chat_ref);
                         }
                     }
                     self.doc_entries = entries;
@@ -590,6 +598,21 @@ impl App {
                 // Hand the text back rather than losing it: the echo carries the
                 // only copy once the composer was cleared.
                 let restored = self.drop_echo(&chat_id, &message_id);
+                if let Some(text) = restored
+                    && self.composer.is_empty()
+                {
+                    self.composer.set_text(text);
+                }
+                self.transcript_stale = true;
+                self.notify(format!("Couldn't send: {error}"));
+                Vec::new()
+            }
+            Update::FederatedSendFailed {
+                chat,
+                message_id,
+                error,
+            } => {
+                let restored = self.drop_echo_ref(&chat, &message_id);
                 if let Some(text) = restored
                     && self.composer.is_empty()
                 {
@@ -669,12 +692,15 @@ impl App {
 
     pub fn selected_chat_ref(&self) -> Option<ServerRef> {
         Some(ServerRef::new(
-            self.selected_server_id.clone()?,
+            self.current_server_id(),
             self.selected_chat.clone()?,
         ))
     }
 
     pub fn select_server_chat(&mut self, chat: ServerRef) -> Effects {
+        if self.selected_chat_ref().as_ref() == Some(&chat) {
+            return Vec::new();
+        }
         self.selected_server_id = Some(chat.server_id.clone());
         self.load_selected_server();
         if let Some(space_id) = self
@@ -685,6 +711,9 @@ impl App {
         {
             self.selected_space = Some(space_id);
         }
+        self.selected_chat = None;
+        self.doc_entries.clear();
+        self.transcript.retarget(None);
         let effects = self.select_chat(Some(chat.local_id));
         self.rebuild_rows();
         effects
@@ -924,15 +953,18 @@ impl App {
         self.selected_space = Some(space_id.clone());
         self.draft = None;
 
+        let space_ref = ServerRef::new(self.current_server_id(), space_id.clone());
         let remembered = self
             .last_visited
-            .get(&space_id)
+            .get(&space_ref)
             .filter(|id| {
                 self.chats.iter().any(|chat| {
-                    &&chat.id == id && !chat.archived && chat.space_id.as_deref() == Some(&space_id)
+                    chat.id == id.local_id
+                        && !chat.archived
+                        && chat.space_id.as_deref() == Some(&space_id)
                 })
             })
-            .cloned();
+            .map(|id| id.local_id.clone());
         let target = remembered.or_else(|| {
             // `chats` is recency-sorted, so the first match is the newest.
             self.chats
@@ -974,7 +1006,10 @@ impl App {
                 .find(|chat| chat.id == id)
                 .and_then(|chat| chat.space_id.clone())
         {
-            self.last_visited.insert(space, id.to_string());
+            self.last_visited.insert(
+                ServerRef::new(self.current_server_id(), space),
+                ServerRef::new(self.current_server_id(), id),
+            );
         }
         self.transcript.retarget(chat_id.clone());
         self.transcript_stale = true;
@@ -1073,6 +1108,16 @@ impl App {
     /// opens a canvas and materializes the tab on the first send, and so does
     /// this.
     fn new_session(&mut self) -> Effects {
+        let cursor_server = match self.rows.get(self.cursor) {
+            Some(Row::Space { server_id, .. }) | Some(Row::Chat { server_id, .. }) => {
+                server_id.clone()
+            }
+            _ => None,
+        };
+        if let Some(server_id) = cursor_server {
+            self.selected_server_id = Some(server_id);
+            self.load_selected_server();
+        }
         let Some(space_id) = self.space_for_new_session() else {
             self.notify(
                 "No space to create a session in — add one from the desktop app first.".into(),
@@ -1133,12 +1178,21 @@ impl App {
     }
 
     fn toggle_archive(&mut self) -> Effects {
-        let Some(Row::Chat { id, archived, .. }) = self.rows.get(self.cursor) else {
+        let Some(Row::Chat {
+            server_id,
+            id,
+            archived,
+            ..
+        }) = self.rows.get(self.cursor)
+        else {
             return Vec::new();
         };
+        let server_id = server_id
+            .clone()
+            .unwrap_or_else(|| self.current_server_id());
         let (chat_id, archived) = (id.clone(), *archived);
         vec![Command::Call {
-            server_id: self.current_server_id(),
+            server_id,
             method: methods::MUTATE,
             params: serde_json::json!({
                 "op": "setChatArchived",
@@ -1391,8 +1445,8 @@ impl App {
         let anchor = self
             .rows
             .get(self.cursor)
-            .and_then(|row| row.id())
-            .map(str::to_string);
+            .and_then(Row::identity)
+            .map(|(server, id, chat)| (server.cloned(), id.to_string(), chat));
         let now = Utc::now();
         let user_row = self.auth_user().map(|user| {
             (
@@ -1586,15 +1640,24 @@ impl App {
 
         self.rows = rows;
         self.cursor = anchor
-            .and_then(|id| {
-                self.rows
-                    .iter()
-                    .position(|row| row.id() == Some(id.as_str()))
+            .and_then(|(server, id, chat)| {
+                self.rows.iter().position(|row| {
+                    row.identity().is_some_and(
+                        |(candidate_server, candidate_id, candidate_chat)| {
+                            candidate_server == server.as_ref()
+                                && candidate_id == id
+                                && candidate_chat == chat
+                        },
+                    )
+                })
             })
             .or_else(|| {
-                self.selected_chat
-                    .as_deref()
-                    .and_then(|id| self.rows.iter().position(|row| row.id() == Some(id)))
+                self.selected_chat_ref().and_then(|selected| {
+                    self.rows.iter().position(|row| {
+                        matches!(row, Row::Chat { server_id: Some(server), id, .. }
+                        if server == &selected.server_id && id == &selected.local_id)
+                    })
+                })
             })
             .unwrap_or_else(|| self.first_selectable());
         // A rebuild can land the cursor on decoration (its row vanished); walk
@@ -1983,7 +2046,8 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn push_echo(&mut self, chat_id: &str, entry: SessionMessageEntry) {
-        let echoes = self.echoes.entry(chat_id.to_string()).or_default();
+        let key = ServerRef::new(self.current_server_id(), chat_id);
+        let echoes = self.echoes.entry(key).or_default();
         if !echoes.iter().any(|existing| existing.id == entry.id) {
             echoes.push(entry);
         }
@@ -1992,11 +2056,16 @@ impl App {
 
     /// Remove an echo, returning its text so a failed send can be restored.
     fn drop_echo(&mut self, chat_id: &str, message_id: &str) -> Option<String> {
-        let echoes = self.echoes.get_mut(chat_id)?;
+        let key = ServerRef::new(self.current_server_id(), chat_id);
+        self.drop_echo_ref(&key, message_id)
+    }
+
+    fn drop_echo_ref(&mut self, chat: &ServerRef, message_id: &str) -> Option<String> {
+        let echoes = self.echoes.get_mut(chat)?;
         let index = echoes.iter().position(|echo| echo.id == message_id)?;
         let echo = echoes.remove(index);
         if echoes.is_empty() {
-            self.echoes.remove(chat_id);
+            self.echoes.remove(chat);
         }
         echo.parts.into_iter().find_map(|part| match part {
             MessagePart::Text { text, .. } => Some(text),
@@ -2016,9 +2085,9 @@ impl App {
         self.transcript_width = width;
         self.transcript_stale = false;
         let echoes = self
-            .selected_chat
-            .as_deref()
-            .and_then(|chat_id| self.echoes.get(chat_id))
+            .selected_chat_ref()
+            .as_ref()
+            .and_then(|chat| self.echoes.get(chat))
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         self.transcript
@@ -2050,45 +2119,59 @@ impl App {
         let target = self.rows.get(self.cursor).cloned();
         let (title, items) = match target {
             Some(Row::Chat {
+                server_id,
                 id,
                 title,
                 archived,
                 ..
-            }) => (
-                title,
-                vec![
-                    MenuItem {
-                        label: "Rename…".into(),
-                        action: MenuAction::RenameChat(id.clone()),
-                        separated: false,
-                    },
-                    MenuItem {
-                        label: if archived { "Unarchive" } else { "Archive" }.into(),
-                        action: MenuAction::SetArchived(id.clone(), !archived),
-                        separated: false,
-                    },
-                    MenuItem {
-                        label: "Delete…".into(),
-                        action: MenuAction::DeleteChat(id),
-                        separated: true,
-                    },
-                ],
-            ),
-            Some(Row::Space { id, label, .. }) => (
+            }) => {
+                let target =
+                    ServerRef::new(server_id.unwrap_or_else(|| self.current_server_id()), id);
+                (
+                    title,
+                    vec![
+                        MenuItem {
+                            label: "Rename…".into(),
+                            action: MenuAction::RenameChat(target.clone()),
+                            separated: false,
+                        },
+                        MenuItem {
+                            label: if archived { "Unarchive" } else { "Archive" }.into(),
+                            action: MenuAction::SetArchived(target.clone(), !archived),
+                            separated: false,
+                        },
+                        MenuItem {
+                            label: "Delete…".into(),
+                            action: MenuAction::DeleteChat(target),
+                            separated: true,
+                        },
+                    ],
+                )
+            }
+            Some(Row::Space {
+                server_id,
+                id,
                 label,
-                vec![
-                    MenuItem {
-                        label: "Rename space".into(),
-                        action: MenuAction::RenameSpace(id.clone()),
-                        separated: false,
-                    },
-                    MenuItem {
-                        label: "Remove space…".into(),
-                        action: MenuAction::DeleteSpace(id),
-                        separated: true,
-                    },
-                ],
-            ),
+                ..
+            }) => {
+                let target =
+                    ServerRef::new(server_id.unwrap_or_else(|| self.current_server_id()), id);
+                (
+                    label,
+                    vec![
+                        MenuItem {
+                            label: "Rename space".into(),
+                            action: MenuAction::RenameSpace(target.clone()),
+                            separated: false,
+                        },
+                        MenuItem {
+                            label: "Remove space…".into(),
+                            action: MenuAction::DeleteSpace(target),
+                            separated: true,
+                        },
+                    ],
+                )
+            }
             _ => return,
         };
         self.overlay = Some(Overlay::Menu {
@@ -2260,19 +2343,19 @@ impl App {
                     return Vec::new();
                 }
                 match action {
-                    PromptAction::RenameChat(chat_id) => vec![Command::Call {
-                        server_id: self.current_server_id(),
+                    PromptAction::RenameChat(chat) => vec![Command::Call {
+                        server_id: chat.server_id,
                         method: methods::MUTATE,
                         params: serde_json::json!({
-                            "op": "renameChat", "chatId": chat_id, "title": text,
+                            "op": "renameChat", "chatId": chat.local_id, "title": text,
                         }),
                         context: "Couldn't rename the session",
                     }],
-                    PromptAction::RenameSpace(space_id) => vec![Command::Call {
-                        server_id: self.current_server_id(),
+                    PromptAction::RenameSpace(space) => vec![Command::Call {
+                        server_id: space.server_id,
                         method: methods::MUTATE,
                         params: serde_json::json!({
-                            "op": "renameSpace", "spaceId": space_id, "name": text,
+                            "op": "renameSpace", "spaceId": space.local_id, "name": text,
                         }),
                         context: "Couldn't rename the space",
                     }],
@@ -2284,11 +2367,14 @@ impl App {
 
     fn run_menu_action(&mut self, action: MenuAction) -> Effects {
         match action {
-            MenuAction::RenameChat(chat_id) => {
+            MenuAction::RenameChat(chat_ref) => {
                 let current = self
-                    .chats
+                    .servers
+                    .server(&chat_ref.server_id)
+                    .map(|server| &server.chats)
+                    .unwrap_or(&self.chats)
                     .iter()
-                    .find(|chat| chat.id == chat_id)
+                    .find(|chat| chat.id == chat_ref.local_id)
                     .and_then(|chat| chat.title.clone())
                     .unwrap_or_default();
                 let mut input = Composer::default();
@@ -2296,15 +2382,18 @@ impl App {
                 self.overlay = Some(Overlay::Prompt {
                     title: "Rename session".into(),
                     input,
-                    action: PromptAction::RenameChat(chat_id),
+                    action: PromptAction::RenameChat(chat_ref),
                 });
                 Vec::new()
             }
-            MenuAction::RenameSpace(space_id) => {
+            MenuAction::RenameSpace(space_ref) => {
                 let current = self
-                    .spaces
+                    .servers
+                    .server(&space_ref.server_id)
+                    .map(|server| &server.spaces)
+                    .unwrap_or(&self.spaces)
                     .iter()
-                    .find(|space| space.id == space_id)
+                    .find(|space| space.id == space_ref.local_id)
                     .map(|space| space.display_name().to_string())
                     .unwrap_or_default();
                 let mut input = Composer::default();
@@ -2312,28 +2401,28 @@ impl App {
                 self.overlay = Some(Overlay::Prompt {
                     title: "Rename space".into(),
                     input,
-                    action: PromptAction::RenameSpace(space_id),
+                    action: PromptAction::RenameSpace(space_ref),
                 });
                 Vec::new()
             }
-            MenuAction::SetArchived(chat_id, archived) => vec![Command::Call {
-                server_id: self.current_server_id(),
+            MenuAction::SetArchived(chat, archived) => vec![Command::Call {
+                server_id: chat.server_id,
                 method: methods::MUTATE,
                 params: serde_json::json!({
-                    "op": "setChatArchived", "chatId": chat_id, "archived": archived,
+                    "op": "setChatArchived", "chatId": chat.local_id, "archived": archived,
                 }),
                 context: "Couldn't archive the session",
             }],
-            MenuAction::DeleteChat(chat_id) => vec![Command::Call {
-                server_id: self.current_server_id(),
+            MenuAction::DeleteChat(chat) => vec![Command::Call {
+                server_id: chat.server_id,
                 method: methods::MUTATE,
-                params: serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
+                params: serde_json::json!({ "op": "deleteChat", "chatId": chat.local_id }),
                 context: "Couldn't delete the session",
             }],
-            MenuAction::DeleteSpace(space_id) => vec![Command::Call {
-                server_id: self.current_server_id(),
+            MenuAction::DeleteSpace(space) => vec![Command::Call {
+                server_id: space.server_id,
                 method: methods::MUTATE,
-                params: serde_json::json!({ "op": "deleteSpace", "spaceId": space_id }),
+                params: serde_json::json!({ "op": "deleteSpace", "spaceId": space.local_id }),
                 context: "Couldn't remove the space",
             }],
             MenuAction::PickModel => self.open_model_picker(),

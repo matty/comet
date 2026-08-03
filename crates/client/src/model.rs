@@ -60,6 +60,12 @@ pub enum FederationCommand {
         method: &'static str,
         params: serde_json::Value,
     },
+    Request {
+        server_id: ServerId,
+        method: &'static str,
+        params: serde_json::Value,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, comet_rpc::RpcError>>,
+    },
     WatchTranscript(Option<ServerRef>),
     Reconnect(ServerId),
     Shutdown,

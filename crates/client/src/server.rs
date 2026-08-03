@@ -11,6 +11,11 @@ use crate::{FederationEvent, ServerState};
 
 pub(crate) enum SupervisorCommand {
     Call(&'static str, serde_json::Value),
+    Request {
+        method: &'static str,
+        params: serde_json::Value,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, RpcError>>,
+    },
     WatchTranscript {
         chat_id: Option<String>,
         acknowledged: Option<tokio::sync::oneshot::Sender<()>>,
@@ -25,20 +30,27 @@ pub(crate) enum ConnectedExit {
 }
 
 const MAX_QUEUED_CALLS: usize = 32;
-type GenericCall = (&'static str, serde_json::Value);
-
-fn start_call(
-    client: Arc<RpcClient>,
-    call: GenericCall,
-) -> BoxFuture<'static, Result<(), RpcError>> {
-    Box::pin(async move { client.call(call.0, call.1).await.map(|_| ()) })
+struct GenericCall {
+    method: &'static str,
+    params: serde_json::Value,
+    reply: Option<tokio::sync::oneshot::Sender<Result<serde_json::Value, RpcError>>>,
 }
 
-async fn active_call_next(
-    active: &mut Option<BoxFuture<'static, Result<(), RpcError>>>,
-) -> Result<(), RpcError> {
+struct ActiveCall {
+    future: BoxFuture<'static, Result<serde_json::Value, RpcError>>,
+    reply: Option<tokio::sync::oneshot::Sender<Result<serde_json::Value, RpcError>>>,
+}
+
+fn start_call(client: Arc<RpcClient>, call: GenericCall) -> ActiveCall {
+    ActiveCall {
+        future: Box::pin(async move { client.call(call.method, call.params).await }),
+        reply: call.reply,
+    }
+}
+
+async fn active_call_next(active: &mut Option<ActiveCall>) -> Result<serde_json::Value, RpcError> {
     match active {
-        Some(call) => call.await,
+        Some(call) => call.future.as_mut().await,
         None => futures::future::pending().await,
     }
 }
@@ -105,6 +117,9 @@ async fn await_initial<T>(
                         message: format!("cannot call {method} while server is connecting"),
                     });
                 }
+                Some(SupervisorCommand::Request { method, reply, .. }) => {
+                    let _ = reply.send(Err(RpcError::Failed(format!("cannot call {method} while server is connecting"))));
+                }
             }
         }
     }
@@ -139,6 +154,9 @@ async fn replace_transcript(
                             server_id: server_id.clone(),
                             message: format!("cannot call {method} while transcript subscription is changing"),
                         });
+                    }
+                    Some(SupervisorCommand::Request { method, reply, .. }) => {
+                        let _ = reply.send(Err(RpcError::Failed(format!("cannot call {method} while transcript subscription is changing"))));
                     }
                 }
             }
@@ -204,7 +222,10 @@ pub(crate) async fn supervise_connected(
                 continue;
             }
             result = active_call_next(&mut active_call) => {
-                if let Err(error) = result {
+                let finished = active_call.take().expect("active call completed");
+                if let Some(reply) = finished.reply {
+                    let _ = reply.send(result);
+                } else if let Err(error) = result {
                     let _ = events.send(FederationEvent::Notice {
                         server_id: hello.server_id.clone(),
                         message: error.to_string(),
@@ -217,7 +238,7 @@ pub(crate) async fn supervise_connected(
             }
             command = commands.recv() => match command {
                 Some(SupervisorCommand::Call(method, params)) => {
-                    let call = (method, params);
+                    let call = GenericCall { method, params, reply: None };
                     if active_call.is_none() {
                         active_call = Some(start_call(client.clone(), call));
                     } else if queued_calls.len() < MAX_QUEUED_CALLS {
@@ -229,6 +250,19 @@ pub(crate) async fn supervise_connected(
                                 "cannot call {method}: generic RPC queue is full ({MAX_QUEUED_CALLS})"
                             ),
                         });
+                    }
+                    continue;
+                }
+                Some(SupervisorCommand::Request { method, params, reply }) => {
+                    let call = GenericCall { method, params, reply: Some(reply) };
+                    if active_call.is_none() {
+                        active_call = Some(start_call(client.clone(), call));
+                    } else if queued_calls.len() < MAX_QUEUED_CALLS {
+                        queued_calls.push_back(call);
+                    } else if let Some(reply) = call.reply {
+                        let _ = reply.send(Err(RpcError::Failed(format!(
+                            "cannot call {method}: generic RPC queue is full ({MAX_QUEUED_CALLS})"
+                        ))));
                     }
                     continue;
                 }
@@ -251,11 +285,30 @@ pub(crate) async fn supervise_connected(
                     if let Some(acknowledged) = acknowledged { let _ = acknowledged.send(()); }
                     continue;
                 }
-                Some(SupervisorCommand::Reconnect) => return Ok(ConnectedExit::Reconnect),
-                Some(SupervisorCommand::Shutdown) | None => return Ok(ConnectedExit::Shutdown),
+                Some(SupervisorCommand::Reconnect) => {
+                    cancel_calls(&mut active_call, &mut queued_calls);
+                    return Ok(ConnectedExit::Reconnect)
+                },
+                Some(SupervisorCommand::Shutdown) | None => {
+                    cancel_calls(&mut active_call, &mut queued_calls);
+                    return Ok(ConnectedExit::Shutdown)
+                },
             }
         }
         let _ = events.send(FederationEvent::ServerChanged(state.clone()));
+    }
+}
+
+fn cancel_calls(active: &mut Option<ActiveCall>, queued: &mut VecDeque<GenericCall>) {
+    if let Some(mut call) = active.take()
+        && let Some(reply) = call.reply.take()
+    {
+        let _ = reply.send(Err(RpcError::Closed));
+    }
+    for mut call in queued.drain(..) {
+        if let Some(reply) = call.reply.take() {
+            let _ = reply.send(Err(RpcError::Closed));
+        }
     }
 }
 
@@ -629,6 +682,90 @@ mod tests {
         .await
         .expect("failed generic call emitted no Notice");
         second_started.notified().await;
+        commands.send(SupervisorCommand::Shutdown).unwrap();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn reply_call_returns_the_server_value() {
+        let (task, commands, mut events, _first_started, _release_first, second_started) =
+            spawn_ordered();
+        wait_online(&mut events).await;
+        let (reply, received) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Request {
+                method: "Second",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+        second_started.notified().await;
+        assert_eq!(received.await.unwrap().unwrap(), serde_json::json!(true));
+        commands.send(SupervisorCommand::Shutdown).unwrap();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn reply_call_returns_the_server_error() {
+        let (task, commands, mut events, ..) = spawn_ordered();
+        wait_online(&mut events).await;
+        let (reply, received) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Request {
+                method: "Fail",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+        assert!(
+            matches!(received.await.unwrap(), Err(RpcError::Failed(message)) if message == "ordered failure")
+        );
+        commands.send(SupervisorCommand::Shutdown).unwrap();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_cancels_a_reply_call() {
+        let (task, commands, mut events, started, _dropped) = spawn_stalled("Block");
+        wait_online(&mut events).await;
+        let (reply, received) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Request {
+                method: "Block",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+        started.notified().await;
+        commands.send(SupervisorCommand::Reconnect).unwrap();
+        assert!(matches!(received.await.unwrap(), Err(RpcError::Closed)));
+        assert!(matches!(task.await, Ok(Ok(ConnectedExit::Reconnect))));
+    }
+
+    #[tokio::test]
+    async fn reply_call_queue_overflow_returns_an_error() {
+        let (task, commands, mut events, first_started, release_first, _) = spawn_ordered();
+        wait_online(&mut events).await;
+        commands
+            .send(SupervisorCommand::Call("First", serde_json::Value::Null))
+            .unwrap();
+        first_started.notified().await;
+        let mut receivers = Vec::new();
+        for _ in 0..=MAX_QUEUED_CALLS {
+            let (reply, received) = tokio::sync::oneshot::channel();
+            commands
+                .send(SupervisorCommand::Request {
+                    method: "Queued",
+                    params: serde_json::Value::Null,
+                    reply,
+                })
+                .unwrap();
+            receivers.push(received);
+        }
+        assert!(
+            matches!(receivers.pop().unwrap().await.unwrap(), Err(RpcError::Failed(message)) if message.contains("queue is full"))
+        );
+        release_first.notify_one();
         commands.send(SupervisorCommand::Shutdown).unwrap();
         let _ = task.await;
     }
