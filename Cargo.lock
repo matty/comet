@@ -1429,7 +1429,10 @@ dependencies = [
 name = "comet-sync"
 version = "0.1.9"
 dependencies = [
+ "comet-doc",
+ "loro",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.19",
 ]
