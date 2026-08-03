@@ -35,6 +35,7 @@ pub(crate) enum ConnectedExit {
 }
 
 const MAX_QUEUED_CALLS: usize = 32;
+const MAX_PENDING_SUBSCRIPTIONS: usize = 32;
 const SUBSCRIPTION_BUFFER: usize = 16;
 struct GenericCall {
     method: &'static str,
@@ -47,20 +48,19 @@ struct ActiveCall {
     reply: Option<tokio::sync::oneshot::Sender<Result<serde_json::Value, RpcError>>>,
 }
 
-type SubscriptionSetup = BoxFuture<
-    'static,
-    (
-        tokio::sync::oneshot::Sender<Result<FederationStream, RpcError>>,
-        Result<RpcStream, RpcError>,
-    ),
->;
+enum SubscriptionSetupResult {
+    Canceled,
+    Completed {
+        reply: tokio::sync::oneshot::Sender<Result<FederationStream, RpcError>>,
+        result: Result<RpcStream, RpcError>,
+    },
+}
+
+type SubscriptionSetup = BoxFuture<'static, SubscriptionSetupResult>;
 
 async fn subscription_setup_next(
     setups: &mut FuturesUnordered<SubscriptionSetup>,
-) -> (
-    tokio::sync::oneshot::Sender<Result<FederationStream, RpcError>>,
-    Result<RpcStream, RpcError>,
-) {
+) -> SubscriptionSetupResult {
     if setups.is_empty() {
         futures::future::pending().await
     } else {
@@ -289,7 +289,10 @@ pub(crate) async fn supervise_connected(
                     .map(|call| start_call(client.clone(), call));
                 continue;
             }
-            (reply, result) = subscription_setup_next(&mut subscription_setups) => {
+            setup = subscription_setup_next(&mut subscription_setups) => {
+                let SubscriptionSetupResult::Completed { reply, result } = setup else {
+                    continue;
+                };
                 match result {
                     Ok(mut source) => {
                         let (send, receive) = mpsc::channel(SUBSCRIPTION_BUFFER);
@@ -350,11 +353,23 @@ pub(crate) async fn supervise_connected(
                     continue;
                 }
                 Some(SupervisorCommand::Subscribe { method, params, reply }) => {
-                    let setup_client = client.clone();
-                    subscription_setups.push(Box::pin(async move {
-                        let result = setup_client.subscribe(method, params).await;
-                        (reply, result)
-                    }));
+                    if subscription_setups.len() >= MAX_PENDING_SUBSCRIPTIONS {
+                        let _ = reply.send(Err(RpcError::Failed(format!(
+                            "cannot subscribe to {method}: subscription setup queue is full ({MAX_PENDING_SUBSCRIPTIONS})"
+                        ))));
+                    } else {
+                        let setup_client = client.clone();
+                        subscription_setups.push(Box::pin(async move {
+                            let mut reply = reply;
+                            tokio::select! {
+                                biased;
+                                _ = reply.closed() => SubscriptionSetupResult::Canceled,
+                                result = setup_client.subscribe(method, params) => {
+                                    SubscriptionSetupResult::Completed { reply, result }
+                                }
+                            }
+                        }));
+                    }
                     continue;
                 }
                 Some(SupervisorCommand::WatchTranscript { chat_id, acknowledged }) => {
@@ -1082,6 +1097,75 @@ mod tests {
         })
         .await
         .expect("completed forwarders retained their source streams");
+        commands.send(SupervisorCommand::Shutdown).unwrap();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn dropping_a_pending_subscription_reply_cancels_its_transport_send() {
+        let (client, transport, mut outbound) = controllable_transport();
+        let (task, commands, mut events) = spawn_with_client(client);
+        for _ in 0..4 {
+            outbound.recv().await.expect("initial watch request");
+        }
+        wait_online(&mut events).await;
+        transport.try_send("occupied".into()).unwrap();
+
+        let (reply, received) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Subscribe {
+                method: "CanceledEvents",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+        tokio::task::yield_now().await;
+        drop(received);
+        tokio::task::yield_now().await;
+
+        assert_eq!(outbound.recv().await.as_deref(), Some("occupied"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), outbound.recv())
+                .await
+                .is_err(),
+            "canceled subscription handshake still reached the transport"
+        );
+        commands.send(SupervisorCommand::Shutdown).unwrap();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn pending_subscription_setup_overflow_returns_an_error() {
+        let (client, transport, mut outbound) = controllable_transport();
+        let (task, commands, mut events) = spawn_with_client(client);
+        for _ in 0..4 {
+            outbound.recv().await.expect("initial watch request");
+        }
+        wait_online(&mut events).await;
+        transport.try_send("occupied".into()).unwrap();
+
+        let mut receivers = Vec::new();
+        for _ in 0..=32 {
+            let (reply, received) = tokio::sync::oneshot::channel();
+            commands
+                .send(SupervisorCommand::Subscribe {
+                    method: "QueuedEvents",
+                    params: serde_json::Value::Null,
+                    reply,
+                })
+                .unwrap();
+            receivers.push(received);
+        }
+        let overflow = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            receivers.pop().unwrap(),
+        )
+        .await
+        .expect("subscription setup overflow did not reply")
+        .unwrap();
+        assert!(
+            matches!(overflow, Err(RpcError::Failed(message)) if message.contains("queue is full"))
+        );
         commands.send(SupervisorCommand::Shutdown).unwrap();
         let _ = task.await;
     }

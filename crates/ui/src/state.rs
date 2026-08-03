@@ -545,10 +545,13 @@ impl AppState {
         match event {
             FederationEvent::ServerChanged(mut server) => {
                 if server.connection != RemoteConnectionState::Online {
+                    crate::attachments::purge_server_attachments(&server.id);
                     server.devices.clear();
                     server.spaces.clear();
                     server.chats.clear();
                     server.sessions.clear();
+                } else {
+                    crate::attachments::mark_server_attachments_online(&server.id);
                 }
                 let id = server.id.clone();
                 if !self.servers.contains_key(&id) {
@@ -571,6 +574,7 @@ impl AppState {
                 }
             }
             FederationEvent::ServerRemoved(id) => {
+                crate::attachments::purge_server_attachments(&id);
                 self.purge_server(&id);
                 self.servers.remove(&id);
                 self.server_order.retain(|candidate| candidate != &id);

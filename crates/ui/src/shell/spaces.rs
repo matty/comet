@@ -79,6 +79,25 @@ mod federation_projection_tests {
         assert_eq!(groups[1].spaces.len(), 1);
         assert!(groups[2].spaces.is_empty());
     }
+
+    #[test]
+    fn grouped_chat_context_targets_preserve_the_owning_server() {
+        let local = ServerId::new("local");
+        let remote = ServerId::new("remote");
+
+        let local_target = grouped_chat_context_target(&local, "same-chat");
+        let remote_target = grouped_chat_context_target(&remote, "same-chat");
+
+        assert_eq!(
+            local_target,
+            comet_proto::ServerRef::new(local, "same-chat")
+        );
+        assert_eq!(
+            remote_target,
+            comet_proto::ServerRef::new(remote, "same-chat")
+        );
+        assert_ne!(local_target, remote_target);
+    }
 }
 
 #[derive(Clone)]
@@ -86,6 +105,13 @@ struct SidebarServerGroup {
     server: comet_client::ServerState,
     spaces: Vec<Space>,
     chats: Vec<comet_proto::Chat>,
+}
+
+fn grouped_chat_context_target(
+    server_id: &comet_proto::ServerId,
+    chat_id: &str,
+) -> comet_proto::ServerRef {
+    comet_proto::ServerRef::new(server_id.clone(), chat_id)
 }
 
 fn project_sidebar_servers(
@@ -534,6 +560,7 @@ impl Shell {
                     let selected = self.state.read(cx).selected_chat.as_ref() == Some(&owner);
                     let select_server = id.clone();
                     let select_chat = chat.id.clone();
+                    let menu_owner = grouped_chat_context_target(&id, &chat.id);
                     column = column.child(
                         div()
                             .id(SharedString::from(format!(
@@ -558,6 +585,13 @@ impl Shell {
                                 });
                                 cx.notify();
                             }))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    this.chat_menu = Some((menu_owner.clone(), event.position));
+                                    cx.notify();
+                                }),
+                            )
                             .child(
                                 icon(icons::CHAT_ROUND_LINE)
                                     .size(px(14.0))

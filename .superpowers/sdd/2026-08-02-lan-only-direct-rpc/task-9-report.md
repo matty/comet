@@ -70,3 +70,28 @@
 - `cargo test -p comet-ui --lib`: 323 passed, 0 failed.
 - `cargo clippy -p comet-client --tests -- -D warnings`: passed.
 - `cargo fmt --all -- --check` and `git diff --check`: passed.
+
+## Fix Round 2
+
+### Pending subscription setup ownership
+
+- RED used a controllable real `RpcClient` transport: after the four initial watches, a filled outbound channel stalled a generic subscription. Dropping its reply receiver still allowed the request to reach transport. The setup future now races `reply.closed()` against `RpcClient::subscribe`; caller cancellation wins biased, drops the RPC pending guard, and removes the completed canceled setup without reconnect.
+- RED queued 33 stalled setups and the last receiver timed out. Pending setup futures are now capped at 32 (the generic call queue bound); overflow replies immediately with a queue-full `RpcError`. Reconnect/shutdown still drop pending setup futures and structured shutdown joins live forwarders.
+
+### Attachment teardown
+
+- RED compilation established server online/purge/generation APIs. The cache now owns entries, per-server generations, and an offline set under one lock.
+- Offline/removal purges every decoded/loading/error entry for that `ServerId`, increments its generation, and blocks new claims and stores. Online snapshots re-enable claims, forcing refetch after reconnect/re-add.
+- Transcript loads capture the claim generation and use guarded success/error stores. A completion from before purge cannot recreate the entry even if it races entity-task cancellation. The test proves equal C keys survive both B purges, offline B cannot refetch, stale B completion is ignored, and re-online B claims a fresh load.
+
+### Qualified grouped chat menus
+
+- RED compilation established a grouped context-target constructor and proves equal local/remote raw chat IDs produce distinct `ServerRef` owners.
+- Grouped rows now expose right-click menus with the owning `ServerRef`. Shell menu, rename dialog, delete confirmation, tab-close archive, and flat-row menus retain qualified owners. Rename/archive/delete switch buckets only when the owner differs, then issue raw `chatId` params through that server's client; actions on the already-selected server do not clear its chat selection.
+
+### Fix-round verification
+
+- `cargo test -p comet-client`: 36 unit + 23 integration tests passed.
+- `cargo test -p comet-ui --lib`: 325 passed, 0 failed.
+- `cargo clippy -p comet-client --tests -- -D warnings`: passed.
+- `cargo fmt --all -- --check`, `git diff --check`, and the `targetDeviceId` audit passed (only two negative test assertions match).

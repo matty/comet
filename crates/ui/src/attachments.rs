@@ -439,14 +439,20 @@ enum CacheEntry {
     Error { attempts: u32, at: Instant },
 }
 
+#[derive(Default)]
+struct AttachmentCache {
+    entries: HashMap<(ServerId, String, String), CacheEntry>,
+    generations: HashMap<ServerId, u64>,
+    offline: std::collections::HashSet<ServerId>,
+}
+
 fn retry_delay(attempts: u32) -> Duration {
     Duration::from_millis((2_000u64 << attempts.min(3)).min(15_000))
 }
 
-fn cache() -> &'static Mutex<HashMap<(ServerId, String, String), CacheEntry>> {
-    static CACHE: OnceLock<Mutex<HashMap<(ServerId, String, String), CacheEntry>>> =
-        OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn cache() -> &'static Mutex<AttachmentCache> {
+    static CACHE: OnceLock<Mutex<AttachmentCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(AttachmentCache::default()))
 }
 
 fn key(server_id: &ServerId, device_id: &str, path: &str) -> (ServerId, String, String) {
@@ -461,6 +467,7 @@ pub fn attachment_snapshot(
     match cache()
         .lock()
         .unwrap()
+        .entries
         .get(&key(server_id, device_id, path))
     {
         Some(CacheEntry::Loaded(image)) => AttachmentSnapshot::Loaded(image.clone()),
@@ -476,7 +483,10 @@ pub fn attachment_snapshot(
 /// Errored sources hand out a retry only after their backoff has elapsed.
 pub fn begin_load(server_id: &ServerId, device_id: &str, path: &str) -> bool {
     let mut cache = cache().lock().unwrap();
-    let entry = cache.entry(key(server_id, device_id, path));
+    if cache.offline.contains(server_id) {
+        return false;
+    }
+    let entry = cache.entries.entry(key(server_id, device_id, path));
     match entry {
         std::collections::hash_map::Entry::Vacant(v) => {
             v.insert(CacheEntry::Loading { attempts: 0 });
@@ -502,26 +512,91 @@ pub fn store_loaded(
     name: SharedString,
     image: Arc<Image>,
 ) {
-    cache().lock().unwrap().insert(
+    let generation = attachment_generation(server_id);
+    store_loaded_for_generation(server_id, device_id, path, name, image, generation);
+}
+
+pub fn attachment_generation(server_id: &ServerId) -> u64 {
+    cache()
+        .lock()
+        .unwrap()
+        .generations
+        .get(server_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+pub fn mark_server_attachments_online(server_id: &ServerId) {
+    let mut cache = cache().lock().unwrap();
+    cache.offline.remove(server_id);
+    cache.generations.entry(server_id.clone()).or_default();
+}
+
+pub fn purge_server_attachments(server_id: &ServerId) {
+    let mut cache = cache().lock().unwrap();
+    cache.entries.retain(|(owner, _, _), _| owner != server_id);
+    *cache.generations.entry(server_id.clone()).or_default() += 1;
+    cache.offline.insert(server_id.clone());
+}
+
+pub fn store_loaded_for_generation(
+    server_id: &ServerId,
+    device_id: &str,
+    path: &str,
+    name: SharedString,
+    image: Arc<Image>,
+    generation: u64,
+) {
+    let mut cache = cache().lock().unwrap();
+    if cache.offline.contains(server_id)
+        || cache.generations.get(server_id).copied().unwrap_or(0) != generation
+    {
+        return;
+    }
+    cache.entries.insert(
         key(server_id, device_id, path),
         CacheEntry::Loaded(CachedAttachmentImage { name, image }),
     );
 }
 
 pub fn store_error(server_id: &ServerId, device_id: &str, path: &str) {
+    let generation = attachment_generation(server_id);
+    store_error_for_generation(server_id, device_id, path, generation);
+}
+
+pub fn store_error_for_generation(
+    server_id: &ServerId,
+    device_id: &str,
+    path: &str,
+    generation: u64,
+) {
     let mut cache = cache().lock().unwrap();
-    let attempts = match cache.get(&key(server_id, device_id, path)) {
+    if cache.offline.contains(server_id)
+        || cache.generations.get(server_id).copied().unwrap_or(0) != generation
+    {
+        return;
+    }
+    let attempts = match cache.entries.get(&key(server_id, device_id, path)) {
         Some(CacheEntry::Loading { attempts }) => attempts + 1,
         Some(CacheEntry::Error { attempts, .. }) => *attempts,
         _ => 1,
     };
-    cache.insert(
+    cache.entries.insert(
         key(server_id, device_id, path),
         CacheEntry::Error {
             attempts,
             at: Instant::now(),
         },
     );
+}
+
+#[cfg(test)]
+fn has_attachment_entry(server_id: &ServerId, device_id: &str, path: &str) -> bool {
+    cache()
+        .lock()
+        .unwrap()
+        .entries
+        .contains_key(&key(server_id, device_id, path))
 }
 
 /// Seed the cache after a successful upload (composer send path) so the just-
@@ -714,5 +789,37 @@ mod tests {
             attachment_snapshot(&c, "device-1", path),
             AttachmentSnapshot::Loading
         ));
+    }
+
+    #[test]
+    fn offline_server_cache_is_purged_and_late_results_are_ignored() {
+        let b = comet_proto::ServerId::new("purge-server-b");
+        let c = comet_proto::ServerId::new("preserve-server-c");
+        let path = "/same/device/purge.png";
+        mark_server_attachments_online(&b);
+        mark_server_attachments_online(&c);
+        assert!(begin_load(&b, "device-1", path));
+        assert!(begin_load(&c, "device-1", path));
+        let stale_generation = attachment_generation(&b);
+        store_error(&b, "device-1", path);
+        store_error(&c, "device-1", path);
+
+        purge_server_attachments(&b);
+
+        assert!(!has_attachment_entry(&b, "device-1", path));
+        assert!(has_attachment_entry(&c, "device-1", path));
+        assert!(
+            !begin_load(&b, "device-1", path),
+            "offline server refetched"
+        );
+        store_error_for_generation(&b, "device-1", path, stale_generation);
+        assert!(!has_attachment_entry(&b, "device-1", path));
+
+        mark_server_attachments_online(&b);
+        assert!(begin_load(&b, "device-1", path));
+        assert!(has_attachment_entry(&b, "device-1", path));
+        purge_server_attachments(&b);
+        assert!(!has_attachment_entry(&b, "device-1", path));
+        assert!(has_attachment_entry(&c, "device-1", path));
     }
 }

@@ -387,7 +387,7 @@ enum SplashPhase {
 
 /// The chat-row Rename dialog.
 struct RenameChatDialog {
-    chat_id: String,
+    chat_id: comet_proto::ServerRef,
     input: Entity<ComposerInput>,
     /// Focus the input on the dialog's first paint (opened without window access).
     focus_pending: bool,
@@ -434,10 +434,10 @@ pub struct Shell {
     accounts_page: Option<Entity<AccountsPage>>,
     shortcuts_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
-    chat_menu: Option<(String, Point<Pixels>)>,
+    chat_menu: Option<(comet_proto::ServerRef, Point<Pixels>)>,
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
-    delete_confirm: Option<String>,
+    delete_confirm: Option<comet_proto::ServerRef>,
     /// Space-row context menu: (space id, window position).
     space_menu: Option<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
@@ -729,11 +729,19 @@ impl Shell {
         if let Some(which) = self.debug_dialog.clone()
             && let Some(first) = state.read(cx).chats.first().map(|c| c.id.clone())
         {
+            let owner = comet_proto::ServerRef::new(
+                state
+                    .read(cx)
+                    .selected_server_id()
+                    .cloned()
+                    .expect("chat rows require a server bucket"),
+                first,
+            );
             self.debug_dialog = None;
             match which.as_str() {
-                "rename" => self.open_rename_chat(first, cx),
+                "rename" => self.open_rename_chat(owner, cx),
                 "delete" => {
-                    self.delete_confirm = Some(first);
+                    self.delete_confirm = Some(owner);
                 }
                 _ => {}
             }
@@ -1212,14 +1220,20 @@ impl Shell {
         }));
     }
 
-    fn open_rename_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+    fn open_rename_chat(&mut self, chat_id: comet_proto::ServerRef, cx: &mut Context<Self>) {
         self.chat_menu = None;
+        if self.state.read(cx).selected_server_id() != Some(&chat_id.server_id) {
+            self.state.update(cx, |state, cx| {
+                state.select_server_bucket(chat_id.server_id.clone());
+                cx.notify();
+            });
+        }
         let current = self
             .state
             .read(cx)
             .chats
             .iter()
-            .find(|c| c.id == chat_id)
+            .find(|c| c.id == chat_id.local_id)
             .and_then(|c| c.title.clone())
             .unwrap_or_default();
         let input = cx.new(|cx| ComposerInput::new("Session title", cx));
@@ -1245,29 +1259,41 @@ impl Shell {
         let title = dialog.input.read(cx).text().trim().to_string();
         if !title.is_empty() {
             self.mutate(
-                serde_json::json!({ "op": "renameChat", "chatId": dialog.chat_id, "title": title }),
+                serde_json::json!({ "op": "renameChat", "chatId": dialog.chat_id.local_id, "title": title }),
                 cx,
             );
         }
         cx.notify();
     }
 
-    fn archive_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+    fn archive_chat(&mut self, chat_id: comet_proto::ServerRef, cx: &mut Context<Self>) {
         self.chat_menu = None;
+        if self.state.read(cx).selected_server_id() != Some(&chat_id.server_id) {
+            self.state.update(cx, |state, cx| {
+                state.select_server_bucket(chat_id.server_id.clone());
+                cx.notify();
+            });
+        }
         self.mutate(
-            serde_json::json!({ "op": "setChatArchived", "chatId": chat_id, "archived": true }),
+            serde_json::json!({ "op": "setChatArchived", "chatId": chat_id.local_id, "archived": true }),
             cx,
         );
         cx.notify();
     }
 
-    fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+    fn delete_chat(&mut self, chat_id: comet_proto::ServerRef, cx: &mut Context<Self>) {
         self.delete_confirm = None;
-        if self.state.read(cx).selected_chat_id() == Some(chat_id.as_str()) {
+        if self.state.read(cx).selected_server_id() != Some(&chat_id.server_id) {
+            self.state.update(cx, |state, cx| {
+                state.select_server_bucket(chat_id.server_id.clone());
+                cx.notify();
+            });
+        }
+        if self.state.read(cx).selected_chat.as_ref() == Some(&chat_id) {
             self.state.update(cx, |s, cx| s.select_chat(None, cx));
         }
         self.mutate(
-            serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
+            serde_json::json!({ "op": "deleteChat", "chatId": chat_id.local_id }),
             cx,
         );
         cx.notify();
@@ -1800,7 +1826,14 @@ impl Shell {
         let selected_wash = crate::theme::glass_selected_bg();
         let subline = theme.text_muted.opacity(0.5);
         let select_id = id.clone();
-        let menu_id = id.clone();
+        let menu_id = comet_proto::ServerRef::new(
+            self.state
+                .read(cx)
+                .selected_server_id()
+                .cloned()
+                .expect("chat rows require a server bucket"),
+            id.clone(),
+        );
         // Hover fades over transition-colors (comet session-row.tsx) — both
         // the wash and the title brighten ride the same 150ms blend.
         let fade_key = format!("chat-row-{id}");
@@ -2428,25 +2461,34 @@ impl Shell {
             let rename_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
-            let menu = popover::popover_card(&theme)
-                .w(px(170.0))
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.chat_menu = None;
-                    cx.notify();
-                }))
-                .flex()
-                .flex_col()
-                .child(
-                    popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
+            let menu =
+                popover::popover_card(&theme)
+                    .w(px(170.0))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.chat_menu = None;
+                        cx.notify();
+                    }))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("chat-menu-rename-{}", chat_id.local_id),
+                        )
                         .id("chat-menu-rename")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.open_rename_chat(rename_id.clone(), cx)
                         }))
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from("Rename…")),
-                )
-                .child(
-                    popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
+                    )
+                    .child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("chat-menu-archive-{}", chat_id.local_id),
+                        )
                         .id("chat-menu-archive")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.archive_chat(archive_id.clone(), cx)
@@ -2457,10 +2499,14 @@ impl Shell {
                                 .text_color(theme.text_muted),
                         )
                         .child(SharedString::from("Archive")),
-                )
-                .child(popover::menu_separator())
-                .child(
-                    popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
+                    )
+                    .child(popover::menu_separator())
+                    .child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("chat-menu-delete-{}", chat_id.local_id),
+                        )
                         .id("chat-menu-delete")
                         .text_color(theme.danger)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2474,8 +2520,8 @@ impl Shell {
                                 .text_color(theme.danger),
                         )
                         .child(SharedString::from("Delete…")),
-                )
-                .into_any_element();
+                    )
+                    .into_any_element();
             overlays.push(popover::menu_at("chat-context-menu", position, menu));
         }
 
@@ -2536,7 +2582,7 @@ impl Shell {
                     .read(cx)
                     .chats
                     .iter()
-                    .find(|c| c.id == chat_id)
+                    .find(|c| c.id == chat_id.local_id)
                     .and_then(|c| c.title.clone())
                     .unwrap_or_else(|| "New session".into()),
             );

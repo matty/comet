@@ -137,20 +137,21 @@ impl Shell {
                 .as_deref()
                 .map(|space| self.tab_ids(space, cx))
                 .unwrap_or_default();
-            (
-                self.state
-                    .read(cx)
-                    .selected_chat
-                    .clone()
-                    .map(|id| id.local_id),
-                order,
-            )
+            (self.state.read(cx).selected_chat.clone(), order)
         };
-        if selected.as_deref() == Some(chat_id.as_str()) {
+        if selected.as_ref().map(|chat| chat.local_id.as_str()) == Some(chat_id.as_str()) {
             let next = next_after_close(&order, &chat_id);
             self.state.update(cx, |s, cx| s.select_chat(next, cx));
         }
-        self.archive_chat(chat_id, cx);
+        let owner = comet_proto::ServerRef::new(
+            self.state
+                .read(cx)
+                .selected_server_id()
+                .cloned()
+                .expect("session tabs require a server bucket"),
+            chat_id,
+        );
+        self.archive_chat(owner, cx);
     }
 
     /// Track the drop slot while a tab is dragged over the strip (150ms sibling

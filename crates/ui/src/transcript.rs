@@ -1374,7 +1374,14 @@ impl Transcript {
         let mut min_retry: Option<Duration> = None;
         for dev in device_ids {
             if begin_load(&server_id, dev, path) {
-                self.spawn_attachment_load(server_id.clone(), dev.clone(), path.to_string(), cx);
+                let generation = crate::attachments::attachment_generation(&server_id);
+                self.spawn_attachment_load(
+                    server_id.clone(),
+                    dev.clone(),
+                    path.to_string(),
+                    generation,
+                    cx,
+                );
             }
             match attachment_snapshot(&server_id, dev, path) {
                 AttachmentSnapshot::Loaded(image) => return AttachmentSnapshot::Loaded(image),
@@ -1410,25 +1417,29 @@ impl Transcript {
         server_id: ServerId,
         device_id: String,
         path: String,
+        generation: u64,
         cx: &mut Context<Self>,
     ) {
-        use crate::attachments::{read_attachment_image, store_error, store_loaded};
+        use crate::attachments::{
+            read_attachment_image, store_error_for_generation, store_loaded_for_generation,
+        };
         let owner = ServerRef::new(server_id.clone(), "attachment");
         let Some(engine) = self.state.read(cx).client_for(&owner) else {
-            store_error(&server_id, &device_id, &path);
+            store_error_for_generation(&server_id, &device_id, &path, generation);
             return;
         };
         let key = (server_id.clone(), device_id.clone(), path.clone());
         let task = cx.spawn(async move |this, cx| {
             match read_attachment_image(&engine, cx.background_executor(), &path).await {
-                Some(loaded) => store_loaded(
+                Some(loaded) => store_loaded_for_generation(
                     &server_id,
                     &device_id,
                     &path,
                     loaded.name.into(),
                     loaded.image,
+                    generation,
                 ),
-                None => store_error(&server_id, &device_id, &path),
+                None => store_error_for_generation(&server_id, &device_id, &path, generation),
             }
             this.update(cx, |transcript, cx| {
                 transcript.attachment_loads.remove(&(
