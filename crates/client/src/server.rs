@@ -9,7 +9,10 @@ use crate::{FederationEvent, ServerState};
 
 pub(crate) enum SupervisorCommand {
     Call(&'static str, serde_json::Value),
-    WatchTranscript(Option<String>),
+    WatchTranscript {
+        chat_id: Option<String>,
+        acknowledged: Option<tokio::sync::oneshot::Sender<()>>,
+    },
     Reconnect,
     Shutdown,
 }
@@ -106,7 +109,7 @@ pub(crate) async fn supervise_connected(
                     }
                     continue;
                 }
-                Some(SupervisorCommand::WatchTranscript(chat_id)) => {
+                Some(SupervisorCommand::WatchTranscript { chat_id, acknowledged }) => {
                     if let Some((old, _)) = transcript.take() {
                         let _ = events.send(FederationEvent::Transcript { chat: old, entries: Vec::new() });
                     }
@@ -115,6 +118,7 @@ pub(crate) async fn supervise_connected(
                         Some(chat_id) => Some(subscribe_transcript(&client, &hello.server_id, chat_id).await?),
                         None => None,
                     };
+                    if let Some(acknowledged) = acknowledged { let _ = acknowledged.send(()); }
                     continue;
                 }
                 Some(SupervisorCommand::Reconnect) => return Ok(ConnectedExit::Reconnect),

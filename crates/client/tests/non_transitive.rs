@@ -1044,3 +1044,183 @@ async fn invalid_persisted_pin_is_terminal_until_registry_replacement_or_reconne
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert_eq!(inspect.0.lock().unwrap().get(&b_id).unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn repeated_short_sessions_accumulate_exponential_backoff() {
+    let a_id = secure_server('a');
+    let b_id = secure_server('b');
+    let local = service(
+        a_id,
+        "A",
+        vec![remote(b_id.clone(), "B", 'b')],
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let mut attempts = VecDeque::new();
+    for _ in 0..4 {
+        attempts.push_back(Ok(service_with_closing_stream(
+            b_id.clone(),
+            "B",
+            Vec::new(),
+            Arc::new(Mutex::new(Vec::new())),
+            methods::WATCH_CHATS,
+        )));
+    }
+    let connector = Arc::new(FixtureConnector(Mutex::new(HashMap::from([(
+        b_id.clone(),
+        attempts,
+    )]))));
+    let inspect = connector.clone();
+    let data_dir = tempfile::tempdir().unwrap();
+    let _federation = Federation::with_connector(local, data_dir.path(), connector)
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    assert_eq!(
+        inspect.0.lock().unwrap().get(&b_id).unwrap().len(),
+        1,
+        "fourth short-lived connection was dialed without accumulated backoff"
+    );
+}
+
+#[tokio::test]
+async fn selection_handoff_clears_old_transcript_before_new_subscription_event() {
+    let a_id = secure_server('a');
+    let b_id = secure_server('b');
+    let c_id = secure_server('c');
+    let local = service(
+        a_id,
+        "A",
+        vec![
+            remote(b_id.clone(), "B", 'b'),
+            remote(c_id.clone(), "C", 'c'),
+        ],
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let b_calls = Arc::new(Mutex::new(Vec::new()));
+    let c_calls = Arc::new(Mutex::new(Vec::new()));
+    let connector = Arc::new(FixtureConnector(Mutex::new(HashMap::from([
+        (
+            b_id.clone(),
+            VecDeque::from([Ok(service(
+                b_id.clone(),
+                "B",
+                Vec::new(),
+                Vec::new(),
+                b_calls.clone(),
+            ))]),
+        ),
+        (
+            c_id.clone(),
+            VecDeque::from([Ok(service(
+                c_id.clone(),
+                "C",
+                Vec::new(),
+                Vec::new(),
+                c_calls.clone(),
+            ))]),
+        ),
+    ]))));
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut federation = Federation::with_connector(local, data_dir.path(), connector)
+        .await
+        .unwrap();
+    let mut snapshot = ServerSnapshot::default();
+    wait_for_state(
+        &mut federation,
+        &mut snapshot,
+        &b_id,
+        &RemoteConnectionState::Online,
+    )
+    .await;
+    wait_for_state(
+        &mut federation,
+        &mut snapshot,
+        &c_id,
+        &RemoteConnectionState::Online,
+    )
+    .await;
+    let b_chat = comet_client::ServerRef::new(b_id.clone(), "chat-1");
+    let c_chat = comet_client::ServerRef::new(c_id.clone(), "chat-1");
+    federation
+        .send(comet_client::FederationCommand::WatchTranscript(Some(
+            b_chat.clone(),
+        )))
+        .unwrap();
+    loop {
+        if matches!(federation.recv().await, Some(FederationEvent::Transcript { chat, .. }) if chat == b_chat)
+        {
+            break;
+        }
+    }
+
+    federation
+        .send(comet_client::FederationCommand::WatchTranscript(Some(
+            c_chat.clone(),
+        )))
+        .unwrap();
+    let mut transcript_events = Vec::new();
+    while transcript_events.len() < 2 {
+        if let Some(event @ FederationEvent::Transcript { .. }) = federation.recv().await {
+            transcript_events.push(event);
+        }
+    }
+    let first = transcript_events.remove(0);
+    let second = transcript_events.remove(0);
+    assert!(
+        matches!(first, FederationEvent::Transcript { chat, entries } if chat == b_chat && entries.is_empty())
+    );
+    assert!(matches!(second, FederationEvent::Transcript { chat, .. } if chat == c_chat));
+    assert!(
+        b_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|method| method == methods::WATCH_DOC_MESSAGES)
+    );
+    assert!(
+        c_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|method| method == methods::WATCH_DOC_MESSAGES)
+    );
+}
+
+#[tokio::test]
+async fn shutdown_clears_selected_transcript_after_supervisors_stop() {
+    let a_id = secure_server('a');
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let local = service(a_id.clone(), "A", Vec::new(), Vec::new(), calls);
+    let connector = Arc::new(FixtureConnector(Mutex::new(HashMap::new())));
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut federation = Federation::with_connector(local, data_dir.path(), connector)
+        .await
+        .unwrap();
+    let selected = comet_client::ServerRef::new(a_id.clone(), "chat-1");
+    federation
+        .send(comet_client::FederationCommand::WatchTranscript(Some(
+            selected.clone(),
+        )))
+        .unwrap();
+    loop {
+        if matches!(federation.recv().await, Some(FederationEvent::Transcript { chat, .. }) if chat == selected)
+        {
+            break;
+        }
+    }
+
+    federation
+        .send(comet_client::FederationCommand::Shutdown)
+        .unwrap();
+    let mut saw_clear = false;
+    while let Some(event) = federation.recv().await {
+        if matches!(event, FederationEvent::Transcript { chat, entries } if chat == selected && entries.is_empty())
+        {
+            saw_clear = true;
+        }
+    }
+    assert!(saw_clear);
+}

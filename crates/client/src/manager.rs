@@ -17,6 +17,9 @@ use crate::server::{
 };
 use crate::{FederationCommand, FederationEvent, ServerState};
 
+const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
+const STABLE_CONNECTION_DURATION: Duration = Duration::from_secs(1);
+
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteConnectError {
     #[error("identity changed")]
@@ -195,16 +198,17 @@ async fn run_manager(
                     Err(error) => { let _ = events.send(FederationEvent::Notice { server_id: local_id.clone(), message: format!("invalid remote registry: {error}") }); }
                 },
                 None => {
-                    if let Some(chat) = selected.take() {
+                    let selected = selected.take();
+                    let owned = std::mem::take(&mut supervisors);
+                    for (id, supervisor) in owned {
+                        stop_supervisor(supervisor).await;
+                        if id != local_id { let _ = events.send(FederationEvent::ServerRemoved(id)); }
+                    }
+                    if let Some(chat) = selected {
                         let _ = events.send(FederationEvent::Transcript { chat, entries: Vec::new() });
                     }
-                    let remote_ids: Vec<_> = supervisors.keys().filter(|id| *id != &local_id).cloned().collect();
-                    for id in remote_ids {
-                        if let Some(supervisor) = supervisors.remove(&id) { stop_supervisor(supervisor).await; }
-                        let _ = events.send(FederationEvent::ServerRemoved(id));
-                    }
                     let _ = events.send(FederationEvent::ServerChanged(ServerState::offline(local_id.clone(), local_name.clone())));
-                    break;
+                    return;
                 },
             },
             command = commands.recv() => match command {
@@ -216,10 +220,16 @@ async fn run_manager(
                     }
                 }
                 Some(FederationCommand::WatchTranscript(chat)) => {
-                    selected = chat.clone();
-                    for supervisor in supervisors.values() { let _ = supervisor.commands.send(SupervisorCommand::WatchTranscript(None)); }
-                    if let Some(chat) = chat && let Some(supervisor) = supervisors.get(&chat.server_id) {
-                        let _ = supervisor.commands.send(SupervisorCommand::WatchTranscript(Some(chat.local_id)));
+                    if let Some(previous) = selected.take() {
+                        if let Some(supervisor) = supervisors.get(&previous.server_id) {
+                            set_supervisor_transcript(supervisor, None).await;
+                        } else {
+                            let _ = events.send(FederationEvent::Transcript { chat: previous, entries: Vec::new() });
+                        }
+                    }
+                    selected = chat;
+                    if let Some(chat) = selected.as_ref() && let Some(supervisor) = supervisors.get(&chat.server_id) {
+                        queue_supervisor_transcript(supervisor, Some(chat.local_id.clone()));
                     }
                 }
                 Some(FederationCommand::Reconnect(server_id)) => {
@@ -232,12 +242,57 @@ async fn run_manager(
     for (_, supervisor) in supervisors {
         stop_supervisor(supervisor).await;
     }
+    if let Some(chat) = selected {
+        let _ = events.send(FederationEvent::Transcript {
+            chat,
+            entries: Vec::new(),
+        });
+    }
 }
 
 async fn stop_supervisor(supervisor: Supervisor) {
     let _ = supervisor.commands.send(SupervisorCommand::Shutdown);
     supervisor.task.abort();
     let _ = supervisor.task.await;
+}
+
+async fn stop_supervisor_then_clear(
+    supervisor: Supervisor,
+    chat: Option<ServerRef>,
+    events: &mpsc::UnboundedSender<FederationEvent>,
+) {
+    stop_supervisor(supervisor).await;
+    if let Some(chat) = chat {
+        let _ = events.send(FederationEvent::Transcript {
+            chat,
+            entries: Vec::new(),
+        });
+    }
+}
+
+async fn set_supervisor_transcript(supervisor: &Supervisor, chat_id: Option<String>) -> bool {
+    let (acknowledged, received) = tokio::sync::oneshot::channel();
+    if supervisor
+        .commands
+        .send(SupervisorCommand::WatchTranscript {
+            chat_id,
+            acknowledged: Some(acknowledged),
+        })
+        .is_err()
+    {
+        return false;
+    }
+    received.await.is_ok()
+}
+
+fn queue_supervisor_transcript(supervisor: &Supervisor, chat_id: Option<String>) -> bool {
+    supervisor
+        .commands
+        .send(SupervisorCommand::WatchTranscript {
+            chat_id,
+            acknowledged: None,
+        })
+        .is_ok()
 }
 
 fn spawn_local_resources(
@@ -298,16 +353,13 @@ async fn reconcile(
         .cloned()
         .collect();
     for id in removed {
-        if selected.as_ref().is_some_and(|chat| chat.server_id == id)
-            && let Some(chat) = selected.take()
-        {
-            let _ = context.events.send(FederationEvent::Transcript {
-                chat,
-                entries: Vec::new(),
-            });
-        }
+        let chat = selected
+            .as_ref()
+            .is_some_and(|chat| chat.server_id == id)
+            .then(|| selected.take())
+            .flatten();
         if let Some(supervisor) = supervisors.remove(&id) {
-            stop_supervisor(supervisor).await;
+            stop_supervisor_then_clear(supervisor, chat, &context.events).await;
         }
         let _ = context.events.send(FederationEvent::ServerRemoved(id));
     }
@@ -329,13 +381,11 @@ async fn reconcile(
             continue;
         }
         if let Some(old) = supervisors.remove(&id) {
-            if let Some(chat) = selected.as_ref().filter(|chat| chat.server_id == id) {
-                let _ = context.events.send(FederationEvent::Transcript {
-                    chat: chat.clone(),
-                    entries: Vec::new(),
-                });
-            }
-            stop_supervisor(old).await;
+            let chat = selected
+                .as_ref()
+                .filter(|chat| chat.server_id == id)
+                .cloned();
+            stop_supervisor_then_clear(old, chat, &context.events).await;
         } else {
             let _ = context
                 .events
@@ -353,19 +403,19 @@ async fn reconcile(
             context.events.clone(),
             rx,
         ));
-        if let Some(chat) = selected.as_ref().filter(|chat| chat.server_id == id) {
-            let _ = tx.send(SupervisorCommand::WatchTranscript(Some(
-                chat.local_id.clone(),
-            )));
-        }
         supervisors.insert(
-            id,
+            id.clone(),
             Supervisor {
                 entry: Some(entry),
                 commands: tx,
                 task,
             },
         );
+        if let Some(chat) = selected.as_ref().filter(|chat| chat.server_id == id)
+            && let Some(supervisor) = supervisors.get(&id)
+        {
+            queue_supervisor_transcript(supervisor, Some(chat.local_id.clone()));
+        }
     }
 }
 
@@ -384,7 +434,7 @@ async fn supervise_remote(
     events: mpsc::UnboundedSender<FederationEvent>,
     mut commands: mpsc::UnboundedReceiver<SupervisorCommand>,
 ) {
-    let mut delay = Duration::from_millis(100);
+    let mut delay = INITIAL_RETRY_DELAY;
     let mut selected_chat = None;
     loop {
         let _ = events.send(FederationEvent::ServerChanged(ServerState::empty(
@@ -516,7 +566,7 @@ async fn supervise_remote(
             &local,
         )
         .await;
-        delay = Duration::from_millis(100);
+        let session_started = std::time::Instant::now();
         let connected = supervise_connected(
             Arc::new(client),
             hello,
@@ -529,11 +579,13 @@ async fn supervise_remote(
         match connected {
             Ok(ConnectedExit::Shutdown) => return,
             Ok(ConnectedExit::Reconnect) => {
+                delay = INITIAL_RETRY_DELAY;
                 clear_selected_transcript(&entry.server_id, &selected_chat, &events);
                 publish_failure(&entry, RemoteConnectionState::Offline, &local, &events).await;
                 continue;
             }
             Err(_) => {
+                delay = retry_delay_after_session(delay, session_started.elapsed());
                 clear_selected_transcript(&entry.server_id, &selected_chat, &events);
                 publish_failure(&entry, RemoteConnectionState::Offline, &local, &events).await;
                 if !wait_transient(
@@ -557,6 +609,14 @@ fn jittered_backoff(base: Duration, entropy: u32) -> Duration {
     let percentage = 80 + (u64::from(entropy) * 40 / u64::from(u32::MAX));
     Duration::from_millis((base.as_millis() as u64 * percentage / 100).max(1))
         .min(Duration::from_secs(5))
+}
+
+fn retry_delay_after_session(current: Duration, connected_for: Duration) -> Duration {
+    if connected_for >= STABLE_CONNECTION_DURATION {
+        INITIAL_RETRY_DELAY
+    } else {
+        current
+    }
 }
 
 async fn wait_terminal(
@@ -606,7 +666,15 @@ fn handle_offline_command(
     events: &mpsc::UnboundedSender<FederationEvent>,
 ) {
     match command {
-        SupervisorCommand::WatchTranscript(chat_id) => *selected_chat = chat_id,
+        SupervisorCommand::WatchTranscript {
+            chat_id,
+            acknowledged,
+        } => {
+            *selected_chat = chat_id;
+            if let Some(acknowledged) = acknowledged {
+                let _ = acknowledged.send(());
+            }
+        }
         SupervisorCommand::Call(method, _) => {
             let _ = events.send(FederationEvent::Notice {
                 server_id: server_id.clone(),
@@ -728,6 +796,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retry_delay_resets_only_after_stable_connection_window() {
+        let accumulated = Duration::from_millis(800);
+        assert_eq!(
+            retry_delay_after_session(accumulated, STABLE_CONNECTION_DURATION / 2),
+            accumulated
+        );
+        assert_eq!(
+            retry_delay_after_session(accumulated, STABLE_CONNECTION_DURATION),
+            INITIAL_RETRY_DELAY
+        );
+    }
+
     #[tokio::test]
     async fn malformed_persisted_pin_is_a_terminal_configuration_error() {
         let pin = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -767,5 +848,91 @@ mod tests {
         .await;
 
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn old_supervisor_is_joined_before_its_transcript_clear() {
+        struct FinalEvent(mpsc::UnboundedSender<FederationEvent>, ServerId);
+        impl Drop for FinalEvent {
+            fn drop(&mut self) {
+                let _ = self.0.send(FederationEvent::Notice {
+                    server_id: self.1.clone(),
+                    message: "old supervisor final event".into(),
+                });
+            }
+        }
+
+        let server_id = ServerId::new(
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let chat = ServerRef::new(server_id.clone(), "old-chat");
+        let (events, mut received) = mpsc::unbounded_channel();
+        let guard = FinalEvent(events.clone(), server_id);
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            futures::future::pending::<()>().await;
+        });
+        let (commands, _receiver) = mpsc::unbounded_channel();
+
+        stop_supervisor_then_clear(
+            Supervisor {
+                entry: None,
+                commands,
+                task,
+            },
+            Some(chat.clone()),
+            &events,
+        )
+        .await;
+
+        assert!(matches!(
+            received.recv().await,
+            Some(FederationEvent::Notice { .. })
+        ));
+        assert_eq!(
+            received.recv().await,
+            Some(FederationEvent::Transcript {
+                chat,
+                entries: Vec::new(),
+            })
+        );
+        assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn selection_handoff_waits_for_prior_owner_acknowledgement() {
+        let server_id = ServerId::new(
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let (events, mut received) = mpsc::unbounded_channel();
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn({
+            let server_id = server_id.clone();
+            async move {
+                if let Some(SupervisorCommand::WatchTranscript { acknowledged, .. }) =
+                    command_rx.recv().await
+                {
+                    let _ = events.send(FederationEvent::Notice {
+                        server_id,
+                        message: "prior owner drained".into(),
+                    });
+                    if let Some(acknowledged) = acknowledged {
+                        let _ = acknowledged.send(());
+                    }
+                }
+            }
+        });
+        let supervisor = Supervisor {
+            entry: None,
+            commands,
+            task,
+        };
+
+        set_supervisor_transcript(&supervisor, None).await;
+        assert!(matches!(
+            received.try_recv(),
+            Ok(FederationEvent::Notice { message, .. }) if message == "prior owner drained"
+        ));
+        stop_supervisor(supervisor).await;
     }
 }
