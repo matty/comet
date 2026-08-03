@@ -2,11 +2,8 @@
 //! a systemd **user** unit on Linux (the VPS deployment target), a launchd
 //! LaunchAgent on macOS. The unit runs the current executable with the
 //! `COMET_*` environment captured at install time, so
-//! `COMET_EDGE_URL=… comet daemon install` bakes that override in.
-//!
-//! Auth is decoupled: the service loads the session `comet login` persisted and
-//! exits with "run `comet login` first" otherwise (`terminal_sign_in`'s non-TTY
-//! path) — it never waits interactively for OAuth.
+//! `COMET_RELEASES_URL=… comet daemon install` bakes the update-source override
+//! in without reintroducing an online runtime-service dependency.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,13 +21,8 @@ const SYSTEMD_UNIT: &str = "comet-native.service";
 const CAPTURED_ENV: &[&str] = &[
     "PATH",
     "COMET_DATA_DIR",
-    "COMET_EDGE_URL",
-    "COMET_EDGE_TOKEN",
-    "COMET_ORG_ID",
-    "COMET_WORKOS_CLIENT_ID",
-    "COMET_WORKOS_API_BASE",
+    "COMET_RELEASES_URL",
     "COMET_IPC_PORT",
-    "COMET_CALLBACK_PORT",
     "COMET_HARNESS",
     "COMET_DEVICE_NAME",
     "RUST_LOG",
@@ -223,9 +215,8 @@ fn captured_env() -> Vec<(String, String)> {
 }
 
 fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
-    // The start limit must actually trip on the "run `comet login` first"
-    // fail-fast exit (5 × RestartSec=5 lands inside the 60s window) — otherwise
-    // a signed-out daemon restart-loops forever.
+    // Bound restart loops for any fail-fast startup error (invalid local
+    // configuration, listener failure, corrupt store, and similar faults).
     let mut unit = String::from(
         "[Unit]\nDescription=Comet native headless engine\nAfter=network-online.target\n\
          StartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n",
@@ -436,5 +427,28 @@ mod tests {
         assert!(plist.contains(
             "<key>StandardOutPath</key><string>/Users/x/.comet-native/daemon.log</string>"
         ));
+    }
+
+    #[test]
+    fn daemon_capture_keeps_releases_separate_from_removed_online_service_env() {
+        assert!(CAPTURED_ENV.contains(&"COMET_RELEASES_URL"));
+        for removed in [
+            "COMET_EDGE_URL",
+            "COMET_EDGE_TOKEN",
+            "COMET_ORG_ID",
+            "COMET_WORKOS_CLIENT_ID",
+            "COMET_WORKOS_API_BASE",
+            "COMET_CALLBACK_PORT",
+        ] {
+            assert!(!CAPTURED_ENV.contains(&removed), "still captures {removed}");
+        }
+        for local in [
+            "COMET_DATA_DIR",
+            "COMET_IPC_PORT",
+            "COMET_HARNESS",
+            "COMET_DEVICE_NAME",
+        ] {
+            assert!(CAPTURED_ENV.contains(&local), "stopped capturing {local}");
+        }
     }
 }

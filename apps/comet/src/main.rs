@@ -1,9 +1,10 @@
-//! comet — headed by default; `comet headless` runs the engine alone. Auth is
-//! decoupled from the daemon: `comet login` persists the session and exits, so a
-//! service-managed `comet headless` only ever loads saved credentials.
+//! comet — headed by default; `comet headless` runs the engine alone. Direct
+//! remote administration is local-IPC-first and falls back to locked offline
+//! configuration only when no engine owns the data directory.
 
-mod auth_cli;
 mod daemon;
+mod migration_cli;
+mod remote_cli;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
@@ -19,12 +20,15 @@ struct Cli {
 enum Command {
     /// Run the engine without a UI (VPS / remote device mode).
     Headless,
-    /// Sign in (paste-code flow), persist the session, and exit.
-    Login,
-    /// Remove the saved session.
-    Logout,
-    /// Show auth + engine status (exits nonzero when a sign-in is needed).
+    /// Show local engine, IPC, LAN listener, clients, and direct remotes.
     Status,
+    /// Configure direct Comet-to-Comet LAN connections.
+    Remote {
+        #[command(subcommand)]
+        command: remote_cli::RemoteCommand,
+    },
+    /// Explicitly migrate one legacy online profile into the local store.
+    Migrate(migration_cli::MigrateArgs),
     /// Manage `comet headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -60,6 +64,7 @@ enum DaemonCommand {
 /// Production edge (Cloudflare Worker + Durable Objects on the zeron.sh zone).
 /// `COMET_EDGE_URL` overrides (local dev / self-hosting).
 const DEFAULT_EDGE_URL: &str = "https://edge.comet.zeron.sh";
+const DEFAULT_RELEASES_URL: &str = "https://edge.comet.zeron.sh";
 
 /// Production WorkOS AuthKit client id — public knowledge (it appears in every
 /// authorize URL), so baking it in is safe. Overridden by `COMET_WORKOS_CLIENT_ID`;
@@ -119,21 +124,22 @@ fn main() -> anyhow::Result<()> {
                 engine.run().await
             })
         }
-        Some(Command::Login) => {
-            let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(auth_cli::login(engine_config_from_env()))
-        }
-        Some(Command::Logout) => {
-            let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(auth_cli::logout(engine_config_from_env()))
-        }
         Some(Command::Status) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(auth_cli::status(engine_config_from_env()))
+            let config = engine_config_from_env();
+            runtime.block_on(remote_cli::status(&config.data_dir, config.ipc_port))
+        }
+        Some(Command::Remote { command }) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            let config = engine_config_from_env();
+            runtime.block_on(remote_cli::run(command, &config.data_dir, config.ipc_port))
+        }
+        Some(Command::Migrate(args)) => {
+            migration_cli::run(&engine_config_from_env().data_dir, &args.from)
         }
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(update_cli::update(&edge_url_from_env(), check))
+            runtime.block_on(update_cli::update(&releases_url_from_env(), check))
         }
         Some(Command::Daemon { command }) => match command {
             DaemonCommand::Install => daemon::install(&engine_config_from_env().data_dir),
@@ -166,9 +172,8 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// The env-resolved engine configuration shared by `headless`, `login`,
-/// `logout`, and `status` — one resolution so the CLI auth commands always
-/// operate on the exact session the daemon will load.
+/// The env-resolved engine configuration shared by the headed, headless, and
+/// local-administration entry points.
 fn engine_config_from_env() -> comet_engine::EngineConfig {
     // Dev-mode bearer (no WorkOS): an explicit token enables sync.
     let edge_token = std::env::var("COMET_EDGE_TOKEN").ok();
@@ -206,4 +211,50 @@ fn harness_from_env() -> comet_engine::HarnessId {
 fn dirs_data_dir() -> std::path::PathBuf {
     let home = std::env::var_os("HOME").expect("HOME not set");
     std::path::PathBuf::from(home).join(".comet-native")
+}
+
+fn releases_url_from_env() -> String {
+    std::env::var("COMET_RELEASES_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_RELEASES_URL.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_and_logout_are_not_commands() {
+        assert!(Cli::try_parse_from(["comet", "login"]).is_err());
+        assert!(Cli::try_parse_from(["comet", "logout"]).is_err());
+    }
+
+    #[test]
+    fn parses_manual_remote_endpoint() {
+        let cli = Cli::try_parse_from(["comet", "remote", "add", "buildbox.local:27655"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Remote {
+                command: remote_cli::RemoteCommand::Add { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_explicit_legacy_profile_selection() {
+        let cli = Cli::try_parse_from(["comet", "migrate", "--from", "org-a/user-a"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Migrate { .. })));
+    }
+
+    #[test]
+    fn parses_server_side_pairing_session() {
+        let cli = Cli::try_parse_from(["comet", "remote", "pair"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Remote {
+                command: remote_cli::RemoteCommand::Pair
+            })
+        ));
+    }
 }
