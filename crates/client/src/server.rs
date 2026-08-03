@@ -3,7 +3,7 @@ use std::sync::Arc;
 use comet_doc::SessionMessageEntry;
 use comet_proto::{Chat, Device, RemoteConnectionState, ServerHello, ServerRef, Session, Space};
 use comet_rpc::{RpcClient, RpcError, methods};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use crate::{FederationEvent, ServerState};
 
@@ -14,78 +14,68 @@ pub(crate) enum SupervisorCommand {
     Shutdown,
 }
 
-enum ResourceUpdate {
-    Devices(Vec<Device>),
-    Spaces(Vec<Space>),
-    Chats(Vec<Chat>),
-    Sessions(Vec<Session>),
+pub(crate) enum ConnectedExit {
+    Reconnect,
+    Shutdown,
 }
 
-async fn subscribe_resource<T>(
-    client: Arc<RpcClient>,
+fn decode<T: serde::de::DeserializeOwned>(
     method: &'static str,
-    updates: mpsc::UnboundedSender<ResourceUpdate>,
-    map: fn(Vec<T>) -> ResourceUpdate,
-) -> Result<(), RpcError>
-where
-    T: serde::de::DeserializeOwned + Send + 'static,
-{
-    let mut stream = client.subscribe(method, serde_json::Value::Null).await?;
-    tokio::spawn(async move {
-        while let Some(value) = stream.recv().await {
-            match serde_json::from_value::<Vec<T>>(value) {
-                Ok(value) => {
-                    if updates.send(map(value)).is_err() {
-                        return;
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%method, %error, "federation: invalid resource snapshot");
-                    return;
-                }
-            }
-        }
-    });
-    Ok(())
+    value: Option<serde_json::Value>,
+) -> Result<Vec<T>, RpcError> {
+    let value = value.ok_or(RpcError::Closed)?;
+    serde_json::from_value(value)
+        .map_err(|error| RpcError::Failed(format!("invalid {method} snapshot: {error}")))
+}
+
+async fn transcript_next(
+    transcript: &mut Option<(ServerRef, mpsc::UnboundedReceiver<serde_json::Value>)>,
+) -> Option<serde_json::Value> {
+    match transcript {
+        Some((_, receiver)) => receiver.recv().await,
+        None => futures::future::pending().await,
+    }
+}
+
+async fn subscribe_transcript(
+    client: &RpcClient,
+    server_id: &comet_proto::ServerId,
+    chat_id: &str,
+) -> Result<(ServerRef, mpsc::UnboundedReceiver<serde_json::Value>), RpcError> {
+    let chat = ServerRef::new(server_id.clone(), chat_id);
+    let receiver = client
+        .subscribe(
+            methods::WATCH_DOC_MESSAGES,
+            serde_json::json!({"chatId": chat_id}),
+        )
+        .await?;
+    Ok((chat, receiver))
 }
 
 pub(crate) async fn supervise_connected(
-    client: RpcClient,
+    client: Arc<RpcClient>,
     hello: ServerHello,
     display_name: String,
     events: mpsc::UnboundedSender<FederationEvent>,
     commands: &mut mpsc::UnboundedReceiver<SupervisorCommand>,
-) -> Result<(), RpcError> {
-    let client = Arc::new(client);
-    let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
-    subscribe_resource(
-        client.clone(),
-        methods::WATCH_DEVICES,
-        updates_tx.clone(),
-        ResourceUpdate::Devices,
-    )
-    .await?;
-    subscribe_resource(
-        client.clone(),
-        methods::WATCH_SPACES,
-        updates_tx.clone(),
-        ResourceUpdate::Spaces,
-    )
-    .await?;
-    subscribe_resource(
-        client.clone(),
-        methods::WATCH_CHATS,
-        updates_tx.clone(),
-        ResourceUpdate::Chats,
-    )
-    .await?;
-    subscribe_resource(
-        client.clone(),
-        methods::WATCH_SESSIONS,
-        updates_tx,
-        ResourceUpdate::Sessions,
-    )
-    .await?;
+    selected_chat: &mut Option<String>,
+) -> Result<ConnectedExit, RpcError> {
+    let mut devices = client
+        .subscribe(methods::WATCH_DEVICES, serde_json::Value::Null)
+        .await?;
+    let mut spaces = client
+        .subscribe(methods::WATCH_SPACES, serde_json::Value::Null)
+        .await?;
+    let mut chats = client
+        .subscribe(methods::WATCH_CHATS, serde_json::Value::Null)
+        .await?;
+    let mut sessions = client
+        .subscribe(methods::WATCH_SESSIONS, serde_json::Value::Null)
+        .await?;
+    let mut transcript = match selected_chat.as_deref() {
+        Some(chat_id) => Some(subscribe_transcript(&client, &hello.server_id, chat_id).await?),
+        None => None,
+    };
 
     let mut state = ServerState::empty(
         hello.server_id.clone(),
@@ -93,17 +83,19 @@ pub(crate) async fn supervise_connected(
         RemoteConnectionState::Online,
     );
     let _ = events.send(FederationEvent::ServerChanged(state.clone()));
-    let (transcript_tx, transcript_rx) = watch::channel::<Option<ServerRef>>(None);
 
     loop {
         tokio::select! {
-            update = updates_rx.recv() => match update {
-                Some(ResourceUpdate::Devices(value)) => state.devices = value,
-                Some(ResourceUpdate::Spaces(value)) => state.spaces = value,
-                Some(ResourceUpdate::Chats(value)) => state.chats = value,
-                Some(ResourceUpdate::Sessions(value)) => state.sessions = value,
-                None => return Err(RpcError::Closed),
-            },
+            value = devices.recv() => state.devices = decode::<Device>(methods::WATCH_DEVICES, value)?,
+            value = spaces.recv() => state.spaces = decode::<Space>(methods::WATCH_SPACES, value)?,
+            value = chats.recv() => state.chats = decode::<Chat>(methods::WATCH_CHATS, value)?,
+            value = sessions.recv() => state.sessions = decode::<Session>(methods::WATCH_SESSIONS, value)?,
+            value = transcript_next(&mut transcript) => {
+                let Some((chat, _)) = transcript.as_ref() else { continue; };
+                let entries = decode::<SessionMessageEntry>(methods::WATCH_DOC_MESSAGES, value)?;
+                let _ = events.send(FederationEvent::Transcript { chat: chat.clone(), entries });
+                continue;
+            }
             command = commands.recv() => match command {
                 Some(SupervisorCommand::Call(method, params)) => {
                     if let Err(error) = client.call(method, params).await {
@@ -115,37 +107,33 @@ pub(crate) async fn supervise_connected(
                     continue;
                 }
                 Some(SupervisorCommand::WatchTranscript(chat_id)) => {
-                    let chat = chat_id.map(|id| ServerRef::new(hello.server_id.clone(), id));
-                    transcript_tx.send_replace(chat.clone());
-                    if let Some(chat) = chat {
-                        let client = client.clone();
-                        let events = events.clone();
-                        let mut selection = transcript_rx.clone();
-                        tokio::spawn(async move {
-                            let params = serde_json::json!({"chatId": chat.local_id()});
-                            let Ok(mut stream) = client.subscribe(methods::WATCH_DOC_MESSAGES, params).await else { return; };
-                            loop {
-                                tokio::select! {
-                                    value = stream.recv() => match value {
-                                        Some(value) => match serde_json::from_value::<Vec<SessionMessageEntry>>(value) {
-                                            Ok(entries) => { let _ = events.send(FederationEvent::Transcript { chat: chat.clone(), entries }); }
-                                            Err(_) => return,
-                                        },
-                                        None => return,
-                                    },
-                                    changed = selection.changed() => {
-                                        if changed.is_err() || selection.borrow().as_ref() != Some(&chat) { return; }
-                                    }
-                                }
-                            }
-                        });
+                    if let Some((old, _)) = transcript.take() {
+                        let _ = events.send(FederationEvent::Transcript { chat: old, entries: Vec::new() });
                     }
+                    *selected_chat = chat_id;
+                    transcript = match selected_chat.as_deref() {
+                        Some(chat_id) => Some(subscribe_transcript(&client, &hello.server_id, chat_id).await?),
+                        None => None,
+                    };
                     continue;
                 }
-                Some(SupervisorCommand::Reconnect) => return Err(RpcError::Closed),
-                Some(SupervisorCommand::Shutdown) | None => return Ok(()),
+                Some(SupervisorCommand::Reconnect) => return Ok(ConnectedExit::Reconnect),
+                Some(SupervisorCommand::Shutdown) | None => return Ok(ConnectedExit::Shutdown),
             }
         }
         let _ = events.send(FederationEvent::ServerChanged(state.clone()));
+    }
+}
+
+pub(crate) fn clear_selected_transcript(
+    server_id: &comet_proto::ServerId,
+    selected_chat: &Option<String>,
+    events: &mpsc::UnboundedSender<FederationEvent>,
+) {
+    if let Some(chat_id) = selected_chat {
+        let _ = events.send(FederationEvent::Transcript {
+            chat: ServerRef::new(server_id.clone(), chat_id),
+            entries: Vec::new(),
+        });
     }
 }

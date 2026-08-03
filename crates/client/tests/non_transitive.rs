@@ -99,6 +99,7 @@ struct FixtureService {
     chats: Vec<Chat>,
     calls: Arc<Mutex<Vec<String>>>,
     keep_open: bool,
+    closing_method: Option<&'static str>,
 }
 
 #[async_trait::async_trait]
@@ -119,11 +120,13 @@ impl RpcService for FixtureService {
             other => return Err(RpcError::UnknownMethod(other.into())),
         };
         let stream = futures::stream::once(async move { snapshot });
-        Ok(RpcReply::Stream(if self.keep_open {
-            stream.chain(futures::stream::pending()).boxed()
-        } else {
-            stream.boxed()
-        }))
+        Ok(RpcReply::Stream(
+            if self.keep_open && self.closing_method != Some(method) {
+                stream.chain(futures::stream::pending()).boxed()
+            } else {
+                stream.boxed()
+            },
+        ))
     }
 }
 
@@ -145,6 +148,54 @@ impl RemoteConnector for FixtureConnector {
                 .and_then(|result| result)
         }
         .boxed()
+    }
+}
+
+struct FailHelloService;
+
+#[async_trait::async_trait]
+impl RpcService for FailHelloService {
+    async fn handle(&self, method: &str, _params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        Err(RpcError::Failed(format!("{method} unavailable")))
+    }
+}
+
+struct DisconnectAfterTranscriptService {
+    hello: ServerHello,
+    transcript_started: Arc<tokio::sync::Notify>,
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl RpcService for DisconnectAfterTranscriptService {
+    async fn handle(&self, method: &str, _params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        self.calls.lock().unwrap().push(method.to_string());
+        match method {
+            methods::SERVER_HELLO => RpcReply::value(&self.hello),
+            methods::WATCH_CHATS => {
+                let notify = self.transcript_started.clone();
+                Ok(RpcReply::Stream(
+                    futures::stream::once(async { serde_json::json!([]) })
+                        .chain(
+                            futures::stream::pending::<serde_json::Value>()
+                                .take_until(async move { notify.notified().await }),
+                        )
+                        .boxed(),
+                ))
+            }
+            methods::WATCH_DEVICES | methods::WATCH_SPACES | methods::WATCH_SESSIONS => {
+                Ok(RpcReply::Stream(
+                    futures::stream::once(async { serde_json::json!([]) })
+                        .chain(futures::stream::pending())
+                        .boxed(),
+                ))
+            }
+            methods::WATCH_DOC_MESSAGES => {
+                self.transcript_started.notify_waiters();
+                Ok(RpcReply::Stream(futures::stream::pending().boxed()))
+            }
+            other => Err(RpcError::UnknownMethod(other.into())),
+        }
     }
 }
 
@@ -195,6 +246,30 @@ fn service_with(
         chats,
         calls,
         keep_open,
+        closing_method: None,
+    }))
+}
+
+fn service_with_closing_stream(
+    id: ServerId,
+    name: &str,
+    remotes: Vec<RemoteEntry>,
+    calls: Arc<Mutex<Vec<String>>>,
+    closing_method: &'static str,
+) -> RpcClient {
+    comet_rpc::memory_client(Arc::new(FixtureService {
+        hello: ServerHello {
+            protocol_version: PROTOCOL_VERSION,
+            server_id: id,
+            device_id: format!("{name}-device"),
+            name: name.into(),
+            capabilities: Vec::new(),
+        },
+        remotes,
+        chats: vec![chat("chat-1")],
+        calls,
+        keep_open: true,
+        closing_method: Some(closing_method),
     }))
 }
 
@@ -508,4 +583,464 @@ async fn local_transcript_watch_uses_trusted_local_connection() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn transcript_selection_during_backoff_does_not_stop_reconnect() {
+    let a_id = secure_server('a');
+    let b_id = secure_server('b');
+    let local = service(
+        a_id,
+        "A",
+        vec![remote(b_id.clone(), "B", 'b')],
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let b_calls = Arc::new(Mutex::new(Vec::new()));
+    let b = service(b_id.clone(), "B", Vec::new(), Vec::new(), b_calls.clone());
+    let connector = Arc::new(FixtureConnector(Mutex::new(HashMap::from([(
+        b_id.clone(),
+        VecDeque::from([Err(RemoteConnectError::Transport("not yet".into())), Ok(b)]),
+    )]))));
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut federation = Federation::with_connector(local, data_dir.path(), connector)
+        .await
+        .unwrap();
+    let mut snapshot = ServerSnapshot::default();
+    wait_for_state(
+        &mut federation,
+        &mut snapshot,
+        &b_id,
+        &RemoteConnectionState::Unreachable {
+            message: "not yet".into(),
+        },
+    )
+    .await;
+
+    federation
+        .send(comet_client::FederationCommand::WatchTranscript(Some(
+            comet_client::ServerRef::new(b_id.clone(), "chat-1"),
+        )))
+        .unwrap();
+    wait_for_state(
+        &mut federation,
+        &mut snapshot,
+        &b_id,
+        &RemoteConnectionState::Online,
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !b_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|method| method == methods::WATCH_DOC_MESSAGES)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn one_required_remote_stream_ending_clears_the_bucket() {
+    let a_id = secure_server('a');
+    let b_id = secure_server('b');
+    let local = service(
+        a_id,
+        "A",
+        vec![remote(b_id.clone(), "B", 'b')],
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let b = service_with_closing_stream(
+        b_id.clone(),
+        "B",
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+        methods::WATCH_CHATS,
+    );
+    let connector = Arc::new(FixtureConnector(Mutex::new(HashMap::from([(
+        b_id.clone(),
+        VecDeque::from([Ok(b)]),
+    )]))));
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut federation = Federation::with_connector(local, data_dir.path(), connector)
+        .await
+        .unwrap();
+    let mut snapshot = ServerSnapshot::default();
+
+    wait_for_state(
+        &mut federation,
+        &mut snapshot,
+        &b_id,
+        &RemoteConnectionState::Online,
+    )
+    .await;
+    wait_for_state(
+        &mut federation,
+        &mut snapshot,
+        &b_id,
+        &RemoteConnectionState::Offline,
+    )
+    .await;
+    assert!(snapshot.server(&b_id).unwrap().chats.is_empty());
+}
+
+#[tokio::test]
+async fn local_required_stream_ending_publishes_empty_offline_bucket() {
+    let a_id = secure_server('a');
+    let local = service_with_closing_stream(
+        a_id.clone(),
+        "A",
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+        methods::WATCH_CHATS,
+    );
+    let connector = Arc::new(FixtureConnector(Mutex::new(HashMap::new())));
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut federation = Federation::with_connector(local, data_dir.path(), connector)
+        .await
+        .unwrap();
+    let mut snapshot = ServerSnapshot::default();
+
+    wait_for_state(
+        &mut federation,
+        &mut snapshot,
+        &a_id,
+        &RemoteConnectionState::Offline,
+    )
+    .await;
+    assert!(snapshot.server(&a_id).unwrap().chats.is_empty());
+}
+
+#[tokio::test]
+async fn registry_entry_colliding_with_local_id_is_ignored() {
+    let a_id = secure_server('a');
+    let local = service(
+        a_id.clone(),
+        "A",
+        vec![remote(a_id.clone(), "Imposter", 'a')],
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let imposter = service(
+        a_id.clone(),
+        "Imposter",
+        Vec::new(),
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let connector = Arc::new(FixtureConnector(Mutex::new(HashMap::from([(
+        a_id.clone(),
+        VecDeque::from([Ok(imposter)]),
+    )]))));
+    let inspect = connector.clone();
+    let data_dir = tempfile::tempdir().unwrap();
+    let _federation = Federation::with_connector(local, data_dir.path(), connector)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert_eq!(inspect.0.lock().unwrap().get(&a_id).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn generic_remote_call_rejects_local_admin_methods_client_side() {
+    let a_id = secure_server('a');
+    let b_id = secure_server('b');
+    let local = service(
+        a_id,
+        "A",
+        vec![remote(b_id.clone(), "B", 'b')],
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let b_calls = Arc::new(Mutex::new(Vec::new()));
+    let b = service(b_id.clone(), "B", Vec::new(), Vec::new(), b_calls.clone());
+    let connector = Arc::new(FixtureConnector(Mutex::new(HashMap::from([(
+        b_id.clone(),
+        VecDeque::from([Ok(b)]),
+    )]))));
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut federation = Federation::with_connector(local, data_dir.path(), connector)
+        .await
+        .unwrap();
+    let mut snapshot = ServerSnapshot::default();
+    wait_for_state(
+        &mut federation,
+        &mut snapshot,
+        &b_id,
+        &RemoteConnectionState::Online,
+    )
+    .await;
+
+    federation
+        .send(comet_client::FederationCommand::Call {
+            server_id: b_id,
+            method: methods::WATCH_REMOTES,
+            params: serde_json::Value::Null,
+        })
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !b_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|method| method == methods::WATCH_REMOTES)
+    );
+}
+
+#[tokio::test]
+async fn failed_server_hello_uses_backoff_before_redial() {
+    let a_id = secure_server('a');
+    let b_id = secure_server('b');
+    let local = service(
+        a_id,
+        "A",
+        vec![remote(b_id.clone(), "B", 'b')],
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let connector = Arc::new(FixtureConnector(Mutex::new(HashMap::from([(
+        b_id.clone(),
+        VecDeque::from([
+            Ok(comet_rpc::memory_client(Arc::new(FailHelloService))),
+            Ok(comet_rpc::memory_client(Arc::new(FailHelloService))),
+        ]),
+    )]))));
+    let inspect = connector.clone();
+    let data_dir = tempfile::tempdir().unwrap();
+    let _federation = Federation::with_connector(local, data_dir.path(), connector)
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    assert_eq!(inspect.0.lock().unwrap().get(&b_id).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn registry_closure_clears_remote_buckets_and_marks_local_offline() {
+    let a_id = secure_server('a');
+    let b_id = secure_server('b');
+    let local = service_with(
+        a_id.clone(),
+        "A",
+        vec![remote(b_id.clone(), "B", 'b')],
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+        PROTOCOL_VERSION,
+        false,
+    );
+    let connector = Arc::new(FixtureConnector(Mutex::new(HashMap::from([(
+        b_id.clone(),
+        VecDeque::from([Err(RemoteConnectError::IdentityChanged)]),
+    )]))));
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut federation = Federation::with_connector(local, data_dir.path(), connector)
+        .await
+        .unwrap();
+    let mut saw_local_offline = false;
+    let mut saw_remote_removed = false;
+
+    while let Some(event) = federation.recv().await {
+        match event {
+            FederationEvent::ServerChanged(server) if server.id == a_id => {
+                saw_local_offline |= server.connection == RemoteConnectionState::Offline;
+            }
+            FederationEvent::ServerRemoved(id) if id == b_id => saw_remote_removed = true,
+            _ => {}
+        }
+    }
+    assert!(saw_local_offline);
+    assert!(saw_remote_removed);
+}
+
+#[tokio::test]
+async fn disconnect_clears_selected_transcript_and_reconnect_resubscribes() {
+    let a_id = secure_server('a');
+    let b_id = secure_server('b');
+    let local = service(
+        a_id,
+        "A",
+        vec![remote(b_id.clone(), "B", 'b')],
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let first_calls = Arc::new(Mutex::new(Vec::new()));
+    let first = comet_rpc::memory_client(Arc::new(DisconnectAfterTranscriptService {
+        hello: ServerHello {
+            protocol_version: PROTOCOL_VERSION,
+            server_id: b_id.clone(),
+            device_id: "b-device".into(),
+            name: "B".into(),
+            capabilities: Vec::new(),
+        },
+        transcript_started: Arc::new(tokio::sync::Notify::new()),
+        calls: first_calls,
+    }));
+    let second_calls = Arc::new(Mutex::new(Vec::new()));
+    let second = service(
+        b_id.clone(),
+        "B",
+        Vec::new(),
+        Vec::new(),
+        second_calls.clone(),
+    );
+    let connector = Arc::new(FixtureConnector(Mutex::new(HashMap::from([(
+        b_id.clone(),
+        VecDeque::from([Ok(first), Ok(second)]),
+    )]))));
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut federation = Federation::with_connector(local, data_dir.path(), connector)
+        .await
+        .unwrap();
+    let mut snapshot = ServerSnapshot::default();
+    wait_for_state(
+        &mut federation,
+        &mut snapshot,
+        &b_id,
+        &RemoteConnectionState::Online,
+    )
+    .await;
+    let selected = comet_client::ServerRef::new(b_id.clone(), "chat-1");
+    federation
+        .send(comet_client::FederationCommand::WatchTranscript(Some(
+            selected.clone(),
+        )))
+        .unwrap();
+
+    let mut saw_clear_before_offline = false;
+    let mut saw_offline = false;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match federation.recv().await.unwrap() {
+                FederationEvent::Transcript { chat, entries }
+                    if chat == selected && entries.is_empty() && !saw_offline =>
+                {
+                    saw_clear_before_offline = true
+                }
+                FederationEvent::ServerChanged(server)
+                    if server.id == b_id && server.connection == RemoteConnectionState::Offline =>
+                {
+                    assert!(
+                        saw_clear_before_offline,
+                        "transcript was not cleared before offline state"
+                    );
+                    saw_offline = true;
+                }
+                FederationEvent::ServerChanged(server)
+                    if server.id == b_id
+                        && server.connection == RemoteConnectionState::Online
+                        && saw_offline =>
+                {
+                    return;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(saw_clear_before_offline);
+    assert!(
+        second_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|method| method == methods::WATCH_DOC_MESSAGES)
+    );
+}
+
+#[tokio::test]
+async fn immediately_ending_resource_stream_uses_backoff_before_redial() {
+    let a_id = secure_server('a');
+    let b_id = secure_server('b');
+    let local = service(
+        a_id,
+        "A",
+        vec![remote(b_id.clone(), "B", 'b')],
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let first = service_with_closing_stream(
+        b_id.clone(),
+        "B",
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+        methods::WATCH_CHATS,
+    );
+    let second = service_with_closing_stream(
+        b_id.clone(),
+        "B",
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+        methods::WATCH_CHATS,
+    );
+    let connector = Arc::new(FixtureConnector(Mutex::new(HashMap::from([(
+        b_id.clone(),
+        VecDeque::from([Ok(first), Ok(second)]),
+    )]))));
+    let inspect = connector.clone();
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut federation = Federation::with_connector(local, data_dir.path(), connector)
+        .await
+        .unwrap();
+    let mut snapshot = ServerSnapshot::default();
+    wait_for_state(
+        &mut federation,
+        &mut snapshot,
+        &b_id,
+        &RemoteConnectionState::Offline,
+    )
+    .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    assert_eq!(inspect.0.lock().unwrap().get(&b_id).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn invalid_persisted_pin_is_terminal_until_registry_replacement_or_reconnect() {
+    let a_id = secure_server('a');
+    let b_id = secure_server('b');
+    let local = service(
+        a_id,
+        "A",
+        vec![remote(b_id.clone(), "B", 'b')],
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let b = service(
+        b_id.clone(),
+        "B",
+        Vec::new(),
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let connector = Arc::new(FixtureConnector(Mutex::new(HashMap::from([(
+        b_id.clone(),
+        VecDeque::from([
+            Err(RemoteConnectError::InvalidConfiguration("bad pin".into())),
+            Ok(b),
+        ]),
+    )]))));
+    let inspect = connector.clone();
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut federation = Federation::with_connector(local, data_dir.path(), connector)
+        .await
+        .unwrap();
+    let mut snapshot = ServerSnapshot::default();
+    wait_for_state(
+        &mut federation,
+        &mut snapshot,
+        &b_id,
+        &RemoteConnectionState::IdentityChanged,
+    )
+    .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(inspect.0.lock().unwrap().get(&b_id).unwrap().len(), 1);
 }
