@@ -414,14 +414,24 @@ pub async fn serve_ipc(
 }
 
 /// Best-effort human name for this device's registry row (hostname).
-fn local_device_name() -> String {
-    std::env::var("COMET_DEVICE_NAME")
-        .ok()
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+fn local_device_name_from(
+    getenv: impl Fn(&str) -> Option<String>,
+    read_hostname: impl Fn() -> Option<String>,
+) -> String {
+    ["COMET_DEVICE_NAME", "COMPUTERNAME", "HOSTNAME"]
+        .into_iter()
+        .filter_map(getenv)
+        .chain(read_hostname())
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
         .unwrap_or_else(|| "unknown-device".to_string())
+}
+
+fn local_device_name() -> String {
+    local_device_name_from(
+        |key| std::env::var(key).ok(),
+        || std::fs::read_to_string("/etc/hostname").ok(),
+    )
 }
 
 /// Stable per-installation device id, persisted at `{data_dir}/device-id`.
@@ -440,6 +450,39 @@ fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_name_prefers_override_then_windows_hostname() {
+        let name = local_device_name_from(
+            |key| match key {
+                "COMET_DEVICE_NAME" => Some("  Lab Override  ".into()),
+                "COMPUTERNAME" => Some("BUILD-PC".into()),
+                "HOSTNAME" => Some("unix-host".into()),
+                _ => None,
+            },
+            || Some("file-host".into()),
+        );
+        assert_eq!(name, "Lab Override");
+
+        let windows = local_device_name_from(
+            |key| (key == "COMPUTERNAME").then(|| "BUILD-PC".into()),
+            || None,
+        );
+        assert_eq!(windows, "BUILD-PC");
+    }
+
+    #[test]
+    fn local_name_ignores_empty_values_and_falls_back() {
+        let hostname = local_device_name_from(
+            |key| match key {
+                "COMET_DEVICE_NAME" | "COMPUTERNAME" => Some("   ".into()),
+                "HOSTNAME" => Some(" linux-box ".into()),
+                _ => None,
+            },
+            || Some("file-host".into()),
+        );
+        assert_eq!(hostname, "linux-box");
+    }
 
     #[tokio::test]
     async fn rpc_services_from_one_core_share_mutation_authority() {

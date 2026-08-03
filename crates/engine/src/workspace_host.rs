@@ -96,7 +96,8 @@ impl WorkspaceHost {
         doc.ensure_schema_version()?;
 
         // Boot: upsert our own device row. A user-set name (RenameDevice is LWW from
-        // any device) survives restarts — only a missing row gets the hostname.
+        // any device) survives restarts; missing and generated sentinel names are
+        // repaired from the detected hostname.
         let now = Utc::now();
         let existing = doc
             .read_devices()?
@@ -104,11 +105,10 @@ impl WorkspaceHost {
             .find(|d| d.id == config.device_id);
         doc.upsert_device(&Device {
             id: config.device_id.clone(),
-            name: existing
-                .as_ref()
-                .map(|d| d.name.clone())
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| config.device_name.clone()),
+            name: startup_device_name(
+                existing.as_ref().map(|device| device.name.as_str()),
+                &config.device_name,
+            ),
             platform: config.platform.clone(),
             last_seen_at: Some(now),
             // First registration stamps `createdAt`; restarts keep the original
@@ -611,6 +611,18 @@ impl WorkspaceHostInner {
     }
 }
 
+fn startup_device_name(existing: Option<&str>, detected: &str) -> String {
+    match existing {
+        Some(name)
+            if !name.trim().is_empty()
+                && !matches!(name.trim(), "unknown-default" | "unknown-device") =>
+        {
+            name.to_string()
+        }
+        _ => detected.to_string(),
+    }
+}
+
 /// Local live statuses win for this device's chats; every other device's rows come
 /// from the workspace doc. Sorted by chat id (stable stream output).
 fn merge_sessions(device_id: &str, rows: &[Session], local: &[Session]) -> Vec<Session> {
@@ -655,5 +667,32 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
                 inner.save_snapshot();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_name_repairs_generated_sentinels() {
+        assert_eq!(startup_device_name(None, "BUILD-PC"), "BUILD-PC");
+        assert_eq!(startup_device_name(Some(""), "BUILD-PC"), "BUILD-PC");
+        assert_eq!(
+            startup_device_name(Some("unknown-default"), "BUILD-PC"),
+            "BUILD-PC"
+        );
+        assert_eq!(
+            startup_device_name(Some("unknown-device"), "BUILD-PC"),
+            "BUILD-PC"
+        );
+    }
+
+    #[test]
+    fn startup_name_preserves_deliberate_rename() {
+        assert_eq!(
+            startup_device_name(Some("Rendering workstation"), "BUILD-PC"),
+            "Rendering workstation"
+        );
     }
 }
