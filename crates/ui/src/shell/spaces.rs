@@ -26,6 +26,106 @@ pub(super) struct SpaceDragState {
     prev_over: usize,
 }
 
+#[cfg(test)]
+mod federation_projection_tests {
+    use super::*;
+    use comet_client::ServerState;
+    use comet_proto::{RemoteConnectionState, ServerId};
+
+    fn server(id: &str, state: RemoteConnectionState, spaces: &[&str]) -> ServerState {
+        let mut server = ServerState::empty(ServerId::new(id), id, state);
+        server.spaces = spaces
+            .iter()
+            .map(|id| Space {
+                id: (*id).into(),
+                device_id: "device".into(),
+                path: format!("/{id}"),
+                name: None,
+                git_detected: false,
+                git_checked_at: None,
+                checkout_id: None,
+                created_at: Utc::now(),
+            })
+            .collect();
+        server
+    }
+
+    #[test]
+    fn projection_groups_every_online_server_and_hides_offline_children() {
+        let local = server("local", RemoteConnectionState::Online, &["same"]);
+        let b = server("b", RemoteConnectionState::Online, &["same"]);
+        let c = server("c", RemoteConnectionState::Offline, &["stale"]);
+        let servers = std::collections::HashMap::from([
+            (local.id.clone(), local),
+            (b.id.clone(), b),
+            (c.id.clone(), c),
+        ]);
+        let order = vec![
+            ServerId::new("local"),
+            ServerId::new("b"),
+            ServerId::new("c"),
+        ];
+
+        let groups = project_sidebar_servers(&servers, &order);
+
+        assert_eq!(
+            groups
+                .iter()
+                .map(|g| g.server.id.clone())
+                .collect::<Vec<_>>(),
+            order
+        );
+        assert_eq!(groups[0].spaces.len(), 1);
+        assert_eq!(groups[1].spaces.len(), 1);
+        assert!(groups[2].spaces.is_empty());
+    }
+}
+
+#[derive(Clone)]
+struct SidebarServerGroup {
+    server: comet_client::ServerState,
+    spaces: Vec<Space>,
+    chats: Vec<comet_proto::Chat>,
+}
+
+fn project_sidebar_servers(
+    servers: &std::collections::HashMap<comet_proto::ServerId, comet_client::ServerState>,
+    order: &[comet_proto::ServerId],
+) -> Vec<SidebarServerGroup> {
+    order
+        .iter()
+        .filter_map(|id| servers.get(id))
+        .map(|server| {
+            let online = server.connection == comet_proto::RemoteConnectionState::Online;
+            SidebarServerGroup {
+                server: server.clone(),
+                spaces: if online {
+                    let mut spaces = server.spaces.clone();
+                    spaces.sort_by(|a, b| {
+                        a.created_at
+                            .cmp(&b.created_at)
+                            .then_with(|| a.id.cmp(&b.id))
+                    });
+                    spaces
+                } else {
+                    Vec::new()
+                },
+                chats: if online {
+                    let mut chats = server.chats.clone();
+                    chats.sort_by(|a, b| {
+                        b.last_message_at
+                            .cmp(&a.last_message_at)
+                            .then_with(|| a.id.cmp(&b.id))
+                    });
+                    chats
+                } else {
+                    Vec::new()
+                },
+            }
+        })
+        .collect()
+}
+
 /// The dragged-row payload (gpui drag-and-drop).
 struct SpaceDragPayload {
     from: usize,
@@ -178,17 +278,14 @@ impl Shell {
         if self.space_drag.is_some() && !cx.has_active_drag() {
             self.space_drag = None;
         }
-        let (server_headers, active_server) = {
+        let (server_groups, active_server) = {
             let state = self.state.read(cx);
             (
-                state
-                    .server_order
-                    .iter()
-                    .filter_map(|id| state.servers.get(id).cloned())
-                    .collect::<Vec<_>>(),
+                project_sidebar_servers(&state.servers, &state.server_order),
                 state.selected_server_id().cloned(),
             )
         };
+        let grouped_mode = server_groups.len() > 1;
         let (spaces, selected, device_names, offline_devices, attention): (
             Vec<Space>,
             Option<String>,
@@ -302,8 +399,10 @@ impl Shell {
             );
 
         let mut column = div().flex().flex_col().child(header);
-        for (index, server) in server_headers.into_iter().enumerate() {
+        for (index, group) in server_groups.into_iter().enumerate() {
+            let server = group.server;
             let id = server.id.clone();
+            let header_id = id.clone();
             let online = server.connection == comet_proto::RemoteConnectionState::Online;
             let selected_server = active_server.as_ref() == Some(&id);
             let status = match server.connection {
@@ -344,7 +443,7 @@ impl Shell {
                         row.cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.state.update(cx, |state, cx| {
-                                    state.select_server_bucket(id.clone());
+                                    state.select_server_bucket(header_id.clone());
                                     cx.notify();
                                 });
                             }))
@@ -352,8 +451,131 @@ impl Shell {
                     .child(SharedString::from(server.name))
                     .child(SharedString::from(status)),
             );
+            if online && grouped_mode {
+                for (space_index, space) in group.spaces.into_iter().enumerate() {
+                    let owner = comet_proto::ServerRef::new(id.clone(), space.id.clone());
+                    let selected = self.state.read(cx).selected_space.as_ref() == Some(&owner);
+                    let select_server = id.clone();
+                    let select_space = space.id.clone();
+                    let menu_server = id.clone();
+                    let menu_space = space.id.clone();
+                    let device_name = server
+                        .devices
+                        .iter()
+                        .find(|device| device.id == space.device_id)
+                        .map(|device| device.name.clone())
+                        .unwrap_or_else(|| "Unknown device".into());
+                    column = column.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "server-{index}-space-{space_index}"
+                            )))
+                            .mx(px(Theme::SPACE_SM))
+                            .px(px(Theme::SPACE_SM))
+                            .py(px(6.0))
+                            .rounded(px(8.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(Theme::SPACE_SM))
+                            .cursor_pointer()
+                            .text_size(px(13.0))
+                            .text_color(theme.text.opacity(0.8))
+                            .when(selected, |row| {
+                                row.bg(crate::theme::glass_selected_bg())
+                                    .shadow(crate::theme::glass_selected_shadows())
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.state.update(cx, |state, cx| {
+                                    state.select_server_bucket(select_server.clone());
+                                    cx.notify();
+                                });
+                                this.activate_space(select_space.clone(), cx);
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    this.state.update(cx, |state, cx| {
+                                        state.select_server_bucket(menu_server.clone());
+                                        cx.notify();
+                                    });
+                                    this.space_menu = Some((menu_space.clone(), event.position));
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                icon(icons::FOLDER)
+                                    .size(px(16.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .child(space.display_name().to_string()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_muted)
+                                    .child(device_name),
+                            ),
+                    );
+                }
+                for (chat_index, chat) in group
+                    .chats
+                    .into_iter()
+                    .filter(|chat| !chat.archived)
+                    .enumerate()
+                {
+                    let owner = comet_proto::ServerRef::new(id.clone(), chat.id.clone());
+                    let selected = self.state.read(cx).selected_chat.as_ref() == Some(&owner);
+                    let select_server = id.clone();
+                    let select_chat = chat.id.clone();
+                    column = column.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "server-{index}-chat-{chat_index}"
+                            )))
+                            .mx(px(Theme::SPACE_SM))
+                            .ml(px(Theme::SPACE_LG))
+                            .px(px(Theme::SPACE_SM))
+                            .py(px(4.0))
+                            .rounded(px(7.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(Theme::SPACE_SM))
+                            .cursor_pointer()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .when(selected, |row| row.bg(crate::theme::glass_selected_bg()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.state.update(cx, |state, cx| {
+                                    state.select_server_bucket(select_server.clone());
+                                    state.select_chat(Some(select_chat.clone()), cx);
+                                });
+                                cx.notify();
+                            }))
+                            .child(
+                                icon(icons::CHAT_ROUND_LINE)
+                                    .size(px(14.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(chat.title.unwrap_or_else(|| "New session".into())),
+                            ),
+                    );
+                }
+            }
         }
-        if spaces.is_empty() {
+        let render_flat_projection = !grouped_mode;
+        if render_flat_projection && spaces.is_empty() {
             // Ghost row: the empty-state affordance mirrors a space row.
             column = column.child(
                 div()
@@ -387,7 +609,7 @@ impl Shell {
                     )
                     .child(SharedString::from("Add space")),
             );
-        } else {
+        } else if render_flat_projection {
             let count = spaces.len();
             let drag = self
                 .space_drag

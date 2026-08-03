@@ -186,6 +186,17 @@ struct ChatTabs {
     active: usize,
 }
 
+fn terminal_server_for_chat(chat: &ServerRef) -> &comet_proto::ServerId {
+    &chat.server_id
+}
+
+fn purge_terminal_server(
+    chats: &mut HashMap<ServerRef, ChatTabs>,
+    server_id: &comet_proto::ServerId,
+) {
+    chats.retain(|chat, _| &chat.server_id != server_id);
+}
+
 /// Drag-reorder state; `epoch` keys the 150 ms slide animation restarts.
 struct DragState {
     from: usize,
@@ -267,7 +278,23 @@ impl TerminalPanel {
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
-        let selected = self.state.read(cx).selected_chat.clone();
+        let (selected, unavailable) = {
+            let state = self.state.read(cx);
+            let unavailable = self
+                .chats
+                .keys()
+                .filter(|chat| {
+                    state.servers.get(&chat.server_id).is_none_or(|server| {
+                        server.connection != comet_proto::RemoteConnectionState::Online
+                    })
+                })
+                .map(|chat| chat.server_id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            (state.selected_chat.clone(), unavailable)
+        };
+        for server_id in unavailable {
+            purge_terminal_server(&mut self.chats, &server_id);
+        }
         let switched = selected != self.last_selected;
         if switched {
             self.last_selected = selected;
@@ -585,7 +612,7 @@ impl TerminalPanel {
     }
 
     fn flush_input(&mut self, chat: ServerRef, key: u64, cx: &mut Context<Self>) {
-        let Some(engine) = self.engine(cx) else {
+        let Some(engine) = self.state.read(cx).client_for(&chat) else {
             return;
         };
         let target = self.chat_target(&chat, cx);
@@ -1280,5 +1307,29 @@ mod tests {
         emulator.feed(b"$ done");
         emulator.feed(&exit_message(1));
         assert_eq!(emulator.row_text(1), "[process exited 1]");
+    }
+
+    #[test]
+    fn terminal_chat_client_ignores_the_current_server_selection() {
+        let chat = ServerRef::new(comet_proto::ServerId::new("server-b"), "chat-1");
+
+        let server = terminal_server_for_chat(&chat);
+
+        assert_eq!(server, &chat.server_id);
+    }
+
+    #[test]
+    fn purging_one_terminal_server_preserves_other_servers() {
+        let b = ServerRef::new(comet_proto::ServerId::new("server-b"), "same-chat");
+        let c = ServerRef::new(comet_proto::ServerId::new("server-c"), "same-chat");
+        let mut chats = HashMap::from([
+            (b.clone(), ChatTabs::default()),
+            (c.clone(), ChatTabs::default()),
+        ]);
+
+        purge_terminal_server(&mut chats, &b.server_id);
+
+        assert!(!chats.contains_key(&b));
+        assert!(chats.contains_key(&c));
     }
 }

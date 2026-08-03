@@ -2750,9 +2750,9 @@ impl Composer {
                     // Attachment in the original send path).
                     let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
                     for (path, att) in attachment_paths.iter().zip(&staged) {
-                        attachments::seed_attachment(&seed_device, path, &att.name, att.image.clone());
+                        attachments::seed_attachment(&async_chat_owner.server_id, &seed_device, path, &att.name, att.image.clone());
                         if seed_device != device_id {
-                            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+                            attachments::seed_attachment(&async_chat_owner.server_id, &device_id, path, &att.name, att.image.clone());
                         }
                     }
                     content = attachments::with_attachments(&text, &attachment_paths);

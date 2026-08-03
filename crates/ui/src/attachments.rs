@@ -25,6 +25,7 @@ use gpui::{
 
 use crate::state::ServerClient;
 use crate::theme::white_alpha;
+use comet_proto::ServerId;
 use comet_rpc::methods;
 
 /// use-attachments.ts `MAX_ATTACHMENT_BYTES`.
@@ -442,17 +443,26 @@ fn retry_delay(attempts: u32) -> Duration {
     Duration::from_millis((2_000u64 << attempts.min(3)).min(15_000))
 }
 
-fn cache() -> &'static Mutex<HashMap<(String, String), CacheEntry>> {
-    static CACHE: OnceLock<Mutex<HashMap<(String, String), CacheEntry>>> = OnceLock::new();
+fn cache() -> &'static Mutex<HashMap<(ServerId, String, String), CacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<(ServerId, String, String), CacheEntry>>> =
+        OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn key(device_id: &str, path: &str) -> (String, String) {
-    (device_id.to_string(), path.to_string())
+fn key(server_id: &ServerId, device_id: &str, path: &str) -> (ServerId, String, String) {
+    (server_id.clone(), device_id.to_string(), path.to_string())
 }
 
-pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
-    match cache().lock().unwrap().get(&key(device_id, path)) {
+pub fn attachment_snapshot(
+    server_id: &ServerId,
+    device_id: &str,
+    path: &str,
+) -> AttachmentSnapshot {
+    match cache()
+        .lock()
+        .unwrap()
+        .get(&key(server_id, device_id, path))
+    {
         Some(CacheEntry::Loaded(image)) => AttachmentSnapshot::Loaded(image.clone()),
         Some(CacheEntry::Error { attempts, at }) => AttachmentSnapshot::Error {
             retry_in: retry_delay(attempts.saturating_sub(1)).saturating_sub(at.elapsed()),
@@ -464,9 +474,9 @@ pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
 /// Claim the load for a source: `true` ⇒ the caller should start fetching now
 /// (the entry is marked Loading so concurrent renders don't double-fetch).
 /// Errored sources hand out a retry only after their backoff has elapsed.
-pub fn begin_load(device_id: &str, path: &str) -> bool {
+pub fn begin_load(server_id: &ServerId, device_id: &str, path: &str) -> bool {
     let mut cache = cache().lock().unwrap();
-    let entry = cache.entry(key(device_id, path));
+    let entry = cache.entry(key(server_id, device_id, path));
     match entry {
         std::collections::hash_map::Entry::Vacant(v) => {
             v.insert(CacheEntry::Loading { attempts: 0 });
@@ -485,22 +495,28 @@ pub fn begin_load(device_id: &str, path: &str) -> bool {
     }
 }
 
-pub fn store_loaded(device_id: &str, path: &str, name: SharedString, image: Arc<Image>) {
+pub fn store_loaded(
+    server_id: &ServerId,
+    device_id: &str,
+    path: &str,
+    name: SharedString,
+    image: Arc<Image>,
+) {
     cache().lock().unwrap().insert(
-        key(device_id, path),
+        key(server_id, device_id, path),
         CacheEntry::Loaded(CachedAttachmentImage { name, image }),
     );
 }
 
-pub fn store_error(device_id: &str, path: &str) {
+pub fn store_error(server_id: &ServerId, device_id: &str, path: &str) {
     let mut cache = cache().lock().unwrap();
-    let attempts = match cache.get(&key(device_id, path)) {
+    let attempts = match cache.get(&key(server_id, device_id, path)) {
         Some(CacheEntry::Loading { attempts }) => attempts + 1,
         Some(CacheEntry::Error { attempts, .. }) => *attempts,
         _ => 1,
     };
     cache.insert(
-        key(device_id, path),
+        key(server_id, device_id, path),
         CacheEntry::Error {
             attempts,
             at: Instant::now(),
@@ -510,8 +526,14 @@ pub fn store_error(device_id: &str, path: &str) {
 
 /// Seed the cache after a successful upload (composer send path) so the just-
 /// sent bubble's thumbnails render from local bytes instead of a round-trip.
-pub fn seed_attachment(device_id: &str, path: &str, name: &str, image: Arc<Image>) {
-    store_loaded(device_id, path, name.to_string().into(), image);
+pub fn seed_attachment(
+    server_id: &ServerId,
+    device_id: &str,
+    path: &str,
+    name: &str,
+    image: Arc<Image>,
+) {
+    store_loaded(server_id, device_id, path, name.to_string().into(), image);
 }
 
 // ---------------------------------------------------------------------------
@@ -672,5 +694,25 @@ mod tests {
         assert_eq!(retry_delay(2), Duration::from_millis(8_000));
         assert_eq!(retry_delay(3), Duration::from_millis(15_000));
         assert_eq!(retry_delay(9), Duration::from_millis(15_000));
+    }
+
+    #[test]
+    fn equal_device_paths_on_different_servers_have_separate_cache_entries() {
+        let b = comet_proto::ServerId::new("server-b");
+        let c = comet_proto::ServerId::new("server-c");
+        let path = "/same/device/path.png";
+
+        assert!(begin_load(&b, "device-1", path));
+        assert!(begin_load(&c, "device-1", path));
+        store_error(&b, "device-1", path);
+
+        assert!(matches!(
+            attachment_snapshot(&b, "device-1", path),
+            AttachmentSnapshot::Error { .. }
+        ));
+        assert!(matches!(
+            attachment_snapshot(&c, "device-1", path),
+            AttachmentSnapshot::Loading
+        ));
     }
 }

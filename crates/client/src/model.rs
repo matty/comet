@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use comet_doc::SessionMessageEntry;
 use comet_proto::{Chat, Device, RemoteConnectionState, ServerId, ServerRef, Session, Space};
 
-pub type FederationStream = tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>;
+pub type FederationStream = tokio::sync::mpsc::Receiver<serde_json::Value>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerState {

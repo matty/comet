@@ -596,8 +596,7 @@ impl AppState {
             .as_ref()
             .is_some_and(|key| &key.server_id == server_id)
         {
-            self.selected_chat = None;
-            self.transcript.clear();
+            self.clear_transcript_ownership();
         }
         if self
             .selected_space
@@ -606,6 +605,16 @@ impl AppState {
         {
             self.selected_space = None;
         }
+    }
+
+    fn clear_transcript_ownership(&mut self) {
+        if self.selected_chat.is_some()
+            && let Some(client) = &self.federation
+        {
+            client.watch_transcript(None);
+        }
+        self.selected_chat = None;
+        self.transcript.clear();
     }
 
     fn heal_to_local(&mut self) {
@@ -645,8 +654,7 @@ impl AppState {
             .as_ref()
             .is_some_and(|selected| !self.chats.iter().any(|chat| chat.id == selected.local_id))
         {
-            self.selected_chat = None;
-            self.transcript.clear();
+            self.clear_transcript_ownership();
         }
         if self.selected_space.as_ref().is_some_and(|selected| {
             !self
@@ -726,8 +734,7 @@ impl AppState {
         }
         self.active_server = Some(server_id);
         self.selected_space = None;
-        self.selected_chat = None;
-        self.transcript.clear();
+        self.clear_transcript_ownership();
         self.project_active_server();
     }
 
@@ -1287,7 +1294,9 @@ mod tests {
     fn remote_offline_heals_qualified_selection_to_local() {
         let local = server("local");
         let remote = server("b");
+        let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
         let mut state = AppState::new();
+        state.federation = Some(FederatedClient { commands });
         state.apply_federation(FederationEvent::ServerChanged(ServerState::empty(
             local.clone(),
             "This device",
@@ -1310,6 +1319,10 @@ mod tests {
         assert_eq!(state.selected_server_id(), Some(&local));
         assert!(state.selected_chat.is_none());
         assert!(state.transcript.is_empty());
+        assert!(matches!(
+            received.try_recv(),
+            Ok(FederationCommand::WatchTranscript(None))
+        ));
     }
 
     #[test]
@@ -1384,6 +1397,27 @@ mod tests {
 
         assert_eq!(state.pending_echoes()[0].id, "from-c");
         assert!(state.echoes.keys().all(|key| key.server_id != server("b")));
+    }
+
+    #[test]
+    fn selecting_a_server_header_clears_transcript_ownership() {
+        let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.federation = Some(FederatedClient { commands });
+        for id in ["a", "b"] {
+            let mut bucket = ServerState::empty(server(id), id, RemoteConnectionState::Online);
+            bucket.chats.push(remote_chat("chat-1", "space-1"));
+            state.apply_federation(FederationEvent::ServerChanged(bucket));
+        }
+        state.select_server_chat(ServerRef::new(server("b"), "chat-1"));
+
+        state.select_server_bucket(server("a"));
+
+        assert!(matches!(
+            received.try_recv(),
+            Ok(FederationCommand::WatchTranscript(None))
+        ));
+        assert!(state.selected_chat.is_none());
     }
 
     /// A localhost port that was just free (bind :0, read, drop).

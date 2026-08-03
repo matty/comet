@@ -21,6 +21,7 @@ use crate::{FederationCommand, FederationEvent, FederationStream, ServerState};
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 const STABLE_CONNECTION_DURATION: Duration = Duration::from_secs(1);
+const TRANSCRIPT_HANDOFF_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RetryWake {
@@ -225,6 +226,42 @@ struct Supervisor {
     task: tokio::task::JoinHandle<()>,
 }
 
+struct TranscriptHandoff {
+    previous: ServerRef,
+    acknowledged: tokio::sync::oneshot::Receiver<()>,
+    deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+fn begin_transcript_handoff(
+    supervisor: &Supervisor,
+    previous: ServerRef,
+) -> Option<TranscriptHandoff> {
+    let (acknowledged, received) = tokio::sync::oneshot::channel();
+    supervisor
+        .commands
+        .send(SupervisorCommand::WatchTranscript {
+            chat_id: None,
+            acknowledged: Some(acknowledged),
+        })
+        .ok()?;
+    Some(TranscriptHandoff {
+        previous,
+        acknowledged: received,
+        deadline: Box::pin(tokio::time::sleep(TRANSCRIPT_HANDOFF_TIMEOUT)),
+    })
+}
+
+async fn transcript_handoff_next(handoff: &mut Option<TranscriptHandoff>) -> (ServerRef, bool) {
+    let Some(handoff) = handoff.as_mut() else {
+        return futures::future::pending().await;
+    };
+    let acknowledged = tokio::select! {
+        result = &mut handoff.acknowledged => result.is_ok(),
+        _ = &mut handoff.deadline => false,
+    };
+    (handoff.previous.clone(), acknowledged)
+}
+
 struct RemoteContext {
     local: Arc<RpcClient>,
     local_hello: ServerHello,
@@ -276,8 +313,25 @@ async fn run_manager(
     };
 
     let mut selected: Option<ServerRef> = None;
+    let mut transcript_handoff: Option<TranscriptHandoff> = None;
     loop {
         tokio::select! {
+            (previous, acknowledged) = transcript_handoff_next(&mut transcript_handoff) => {
+                transcript_handoff = None;
+                if !acknowledged {
+                    restart_unresponsive_owner(
+                        &mut supervisors,
+                        &previous,
+                        &remote_context,
+                    )
+                    .await;
+                }
+                if let Some(chat) = selected.as_ref()
+                    && let Some(supervisor) = supervisors.get(&chat.server_id)
+                {
+                    queue_supervisor_transcript(supervisor, Some(chat.local_id.clone()));
+                }
+            }
             snapshot = registry.recv() => match snapshot {
                 Some(value) => match serde_json::from_value::<Vec<RemoteEntry>>(value) {
                     Ok(entries) => reconcile(&mut supervisors, &local_id, entries, &mut selected, &remote_context).await,
@@ -332,9 +386,16 @@ async fn run_manager(
                     }
                 }
                 Some(FederationCommand::WatchTranscript(chat)) => {
-                    if let Some(previous) = selected.take() {
+                    let previous = selected.clone();
+                    selected = chat;
+                    if transcript_handoff.is_some() {
+                        continue;
+                    }
+                    if let Some(previous) = previous {
                         if let Some(supervisor) = supervisors.get(&previous.server_id) {
-                            if !set_supervisor_transcript(supervisor, None).await {
+                            if let Some(handoff) = begin_transcript_handoff(supervisor, previous.clone()) {
+                                transcript_handoff = Some(handoff);
+                            } else {
                                 restart_unresponsive_owner(
                                     &mut supervisors,
                                     &previous,
@@ -346,8 +407,10 @@ async fn run_manager(
                             let _ = events.send(FederationEvent::Transcript { chat: previous, entries: Vec::new() });
                         }
                     }
-                    selected = chat;
-                    if let Some(chat) = selected.as_ref() && let Some(supervisor) = supervisors.get(&chat.server_id) {
+                    if transcript_handoff.is_none()
+                        && let Some(chat) = selected.as_ref()
+                        && let Some(supervisor) = supervisors.get(&chat.server_id)
+                    {
                         queue_supervisor_transcript(supervisor, Some(chat.local_id.clone()));
                     }
                 }
@@ -371,8 +434,14 @@ async fn run_manager(
 
 async fn stop_supervisor(supervisor: Supervisor) {
     let _ = supervisor.commands.send(SupervisorCommand::Shutdown);
-    supervisor.task.abort();
-    let _ = supervisor.task.await;
+    let mut task = supervisor.task;
+    if tokio::time::timeout(Duration::from_millis(250), &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 async fn stop_supervisor_then_clear(
@@ -389,6 +458,7 @@ async fn stop_supervisor_then_clear(
     }
 }
 
+#[cfg(test)]
 async fn set_supervisor_transcript(supervisor: &Supervisor, chat_id: Option<String>) -> bool {
     let (acknowledged, received) = tokio::sync::oneshot::channel();
     if supervisor
@@ -1195,6 +1265,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stopping_a_supervisor_allows_structured_shutdown_before_abort() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_task = completed.clone();
+        let (commands, mut receiver) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            if matches!(receiver.recv().await, Some(SupervisorCommand::Shutdown)) {
+                tokio::task::yield_now().await;
+                completed_task.store(true, Ordering::SeqCst);
+            }
+        });
+
+        stop_supervisor(Supervisor {
+            entry: None,
+            commands,
+            task,
+        })
+        .await;
+
+        assert!(completed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn old_supervisor_is_joined_before_its_transcript_clear() {
         struct FinalEvent(mpsc::UnboundedSender<FederationEvent>, ServerId);
         impl Drop for FinalEvent {
@@ -1450,6 +1542,36 @@ mod tests {
             received.try_recv(),
             Ok(FederationEvent::Notice { message, .. }) if message == "prior owner drained"
         ));
+        stop_supervisor(supervisor).await;
+    }
+
+    #[tokio::test]
+    async fn stalled_transcript_handoff_does_not_block_other_manager_inputs() {
+        let server_id = ServerId::new("server-b");
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let _held = command_rx.recv().await;
+            futures::future::pending::<()>().await;
+        });
+        let supervisor = Supervisor {
+            entry: None,
+            commands,
+            task,
+        };
+        let previous = ServerRef::new(server_id, "chat-1");
+        let mut handoff = Some(
+            begin_transcript_handoff(&supervisor, previous)
+                .expect("supervisor accepted transcript clear"),
+        );
+        let (other_send, mut other_receive) = mpsc::unbounded_channel();
+        other_send.send("registry changed").unwrap();
+
+        tokio::select! {
+            _ = transcript_handoff_next(&mut handoff) => {
+                panic!("stalled handoff completed before its acknowledgement");
+            }
+            value = other_receive.recv() => assert_eq!(value, Some("registry changed")),
+        }
         stop_supervisor(supervisor).await;
     }
 

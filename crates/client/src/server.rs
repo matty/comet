@@ -4,7 +4,7 @@ use std::sync::Arc;
 use comet_doc::SessionMessageEntry;
 use comet_proto::{Chat, Device, RemoteConnectionState, ServerHello, ServerRef, Session, Space};
 use comet_rpc::{RpcClient, RpcError, RpcStream, methods};
-use futures::future::BoxFuture;
+use futures::{StreamExt as _, future::BoxFuture, stream::FuturesUnordered};
 use tokio::sync::mpsc;
 
 use crate::{FederationEvent, FederationStream, ServerState};
@@ -35,6 +35,7 @@ pub(crate) enum ConnectedExit {
 }
 
 const MAX_QUEUED_CALLS: usize = 32;
+const SUBSCRIPTION_BUFFER: usize = 16;
 struct GenericCall {
     method: &'static str,
     params: serde_json::Value,
@@ -44,6 +45,45 @@ struct GenericCall {
 struct ActiveCall {
     future: BoxFuture<'static, Result<serde_json::Value, RpcError>>,
     reply: Option<tokio::sync::oneshot::Sender<Result<serde_json::Value, RpcError>>>,
+}
+
+type SubscriptionSetup = BoxFuture<
+    'static,
+    (
+        tokio::sync::oneshot::Sender<Result<FederationStream, RpcError>>,
+        Result<RpcStream, RpcError>,
+    ),
+>;
+
+async fn subscription_setup_next(
+    setups: &mut FuturesUnordered<SubscriptionSetup>,
+) -> (
+    tokio::sync::oneshot::Sender<Result<FederationStream, RpcError>>,
+    Result<RpcStream, RpcError>,
+) {
+    if setups.is_empty() {
+        futures::future::pending().await
+    } else {
+        setups
+            .next()
+            .await
+            .expect("non-empty subscription setup set")
+    }
+}
+
+async fn subscription_forwarder_next(
+    tasks: &mut tokio::task::JoinSet<()>,
+) -> Option<Result<(), tokio::task::JoinError>> {
+    if tasks.is_empty() {
+        futures::future::pending().await
+    } else {
+        tasks.join_next().await
+    }
+}
+
+async fn stop_subscription_forwarders(tasks: &mut tokio::task::JoinSet<()>) {
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
 }
 
 fn start_call(client: Arc<RpcClient>, call: GenericCall) -> ActiveCall {
@@ -212,13 +252,8 @@ pub(crate) async fn supervise_connected(
         };
     let mut active_call = None;
     let mut queued_calls = VecDeque::<GenericCall>::new();
-    struct SubscriptionTask(tokio::task::JoinHandle<()>);
-    impl Drop for SubscriptionTask {
-        fn drop(&mut self) {
-            self.0.abort();
-        }
-    }
-    let mut subscriptions = Vec::<SubscriptionTask>::new();
+    let mut subscriptions = tokio::task::JoinSet::<()>::new();
+    let mut subscription_setups = FuturesUnordered::<SubscriptionSetup>::new();
 
     let mut state = ServerState::empty(
         hello.server_id.clone(),
@@ -254,6 +289,36 @@ pub(crate) async fn supervise_connected(
                     .map(|call| start_call(client.clone(), call));
                 continue;
             }
+            (reply, result) = subscription_setup_next(&mut subscription_setups) => {
+                match result {
+                    Ok(mut source) => {
+                        let (send, receive) = mpsc::channel(SUBSCRIPTION_BUFFER);
+                        if reply.is_closed() {
+                            continue;
+                        }
+                        subscriptions.spawn(async move {
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    _ = send.closed() => break,
+                                    value = source.recv() => match value {
+                                        Some(value) => {
+                                            if send.send(value).await.is_err() { break; }
+                                        }
+                                        None => break,
+                                    }
+                                }
+                            }
+                        });
+                        let _ = reply.send(Ok(receive));
+                    }
+                    Err(error) => { let _ = reply.send(Err(error)); }
+                }
+                continue;
+            }
+            _ = subscription_forwarder_next(&mut subscriptions) => {
+                continue;
+            }
             command = commands.recv() => match command {
                 Some(SupervisorCommand::Call(method, params)) => {
                     let call = GenericCall { method, params, reply: None };
@@ -285,20 +350,11 @@ pub(crate) async fn supervise_connected(
                     continue;
                 }
                 Some(SupervisorCommand::Subscribe { method, params, reply }) => {
-                    match client.subscribe(method, params).await {
-                        Ok(mut source) => {
-                            let (send, receive) = mpsc::unbounded_channel();
-                            subscriptions.push(SubscriptionTask(tokio::spawn(async move {
-                                while let Some(value) = source.recv().await {
-                                    if send.send(value).is_err() {
-                                        break;
-                                    }
-                                }
-                            })));
-                            let _ = reply.send(Ok(receive));
-                        }
-                        Err(error) => { let _ = reply.send(Err(error)); }
-                    }
+                    let setup_client = client.clone();
+                    subscription_setups.push(Box::pin(async move {
+                        let result = setup_client.subscribe(method, params).await;
+                        (reply, result)
+                    }));
                     continue;
                 }
                 Some(SupervisorCommand::WatchTranscript { chat_id, acknowledged }) => {
@@ -322,10 +378,12 @@ pub(crate) async fn supervise_connected(
                 }
                 Some(SupervisorCommand::Reconnect) => {
                     cancel_calls(&mut active_call, &mut queued_calls);
+                    stop_subscription_forwarders(&mut subscriptions).await;
                     return Ok(ConnectedExit::Reconnect)
                 },
                 Some(SupervisorCommand::Shutdown) | None => {
                     cancel_calls(&mut active_call, &mut queued_calls);
+                    stop_subscription_forwarders(&mut subscriptions).await;
                     return Ok(ConnectedExit::Shutdown)
                 },
             }
@@ -366,7 +424,7 @@ mod tests {
     use comet_proto::{PROTOCOL_VERSION, ServerId};
     use comet_rpc::{RpcReply, RpcService};
     use futures::StreamExt;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     type SupervisorTask = tokio::task::JoinHandle<Result<ConnectedExit, RpcError>>;
     type StalledFixture = (
@@ -404,6 +462,49 @@ mod tests {
         second_started: Arc<tokio::sync::Notify>,
     }
 
+    struct QuietSubscriptionService {
+        dropped: Arc<AtomicUsize>,
+    }
+
+    struct CountDrop(Arc<AtomicUsize>);
+
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RpcService for QuietSubscriptionService {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            match method {
+                methods::WATCH_DEVICES
+                | methods::WATCH_SPACES
+                | methods::WATCH_CHATS
+                | methods::WATCH_SESSIONS => Ok(RpcReply::Stream(
+                    futures::stream::once(async { serde_json::json!([]) })
+                        .chain(futures::stream::pending())
+                        .boxed(),
+                )),
+                "QuietEvents" => {
+                    let guard = CountDrop(self.dropped.clone());
+                    Ok(RpcReply::Stream(
+                        futures::stream::unfold(guard, |guard| async move {
+                            futures::future::pending::<()>().await;
+                            Some((serde_json::Value::Null, guard))
+                        })
+                        .boxed(),
+                    ))
+                }
+                other => Err(RpcError::UnknownMethod(other.into())),
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl RpcService for OrderedCallService {
         async fn handle(
@@ -432,6 +533,11 @@ mod tests {
                 "Fail" => Err(RpcError::Failed("ordered failure".into())),
                 "Events" => Ok(RpcReply::Stream(
                     futures::stream::once(async { serde_json::json!({"seq": 1}) })
+                        .chain(futures::stream::pending())
+                        .boxed(),
+                )),
+                "FastEvents" => Ok(RpcReply::Stream(
+                    futures::stream::iter((0..1_000).map(|seq| serde_json::json!(seq)))
                         .chain(futures::stream::pending())
                         .boxed(),
                 )),
@@ -560,6 +666,17 @@ mod tests {
             futures::future::pending::<()>().await;
         });
         RpcClient::new(out, inbound)
+    }
+
+    fn controllable_transport() -> (RpcClient, mpsc::Sender<String>, mpsc::Receiver<String>) {
+        let (out, outbound) = mpsc::channel(1);
+        let control = out.clone();
+        let (inbound_sender, inbound) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let _inbound_sender = inbound_sender;
+            futures::future::pending::<()>().await;
+        });
+        (RpcClient::new(out, inbound), control, outbound)
     }
 
     async fn wait_online(events: &mut mpsc::UnboundedReceiver<FederationEvent>) {
@@ -857,5 +974,115 @@ mod tests {
         commands.send(SupervisorCommand::Reconnect).unwrap();
         assert!(matches!(task.await, Ok(Ok(ConnectedExit::Reconnect))));
         assert_eq!(stream.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn reconnect_interrupts_a_stalled_subscription_handshake() {
+        let (client, transport, mut outbound) = controllable_transport();
+        let (task, commands, mut events) = spawn_with_client(client);
+        for _ in 0..4 {
+            outbound.recv().await.expect("initial watch request");
+        }
+        wait_online(&mut events).await;
+        transport.try_send("occupied".into()).unwrap();
+        let (reply, _received) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Subscribe {
+                method: "SlowEvents",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        commands.send(SupervisorCommand::Reconnect).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), task).await;
+        assert!(
+            matches!(result, Ok(Ok(Ok(ConnectedExit::Reconnect)))),
+            "stalled subscription handshake blocked reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_quiet_subscription_receiver_cancels_server_work() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let client = comet_rpc::memory_client(Arc::new(QuietSubscriptionService {
+            dropped: dropped.clone(),
+        }));
+        let (task, commands, mut events) = spawn_with_client(client);
+        wait_online(&mut events).await;
+        let (reply, received) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Subscribe {
+                method: "QuietEvents",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+        let stream = received.await.unwrap().unwrap();
+        drop(stream);
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            while dropped.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("quiet server stream survived receiver drop");
+        commands.send(SupervisorCommand::Shutdown).unwrap();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn fast_subscription_source_cannot_overfill_the_public_receiver() {
+        let (task, commands, mut events, ..) = spawn_ordered();
+        wait_online(&mut events).await;
+        let (reply, received) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Subscribe {
+                method: "FastEvents",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+        let stream = received.await.unwrap().unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            stream.len() <= 16,
+            "public subscription buffer grew unbounded"
+        );
+        drop(stream);
+        commands.send(SupervisorCommand::Shutdown).unwrap();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn completed_subscription_forwarders_do_not_accumulate() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let client = comet_rpc::memory_client(Arc::new(QuietSubscriptionService {
+            dropped: dropped.clone(),
+        }));
+        let (task, commands, mut events) = spawn_with_client(client);
+        wait_online(&mut events).await;
+        for _ in 0..32 {
+            let (reply, received) = tokio::sync::oneshot::channel();
+            commands
+                .send(SupervisorCommand::Subscribe {
+                    method: "QuietEvents",
+                    params: serde_json::Value::Null,
+                    reply,
+                })
+                .unwrap();
+            drop(received.await.unwrap().unwrap());
+        }
+        tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            while dropped.load(Ordering::SeqCst) != 32 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed forwarders retained their source streams");
+        commands.send(SupervisorCommand::Shutdown).unwrap();
+        let _ = task.await;
     }
 }
