@@ -14,10 +14,12 @@ pub struct MigrateArgs {
 pub fn run(data_dir: &Path, from: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(data_dir)?;
     let profile = parse_legacy_profile(from)?;
-    validate_legacy_directory(data_dir, &profile)?;
     let _lock = InstanceLock::acquire(data_dir).map_err(|error| {
         anyhow::anyhow!("cannot migrate while the Comet engine is running: {error}")
     })?;
+    // Validate only after obtaining exclusive ownership, and immediately
+    // before the migration consumes this exact profile selector.
+    validate_legacy_directory(data_dir, &profile)?;
     let store = prepare_local_store(data_dir, Some(&profile))?;
     println!("Migrated {from} into {}.", store.root.display());
     Ok(())
@@ -46,6 +48,9 @@ fn safe_segment(value: &str) -> bool {
 }
 
 fn validate_legacy_directory(data_dir: &Path, profile: &LegacyProfile) -> anyhow::Result<()> {
+    let canonical_data_dir = data_dir
+        .canonicalize()
+        .context("resolving the selected data directory")?;
     let orgs = data_dir.join("orgs");
     let selected = orgs.join(&profile.org_id).join(&profile.user_id);
     if !selected.is_dir() {
@@ -60,6 +65,9 @@ fn validate_legacy_directory(data_dir: &Path, profile: &LegacyProfile) -> anyhow
     let orgs = orgs
         .canonicalize()
         .context("resolving the legacy orgs directory")?;
+    if !orgs.starts_with(&canonical_data_dir) {
+        bail!("legacy orgs directory resolves outside the data directory");
+    }
     let selected = selected
         .canonicalize()
         .context("resolving the selected legacy profile")?;
@@ -106,5 +114,47 @@ mod tests {
         let err = run(dir.path(), "org-a/user-a").unwrap_err().to_string();
         assert!(err.contains("engine is running"), "{err}");
         assert!(!dir.path().join("local-store").exists());
+    }
+
+    #[test]
+    fn orgs_directory_cannot_escape_the_canonical_data_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("org-a/user-a")).unwrap();
+        create_directory_link(outside.path(), &dir.path().join("orgs")).unwrap();
+        let profile = comet_engine::LegacyProfile {
+            org_id: "org-a".into(),
+            user_id: "user-a".into(),
+        };
+        let error = validate_legacy_directory(dir.path(), &profile)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outside the data directory"), "{error}");
+    }
+
+    #[cfg(unix)]
+    fn create_directory_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let status = std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(link)
+                    .arg(target)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other("failed to create test junction"))
+                }
+            }
+        }
     }
 }

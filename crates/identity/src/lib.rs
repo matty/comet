@@ -38,6 +38,18 @@ pub struct DeviceIdentity {
 }
 
 impl DeviceIdentity {
+    /// Load the selected installation identity without creating filesystem
+    /// state. Local IPC authority checks use this to fail closed when a port is
+    /// occupied before the selected data directory has an identity.
+    pub fn load_existing(data_dir: &Path) -> Result<Option<Arc<Self>>, IdentityError> {
+        let path = data_dir.join(IDENTITY_FILE);
+        match permissions::read_private(&path) {
+            Ok(bytes) => Self::from_private_bytes(bytes).map(Arc::new).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn load_or_create(data_dir: &Path) -> Result<Arc<Self>, IdentityError> {
         std::fs::create_dir_all(data_dir)?;
         let path = data_dir.join(IDENTITY_FILE);
@@ -243,6 +255,17 @@ mod tests {
                 .iter()
                 .all(|identity| identity.server_id() == identities[0].server_id())
         );
+    }
+
+    #[test]
+    fn loading_an_existing_identity_never_creates_one() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(DeviceIdentity::load_existing(dir.path()).unwrap().is_none());
+        assert!(!dir.path().join(IDENTITY_FILE).exists());
+
+        let created = DeviceIdentity::load_or_create(dir.path()).unwrap();
+        let loaded = DeviceIdentity::load_existing(dir.path()).unwrap().unwrap();
+        assert_eq!(created.server_id(), loaded.server_id());
     }
 
     #[cfg(unix)]

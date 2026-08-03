@@ -6,7 +6,8 @@ use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use comet_engine::{InstanceLock, RemoteConfigStore};
 use comet_proto::{
-    LanSettings, RemoteConnectionState, RemoteEndpoint, RemoteEntry, ServerId, TrustedClient,
+    LanSettings, RemoteConnectionState, RemoteEndpoint, RemoteEntry, ServerHello, ServerId,
+    TrustedClient,
 };
 use comet_rpc::{RpcClient, TlsIdentity, connect_ws, methods, pair_client_zeroizing};
 use data_encoding::{BASE32_NOPAD, HEXLOWER};
@@ -72,7 +73,7 @@ pub async fn run(command: RemoteCommand, data_dir: &Path, ipc_port: u16) -> anyh
 
 pub async fn status(data_dir: &Path, ipc_port: u16) -> anyhow::Result<()> {
     println!("Data dir: {}", data_dir.display());
-    if let Some(client) = local_client(ipc_port).await {
+    if let Some(client) = local_client(data_dir, ipc_port).await? {
         println!("Engine:   running");
         println!("IPC:      listening on 127.0.0.1:{ipc_port}");
         let lan = client
@@ -122,13 +123,15 @@ async fn add(
     name: Option<String>,
 ) -> anyhow::Result<()> {
     let endpoint = RemoteEndpoint::parse(endpoint_text).map_err(anyhow::Error::msg)?;
+    let client = local_client(data_dir, ipc_port).await?;
     let entered = Zeroizing::new(rpassword::prompt_password("Pairing secret: ")?);
     let secret = decode_pairing_secret(&entered)?;
-    let identity = comet_identity::DeviceIdentity::load_or_create(data_dir)?;
-    let tls = TlsIdentity::from_device_identity(&identity)?;
     let address = endpoint_address(&endpoint);
 
-    if let Some(client) = local_client(ipc_port).await {
+    if let Some(client) = client {
+        let identity = comet_identity::DeviceIdentity::load_existing(data_dir)?
+            .expect("validated local IPC requires an existing identity");
+        let tls = TlsIdentity::from_device_identity(&identity)?;
         let pinned = pair_client_zeroizing(address, &tls, secret).await?;
         let entry = paired_entry(endpoint, name, &pinned);
         client
@@ -139,8 +142,9 @@ async fn add(
         return Ok(());
     }
 
-    let _lock = acquire_offline_lock(data_dir)?;
-    let store = RemoteConfigStore::open(data_dir)?;
+    let offline = OfflineRemoteAdmin::open(data_dir)?;
+    let store = &offline.store;
+    let tls = TlsIdentity::from_device_identity(&offline.identity)?;
     let pinned = pair_client_zeroizing(address, &tls, secret).await?;
     let entry = paired_entry(endpoint, name, &pinned);
     store
@@ -178,7 +182,7 @@ fn paired_but_not_saved(entry: &RemoteEntry) -> String {
 }
 
 async fn remove(data_dir: &Path, ipc_port: u16, server_id: ServerId) -> anyhow::Result<()> {
-    if let Some(client) = local_client(ipc_port).await {
+    if let Some(client) = local_client(data_dir, ipc_port).await? {
         let reply = client
             .call(
                 methods::REMOVE_REMOTE,
@@ -204,7 +208,7 @@ async fn listen(
     disable: bool,
     bind: Option<std::net::SocketAddr>,
 ) -> anyhow::Result<()> {
-    if let Some(client) = local_client(ipc_port).await {
+    if let Some(client) = local_client(data_dir, ipc_port).await? {
         let current = client
             .call(methods::GET_LAN_SETTINGS, serde_json::Value::Null)
             .await?;
@@ -265,7 +269,7 @@ struct BeginPairingReply {
 }
 
 async fn pair(_data_dir: &Path, ipc_port: u16) -> anyhow::Result<()> {
-    let client = local_client(ipc_port).await.ok_or_else(|| {
+    let client = local_client(_data_dir, ipc_port).await?.ok_or_else(|| {
         anyhow::anyhow!(
             "pairing requires a running local Comet engine with remote connections enabled"
         )
@@ -291,7 +295,7 @@ async fn pair(_data_dir: &Path, ipc_port: u16) -> anyhow::Result<()> {
 }
 
 async fn revoke(data_dir: &Path, ipc_port: u16, server_id: ServerId) -> anyhow::Result<()> {
-    if let Some(client) = local_client(ipc_port).await {
+    if let Some(client) = local_client(data_dir, ipc_port).await? {
         let reply = client
             .call(
                 methods::REVOKE_TRUSTED_CLIENT,
@@ -319,7 +323,7 @@ fn print_removed(reply: &serde_json::Value, kind: &str) -> anyhow::Result<()> {
 }
 
 async fn read_remotes(data_dir: &Path, ipc_port: u16) -> anyhow::Result<Vec<RemoteEntry>> {
-    if let Some(client) = local_client(ipc_port).await {
+    if let Some(client) = local_client(data_dir, ipc_port).await? {
         return watch_first(&client, methods::WATCH_REMOTES).await;
     }
     let _lock = acquire_offline_lock(data_dir)?;
@@ -332,7 +336,7 @@ async fn read_remotes(data_dir: &Path, ipc_port: u16) -> anyhow::Result<Vec<Remo
 }
 
 async fn read_clients(data_dir: &Path, ipc_port: u16) -> anyhow::Result<Vec<TrustedClient>> {
-    if let Some(client) = local_client(ipc_port).await {
+    if let Some(client) = local_client(data_dir, ipc_port).await? {
         return watch_first(&client, methods::WATCH_TRUSTED_CLIENTS).await;
     }
     let _lock = acquire_offline_lock(data_dir)?;
@@ -354,14 +358,45 @@ async fn watch_first<T: serde::de::DeserializeOwned>(
     Ok(serde_json::from_value(value)?)
 }
 
-async fn local_client(ipc_port: u16) -> Option<RpcClient> {
-    tokio::time::timeout(
+async fn local_client(data_dir: &Path, ipc_port: u16) -> anyhow::Result<Option<RpcClient>> {
+    let Some(client) = tokio::time::timeout(
         Duration::from_millis(750),
         connect_ws(&format!("ws://127.0.0.1:{ipc_port}")),
     )
     .await
     .ok()
-    .and_then(Result::ok)
+    .and_then(Result::ok) else {
+        return Ok(None);
+    };
+    let hello: ServerHello = client
+        .call_as(methods::SERVER_HELLO, serde_json::Value::Null)
+        .await
+        .context("validating local IPC server identity")?;
+    let selected = comet_identity::DeviceIdentity::load_existing(data_dir)?
+        .ok_or_else(|| anyhow::anyhow!("local IPC is occupied, but the selected data directory has no identity; refusing local administration"))?;
+    if hello.server_id != *selected.server_id() {
+        bail!("local IPC belongs to a different data directory; refusing local administration");
+    }
+    Ok(Some(client))
+}
+
+struct OfflineRemoteAdmin {
+    _lock: InstanceLock,
+    identity: std::sync::Arc<comet_identity::DeviceIdentity>,
+    store: RemoteConfigStore,
+}
+
+impl OfflineRemoteAdmin {
+    fn open(data_dir: &Path) -> anyhow::Result<Self> {
+        let lock = acquire_offline_lock(data_dir)?;
+        let identity = comet_identity::DeviceIdentity::load_or_create(data_dir)?;
+        let store = RemoteConfigStore::open(data_dir)?;
+        Ok(Self {
+            _lock: lock,
+            identity,
+            store,
+        })
+    }
 }
 
 fn acquire_offline_lock(data_dir: &Path) -> anyhow::Result<InstanceLock> {
@@ -384,11 +419,12 @@ fn decode_pairing_secret(encoded: &str) -> anyhow::Result<Zeroizing<[u8; 16]>> {
             .decode(compact.as_bytes())
             .map_err(|_| anyhow::anyhow!("pairing secret must be grouped Base32 text"))?,
     );
-    let bytes: [u8; 16] = decoded
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("pairing secret must encode exactly 128 bits"))?;
-    Ok(Zeroizing::new(bytes))
+    if decoded.len() != 16 {
+        bail!("pairing secret must encode exactly 128 bits");
+    }
+    let mut secret = Zeroizing::new([0_u8; 16]);
+    secret.copy_from_slice(decoded.as_slice());
+    Ok(secret)
 }
 
 fn parse_server_id(value: &str) -> anyhow::Result<ServerId> {
@@ -497,7 +533,8 @@ mod tests {
 
     #[test]
     fn pairing_secret_decoder_accepts_grouped_text_without_retaining_the_input() {
-        let decoded = decode_pairing_secret("AEBA-GBAF-AYDQ-QCIK-BMGA-2DQP-CA").unwrap();
+        let decoded: Zeroizing<[u8; 16]> =
+            decode_pairing_secret("AEBA-GBAF-AYDQ-QCIK-BMGA-2DQP-CA").unwrap();
         assert_eq!(
             decoded.as_ref(),
             &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
@@ -543,5 +580,79 @@ mod tests {
         }];
         mark_offline(&mut remotes);
         assert_eq!(remotes[0].last_state, RemoteConnectionState::Offline);
+    }
+
+    #[test]
+    fn refused_offline_admin_does_not_create_identity_or_remote_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let _lock = InstanceLock::acquire(dir.path()).unwrap();
+        assert!(OfflineRemoteAdmin::open(dir.path()).is_err());
+        assert!(!dir.path().join("device-identity.pem").exists());
+        assert!(!dir.path().join("remote-access.json").exists());
+    }
+
+    struct HelloService(ServerHello);
+
+    #[async_trait::async_trait]
+    impl comet_rpc::RpcService for HelloService {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<comet_rpc::RpcReply, comet_rpc::RpcError> {
+            match method {
+                methods::SERVER_HELLO => comet_rpc::RpcReply::value(&self.0),
+                other => Err(comet_rpc::RpcError::UnknownMethod(other.into())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_for_another_data_directory_has_no_admin_authority() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let identity_a = comet_identity::DeviceIdentity::load_or_create(a.path()).unwrap();
+        let identity_b = comet_identity::DeviceIdentity::load_or_create(b.path()).unwrap();
+        let store_b = RemoteConfigStore::open(b.path()).unwrap();
+        let remote = remote("sha256:remote-a", RemoteConnectionState::Offline);
+        store_b.put_remote(remote.clone()).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(comet_rpc::serve_ws_listener(
+            listener,
+            std::sync::Arc::new(HelloService(ServerHello {
+                protocol_version: comet_proto::PROTOCOL_VERSION,
+                server_id: identity_a.server_id().clone(),
+                device_id: "a".into(),
+                name: "A".into(),
+                capabilities: vec![],
+            })),
+        ));
+
+        let error = remove(b.path(), port, remote.server_id.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("different data directory"), "{error}");
+        assert_eq!(
+            store_b.watch_remotes().borrow()[0].server_id,
+            remote.server_id
+        );
+        assert_ne!(identity_a.server_id(), identity_b.server_id());
+        server.abort();
+    }
+
+    fn remote(server_id: &str, state: RemoteConnectionState) -> RemoteEntry {
+        RemoteEntry {
+            server_id: ServerId::new(server_id),
+            endpoint: RemoteEndpoint::parse("buildbox.local:27655").unwrap(),
+            name: "Build box".into(),
+            pinned_spki_sha256: "pin".into(),
+            protocol_version: 1,
+            last_state: state,
+            created_at: Utc::now(),
+            last_connected_at: None,
+        }
     }
 }

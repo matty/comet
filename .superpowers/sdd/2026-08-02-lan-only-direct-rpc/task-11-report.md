@@ -39,3 +39,15 @@ The migration guard exposed that `InstanceLock` did not lock on Windows. The exi
 
 - Pairing and live local-RPC administration were verified against the existing hardened RPC/remote-access integration suite, but not with two physical machines in this task.
 - Non-Unix/non-Windows targets retain the pre-existing best-effort lock behavior; supported desktop/service targets (Windows, macOS, Linux) now have real exclusivity.
+
+## Review fix round 1
+
+- Every successful IPC connection now calls `ServerHello` and compares its `serverId` with the already-existing identity in the selected data directory before granting status or administrative authority. A mismatched engine is an error, including for destructive commands. If the selected directory has no identity, an occupied IPC port fails closed without creating one; only genuinely absent IPC proceeds to the offline-lock path.
+- Added `DeviceIdentity::load_existing`, which never creates a directory or identity file, plus identity and live WebSocket regressions. The destructive mismatch regression serves engine A on the selected port, selects data directory B, attempts removal, verifies the authority error, and verifies B remains unchanged.
+- Offline add setup is now represented by `OfflineRemoteAdmin::open`: it acquires `InstanceLock` before creating/loading `DeviceIdentity` or opening remote configuration. The refusal regression holds the lock and verifies neither `device-identity.pem` nor `remote-access.json` is created.
+- Migration now acquires the instance lock before legacy path validation. Validation canonicalizes the data directory, requires canonical `orgs` and selected profile paths to remain beneath it, rejects selected links, and runs immediately before `prepare_local_store` while the lock remains held. A Windows-capable directory-link escape regression covers the containment boundary.
+- Pairing secret decoding now checks the decoded length and copies directly from the zeroizing decoded vector into a pre-zeroized `[u8; 16]`; no plain fixed-size secret array is constructed. The decoder test statically requires `Zeroizing<[u8; 16]>`.
+
+Fix-round verification: `cargo test -p comet` 18/18, `cargo test -p comet-identity` 8/8, remote-access 20/20, instance-lock 2/2, focused strict Clippy passed, format and diff checks passed.
+
+After the final test-helper-only output suppression, the two directly affected IPC-identity and migration-containment tests passed again. A subsequent full package rerun hit MSVC `LNK1318 Unexpected PDB error; LIMIT`; clearing only the Comet package build artifacts and retrying single-job then stalled in the linker until the five-minute command timeout. No test failed in either linker attempt; the full 18/18 package run above predates only that output suppression.

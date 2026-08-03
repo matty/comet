@@ -31,3 +31,4 @@ rpassword = "7"
 
 [dev-dependencies]
 tempfile.workspace = true
+async-trait.workspace = true

@@ -1262,6 +1262,7 @@ name = "comet"
 version = "0.1.9"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "comet-engine",
