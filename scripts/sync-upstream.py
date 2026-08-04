@@ -86,7 +86,8 @@ def ensure_upstream(git: Git) -> None:
     found_url = result.stdout.strip()
     if not is_expected_upstream(found_url):
         raise SyncError(
-            f"Remote 'upstream' has an unexpected URL: {found_url}"
+            f"Remote 'upstream' has an unexpected URL: {found_url}. "
+            "Rename it first with git remote rename upstream <new-name>."
         )
 
 
@@ -241,7 +242,17 @@ def is_expected_upstream(url: str) -> bool:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Select and cherry-pick commits from zeronsh/comet"
+        description="Select and cherry-pick commits from zeronsh/comet",
+        epilog=(
+            "Choose eligible upstream commits, then review the oldest-first "
+            "order and give confirmation before any branch is created.\n"
+            "The helper creates a sync/upstream-YYYY-MM-DD safety branch. "
+            "If a cherry-pick stops, resolve conflicts manually and continue "
+            "or abort it yourself.\n"
+            "On success, it prints integration commands for review and a "
+            "fast-forward merge; it never merges or pushes."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.parse_args(argv)
 
@@ -249,6 +260,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         git = Git()
         git.cwd = repository_root(git)
         return run_workflow(git, input, sys.stdout, date.today())
+    except GitError as error:
+        command = "git " + " ".join(error.args_list)
+        detail = error.stderr.strip() or f"exit status {error.returncode}"
+        print(f"error: {command} failed: {detail}", file=sys.stderr)
+        return 1
     except SyncError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

@@ -284,6 +284,12 @@ class CliTests(unittest.TestCase):
             "Select and cherry-pick commits from zeronsh/comet",
             output.getvalue(),
         )
+        help_text = output.getvalue().lower()
+        self.assertIn("confirmation", help_text)
+        self.assertIn("sync/upstream-yyyy-mm-dd", help_text)
+        self.assertIn("resolve conflicts manually", help_text)
+        self.assertIn("prints integration commands", help_text)
+        self.assertIn("never merges or pushes", help_text)
 
     @mock.patch.object(sync, "repository_root", side_effect=sync.SyncError("not a repo"))
     def test_sync_errors_are_reported_concisely_to_stderr(self, repository_root):
@@ -294,6 +300,47 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(result, 1)
         self.assertEqual(error_output.getvalue(), "error: not a repo\n")
+
+    @mock.patch.object(
+        sync,
+        "repository_root",
+        side_effect=sync.GitError(
+            ["fetch", "--prune", "upstream", "main"],
+            7,
+            "partial output",
+            "fatal: example\n",
+        ),
+    )
+    def test_checked_git_errors_are_reported_concisely_to_stderr(
+        self, repository_root
+    ):
+        error_output = io.StringIO()
+
+        with mock.patch("sys.stderr", error_output):
+            result = sync.main([])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(
+            error_output.getvalue(),
+            "error: git fetch --prune upstream main failed: fatal: example\n",
+        )
+
+    @mock.patch.object(
+        sync,
+        "repository_root",
+        side_effect=sync.GitError(["fetch"], 7, "", ""),
+    )
+    def test_checked_git_errors_fall_back_to_exit_status(self, repository_root):
+        error_output = io.StringIO()
+
+        with mock.patch("sys.stderr", error_output):
+            result = sync.main([])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(
+            error_output.getvalue(),
+            "error: git fetch failed: exit status 7\n",
+        )
 
 
 class GitAdapterTests(unittest.TestCase):
@@ -389,7 +436,7 @@ class UpstreamTests(unittest.TestCase):
 
                 self.assertEqual(git.commands, [(get_url, False)])
 
-    def test_conflicting_remote_reports_name_and_found_url(self):
+    def test_conflicting_remote_reports_url_and_rename_guidance(self):
         get_url = ("remote", "get-url", "upstream")
         found = "https://github.com/example/comet.git"
         git = ScriptedGit({get_url: found + "\n"})
@@ -399,6 +446,10 @@ class UpstreamTests(unittest.TestCase):
 
         self.assertIn("upstream", str(caught.exception))
         self.assertIn(found, str(caught.exception))
+        self.assertIn(
+            "git remote rename upstream <new-name>",
+            str(caught.exception),
+        )
 
 
 class DiscoveryTests(unittest.TestCase):
