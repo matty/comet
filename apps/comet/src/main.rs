@@ -6,6 +6,10 @@ mod daemon;
 mod remote_cli;
 mod update_cli;
 
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -60,7 +64,43 @@ enum DaemonCommand {
 /// permanent RSS (docs/memory-plan.md §1).
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+fn home_to_initialize(
+    existing_home: Option<OsString>,
+    os_home: impl FnOnce() -> Option<PathBuf>,
+) -> anyhow::Result<Option<PathBuf>> {
+    if existing_home.as_ref().is_some_and(|home| !home.is_empty()) {
+        return Ok(None);
+    }
+
+    os_home()
+        .filter(|home| !home.as_os_str().is_empty())
+        .map(Some)
+        .context("could not determine the current user's home directory")
+}
+
+fn initialize_home() -> anyhow::Result<()> {
+    let existing_home = std::env::var_os("HOME");
+    if existing_home.as_ref().is_some_and(|home| !home.is_empty()) {
+        return Ok(());
+    }
+
+    if existing_home.is_some() {
+        // SAFETY: this runs as the first operation in main, before Comet starts
+        // any threads. Removing an empty value lets Unix consult its user DB.
+        unsafe { std::env::remove_var("HOME") };
+    }
+
+    if let Some(home) = home_to_initialize(existing_home, home::home_dir)? {
+        // SAFETY: this runs as the first operation in main, before Comet starts
+        // any threads or child processes.
+        unsafe { std::env::set_var("HOME", home) };
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
+    initialize_home()?;
     let cli = Cli::parse();
     // Everything logs to stdout: long-running modes at info, one-shot CLI
     // commands at warn (RUST_LOG overrides either).
@@ -165,7 +205,45 @@ fn dirs_data_dir() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
     use super::*;
+
+    #[test]
+    fn configured_home_does_not_require_initialization() {
+        let result = home_to_initialize(Some("configured-home".into()), || {
+            panic!("OS lookup must not run when HOME is configured")
+        })
+        .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn empty_home_uses_os_home() {
+        let result =
+            home_to_initialize(Some(OsString::new()), || Some(PathBuf::from("os-home"))).unwrap();
+
+        assert_eq!(result, Some(PathBuf::from("os-home")));
+    }
+
+    #[test]
+    fn missing_home_uses_os_home() {
+        let result = home_to_initialize(None, || Some(PathBuf::from("os-home"))).unwrap();
+
+        assert_eq!(result, Some(PathBuf::from("os-home")));
+    }
+
+    #[test]
+    fn unresolved_home_returns_contextual_error() {
+        let error = home_to_initialize(None, || None).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "could not determine the current user's home directory"
+        );
+    }
 
     #[test]
     fn login_and_logout_are_not_commands() {
