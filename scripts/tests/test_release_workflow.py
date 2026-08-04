@@ -78,10 +78,15 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(publish["needs"], ["prepare", "linux", "macos", "windows"])
         self.assertEqual(
             publish.get("if"),
-            "${{ !cancelled() && needs.prepare.result == 'success' && "
+            "${{ github.repository == 'matty/comet' && !cancelled() && "
+            "needs.prepare.result == 'success' && "
             "needs.linux.result == 'success' && needs.windows.result == 'success' && "
             "(needs.macos.result == 'success' || needs.macos.result == 'failure') }}",
         )
+
+    def test_only_canonical_repository_can_publish(self):
+        condition = self.workflow["jobs"]["publish"].get("if", "")
+        self.assertIn("github.repository == 'matty/comet'", condition)
 
     def test_publication_rechecks_main_immediately_before_release(self):
         steps = self.workflow["jobs"]["publish"]["steps"]

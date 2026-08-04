@@ -179,7 +179,7 @@ jobs:
 
   publish:
     needs: [prepare, linux, macos, windows]
-    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.linux.result == 'success' && needs.windows.result == 'success' && (needs.macos.result == 'success' || needs.macos.result == 'failure') }}
+    if: ${{ github.repository == 'matty/comet' && !cancelled() && needs.prepare.result == 'success' && needs.linux.result == 'success' && needs.windows.result == 'success' && (needs.macos.result == 'success' || needs.macos.result == 'failure') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
