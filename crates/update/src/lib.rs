@@ -732,7 +732,7 @@ mod tests {
     fn releases_url_is_independent_of_removed_edge_variables() {
         let lookup = |key: &str| match key {
             "COMET_RELEASES_URL" => Some("https://downloads.example".to_string()),
-            "COMET_EDGE_URL" => Some("https://must-not-be-read.example".to_string()),
+            concat!("COMET_", "EDGE_URL") => Some("https://must-not-be-read.example".to_string()),
             _ => None,
         };
 

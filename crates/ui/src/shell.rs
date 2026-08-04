@@ -34,6 +34,7 @@ use crate::popover::{self, Loadable};
 use crate::rail;
 use crate::remotes::RemoteConnectionsPage;
 use crate::settings::accounts::AccountsPage;
+use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
@@ -144,15 +145,17 @@ pub enum SettingsSection {
     Devices,
     RemoteConnections,
     Agents,
+    Appearance,
     Shortcuts,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 5] = [
+    pub const ALL: [SettingsSection; 6] = [
         SettingsSection::Devices,
         SettingsSection::RemoteConnections,
         SettingsSection::Agents,
+        SettingsSection::Appearance,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
     ];
@@ -164,6 +167,7 @@ impl SettingsSection {
             SettingsSection::Devices => "Devices",
             SettingsSection::RemoteConnections => "Remote",
             SettingsSection::Agents => "Accounts",
+            SettingsSection::Appearance => "Appearance",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
         }
@@ -426,6 +430,7 @@ pub struct Shell {
     devices_page: Option<Entity<DevicesPage>>,
     remote_connections_page: Option<Entity<RemoteConnectionsPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
+    appearance_page: Option<Entity<AppearancePage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     shortcuts_sub: Option<Subscription>,
@@ -589,6 +594,7 @@ impl Shell {
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
             Some("settings/remotes") => Route::Settings(SettingsSection::RemoteConnections),
+            Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
@@ -626,6 +632,7 @@ impl Shell {
             devices_page: None,
             remote_connections_page: None,
             archived_page: None,
+            appearance_page: None,
             shortcuts_page: None,
             accounts_page: None,
             shortcuts_sub: None,
@@ -1059,7 +1066,15 @@ impl Shell {
             cx.background_executor()
                 .timer(Duration::from_millis(SAVE_DEBOUNCE_MS))
                 .await;
-            let Ok(snapshot) = this.update(cx, |shell, _| shell.settings.clone()) else {
+            // Re-stamp the appearance from the global before writing. The View
+            // menu changes it through `appearance::set_mode`, which never touches
+            // this shell's in-memory copy — without this, the next pane resize
+            // would quietly write the boot-time appearance back over the user's
+            // choice.
+            let Ok(snapshot) = this.update(cx, |shell, cx| {
+                shell.settings.appearance = crate::appearance::mode(cx);
+                shell.settings.clone()
+            }) else {
                 return;
             };
             cx.background_executor()
@@ -1155,6 +1170,15 @@ impl Shell {
                     self.accounts_page = Some(cx.new(|cx| AccountsPage::new(state, cx)));
                 }
                 match &self.accounts_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Appearance => {
+                if self.appearance_page.is_none() {
+                    self.appearance_page = Some(cx.new(AppearancePage::new));
+                }
+                match &self.appearance_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -1302,6 +1326,8 @@ impl Shell {
         if self.state.read(cx).selected_chat.as_ref() == Some(&chat_id) {
             self.state.update(cx, |s, cx| s.select_chat(None, cx));
         }
+        self.composer
+            .update(cx, |composer, _| composer.purge_chat(&chat_id));
         self.mutate_for(
             chat_id.clone(),
             serde_json::json!({ "op": "deleteChat", "chatId": chat_id.local_id }),
@@ -1533,6 +1559,7 @@ impl Shell {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::RemoteConnections => icons::GLOBAL,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
+            SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
@@ -1584,10 +1611,7 @@ impl Shell {
                                     theme.text_muted
                                 })
                                 .cursor_pointer()
-                                .hover(|s| {
-                                    s.bg(crate::theme::wash(0.11))
-                                        .text_color(Theme::dark().text)
-                                })
+                                .hover(|s| s.bg(crate::theme::wash(0.11)).text_color(theme.text))
                                 .on_click(
                                     cx.listener(move |this, _, _, cx| this.open_settings(item, cx)),
                                 )
@@ -1615,10 +1639,7 @@ impl Shell {
                         .text_size(px(13.0))
                         .text_color(theme.text_muted)
                         .cursor_pointer()
-                        .hover(|s| {
-                            s.bg(crate::theme::wash(0.11))
-                                .text_color(Theme::dark().text)
-                        })
+                        .hover(|s| s.bg(crate::theme::wash(0.11)).text_color(theme.text))
                         .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
                         .child(
                             // AltArrowLeft chevron (comet settings-sidebar.tsx),
@@ -1665,6 +1686,8 @@ impl Shell {
                 .child(loaders::mini_gradient_spinner(
                     format!("chat-working-{id}"),
                     2.0,
+                    cx.entity_id(),
+                    cx,
                 ))
                 .into_any_element()
         } else {
@@ -1675,7 +1698,7 @@ impl Shell {
                 .bg(dot_color)
                 .into_any_element()
         };
-        let (hover, text) = (theme.element_hover, theme.text);
+        let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
         let subline = theme.text_muted.opacity(0.5);
         let select_id = id.clone();
@@ -1695,6 +1718,11 @@ impl Shell {
         } else {
             crate::theme::wash(0.0)
         };
+        // A selected row must NOT drift toward the hover wash: in dark the two
+        // fills are identical so the blend is a no-op, but light's hover sits
+        // below its near-opaque selected fill, and blending toward it visibly
+        // dimmed the active row under the pointer (user report).
+        let hover_bg = if selected { selected_wash } else { hover };
         let rest_text = if selected { text } else { text.opacity(0.8) };
         div()
             .id(SharedString::from(format!("chat-{id}")))
@@ -1705,7 +1733,7 @@ impl Shell {
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, text))
-            .bg(motion::hover_blend(&fade_key, rest_bg, hover))
+            .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
             .when(selected, |el| {
                 el.shadow(crate::theme::glass_selected_shadows())
             })
@@ -1878,7 +1906,7 @@ impl Shell {
         // shadow (user reports). Instead the ROWS fade themselves: prepaint-
         // measured bounds drive per-row opacity toward the viewport edges
         // ([`Shell::sidebar_row_alpha`]), dissolving the edge to pure glass.
-        let glass = Theme::GLASS_ALPHA < 1.0;
+        let glass = theme.is_glass();
         let sidebar_fade = theme.surface;
 
         let settings_button = self.render_settings_button(theme, cx);
@@ -2575,7 +2603,7 @@ impl Shell {
                     div()
                         .absolute()
                         .inset_0()
-                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.4))
+                        .bg(theme.scrim().opacity(0.4 / 0.6))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -2629,7 +2657,7 @@ impl Shell {
                         .bg(motion::hover_blend(
                             "jump-pill",
                             theme.surface_raised,
-                            crate::theme::neutral(0.29),
+                            theme.surface_raised_hover,
                         ))
                         .on_hover(motion::hover_listener("jump-pill"))
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -2762,7 +2790,13 @@ impl Shell {
                 let word =
                     transcript::flavour_word(transcript::flavour_seed(&chat_id), elapsed_secs);
                 strip
-                    .child(loaders::gradient_spinner("working-indicator", &theme, 2.5))
+                    .child(loaders::gradient_spinner(
+                        "working-indicator",
+                        &theme,
+                        2.5,
+                        cx.entity_id(),
+                        cx,
+                    ))
                     .child(
                         div()
                             .text_size(px(12.0))
@@ -2784,7 +2818,13 @@ impl Shell {
                 .child(SharedString::from("Run failed"))
                 .into_any_element(),
             Indicator::None if sending => strip
-                .child(loaders::gradient_spinner("sending-indicator", &theme, 2.5))
+                .child(loaders::gradient_spinner(
+                    "sending-indicator",
+                    &theme,
+                    2.5,
+                    cx.entity_id(),
+                    cx,
+                ))
                 .child(
                     div()
                         .text_size(px(12.0))
@@ -2880,7 +2920,7 @@ impl Shell {
                         .text_size(px(13.0))
                         .text_color(theme.text)
                         .cursor_pointer()
-                        .hover(|s| s.bg(Theme::dark().element_hover))
+                        .hover(|s| s.bg(theme.glass_hover()))
                         .on_click(cx.listener(|this, _, _, cx| this.retry_engine(cx)))
                         .child(SharedString::from("Retry")),
                 )
@@ -2917,7 +2957,7 @@ impl Shell {
 /// 44px hairlines at white 3.5%, with the radial mask approximated by edge
 /// gradients back into the page background (gpui has no mask-image).
 fn grid_backdrop(theme: &Theme) -> AnyElement {
-    let line = crate::theme::white_alpha(0.035);
+    let line = crate::theme::hairline(0.035);
     let bg = theme.bg;
     const STEP: f32 = 44.0;
     const SPAN: f32 = 2640.0;
@@ -3024,8 +3064,8 @@ fn window_control_button(
         // comet window-controls.tsx: `transition-colors` — the wash fades.
         .bg(motion::hover_blend(
             &fade_key,
-            crate::theme::wash(0.0),
-            Theme::dark().element_hover,
+            theme.glass_hover().opacity(0.0),
+            theme.glass_hover(),
         ))
         .on_hover(motion::hover_listener(fade_key))
         // Buttons in/over a titlebar drag strip must be EXCLUDED from the
@@ -3382,8 +3422,16 @@ impl Render for Shell {
 
         // Boot splash overlay: visible → crossfades out on Ready → removed.
         match self.splash {
-            SplashPhase::Visible => root.child(loaders::splash_overlay(Theme::of(cx), false)),
-            SplashPhase::FadingOut => root.child(loaders::splash_overlay(Theme::of(cx), true)),
+            SplashPhase::Visible => {
+                let theme = Theme::of(cx).clone();
+                let view = cx.entity_id();
+                root.child(loaders::splash_overlay(&theme, false, view, cx))
+            }
+            SplashPhase::FadingOut => {
+                let theme = Theme::of(cx).clone();
+                let view = cx.entity_id();
+                root.child(loaders::splash_overlay(&theme, true, view, cx))
+            }
             SplashPhase::Gone => root,
         }
     }

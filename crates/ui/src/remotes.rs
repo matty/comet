@@ -1696,7 +1696,7 @@ fn secret_field(input: Entity<SecretInput>) -> AnyElement {
 
 fn action_button(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div {
     crate::settings::widgets::ghost_action(theme)
-        .hover(crate::settings::widgets::ghost_hover)
+        .hover(|style| crate::settings::widgets::ghost_hover(theme, style))
         .child(label.into())
 }
 
@@ -1880,7 +1880,7 @@ impl gpui::Render for RemoteConnectionsPage {
                 div()
                     .px(px(20.0))
                     .pt(px(14.0))
-                    .child(widgets::warning_strip(PAIRING_WARNING)),
+                    .child(widgets::warning_strip(&theme, PAIRING_WARNING)),
             )
             .child(
                 widgets::card_row(&theme, false)
@@ -1971,7 +1971,7 @@ impl gpui::Render for RemoteConnectionsPage {
                     div()
                         .px(px(20.0))
                         .pt(px(14.0))
-                        .child(widgets::warning_strip(copy)),
+                        .child(widgets::warning_strip(&theme, copy)),
                 )
                 .child(
                     widgets::card_row(&theme, false)
@@ -2003,13 +2003,16 @@ impl gpui::Render for RemoteConnectionsPage {
                 "{}:{}",
                 partial.remote.endpoint.host, partial.remote.endpoint.port
             );
-            widgets::warning_strip(format!(
-                "{} ({endpoint}, pin {}). {} Save error: {}",
-                partial.remote.name,
-                partial.remote.pinned_spki_sha256,
-                partial.recovery,
-                partial.source
-            ))
+            widgets::warning_strip(
+                &theme,
+                format!(
+                    "{} ({endpoint}, pin {}). {} Save error: {}",
+                    partial.remote.name,
+                    partial.remote.pinned_spki_sha256,
+                    partial.recovery,
+                    partial.source
+                ),
+            )
             .into_any_element()
         });
         let operation_error = self.operations.first_error().or(match app_add_state {
@@ -2025,19 +2028,19 @@ impl gpui::Render for RemoteConnectionsPage {
             widgets::page_column()
                 .child(widgets::page_header(&theme, "Remote connections", None))
                 .child(widgets::page_subtitle(&theme, "Listen on your LAN and connect directly to explicitly configured Comet servers."))
-                .when_some(self.model.listener_error.clone(), |el, error| el.child(widgets::error_strip(error)))
+                .when_some(self.model.listener_error.clone(), |el, error| el.child(widgets::error_strip(&theme, error)))
                 .child(listener_card)
-                .when_some(self.model.pairing_error.clone(), |el, error| el.child(widgets::error_strip(error)))
+                .when_some(self.model.pairing_error.clone(), |el, error| el.child(widgets::error_strip(&theme, error)))
                 .child(pairing_card)
-                .when_some(trusted_watch_error, |el, error| el.child(widgets::error_strip(error)))
+                .when_some(trusted_watch_error, |el, error| el.child(widgets::error_strip(&theme, error)))
                 .child(trusted_card)
-                .when_some(self.model.add_error.clone(), |el, error| el.child(widgets::error_strip(error)))
-                .when_some(operation_error, |el, error| el.child(widgets::error_strip(error)))
+                .when_some(self.model.add_error.clone(), |el, error| el.child(widgets::error_strip(&theme, error)))
+                .when_some(operation_error, |el, error| el.child(widgets::error_strip(&theme, error)))
                 .when_some(partial_success, |el, partial| el.child(partial))
                 .child(add_card)
                 .when_some(rename, |el, rename| el.child(rename))
                 .when_some(confirmation, |el, confirmation| el.child(confirmation))
-                .when_some(remotes_watch_error, |el, error| el.child(widgets::error_strip(error)))
+                .when_some(remotes_watch_error, |el, error| el.child(widgets::error_strip(&theme, error)))
                 .child(remote_card)
         )
     }

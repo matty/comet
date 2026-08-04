@@ -172,7 +172,7 @@ pub struct AccountsPage {
     state: Entity<AppState>,
     /// Which device's logins are shown; `None` = this device (no passthrough).
     /// Retargeted by the page-header device switcher (comet parity: the
-    /// accounts RPCs are relay-forwardable, CLI logins are per-device).
+    /// account RPCs are server-qualified; CLI logins are per Comet instance).
     selected_device: Option<String>,
     device_menu_open: bool,
     /// Outside-click dismissal instant — suppresses the trigger click that
@@ -226,7 +226,7 @@ impl AccountsPage {
     }
 
     /// Retarget the page at another device's logins: every accounts RPC is
-    /// relay-forwardable, so the whole page — list, usage probes, switch,
+    /// server-qualified, so the whole page — list, usage probes, switch,
     /// forget, login flows — follows the passthrough.
     fn set_selected_device(&mut self, target: Option<String>, cx: &mut Context<Self>) {
         self.device_menu_open = false;
@@ -284,7 +284,7 @@ impl AccountsPage {
             .as_ref()
             .map(|d| d.name.clone().into())
             .unwrap_or_else(|| SharedString::from("This device"));
-        let emerald = crate::theme::oklch(0.765, 0.177, 163.223);
+        let emerald = theme.success;
         let open = self.device_menu_open;
 
         let mut trigger =
@@ -300,13 +300,11 @@ impl AccountsPage {
                 .gap(px(6.0))
                 .cursor_pointer()
                 .bg(if open {
-                    crate::theme::white_alpha(0.06)
+                    crate::theme::ink(0.06)
                 } else {
                     gpui::transparent_black()
                 })
-                .when(!open, |el| {
-                    el.hover(|s| s.bg(crate::theme::white_alpha(0.04)))
-                })
+                .when(!open, |el| el.hover(|s| s.bg(crate::theme::ink(0.04))))
                 .on_click(cx.listener(|this, _, _, cx| {
                     let just_dismissed = this
                         .device_menu_dismissed_at
@@ -334,7 +332,7 @@ impl AccountsPage {
                     if effective == local_id {
                         emerald
                     } else {
-                        crate::theme::white_alpha(0.2)
+                        crate::theme::ink(0.2)
                     },
                 ))
                 .child(
@@ -395,7 +393,7 @@ impl AccountsPage {
                                 .bg(if is_local {
                                     emerald
                                 } else {
-                                    crate::theme::white_alpha(0.2)
+                                    crate::theme::ink(0.2)
                                 }),
                         )
                 }))
@@ -701,7 +699,7 @@ impl AccountsPage {
                     .h(px(5.0))
                     .rounded_full()
                     .overflow_hidden()
-                    .bg(crate::theme::white_alpha(0.07))
+                    .bg(crate::theme::ink(0.07))
                     .when(fraction > 0.0, |el| {
                         el.child(
                             div()
@@ -771,7 +769,7 @@ impl AccountsPage {
             .items_center()
             .gap(px(6.0))
             .when(account.active, |el| {
-                el.child(widgets::badge_active("Active"))
+                el.child(widgets::badge_active(theme, "Active"))
             })
             .when_some(account.plan_label.clone(), |el, plan| {
                 el.child(widgets::badge(theme, plan))
@@ -795,10 +793,7 @@ impl AccountsPage {
                         .text_color(theme.text_muted)
                         .cursor_pointer()
                         .when(is_busy, |el| el.opacity(0.5))
-                        .hover(|s| {
-                            s.bg(crate::theme::white_alpha(0.06))
-                                .text_color(Theme::dark().text)
-                        })
+                        .hover(|s| s.bg(crate::theme::ink(0.06)).text_color(theme.text))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.account_action(methods::FORGET_AGENT_ACCOUNT, &forget_account, cx);
                         }))
@@ -848,7 +843,7 @@ impl AccountsPage {
                     .rounded_full()
                     .border_1()
                     .border_color(theme.border)
-                    .bg(crate::theme::white_alpha(0.03))
+                    .bg(crate::theme::ink(0.03))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -912,7 +907,7 @@ impl AccountsPage {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
-        let red_text = crate::theme::oklch(0.81, 0.108, 19.6).opacity(0.9); // red-300
+        let red_text = theme.danger_muted.opacity(0.9); // red-300
         let login = self.login.as_ref()?;
         let title = login.title();
         let url_link =
@@ -927,7 +922,7 @@ impl AccountsPage {
                     .text_color(theme.text_muted.opacity(0.6))
                     .truncate()
                     .cursor_pointer()
-                    .hover(|s| s.text_color(Theme::dark().text))
+                    .hover(|s| s.text_color(theme.text))
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.open_url(&open_url);
                     }))
@@ -936,7 +931,13 @@ impl AccountsPage {
         let body: AnyElement = match login {
             LoginFlow::Starting { .. } => div()
                 .mt(px(8.0))
-                .child(popover::skeleton_rows("login-starting", &theme, 2))
+                .child(popover::skeleton_rows(
+                    "login-starting",
+                    &theme,
+                    2,
+                    cx.entity_id(),
+                    cx,
+                ))
                 .into_any_element(),
             LoginFlow::PasteCode {
                 start,
@@ -1034,7 +1035,13 @@ impl AccountsPage {
                                 .flex_row()
                                 .items_center()
                                 .gap(px(8.0))
-                                .child(crate::loaders::gradient_spinner("login-poll", &theme, 3.0))
+                                .child(crate::loaders::gradient_spinner(
+                                    "login-poll",
+                                    &theme,
+                                    3.0,
+                                    cx.entity_id(),
+                                    cx,
+                                ))
                                 .child(
                                     div()
                                         .text_size(px(12.5))
@@ -1080,12 +1087,14 @@ impl AccountsPage {
     /// row so loaded data lands without a layout jump. `dim` fades row two.
     fn render_skeleton_row(
         &self,
-        id: (&'static str, usize),
+        _id: (&'static str, usize),
         dim: bool,
         first: bool,
         theme: &Theme,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        use crate::motion::{self, AnimationExt as _};
+        use crate::motion;
+        let delta = motion::pulse_delta(&motion::COMET_PULSE, cx.entity_id(), cx);
         let ghost = |w: gpui::Length, h: f32, round_full: bool| {
             div()
                 .w(w)
@@ -1098,7 +1107,7 @@ impl AccountsPage {
                         el.rounded(px(4.0))
                     }
                 })
-                .bg(crate::theme::white_alpha(0.05))
+                .bg(crate::theme::ink(0.05))
         };
         let meters = div()
             .mt(px(8.0))
@@ -1119,7 +1128,7 @@ impl AccountsPage {
                             .max_w(px(230.0))
                             .h(px(5.0))
                             .rounded_full()
-                            .bg(crate::theme::white_alpha(0.04)),
+                            .bg(crate::theme::ink(0.04)),
                     )
                     .child(ghost(px(64.0).into(), 9.0, false))
             }));
@@ -1134,7 +1143,7 @@ impl AccountsPage {
                     .self_center()
                     .size(px(32.0))
                     .rounded_full()
-                    .bg(crate::theme::white_alpha(0.05)),
+                    .bg(crate::theme::ink(0.05)),
             )
             .child(
                 div()
@@ -1153,11 +1162,7 @@ impl AccountsPage {
             .py(px(14.0))
             .when(!first, |el| el.border_t_1().border_color(theme.border))
             .when(dim, |el| el.opacity(0.6))
-            .child(
-                inner.with_animation(id, motion::COMET_PULSE.repeating(), move |el, delta| {
-                    el.opacity(0.55 + 0.35 * motion::pulse_wave(delta))
-                }),
-            )
+            .child(inner.opacity(0.55 + 0.35 * motion::pulse_wave(delta)))
             .into_any_element()
     }
 }
@@ -1239,12 +1244,14 @@ impl Render for AccountsPage {
                                     false,
                                     true,
                                     &theme,
+                                    cx,
                                 ))
                                 .child(self.render_skeleton_row(
                                     (skeleton_id, 1),
                                     true,
                                     false,
                                     &theme,
+                                    cx,
                                 )),
                         )
                         .into_any_element()
@@ -1253,7 +1260,7 @@ impl Render for AccountsPage {
             Loadable::Error(message) => {
                 let message = message.clone();
                 vec![
-                    widgets::error_strip(message)
+                    widgets::error_strip(&theme, message)
                         .id("accounts-load-error")
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -1264,7 +1271,7 @@ impl Render for AccountsPage {
                             div()
                                 .mt(px(4.0))
                                 .text_size(px(11.5))
-                                .text_color(Theme::dark().text_muted)
+                                .text_color(theme.text_muted)
                                 .child(SharedString::from("Click to retry")),
                         )
                         .into_any_element(),
@@ -1330,7 +1337,7 @@ impl Render for AccountsPage {
                                     .child(
                                         widgets::ghost_action(&theme)
                                             .id(add_id)
-                                            .hover(widgets::ghost_hover)
+                                            .hover(|s| widgets::ghost_hover(&theme, s))
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.start_login(harness, cx);
                                             }))
@@ -1345,7 +1352,7 @@ impl Render for AccountsPage {
                             .children(
                                 warnings
                                     .into_iter()
-                                    .map(|warning| widgets::warning_strip(warning)),
+                                    .map(|warning| widgets::warning_strip(&theme, warning)),
                             )
                             .child(card)
                             .into_any_element()
@@ -1376,7 +1383,7 @@ impl Render for AccountsPage {
                                     .id("accounts-refresh")
                                     .flex_none()
                                     .text_size(px(12.5))
-                                    .hover(widgets::ghost_hover)
+                                    .hover(|s| widgets::ghost_hover(&theme, s))
                                     .when(refreshing, |el| el.opacity(0.5))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.load(force_usage_for(LoadTrigger::Refresh), cx)
@@ -1398,7 +1405,7 @@ impl Render for AccountsPage {
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
-                            widgets::error_strip(message)
+                            widgets::error_strip(&theme, message)
                                 .id("accounts-action-error")
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {

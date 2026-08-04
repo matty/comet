@@ -54,7 +54,7 @@ pub mod methods {
     /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
     /// the answer is about whichever engine you are directly connected to).
     pub const LOCAL_DEVICE: &str = "LocalDevice";
-    // Repos / worktrees / folders (ControlRpc, relay-forwardable).
+    // Repos / worktrees / folders (served by the explicitly selected server).
     pub const LIST_REPOS: &str = "ListRepos";
     pub const ADD_REPO: &str = "AddRepo";
     pub const CLONE_REPO: &str = "CloneRepo";
@@ -63,18 +63,20 @@ pub mod methods {
     pub const LIST_REFS: &str = "ListRefs";
     pub const SWITCH_REF: &str = "SwitchRef";
     pub const LIST_FOLDERS: &str = "ListFolders";
+    /// Fuzzy relative-path search rooted in a known chat or space checkout.
+    pub const SEARCH_FILES: &str = "SearchFiles";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
-    // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
+    // Terminals (served by the explicitly selected server; SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";
     pub const WRITE_TERMINAL: &str = "WriteTerminal";
     pub const RESIZE_TERMINAL: &str = "ResizeTerminal";
     pub const CLOSE_TERMINAL: &str = "CloseTerminal";
     /// Checkout-diff stream for the target device's chats (DataRpc,
-    /// relay-forwardable — diffs are produced where the checkout lives).
+    /// server-qualified — diffs are produced where the checkout lives).
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
-    // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
+    // Agent accounts (server-qualified — CLI logins are per Comet instance).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
     pub const ACTIVATE_AGENT_ACCOUNT: &str = "ActivateAgentAccount";
     pub const FORGET_AGENT_ACCOUNT: &str = "ForgetAgentAccount";
@@ -82,11 +84,11 @@ pub mod methods {
     pub const COMPLETE_AGENT_LOGIN: &str = "CompleteAgentLogin";
     pub const POLL_AGENT_LOGIN: &str = "PollAgentLogin";
     pub const CANCEL_AGENT_LOGIN: &str = "CancelAgentLogin";
-    // Uploads / attachments (ControlRpc, relay-forwardable — target the chat's host device).
+    // Uploads / attachments (served directly by the chat's owning Comet instance).
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
-    // Updates (ControlRpc, relay-forwardable — a device reports/applies its own
+    // Updates (a selected server reports/applies its own
     // binary's update). Stream: current UpdateStatus, then every change.
     pub const UPDATE_STATUS: &str = "UpdateStatus";
     /// Download + apply the newest release on the target device (symlink-managed

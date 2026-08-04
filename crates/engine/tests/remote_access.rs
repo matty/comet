@@ -591,6 +591,7 @@ fn operational_surface_is_explicitly_allowed() {
         methods::LIST_REFS,
         methods::SWITCH_REF,
         methods::LIST_FOLDERS,
+        methods::SEARCH_FILES,
         methods::CREATE_WORKTREE,
         methods::DELETE_WORKTREE,
         methods::OPEN_TERMINAL,
@@ -686,7 +687,12 @@ async fn transcript_watch_ends_when_chat_loses_local_ownership() {
     else {
         panic!("expected transcript stream");
     };
-    assert!(stream.next().await.unwrap().as_array().unwrap().is_empty());
+    let first: comet_doc::TranscriptFrame =
+        serde_json::from_value(stream.next().await.unwrap()).unwrap();
+    assert!(matches!(
+        first,
+        comet_doc::TranscriptFrame::Reset { reset } if reset.is_empty()
+    ));
 
     fixture.core.workspace.delete_chat("local-chat").unwrap();
     handle

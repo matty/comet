@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.9"
+version = "0.1.15"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -81,6 +81,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # misc
+# Global allocator for the binaries: returns freed pages to the OS. System
+# malloc (macOS libmalloc especially) retains the churn high-water mark as
+# permanent RSS - measured as the top residency cause in docs/memory-plan.md.
+mimalloc = "0.1"
 anyhow = "1"
 tempfile = "3"
 thiserror = "2"
@@ -113,6 +117,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Memory",
     "Win32_System_Threading",
 ] }
+ignore = "0.4"
 
 [profile.release]
 # Distribution profile (scripts/package-linux.sh): thin LTO buys most of fat

@@ -58,6 +58,11 @@ enum DaemonCommand {
     Status,
 }
 
+/// mimalloc: system malloc (macOS libmalloc especially) never returns the
+/// streaming churn's high-water pages, so transient allocation became
+/// permanent RSS (docs/memory-plan.md §1).
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // The TUI owns its own tracing (to a file — a line on stdout would land

@@ -113,7 +113,9 @@ impl RpcService for FixtureService {
             methods::WATCH_DEVICES | methods::WATCH_SPACES | methods::WATCH_SESSIONS => {
                 serde_json::json!([])
             }
-            methods::WATCH_DOC_MESSAGES => serde_json::json!([]),
+            methods::WATCH_DOC_MESSAGES => {
+                serde_json::to_value(comet_doc::TranscriptFrame::reset(&[])).unwrap()
+            }
             methods::REPORT_REMOTE_STATUS => {
                 return RpcReply::value(&serde_json::json!({"ok": true}));
             }
@@ -181,11 +183,17 @@ impl RpcService for BlockingCallService {
             methods::WATCH_DEVICES
             | methods::WATCH_SPACES
             | methods::WATCH_CHATS
-            | methods::WATCH_SESSIONS
-            | methods::WATCH_DOC_MESSAGES => Ok(RpcReply::Stream(
+            | methods::WATCH_SESSIONS => Ok(RpcReply::Stream(
                 futures::stream::once(async { serde_json::json!([]) })
                     .chain(futures::stream::pending())
                     .boxed(),
+            )),
+            methods::WATCH_DOC_MESSAGES => Ok(RpcReply::Stream(
+                futures::stream::once(async {
+                    serde_json::to_value(comet_doc::TranscriptFrame::reset(&[])).unwrap()
+                })
+                .chain(futures::stream::pending())
+                .boxed(),
             )),
             "Block" => {
                 self.block_started.notify_waiters();

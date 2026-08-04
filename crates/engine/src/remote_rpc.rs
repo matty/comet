@@ -31,6 +31,7 @@ pub fn remote_method_allowed(method: &str) -> bool {
             | methods::LIST_REFS
             | methods::SWITCH_REF
             | methods::LIST_FOLDERS
+            | methods::SEARCH_FILES
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
             | methods::OPEN_TERMINAL

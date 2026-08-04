@@ -273,7 +273,7 @@ impl Shell {
                     let (text_color, bg) = if is_selected {
                         (theme.text, crate::theme::glass_selected_bg())
                     } else if is_hovered {
-                        (theme.text_muted.opacity(0.8), theme.element_hover)
+                        (theme.text_muted.opacity(0.8), theme.glass_hover())
                     } else {
                         (theme.text_muted.opacity(0.6), crate::theme::wash(0.0))
                     };
@@ -323,6 +323,8 @@ impl Shell {
                                 el.child(loaders::mini_gradient_spinner(
                                     format!("tab-working-{id}"),
                                     2.0,
+                                    cx.entity_id(),
+                                    cx,
                                 ))
                             })
                             .when(
@@ -453,8 +455,8 @@ impl Shell {
             } else {
                 motion::hover_blend(
                     "session-tab-new",
-                    crate::theme::wash(0.0),
-                    crate::theme::wash(0.12),
+                    theme.glass_hover().opacity(0.0),
+                    theme.glass_hover(),
                 )
             })
             .when(on_canvas && has_space, |el| {
@@ -484,7 +486,7 @@ impl Shell {
         let max_scroll = f32::from(self.tabs_scroll.max_offset().x);
         let fade_left = scrolled > 1.0;
         let fade_right = scrolled < max_scroll - 1.0;
-        let glass = Theme::GLASS_ALPHA < 1.0;
+        let glass = theme.is_glass();
         let bar_bg = theme.surface;
         let drag_move_space = space_id.clone().unwrap_or_default();
         let drop_space = space_id.clone().unwrap_or_default();

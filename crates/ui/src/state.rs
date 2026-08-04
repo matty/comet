@@ -28,7 +28,7 @@ use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
 use comet_client::{Federation, FederationCommand, FederationEvent, ServerState};
-use comet_doc::SessionMessageEntry;
+use comet_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use comet_engine::{Engine, EngineConfig, EngineRuntime};
 use comet_proto::{
     Chat, ChatIndicator, Device, HarnessId, RemoteConnectionState, ServerId, ServerRef, Session,
@@ -694,6 +694,22 @@ impl AppState {
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
         }
         self.transcript = entries;
+    }
+
+    /// Apply a `WatchDocMessages` delta frame in place. `Err` = this copy has
+    /// diverged; the watch task resubscribes for a fresh reset.
+    pub fn apply_transcript_frame(
+        &mut self,
+        frame: TranscriptFrame,
+    ) -> Result<(), TranscriptDesync> {
+        comet_doc::apply_transcript_frame(&mut self.transcript, frame)?;
+        if let Some(chat_id) = self.selected_chat.as_ref()
+            && let Some(echoes) = self.echoes.get_mut(chat_id)
+        {
+            let transcript = &self.transcript;
+            echoes.retain(|echo| !transcript.iter().any(|e| e.id == echo.id));
+        }
+        Ok(())
     }
 
     /// Add an optimistic user echo (composer send path).

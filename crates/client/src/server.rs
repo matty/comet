@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use comet_doc::SessionMessageEntry;
+use comet_doc::{SessionMessageEntry, TranscriptFrame};
 use comet_proto::{Chat, Device, RemoteConnectionState, ServerHello, ServerRef, Session, Space};
 use comet_rpc::{RpcClient, RpcError, RpcStream, methods};
 use futures::{StreamExt as _, future::BoxFuture, stream::FuturesUnordered};
@@ -109,11 +109,28 @@ fn decode<T: serde::de::DeserializeOwned>(
         .map_err(|error| RpcError::Failed(format!("invalid {method} snapshot: {error}")))
 }
 
+fn apply_transcript_value(
+    entries: &mut Vec<SessionMessageEntry>,
+    value: Option<serde_json::Value>,
+) -> Result<(), RpcError> {
+    let value = value.ok_or(RpcError::Closed)?;
+    let frame: TranscriptFrame = serde_json::from_value(value)
+        .map_err(|error| RpcError::Failed(format!("invalid WatchDocMessages frame: {error}")))?;
+    comet_doc::apply_transcript_frame(entries, frame)
+        .map_err(|error| RpcError::Failed(error.to_string()))
+}
+
+struct TranscriptSubscription {
+    chat: ServerRef,
+    receiver: RpcStream,
+    entries: Vec<SessionMessageEntry>,
+}
+
 async fn transcript_next(
-    transcript: &mut Option<(ServerRef, RpcStream)>,
+    transcript: &mut Option<TranscriptSubscription>,
 ) -> Option<serde_json::Value> {
     match transcript {
-        Some((_, receiver)) => receiver.recv().await,
+        Some(transcript) => transcript.receiver.recv().await,
         None => futures::future::pending().await,
     }
 }
@@ -122,7 +139,7 @@ async fn subscribe_transcript(
     client: &RpcClient,
     server_id: &comet_proto::ServerId,
     chat_id: &str,
-) -> Result<(ServerRef, RpcStream), RpcError> {
+) -> Result<TranscriptSubscription, RpcError> {
     let chat = ServerRef::new(server_id.clone(), chat_id);
     let receiver = client
         .subscribe(
@@ -130,7 +147,11 @@ async fn subscribe_transcript(
             serde_json::json!({"chatId": chat_id}),
         )
         .await?;
-    Ok((chat, receiver))
+    Ok(TranscriptSubscription {
+        chat,
+        receiver,
+        entries: Vec::new(),
+    })
 }
 
 enum Phase<T> {
@@ -179,7 +200,7 @@ async fn replace_transcript(
     commands: &mut mpsc::UnboundedReceiver<SupervisorCommand>,
     selected_chat: &mut Option<String>,
     events: &mpsc::UnboundedSender<FederationEvent>,
-) -> Result<Phase<Option<(ServerRef, RpcStream)>>, RpcError> {
+) -> Result<Phase<Option<TranscriptSubscription>>, RpcError> {
     loop {
         let Some(chat_id) = selected_chat.clone() else {
             return Ok(Phase::Ready(None));
@@ -269,9 +290,25 @@ pub(crate) async fn supervise_connected(
             value = chats.recv() => state.chats = decode::<Chat>(methods::WATCH_CHATS, value)?,
             value = sessions.recv() => state.sessions = decode::<Session>(methods::WATCH_SESSIONS, value)?,
             value = transcript_next(&mut transcript) => {
-                let Some((chat, _)) = transcript.as_ref() else { continue; };
-                let entries = decode::<SessionMessageEntry>(methods::WATCH_DOC_MESSAGES, value)?;
-                let _ = events.send(FederationEvent::Transcript { chat: chat.clone(), entries });
+                let Some(active) = transcript.as_mut() else { continue; };
+                if let Err(error) = apply_transcript_value(&mut active.entries, value) {
+                    tracing::warn!(chat = ?active.chat, %error, "resubscribing desynced transcript");
+                    transcript = match replace_transcript(
+                        &client,
+                        &hello.server_id,
+                        commands,
+                        selected_chat,
+                        &events,
+                    ).await? {
+                        Phase::Ready(transcript) => transcript,
+                        Phase::Exit(exit) => return Ok(exit),
+                    };
+                    continue;
+                }
+                let _ = events.send(FederationEvent::Transcript {
+                    chat: active.chat.clone(),
+                    entries: active.entries.clone(),
+                });
                 continue;
             }
             result = active_call_next(&mut active_call) => {
@@ -373,8 +410,8 @@ pub(crate) async fn supervise_connected(
                     continue;
                 }
                 Some(SupervisorCommand::WatchTranscript { chat_id, acknowledged }) => {
-                    if let Some((old, _)) = transcript.take() {
-                        let _ = events.send(FederationEvent::Transcript { chat: old, entries: Vec::new() });
+                    if let Some(old) = transcript.take() {
+                        let _ = events.send(FederationEvent::Transcript { chat: old.chat, entries: Vec::new() });
                     }
                     *selected_chat = chat_id;
                     transcript = match replace_transcript(
@@ -440,6 +477,29 @@ mod tests {
     use comet_rpc::{RpcReply, RpcService};
     use futures::StreamExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn transcript_wire_frames_materialize_in_the_server_copy() {
+        let entry = SessionMessageEntry {
+            id: "message-1".into(),
+            role: comet_doc::MessageRole::Assistant,
+            parts: vec![comet_doc::MessagePart::Text {
+                id: "text-1".into(),
+                text: "hello".into(),
+            }],
+            created_at: 0,
+            device_id: "device-a".into(),
+            status: None,
+            continuation_of: None,
+        };
+        let value = serde_json::to_value(comet_doc::TranscriptFrame::reset(&[entry.clone()]))
+            .expect("serialize reset frame");
+        let mut entries = Vec::new();
+
+        apply_transcript_value(&mut entries, Some(value)).expect("apply reset frame");
+
+        assert_eq!(entries, vec![entry]);
+    }
 
     type SupervisorTask = tokio::task::JoinHandle<Result<ConnectedExit, RpcError>>;
     type StalledFixture = (

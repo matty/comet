@@ -1,6 +1,5 @@
-//! Workspace doc schema over `loro` — the per-org entity index that replaces comet's
-//! residual entity sync (ARCHITECTURE.md §2.2). Lives in its own DO room (same
-//! SessionRoom class, doc id `ws/{orgId}`).
+//! Workspace doc schema over `loro` — the authoritative entity index used by
+//! the local Comet server (ARCHITECTURE.md §2.2).
 //!
 //! Container layout — maps keyed by id, NOT lists: entity rows are LWW upserts, and a
 //! map-of-maps means concurrent writers to *different* rows never conflict while writes
@@ -289,7 +288,19 @@ impl WorkspaceDoc {
     }
 
     pub fn chat(&self, chat_id: &str) -> Result<Option<Chat>, DocError> {
-        Ok(self.read_chats()?.into_iter().find(|c| c.id == chat_id))
+        // Single-row read: this sits on the per-tick `is_host` path, where
+        // materializing every chat row per call multiplied with chat count.
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(None);
+        };
+        let value = row.get_deep_value().to_json_value();
+        match serde_json::from_value::<RawChat>(value) {
+            Ok(raw) => Ok(Some(raw.into())),
+            Err(err) => {
+                tracing::warn!(row = %chat_id, error = %err, "skipping malformed chat row");
+                Ok(None)
+            }
+        }
     }
 
     pub fn read_chats(&self) -> Result<Vec<Chat>, DocError> {

@@ -24,7 +24,7 @@ use gpui::{
 };
 
 use crate::state::ServerClient;
-use crate::theme::white_alpha;
+use crate::theme::ink;
 use comet_proto::ServerId;
 use comet_rpc::methods;
 
@@ -434,9 +434,18 @@ pub enum AttachmentSnapshot {
 }
 
 enum CacheEntry {
-    Loading { attempts: u32 },
-    Loaded(CachedAttachmentImage),
-    Error { attempts: u32, at: Instant },
+    Loading {
+        attempts: u32,
+    },
+    Loaded {
+        image: CachedAttachmentImage,
+        bytes: usize,
+        last_used: u64,
+    },
+    Error {
+        attempts: u32,
+        at: Instant,
+    },
 }
 
 #[derive(Default)]
@@ -444,10 +453,53 @@ struct AttachmentCache {
     entries: HashMap<(ServerId, String, String), CacheEntry>,
     generations: HashMap<ServerId, u64>,
     offline: std::collections::HashSet<ServerId>,
+    tick: u64,
+    loaded_bytes: usize,
+    pending_free: Vec<Arc<Image>>,
 }
 
 fn retry_delay(attempts: u32) -> Duration {
     Duration::from_millis((2_000u64 << attempts.min(3)).min(15_000))
+}
+
+/// Byte budget for retained encoded images. The decoded copies gpui holds are
+/// proportional (and usually larger), so bounding the encoded side bounds both
+/// — this cache previously grew for the process lifetime with no eviction.
+const IMAGE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+impl AttachmentCache {
+    fn insert_loaded(&mut self, key: (ServerId, String, String), image: CachedAttachmentImage) {
+        let bytes = image.image.bytes.len();
+        self.tick += 1;
+        if let Some(CacheEntry::Loaded { image, bytes, .. }) = self.entries.insert(
+            key.clone(),
+            CacheEntry::Loaded {
+                image,
+                bytes,
+                last_used: self.tick,
+            },
+        ) {
+            self.loaded_bytes = self.loaded_bytes.saturating_sub(bytes);
+            self.pending_free.push(image.image);
+        }
+        self.loaded_bytes += bytes;
+        while self.loaded_bytes > IMAGE_CACHE_BUDGET_BYTES {
+            let oldest = self
+                .entries
+                .iter()
+                .filter(|(k, _)| **k != key)
+                .filter_map(|(k, e)| match e {
+                    CacheEntry::Loaded { last_used, .. } => Some((*last_used, k.clone())),
+                    _ => None,
+                })
+                .min_by_key(|(last_used, _)| *last_used);
+            let Some((_, evict_key)) = oldest else { break };
+            if let Some(CacheEntry::Loaded { image, bytes, .. }) = self.entries.remove(&evict_key) {
+                self.loaded_bytes = self.loaded_bytes.saturating_sub(bytes);
+                self.pending_free.push(image.image);
+            }
+        }
+    }
 }
 
 fn cache() -> &'static Mutex<AttachmentCache> {
@@ -464,17 +516,31 @@ pub fn attachment_snapshot(
     device_id: &str,
     path: &str,
 ) -> AttachmentSnapshot {
-    match cache()
-        .lock()
-        .unwrap()
-        .entries
-        .get(&key(server_id, device_id, path))
-    {
-        Some(CacheEntry::Loaded(image)) => AttachmentSnapshot::Loaded(image.clone()),
+    let mut cache = cache().lock().unwrap();
+    let tick = {
+        cache.tick += 1;
+        cache.tick
+    };
+    match cache.entries.get_mut(&key(server_id, device_id, path)) {
+        Some(CacheEntry::Loaded {
+            image, last_used, ..
+        }) => {
+            *last_used = tick;
+            AttachmentSnapshot::Loaded(image.clone())
+        }
         Some(CacheEntry::Error { attempts, at }) => AttachmentSnapshot::Error {
             retry_in: retry_delay(attempts.saturating_sub(1)).saturating_sub(at.elapsed()),
         },
         _ => AttachmentSnapshot::Loading,
+    }
+}
+
+/// Release gpui's decoded copies of evicted images (asset-system entries).
+/// Call with any `&mut App` on the render/update path; cheap when empty.
+pub fn flush_evicted(cx: &mut gpui::App) {
+    let evicted = std::mem::take(&mut cache().lock().unwrap().pending_free);
+    for image in evicted {
+        gpui::ImageSource::Image(image).remove_asset(cx);
     }
 }
 
@@ -534,7 +600,17 @@ pub fn mark_server_attachments_online(server_id: &ServerId) {
 
 pub fn purge_server_attachments(server_id: &ServerId) {
     let mut cache = cache().lock().unwrap();
-    cache.entries.retain(|(owner, _, _), _| owner != server_id);
+    let removed: Vec<_> = cache
+        .entries
+        .extract_if(|(owner, _, _), _| owner == server_id)
+        .map(|(_, entry)| entry)
+        .collect();
+    for entry in removed {
+        if let CacheEntry::Loaded { image, bytes, .. } = entry {
+            cache.loaded_bytes = cache.loaded_bytes.saturating_sub(bytes);
+            cache.pending_free.push(image.image);
+        }
+    }
     *cache.generations.entry(server_id.clone()).or_default() += 1;
     cache.offline.insert(server_id.clone());
 }
@@ -553,9 +629,9 @@ pub fn store_loaded_for_generation(
     {
         return;
     }
-    cache.entries.insert(
+    cache.insert_loaded(
         key(server_id, device_id, path),
-        CacheEntry::Loaded(CachedAttachmentImage { name, image }),
+        CachedAttachmentImage { name, image },
     );
 }
 
@@ -641,7 +717,7 @@ pub fn lightbox(
                     .occlude()
                     .w(viewport.width)
                     .h(viewport.height)
-                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.7))
+                    .bg(crate::popover::scrim_alpha(0.7))
                     .flex()
                     .flex_col()
                     .items_center()
@@ -662,7 +738,7 @@ pub fn lightbox(
                             .max_w(max_w)
                             .overflow_hidden()
                             .text_size(px(11.0))
-                            .text_color(white_alpha(0.45))
+                            .text_color(ink(0.45))
                             .child(preview.name.clone()),
                     ),
             ),

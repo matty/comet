@@ -11,9 +11,15 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::{ClientFrame, RpcError, ServerFrame};
 
+/// Per-stream queue depth. Bounded: route_frame awaits a full queue, pausing
+/// the connection reader — transport backpressure instead of unbounded growth
+/// when a consumer stalls behind a fast producer (watch frames every 120ms
+/// during streaming used to pile up whole-transcript payloads here).
+const STREAM_QUEUE_CAP: usize = 256;
+
 enum Pending {
     Call(oneshot::Sender<Result<serde_json::Value, RpcError>>),
-    Stream(mpsc::UnboundedSender<serde_json::Value>),
+    Stream(mpsc::Sender<serde_json::Value>),
 }
 
 struct Shared {
@@ -100,7 +106,7 @@ async fn run_writer(
 }
 
 pub struct RpcStream {
-    inbound: mpsc::UnboundedReceiver<serde_json::Value>,
+    inbound: mpsc::Receiver<serde_json::Value>,
     _guard: PendingGuard,
 }
 
@@ -151,7 +157,7 @@ impl RpcClient {
                             continue;
                         }
                     };
-                    route_frame(&reader_shared, frame);
+                    route_frame(&reader_shared, frame).await;
                 }
             }
             // Connection closed: fail everything still pending.
@@ -223,7 +229,7 @@ impl RpcClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<RpcStream, RpcError> {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
         let id = self.register(Pending::Stream(tx));
         let guard = PendingGuard {
             id,
@@ -294,7 +300,7 @@ impl Drop for RpcClient {
     }
 }
 
-fn route_frame(shared: &Arc<Shared>, frame: ServerFrame) {
+async fn route_frame(shared: &Arc<Shared>, frame: ServerFrame) {
     let id = frame.id;
     if let Some(err) = frame.err {
         match shared.lock().remove(&id) {
@@ -315,8 +321,20 @@ fn route_frame(shared: &Arc<Shared>, frame: ServerFrame) {
         return;
     }
     if let Some(item) = frame.item {
-        if let Some(Pending::Stream(tx)) = shared.lock().get(&id) {
-            let _ = tx.send(item);
+        // Clone the sender out of the lock: the bounded send must await
+        // (backpressure) without holding `shared`.
+        let tx = match shared.lock().get(&id) {
+            Some(Pending::Stream(tx)) => Some(tx.clone()),
+            _ => None,
+        };
+        let dead = match tx {
+            Some(tx) => tx.send(item).await.is_err(),
+            None => false,
+        };
+        if dead {
+            // Receiver was dropped. RpcStream's guard has already queued the
+            // writer-owned cancellation; just forget any racing pending entry.
+            shared.lock().remove(&id);
         }
         return;
     }
@@ -397,7 +415,7 @@ mod cancellation_backpressure_tests {
         }
         let streams: Vec<_> = (0..32)
             .map(|_| {
-                let (sender, inbound) = mpsc::unbounded_channel();
+                let (sender, inbound) = mpsc::channel(STREAM_QUEUE_CAP);
                 let id = client.register(Pending::Stream(sender));
                 RpcStream {
                     inbound,
@@ -437,7 +455,7 @@ mod cancellation_backpressure_tests {
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::from([(
                 1,
-                Pending::Stream(mpsc::unbounded_channel().0),
+                Pending::Stream(mpsc::channel(STREAM_QUEUE_CAP).0),
             )])),
         });
         let guard = PendingGuard {
