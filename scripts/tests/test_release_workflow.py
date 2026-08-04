@@ -73,6 +73,16 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "${{ needs.prepare.outputs.source_sha }}",
         )
 
+    def test_failed_optional_macos_does_not_block_publication(self):
+        publish = self.workflow["jobs"]["publish"]
+        self.assertEqual(publish["needs"], ["prepare", "linux", "macos", "windows"])
+        self.assertEqual(
+            publish.get("if"),
+            "${{ always() && needs.prepare.result == 'success' && "
+            "needs.linux.result == 'success' && needs.windows.result == 'success' && "
+            "(needs.macos.result == 'success' || needs.macos.result == 'failure') }}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
