@@ -1,7 +1,10 @@
+import argparse
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 import subprocess
+import sys
+from typing import Callable, Sequence, TextIO
 from urllib.parse import urlsplit
 
 
@@ -150,6 +153,71 @@ def next_branch_name(existing: set[str], day: date) -> str:
     return f"{base}-{suffix}"
 
 
+def format_commit(index: int | None, commit: Commit) -> str:
+    prefix = f"{index}. " if index is not None else ""
+    return (
+        f"{prefix}{commit.short_oid}  {commit.date}  "
+        f"{commit.author}  {commit.subject}"
+    )
+
+
+def run_workflow(
+    git: Git,
+    input_fn: Callable[[str], str],
+    output: TextIO,
+    day: date,
+) -> int:
+    target = validate_repository(git)
+    ensure_upstream(git)
+    git.run("fetch", "--prune", "upstream", "main")
+    commits = discover_commits(git, target)
+
+    if not commits:
+        print(f"{target} is already aligned with upstream/main.", file=output)
+        return 0
+
+    print("Eligible upstream commits (newest first):", file=output)
+    for index, commit in enumerate(commits, start=1):
+        print(format_commit(index, commit), file=output)
+
+    while True:
+        try:
+            selected = parse_selection(
+                input_fn("Select commits (for example 1,3-5): "), commits
+            )
+            break
+        except ValueError as error:
+            print(error, file=output)
+
+    print("Selected commits (oldest first):", file=output)
+    for commit in selected:
+        print(format_commit(None, commit), file=output)
+
+    confirmation = input_fn(
+        "Create a sync branch and cherry-pick these commits? [y/N] "
+    )
+    if confirmation.strip().lower() not in {"y", "yes"}:
+        return 0
+
+    branch = next_branch_name(existing_branches(git), day)
+    git.run("switch", "-c", branch)
+    for commit in selected:
+        result = git.run("cherry-pick", commit.oid, check=False)
+        if result.returncode != 0:
+            print("Cherry-pick stopped. Resolve conflicts, then choose:", file=output)
+            print("git add <resolved-files>", file=output)
+            print("git cherry-pick --continue", file=output)
+            print("git cherry-pick --abort", file=output)
+            return 1
+
+    print("Review and integrate the sync branch with:", file=output)
+    print(f"git diff {target}...HEAD", file=output)
+    print(f"git log --oneline {target}..HEAD", file=output)
+    print(f"git switch {target}", file=output)
+    print(f"git merge --ff-only {branch}", file=output)
+    return 0
+
+
 def normalize_github_url(url: str) -> str:
     normalized = url.strip().lower().rstrip("/")
     if "://" in normalized:
@@ -169,3 +237,22 @@ def normalize_github_url(url: str) -> str:
 
 def is_expected_upstream(url: str) -> bool:
     return normalize_github_url(url) == "github.com/zeronsh/comet"
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Select and cherry-pick commits from zeronsh/comet"
+    )
+    parser.parse_args(argv)
+
+    try:
+        git = Git()
+        git.cwd = repository_root(git)
+        return run_workflow(git, input, sys.stdout, date.today())
+    except SyncError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

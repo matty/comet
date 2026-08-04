@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import subprocess
 import unittest
 from datetime import date
@@ -33,6 +34,178 @@ class ScriptedGit:
         if isinstance(response, subprocess.CompletedProcess):
             return response
         return subprocess.CompletedProcess(args, 0, response, "")
+
+
+class WorkflowGit:
+    def __init__(self, commits=DISPLAYED, existing=None, cherry_pick_failures=None):
+        self.commits = commits
+        self.existing = existing or set()
+        self.cherry_pick_failures = cherry_pick_failures or set()
+        self.commands = []
+
+    def run(self, *args, check=True):
+        self.commands.append((args, check))
+        if args == ("status", "--porcelain"):
+            stdout = ""
+        elif args == ("symbolic-ref", "--quiet", "--short", "HEAD"):
+            stdout = "feature/current\n"
+        elif args == ("remote", "get-url", "upstream"):
+            stdout = "https://github.com/zeronsh/comet.git\n"
+        elif args == ("fetch", "--prune", "upstream", "main"):
+            stdout = ""
+        elif args[:5] == (
+            "log",
+            "--right-only",
+            "--cherry-pick",
+            "--topo-order",
+            "--format=%H%x00%h%x00%cs%x00%an%x00%s",
+        ):
+            stdout = "".join(
+                f"{commit.oid}\x00{commit.short_oid}\x00{commit.date}\x00"
+                f"{commit.author}\x00{commit.subject}\n"
+                for commit in self.commits
+            )
+        elif args == (
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/",
+        ):
+            stdout = "".join(f"{branch}\n" for branch in sorted(self.existing))
+        elif args[:2] == ("switch", "-c"):
+            stdout = ""
+        elif args[:1] == ("cherry-pick",):
+            returncode = 1 if args[1] in self.cherry_pick_failures else 0
+            result = subprocess.CompletedProcess(args, returncode, "", "conflict")
+            if check and returncode:
+                raise sync.GitError(list(args), returncode, "", "conflict")
+            return result
+        else:
+            raise AssertionError(f"Unexpected Git command: {args!r}")
+        return subprocess.CompletedProcess(args, 0, stdout, "")
+
+
+class WorkflowTests(unittest.TestCase):
+    def run_workflow(self, git, answers):
+        prompts = []
+        answer_iter = iter(answers)
+
+        def input_fn(prompt):
+            prompts.append(prompt)
+            return next(answer_iter)
+
+        output = io.StringIO()
+        result = sync.run_workflow(git, input_fn, output, date(2026, 8, 4))
+        return result, output.getvalue(), prompts
+
+    def test_format_commit_numbers_only_browsing_entries(self):
+        commit = sync.Commit("oid", "abc1234", "2026-08-04", "Alice", "Subject")
+
+        self.assertEqual(
+            sync.format_commit(2, commit),
+            "2. abc1234  2026-08-04  Alice  Subject",
+        )
+        self.assertEqual(
+            sync.format_commit(None, commit),
+            "abc1234  2026-08-04  Alice  Subject",
+        )
+
+    def test_no_commits_fetches_and_exits_without_creating_branch(self):
+        git = WorkflowGit(commits=[])
+
+        result, output, prompts = self.run_workflow(git, [])
+
+        self.assertEqual(result, 0)
+        self.assertIn("already aligned", output)
+        self.assertEqual(prompts, [])
+        commands = [args for args, _ in git.commands]
+        self.assertIn(("fetch", "--prune", "upstream", "main"), commands)
+        self.assertFalse(any(args[:2] == ("switch", "-c") for args in commands))
+
+    def test_invalid_selection_prints_error_and_prompts_again(self):
+        git = WorkflowGit()
+
+        result, output, prompts = self.run_workflow(git, ["nope", "2", "n"])
+
+        self.assertEqual(result, 0)
+        self.assertIn("Invalid selection: nope", output)
+        selection_prompts = [prompt for prompt in prompts if "Select" in prompt]
+        self.assertEqual(len(selection_prompts), 2)
+
+    def test_declined_confirmation_does_not_mutate_repository(self):
+        git = WorkflowGit()
+
+        result, _, _ = self.run_workflow(git, ["2", "n"])
+
+        self.assertEqual(result, 0)
+        commands = [args for args, _ in git.commands]
+        self.assertFalse(any(args[:2] == ("switch", "-c") for args in commands))
+        self.assertFalse(any(args[:1] == ("cherry-pick",) for args in commands))
+
+    def test_confirmed_selection_creates_unique_branch_and_cherry_picks_oldest_first(self):
+        git = WorkflowGit(
+            existing={"sync/upstream-2026-08-04"},
+        )
+
+        result, output, _ = self.run_workflow(git, ["1,3-4", "yes"])
+
+        self.assertEqual(result, 0)
+        state_changes = [
+            args
+            for args, _ in git.commands
+            if args[:2] == ("switch", "-c") or args[:1] == ("cherry-pick",)
+        ]
+        self.assertEqual(
+            state_changes,
+            [
+                ("switch", "-c", "sync/upstream-2026-08-04-2"),
+                ("cherry-pick", "c1"),
+                ("cherry-pick", "c2"),
+                ("cherry-pick", "c4"),
+            ],
+        )
+        self.assertIn("Selected commits (oldest first):", output)
+        self.assertIn("git diff feature/current...HEAD", output)
+        self.assertIn("git log --oneline feature/current..HEAD", output)
+        self.assertIn("git switch feature/current", output)
+        self.assertIn("git merge --ff-only sync/upstream-2026-08-04-2", output)
+
+    def test_cherry_pick_failure_prints_recovery_and_stops_later_commits(self):
+        git = WorkflowGit(cherry_pick_failures={"c3"})
+
+        result, output, _ = self.run_workflow(git, ["1-3", "y"])
+
+        self.assertEqual(result, 1)
+        self.assertIn("git cherry-pick --continue", output)
+        self.assertIn("git cherry-pick --abort", output)
+        cherry_picks = [
+            args for args, _ in git.commands if args[:1] == ("cherry-pick",)
+        ]
+        self.assertEqual(cherry_picks, [("cherry-pick", "c2"), ("cherry-pick", "c3")])
+
+
+class CliTests(unittest.TestCase):
+    def test_help_exits_successfully_and_describes_upstream_selection(self):
+        output = io.StringIO()
+
+        with mock.patch("sys.stdout", output):
+            with self.assertRaises(SystemExit) as caught:
+                sync.main(["--help"])
+
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn(
+            "Select and cherry-pick commits from zeronsh/comet",
+            output.getvalue(),
+        )
+
+    @mock.patch.object(sync, "repository_root", side_effect=sync.SyncError("not a repo"))
+    def test_sync_errors_are_reported_concisely_to_stderr(self, repository_root):
+        error_output = io.StringIO()
+
+        with mock.patch("sys.stderr", error_output):
+            result = sync.main([])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(error_output.getvalue(), "error: not a repo\n")
 
 
 class GitAdapterTests(unittest.TestCase):
