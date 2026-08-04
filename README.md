@@ -88,7 +88,8 @@ C, A cannot see or control C. A must configure and pair C separately.
 
 ## Sync selected upstream changes
 
-With Python 3 and Git installed, run this from a clean Comet worktree:
+With Python 3 and Git installed, run this from a clean Comet worktree with a
+branch checked out. The helper refuses to run when HEAD is detached.
 
 ```bash
 python scripts/sync-upstream.py
@@ -96,10 +97,12 @@ python scripts/sync-upstream.py
 
 The helper adds the fixed `upstream` remote for
 `https://github.com/zeronsh/comet.git` when it is missing, fetches `main`, and
-lists eligible commits by number. Select one commit (`2`), a list (`1,4`), or a
-range (`2-5`). After confirmation, the helper creates a
+lists eligible commits by number. If an existing `upstream` remote points
+elsewhere, the helper refuses to continue and never overwrites it. Select one
+commit (`2`), a list (`1,4`), or a range (`2-5`). After an affirmative
+confirmation (`y` or `yes`), the helper creates a
 `sync/upstream-YYYY-MM-DD` branch and cherry-picks the selections in
-chronological order.
+chronological order. Any other answer exits without changing history.
 
 If a cherry-pick conflicts, resolve it and run `git cherry-pick --continue`, or
 cancel it with `git cherry-pick --abort`. On success, the helper prints review
