@@ -73,14 +73,40 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "${{ needs.prepare.outputs.source_sha }}",
         )
 
-    def test_failed_optional_macos_does_not_block_publication(self):
+    def test_publication_gate_is_cancellable_and_tolerates_failed_macos(self):
         publish = self.workflow["jobs"]["publish"]
         self.assertEqual(publish["needs"], ["prepare", "linux", "macos", "windows"])
         self.assertEqual(
             publish.get("if"),
-            "${{ always() && needs.prepare.result == 'success' && "
+            "${{ !cancelled() && needs.prepare.result == 'success' && "
             "needs.linux.result == 'success' && needs.windows.result == 'success' && "
             "(needs.macos.result == 'success' || needs.macos.result == 'failure') }}",
+        )
+
+    def test_publication_rechecks_main_immediately_before_release(self):
+        steps = self.workflow["jobs"]["publish"]["steps"]
+        release_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("uses") == "softprops/action-gh-release@v3"
+        )
+        guard = steps[release_index - 1]
+        self.assertEqual(guard.get("name"), "verify source and tag are immutable")
+        self.assertEqual(
+            guard.get("env"),
+            {
+                "SOURCE_SHA": "${{ needs.prepare.outputs.source_sha }}",
+                "TAG": "${{ needs.prepare.outputs.tag }}",
+            },
+        )
+        self.assertIn("git fetch origin main", guard.get("run", ""))
+        self.assertIn(
+            'current_sha="$(git rev-parse origin/main)"',
+            guard.get("run", ""),
+        )
+        self.assertIn(
+            'if [ "$current_sha" != "$SOURCE_SHA" ]; then',
+            guard.get("run", ""),
         )
 
 

@@ -179,7 +179,7 @@ jobs:
 
   publish:
     needs: [prepare, linux, macos, windows]
-    if: ${{ always() && needs.prepare.result == 'success' && needs.linux.result == 'success' && needs.windows.result == 'success' && (needs.macos.result == 'success' || needs.macos.result == 'failure') }}
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.linux.result == 'success' && needs.windows.result == 'success' && (needs.macos.result == 'success' || needs.macos.result == 'failure') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -197,10 +197,17 @@ jobs:
           test -f "dist/comet-$VERSION-linux-x86_64.tar.gz"
           test -f "dist/comet-$VERSION-linux-aarch64.tar.gz"
           test -f "dist/comet-$VERSION-windows-x86_64.zip"
-      - name: reject an existing tag
+      - name: verify source and tag are immutable
         env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
+          git fetch origin main
+          current_sha="$(git rev-parse origin/main)"
+          if [ "$current_sha" != "$SOURCE_SHA" ]; then
+            echo "main advanced from $SOURCE_SHA to $current_sha" >&2
+            exit 1
+          fi
           if git ls-remote --exit-code --tags origin "refs/tags/$TAG"; then
             echo "tag $TAG already exists" >&2
             exit 1
