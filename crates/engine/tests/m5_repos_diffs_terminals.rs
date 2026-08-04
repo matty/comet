@@ -160,9 +160,13 @@ async fn repos_round_trip_add_branches_worktrees() {
         by_name("main").current,
         "main is the main checkout: {refs:?}"
     );
+    let ref_worktree_path = by_name(&worktree.branch)
+        .worktree_path
+        .as_deref()
+        .expect("worktree branch path");
     assert_eq!(
-        by_name(&worktree.branch).worktree_path.as_deref(),
-        Some(worktree.path.as_str()),
+        std::fs::canonicalize(ref_worktree_path).expect("canonical ref worktree path"),
+        std::fs::canonicalize(&worktree.path).expect("canonical created worktree path"),
         "worktree branch maps to its path: {refs:?}"
     );
     let plain_ref = by_name("feature/x");
@@ -360,7 +364,10 @@ async fn diff_capture_truncates_at_patch_cap() {
         big.push_str(&format!("line number {i} padded\n"));
     }
     std::fs::write(repo_dir.join("a.txt"), &big).expect("big rewrite");
-    let snapshot = capture_diff(&repos, &repo_dir).await.expect("capture");
+    let snapshot = tokio::time::timeout(Duration::from_secs(10), capture_diff(&repos, &repo_dir))
+        .await
+        .expect("capture completes before timeout")
+        .expect("capture");
     assert!(snapshot.truncated, "patch cap hit");
     assert!(snapshot.patch.len() <= 3 * 1024 * 1024 + 64);
     assert!(snapshot.patch.contains("# Comet diff truncated"));

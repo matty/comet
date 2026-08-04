@@ -435,6 +435,7 @@ async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capt
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
     let mut child = cmd
         .spawn()
         .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
@@ -442,35 +443,52 @@ async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capt
         .stdout
         .take()
         .ok_or_else(|| EngineError::Other("git stdout unavailable".into()))?;
-    let mut out: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 64 * 1024];
-    let mut truncated = false;
-    loop {
-        let n = stdout
-            .read(&mut buf)
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| EngineError::Other("git stderr unavailable".into()))?;
+    let stderr_capture = async move {
+        let mut bytes = Vec::new();
+        stderr
+            .read_to_end(&mut bytes)
             .await
-            .map_err(|e| EngineError::Other(format!("git read failed: {e}")))?;
-        if n == 0 {
-            break;
+            .map_err(|e| EngineError::Other(format!("git stderr read failed: {e}")))?;
+        Ok::<_, EngineError>(bytes)
+    };
+    let stdout_capture = async move {
+        let mut out: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 64 * 1024];
+        let mut truncated = false;
+        loop {
+            let n = stdout
+                .read(&mut buf)
+                .await
+                .map_err(|e| EngineError::Other(format!("git read failed: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            let remaining = max_bytes.saturating_sub(out.len());
+            if n > remaining {
+                out.extend_from_slice(&buf[..remaining]);
+                truncated = true;
+                let _ = child.start_kill();
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
         }
-        let remaining = max_bytes.saturating_sub(out.len());
-        if n > remaining {
-            out.extend_from_slice(&buf[..remaining]);
-            truncated = true;
-            let _ = child.start_kill();
-            break;
-        }
-        out.extend_from_slice(&buf[..n]);
-    }
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| EngineError::Other(format!("git wait failed: {e}")))?;
-    if !output.status.success() && !truncated {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        drop(stdout);
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| EngineError::Other(format!("git wait failed: {e}")))?;
+        Ok::<_, EngineError>((out, truncated, status))
+    };
+    let ((out, truncated, status), stderr) = tokio::try_join!(stdout_capture, stderr_capture)?;
+    if !status.success() && !truncated {
+        let stderr = String::from_utf8_lossy(&stderr);
         let message = stderr.trim();
         return Err(EngineError::Other(if message.is_empty() {
-            format!("git exited {}", output.status)
+            format!("git exited {status}")
         } else {
             format!("git: {message}")
         }));
