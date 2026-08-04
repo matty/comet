@@ -217,8 +217,11 @@ impl Terminals {
             .name(format!("pty-read-{id}"))
             .spawn(move || read_pty(reader, raw_tx))
         {
-            dispose(&session, true);
-            let _ = child.wait();
+            let killed = child.kill().is_ok();
+            dispose(&session, false);
+            if killed {
+                let _ = child.wait();
+            }
             return Err(EngineError::Other(format!("pty reader thread: {err}")));
         }
         lock(&self.inner.sessions).insert(id.clone(), session.clone());
