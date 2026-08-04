@@ -145,7 +145,7 @@ impl Terminals {
         self.open_with_shell(cwd, cols, rows, None)
     }
 
-    /// Explicit shell override (tests use `/bin/sh`).
+    /// Explicit shell override (tests use a platform-specific fixture).
     pub fn open_with_shell(
         &self,
         cwd: &str,
@@ -211,14 +211,17 @@ impl Terminals {
             last_active_at: std::time::Instant::now(),
             exited: false,
         }));
-        lock(&self.inner.sessions).insert(id.clone(), session.clone());
-
         // Raw PTY bytes: blocking reader thread → batcher task (12ms windows).
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        std::thread::Builder::new()
+        if let Err(err) = std::thread::Builder::new()
             .name(format!("pty-read-{id}"))
             .spawn(move || read_pty(reader, raw_tx))
-            .map_err(|e| EngineError::Other(format!("pty reader thread: {e}")))?;
+        {
+            dispose(&session, true);
+            let _ = child.wait();
+            return Err(EngineError::Other(format!("pty reader thread: {err}")));
+        }
+        lock(&self.inner.sessions).insert(id.clone(), session.clone());
         let wait = tokio::task::spawn_blocking(move || child.wait());
         let exit = tokio::spawn(wait_for_exit(Arc::downgrade(&session), wait));
         tokio::spawn(pump_output(Arc::downgrade(&session), raw_rx, exit));

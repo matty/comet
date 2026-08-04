@@ -557,8 +557,7 @@ struct TestShell {
     name: &'static str,
     marker_42_command: &'static str,
     marker_11_command: &'static str,
-    rpc_marker_command: &'static str,
-    exit_3_command: &'static str,
+    final_output_exit_command: &'static str,
 }
 
 #[cfg(not(windows))]
@@ -568,8 +567,7 @@ fn test_shell() -> TestShell {
         name: "sh",
         marker_42_command: "echo m4rk3r-$((40+2))\n",
         marker_11_command: "echo aft3r-$((10+1))\n",
-        rpc_marker_command: "echo rpc-t3st-$((5+4))\n",
-        exit_3_command: "exit 3\n",
+        final_output_exit_command: "echo f1nal-$((6+1)); exit 3\n",
     }
 }
 
@@ -580,8 +578,23 @@ fn test_shell() -> TestShell {
         name: "cmd.exe",
         marker_42_command: "set /a marker=40+2\r\necho m4rk3r-%marker%\r\n",
         marker_11_command: "set /a marker=10+1\r\necho aft3r-%marker%\r\n",
-        rpc_marker_command: "set /a marker=5+4\r\necho rpc-t3st-%marker%\r\n",
-        exit_3_command: "exit 3\r\n",
+        final_output_exit_command: "set /a final=6+1\r\necho f1nal-%final%& exit 3\r\n",
+    }
+}
+
+#[cfg(not(windows))]
+fn rpc_marker_command(_shell: &str) -> &'static str {
+    "echo rpc-t3st-$((5+4))\n"
+}
+
+#[cfg(windows)]
+fn rpc_marker_command(shell: &str) -> &'static str {
+    if shell.to_ascii_lowercase().contains("powershell")
+        || shell.to_ascii_lowercase().contains("pwsh")
+    {
+        "Write-Output ('rpc-t3st-' + (5 + 4))\r\n"
+    } else {
+        "set /a marker=5+4\r\necho rpc-t3st-%marker%\r\n"
     }
 }
 
@@ -644,10 +657,10 @@ async fn terminal_e2e_replay_live_resize_exit() {
         .subscribe(&session.id, Some(last_seen))
         .expect("resume");
 
-    // Exit: shell terminates, Exit event lands on every live stream, streams end.
+    // Final output is flushed before Exit; Exit lands on every live stream.
     terminals
-        .write(&session.id, &BASE64.encode(shell.exit_3_command))
-        .expect("write exit");
+        .write(&session.id, &BASE64.encode(shell.final_output_exit_command))
+        .expect("write final output and exit");
     let mut events3 = Vec::new();
     drain_until(&mut rx3, &mut events3, |events| {
         events
@@ -655,6 +668,10 @@ async fn terminal_e2e_replay_live_resize_exit() {
             .any(|e| matches!(e, TerminalEvent::Exit { .. }))
     })
     .await;
+    assert!(
+        decoded(&events3).contains("f1nal-7"),
+        "final process output must precede Exit"
+    );
     match events3.last().expect("exit event") {
         TerminalEvent::Exit { exit_code, .. } => assert_eq!(*exit_code, 3),
         other => panic!("expected exit last, got {other:?}"),
@@ -670,6 +687,7 @@ async fn terminal_e2e_replay_live_resize_exit() {
         events4.push(event);
     }
     assert!(decoded(&events4).contains("m4rk3r-42"));
+    assert!(decoded(&events4).contains("f1nal-7"));
     assert!(matches!(
         events4.last(),
         Some(TerminalEvent::Exit { exit_code: 3, .. })
@@ -919,7 +937,9 @@ async fn rpc_dispatch_for_m5_methods() {
             methods::WRITE_TERMINAL,
             serde_json::json!({
                 "terminalId": terminal_id,
-                "data": BASE64.encode(test_shell().rpc_marker_command),
+                "data": BASE64.encode(rpc_marker_command(
+                    session["shell"].as_str().expect("terminal shell")
+                )),
             }),
         )
         .await
