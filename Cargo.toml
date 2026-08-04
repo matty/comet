@@ -119,6 +119,10 @@ windows-sys = { version = "0.61", features = [
 ] }
 ignore = "0.4"
 
+[workspace.dependencies.windows]
+version = "0.61"
+features = ["Wdk_System_SystemServices"]
+
 [profile.release]
 # Distribution profile (scripts/package-linux.sh): thin LTO buys most of fat
 # LTO's size/speed win at a fraction of the link time; strip debug symbols.

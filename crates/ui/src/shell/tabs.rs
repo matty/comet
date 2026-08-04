@@ -590,7 +590,7 @@ impl Shell {
             .pt(px(Theme::TITLEBAR_TOP_PAD))
             .gap(px(6.0))
             .pl(px(tabs_left))
-            .pr(px(Theme::SPACE_LG))
+            .pr(px(Theme::SPACE_LG + self.windows_caption_clearance()))
             .child(tab_region)
             .when(has_space && has_tabs, |el| el.child(new_tab))
             .child(div().flex_1())
