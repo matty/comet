@@ -41,7 +41,7 @@ fn rejects_removed_tui_subcommand() {
 
 - [ ] **Step 2: Run the test and verify it fails before removal**
 
-Run `cargo test -p comet rejects_removed_tui_subcommand -- --exact`.
+Run `cargo test -p comet tests::rejects_removed_tui_subcommand -- --exact`.
 
 Expected: FAIL because the current parser accepts `tui` and returns `Command::Tui`.
 
@@ -115,7 +115,7 @@ git commit --amend --no-edit
 
 - [ ] **Step 4: Verify the CLI regression guard is green**
 
-Run `cargo test -p comet rejects_removed_tui_subcommand -- --exact`.
+Run `cargo test -p comet tests::rejects_removed_tui_subcommand -- --exact`.
 
 Expected: PASS.
 

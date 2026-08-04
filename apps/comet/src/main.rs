@@ -182,6 +182,11 @@ mod tests {
     }
 
     #[test]
+    fn rejects_removed_tui_subcommand() {
+        assert!(Cli::try_parse_from(["comet", "tui"]).is_err());
+    }
+
+    #[test]
     fn parses_manual_remote_endpoint() {
         let cli = Cli::try_parse_from(["comet", "remote", "add", "buildbox.local:27655"]).unwrap();
         assert!(matches!(
