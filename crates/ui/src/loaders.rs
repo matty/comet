@@ -14,8 +14,8 @@ use gpui::{AnyElement, App, EntityId, IntoElement, ParentElement, SharedString, 
 use crate::motion::{self, COMET_PULSE, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT};
 use crate::theme::Theme;
 
-// Shared with the terminal viewport (`comet_proto::motion`) so both animate the
-// same loaders from the same numbers.
+// Shared through `comet_proto::motion` so motion constants remain pure and
+// independently testable.
 pub use comet_proto::motion::{
     COMET_CELLS, MARK_CELLS, MARK_SPREAD, MATRIX_SIDE, mark_cell_stagger,
 };

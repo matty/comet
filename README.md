@@ -1,8 +1,7 @@
 # Comet
 
-Comet is a native Desktop and terminal UI for running Claude Code and Codex
-sessions on this machine or on explicitly configured Comet machines on your
-local network.
+Comet is a native Desktop app for running Claude Code and Codex sessions on
+this machine or on explicitly configured Comet machines on your local network.
 
 ![Comet running a Claude Code session](docs/screenshot.png)
 
@@ -13,9 +12,7 @@ agents, repositories, terminals, chats, sessions, and attachments.
 ## Run locally
 
 Running the Desktop app starts an engine in the app when no local engine is
-already running. `comet tui` attaches to an existing local engine or starts a
-detached `comet headless` process itself. You do not need to install a daemon
-for ordinary Desktop or TUI use.
+already running. You do not need to install a daemon for ordinary Desktop use.
 
 An installed daemon is useful only when the engine must survive logouts or run
 continuously on a headless machine:
@@ -36,10 +33,10 @@ Day-to-day commands:
 
 ```bash
 comet                    # Desktop UI; embeds the local engine when needed
-comet tui                # terminal UI; attaches or auto-starts an engine
 comet headless           # engine only, in the foreground
 comet status             # local engine, listener, trust, and remote status
 comet update             # optional release check/download
+comet daemon start|stop|restart|status
 ```
 
 There is no `comet login`, `comet logout`, or `comet migrate` command. Existing
@@ -79,9 +76,9 @@ comet remote clients
 comet remote revoke sha256:<client-id>
 ```
 
-Desktop and TUI group data by server. A stopped or unreachable server remains
-listed as offline/unreachable, but its child spaces, chats, and sessions are
-cleared; Comet does not cache or reconcile remote content.
+Desktop groups data by server. A stopped or unreachable server remains listed
+as offline/unreachable, but its child spaces, chats, and sessions are cleared;
+Comet does not cache or reconcile remote content.
 
 Connections are direct and non-transitive. If A connects to B and B connects to
 C, A cannot see or control C. A must configure and pair C separately.

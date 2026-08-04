@@ -292,10 +292,10 @@ impl EngineHandle {
         let service: Arc<dyn RpcService> = engine_runtime.core().rpc_service();
         let client = memory_client(service.clone());
 
-        // Serve the same service on the IPC port so a terminal viewport can
-        // attach to this window's engine with no setup.
+        // Serve the same service on the IPC port so local administration
+        // clients can attach to this window's engine with no setup.
         // Best-effort — losing the bind race with another engine costs other
-        // viewports, not this one.
+        // local clients, not this one.
         let ipc_task = match comet_engine::serve_ipc(engine_config.ipc_port, service).await {
             Ok(task) => Some(task),
             Err(err) => {
@@ -335,10 +335,9 @@ impl EngineHandle {
 // ---------------------------------------------------------------------------
 
 // The frontend-agnostic derivations (sort orders, staleness gating, sidebar
-// grouping, the boot gate, relative times) live in `comet_proto::view` so the
-// terminal viewport (`comet-tui`) shares one implementation and one test suite
-// with this one — a sort order that differs per surface is a bug. Re-exported
-// here because every call site in this crate reads them as `state::…`.
+// grouping, the boot gate, relative times) live in `comet_proto::view`, pure
+// and with their own test suite. Re-exported here because every call site in
+// this crate reads them as `state::…`.
 pub use comet_proto::view::{
     ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
     chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
@@ -1509,7 +1508,7 @@ mod tests {
         .unwrap();
         assert_eq!(handle.mode(), EngineMode::InProcess);
 
-        // Attach the way `comet-tui` does, and speak the same protocol.
+        // Attach the way an external viewport would, and speak the same protocol.
         let attached = connect_ws(&format!("ws://127.0.0.1:{port}"))
             .await
             .expect("a second viewport must be able to attach");

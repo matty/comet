@@ -9,12 +9,11 @@ cloud-to-local migration path.
 
 ```text
 Desktop ── in-memory or localhost RPC ── engine A
-TUI     ── localhost RPC ────────────────┘
-                                            direct TLS RPC
-                                                  │
-Desktop/TUI federation on A ───────────────── engine B
-                                                  │
-                                           B's local store
+                                      direct TLS RPC
+                                            │
+Desktop federation on A ─────────────── engine B
+                                            │
+                                     B's local store
 ```
 
 `comet` opens the Desktop app. If no engine owns the configured data directory,
@@ -22,20 +21,15 @@ the Desktop embeds one and also exposes its localhost IPC endpoint. If an engine
 is already running, the Desktop connects to it. No daemon installation is
 required.
 
-`comet tui` is a viewport with a deliberately separate lifetime. It attaches to
-the localhost IPC endpoint; when none exists it starts a detached `comet
-headless` process and then attaches. Exiting the TUI detaches without stopping
-active work. `--no-spawn` disables this automatic start.
-
 `comet headless` runs the same engine without a UI. `comet daemon install` is an
 optional launchd/systemd-user deployment for an always-on or headless machine;
-it is not a prerequisite for Desktop or TUI operation. The data-directory
-instance lock prevents two engines from owning one store.
+it is not a prerequisite for Desktop operation. The data-directory instance
+lock prevents two engines from owning one store.
 
 ## Authority and federation
 
 An engine owns only its local spaces, chats, sessions, repositories, terminals,
-uploads, attachments, and agent processes. Desktop and TUI use `comet-client` to
+uploads, attachments, and agent processes. Desktop uses `comet-client` to
 combine the local engine and each explicitly configured remote into server
 buckets. Entity IDs are interpreted with their server ID, so equal local IDs on
 different machines do not collide.
@@ -82,8 +76,8 @@ merges hosted profiles. There is no `login`, `logout`, or `migrate` CLI surface.
 `comet-proto` defines server-scoped identifiers, endpoints, connection states,
 handshakes, and entity payloads. `comet-rpc` provides localhost WebSocket RPC,
 pinned TLS transport, and pairing. `comet-engine` owns storage and authoritative
-operations. `comet-client` supervises direct connections. `comet-ui` and
-`comet-tui` are the supported remote UX surfaces.
+operations. `comet-client` supervises direct connections, and `comet-ui` is the
+supported remote UX surface.
 
 ## Network and release boundary
 
@@ -112,7 +106,7 @@ contact Claude, OpenAI, or another configured agent provider.
   conflicts, revocation, the LAN allowlist, local ownership, terminal and
   attachment restrictions.
 - Engine repository/terminal/upload and mock-harness suites cover the allowed
-  operations themselves; Desktop and TUI tests cover server grouping/routing.
+  operations themselves; Desktop tests cover server grouping/routing.
 
 The iOS client is outside the LAN-remote scope for this release.
 

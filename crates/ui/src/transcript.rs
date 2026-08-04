@@ -670,15 +670,15 @@ pub fn diff_rows(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
 
 /// The ToolGroup summary line — "Ran 3 commands · edited 2 files".
 ///
-/// The rule lives in `comet_proto::view` so the terminal viewport reports the
-/// same summary; this only adapts the row model's [`ToolItem`] to it.
+/// The rule lives in `comet_proto::view` so it remains presentation-independent;
+/// this only adapts the row model's [`ToolItem`] to it.
 pub fn tool_group_summary(tools: &[ToolItem]) -> String {
     let pairs: Vec<(ToolCall, bool)> = tools.iter().map(|t| (t.call.clone(), t.is_error)).collect();
     comet_proto::view::tool_group_summary(&pairs)
 }
 
-// `single_line` and the per-kind chip label/detail are shared with the terminal
-// viewport (`comet_proto::view`): a tool must be named identically on every
+// `single_line` and the per-kind chip label/detail live in
+// `comet_proto::view`: a tool must be named identically on every
 // surface, and the one-line collapse is needed for the same reason in both (a
 // literal newline breaks gpui's ellipsis logic and would be a cursor move in a
 // cell grid).
