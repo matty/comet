@@ -1293,6 +1293,7 @@ dependencies = [
  "comet-rpc",
  "comet-sync",
  "comet-update",
+ "data-encoding",
  "futures",
  "ignore",
  "libc",

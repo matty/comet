@@ -16,7 +16,10 @@ use comet_proto::{
     AgentEvent, Device, HarnessId, Model, PROTOCOL_VERSION, ReasoningLevel, RemoteConnectionState,
     RemoteEndpoint, RemoteEntry, RunRequest, ServerId, SteeringMode, TrustedClient,
 };
-use comet_rpc::{RpcError, RpcReply, RpcService, TlsIdentity, connect_lan_rpc, methods};
+use comet_rpc::{
+    RpcError, RpcReply, RpcService, TlsIdentity, connect_lan_rpc, methods, pair_client,
+};
+use data_encoding::BASE32_NOPAD;
 use tokio::net::{TcpListener, TcpStream};
 
 struct EmptyHarness;
@@ -433,19 +436,18 @@ async fn persisted_online_remote_is_offline_when_engine_opens() {
     core.shutdown().await;
 }
 
-#[tokio::test]
-async fn revoking_a_trusted_client_closes_its_active_connection() {
-    let fixture = EngineFixture::start().await;
-    let client_dir = tempfile::tempdir().unwrap();
-    let client_identity = DeviceIdentity::load_or_create(client_dir.path()).unwrap();
-    let client_tls = TlsIdentity::from_device_identity(&client_identity).unwrap();
+/// A client identity that the engine already trusts, as if it had paired.
+fn trusted_client(fixture: &EngineFixture, name: &str) -> (tempfile::TempDir, TlsIdentity) {
+    let dir = tempfile::tempdir().unwrap();
+    let identity = DeviceIdentity::load_or_create(dir.path()).unwrap();
+    let tls = TlsIdentity::from_device_identity(&identity).unwrap();
     fixture
         .core
         .remote_config()
         .trust_client(TrustedClient {
-            server_id: client_tls.server_id().clone(),
-            name: "Test client".into(),
-            pinned_spki_sha256: serde_json::to_value(client_tls.server_id())
+            server_id: tls.server_id().clone(),
+            name: name.into(),
+            pinned_spki_sha256: serde_json::to_value(tls.server_id())
                 .unwrap()
                 .as_str()
                 .unwrap()
@@ -453,6 +455,38 @@ async fn revoking_a_trusted_client_closes_its_active_connection() {
             paired_at: Utc::now(),
         })
         .unwrap();
+    (dir, tls)
+}
+
+async fn wait_until_disconnected(client: &comet_rpc::RpcClient) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if client
+                .call(methods::SERVER_HELLO, serde_json::json!({}))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("revocation closes the active connection");
+}
+
+fn decode_pairing_secret(encoded: &str) -> [u8; 16] {
+    BASE32_NOPAD
+        .decode(encoded.replace('-', "").as_bytes())
+        .expect("pairing secret is base32")
+        .try_into()
+        .expect("pairing secret is 16 bytes")
+}
+
+#[tokio::test]
+async fn revoking_a_trusted_client_closes_its_active_connection() {
+    let fixture = EngineFixture::start().await;
+    let (_client_dir, client_tls) = trusted_client(&fixture, "Test client");
     fixture.enable_lan().await.unwrap();
     fixture
         .wait_for_status(|status| matches!(status, LanServerStatus::Listening { .. }))
@@ -474,20 +508,142 @@ async fn revoking_a_trusted_client_closes_its_active_connection() {
         )
         .await
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if client
-                .call(methods::SERVER_HELLO, serde_json::json!({}))
+    wait_until_disconnected(&client).await;
+    fixture.core.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_paired_clients_hold_concurrent_connections() {
+    let fixture = EngineFixture::start().await;
+    let (_first_dir, first_tls) = trusted_client(&fixture, "First client");
+    let (_second_dir, second_tls) = trusted_client(&fixture, "Second client");
+    assert_ne!(first_tls.server_id(), second_tls.server_id());
+    fixture.enable_lan().await.unwrap();
+    fixture
+        .wait_for_status(|status| matches!(status, LanServerStatus::Listening { .. }))
+        .await;
+    let pin = TlsIdentity::from_device_identity(fixture.core.device_identity())
+        .unwrap()
+        .pinned_server();
+
+    let first = connect_lan_rpc(fixture.lan_addr, &first_tls, &pin)
+        .await
+        .unwrap();
+    let second = connect_lan_rpc(fixture.lan_addr, &second_tls, &pin)
+        .await
+        .unwrap();
+    let (first_hello, second_hello) = tokio::join!(
+        first.call(methods::SERVER_HELLO, serde_json::json!({})),
+        second.call(methods::SERVER_HELLO, serde_json::json!({})),
+    );
+    assert_eq!(first_hello.unwrap(), second_hello.unwrap());
+    // Neither connection was consumed by the other's traffic.
+    assert!(
+        first
+            .call(methods::LOCAL_DEVICE, serde_json::json!({}))
+            .await
+            .is_ok()
+    );
+    assert!(
+        second
+            .call(methods::LOCAL_DEVICE, serde_json::json!({}))
+            .await
+            .is_ok()
+    );
+    fixture.core.shutdown().await;
+}
+
+#[tokio::test]
+async fn revoking_one_client_leaves_another_client_connected() {
+    let fixture = EngineFixture::start().await;
+    let (_revoked_dir, revoked_tls) = trusted_client(&fixture, "Revoked client");
+    let (_kept_dir, kept_tls) = trusted_client(&fixture, "Kept client");
+    fixture.enable_lan().await.unwrap();
+    fixture
+        .wait_for_status(|status| matches!(status, LanServerStatus::Listening { .. }))
+        .await;
+    let pin = TlsIdentity::from_device_identity(fixture.core.device_identity())
+        .unwrap()
+        .pinned_server();
+    let revoked = connect_lan_rpc(fixture.lan_addr, &revoked_tls, &pin)
+        .await
+        .unwrap();
+    let kept = connect_lan_rpc(fixture.lan_addr, &kept_tls, &pin)
+        .await
+        .unwrap();
+
+    fixture
+        .local_call(
+            methods::REVOKE_TRUSTED_CLIENT,
+            serde_json::json!({"serverId": revoked_tls.server_id()}),
+        )
+        .await
+        .unwrap();
+    wait_until_disconnected(&revoked).await;
+
+    assert!(
+        kept.call(methods::SERVER_HELLO, serde_json::json!({}))
+            .await
+            .is_ok(),
+        "revoking one client must not close another client's connection"
+    );
+    assert!(
+        connect_lan_rpc(fixture.lan_addr, &kept_tls, &pin)
+            .await
+            .is_ok(),
+        "revoking one client must not remove another client's trust"
+    );
+    assert!(
+        connect_lan_rpc(fixture.lan_addr, &revoked_tls, &pin)
+            .await
+            .is_err()
+    );
+    fixture.core.shutdown().await;
+}
+
+#[tokio::test]
+async fn sequential_pairing_sessions_accumulate_trusted_clients() {
+    let fixture = EngineFixture::start().await;
+    fixture.enable_lan().await.unwrap();
+    fixture
+        .wait_for_status(|status| matches!(status, LanServerStatus::Listening { .. }))
+        .await;
+    let server_tls = TlsIdentity::from_device_identity(fixture.core.device_identity()).unwrap();
+
+    let mut paired = Vec::new();
+    for _ in 0..2 {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = DeviceIdentity::load_or_create(dir.path()).unwrap();
+        let tls = TlsIdentity::from_device_identity(&identity).unwrap();
+        let session = fixture
+            .local_call(methods::BEGIN_PAIRING, serde_json::json!({}))
+            .await
+            .unwrap();
+        let secret = decode_pairing_secret(session["secret"].as_str().unwrap());
+        let pin = pair_client(fixture.lan_addr, &tls, secret).await.unwrap();
+        assert_eq!(pin.server_id(), server_tls.server_id());
+        paired.push((dir, tls));
+    }
+
+    let trusted_rx = fixture.core.remote_config().watch_trusted_clients();
+    let trusted = trusted_rx.borrow().clone();
+    assert_eq!(
+        trusted.len(),
+        2,
+        "a second pairing must not replace the first"
+    );
+    for (_dir, tls) in &paired {
+        assert!(
+            trusted
+                .iter()
+                .any(|client| client.server_id == *tls.server_id())
+        );
+        assert!(
+            connect_lan_rpc(fixture.lan_addr, tls, &server_tls.pinned_server())
                 .await
-                .is_err()
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("revocation closes the active connection");
+                .is_ok()
+        );
+    }
     fixture.core.shutdown().await;
 }
 
