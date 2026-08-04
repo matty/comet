@@ -1,36 +1,62 @@
-name: release
-
-# Build release artifacts and publish them:
-#   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
-#   - macOS dmg (Apple silicon) via scripts/package-macos.sh
-# then create a GitHub Release AND upload everything to the
-# `comet-native-releases` R2 bucket (served by the distribution-only Worker at
-# comet.zeron.sh/releases/* for
-# `curl -fsSL https://comet.zeron.sh/install.sh | sh`).
-#
-# Trigger: push a tag `v<version>` matching the workspace version in
-# Cargo.toml (bump it in the same commit), or run manually via
-# workflow_dispatch (builds + uploads artifacts, no release/R2 publish).
+name: nightly release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: nightly-release
+  cancel-in-progress: true
+
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
+    steps:
+      - name: wait for 30 minutes of silence
+        if: github.event_name == 'push'
+        run: sleep 1800
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: derive immutable nightly version
+        id: release
+        shell: bash
+        run: |
+          git fetch origin main
+          source_sha="$(git rev-parse origin/main)"
+          if [ "${{ github.event_name }}" = push ] && [ "$source_sha" != "$GITHUB_SHA" ]; then
+            echo "main advanced from $GITHUB_SHA to $source_sha" >&2
+            exit 1
+          fi
+          base="$(sed -n '0,/^version = /s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          test -n "$base"
+          version="$base-nightly.$(date -u +%Y%m%d).${{ github.run_number }}.g${source_sha:0:7}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+
   linux:
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04 # x86_64
-          - runner: ubuntu-24.04-arm # aarch64
+          - runner: ubuntu-24.04
+          - runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
       - name: gpui system deps
         run: |
           sudo apt-get update -qq
@@ -39,6 +65,28 @@ jobs:
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libfontconfig1-dev libfreetype-dev libasound2-dev \
             libvulkan-dev pkg-config cmake
+      - name: set nightly workspace version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python3 - "$VERSION" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          path = Path("Cargo.toml")
+          text = path.read_text()
+          updated, count = re.subn(
+              r'^version = "[^"]+"',
+              f'version = "{sys.argv[1]}"',
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if count != 1:
+              raise SystemExit("workspace version was not found exactly once")
+          path.write_text(updated)
+          PY
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -50,14 +98,36 @@ jobs:
           path: target/package/*.tar.gz
           if-no-files-found: error
 
-  # Heads-up: the macOS cfg paths (Keychain in agent_accounts.rs) have never
-  # been type-checked against the Apple SDK — this job may surface errors on
-  # its first runs. continue-on-error keeps the Linux release shippable.
   macos:
-    runs-on: macos-latest # Apple silicon
+    needs: prepare
+    runs-on: macos-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+      - name: set nightly workspace version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python3 - "$VERSION" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          path = Path("Cargo.toml")
+          text = path.read_text()
+          updated, count = re.subn(
+              r'^version = "[^"]+"',
+              f'version = "{sys.argv[1]}"',
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if count != 1:
+              raise SystemExit("workspace version was not found exactly once")
+          path.write_text(updated)
+          PY
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -71,48 +141,90 @@ jobs:
             target/package/*.tar.gz
           if-no-files-found: error
 
-  publish:
-    if: github.repository == 'matty/comet' && startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, macos]
-    runs-on: ubuntu-latest
-    env:
-      # `secrets` is not a valid context in step `if:` expressions — surface
-      # the token through job env and gate on that instead.
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: b57dde68ee5964dccc025437b5478a5b
+  windows:
+    needs: prepare
+    runs-on: windows-latest
     steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+      - name: set nightly workspace version
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $content = Get-Content -Raw Cargo.toml
+          $updated = [regex]::Replace($content, '(?m)^version = "[^"]+"', "version = `"$env:VERSION`"", 1)
+          if ($updated -eq $content) { throw "workspace version was not replaced" }
+          Set-Content -Path Cargo.toml -Value $updated -NoNewline
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: build and package
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          cargo build --release -p comet
+          $stage = Join-Path $env:RUNNER_TEMP "comet-$env:VERSION-windows-x86_64"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target/release/comet.exe, README.md, LICENSE $stage
+          New-Item -ItemType Directory -Force target/package | Out-Null
+          Compress-Archive -Path "$stage/*" -DestinationPath "target/package/comet-$env:VERSION-windows-x86_64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: target/package/*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, linux, macos, windows]
+    if: ${{ github.repository == 'matty/comet' && !cancelled() && needs.prepare.result == 'success' && needs.linux.result == 'success' && needs.windows.result == 'success' && (needs.macos.result == 'success' || needs.macos.result == 'failure') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: version guard (tag == artifact version)
+      - name: require release artifacts
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          ver="${GITHUB_REF_NAME#v}"
-          ls dist/
-          ls dist/ | grep -q "comet-$ver-" \
-            || { echo "tag v$ver does not match built artifact versions — bump Cargo.toml [workspace.package] version"; exit 1; }
-          echo "VERSION=$ver" >> "$GITHUB_ENV"
-      - uses: softprops/action-gh-release@v2
+          test -f "dist/comet-$VERSION-linux-x86_64.tar.gz"
+          test -f "dist/comet-$VERSION-linux-aarch64.tar.gz"
+          test -f "dist/comet-$VERSION-windows-x86_64.zip"
+      - name: verify source and tag are immutable
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          git fetch origin main
+          current_sha="$(git rev-parse origin/main)"
+          if [ "$current_sha" != "$SOURCE_SHA" ]; then
+            echo "main advanced from $SOURCE_SHA to $current_sha" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG"; then
+            echo "tag $TAG already exists" >&2
+            exit 1
+          else
+            status=$?
+            if [ "$status" -ne 2 ]; then
+              exit "$status"
+            fi
+          fi
+      - uses: softprops/action-gh-release@v3
         with:
-          files: dist/*
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Comet ${{ needs.prepare.outputs.version }}
+          target_commitish: ${{ needs.prepare.outputs.source_sha }}
+          prerelease: true
+          make_latest: false
           generate_release_notes: true
-      - name: upload to R2 (comet.zeron.sh/releases/*)
-        if: env.CLOUDFLARE_API_TOKEN != ''
-        run: |
-          for f in dist/*; do
-            npx wrangler@4 r2 object put "comet-native-releases/$(basename "$f")" \
-              --file "$f" --remote
-          done
-          # manifest.json: canonical repository + version + per-artifact sha256
-          # — the auto-updater verifies provenance and downloads against it.
-          # The provenance-bearing manifest is the sole release pointer.
-          manifest=$(jq -n --arg repository "matty/comet" --arg version "$VERSION" \
-            '{repository: $repository, version: $version, files: {}}')
-          for f in dist/*; do
-            sha=$(sha256sum "$f" | cut -d' ' -f1)
-            manifest=$(jq --arg name "$(basename "$f")" --arg sha "$sha" \
-              '.files[$name] = {sha256: $sha}' <<<"$manifest")
-          done
-          printf '%s' "$manifest" > manifest.json
-          npx wrangler@4 r2 object put comet-native-releases/manifest.json \
-            --file manifest.json --remote
+          body: Built from `${{ needs.prepare.outputs.source_sha }}` on `main`.
+          files: dist/*
+          fail_on_unmatched_files: true
