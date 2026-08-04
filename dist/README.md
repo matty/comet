@@ -18,6 +18,19 @@ Produces `target/package/comet-<version>-linux-<arch>.tar.gz` containing:
 The release profile in the root `Cargo.toml` sets `lto = "thin"` and
 `strip = "symbols"` for distribution builds.
 
+## Windows
+
+```powershell
+cargo build --release -p comet
+```
+
+The nightly workflow packages the release build as
+`comet-<version>-windows-x86_64.zip` containing:
+
+- `comet.exe`
+- `README.md`
+- `LICENSE`
+
 ## macOS
 
 ```sh
@@ -26,9 +39,8 @@ scripts/package-macos.sh    # → target/package/comet-<version>-macos-<arch>.dm
 
 Builds the release binary, assembles `Comet.app` (Info.plist + icns), ad-hoc
 signs it (set `CODESIGN_IDENTITY` for a real Developer ID), and wraps it in a
-dmg. CI runs this on tags (`.github/workflows/release.yml`). The manual steps
-it automates, for reference (run on a macOS host — gpui needs Metal; no
-cross-build from Linux):
+dmg. The manual steps it automates, for reference (run on a macOS host — gpui
+needs Metal; no cross-build from Linux):
 
 1. Build the universal (or per-arch) binary:
    ```sh
@@ -58,3 +70,15 @@ cross-build from Linux):
    xcrun stapler staple Comet.app
    ```
 5. Ship as a `.dmg` (`hdiutil create -volname Comet -srcfolder Comet.app -ov -format UDZO Comet.dmg`).
+
+## Nightly GitHub releases
+
+Every push to `main` starts a release run after a 30-minute quiet period. A new
+push resets that quiet period by cancelling the in-progress run. A manual
+`workflow_dispatch` run bypasses the wait.
+
+Each run derives an immutable prerelease version from the workspace version,
+UTC date, GitHub run number, and source commit, for example
+`0.1.15-nightly.20260804.123.g1a2b3c4`. The resulting packages are published as
+a GitHub prerelease and are not marked as the latest release. Publication is
+GitHub-only; artifacts are not copied to a separate cloud object store.
