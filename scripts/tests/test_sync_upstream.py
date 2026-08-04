@@ -1,6 +1,8 @@
 import importlib.util
 import io
 import subprocess
+import sys
+import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
@@ -19,6 +21,92 @@ COMMITS = [
     sync.Commit("c4", "c4", "2026-08-04", "Dave", "Fourth"),
 ]
 DISPLAYED = list(reversed(COMMITS))
+
+
+class LocalRepositoryIntegrationTests(unittest.TestCase):
+    def test_selected_upstream_commits_are_cherry_picked_without_moving_main(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            upstream = root / "upstream.git"
+            source = root / "source"
+            fork = root / "fork"
+
+            def git(*args, cwd=None):
+                return subprocess.run(
+                    ["git", *args],
+                    cwd=cwd,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                )
+
+            git("init", "--bare", "--initial-branch=main", str(upstream))
+            git("clone", str(upstream), str(source))
+            git("config", "user.name", "Comet Test", cwd=source)
+            git("config", "user.email", "comet-test@example.invalid", cwd=source)
+            (source / "shared.txt").write_text("base\n", encoding="utf-8")
+            git("add", "shared.txt", cwd=source)
+            git("commit", "-m", "Shared base", cwd=source)
+            git("push", "origin", "main", cwd=source)
+
+            git("clone", str(upstream), str(fork))
+            git("config", "user.name", "Comet Test", cwd=fork)
+            git("config", "user.email", "comet-test@example.invalid", cwd=fork)
+            base_oid = git("rev-parse", "main", cwd=fork).stdout.strip()
+
+            (source / "first.txt").write_text("first\n", encoding="utf-8")
+            git("add", "first.txt", cwd=source)
+            git("commit", "-m", "First upstream change", cwd=source)
+            (source / "second.txt").write_text("second\n", encoding="utf-8")
+            git("add", "second.txt", cwd=source)
+            git("commit", "-m", "Second upstream change", cwd=source)
+            git("push", "origin", "main", cwd=source)
+
+            git("remote", "add", "upstream", str(upstream), cwd=fork)
+            offline_entrypoint = """
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("sync_upstream_offline", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+expected_upstream = module.is_expected_upstream
+module.is_expected_upstream = lambda url: (
+    expected_upstream(url) or url == sys.argv[2]
+)
+raise SystemExit(module.main([]))
+"""
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    offline_entrypoint,
+                    str(SCRIPT_PATH),
+                    str(upstream),
+                ],
+                cwd=fork,
+                input="1,2\nyes\n",
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            branch = git(
+                "symbolic-ref", "--quiet", "--short", "HEAD", cwd=fork
+            ).stdout.strip()
+            self.assertTrue(branch.startswith("sync/upstream-"), branch)
+            subjects = git(
+                "log", "--format=%s", "main..HEAD", cwd=fork
+            ).stdout.splitlines()
+            self.assertEqual(
+                subjects,
+                ["Second upstream change", "First upstream change"],
+            )
+            self.assertEqual(git("status", "--porcelain", cwd=fork).stdout, "")
+            self.assertEqual(git("rev-parse", "main", cwd=fork).stdout.strip(), base_oid)
 
 
 class ScriptedGit:
