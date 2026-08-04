@@ -52,4 +52,4 @@ After the cherry-pick and conflict resolution:
 3. Run formatting checks, upstream-sync helper tests, and the remaining Rust
    workspace tests, reporting any unrelated pre-existing failures separately.
 4. Confirm the worktree is clean and the removal is represented by a commit
-   descended from upstream `7b52ce1`.
+   derived by cherry-picking upstream `7b52ce1`.
