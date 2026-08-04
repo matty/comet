@@ -1,3 +1,7 @@
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -60,6 +64,52 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )["run"]
         self.assertIn("Compress-Archive", windows_package)
         self.assertIn("windows-x86_64.zip", windows_package)
+
+    def test_windows_version_step_only_changes_workspace_package_version(self):
+        pwsh = shutil.which("pwsh")
+        if pwsh is None:
+            self.skipTest("PowerShell is required to exercise the Windows workflow step")
+
+        windows_steps = self.workflow["jobs"]["windows"]["steps"]
+        version_step = next(
+            step
+            for step in windows_steps
+            if step.get("name") == "set nightly workspace version"
+        )
+        cargo_toml = """\
+[workspace]
+members = []
+
+[workspace.package]
+version = "0.1.15"
+
+[workspace.dependencies.windows]
+version = "0.61"
+"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "Cargo.toml"
+            manifest.write_text(cargo_toml, encoding="utf-8")
+            env = os.environ.copy()
+            env["VERSION"] = "0.1.15-nightly.20260804.1.g8a4edce"
+            result = subprocess.run(
+                [pwsh, "-NoProfile", "-NonInteractive", "-Command", version_step["run"]],
+                cwd=directory,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                manifest.read_text(encoding="utf-8"),
+                cargo_toml.replace(
+                    'version = "0.1.15"',
+                    'version = "0.1.15-nightly.20260804.1.g8a4edce"',
+                    1,
+                ),
+            )
 
     def test_publication_is_github_only_prerelease(self):
         publish = self.workflow["jobs"]["publish"]

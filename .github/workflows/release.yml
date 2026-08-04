@@ -154,7 +154,8 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           $content = Get-Content -Raw Cargo.toml
-          $updated = [regex]::Replace($content, '(?m)^version = "[^"]+"', "version = `"$env:VERSION`"", 1)
+          $versionPattern = [regex]::new('(?m)^version = "[^"]+"')
+          $updated = $versionPattern.Replace($content, "version = `"$env:VERSION`"", 1)
           if ($updated -eq $content) { throw "workspace version was not replaced" }
           Set-Content -Path Cargo.toml -Value $updated -NoNewline
       - name: rust toolchain (rust-toolchain.toml)
