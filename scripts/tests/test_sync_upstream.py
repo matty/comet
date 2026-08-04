@@ -1,7 +1,9 @@
 import importlib.util
+import subprocess
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT_PATH = Path(__file__).parents[1] / "sync-upstream.py"
@@ -16,6 +18,176 @@ COMMITS = [
     sync.Commit("c4", "c4", "2026-08-04", "Dave", "Fourth"),
 ]
 DISPLAYED = list(reversed(COMMITS))
+
+
+class ScriptedGit:
+    def __init__(self, responses):
+        self.responses = responses
+        self.commands = []
+
+    def run(self, *args, check=True):
+        self.commands.append((args, check))
+        response = self.responses[args]
+        if isinstance(response, Exception):
+            raise response
+        if isinstance(response, subprocess.CompletedProcess):
+            return response
+        return subprocess.CompletedProcess(args, 0, response, "")
+
+
+class GitAdapterTests(unittest.TestCase):
+    @mock.patch.object(sync.subprocess, "run")
+    def test_run_preserves_failed_command_details(self, run):
+        run.return_value = subprocess.CompletedProcess(
+            ["git", "fetch"], 7, "partial", "fatal: example"
+        )
+
+        with self.assertRaises(sync.GitError) as caught:
+            sync.Git().run("fetch")
+
+        error = caught.exception
+        self.assertEqual(error.args_list, ["fetch"])
+        self.assertEqual(error.returncode, 7)
+        self.assertEqual(error.stdout, "partial")
+        self.assertEqual(error.stderr, "fatal: example")
+        run.assert_called_once_with(
+            ["git", "fetch"],
+            cwd=None,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    @mock.patch.object(sync.subprocess, "run", side_effect=FileNotFoundError)
+    def test_run_reports_missing_git(self, run):
+        with self.assertRaisesRegex(
+            sync.SyncError, "Git is not installed or is not on PATH"
+        ):
+            sync.Git(Path("C:/repo")).run("status")
+
+
+class RepositoryTests(unittest.TestCase):
+    def test_repository_root_returns_resolved_git_toplevel(self):
+        git = ScriptedGit({("rev-parse", "--show-toplevel"): "C:/dev/comet\n"})
+
+        self.assertEqual(sync.repository_root(git), Path("C:/dev/comet"))
+
+    def test_validate_repository_rejects_dirty_worktree(self):
+        git = ScriptedGit({("status", "--porcelain"): "?? local.txt\n"})
+        with self.assertRaisesRegex(sync.SyncError, "clean worktree"):
+            sync.validate_repository(git)
+
+    def test_validate_repository_rejects_detached_head(self):
+        git = ScriptedGit({
+            ("status", "--porcelain"): "",
+            ("symbolic-ref", "--quiet", "--short", "HEAD"): sync.GitError(
+                ["symbolic-ref", "--quiet", "--short", "HEAD"], 1, "", ""
+            ),
+        })
+        with self.assertRaisesRegex(sync.SyncError, "detached HEAD"):
+            sync.validate_repository(git)
+
+    def test_validate_repository_returns_exact_attached_branch_name(self):
+        git = ScriptedGit({
+            ("status", "--porcelain"): "",
+            ("symbolic-ref", "--quiet", "--short", "HEAD"): "feature/exact-name\n",
+        })
+
+        self.assertEqual(sync.validate_repository(git), "feature/exact-name")
+
+
+class UpstreamTests(unittest.TestCase):
+    def test_missing_remote_adds_expected_upstream(self):
+        get_url = ("remote", "get-url", "upstream")
+        add = (
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/zeronsh/comet.git",
+        )
+        git = ScriptedGit({
+            get_url: subprocess.CompletedProcess(get_url, 2, "", "missing"),
+            add: "",
+        })
+
+        sync.ensure_upstream(git)
+
+        self.assertEqual(git.commands, [(get_url, False), (add, True)])
+
+    def test_matching_remote_causes_no_mutation(self):
+        get_url = ("remote", "get-url", "upstream")
+        for url in (
+            "https://github.com/zeronsh/comet.git\n",
+            "git@github.com:zeronsh/comet.git\n",
+        ):
+            with self.subTest(url=url):
+                git = ScriptedGit({get_url: url})
+
+                sync.ensure_upstream(git)
+
+                self.assertEqual(git.commands, [(get_url, False)])
+
+    def test_conflicting_remote_reports_name_and_found_url(self):
+        get_url = ("remote", "get-url", "upstream")
+        found = "https://github.com/example/comet.git"
+        git = ScriptedGit({get_url: found + "\n"})
+
+        with self.assertRaises(sync.SyncError) as caught:
+            sync.ensure_upstream(git)
+
+        self.assertIn("upstream", str(caught.exception))
+        self.assertIn(found, str(caught.exception))
+
+
+class DiscoveryTests(unittest.TestCase):
+    LOG_COMMAND = (
+        "log",
+        "--right-only",
+        "--cherry-pick",
+        "--topo-order",
+        "--format=%H%x00%h%x00%cs%x00%an%x00%s",
+        "feature/current...upstream/main",
+    )
+
+    def test_discovery_uses_expected_log_and_parses_newest_first(self):
+        output = (
+            "b" * 40 + "\x00bbbbbbb\x002026-08-04\x00Bob\x00Newest\n"
+            + "a" * 40 + "\x00aaaaaaa\x002026-08-03\x00Alice\x00Older\n"
+        )
+        git = ScriptedGit({self.LOG_COMMAND: output})
+
+        commits = sync.discover_commits(git, "feature/current")
+
+        self.assertEqual(git.commands, [(self.LOG_COMMAND, True)])
+        self.assertEqual(
+            commits,
+            [
+                sync.Commit("b" * 40, "bbbbbbb", "2026-08-04", "Bob", "Newest"),
+                sync.Commit("a" * 40, "aaaaaaa", "2026-08-03", "Alice", "Older"),
+            ],
+        )
+
+    def test_empty_discovery_returns_empty_list(self):
+        git = ScriptedGit({self.LOG_COMMAND: ""})
+
+        self.assertEqual(sync.discover_commits(git, "feature/current"), [])
+
+    def test_malformed_discovery_data_is_rejected(self):
+        git = ScriptedGit({self.LOG_COMMAND: "one\x00two\n"})
+
+        with self.assertRaisesRegex(sync.SyncError, "malformed commit data"):
+            sync.discover_commits(git, "feature/current")
+
+    def test_existing_branches_returns_local_branch_names(self):
+        command = (
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/",
+        )
+        git = ScriptedGit({command: "main\nfeature/current\n\n"})
+
+        self.assertEqual(sync.existing_branches(git), {"main", "feature/current"})
 
 
 class SelectionTests(unittest.TestCase):

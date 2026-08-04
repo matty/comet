@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
+import subprocess
 from urllib.parse import urlsplit
 
 
@@ -10,6 +12,106 @@ class Commit:
     date: str
     author: str
     subject: str
+
+
+class SyncError(RuntimeError):
+    pass
+
+
+class GitError(RuntimeError):
+    def __init__(
+        self,
+        args_list: list[str],
+        returncode: int,
+        stdout: str,
+        stderr: str,
+    ) -> None:
+        super().__init__(stderr.strip() or f"Git exited with status {returncode}.")
+        self.args_list = args_list
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class Git:
+    def __init__(self, cwd: Path | None = None) -> None:
+        self.cwd = cwd
+
+    def run(
+        self, *args: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=self.cwd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except FileNotFoundError as error:
+            raise SyncError("Git is not installed or is not on PATH.") from error
+        if check and result.returncode != 0:
+            raise GitError(list(args), result.returncode, result.stdout, result.stderr)
+        return result
+
+
+def repository_root(git: Git) -> Path:
+    return Path(git.run("rev-parse", "--show-toplevel").stdout.strip())
+
+
+def validate_repository(git: Git) -> str:
+    if git.run("status", "--porcelain").stdout:
+        raise SyncError("The repository must have a clean worktree.")
+    try:
+        branch = git.run("symbolic-ref", "--quiet", "--short", "HEAD")
+    except GitError as error:
+        raise SyncError("The repository is in detached HEAD state.") from error
+    return branch.stdout.strip()
+
+
+def ensure_upstream(git: Git) -> None:
+    result = git.run("remote", "get-url", "upstream", check=False)
+    if result.returncode != 0:
+        git.run(
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/zeronsh/comet.git",
+        )
+        return
+    found_url = result.stdout.strip()
+    if not is_expected_upstream(found_url):
+        raise SyncError(
+            f"Remote 'upstream' has an unexpected URL: {found_url}"
+        )
+
+
+def discover_commits(git: Git, target: str) -> list[Commit]:
+    result = git.run(
+        "log",
+        "--right-only",
+        "--cherry-pick",
+        "--topo-order",
+        "--format=%H%x00%h%x00%cs%x00%an%x00%s",
+        f"{target}...upstream/main",
+    )
+    commits = []
+    for line in result.stdout.splitlines():
+        fields = line.split("\x00")
+        if len(fields) != 5:
+            raise SyncError("Git returned malformed commit data.")
+        commits.append(Commit(*fields))
+    return commits
+
+
+def existing_branches(git: Git) -> set[str]:
+    result = git.run(
+        "for-each-ref",
+        "--format=%(refname:short)",
+        "refs/heads/",
+    )
+    return {line for line in result.stdout.splitlines() if line}
 
 
 def parse_selection(text: str, commits: list[Commit]) -> list[Commit]:
