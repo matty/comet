@@ -557,6 +557,7 @@ struct TestShell {
     name: &'static str,
     marker_42_command: &'static str,
     marker_11_command: &'static str,
+    rpc_marker_command: &'static str,
     exit_3_command: &'static str,
 }
 
@@ -567,6 +568,7 @@ fn test_shell() -> TestShell {
         name: "sh",
         marker_42_command: "echo m4rk3r-$((40+2))\n",
         marker_11_command: "echo aft3r-$((10+1))\n",
+        rpc_marker_command: "echo rpc-t3st-$((5+4))\n",
         exit_3_command: "exit 3\n",
     }
 }
@@ -578,6 +580,7 @@ fn test_shell() -> TestShell {
         name: "cmd.exe",
         marker_42_command: "set /a marker=40+2\r\necho m4rk3r-%marker%\r\n",
         marker_11_command: "set /a marker=10+1\r\necho aft3r-%marker%\r\n",
+        rpc_marker_command: "set /a marker=5+4\r\necho rpc-t3st-%marker%\r\n",
         exit_3_command: "exit 3\r\n",
     }
 }
@@ -916,7 +919,7 @@ async fn rpc_dispatch_for_m5_methods() {
             methods::WRITE_TERMINAL,
             serde_json::json!({
                 "terminalId": terminal_id,
-                "data": BASE64.encode("echo rpc-t3st-$((5+4))\n"),
+                "data": BASE64.encode(test_shell().rpc_marker_command),
             }),
         )
         .await
