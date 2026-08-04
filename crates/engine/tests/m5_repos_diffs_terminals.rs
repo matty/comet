@@ -78,10 +78,14 @@ async fn drain_until(
 ) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while !predicate(events) {
-        let event = tokio::time::timeout_at(deadline, rx.recv())
-            .await
-            .expect("terminal event before timeout")
-            .expect("terminal stream alive");
+        let event = match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => panic!("terminal stream ended; transcript: {:?}", decoded(events)),
+            Err(_) => panic!(
+                "terminal event timed out; transcript: {:?}",
+                decoded(events)
+            ),
+        };
         events.push(event);
     }
 }
@@ -548,22 +552,53 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
 // Terminals
 // ---------------------------------------------------------------------------
 
+struct TestShell {
+    program: &'static str,
+    name: &'static str,
+    marker_42_command: &'static str,
+    marker_11_command: &'static str,
+    exit_3_command: &'static str,
+}
+
+#[cfg(not(windows))]
+fn test_shell() -> TestShell {
+    TestShell {
+        program: "/bin/sh",
+        name: "sh",
+        marker_42_command: "echo m4rk3r-$((40+2))\n",
+        marker_11_command: "echo aft3r-$((10+1))\n",
+        exit_3_command: "exit 3\n",
+    }
+}
+
+#[cfg(windows)]
+fn test_shell() -> TestShell {
+    TestShell {
+        program: "cmd.exe",
+        name: "cmd.exe",
+        marker_42_command: "set /a marker=40+2\r\necho m4rk3r-%marker%\r\n",
+        marker_11_command: "set /a marker=10+1\r\necho aft3r-%marker%\r\n",
+        exit_3_command: "exit 3\r\n",
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_e2e_replay_live_resize_exit() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let terminals = Terminals::new();
+    let shell = test_shell();
     let session = terminals
-        .open_with_shell(&tmp.path().to_string_lossy(), 80, 24, Some("/bin/sh"))
-        .expect("open sh");
-    assert_eq!(session.shell, "sh");
+        .open_with_shell(&tmp.path().to_string_lossy(), 80, 24, Some(shell.program))
+        .expect("open test shell");
+    assert_eq!(session.shell, shell.name);
     assert_eq!(session.cwd, tmp.path().to_string_lossy());
 
     // Live subscribe, then run a command whose OUTPUT differs from the echoed input.
     let mut rx = terminals.subscribe(&session.id, None).expect("subscribe");
     let mut events = Vec::new();
     terminals
-        .write(&session.id, &BASE64.encode("echo m4rk3r-$((40+2))\n"))
-        .expect("write echo");
+        .write(&session.id, &BASE64.encode(shell.marker_42_command))
+        .expect("write marker command");
     drain_until(&mut rx, &mut events, |events| {
         decoded(events).contains("m4rk3r-42")
     })
@@ -574,12 +609,15 @@ async fn terminal_e2e_replay_live_resize_exit() {
     terminals
         .resize(&session.id, 1, 1000)
         .expect("clamped resize");
+    terminals
+        .resize(&session.id, 80, 24)
+        .expect("restore usable size");
 
     // Detach (drop the stream) — the shell survives and keeps producing output.
     drop(rx);
     terminals
-        .write(&session.id, &BASE64.encode("echo aft3r-$((10+1))\n"))
-        .expect("write");
+        .write(&session.id, &BASE64.encode(shell.marker_11_command))
+        .expect("write marker command");
     let mut rx2 = terminals
         .subscribe(&session.id, None)
         .expect("re-subscribe");
@@ -605,7 +643,7 @@ async fn terminal_e2e_replay_live_resize_exit() {
 
     // Exit: shell terminates, Exit event lands on every live stream, streams end.
     terminals
-        .write(&session.id, &BASE64.encode("exit 3\n"))
+        .write(&session.id, &BASE64.encode(shell.exit_3_command))
         .expect("write exit");
     let mut events3 = Vec::new();
     drain_until(&mut rx3, &mut events3, |events| {
@@ -651,15 +689,16 @@ async fn terminal_e2e_replay_live_resize_exit() {
 async fn terminal_guards_input_size_and_cwd() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let terminals = Terminals::new();
+    let shell = test_shell();
     assert!(
         terminals
-            .open_with_shell("/definitely/not/a/dir", 80, 24, Some("/bin/sh"))
+            .open_with_shell("/definitely/not/a/dir", 80, 24, Some(shell.program),)
             .is_err(),
         "bad cwd rejected"
     );
     let session = terminals
-        .open_with_shell(&tmp.path().to_string_lossy(), 80, 24, Some("/bin/sh"))
-        .expect("open sh");
+        .open_with_shell(&tmp.path().to_string_lossy(), 80, 24, Some(shell.program))
+        .expect("open test shell");
     let huge = BASE64.encode(vec![b'x'; 65 * 1024]);
     assert!(
         terminals.write(&session.id, &huge).is_err(),
