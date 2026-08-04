@@ -308,7 +308,7 @@ class CliTests(unittest.TestCase):
             ["fetch", "--prune", "upstream", "main"],
             7,
             "partial output",
-            "fatal: example\n",
+            "fatal: example\n    hint: retry\twith care\n",
         ),
     )
     def test_checked_git_errors_are_reported_concisely_to_stderr(
@@ -322,7 +322,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(
             error_output.getvalue(),
-            "error: git fetch --prune upstream main failed: fatal: example\n",
+            "error: git fetch --prune upstream main failed: "
+            "fatal: example hint: retry with care\n",
         )
 
     @mock.patch.object(

@@ -262,7 +262,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_workflow(git, input, sys.stdout, date.today())
     except GitError as error:
         command = "git " + " ".join(error.args_list)
-        detail = error.stderr.strip() or f"exit status {error.returncode}"
+        detail = " ".join(error.stderr.split()) or f"exit status {error.returncode}"
         print(f"error: {command} failed: {detail}", file=sys.stderr)
         return 1
     except SyncError as error:
