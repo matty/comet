@@ -94,6 +94,13 @@ raise SystemExit(module.main([]))
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
+            eligible_output = result.stdout.split(
+                "Selected commits (oldest first):", 1
+            )[0]
+            self.assertLess(
+                eligible_output.index("Second upstream change"),
+                eligible_output.index("First upstream change"),
+            )
             branch = git(
                 "symbolic-ref", "--quiet", "--short", "HEAD", cwd=fork
             ).stdout.strip()
@@ -128,7 +135,7 @@ class WorkflowGit:
     def __init__(self, commits=DISPLAYED, existing=None, cherry_pick_failures=None):
         self.commits = commits
         self.existing = existing or set()
-        self.cherry_pick_failures = cherry_pick_failures or set()
+        self.cherry_pick_failures = cherry_pick_failures or {}
         self.commands = []
 
     def run(self, *args, check=True):
@@ -162,10 +169,13 @@ class WorkflowGit:
         elif args[:2] == ("switch", "-c"):
             stdout = ""
         elif args[:1] == ("cherry-pick",):
-            returncode = 1 if args[1] in self.cherry_pick_failures else 0
-            result = subprocess.CompletedProcess(args, returncode, "", "conflict")
-            if check and returncode:
-                raise sync.GitError(list(args), returncode, "", "conflict")
+            result = self.cherry_pick_failures.get(
+                args[1], subprocess.CompletedProcess(args, 0, "", "")
+            )
+            if check and result.returncode:
+                raise sync.GitError(
+                    list(args), result.returncode, result.stdout, result.stderr
+                )
             return result
         else:
             raise AssertionError(f"Unexpected Git command: {args!r}")
@@ -257,18 +267,50 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("git switch feature/current", output)
         self.assertIn("git merge --ff-only sync/upstream-2026-08-04-2", output)
 
-    def test_cherry_pick_failure_prints_recovery_and_stops_later_commits(self):
-        git = WorkflowGit(cherry_pick_failures={"c3"})
+    def test_cherry_pick_failure_surfaces_git_detail_and_stops_later_commits(self):
+        failure = subprocess.CompletedProcess(
+            ("cherry-pick", "c3"),
+            1,
+            "",
+            "error: could not apply c3... Third\n"
+            "hint: after resolving the conflicts, mark the corrected paths\n",
+        )
+        git = WorkflowGit(cherry_pick_failures={"c3": failure})
 
         result, output, _ = self.run_workflow(git, ["1-3", "y"])
 
         self.assertEqual(result, 1)
+        self.assertIn(
+            "Cherry-pick stopped at c3 (Third): "
+            "error: could not apply c3... Third hint: after resolving the "
+            "conflicts, mark the corrected paths",
+            output,
+        )
+        self.assertIn("Inspect the repository with git status.", output)
+        self.assertIn("If conflicts or cherry-pick state are present", output)
         self.assertIn("git cherry-pick --continue", output)
         self.assertIn("git cherry-pick --abort", output)
         cherry_picks = [
             args for args, _ in git.commands if args[:1] == ("cherry-pick",)
         ]
         self.assertEqual(cherry_picks, [("cherry-pick", "c2"), ("cherry-pick", "c3")])
+
+
+class FailureDetailTests(unittest.TestCase):
+    def test_failure_detail_prefers_stderr_and_collapses_display_whitespace(self):
+        self.assertEqual(
+            sync.format_failure_detail(
+                "stdout detail", "fatal: first line\n  hint:\tretry\n", 9
+            ),
+            "fatal: first line hint: retry",
+        )
+
+    def test_failure_detail_falls_back_to_stdout_then_exit_status(self):
+        self.assertEqual(
+            sync.format_failure_detail("fetch stopped\n", "", 8),
+            "fetch stopped",
+        )
+        self.assertEqual(sync.format_failure_detail("", "", 8), "exit status 8")
 
 
 class CliTests(unittest.TestCase):
@@ -285,6 +327,11 @@ class CliTests(unittest.TestCase):
             output.getvalue(),
         )
         help_text = output.getvalue().lower()
+        self.assertIn("clean worktree", help_text)
+        self.assertIn("attached branch", help_text)
+        self.assertIn("fixed upstream remote", help_text)
+        self.assertIn("refuses a collision", help_text)
+        self.assertIn("2, 1,4, or 2-5", help_text)
         self.assertIn("confirmation", help_text)
         self.assertIn("sync/upstream-yyyy-mm-dd", help_text)
         self.assertIn("resolve conflicts manually", help_text)
@@ -363,6 +410,8 @@ class GitAdapterTests(unittest.TestCase):
             ["git", "fetch"],
             cwd=None,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -486,6 +535,26 @@ class DiscoveryTests(unittest.TestCase):
 
         self.assertEqual(sync.discover_commits(git, "feature/current"), [])
 
+    def test_discovery_preserves_non_ascii_author_and_subject(self):
+        output = (
+            "a" * 40
+            + "\x00aaaaaaa\x002026-08-04\x00Zoë 王\x00Répare le café ☕\n"
+        )
+        git = ScriptedGit({self.LOG_COMMAND: output})
+
+        self.assertEqual(
+            sync.discover_commits(git, "feature/current"),
+            [
+                sync.Commit(
+                    "a" * 40,
+                    "aaaaaaa",
+                    "2026-08-04",
+                    "Zoë 王",
+                    "Répare le café ☕",
+                )
+            ],
+        )
+
     def test_malformed_discovery_data_is_rejected(self):
         git = ScriptedGit({self.LOG_COMMAND: "one\x00two\n"})
 
@@ -526,11 +595,24 @@ class SelectionTests(unittest.TestCase):
 
 
 class NamingAndUrlTests(unittest.TestCase):
+    def test_next_branch_name_uses_unsuffixed_name_first(self):
+        self.assertEqual(
+            sync.next_branch_name(set(), date(2026, 8, 4)),
+            "sync/upstream-2026-08-04",
+        )
+
     def test_next_branch_name_uses_first_available_suffix(self):
         existing = {"sync/upstream-2026-08-04", "sync/upstream-2026-08-04-2"}
         self.assertEqual(
             sync.next_branch_name(existing, date(2026, 8, 4)),
             "sync/upstream-2026-08-04-3",
+        )
+
+    def test_next_branch_name_fills_suffix_gap(self):
+        existing = {"sync/upstream-2026-08-04", "sync/upstream-2026-08-04-3"}
+        self.assertEqual(
+            sync.next_branch_name(existing, date(2026, 8, 4)),
+            "sync/upstream-2026-08-04-2",
         )
 
     def test_normalize_github_url_canonicalizes_supported_forms(self):

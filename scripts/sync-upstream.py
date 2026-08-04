@@ -48,6 +48,8 @@ class Git:
                 ["git", *args],
                 cwd=self.cwd,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
@@ -162,6 +164,14 @@ def format_commit(index: int | None, commit: Commit) -> str:
     )
 
 
+def format_failure_detail(stdout: str, stderr: str, returncode: int) -> str:
+    for captured in (stderr, stdout):
+        detail = " ".join(captured.split())
+        if detail:
+            return detail
+    return f"exit status {returncode}"
+
+
 def run_workflow(
     git: Git,
     input_fn: Callable[[str], str],
@@ -205,7 +215,20 @@ def run_workflow(
     for commit in selected:
         result = git.run("cherry-pick", commit.oid, check=False)
         if result.returncode != 0:
-            print("Cherry-pick stopped. Resolve conflicts, then choose:", file=output)
+            detail = format_failure_detail(
+                result.stdout, result.stderr, result.returncode
+            )
+            print(
+                f"Cherry-pick stopped at {commit.short_oid} "
+                f"({commit.subject}): {detail}",
+                file=output,
+            )
+            print("Inspect the repository with git status.", file=output)
+            print(
+                "If conflicts or cherry-pick state are present, resolve them "
+                "and choose:",
+                file=output,
+            )
             print("git add <resolved-files>", file=output)
             print("git cherry-pick --continue", file=output)
             print("git cherry-pick --abort", file=output)
@@ -244,7 +267,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Select and cherry-pick commits from zeronsh/comet",
         epilog=(
-            "Choose eligible upstream commits, then review the oldest-first "
+            "Run from a clean worktree with an attached branch. The helper "
+            "configures the fixed upstream remote when missing and refuses a "
+            "collision when that name points elsewhere.\n"
+            "Choose commits with 2, 1,4, or 2-5, then review the oldest-first "
             "order and give confirmation before any branch is created.\n"
             "The helper creates a sync/upstream-YYYY-MM-DD safety branch. "
             "If a cherry-pick stops, resolve conflicts manually and continue "
@@ -262,7 +288,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_workflow(git, input, sys.stdout, date.today())
     except GitError as error:
         command = "git " + " ".join(error.args_list)
-        detail = " ".join(error.stderr.split()) or f"exit status {error.returncode}"
+        detail = format_failure_detail(
+            error.stdout, error.stderr, error.returncode
+        )
         print(f"error: {command} failed: {detail}", file=sys.stderr)
         return 1
     except SyncError as error:

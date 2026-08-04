@@ -107,7 +107,9 @@ chronological order. Any other answer exits without changing history.
 If a cherry-pick conflicts, resolve it and run `git cherry-pick --continue`, or
 cancel it with `git cherry-pick --abort`. On success, the helper prints review
 commands and the commands to switch back and fast-forward the original branch.
-It does not merge or push for you.
+These printed commands are reviewable guidance, not commands the helper runs.
+If a branch name contains unusual shell metacharacters, adapt or quote its
+branch argument for your shell. The helper does not merge or push for you.
 
 ## Updates are separate
 
