@@ -1,125 +1,123 @@
-//! The engine link: one supervisor task that owns the RPC connection and all
-//! subscriptions, and talks to the render loop over two channels.
+//! TUI bridge to the shared client-side federation.
 //!
-//! Why a supervisor and not `RpcClient` calls from the draw loop:
-//!
-//! - **Decoding is not the renderer's job.** Every watch frame arrives as a
-//!   `serde_json::Value` carrying a *full snapshot* (the engine's watch streams
-//!   are `tokio::sync::watch`, so a burst of doc commits collapses to the
-//!   latest value). Deserializing into typed rows here keeps the render loop's
-//!   only work layout and diffing — it never touches serde.
-//! - **The daemon is a separate process.** It can be restarted under us
-//!   (`comet daemon restart`, an upgrade, a crash). The supervisor notices the
-//!   streams ending, reconnects with backoff, and resubscribes; the app just
-//!   sees `Connection` updates and keeps its own state. Nothing in the
-//!   viewport needs to know a reconnect happened.
-//! - **A slow call must not stall input.** Outgoing calls are spawned, so a
-//!   `QueueCommand` that takes a second cannot delay a keystroke.
+//! Daemon attachment remains TUI-owned so detaching never stops the trusted
+//! local engine. Once attached, all resource streams and calls are owned by
+//! [`comet_client::Federation`], including the local server.
 
-use std::sync::Arc;
 use std::time::Duration;
 
+use comet_client::{Federation, FederationCommand, FederationEvent};
 use comet_doc::SessionMessageEntry;
 use comet_proto::view::ConnectionStatus;
-use comet_proto::{AuthState, Chat, Device, Session, Space};
-use comet_rpc::{RpcClient, methods};
+use comet_proto::{ServerId, ServerRef};
+use comet_rpc::methods;
 use tokio::sync::mpsc;
 
 use crate::daemon::{Attachment, DaemonConfig};
 
-/// Everything the render loop learns about the world.
 #[derive(Debug)]
 pub enum Update {
     Connection(ConnectionStatus),
-    /// How we reached the engine — decides what quitting means.
     Attached(Attachment),
-    Auth(Box<AuthState>),
-    Chats(Vec<Chat>),
-    Spaces(Vec<Space>),
-    Devices(Vec<Device>),
-    Sessions(Vec<Session>),
-    /// A transcript snapshot. Carries the chat id so a frame that raced a
-    /// selection change is dropped rather than rendered under the wrong title.
+    Federation(FederationEvent),
+    Devices(Vec<comet_proto::Device>),
+    Spaces(Vec<comet_proto::Space>),
+    Chats(Vec<comet_proto::Chat>),
+    Sessions(Vec<comet_proto::Session>),
     Transcript {
         chat_id: String,
         entries: Vec<SessionMessageEntry>,
     },
-    /// This engine's device id — the host for spaces we create.
     LocalDevice(String),
-    /// The model catalogue for a harness, answering [`Command::ListModels`].
     Models(Vec<comet_proto::Model>),
-    /// A space's branches, answering [`Command::ListRefs`].
+    FederatedModels {
+        server_id: ServerId,
+        request_id: String,
+        models: Vec<comet_proto::Model>,
+    },
     Refs(Vec<comet_proto::RepoRef>),
-    /// A drafted session became real: the chat exists and its prompt is queued.
+    FederatedRefs {
+        server_id: ServerId,
+        request_id: String,
+        refs: Vec<comet_proto::RepoRef>,
+    },
     SessionStarted {
         chat_id: String,
     },
-    /// A transient message for the status line.
+    FederatedSessionStarted {
+        chat: ServerRef,
+        request_id: String,
+    },
     Notice(String),
-    /// An optimistic send that didn't land: the app drops the echo and hands
-    /// the text back to the composer rather than silently losing it.
     SendFailed {
         chat_id: String,
         message_id: String,
         error: String,
     },
+    FederatedSendFailed {
+        chat: ServerRef,
+        message_id: String,
+        error: String,
+    },
+    FederatedRequestFailed {
+        server_id: ServerId,
+        request_id: String,
+        message: String,
+    },
+    FederatedStartFailed {
+        chat: ServerRef,
+        request_id: String,
+        message_id: String,
+        error: String,
+    },
 }
 
-/// Everything the render loop asks of the engine.
+impl From<FederationEvent> for Update {
+    fn from(event: FederationEvent) -> Self {
+        Self::Federation(event)
+    }
+}
+
 #[derive(Debug)]
 pub enum Command {
-    /// Retarget the per-chat transcript subscription (`None` unsubscribes).
-    /// Only the visible chat's transcript is streamed: an idle engine should
-    /// not be serializing docs nobody is looking at.
-    WatchTranscript(Option<String>),
-    /// Fire-and-forget call; failures surface as [`Update::Notice`].
+    WatchTranscript(Option<ServerRef>),
     Call {
+        server_id: ServerId,
         method: &'static str,
         params: serde_json::Value,
-        /// What to say if it fails ("Couldn't archive the session").
         context: &'static str,
     },
-    /// A send, tracked so a failure can be attributed to its echo.
     Send {
+        server_id: ServerId,
         chat_id: String,
         message_id: String,
         params: serde_json::Value,
     },
-    /// Fetch the model catalogue for a harness. Unlike [`Command::Call`] this
-    /// one's *reply* is wanted, so it comes back as [`Update::Models`].
-    ListModels { harness: comet_proto::HarnessId },
-    /// Fetch a space's branches, for the ref picker.
-    ListRefs {
-        repo_path: String,
-        target_device: Option<String>,
+    ListModels {
+        server_id: ServerId,
+        request_id: String,
+        harness: comet_proto::HarnessId,
     },
-    /// Turn a drafted session into a real one, then send its first prompt.
-    ///
-    /// This is one command rather than three because the steps are *ordered and
-    /// dependent*: a new worktree has to exist before the chat can name it as
-    /// its cwd, and the chat has to exist before its prompt can be queued.
-    /// Sequencing that in the reducer would mean modelling half-finished
-    /// sessions; sequencing it here means a failure at any step leaves nothing
-    /// behind but a notice.
+    ListRefs {
+        server_id: ServerId,
+        request_id: String,
+        repo_path: String,
+    },
     StartSession(Box<StartSession>),
-    /// Drop this connection and dial again now, skipping the backoff. What `r`
-    /// does after the user has fixed whatever was wrong.
-    Reconnect,
-    /// Drop the connection and stop reconnecting (quit path).
+    Reconnect(ServerId),
     Shutdown,
 }
 
-/// Everything needed to materialize a drafted session.
 #[derive(Debug)]
 pub struct StartSession {
+    pub server_id: ServerId,
+    pub request_id: String,
     pub chat_id: String,
     pub space_id: String,
     pub repo_path: String,
-    pub target_device: Option<String>,
     pub plan: comet_proto::view::CheckoutPlan,
     pub config: Option<serde_json::Value>,
     pub message_id: String,
-    /// The already-encoded `SessionCommandPayload::Run`.
     pub command: serde_json::Value,
 }
 
@@ -130,9 +128,6 @@ pub struct EngineLink {
 }
 
 impl EngineLink {
-    /// Ask the supervisor to do something. A closed channel means the
-    /// supervisor is gone, which only happens on the quit path — dropping the
-    /// command is correct there.
     pub fn send(&self, command: Command) {
         let _ = self.commands.send(command);
     }
@@ -145,13 +140,8 @@ impl Drop for EngineLink {
     }
 }
 
-/// Reconnect backoff: quick first retries (a `comet daemon restart` is back in
-/// well under a second) flattening to a 5s poll so a long-down engine costs
-/// nothing.
 const BACKOFF_MS: [u64; 6] = [200, 400, 800, 1_600, 3_200, 5_000];
 
-/// Start the supervisor. It connects immediately (spawning a daemon if needed)
-/// and keeps the connection alive for the life of the app.
 pub fn spawn(config: DaemonConfig) -> EngineLink {
     let (update_tx, updates) = mpsc::unbounded_channel();
     let (commands, command_rx) = mpsc::unbounded_channel();
@@ -168,39 +158,39 @@ async fn supervise(
     updates: mpsc::UnboundedSender<Update>,
     mut commands: mpsc::UnboundedReceiver<Command>,
 ) {
-    // The transcript target survives reconnects: after the engine comes back we
-    // resubscribe whatever the user is still looking at.
-    let mut transcript_target: Option<String> = None;
     let mut attempt = 0usize;
-
     loop {
         if updates
             .send(Update::Connection(ConnectionStatus::Connecting))
             .is_err()
         {
-            return; // App is gone.
+            return;
         }
-
         match crate::daemon::connect(&config).await {
             Ok(connection) => {
                 attempt = 0;
-                let _ = updates.send(Update::Attached(connection.attachment.clone()));
-                let _ = updates.send(Update::Connection(ConnectionStatus::Ready));
-                let client = Arc::new(connection.client);
-                match session(&client, &updates, &mut commands, &mut transcript_target).await {
-                    SessionEnd::Shutdown => return,
-                    SessionEnd::AppGone => return,
-                    SessionEnd::ConnectionLost => {
+                let _ = updates.send(Update::Attached(connection.attachment));
+                match Federation::new(connection.client, &config.data_dir).await {
+                    Ok(mut federation) => {
+                        let _ = updates.send(Update::Connection(ConnectionStatus::Ready));
+                        if run_federation(&mut federation, &updates, &mut commands).await {
+                            return;
+                        }
                         let _ = updates.send(Update::Connection(ConnectionStatus::Failed(
                             "engine connection lost".into(),
                         )));
                     }
+                    Err(error) => {
+                        let _ = updates.send(Update::Connection(ConnectionStatus::Failed(
+                            format!("{error:#}"),
+                        )));
+                    }
                 }
             }
-            Err(err) => {
+            Err(error) => {
                 if updates
                     .send(Update::Connection(ConnectionStatus::Failed(format!(
-                        "{err:#}"
+                        "{error:#}"
                     ))))
                     .is_err()
                 {
@@ -208,441 +198,388 @@ async fn supervise(
                 }
             }
         }
-
-        // Backoff, but stay responsive: Shutdown ends us now and Reconnect
-        // short-circuits the wait. Commands that need a connection are dropped
-        // — except the transcript target, which we must remember so the
-        // resubscribe after reconnect restores what the user is reading.
-        let wait = Duration::from_millis(BACKOFF_MS[attempt.min(BACKOFF_MS.len() - 1)]);
+        let delay = Duration::from_millis(BACKOFF_MS[attempt.min(BACKOFF_MS.len() - 1)]);
         attempt = attempt.saturating_add(1);
-        let deadline = tokio::time::Instant::now() + wait;
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => break,
-                command = commands.recv() => match command {
-                    None | Some(Command::Shutdown) => return,
-                    Some(Command::Reconnect) => {
-                        attempt = 0;
-                        break;
-                    }
-                    Some(Command::WatchTranscript(target)) => transcript_target = target,
-                    Some(_) => {}
-                },
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            command = commands.recv() => match command {
+                None | Some(Command::Shutdown) => return,
+                Some(Command::Reconnect(_)) => attempt = 0,
+                Some(_) => {}
             }
         }
     }
 }
 
-enum SessionEnd {
-    /// A stream ended or a subscribe failed — the daemon went away.
-    ConnectionLost,
-    /// The app asked us to stop.
-    Shutdown,
-    /// The app dropped its receiver.
-    AppGone,
-}
-
-/// Serve one connection: subscribe everything, then pump until something breaks.
-async fn session(
-    client: &Arc<RpcClient>,
+/// Returns true only when the viewport intentionally shuts down.
+async fn run_federation(
+    federation: &mut Federation,
     updates: &mpsc::UnboundedSender<Update>,
     commands: &mut mpsc::UnboundedReceiver<Command>,
-    transcript_target: &mut Option<String>,
-) -> SessionEnd {
-    let empty = || serde_json::json!({});
-
-    // The engine's device id is a plain call, not a stream. Best-effort: an
-    // engine that doesn't serve it yet just leaves space creation disabled.
-    match client.call(methods::LOCAL_DEVICE, empty()).await {
-        Ok(value) => {
-            if let Some(id) = value.get("deviceId").and_then(|v| v.as_str())
-                && updates.send(Update::LocalDevice(id.to_string())).is_err()
-            {
-                return SessionEnd::AppGone;
-            }
-        }
-        Err(err) => tracing::debug!(error = %err, "LocalDevice unavailable"),
-    }
-
-    let (mut chats, mut spaces, mut devices, mut sessions, mut auth) = match tokio::try_join!(
-        client.subscribe(methods::WATCH_CHATS, empty()),
-        client.subscribe(methods::WATCH_SPACES, empty()),
-        client.subscribe(methods::WATCH_DEVICES, empty()),
-        client.subscribe(methods::WATCH_SESSIONS, empty()),
-        client.subscribe(methods::AUTH_STATUS, empty()),
-    ) {
-        Ok(streams) => streams,
-        Err(err) => {
-            tracing::warn!(error = %err, "engine subscribe failed");
-            return SessionEnd::ConnectionLost;
-        }
-    };
-
-    // Resubscribe the visible transcript (first connect: usually None; after a
-    // reconnect: whatever the user was reading).
-    let mut transcript = match transcript_target.clone() {
-        Some(chat_id) => open_transcript(client, chat_id).await,
-        None => None,
-    };
-    // The link materializes delta frames into the full transcript here, so the
-    // app keeps receiving complete `Update::Transcript`s.
-    let mut transcript_entries: Vec<SessionMessageEntry> = Vec::new();
-
+) -> bool {
     loop {
         tokio::select! {
-            // Biased so a burst of doc frames can never starve a command: the
-            // user's keystroke-driven work goes out first.
             biased;
-
             command = commands.recv() => match command {
-                None | Some(Command::Shutdown) => return SessionEnd::Shutdown,
-                // A manual reconnect tears this link down; `supervise` dials
-                // again immediately.
-                Some(Command::Reconnect) => return SessionEnd::ConnectionLost,
-                Some(Command::WatchTranscript(target)) => {
-                    if *transcript_target != target {
-                        *transcript_target = target.clone();
-                        transcript_entries.clear();
-                        // Dropping the receiver cancels the stream server-side
-                        // (comet-rpc sends `{id, cancel}` on the next frame),
-                        // so the engine stops serializing the old doc.
-                        transcript = match target {
-                            Some(chat_id) => open_transcript(client, chat_id).await,
-                            None => None,
-                        };
-                    }
+                None | Some(Command::Shutdown) => {
+                    let _ = federation.send(FederationCommand::Shutdown);
+                    return true;
                 }
-                Some(Command::Call { method, params, context }) => {
-                    spawn_call(client.clone(), updates.clone(), method, params, context);
-                }
-                Some(Command::Send { chat_id, message_id, params }) => {
-                    spawn_send(client.clone(), updates.clone(), chat_id, message_id, params);
-                }
-                Some(Command::ListModels { harness }) => {
-                    spawn_models(client.clone(), updates.clone(), harness);
-                }
-                Some(Command::ListRefs { repo_path, target_device }) => {
-                    spawn_refs(client.clone(), updates.clone(), repo_path, target_device);
-                }
-                Some(Command::StartSession(start)) => {
-                    spawn_start_session(client.clone(), updates.clone(), *start);
-                }
+                Some(command) => forward(command, federation, updates),
             },
-
-            frame = chats.recv() => match decode::<Vec<Chat>>(frame, "chats") {
-                Frame::Value(rows) => if updates.send(Update::Chats(rows)).is_err() { return SessionEnd::AppGone },
-                Frame::Skip => {}
-                Frame::Ended => return SessionEnd::ConnectionLost,
-            },
-            frame = spaces.recv() => match decode::<Vec<Space>>(frame, "spaces") {
-                Frame::Value(rows) => if updates.send(Update::Spaces(rows)).is_err() { return SessionEnd::AppGone },
-                Frame::Skip => {}
-                Frame::Ended => return SessionEnd::ConnectionLost,
-            },
-            frame = devices.recv() => match decode::<Vec<Device>>(frame, "devices") {
-                Frame::Value(rows) => if updates.send(Update::Devices(rows)).is_err() { return SessionEnd::AppGone },
-                Frame::Skip => {}
-                Frame::Ended => return SessionEnd::ConnectionLost,
-            },
-            frame = sessions.recv() => match decode::<Vec<Session>>(frame, "sessions") {
-                Frame::Value(rows) => if updates.send(Update::Sessions(rows)).is_err() { return SessionEnd::AppGone },
-                Frame::Skip => {}
-                Frame::Ended => return SessionEnd::ConnectionLost,
-            },
-            frame = auth.recv() => match frame {
-                // Auth is the one frame with two wire shapes in flight; the
-                // tolerant parser is shared with the gpui viewport.
-                Some(value) => match comet_proto::view::parse_auth_state(&value) {
-                    Some(state) => if updates.send(Update::Auth(Box::new(state))).is_err() {
-                        return SessionEnd::AppGone;
-                    },
-                    None => tracing::warn!("dropping unrecognized AuthStatus frame"),
-                },
-                None => return SessionEnd::ConnectionLost,
-            },
-
-            // A transcript stream ending is NOT a lost connection: the engine
-            // ends it when the chat is deleted. Drop it and keep going.
-            frame = recv_optional(&mut transcript) => {
-                let (chat_id, frame) = frame;
-                match frame {
-                    Some(value) => match serde_json::from_value::<comet_doc::TranscriptFrame>(value) {
-                        Ok(frame) => {
-                            match comet_doc::apply_transcript_frame(&mut transcript_entries, frame) {
-                                Ok(()) => {
-                                    let entries = transcript_entries.clone();
-                                    if updates.send(Update::Transcript { chat_id, entries }).is_err() {
-                                        return SessionEnd::AppGone;
-                                    }
-                                }
-                                Err(err) => {
-                                    // Diverged copy: resubscribe — the fresh
-                                    // stream's reset frame heals it.
-                                    tracing::warn!(%chat_id, error = %err, "resubscribing transcript");
-                                    transcript_entries.clear();
-                                    transcript = open_transcript(client, chat_id).await;
-                                }
-                            }
-                        }
-                        Err(err) => tracing::warn!(error = %err, "dropping malformed transcript frame"),
-                    },
-                    None => {
-                        transcript = None;
-                        *transcript_target = None;
-                    }
-                }
-            },
+            event = federation.recv() => match event {
+                Some(event) => if updates.send(Update::Federation(event)).is_err() { return true; },
+                None => return false,
+            }
         }
     }
 }
 
-/// Subscribe a chat's transcript. A failure here is not fatal to the session —
-/// the chat may have just been deleted.
-async fn open_transcript(
-    client: &Arc<RpcClient>,
-    chat_id: String,
-) -> Option<(String, mpsc::Receiver<serde_json::Value>)> {
-    match client
-        .subscribe(
-            methods::WATCH_DOC_MESSAGES,
-            serde_json::json!({ "chatId": chat_id }),
-        )
-        .await
-    {
-        Ok(stream) => Some((chat_id, stream)),
-        Err(err) => {
-            tracing::warn!(%chat_id, error = %err, "WatchDocMessages failed");
-            None
-        }
-    }
-}
-
-/// `recv` on the optional transcript stream, pending forever when there is
-/// none, so it can sit in the `select!` unconditionally.
-async fn recv_optional(
-    slot: &mut Option<(String, mpsc::Receiver<serde_json::Value>)>,
-) -> (String, Option<serde_json::Value>) {
-    match slot {
-        Some((chat_id, stream)) => {
-            let frame = stream.recv().await;
-            (chat_id.clone(), frame)
-        }
-        None => std::future::pending().await,
-    }
-}
-
-/// The three things a watch frame can mean. Kept distinct on purpose: a frame
-/// we failed to parse must NOT read as a dropped connection, or one schema skew
-/// between engine and viewport would put the app into a reconnect loop against
-/// a perfectly healthy daemon.
-enum Frame<T> {
-    Value(T),
-    /// Malformed — logged and ignored; the next snapshot supersedes it anyway.
-    Skip,
-    /// Stream closed: the engine is gone.
-    Ended,
-}
-
-fn decode<T: serde::de::DeserializeOwned>(
-    frame: Option<serde_json::Value>,
-    what: &'static str,
-) -> Frame<T> {
-    let Some(value) = frame else {
-        return Frame::Ended;
+fn forward(command: Command, federation: &Federation, updates: &mpsc::UnboundedSender<Update>) {
+    let send = |command| {
+        let _ = federation.send(command);
     };
-    match serde_json::from_value(value) {
-        Ok(rows) => Frame::Value(rows),
-        Err(err) => {
-            tracing::warn!(error = %err, what, "dropping malformed watch frame");
-            Frame::Skip
-        }
-    }
-}
-
-fn spawn_call(
-    client: Arc<RpcClient>,
-    updates: mpsc::UnboundedSender<Update>,
-    method: &'static str,
-    params: serde_json::Value,
-    context: &'static str,
-) {
-    tokio::spawn(async move {
-        if let Err(err) = client.call(method, params).await {
-            let _ = updates.send(Update::Notice(format!("{context}: {err}")));
-        }
-    });
-}
-
-/// Fetch the model catalogue and hand it up. A failure is a notice, not a
-/// silent empty list — an empty picker is indistinguishable from a broken one.
-fn spawn_models(
-    client: Arc<RpcClient>,
-    updates: mpsc::UnboundedSender<Update>,
-    harness: comet_proto::HarnessId,
-) {
-    tokio::spawn(async move {
-        match client
-            .call(
-                methods::LIST_MODELS,
-                serde_json::json!({ "harness": harness }),
-            )
-            .await
-        {
-            Ok(value) => match serde_json::from_value::<Vec<comet_proto::Model>>(value) {
-                Ok(models) => {
-                    let _ = updates.send(Update::Models(models));
-                }
-                Err(err) => {
-                    let _ = updates.send(Update::Notice(format!("Model list malformed: {err}")));
-                }
-            },
-            Err(err) => {
-                let _ = updates.send(Update::Notice(format!("Couldn't list models: {err}")));
-            }
-        }
-    });
-}
-
-/// Fetch a space's branches for the ref picker.
-fn spawn_refs(
-    client: Arc<RpcClient>,
-    updates: mpsc::UnboundedSender<Update>,
-    repo_path: String,
-    target_device: Option<String>,
-) {
-    tokio::spawn(async move {
-        let mut params = serde_json::json!({ "repoPath": repo_path });
-        if let (Some(device), Some(object)) = (target_device, params.as_object_mut()) {
-            object.insert("targetDeviceId".into(), serde_json::Value::String(device));
-        }
-        match client.call(methods::LIST_REFS, params).await {
-            Ok(value) => match serde_json::from_value::<Vec<comet_proto::RepoRef>>(value) {
-                Ok(refs) => {
-                    let _ = updates.send(Update::Refs(refs));
-                }
-                Err(err) => {
-                    let _ = updates.send(Update::Notice(format!("Branch list malformed: {err}")));
-                }
-            },
-            // A non-git space has no refs; that is not an error worth shouting.
-            Err(err) => tracing::debug!(error = %err, "ListRefs unavailable"),
-        }
-    });
-}
-
-/// Materialize a drafted session: worktree (if the plan calls for one), then
-/// the chat row, then its first command — in that order, because each step
-/// depends on the last.
-fn spawn_start_session(
-    client: Arc<RpcClient>,
-    updates: mpsc::UnboundedSender<Update>,
-    start: StartSession,
-) {
-    use comet_proto::view::CheckoutPlan;
-    tokio::spawn(async move {
-        let mut cwd: Option<String> = None;
-        let mut branch: Option<String> = None;
-
-        match &start.plan {
-            CheckoutPlan::CurrentCheckout { branch: name } => branch.clone_from(name),
-            CheckoutPlan::ReuseWorktree { path, branch: name } => {
-                cwd = Some(path.clone());
-                branch = Some(name.clone());
-            }
-            CheckoutPlan::NewWorktree { base } => {
-                branch.clone_from(base);
-                if let Some(base) = base {
-                    let mut params = serde_json::json!({
-                        "repoPath": start.repo_path,
-                        "branch": base,
-                    });
-                    if let (Some(device), Some(object)) =
-                        (start.target_device.clone(), params.as_object_mut())
-                    {
-                        object.insert("targetDeviceId".into(), serde_json::Value::String(device));
-                    }
-                    match client.call(methods::CREATE_WORKTREE, params).await {
-                        Ok(value) => match serde_json::from_value::<comet_proto::Worktree>(value) {
-                            Ok(worktree) => cwd = Some(worktree.path),
-                            Err(err) => {
-                                let _ = updates.send(Update::Notice(format!(
-                                    "Worktree reply malformed: {err}"
-                                )));
-                                return;
-                            }
-                        },
-                        Err(err) => {
-                            let _ = updates.send(Update::Notice(format!("Worktree failed: {err}")));
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut mutate = serde_json::json!({
-            "op": "createChat",
-            "chatId": start.chat_id,
-            "spaceId": start.space_id,
-        });
-        if let Some(object) = mutate.as_object_mut() {
-            if let Some(cwd) = &cwd {
-                object.insert("cwd".into(), serde_json::Value::String(cwd.clone()));
-            }
-            if let Some(branch) = &branch {
-                object.insert("branch".into(), serde_json::Value::String(branch.clone()));
-            }
-            if let Some(config) = start.config {
-                object.insert("config".into(), config);
-            }
-        }
-        if let Err(err) = client.call(methods::MUTATE, mutate).await {
-            let _ = updates.send(Update::Notice(format!(
-                "Couldn't create the session: {err}"
-            )));
-            return;
-        }
-
-        // The run's cwd must match what the chat was created with.
-        let mut command = start.command;
-        if let (Some(cwd), Some(request)) = (
-            &cwd,
-            command.get_mut("request").and_then(|r| r.as_object_mut()),
-        ) {
-            request.insert("cwd".into(), serde_json::Value::String(cwd.clone()));
-        }
-        let params = serde_json::json!({ "chatId": start.chat_id, "command": command });
-        match client.call(methods::QUEUE_COMMAND, params).await {
-            Ok(_) => {
-                let _ = updates.send(Update::SessionStarted {
-                    chat_id: start.chat_id,
-                });
-            }
-            Err(err) => {
-                let _ = updates.send(Update::SendFailed {
-                    chat_id: start.chat_id,
-                    message_id: start.message_id,
-                    error: err.to_string(),
-                });
-            }
-        }
-    });
-}
-
-fn spawn_send(
-    client: Arc<RpcClient>,
-    updates: mpsc::UnboundedSender<Update>,
-    chat_id: String,
-    message_id: String,
-    params: serde_json::Value,
-) {
-    tokio::spawn(async move {
-        if let Err(err) = client.call(methods::QUEUE_COMMAND, params).await {
-            let _ = updates.send(Update::SendFailed {
-                chat_id,
-                message_id,
-                error: err.to_string(),
+    match command {
+        Command::WatchTranscript(chat) => send(FederationCommand::WatchTranscript(chat)),
+        Command::Call {
+            server_id,
+            method,
+            params,
+            ..
+        } => {
+            send(FederationCommand::Call {
+                server_id,
+                method,
+                params,
             });
         }
-    });
+        Command::Send {
+            server_id,
+            chat_id,
+            message_id,
+            params,
+        } => {
+            let commands = federation.command_sender();
+            let updates = updates.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    request(&commands, server_id.clone(), methods::QUEUE_COMMAND, params).await
+                {
+                    let _ = updates.send(Update::FederatedSendFailed {
+                        chat: ServerRef::new(server_id, chat_id),
+                        message_id,
+                        error: error.to_string(),
+                    });
+                }
+            });
+        }
+        Command::ListModels {
+            server_id,
+            request_id,
+            harness,
+        } => {
+            let commands = federation.command_sender();
+            let updates = updates.clone();
+            tokio::spawn(async move {
+                match request(
+                    &commands,
+                    server_id.clone(),
+                    methods::LIST_MODELS,
+                    serde_json::json!({ "harness": harness }),
+                )
+                .await
+                .and_then(|value| {
+                    serde_json::from_value(value)
+                        .map_err(|error| comet_rpc::RpcError::Failed(error.to_string()))
+                }) {
+                    Ok(models) => {
+                        let _ = updates.send(Update::FederatedModels {
+                            server_id,
+                            request_id,
+                            models,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = updates.send(Update::FederatedRequestFailed {
+                            server_id,
+                            request_id,
+                            message: format!("Couldn't list models: {error}"),
+                        });
+                    }
+                }
+            });
+        }
+        Command::ListRefs {
+            server_id,
+            request_id,
+            repo_path,
+        } => {
+            let commands = federation.command_sender();
+            let updates = updates.clone();
+            tokio::spawn(async move {
+                match request(
+                    &commands,
+                    server_id.clone(),
+                    methods::LIST_REFS,
+                    serde_json::json!({ "repoPath": repo_path }),
+                )
+                .await
+                .and_then(|value| {
+                    serde_json::from_value(value)
+                        .map_err(|error| comet_rpc::RpcError::Failed(error.to_string()))
+                }) {
+                    Ok(refs) => {
+                        let _ = updates.send(Update::FederatedRefs {
+                            server_id,
+                            request_id,
+                            refs,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = updates.send(Update::FederatedRequestFailed {
+                            server_id,
+                            request_id,
+                            message: format!("Couldn't list refs: {error}"),
+                        });
+                    }
+                }
+            });
+        }
+        Command::Reconnect(server_id) => send(FederationCommand::Reconnect(server_id)),
+        Command::StartSession(start) => {
+            let commands = federation.command_sender();
+            let updates = updates.clone();
+            let failed_chat = ServerRef::new(start.server_id.clone(), start.chat_id.clone());
+            let failed_request = start.request_id.clone();
+            let failed_message = start.message_id.clone();
+            tokio::spawn(async move {
+                if let Err(error) = start_session(&commands, &updates, *start).await {
+                    let _ = updates.send(Update::FederatedStartFailed {
+                        chat: failed_chat,
+                        request_id: failed_request,
+                        message_id: failed_message,
+                        error: error.to_string(),
+                    });
+                }
+            });
+        }
+        Command::Shutdown => {}
+    }
+}
+
+async fn request(
+    commands: &mpsc::UnboundedSender<FederationCommand>,
+    server_id: ServerId,
+    method: &'static str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, comet_rpc::RpcError> {
+    let (reply, received) = tokio::sync::oneshot::channel();
+    commands
+        .send(FederationCommand::Request {
+            server_id,
+            method,
+            params,
+            reply,
+        })
+        .map_err(|_| comet_rpc::RpcError::Closed)?;
+    received.await.unwrap_or(Err(comet_rpc::RpcError::Closed))
+}
+
+async fn start_session(
+    commands: &mpsc::UnboundedSender<FederationCommand>,
+    updates: &mpsc::UnboundedSender<Update>,
+    start: StartSession,
+) -> Result<(), comet_rpc::RpcError> {
+    use comet_proto::view::CheckoutPlan;
+    let (mut cwd, branch) = match &start.plan {
+        CheckoutPlan::CurrentCheckout { branch } => (None, branch.clone()),
+        CheckoutPlan::ReuseWorktree { path, branch } => (Some(path.clone()), Some(branch.clone())),
+        CheckoutPlan::NewWorktree { base } => (None, base.clone()),
+    };
+    if let CheckoutPlan::NewWorktree { base: Some(base) } = &start.plan {
+        let value = request(
+            commands,
+            start.server_id.clone(),
+            methods::CREATE_WORKTREE,
+            serde_json::json!({ "repoPath": start.repo_path, "branch": base }),
+        )
+        .await?;
+        cwd = Some(
+            serde_json::from_value::<comet_proto::Worktree>(value)
+                .map_err(|error| comet_rpc::RpcError::Failed(error.to_string()))?
+                .path,
+        );
+    }
+    let mut mutate = serde_json::json!({ "op": "createChat", "chatId": start.chat_id, "spaceId": start.space_id });
+    if let Some(object) = mutate.as_object_mut() {
+        if let Some(cwd) = &cwd {
+            object.insert("cwd".into(), serde_json::Value::String(cwd.clone()));
+        }
+        if let Some(branch) = &branch {
+            object.insert("branch".into(), serde_json::Value::String(branch.clone()));
+        }
+        if let Some(config) = start.config {
+            object.insert("config".into(), config);
+        }
+    }
+    request(commands, start.server_id.clone(), methods::MUTATE, mutate).await?;
+    let mut command = start.command;
+    if let (Some(cwd), Some(request)) = (
+        &cwd,
+        command
+            .get_mut("request")
+            .and_then(|value| value.as_object_mut()),
+    ) {
+        request.insert("cwd".into(), serde_json::Value::String(cwd.clone()));
+    }
+    let queue = request(
+        commands,
+        start.server_id.clone(),
+        methods::QUEUE_COMMAND,
+        serde_json::json!({ "chatId": start.chat_id, "command": command }),
+    )
+    .await;
+    match queue {
+        Ok(_) => {
+            let _ = updates.send(Update::FederatedSessionStarted {
+                chat: ServerRef::new(start.server_id, start.chat_id),
+                request_id: start.request_id,
+            });
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+// Kept public through Update's transcript payload type documentation.
+#[allow(dead_code)]
+fn _typed_transcript(_: Vec<SessionMessageEntry>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use comet_proto::view::CheckoutPlan;
+    use std::sync::{Arc, Mutex};
+
+    async fn run_start(
+        plan: CheckoutPlan,
+        fail_mutate: bool,
+    ) -> (
+        Result<(), comet_rpc::RpcError>,
+        Vec<(&'static str, serde_json::Value)>,
+        Vec<Update>,
+    ) {
+        let (commands, mut receiver) = mpsc::unbounded_channel();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        tokio::spawn(async move {
+            while let Some(FederationCommand::Request {
+                method,
+                params,
+                reply,
+                ..
+            }) = receiver.recv().await
+            {
+                recorded.lock().unwrap().push((method, params));
+                let result = if method == methods::MUTATE && fail_mutate {
+                    Err(comet_rpc::RpcError::Failed("mutate failed".into()))
+                } else if method == methods::CREATE_WORKTREE {
+                    Ok(
+                        serde_json::json!({"repoPath":"/repo","path":"/worktree","branch":"feature","name":"feature","checkoutId":null}),
+                    )
+                } else {
+                    Ok(serde_json::Value::Null)
+                };
+                let _ = reply.send(result);
+            }
+        });
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        let result = start_session(
+            &commands,
+            &updates,
+            StartSession {
+                server_id: ServerId::new("server-b"),
+                request_id: "request-1".into(),
+                chat_id: "chat-1".into(),
+                space_id: "space-1".into(),
+                repo_path: "/repo".into(),
+                plan,
+                config: None,
+                message_id: "message-1".into(),
+                command: serde_json::json!({"request":{}}),
+            },
+        )
+        .await;
+        drop(commands);
+        let mut emitted = Vec::new();
+        while let Ok(update) = update_rx.try_recv() {
+            emitted.push(update);
+        }
+        let calls = calls.lock().unwrap().clone();
+        (result, calls, emitted)
+    }
+
+    #[tokio::test]
+    async fn start_session_preserves_each_checkout_plan_and_call_order() {
+        let (_, current, _) = run_start(
+            CheckoutPlan::CurrentCheckout {
+                branch: Some("main".into()),
+            },
+            false,
+        )
+        .await;
+        assert_eq!(
+            current.iter().map(|call| call.0).collect::<Vec<_>>(),
+            [methods::MUTATE, methods::QUEUE_COMMAND]
+        );
+        assert_eq!(current[0].1["branch"], "main");
+
+        let (_, reuse, _) = run_start(
+            CheckoutPlan::ReuseWorktree {
+                path: "/existing".into(),
+                branch: "topic".into(),
+            },
+            false,
+        )
+        .await;
+        assert_eq!(
+            reuse.iter().map(|call| call.0).collect::<Vec<_>>(),
+            [methods::MUTATE, methods::QUEUE_COMMAND]
+        );
+        assert_eq!(reuse[0].1["cwd"], "/existing");
+        assert_eq!(reuse[0].1["branch"], "topic");
+
+        let (_, created, _) = run_start(
+            CheckoutPlan::NewWorktree {
+                base: Some("main".into()),
+            },
+            false,
+        )
+        .await;
+        assert_eq!(
+            created.iter().map(|call| call.0).collect::<Vec<_>>(),
+            [
+                methods::CREATE_WORKTREE,
+                methods::MUTATE,
+                methods::QUEUE_COMMAND
+            ]
+        );
+        assert_eq!(created[1].1["cwd"], "/worktree");
+    }
+
+    #[tokio::test]
+    async fn failed_create_chat_never_queues_or_emits_started() {
+        let (result, calls, updates) =
+            run_start(CheckoutPlan::CurrentCheckout { branch: None }, true).await;
+        assert!(result.is_err());
+        assert_eq!(
+            calls.iter().map(|call| call.0).collect::<Vec<_>>(),
+            [methods::MUTATE]
+        );
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update, Update::SessionStarted { .. }))
+        );
+    }
 }

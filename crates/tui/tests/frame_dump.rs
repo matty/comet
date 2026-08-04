@@ -6,9 +6,10 @@
 //! is `#[ignore]`d; run it with `--ignored --nocapture` and pipe to a renderer.
 
 use chrono::Utc;
+use comet_client::{FederationEvent, ServerState};
 use comet_doc::{MessagePart, MessageRole, SessionMessageEntry};
 use comet_proto::view::ConnectionStatus;
-use comet_proto::{AuthState, Chat, Space, UserProfile};
+use comet_proto::{Chat, RemoteConnectionState, ServerId, ServerRef, Space};
 use comet_tui::app::App;
 use comet_tui::link::Update;
 use comet_tui::render;
@@ -71,29 +72,28 @@ fn entry(id: &str, role: MessageRole, parts: Vec<MessagePart>) -> SessionMessage
 fn scene() -> App {
     let mut app = App::with_theme(Theme::dark());
     app.apply(Update::Connection(ConnectionStatus::Ready));
-    app.apply(Update::Auth(Box::new(AuthState::SignedIn {
-        user: UserProfile {
-            id: "u1".into(),
-            email: "imisterlee@gmail.com".into(),
-            name: Some("Wing Lee".into()),
-        },
-        org_id: Some("org".into()),
-    })));
-    app.apply(Update::Spaces(vec![
+    let server_id = ServerId::new("sha256:local");
+    let mut local = ServerState::empty(
+        server_id.clone(),
+        "This machine",
+        RemoteConnectionState::Online,
+    );
+    local.spaces = vec![
         space("s1", "/home/w/comet-native"),
         space("s2", "/home/w/website"),
-    ]));
-    app.apply(Update::Chats(vec![
+    ];
+    local.chats = vec![
         chat("c1", "Legacy App Decompilation", "s1", 24),
         chat("c2", "App Terminal TUI Monochrome", "s1", 5),
         chat("c3", "Rebuild CLI and Test Harness", "s1", 0),
         chat("c4", "Session Loading Virtualisation", "s1", 4),
         chat("c5", "Invert PNG Image Colors", "s2", 0),
-    ]));
+    ];
+    app.apply(FederationEvent::ServerChanged(local));
     app.activate_space("s1".into());
     app.select_chat(Some("c1".into()));
-    app.apply(Update::Transcript {
-        chat_id: "c1".into(),
+    app.apply(FederationEvent::Transcript {
+        chat: ServerRef::new(server_id, "c1"),
         entries: vec![
             entry(
                 "m0",

@@ -37,8 +37,7 @@
 //!    soccertcg · comet/re…       Run   cargo test --workspace
 //!
 //!                              ◜ Working · 11s · Ctrl-X to interrupt
-//!  Wing Lee
-//!  w@example.com               Do anything…
+//!                              Do anything…
 //!
 //!                              Fable 5  High        ⎇ main  Worktree
 //! ```
@@ -203,18 +202,8 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         return;
     }
 
-    // The user row is pinned to the bottom, as in the original; everything else
-    // scrolls above it.
-    let user = app
-        .rows
-        .iter()
-        .position(|row| matches!(row, Row::User { .. }));
-    let (list_rows, footer_rows): (&[Row], &[Row]) = match user {
-        Some(at) => (&app.rows[..at], &app.rows[at..]),
-        None => (&app.rows, &[]),
-    };
-    let footer_height: u16 = footer_rows.iter().map(|row| row.height()).sum();
-    let list_height = inner.height.saturating_sub(footer_height);
+    let list_rows = app.rows.as_slice();
+    let list_height = inner.height;
 
     // Scroll so the cursor's row is visible. Rows are 1–2 lines tall, so the
     // window is computed in lines, not indices.
@@ -231,22 +220,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         visible.push((index, Rect { y, height, ..inner }));
         y += height;
     }
-    let footer_start = inner.y + list_height;
-    let mut footer: Vec<(usize, Rect)> = Vec::new();
-    let mut y = footer_start;
-    for (offset, row) in footer_rows.iter().enumerate() {
-        footer.push((
-            list_rows.len() + offset,
-            Rect {
-                y,
-                height: row.height(),
-                ..inner
-            },
-        ));
-        y += row.height();
-    }
-
-    for (index, slot) in visible.iter().chain(footer.iter()) {
+    for (index, slot) in &visible {
         if app.rows[*index].selectable() {
             app.push_hit(*slot, Hit::Row(*index));
         }
@@ -268,7 +242,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             );
         }
     }
-    for (index, slot) in visible.into_iter().chain(footer) {
+    for (index, slot) in visible {
         let selected = index == app.cursor && index < app.rows.len();
         let row = app.rows[index].clone();
         draw_sidebar_row(frame, slot, app, &row, selected, theme);
@@ -313,6 +287,23 @@ fn draw_sidebar_row(
         ..area
     };
     match row {
+        Row::Server { name, status } => {
+            let status_width = wrap::width_of(status) as u16;
+            frame.render_widget(
+                Paragraph::new(Span::styled(name.clone(), theme.body())),
+                area,
+            );
+            if status_width < area.width {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(status.clone(), theme.hint())),
+                    Rect {
+                        x: area.x + area.width - status_width,
+                        width: status_width,
+                        ..area
+                    },
+                );
+            }
+        }
         // Label left, affordance right — herdr's header row.
         Row::Section { label, action } => {
             frame.render_widget(
@@ -464,25 +455,6 @@ fn draw_sidebar_row(
                         format!("  {}", wrap::truncate(&sub, width.saturating_sub(2))),
                         base.patch(theme.hint()),
                     )),
-                    Rect {
-                        y: area.y + 1,
-                        height: 1,
-                        ..area
-                    },
-                );
-            }
-        }
-        Row::User { name, email } => {
-            // With no display name the email takes the top line rather than
-            // leaving a gap where a name would have been.
-            let lead = if name.is_empty() { email } else { name };
-            frame.render_widget(
-                Paragraph::new(Span::styled(wrap::truncate(lead, width), theme.subtle())),
-                Rect { height: 1, ..area },
-            );
-            if area.height > 1 && !email.is_empty() && email != name {
-                frame.render_widget(
-                    Paragraph::new(Span::styled(wrap::truncate(email, width), theme.hint())),
                     Rect {
                         y: area.y + 1,
                         height: 1,
@@ -1121,20 +1093,6 @@ fn draw_gate(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, phase: Gat
             "Can't reach the engine".into(),
             err.lines().map(str::to_string).collect(),
         ),
-        GatePhase::SignIn => (
-            "Sign in".into(),
-            vec![
-                "The engine has no session.".into(),
-                "Run `comet login` in another terminal, then `comet daemon restart`.".into(),
-            ],
-        ),
-        GatePhase::OrgGate => (
-            "Choose a workspace".into(),
-            vec![
-                "This account has no workspace selected.".into(),
-                "Pick one in the desktop app; the TUI follows the engine's choice.".into(),
-            ],
-        ),
         GatePhase::Ready => return,
     };
 
@@ -1362,7 +1320,7 @@ fn draw_overlay(
             list_card(frame, body, theme, "Effort", &rows, true, *active)
         }
 
-        Overlay::Models { models, active } => {
+        Overlay::Models { models, active, .. } => {
             let rows: Vec<(String, Option<String>)> = match models {
                 Some(list) if !list.is_empty() => list
                     .iter()

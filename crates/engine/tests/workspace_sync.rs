@@ -1,11 +1,6 @@
-//! M4a integration: two `EngineCore`s (distinct data dirs + device ids) sharing one
-//! per-org workspace doc.
-//!
-//! The in-memory bridge below stands in for the edge room: it cross-imports Loro
-//! updates (`export(updates)`) between the two engines' workspace docs on a timer,
-//! which is exactly what `RoomClient` + the SessionRoom DO do over the wire. A live
-//! variant against a real edge runs behind `#[ignore]` (COMET_EDGE_WS, like
-//! comet-sync's edge_convergence test).
+//! Workspace document convergence semantics exercised with a test-only in-memory
+//! cross-import bridge. Production instances use independent local stores and
+//! direct LAN RPC rather than shared document synchronization.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -440,78 +435,4 @@ async fn chat_config_selects_the_run_harness() {
     .await;
 
     a.shutdown().await;
-}
-
-/// Live-edge variant: the same convergence through a real workspace room. Requires
-/// the TS edge (`wrangler dev` in `edge/` with AUTH_MODE=dev):
-///
-/// ```sh
-/// COMET_EDGE_WS=ws://127.0.0.1:8787 cargo test -p comet-engine -- --ignored
-/// ```
-#[tokio::test]
-#[ignore = "requires a live edge: set COMET_EDGE_WS (e.g. ws://127.0.0.1:8787)"]
-async fn two_engines_converge_through_a_real_workspace_room() {
-    use comet_engine::doc_host::EdgeConfig;
-
-    let base = std::env::var("COMET_EDGE_WS")
-        .expect("set COMET_EDGE_WS to the edge origin, e.g. ws://127.0.0.1:8787");
-    let org = format!("org-{}", uuid::Uuid::new_v4().simple());
-
-    let assemble_live = |dir: &std::path::Path, device_id: &str, user: &str| {
-        std::fs::create_dir_all(dir).expect("create data dir");
-        std::fs::write(dir.join("device-id"), device_id).expect("write device id");
-        // Dev-mode bearer `user@org` carries the org claim the workspace route checks.
-        let edge = Some(EdgeConfig::with_static_token(
-            base.clone(),
-            format!("{user}@{org}"),
-        ));
-        EngineCore::assemble_with_identity(dir, registry(), HarnessId::Mock, edge, &org, user)
-            .expect("engine core assembles")
-    };
-
-    // Workspace docs are per-user (`ws3/{org}/{user}`): convergence is across
-    // ONE user's devices — two engines, same user, different device ids.
-    let dir_a = tempfile::tempdir().unwrap();
-    let dir_b = tempfile::tempdir().unwrap();
-    let a = assemble_live(dir_a.path(), "dev-live-a", "alice");
-    let b = assemble_live(dir_b.path(), "dev-live-b", "alice");
-
-    // Both device rows converge through the real room.
-    for core in [&a, &b] {
-        wait_for(
-            || {
-                let ids: Vec<String> = core
-                    .workspace
-                    .doc()
-                    .read_devices()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|d| d.id)
-                    .collect();
-                ids == ["dev-live-a", "dev-live-b"]
-            },
-            "both device rows through the edge",
-        )
-        .await;
-    }
-
-    // A rename from B lands on A.
-    b.workspace
-        .rename_device("dev-live-a", "renamed by b")
-        .expect("rename");
-    wait_for(
-        || {
-            a.workspace
-                .doc()
-                .read_devices()
-                .unwrap_or_default()
-                .iter()
-                .any(|d| d.id == "dev-live-a" && d.name == "renamed by b")
-        },
-        "device rename through the edge",
-    )
-    .await;
-
-    a.shutdown().await;
-    b.shutdown().await;
 }

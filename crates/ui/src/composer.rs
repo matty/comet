@@ -25,7 +25,9 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use comet_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
-use comet_proto::{FileSearchMatch, RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion};
+use comet_proto::{
+    FileSearchMatch, RunRequest, SandboxLevel, ServerRef, UserInputAnswer, UserInputQuestion,
+};
 use comet_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
@@ -3131,23 +3133,27 @@ fn mention_error_message(err: &RpcError) -> SharedString {
     }
 }
 
+fn mention_search_owner(chat: Option<&ServerRef>, space: Option<&ServerRef>) -> Option<ServerRef> {
+    chat.or(space).cloned()
+}
+
 pub struct Composer {
     state: Entity<AppState>,
     input: Entity<ComposerInput>,
     /// Composer actions row: repo/branch/harness-model/traits (§1.7).
     pickers: Entity<Pickers>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
-    drafts: HashMap<String, String>,
+    drafts: HashMap<Option<ServerRef>, String>,
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
     /// navigating away and back restores them; memory-only, like the original.
-    attachments: HashMap<String, Vec<StagedAttachment>>,
+    attachments: HashMap<Option<ServerRef>, Vec<StagedAttachment>>,
     /// The staged attachment being viewed full-size (click a thumbnail).
     preview: Option<attachments::PreviewImage>,
     /// In-flight file-picker prompt (paperclip).
     picker_task: Option<Task<()>>,
     mention_task: Option<Task<()>>,
     mention: FileMentionState,
-    current_key: String,
+    current_key: Option<ServerRef>,
     sending: bool,
     failure: Option<SharedString>,
     wizard: Option<Wizard>,
@@ -3224,7 +3230,7 @@ impl Composer {
             }
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
         });
-        let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
+        let current_key = state.read(cx).selected_chat.clone();
         let mut composer = Self {
             state,
             input,
@@ -3358,8 +3364,8 @@ impl Composer {
 
     /// Drop a deleted chat's per-chat composer state — staged attachments hold
     /// raw image bytes, and a deleted chat's stage could never be sent again.
-    pub fn purge_chat(&mut self, chat_id: &str) {
-        self.attachments.remove(chat_id);
+    pub fn purge_chat(&mut self, chat_id: &ServerRef) {
+        self.attachments.remove(&Some(chat_id.clone()));
     }
 
     /// The staged-thumbnail strip (attachment-ui.tsx AttachmentStrip):
@@ -3527,7 +3533,12 @@ impl Composer {
             cx.notify();
             return;
         };
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let engine = {
+            let state = self.state.read(cx);
+            mention_search_owner(state.selected_chat.as_ref(), state.selected_space.as_ref())
+                .and_then(|owner| state.client_for(&owner))
+        };
+        let Some(engine) = engine else {
             self.mention.loading = false;
             cx.notify();
             return;
@@ -3536,32 +3547,24 @@ impl Composer {
             crate::pickers::CheckoutPlan::ReuseWorktree { path, .. } => Some(path),
             _ => None,
         };
-        let (params, target) = {
+        let params = {
             let state = self.state.read(cx);
             let mut params = serde_json::Map::new();
             params.insert("query".into(), token.query.clone().into());
-            let target = if let Some(chat) = state.selected_chat_row() {
+            if let Some(chat) = state.selected_chat_row() {
                 params.insert("chatId".into(), chat.id.clone().into());
-                Some(chat.device_id.clone())
             } else if let Some(space) = state.selected_space_row() {
                 params.insert("spaceId".into(), space.id.clone().into());
                 if let Some(path) = selected_worktree {
                     params.insert("path".into(), path.into());
                 }
-                Some(space.device_id.clone())
             } else {
-                None
-            };
-            if let Some(target) = &target {
-                params.insert("targetDeviceId".into(), target.clone().into());
+                self.mention.loading = false;
+                cx.notify();
+                return;
             }
-            (serde_json::Value::Object(params), target)
+            serde_json::Value::Object(params)
         };
-        if target.is_none() {
-            self.mention.loading = false;
-            cx.notify();
-            return;
-        }
         let request = self.mention.request;
         self.mention_task = Some(cx.spawn(async move |this, cx| {
             // A short debounce prevents one full workspace walk per keystroke
@@ -3575,9 +3578,8 @@ impl Composer {
                 .call(methods::SEARCH_FILES, params.clone())
                 .await;
             if matches!(result, Err(RpcError::Transport(_)) | Err(RpcError::Closed)) {
-                // One retry rides out a cold relay dial to the host device
-                // (the diffs pane retries forever; a keystroke-scoped search
-                // gets a single second chance).
+                // One retry rides out a cold direct connection to the owning
+                // server; a keystroke-scoped search gets one second chance.
                 cx.background_executor()
                     .timer(Duration::from_millis(250))
                     .await;
@@ -3761,7 +3763,7 @@ impl Composer {
         let (key, pending) = {
             let s = self.state.read(cx);
             (
-                s.selected_chat.clone().unwrap_or_default(),
+                s.selected_chat.clone(),
                 pending_input_request(&s.transcript),
             )
         };
@@ -3840,7 +3842,7 @@ impl Composer {
 
     fn run_live(&self, cx: &App) -> bool {
         let s = self.state.read(cx);
-        let Some(chat_id) = s.selected_chat.as_deref() else {
+        let Some(chat_id) = s.selected_chat_id() else {
             return false;
         };
         matches!(
@@ -3880,17 +3882,21 @@ impl Composer {
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
     fn send(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             self.failure = Some("Engine not connected".into());
             cx.notify();
             return;
         };
         // Chat id: existing selection, or client-minted for the new-chat canvas
         // (the chat then appears from the doc host once the doc materializes).
-        let (chat_id, is_new) = match self.state.read(cx).selected_chat.clone() {
+        let (chat_owner, is_new) = match self.state.read(cx).selected_chat.clone() {
             Some(id) => (id, false),
-            None => (uuid::Uuid::new_v4().to_string(), true),
+            None => (
+                ServerRef::new(engine.server_id().clone(), uuid::Uuid::new_v4().to_string()),
+                true,
+            ),
         };
+        let chat_id = chat_owner.local_id.clone();
         // Where the new session runs (Current checkout / reuse an existing
         // worktree / fresh worktree off the picked base) — resolved NOW so
         // the async block needs no picker access.
@@ -3926,7 +3932,7 @@ impl Composer {
                 .or_else(|| local_device_id.clone())
                 .unwrap_or_else(|| "local".to_string())
         };
-        // Uploads/read-backs target the chat's HOST device (forwardable RPCs);
+        // Uploads/read-backs target the chat's explicitly qualified server;
         // for a new chat that's the space's device (None when it's local).
         let host_device_id = if is_new {
             space
@@ -3941,9 +3947,6 @@ impl Composer {
         };
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
-        let space_remote = space
-            .as_ref()
-            .is_some_and(|s| local_device_id.as_deref() != Some(s.device_id.as_str()));
         // Snapshot-and-clear NOW (use-attachments.ts takeAttachments): the
         // strip empties the instant you hit send; a failure hands the files
         // back into the chat's stash.
@@ -3977,11 +3980,12 @@ impl Composer {
             status: None,
             continuation_of: None,
         };
+        let echo_owner = chat_owner.clone();
         self.state.update(cx, |s, cx| {
             if is_new {
                 s.select_chat(Some(chat_id.clone()), cx);
             }
-            s.push_echo(&chat_id, echo);
+            s.push_echo_for(echo_owner, echo);
             cx.notify();
         });
 
@@ -3996,7 +4000,8 @@ impl Composer {
 
         let steer_cmd = steer && !is_new;
         let restore_text = text.clone();
-        let err_chat_id = chat_id.clone();
+        let err_chat_key = Some(chat_owner.clone());
+        let async_chat_owner = chat_owner;
         let err_message_id = message_id.clone();
         self.send_task = Some(cx.spawn(async move |this, cx| {
             let result: Result<(), String> = async {
@@ -4031,18 +4036,10 @@ impl Composer {
                         crate::pickers::CheckoutPlan::NewWorktree { base } => {
                             chat_branch = base.clone();
                             if let (Some(repo_path), Some(base)) = (&space_path, base) {
-                                let mut params = serde_json::json!({
+                                let params = serde_json::json!({
                                     "repoPath": repo_path,
                                     "branch": base,
                                 });
-                                if space_remote
-                                    && let Some(object) = params.as_object_mut()
-                                {
-                                    object.insert(
-                                        "targetDeviceId".into(),
-                                        serde_json::Value::String(device_id.clone()),
-                                    );
-                                }
                                 let value = engine
                                     .client()
                                     .call(methods::CREATE_WORKTREE, params)
@@ -4102,7 +4099,6 @@ impl Composer {
                         match attachments::upload_attachment(
                             &engine,
                             cx.background_executor(),
-                            host_device_id.as_deref(),
                             att,
                         )
                         .await
@@ -4122,9 +4118,9 @@ impl Composer {
                     // Attachment in the original send path).
                     let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
                     for (path, att) in attachment_paths.iter().zip(&staged) {
-                        attachments::seed_attachment(&seed_device, path, &att.name, att.image.clone());
+                        attachments::seed_attachment(&async_chat_owner.server_id, &seed_device, path, &att.name, att.image.clone());
                         if seed_device != device_id {
-                            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+                            attachments::seed_attachment(&async_chat_owner.server_id, &device_id, path, &att.name, att.image.clone());
                         }
                     }
                     content = attachments::with_attachments(&text, &attachment_paths);
@@ -4143,11 +4139,11 @@ impl Composer {
                         status: None,
                         continuation_of: None,
                     };
-                    let echo_chat_id = chat_id.clone();
+                    let echo_chat_owner = async_chat_owner.clone();
                     this.update(cx, |composer, cx| {
                         composer.state.update(cx, |s, cx| {
-                            s.remove_echo(&echo_chat_id, &message_id);
-                            s.push_echo(&echo_chat_id, refreshed);
+                            s.remove_echo_for(&echo_chat_owner, &message_id);
+                            s.push_echo_for(echo_chat_owner, refreshed);
                             cx.notify();
                         });
                     })
@@ -4191,16 +4187,20 @@ impl Composer {
                 if let Err(message) = result {
                     // Failure: red banner, echo removed, prompt back in the
                     // draft, staged files back in the chat's stash.
-                    composer.failure = Some(message.into());
                     composer.state.update(cx, |s, cx| {
-                        s.remove_echo(&err_chat_id, &err_message_id);
+                        s.remove_echo_for(&async_chat_owner, &err_message_id);
                         cx.notify();
                     });
-                    composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                    if composer.current_key == err_chat_key {
+                        composer.failure = Some(message.into());
+                        composer
+                            .input
+                            .update(cx, |input, cx| input.set_text(restore_text, cx));
+                    }
                     if !staged.is_empty() {
                         // Merge by id (stashAttachments): files the user staged
                         // while the send was in flight survive the hand-back.
-                        let slot = composer.attachments.entry(err_chat_id.clone()).or_default();
+                        let slot = composer.attachments.entry(err_chat_key.clone()).or_default();
                         let mut merged = staged.clone();
                         merged.extend(
                             slot.drain(..)
@@ -4216,10 +4216,16 @@ impl Composer {
     }
 
     fn interrupt(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             return;
         };
-        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+        let Some(chat_id) = self
+            .state
+            .read(cx)
+            .selected_chat
+            .clone()
+            .map(|id| id.local_id)
+        else {
             return;
         };
         let params = serde_json::json!({
@@ -4307,10 +4313,16 @@ impl Composer {
             // The panel borrowed the composer input; hand back its identity.
             input.set_placeholder("Do anything…", cx);
         });
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             return;
         };
-        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+        let Some(chat_id) = self
+            .state
+            .read(cx)
+            .selected_chat
+            .clone()
+            .map(|id| id.local_id)
+        else {
             return;
         };
         let request_id = wizard.request_id.clone();
@@ -5183,6 +5195,19 @@ mod tests {
         let links = file_mention_links(&folder);
         assert_eq!(links[0].path, "src/components");
         assert!(links[0].is_dir);
+    }
+
+    #[test]
+    fn mention_search_uses_the_qualified_resource_owner() {
+        let chat = ServerRef::new(comet_proto::ServerId::new("sha256:remote"), "chat-1");
+        let space = ServerRef::new(comet_proto::ServerId::new("sha256:local"), "space-1");
+
+        assert_eq!(
+            mention_search_owner(Some(&chat), Some(&space)),
+            Some(chat.clone())
+        );
+        assert_eq!(mention_search_owner(None, Some(&space)), Some(space));
+        assert_eq!(mention_search_owner(None, None), None);
     }
 
     #[test]

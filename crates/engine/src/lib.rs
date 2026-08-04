@@ -8,16 +8,20 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub use comet_identity::DeviceIdentity;
 pub use comet_proto::HarnessId;
 
 use comet_sync::DocsStore;
 
 pub mod agent_accounts;
-pub mod auth;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
+pub mod lan_server;
+pub mod local_store;
 pub mod registry;
+pub mod remote_config;
+pub mod remote_rpc;
 pub mod repos;
 pub mod rpc;
 pub mod run_journal;
@@ -29,25 +33,28 @@ pub mod uploads;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
-pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
-pub use diff_sync::{CheckoutDiffSync, DiffSidecar, DiffSnapshot, capture_diff};
-pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
+pub use diff_sync::{CheckoutDiffSync, DiffSnapshot, capture_diff};
+pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig};
 pub use instance_lock::InstanceLock;
+pub use lan_server::{LanServer, LanServerHandle, LanServerStatus};
+pub use local_store::initialize_local_store;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
+pub use remote_config::RemoteConfigStore;
+pub use remote_rpc::{RemoteRpcService, remote_method_allowed};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
-pub use rpc::EngineRpc;
+pub use rpc::{EngineRpc, LocalRpcService};
 pub use run_journal::{JournalError, RunJournal};
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
-pub use workspace_host::{
-    DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
-};
+pub use workspace_host::{WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
+    #[error("identity: {0}")]
+    Identity(#[from] comet_identity::IdentityError),
     #[error("doc: {0}")]
     Doc(#[from] comet_doc::DocError),
     #[error("journal: {0}")]
@@ -75,19 +82,23 @@ pub(crate) fn new_id() -> String {
 pub struct EngineConfig {
     /// Data directory (default `~/.comet-native`, dev `~/.comet-native-dev`).
     pub data_dir: PathBuf,
-    /// Edge base URL.
-    pub edge_url: String,
-    /// Bearer for edge room joins; `None` runs fully offline (sync disabled).
-    pub edge_token: Option<String>,
     /// Localhost IPC port for the UI.
     pub ipc_port: u16,
     /// Harness for doc-command runs on chats without a workspace `config` row.
     pub default_harness: HarnessId,
-    /// Workspace-doc org (`ws/{orgId}` room). `None` = `$COMET_ORG_ID` or the dev default.
-    /// In WorkOS mode the signed-in session's org wins.
-    pub org_id: Option<String>,
-    /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
-    pub workos_client_id: Option<String>,
+    /// Release metadata/download origin. It is not a runtime authority.
+    pub releases_url: String,
+}
+
+impl EngineConfig {
+    pub fn for_test(data_dir: &Path) -> Self {
+        Self {
+            data_dir: data_dir.to_path_buf(),
+            ipc_port: 0,
+            default_harness: HarnessId::Mock,
+            releases_url: "http://127.0.0.1:1".into(),
+        }
+    }
 }
 
 /// The assembled engine core — also constructible without the IPC server for tests
@@ -104,10 +115,11 @@ pub struct EngineCore {
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
-    /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
-    auth: std::sync::Mutex<Option<Auth>>,
-    /// Peer link cache for `targetDeviceId` routing (attached when edge+auth are ready).
-    links: std::sync::Mutex<Option<Arc<comet_rpc::LinkCache>>>,
+    device_identity: Arc<DeviceIdentity>,
+    remote_config: RemoteConfigStore,
+    lan_server: LanServerHandle,
+    rpc: std::sync::OnceLock<Arc<EngineRpc>>,
+    local_rpc: std::sync::OnceLock<Arc<LocalRpcService>>,
     /// Release checker (attached by [`Engine::assemble_runtime`]) — the
     /// UpdateStatus stream + ApplyUpdate.
     updater: std::sync::Mutex<Option<comet_update::Updater>>,
@@ -117,27 +129,12 @@ pub struct EngineCore {
 
 impl EngineCore {
     /// Open stores under `data_dir`, wire sessions ⇄ doc host ⇄ workspace host, and
-    /// recover stale journals from a previous crash. Identity comes from
-    /// `$COMET_ORG_ID` / `$COMET_USER_ID` (dev defaults `dev-org` / `dev-user`);
-    /// use [`Self::assemble_with_identity`] to pass one explicitly.
+    /// recover stale journals from a previous crash.
     pub fn assemble(
         data_dir: &Path,
         registry: Arc<HarnessRegistry>,
         default_harness: HarnessId,
-        edge: Option<EdgeConfig>,
-    ) -> Result<Self, EngineError> {
-        let org_id = env_or("COMET_ORG_ID", DEFAULT_ORG_ID);
-        let user_id = env_or("COMET_USER_ID", DEFAULT_USER_ID);
-        Self::assemble_with_identity(data_dir, registry, default_harness, edge, &org_id, &user_id)
-    }
-
-    pub fn assemble_with_identity(
-        data_dir: &Path,
-        registry: Arc<HarnessRegistry>,
-        default_harness: HarnessId,
-        edge: Option<EdgeConfig>,
-        org_id: &str,
-        user_id: &str,
+        _legacy_offline: Option<()>,
     ) -> Result<Self, EngineError> {
         std::fs::create_dir_all(data_dir)?;
         // Single-instance guard: two engines on one data dir would race the
@@ -145,33 +142,34 @@ impl EngineCore {
         // port binds; held (and kernel-released on crash) for the engine's life.
         let lock = InstanceLock::acquire(data_dir)?;
         let device_id = load_or_create_device_id(data_dir)?;
-        // Identity-scoped storage: snapshots, the command ledger, and run
-        // journals live under `orgs/{orgId}/{userId}/` so switching accounts or
-        // orgs on one machine never reuses another identity's cached docs.
-        let org_dir = data_dir
-            .join("orgs")
-            .join(sanitize_path_id(org_id))
-            .join(sanitize_path_id(user_id));
-        let store = Arc::new(DocsStore::open(&org_dir)?);
-        let journal = Arc::new(RunJournal::open(org_dir.join("journals"))?);
+        let device_identity = DeviceIdentity::load_or_create(data_dir)?;
+        let remote_config = RemoteConfigStore::open(data_dir)?;
+        let persisted_remotes = remote_config.watch_remotes().borrow().clone();
+        for mut remote in persisted_remotes {
+            if remote.last_state == comet_proto::RemoteConnectionState::Online {
+                remote.last_state = comet_proto::RemoteConnectionState::Offline;
+                remote_config.put_remote(remote)?;
+            }
+        }
+        let lan_server = LanServerHandle::new(remote_config.clone(), device_identity.clone());
+        let local_root = initialize_local_store(data_dir)?;
+        let store = Arc::new(DocsStore::open(&local_root)?);
+        let journal = Arc::new(RunJournal::open(local_root.join("journals"))?);
+        let detected_device_name = local_device_name();
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
         let doc_host = DocHost::new(
             store.clone(),
             DocHostConfig {
                 device_id: device_id.clone(),
                 default_harness,
-                edge: edge.clone(),
             },
         );
         let workspace = WorkspaceHost::open(
             store,
             WorkspaceHostConfig {
                 device_id: device_id.clone(),
-                device_name: local_device_name(),
+                device_name: detected_device_name,
                 platform: std::env::consts::OS.to_string(),
-                org_id: org_id.to_string(),
-                user_id: user_id.to_string(),
-                edge: edge.clone(),
             },
         )?;
         doc_host.set_workspace(workspace.clone());
@@ -184,14 +182,14 @@ impl EngineCore {
         }
         let repos = Repos::new(data_dir, &device_id);
         let terminals = Terminals::new();
-        let uploads = Uploads::new(data_dir, edge.clone());
+        let uploads = Uploads::new(data_dir);
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
             repos.clone(),
         ));
-        let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id, edge);
+        let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id);
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
         Ok(Self {
             sessions,
@@ -205,53 +203,14 @@ impl EngineCore {
             uploads,
             agent_accounts,
             device_id,
-            auth: std::sync::Mutex::new(None),
-            links: std::sync::Mutex::new(None),
+            device_identity,
+            remote_config,
+            lan_server,
+            rpc: std::sync::OnceLock::new(),
+            local_rpc: std::sync::OnceLock::new(),
             updater: std::sync::Mutex::new(None),
             _instance_lock: lock,
         })
-    }
-
-    /// Attach the auth service (before building the RPC service / relays).
-    pub fn set_auth(&self, auth: Auth) {
-        *self
-            .auth
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(auth);
-    }
-
-    /// The attached auth service, or a lazily-created dev-mode one (in-process embeds
-    /// that never wired WorkOS still answer AuthStatus honestly).
-    pub fn auth(&self) -> Auth {
-        let mut slot = self
-            .auth
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        slot.get_or_insert_with(|| {
-            let dev_user = std::env::var("COMET_EDGE_TOKEN")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "dev-user".into());
-            let mut config = AuthConfig::new("http://localhost:27640", std::env::temp_dir());
-            config.dev_user_id = dev_user;
-            Auth::new(config)
-        })
-        .clone()
-    }
-
-    /// Attach the peer link cache — enables `targetDeviceId` routing and [`Self::dial_device`].
-    pub fn set_links(&self, links: Arc<comet_rpc::LinkCache>) {
-        *self
-            .links
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(links);
-    }
-
-    pub fn links(&self) -> Option<Arc<comet_rpc::LinkCache>> {
-        self.links
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
     }
 
     /// Attach the release checker (before building the RPC service).
@@ -269,68 +228,78 @@ impl EngineCore {
             .clone()
     }
 
-    /// A live RPC client to another device's engine through its relay DO (the router's
-    /// dial seam). Cached per device; invalidated + re-dialed on failure.
-    pub async fn dial_device(
-        &self,
-        device_id: &str,
-    ) -> Result<Arc<comet_rpc::RpcClient>, EngineError> {
-        let links = self
-            .links()
-            .ok_or_else(|| EngineError::Other("peer links unavailable (offline)".into()))?;
-        links
-            .client(device_id)
-            .await
-            .map_err(|e| EngineError::Other(e.to_string()))
-    }
-
-    /// Start hosting our device room: serve the full RPC surface to relay clients and
-    /// warm-open chat docs on nudges (§7 cold-chat command delivery). The token source
-    /// re-reads auth on every (re)dial, so token refreshes take effect at reconnect.
-    pub fn start_host_relay(&self, edge_url: &str) -> comet_rpc::HostRelay {
-        let auth = self.auth();
-        let config =
-            comet_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
-        let doc_host = self.doc_host.clone();
-        let on_nudge: comet_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
-            // Opening the doc joins its room + syncs; drain fires on the change
-            // subscription — the command executes with no standing per-chat socket.
-            match doc_host.open(&chat_id) {
-                Ok(_) => tracing::info!(chat = %chat_id, "nudge: chat doc opened"),
-                Err(err) => {
-                    tracing::warn!(chat = %chat_id, error = %err, "nudge: open failed")
+    fn engine_rpc_service(&self) -> Arc<EngineRpc> {
+        self.rpc
+            .get_or_init(|| {
+                let hello = comet_proto::ServerHello {
+                    protocol_version: comet_proto::PROTOCOL_VERSION,
+                    server_id: self.device_identity.server_id().clone(),
+                    device_id: self.device_id.clone(),
+                    name: self.workspace.device_name().to_string(),
+                    capabilities: vec!["authoritative-rpc".into(), "pairing".into()],
+                };
+                let mut rpc = EngineRpc::new(
+                    self.sessions.clone(),
+                    self.doc_host.clone(),
+                    self.workspace.clone(),
+                    self.registry.clone(),
+                    self.repos.clone(),
+                    self.terminals.clone(),
+                    self.diff_sync.clone(),
+                    self.uploads.clone(),
+                    self.agent_accounts.clone(),
+                )
+                .with_server_hello(hello);
+                if let Some(updater) = self.updater() {
+                    rpc = rpc.with_updater(updater);
                 }
-            }
-        });
-        comet_rpc::HostRelay::spawn(config, self.rpc_service(), on_nudge)
+                Arc::new(rpc)
+            })
+            .clone()
     }
 
-    pub fn rpc_service(&self) -> Arc<EngineRpc> {
-        let mut rpc = EngineRpc::new(
-            self.sessions.clone(),
-            self.doc_host.clone(),
-            self.workspace.clone(),
-            self.registry.clone(),
-            self.repos.clone(),
-            self.terminals.clone(),
-            self.diff_sync.clone(),
-            self.uploads.clone(),
-            self.agent_accounts.clone(),
-        )
-        .with_auth(self.auth());
-        if let Some(links) = self.links() {
-            rpc = rpc.with_links(links);
-        }
-        if let Some(updater) = self.updater() {
-            rpc = rpc.with_updater(updater);
-        }
-        Arc::new(rpc)
+    /// Authoritative service exposed to explicitly paired direct-LAN clients.
+    pub fn remote_rpc_service(&self) -> Arc<EngineRpc> {
+        self.engine_rpc_service()
+    }
+
+    pub fn rpc_service(&self) -> Arc<LocalRpcService> {
+        let engine_rpc = self.engine_rpc_service();
+        let local = self
+            .local_rpc
+            .get_or_init(|| {
+                Arc::new(LocalRpcService::new(
+                    engine_rpc.clone(),
+                    self.remote_config.clone(),
+                    self.lan_server.clone(),
+                ))
+            })
+            .clone();
+        self.lan_server
+            .ensure_started(Arc::new(RemoteRpcService::new(
+                engine_rpc,
+                self.device_id.clone(),
+            )));
+        local
+    }
+
+    pub fn remote_config(&self) -> &RemoteConfigStore {
+        &self.remote_config
+    }
+
+    pub fn device_identity(&self) -> &DeviceIdentity {
+        &self.device_identity
+    }
+
+    pub fn lan_status(&self) -> LanServerStatus {
+        self.lan_server.status()
     }
 
     /// Graceful teardown: settle live runs (streaming entries stamped `aborted`),
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
     pub async fn shutdown(&self) {
+        self.lan_server.shutdown().await;
         self.sessions.shutdown().await;
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
@@ -343,12 +312,8 @@ pub struct Engine {
     pub config: EngineConfig,
 }
 
-/// A fully assembled identity-scoped engine plus the relay handle whose lifetime
-/// keeps this device reachable. Used by both the headless server and the headed
-/// in-process engine so their production authentication paths cannot diverge.
 pub struct EngineRuntime {
     core: EngineCore,
-    _host_relay: Option<comet_rpc::HostRelay>,
 }
 
 impl EngineRuntime {
@@ -366,66 +331,14 @@ impl Engine {
         Self { config }
     }
 
-    /// Resolve the shared dev/WorkOS auth configuration for headed and headless
-    /// modes. Production callers pass the baked WorkOS client id; explicit dev
-    /// bearers still opt into the local dev identity.
-    pub async fn build_auth(config: &EngineConfig) -> Auth {
-        let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
-        auth_config.workos_client_id = config.workos_client_id.clone();
-        if let Ok(base) = std::env::var("COMET_WORKOS_API_BASE")
-            && !base.trim().is_empty()
-        {
-            auth_config.workos_api_base = base;
-        }
-        auth_config.callback_port = Some(
-            std::env::var("COMET_CALLBACK_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(27641),
-        );
-        if let Some(token) = &config.edge_token {
-            auth_config.dev_user_id = token.clone();
-        }
-        Auth::detect(auth_config).await
-    }
-
-    /// Open the identity-scoped stores and online transports for an auth session
-    /// that is already ready. The headed UI waits behind its sign-in gate before
-    /// calling this; headless mode waits on the terminal flow.
-    pub async fn assemble_runtime(
-        config: &EngineConfig,
-        auth: Auth,
-    ) -> anyhow::Result<EngineRuntime> {
-        let online = (auth.workos_enabled() || config.edge_token.is_some())
-            && auth.access_token().await.is_some();
-        let edge = online.then(|| EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())));
-
-        let dev_token_org = config
-            .edge_token
-            .as_deref()
-            .and_then(|t| t.split_once('@'))
-            .map(|(_, org)| org.to_string())
-            .filter(|s| !s.is_empty());
-        let org_id = auth
-            .state()
-            .org_id()
-            .map(str::to_string)
-            .or(dev_token_org)
-            .or(config.org_id.clone())
-            .unwrap_or_else(|| env_or("COMET_ORG_ID", DEFAULT_ORG_ID));
-        let user_id = auth
-            .user_id()
-            .unwrap_or_else(|| env_or("COMET_USER_ID", DEFAULT_USER_ID));
-        let core = EngineCore::assemble_with_identity(
+    pub async fn assemble_runtime(config: &EngineConfig) -> anyhow::Result<EngineRuntime> {
+        let core = EngineCore::assemble(
             &config.data_dir,
             Arc::new(default_registry()),
             config.default_harness,
-            edge.clone(),
-            &org_id,
-            &user_id,
+            None,
         )?;
-        core.set_auth(auth.clone());
-        // Release checker: polls {edge}/releases on a 6h cadence; headless
+        // The release checker is an independent distribution edge, not runtime authority.
         // installs with COMET_AUTO_UPDATE=1 apply + restart themselves — gated
         // on quiescence so a restart never lands under a live run or open PTY.
         let quiescent: comet_update::QuiescentCheck = {
@@ -434,50 +347,19 @@ impl Engine {
             Arc::new(move || !sessions.any_active() && !terminals.any_open())
         };
         core.set_updater(comet_update::Updater::spawn(
-            config.edge_url.clone(),
+            config.releases_url.clone(),
             Some(quiescent),
         ));
         tracing::info!(device_id = %core.device_id, "engine core assembled");
-
-        let host_relay = edge.as_ref().map(|edge| {
-            let links = comet_rpc::LinkCache::new(comet_rpc::LinkCacheConfig::new(
-                edge.url.clone(),
-                Arc::new(auth.clone()),
-            ));
-            let links_for_presence = links.clone();
-            core.workspace
-                .set_peer_alive_hook(Arc::new(move |device_id: &str| {
-                    links_for_presence.reset_cooldown(device_id);
-                }));
-            core.set_links(links);
-            core.start_host_relay(&edge.url)
-        });
-
-        Ok(EngineRuntime {
-            core,
-            _host_relay: host_relay,
-        })
+        Ok(EngineRuntime { core })
     }
 
-    /// Run until ctrl-c: auth (dev or WorkOS), sessions engine + doc host + command
-    /// executor, IPC server, and — when edge+auth are ready — the device-room host
-    /// relay + peer link cache (targetDeviceId routing).
+    /// Run the local engine and opt-in LAN server until shutdown.
     pub async fn run(self) -> anyhow::Result<()> {
         let config = self.config;
         tracing::info!(data_dir = %config.data_dir.display(), "engine starting");
 
-        std::fs::create_dir_all(&config.data_dir)?;
-        let auth = Self::build_auth(&config).await;
-        let _refresh_loop = auth.spawn_refresh_loop();
-
-        // WorkOS mode: gate edge features on a signed-in, org-scoped session. A TTY
-        // gets the interactive paste-code flow; a service manager (systemd/launchd)
-        // fails fast with a "run `comet login`" error instead of hanging on a prompt.
-        if auth.workos_enabled() {
-            terminal_sign_in(&auth).await?;
-        }
-
-        let runtime = Self::assemble_runtime(&config, auth).await?;
+        let runtime = Self::assemble_runtime(&config).await?;
 
         // A daemon exists to serve this port, so a bind failure is fatal here —
         // unlike the headed app, which can still work over its in-process
@@ -532,196 +414,25 @@ pub async fn serve_ipc(
     )))
 }
 
-/// Block until the WorkOS session is signed in AND org-scoped. On a TTY, print the
-/// headless (paste-code) sign-in URL, read the pasted `state.code` from stdin, and
-/// run workspace onboarding (create / auto-join / numbered picker). Off a TTY this
-/// errors immediately — a daemon under systemd/launchd must load the session that
-/// `comet login` persisted, never wait on a prompt nobody can see.
-pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
-    use std::io::IsTerminal;
-    let interactive = std::io::stdin().is_terminal();
-    let mut state_rx = auth.watch_state();
-    let mut stdin_reader: Option<tokio::task::JoinHandle<()>> = None;
-    let mut org_reader: Option<tokio::task::JoinHandle<()>> = None;
-    loop {
-        let state = state_rx.borrow().clone();
-        match state {
-            AuthState::SignedIn { user, org_id } => {
-                tracing::info!(email = %user.email, org = org_id.as_deref().unwrap_or("<none>"),
-                    "auth: session ready");
-                break;
-            }
-            AuthState::NeedsOrganization { user } => {
-                if !interactive {
-                    // No reader tasks have been spawned on this path (both spawns
-                    // are TTY-gated), so an early return leaks nothing.
-                    return Err(EngineError::Other(format!(
-                        "signed in as {} but no workspace is selected — run `comet login` on this machine to pick one",
-                        user.email
-                    )));
-                }
-                if org_reader.is_none() {
-                    // Workspace onboarding on the TTY (old comet's
-                    // `backend login` flow): create if none, auto-join a
-                    // single membership, numbered picker otherwise.
-                    println!("Signed in as {}.", user.email);
-                    org_reader = Some(tokio::spawn(run_org_onboarding(auth.clone())));
-                }
-            }
-            AuthState::SignedOut => {
-                if !interactive {
-                    return Err(EngineError::Other(
-                        "not signed in — run `comet login` on this machine first".into(),
-                    ));
-                }
-                if stdin_reader.is_none() {
-                    let url = auth.start_headless_sign_in();
-                    println!("Sign in to Comet:\n\n  {url}\n");
-                    println!("Then paste the code shown in the browser here and press enter.");
-                    let auth = auth.clone();
-                    stdin_reader = Some(tokio::spawn(async move {
-                        loop {
-                            let Some(line) = read_stdin_line().await else {
-                                return;
-                            };
-                            let pasted = line.trim();
-                            if pasted.is_empty() {
-                                continue;
-                            }
-                            match auth.complete_sign_in(pasted).await {
-                                Ok(()) => return,
-                                Err(err) => println!("Sign-in failed: {err}"),
-                            }
-                        }
-                    }));
-                }
-            }
-        }
-        if state_rx.changed().await.is_err() {
-            break;
-        }
-    }
-    if let Some(reader) = stdin_reader {
-        reader.abort();
-    }
-    if let Some(reader) = org_reader {
-        reader.abort();
-    }
-    Ok(())
-}
-
-/// One line from stdin (blocking read off the runtime). `None` = stdin closed.
-async fn read_stdin_line() -> Option<String> {
-    tokio::task::spawn_blocking(|| {
-        let mut line = String::new();
-        match std::io::stdin().read_line(&mut line) {
-            Ok(0) | Err(_) => None, // EOF / error
-            Ok(_) => Some(line),
-        }
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-/// TTY workspace onboarding for an org-less session (ports old comet's
-/// `backend login` flow): no memberships → prompt a name and create; exactly
-/// one → auto-join; several → numbered picker. Success flips the auth state to
-/// `SignedIn`, which ends [`wait_for_sign_in`]'s wait (and aborts this task).
-async fn run_org_onboarding(auth: Auth) {
-    let orgs = match auth.list_orgs().await {
-        Ok(orgs) => orgs,
-        Err(err) => {
-            println!(
-                "Could not list workspaces ({err}) — create or select one from the Comet UI to continue."
-            );
-            return;
-        }
-    };
-    match orgs.len() {
-        0 => {
-            println!("No workspaces yet — name your new workspace and press enter:");
-            loop {
-                let Some(line) = read_stdin_line().await else {
-                    return;
-                };
-                let name = line.trim();
-                if name.is_empty() {
-                    continue;
-                }
-                match auth.create_org(name).await {
-                    Ok(()) => return,
-                    Err(err) => println!("Creating workspace failed: {err}"),
-                }
-            }
-        }
-        1 => {
-            let only = &orgs[0];
-            println!("Joining workspace \"{}\"…", only.name);
-            if let Err(err) = auth.select_org(&only.organization_id).await {
-                println!("Joining workspace failed: {err}");
-            }
-        }
-        _ => {
-            println!("\nYour workspaces:");
-            for (index, org) in orgs.iter().enumerate() {
-                println!("  {}. {}", index + 1, org.name);
-            }
-            println!("Pick a workspace [1-{}]:", orgs.len());
-            loop {
-                let Some(line) = read_stdin_line().await else {
-                    return;
-                };
-                let choice = line
-                    .trim()
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|n| n.checked_sub(1))
-                    .and_then(|index| orgs.get(index));
-                let Some(org) = choice else {
-                    println!("Pick a workspace [1-{}]:", orgs.len());
-                    continue;
-                };
-                match auth.select_org(&org.organization_id).await {
-                    Ok(()) => return,
-                    Err(err) => println!("Joining workspace failed: {err}"),
-                }
-            }
-        }
-    }
-}
-
 /// Best-effort human name for this device's registry row (hostname).
-fn local_device_name() -> String {
-    std::env::var("COMET_DEVICE_NAME")
-        .ok()
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+fn local_device_name_from(
+    getenv: impl Fn(&str) -> Option<String>,
+    read_hostname: impl Fn() -> Option<String>,
+) -> String {
+    ["COMET_DEVICE_NAME", "COMPUTERNAME", "HOSTNAME"]
+        .into_iter()
+        .filter_map(getenv)
+        .chain(read_hostname())
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
         .unwrap_or_else(|| "unknown-device".to_string())
 }
 
-/// Trimmed env var or the given default.
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| default.to_string())
-}
-
-/// Filesystem-safe form of an org/user id (path segments for `orgs/{org}/{user}/`).
-fn sanitize_path_id(id: &str) -> String {
-    id.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+fn local_device_name() -> String {
+    local_device_name_from(
+        |key| std::env::var(key).ok(),
+        || std::fs::read_to_string("/etc/hostname").ok(),
+    )
 }
 
 /// Stable per-installation device id, persisted at `{data_dir}/device-id`.
@@ -734,5 +445,71 @@ fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
             std::fs::write(&path, &id)?;
             Ok(id)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_name_prefers_override_then_windows_hostname() {
+        let name = local_device_name_from(
+            |key| match key {
+                "COMET_DEVICE_NAME" => Some("  Lab Override  ".into()),
+                "COMPUTERNAME" => Some("BUILD-PC".into()),
+                "HOSTNAME" => Some("unix-host".into()),
+                _ => None,
+            },
+            || Some("file-host".into()),
+        );
+        assert_eq!(name, "Lab Override");
+
+        let windows = local_device_name_from(
+            |key| (key == "COMPUTERNAME").then(|| "BUILD-PC".into()),
+            || None,
+        );
+        assert_eq!(windows, "BUILD-PC");
+    }
+
+    #[test]
+    fn local_name_ignores_empty_values_and_falls_back() {
+        let hostname = local_device_name_from(
+            |key| match key {
+                "COMET_DEVICE_NAME" | "COMPUTERNAME" => Some("   ".into()),
+                "HOSTNAME" => Some(" linux-box ".into()),
+                _ => None,
+            },
+            || Some("file-host".into()),
+        );
+        assert_eq!(hostname, "linux-box");
+    }
+
+    #[test]
+    fn local_name_uses_hostname_file_after_empty_environment() {
+        let name = local_device_name_from(|_| Some("   ".into()), || Some(" file-host\n".into()));
+        assert_eq!(name, "file-host");
+    }
+
+    #[test]
+    fn local_name_uses_unknown_device_as_the_final_fallback() {
+        let name = local_device_name_from(|_| None, || Some("  \n".into()));
+        assert_eq!(name, "unknown-device");
+    }
+
+    #[tokio::test]
+    async fn rpc_services_from_one_core_share_mutation_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = EngineCore::assemble(
+            dir.path(),
+            Arc::new(HarnessRegistry::new()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let first = core.rpc_service();
+        let second = core.rpc_service();
+        assert!(first.shares_mutation_authority(&second));
+        core.shutdown().await;
     }
 }

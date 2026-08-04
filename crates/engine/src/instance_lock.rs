@@ -27,12 +27,28 @@ impl InstanceLock {
     /// already owns this data dir.
     pub fn acquire(data_dir: &Path) -> Result<Self, EngineError> {
         let path = data_dir.join("engine.lock");
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Let status probes read the PID, but deny a second writer for the
+            // engine's lifetime. Windows releases the share lock on crash.
+            options.share_mode(1); // FILE_SHARE_READ
+        }
+        let mut file = options.open(&path).map_err(|error| {
+            #[cfg(windows)]
+            if matches!(error.raw_os_error(), Some(32 | 33)) {
+                let holder = std::fs::read_to_string(&path).unwrap_or_default();
+                let holder = holder.trim();
+                return EngineError::Other(format!(
+                    "another comet engine is already running on {} (pid {}); stop it or use a different data dir (COMET_DATA_DIR)",
+                    data_dir.display(),
+                    if holder.is_empty() { "unknown" } else { holder },
+                ));
+            }
+            EngineError::Io(error)
+        })?;
 
         #[cfg(unix)]
         {
@@ -113,7 +129,26 @@ impl InstanceLock {
                 pid.to_string()
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).share_mode(1);
+            match options.open(&path) {
+                Ok(_) => None,
+                Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => {
+                    let pid = std::fs::read_to_string(&path).unwrap_or_default();
+                    let pid = pid.trim();
+                    Some(if pid.is_empty() {
+                        "unknown".into()
+                    } else {
+                        pid.into()
+                    })
+                }
+                Err(_) => None,
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = path;
             None
@@ -121,7 +156,7 @@ impl InstanceLock {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
 

@@ -23,8 +23,9 @@ use gpui::{
     StyledImage as _, div, img, prelude::*, px,
 };
 
-use crate::state::EngineHandle;
+use crate::state::ServerClient;
 use crate::theme::ink;
+use comet_proto::ServerId;
 use comet_rpc::methods;
 
 /// use-attachments.ts `MAX_ATTACHMENT_BYTES`.
@@ -259,13 +260,6 @@ pub fn stage_clipboard_image(image: Image) -> StagedAttachment {
 // Upload (state.ts uploadAttachment) + read-back (state.ts readAttachmentImage)
 // ---------------------------------------------------------------------------
 
-fn with_target(mut params: serde_json::Value, target_device_id: Option<&str>) -> serde_json::Value {
-    if let (Some(target), Some(map)) = (target_device_id, params.as_object_mut()) {
-        map.insert("targetDeviceId".into(), target.into());
-    }
-    params
-}
-
 /// Per-call deadlines (desktop state.ts): a stalled-but-open relay link never
 /// fails an RPC on its own, so every attachment call races a timer. The first
 /// chunk gets 90s (a cold dial to a remote device), later chunks 30s; commit
@@ -278,9 +272,9 @@ const READ_CHUNK_TIMEOUT: Duration = Duration::from_secs(20);
 /// Race an RPC against `timeout` on the gpui background executor (these
 /// futures run under `cx.spawn`, so tokio's timer reactor isn't available).
 async fn call_with_timeout(
-    engine: &EngineHandle,
+    engine: &ServerClient,
     executor: &BackgroundExecutor,
-    method: &str,
+    method: &'static str,
     params: serde_json::Value,
     timeout: Duration,
 ) -> Result<serde_json::Value, String> {
@@ -298,9 +292,8 @@ async fn call_with_timeout(
 /// `UploadCommit{uploadId,fileName}` → the durable absolute path on the target
 /// device. Errors return the raw cause (the composer shows friendly copy).
 pub async fn upload_attachment(
-    engine: &EngineHandle,
+    engine: &ServerClient,
     executor: &BackgroundExecutor,
-    target_device_id: Option<&str>,
     attachment: &StagedAttachment,
 ) -> Result<String, String> {
     let b64 = BASE64.encode(attachment.bytes());
@@ -309,10 +302,8 @@ pub async fn upload_attachment(
     let mut seq = 0u64;
     loop {
         let end = (start + UPLOAD_CHUNK_B64_CHARS).min(b64.len());
-        let params = with_target(
-            serde_json::json!({ "uploadId": upload_id, "seq": seq, "data": &b64[start..end] }),
-            target_device_id,
-        );
+        let params =
+            serde_json::json!({ "uploadId": upload_id, "seq": seq, "data": &b64[start..end] });
         let timeout = if seq == 0 {
             FIRST_CHUNK_TIMEOUT
         } else {
@@ -346,10 +337,7 @@ pub async fn upload_attachment(
             break;
         }
     }
-    let params = with_target(
-        serde_json::json!({ "uploadId": upload_id, "fileName": attachment.name }),
-        target_device_id,
-    );
+    let params = serde_json::json!({ "uploadId": upload_id, "fileName": attachment.name });
     let reply = call_with_timeout(
         engine,
         executor,
@@ -374,9 +362,8 @@ pub struct LoadedAttachmentImage {
 /// `ReadAttachmentChunk` loop: 45KB base64 chunks until `done` (bounded, with
 /// the same stuck-offset guard as comet's `readAttachmentImage`).
 pub async fn read_attachment_image(
-    engine: &EngineHandle,
+    engine: &ServerClient,
     executor: &BackgroundExecutor,
-    target_device_id: Option<&str>,
     path: &str,
 ) -> Option<LoadedAttachmentImage> {
     let mut name = String::new();
@@ -385,10 +372,7 @@ pub async fn read_attachment_image(
     let mut offset = 0u64;
     let mut done = false;
     for _ in 0..MAX_READ_CHUNKS {
-        let params = with_target(
-            serde_json::json!({ "path": path, "offset": offset }),
-            target_device_id,
-        );
+        let params = serde_json::json!({ "path": path, "offset": offset });
         let chunk = call_with_timeout(
             engine,
             executor,
@@ -464,6 +448,16 @@ enum CacheEntry {
     },
 }
 
+#[derive(Default)]
+struct AttachmentCache {
+    entries: HashMap<(ServerId, String, String), CacheEntry>,
+    generations: HashMap<ServerId, u64>,
+    offline: std::collections::HashSet<ServerId>,
+    tick: u64,
+    loaded_bytes: usize,
+    pending_free: Vec<Arc<Image>>,
+}
+
 fn retry_delay(attempts: u32) -> Duration {
     Duration::from_millis((2_000u64 << attempts.min(3)).min(15_000))
 }
@@ -473,22 +467,11 @@ fn retry_delay(attempts: u32) -> Duration {
 /// — this cache previously grew for the process lifetime with no eviction.
 const IMAGE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Default)]
-struct ImageCache {
-    map: HashMap<(String, String), CacheEntry>,
-    /// Monotonic access clock for LRU ordering.
-    tick: u64,
-    loaded_bytes: usize,
-    /// Evicted images awaiting `flush_evicted` (freeing needs `&mut App`,
-    /// which eviction sites — async load completions — don't always have).
-    pending_free: Vec<Arc<Image>>,
-}
-
-impl ImageCache {
-    fn insert_loaded(&mut self, key: (String, String), image: CachedAttachmentImage) {
+impl AttachmentCache {
+    fn insert_loaded(&mut self, key: (ServerId, String, String), image: CachedAttachmentImage) {
         let bytes = image.image.bytes.len();
         self.tick += 1;
-        if let Some(CacheEntry::Loaded { image, bytes, .. }) = self.map.insert(
+        if let Some(CacheEntry::Loaded { image, bytes, .. }) = self.entries.insert(
             key.clone(),
             CacheEntry::Loaded {
                 image,
@@ -502,16 +485,16 @@ impl ImageCache {
         self.loaded_bytes += bytes;
         while self.loaded_bytes > IMAGE_CACHE_BUDGET_BYTES {
             let oldest = self
-                .map
+                .entries
                 .iter()
                 .filter(|(k, _)| **k != key)
                 .filter_map(|(k, e)| match e {
                     CacheEntry::Loaded { last_used, .. } => Some((*last_used, k.clone())),
                     _ => None,
                 })
-                .min();
+                .min_by_key(|(last_used, _)| *last_used);
             let Some((_, evict_key)) = oldest else { break };
-            if let Some(CacheEntry::Loaded { image, bytes, .. }) = self.map.remove(&evict_key) {
+            if let Some(CacheEntry::Loaded { image, bytes, .. }) = self.entries.remove(&evict_key) {
                 self.loaded_bytes = self.loaded_bytes.saturating_sub(bytes);
                 self.pending_free.push(image.image);
             }
@@ -519,22 +502,26 @@ impl ImageCache {
     }
 }
 
-fn cache() -> &'static Mutex<ImageCache> {
-    static CACHE: OnceLock<Mutex<ImageCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(ImageCache::default()))
+fn cache() -> &'static Mutex<AttachmentCache> {
+    static CACHE: OnceLock<Mutex<AttachmentCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(AttachmentCache::default()))
 }
 
-fn key(device_id: &str, path: &str) -> (String, String) {
-    (device_id.to_string(), path.to_string())
+fn key(server_id: &ServerId, device_id: &str, path: &str) -> (ServerId, String, String) {
+    (server_id.clone(), device_id.to_string(), path.to_string())
 }
 
-pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
+pub fn attachment_snapshot(
+    server_id: &ServerId,
+    device_id: &str,
+    path: &str,
+) -> AttachmentSnapshot {
     let mut cache = cache().lock().unwrap();
     let tick = {
         cache.tick += 1;
         cache.tick
     };
-    match cache.map.get_mut(&key(device_id, path)) {
+    match cache.entries.get_mut(&key(server_id, device_id, path)) {
         Some(CacheEntry::Loaded {
             image, last_used, ..
         }) => {
@@ -560,9 +547,12 @@ pub fn flush_evicted(cx: &mut gpui::App) {
 /// Claim the load for a source: `true` ⇒ the caller should start fetching now
 /// (the entry is marked Loading so concurrent renders don't double-fetch).
 /// Errored sources hand out a retry only after their backoff has elapsed.
-pub fn begin_load(device_id: &str, path: &str) -> bool {
+pub fn begin_load(server_id: &ServerId, device_id: &str, path: &str) -> bool {
     let mut cache = cache().lock().unwrap();
-    let entry = cache.map.entry(key(device_id, path));
+    if cache.offline.contains(server_id) {
+        return false;
+    }
+    let entry = cache.entries.entry(key(server_id, device_id, path));
     match entry {
         std::collections::hash_map::Entry::Vacant(v) => {
             v.insert(CacheEntry::Loading { attempts: 0 });
@@ -581,22 +571,94 @@ pub fn begin_load(device_id: &str, path: &str) -> bool {
     }
 }
 
-pub fn store_loaded(device_id: &str, path: &str, name: SharedString, image: Arc<Image>) {
+pub fn store_loaded(
+    server_id: &ServerId,
+    device_id: &str,
+    path: &str,
+    name: SharedString,
+    image: Arc<Image>,
+) {
+    let generation = attachment_generation(server_id);
+    store_loaded_for_generation(server_id, device_id, path, name, image, generation);
+}
+
+pub fn attachment_generation(server_id: &ServerId) -> u64 {
     cache()
         .lock()
         .unwrap()
-        .insert_loaded(key(device_id, path), CachedAttachmentImage { name, image });
+        .generations
+        .get(server_id)
+        .copied()
+        .unwrap_or(0)
 }
 
-pub fn store_error(device_id: &str, path: &str) {
+pub fn mark_server_attachments_online(server_id: &ServerId) {
     let mut cache = cache().lock().unwrap();
-    let attempts = match cache.map.get(&key(device_id, path)) {
+    cache.offline.remove(server_id);
+    cache.generations.entry(server_id.clone()).or_default();
+}
+
+pub fn purge_server_attachments(server_id: &ServerId) {
+    let mut cache = cache().lock().unwrap();
+    let removed: Vec<_> = cache
+        .entries
+        .extract_if(|(owner, _, _), _| owner == server_id)
+        .map(|(_, entry)| entry)
+        .collect();
+    for entry in removed {
+        if let CacheEntry::Loaded { image, bytes, .. } = entry {
+            cache.loaded_bytes = cache.loaded_bytes.saturating_sub(bytes);
+            cache.pending_free.push(image.image);
+        }
+    }
+    *cache.generations.entry(server_id.clone()).or_default() += 1;
+    cache.offline.insert(server_id.clone());
+}
+
+pub fn store_loaded_for_generation(
+    server_id: &ServerId,
+    device_id: &str,
+    path: &str,
+    name: SharedString,
+    image: Arc<Image>,
+    generation: u64,
+) {
+    let mut cache = cache().lock().unwrap();
+    if cache.offline.contains(server_id)
+        || cache.generations.get(server_id).copied().unwrap_or(0) != generation
+    {
+        return;
+    }
+    cache.insert_loaded(
+        key(server_id, device_id, path),
+        CachedAttachmentImage { name, image },
+    );
+}
+
+pub fn store_error(server_id: &ServerId, device_id: &str, path: &str) {
+    let generation = attachment_generation(server_id);
+    store_error_for_generation(server_id, device_id, path, generation);
+}
+
+pub fn store_error_for_generation(
+    server_id: &ServerId,
+    device_id: &str,
+    path: &str,
+    generation: u64,
+) {
+    let mut cache = cache().lock().unwrap();
+    if cache.offline.contains(server_id)
+        || cache.generations.get(server_id).copied().unwrap_or(0) != generation
+    {
+        return;
+    }
+    let attempts = match cache.entries.get(&key(server_id, device_id, path)) {
         Some(CacheEntry::Loading { attempts }) => attempts + 1,
         Some(CacheEntry::Error { attempts, .. }) => *attempts,
         _ => 1,
     };
-    cache.map.insert(
-        key(device_id, path),
+    cache.entries.insert(
+        key(server_id, device_id, path),
         CacheEntry::Error {
             attempts,
             at: Instant::now(),
@@ -604,10 +666,25 @@ pub fn store_error(device_id: &str, path: &str) {
     );
 }
 
+#[cfg(test)]
+fn has_attachment_entry(server_id: &ServerId, device_id: &str, path: &str) -> bool {
+    cache()
+        .lock()
+        .unwrap()
+        .entries
+        .contains_key(&key(server_id, device_id, path))
+}
+
 /// Seed the cache after a successful upload (composer send path) so the just-
 /// sent bubble's thumbnails render from local bytes instead of a round-trip.
-pub fn seed_attachment(device_id: &str, path: &str, name: &str, image: Arc<Image>) {
-    store_loaded(device_id, path, name.to_string().into(), image);
+pub fn seed_attachment(
+    server_id: &ServerId,
+    device_id: &str,
+    path: &str,
+    name: &str,
+    image: Arc<Image>,
+) {
+    store_loaded(server_id, device_id, path, name.to_string().into(), image);
 }
 
 // ---------------------------------------------------------------------------
@@ -768,5 +845,57 @@ mod tests {
         assert_eq!(retry_delay(2), Duration::from_millis(8_000));
         assert_eq!(retry_delay(3), Duration::from_millis(15_000));
         assert_eq!(retry_delay(9), Duration::from_millis(15_000));
+    }
+
+    #[test]
+    fn equal_device_paths_on_different_servers_have_separate_cache_entries() {
+        let b = comet_proto::ServerId::new("server-b");
+        let c = comet_proto::ServerId::new("server-c");
+        let path = "/same/host/path.png";
+
+        assert!(begin_load(&b, "device-1", path));
+        assert!(begin_load(&c, "device-1", path));
+        store_error(&b, "device-1", path);
+
+        assert!(matches!(
+            attachment_snapshot(&b, "device-1", path),
+            AttachmentSnapshot::Error { .. }
+        ));
+        assert!(matches!(
+            attachment_snapshot(&c, "device-1", path),
+            AttachmentSnapshot::Loading
+        ));
+    }
+
+    #[test]
+    fn offline_server_cache_is_purged_and_late_results_are_ignored() {
+        let b = comet_proto::ServerId::new("purge-server-b");
+        let c = comet_proto::ServerId::new("preserve-server-c");
+        let path = "/same/host/purge.png";
+        mark_server_attachments_online(&b);
+        mark_server_attachments_online(&c);
+        assert!(begin_load(&b, "device-1", path));
+        assert!(begin_load(&c, "device-1", path));
+        let stale_generation = attachment_generation(&b);
+        store_error(&b, "device-1", path);
+        store_error(&c, "device-1", path);
+
+        purge_server_attachments(&b);
+
+        assert!(!has_attachment_entry(&b, "device-1", path));
+        assert!(has_attachment_entry(&c, "device-1", path));
+        assert!(
+            !begin_load(&b, "device-1", path),
+            "offline server refetched"
+        );
+        store_error_for_generation(&b, "device-1", path, stale_generation);
+        assert!(!has_attachment_entry(&b, "device-1", path));
+
+        mark_server_attachments_online(&b);
+        assert!(begin_load(&b, "device-1", path));
+        assert!(has_attachment_entry(&b, "device-1", path));
+        purge_server_attachments(&b);
+        assert!(!has_attachment_entry(&b, "device-1", path));
+        assert!(has_attachment_entry(&c, "device-1", path));
     }
 }

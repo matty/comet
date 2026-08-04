@@ -13,9 +13,6 @@
 //! - `Mutate {op, …}` → `{ok}` — workspace entity mutations (createChat, renameChat,
 //!   setChatArchived, deleteChat, renameDevice, markChatSeen)
 //! - `LocalDevice` → `{deviceId}` — this engine's identity (never forwarded)
-//! - AuthRpc (feature-inventory §2): `AuthStatus` (stream), `SignIn`/`SignInHeadless` →
-//!   `{url}`, `CompleteSignIn {code}`, `SignOut`, `ListOrgs`, `CreateOrg {name}`,
-//!   `SelectOrg {organizationId}`
 //! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
@@ -35,17 +32,6 @@
 //!   `ReadAttachmentChunk {path, offset}` → `{name, mimeType, data, nextOffset,
 //!   done}` (path-jailed to the uploads dir + workspace-known chat cwds).
 //!
-//! ## Device-addressed routing (`targetDeviceId`, feature-inventory §2.1)
-//!
-//! ControlRpc methods are relay-forwardable: params may carry `targetDeviceId`. When it
-//! names another device, the call is forwarded verbatim over that device's relay DO via
-//! the [`LinkCache`] — the remote engine sees its own id and handles locally, so the
-//! forward can never loop. Streaming methods are proxied by re-subscribing remotely and
-//! piping items. To make another method device-addressable, nothing per-method is needed
-//! beyond listing it in [`forwardable`] (and [`is_stream_method`] if it streams);
-//! handlers stay transport-agnostic. Currently routed: `ListHarnesses`, `ListModels`,
-//! `QueueCommand`, and `WatchDocMessages`.
-
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -55,11 +41,13 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use comet_doc::{MessagePart, SessionCommandPayload};
-use comet_proto::{ChatConfig, HarnessId, ToolCall};
-use comet_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
+use comet_proto::{
+    ChatConfig, HarnessId, LanSettings, RemoteConnectionState, RemoteEntry, ServerHello, ServerId,
+    ToolCall,
+};
+use comet_rpc::{RpcError, RpcReply, RpcService, methods, parse_params};
 
 use crate::agent_accounts::AgentAccounts;
-use crate::auth::Auth;
 use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
 use crate::registry::HarnessRegistry;
@@ -67,7 +55,8 @@ use crate::repos::{Repos, home_dir};
 use crate::sessions::SessionsEngine;
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
-use crate::workspace_host::WorkspaceHost;
+use crate::workspace_host::{DocMutationGate, WorkspaceHost};
+use crate::{LanServerHandle, RemoteConfigStore};
 
 const FILE_SEARCH_RPC_TIMEOUT: Duration = Duration::from_secs(6);
 const FILE_SEARCH_FEATURED_PATHS: usize = 32;
@@ -357,9 +346,16 @@ pub struct EngineRpc {
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
-    auth: Option<Auth>,
-    links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<comet_update::Updater>,
+    server_hello: Option<ServerHello>,
+    mutation_authority: DocMutationGate,
+}
+
+#[derive(Clone)]
+pub struct LocalRpcService {
+    inner: std::sync::Arc<EngineRpc>,
+    store: RemoteConfigStore,
+    lan: LanServerHandle,
 }
 
 impl EngineRpc {
@@ -375,6 +371,7 @@ impl EngineRpc {
         uploads: Uploads,
         agent_accounts: AgentAccounts,
     ) -> Self {
+        let mutation_authority = workspace.mutation_gate();
         Self {
             sessions,
             doc_host,
@@ -385,22 +382,10 @@ impl EngineRpc {
             diff_sync,
             uploads,
             agent_accounts,
-            auth: None,
-            links: None,
             updater: None,
+            server_hello: None,
+            mutation_authority,
         }
-    }
-
-    /// Attach the auth service (AuthStatus + AuthRpc mutations).
-    pub fn with_auth(mut self, auth: Auth) -> Self {
-        self.auth = Some(auth);
-        self
-    }
-
-    /// Attach the peer link cache — enables `targetDeviceId` relay forwarding.
-    pub fn with_links(mut self, links: std::sync::Arc<LinkCache>) -> Self {
-        self.links = Some(links);
-        self
     }
 
     /// Attach the release checker (UpdateStatus stream + ApplyUpdate).
@@ -409,10 +394,20 @@ impl EngineRpc {
         self
     }
 
-    fn auth(&self) -> Result<&Auth, RpcError> {
-        self.auth
+    pub fn with_server_hello(mut self, hello: ServerHello) -> Self {
+        self.server_hello = Some(hello);
+        self
+    }
+
+    fn server_hello(&self) -> Result<&ServerHello, RpcError> {
+        self.server_hello
             .as_ref()
-            .ok_or_else(|| RpcError::Failed("auth unavailable".into()))
+            .ok_or_else(|| RpcError::Failed("server identity unavailable".into()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_mutation_authority(&self, other: &Self) -> bool {
+        self.mutation_authority.ptr_eq(&other.mutation_authority)
     }
 
     fn updater(&self) -> Result<&comet_update::Updater, RpcError> {
@@ -557,47 +552,6 @@ impl EngineRpc {
         paths
     }
 
-    /// Forward a device-addressed call over the target device's relay. On transport
-    /// failure the cached link is invalidated so the next call re-dials.
-    async fn forward(
-        &self,
-        target: &str,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<RpcReply, RpcError> {
-        let Some(links) = &self.links else {
-            return Err(RpcError::Failed(format!(
-                "cannot reach device {target}: remote routing unavailable (offline)"
-            )));
-        };
-        let client = links.client(target).await?;
-        if is_stream_method(method) {
-            let rx = match client.subscribe(method, params).await {
-                Ok(rx) => rx,
-                Err(err) => {
-                    links.invalidate(target);
-                    return Err(err);
-                }
-            };
-            // Pipe remote items; the held client keeps the link's RpcClient alive for
-            // the stream's lifetime. A remote error just ends the stream (the relay
-            // link-down path fails pending calls; stream receivers close).
-            let stream = futures::stream::unfold((rx, client), |(mut rx, client)| async move {
-                rx.recv().await.map(|item| (item, (rx, client)))
-            });
-            return Ok(RpcReply::Stream(stream.boxed()));
-        }
-        match client.call(method, params).await {
-            Ok(value) => Ok(RpcReply::Value(value)),
-            Err(err) => {
-                if matches!(err, RpcError::Closed | RpcError::Transport(_)) {
-                    links.invalidate(target);
-                }
-                Err(err)
-            }
-        }
-    }
-
     fn mutate(&self, params: MutateParams) -> Result<(), RpcError> {
         let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
         match params {
@@ -711,67 +665,126 @@ impl EngineRpc {
             }
         }
     }
-}
 
-/// ControlRpc methods that honor `targetDeviceId` (feature-inventory §2.1). Extend this
-/// list (plus [`is_stream_method`] for streams) to make more of the surface
-/// device-addressable — the handlers themselves need no changes.
-fn forwardable(method: &str) -> bool {
-    matches!(
-        method,
-        methods::LIST_HARNESSES
-            | methods::LIST_MODELS
-            | methods::QUEUE_COMMAND
-            | methods::WATCH_DOC_MESSAGES
-            // Repos/worktrees/folders are device-local filesystem state.
-            | methods::LIST_REPOS
-            | methods::ADD_REPO
-            | methods::CLONE_REPO
-            | methods::CREATE_REPO
-            | methods::LIST_BRANCHES
-            | methods::LIST_REFS
-            | methods::SWITCH_REF
-            | methods::LIST_FOLDERS
-            | methods::SEARCH_FILES
-            | methods::CREATE_WORKTREE
-            | methods::DELETE_WORKTREE
-            // Checkout diffs are produced on the device holding the checkout.
-            | methods::WATCH_CHECKOUT_DIFFS
-            // Terminals live on the chat's host device.
-            | methods::OPEN_TERMINAL
-            | methods::SUBSCRIBE_TERMINAL
-            | methods::WRITE_TERMINAL
-            | methods::RESIZE_TERMINAL
-            | methods::CLOSE_TERMINAL
-            // Agent accounts are per-device CLI logins (the device switcher
-            // retargets which device's logins are shown).
-            | methods::LIST_AGENT_ACCOUNTS
-            | methods::ACTIVATE_AGENT_ACCOUNT
-            | methods::FORGET_AGENT_ACCOUNT
-            | methods::START_AGENT_LOGIN
-            | methods::COMPLETE_AGENT_LOGIN
-            | methods::POLL_AGENT_LOGIN
-            | methods::CANCEL_AGENT_LOGIN
-            // Uploads/attachments target the chat's host device (the agent reads
-            // the committed file from that device's disk).
-            | methods::UPLOAD_CHUNK
-            | methods::UPLOAD_COMMIT
-            | methods::READ_ATTACHMENT_CHUNK
-            // Updates report/apply on the device whose binary they concern.
-            | methods::UPDATE_STATUS
-            | methods::APPLY_UPDATE
-    )
-}
+    pub(crate) fn owns_remote_chat(&self, chat_id: &str, local_device_id: &str) -> bool {
+        matches!(
+            self.workspace.doc().chat(chat_id),
+            Ok(Some(chat)) if chat.device_id == local_device_id
+        )
+    }
 
-/// Forwardable methods whose reply is a stream (proxied item-by-item).
-fn is_stream_method(method: &str) -> bool {
-    matches!(
-        method,
-        methods::WATCH_DOC_MESSAGES
-            | methods::SUBSCRIBE_TERMINAL
-            | methods::WATCH_CHECKOUT_DIFFS
-            | methods::UPDATE_STATUS
-    )
+    pub(crate) fn read_remote_attachment(
+        &self,
+        chat_id: &str,
+        path: &str,
+        offset: u64,
+        local_device_id: &str,
+    ) -> Result<RpcReply, RpcError> {
+        self.mutation_authority.run(|| {
+            let chat = self
+                .workspace
+                .doc()
+                .chat(chat_id)
+                .map_err(|error| RpcError::Failed(error.to_string()))?
+                .filter(|chat| chat.device_id == local_device_id)
+                .ok_or_else(|| {
+                    RpcError::Failed(format!("chat {chat_id} is not owned by this server"))
+                })?;
+            let roots: Vec<std::path::PathBuf> = chat.cwd.into_iter().map(Into::into).collect();
+            let chunk = self
+                .uploads
+                .read_chunk(path, offset, &roots)
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            RpcReply::value(&chunk)
+        })
+    }
+
+    fn owns_remote_space(&self, space_id: &str, local_device_id: &str) -> bool {
+        matches!(
+            self.workspace.doc().space(space_id),
+            Ok(Some(space)) if space.device_id == local_device_id
+        )
+    }
+
+    fn validate_remote_mutation(
+        &self,
+        params: serde_json::Value,
+        local_device_id: &str,
+    ) -> Result<serde_json::Value, RpcError> {
+        let mutation: MutateParams = parse_params(params.clone())?;
+        let ownership_error = |kind: &str, id: &str| {
+            RpcError::Failed(format!("{kind} {id} is not owned by this server"))
+        };
+        match &mutation {
+            MutateParams::CreateSpace {
+                space_id,
+                device_id,
+                ..
+            } => {
+                if device_id != local_device_id {
+                    return Err(RpcError::BadParams(format!(
+                        "deviceId must match {local_device_id}"
+                    )));
+                }
+                if matches!(self.workspace.doc().space(space_id), Ok(Some(space)) if space.device_id != local_device_id)
+                {
+                    return Err(ownership_error("space", space_id));
+                }
+            }
+            MutateParams::CreateChat {
+                chat_id, space_id, ..
+            } => {
+                if !self.owns_remote_space(space_id, local_device_id) {
+                    return Err(ownership_error("space", space_id));
+                }
+                if matches!(self.workspace.doc().chat(chat_id), Ok(Some(chat)) if chat.device_id != local_device_id)
+                {
+                    return Err(ownership_error("chat", chat_id));
+                }
+            }
+            MutateParams::RenameSpace { space_id, .. } | MutateParams::DeleteSpace { space_id } => {
+                if !self.owns_remote_space(space_id, local_device_id) {
+                    return Err(ownership_error("space", space_id));
+                }
+            }
+            MutateParams::RenameChat { chat_id, .. }
+            | MutateParams::SetChatBranch { chat_id, .. }
+            | MutateParams::SetChatCwd { chat_id, .. }
+            | MutateParams::SetChatActivity { chat_id, .. }
+            | MutateParams::SetChatArchived { chat_id, .. }
+            | MutateParams::SetChatConfig { chat_id, .. }
+            | MutateParams::DeleteChat { chat_id }
+            | MutateParams::MarkChatSeen { chat_id, .. } => {
+                if !self.owns_remote_chat(chat_id, local_device_id) {
+                    return Err(ownership_error("chat", chat_id));
+                }
+            }
+            MutateParams::SetChatHost { .. } => {
+                return Err(RpcError::BadParams(
+                    "setChatHost is not allowed over LAN".into(),
+                ));
+            }
+            MutateParams::RenameDevice { .. } => {
+                return Err(RpcError::BadParams(
+                    "renameDevice is not allowed over LAN".into(),
+                ));
+            }
+        }
+        Ok(params)
+    }
+
+    pub(crate) fn handle_remote_mutation(
+        &self,
+        params: serde_json::Value,
+        local_device_id: &str,
+    ) -> Result<RpcReply, RpcError> {
+        self.mutation_authority.run(|| {
+            let params = self.validate_remote_mutation(params, local_device_id)?;
+            let mutation: MutateParams = parse_params(params)?;
+            self.mutate(mutation)?;
+            RpcReply::value(&serde_json::json!({ "ok": true }))
+        })
+    }
 }
 
 /// A watch receiver as a stream: current value first, then every change.
@@ -825,102 +838,128 @@ fn doc_messages_stream(
     .boxed()
 }
 
-/// Authentication-only RPC surface used while the headed app is waiting for a
-/// production WorkOS session. Keeping this independent from [`EngineRpc`] lets
-/// the UI show its sign-in and organization gates before identity-scoped Loro
-/// stores are opened.
-#[derive(Clone)]
-pub struct AuthRpc {
-    auth: Auth,
-}
-
-impl AuthRpc {
-    pub fn new(auth: Auth) -> Self {
-        Self { auth }
+impl LocalRpcService {
+    pub fn new(
+        inner: std::sync::Arc<EngineRpc>,
+        store: RemoteConfigStore,
+        lan: LanServerHandle,
+    ) -> Self {
+        Self { inner, store, lan }
     }
 
-    pub fn handles(method: &str) -> bool {
-        matches!(
-            method,
-            methods::AUTH_STATUS
-                | methods::SIGN_IN
-                | methods::SIGN_IN_HEADLESS
-                | methods::COMPLETE_SIGN_IN
-                | methods::SIGN_OUT
-                | methods::LIST_ORGS
-                | methods::CREATE_ORG
-                | methods::SELECT_ORG
-        )
+    #[cfg(test)]
+    pub(crate) fn shares_mutation_authority(&self, other: &Self) -> bool {
+        self.inner.shares_mutation_authority(&other.inner)
     }
 }
 
 #[async_trait]
-impl RpcService for AuthRpc {
+impl RpcService for LocalRpcService {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
         match method {
-            methods::AUTH_STATUS => Ok(RpcReply::Stream(watch_stream(self.auth.watch_state()))),
-            methods::SIGN_IN => {
-                let url = self
-                    .auth
-                    .start_sign_in()
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "url": url }))
+            methods::WATCH_REMOTES => {
+                Ok(RpcReply::Stream(watch_stream(self.store.watch_remotes())))
             }
-            methods::SIGN_IN_HEADLESS => {
-                let url = self.auth.start_headless_sign_in();
-                RpcReply::value(&serde_json::json!({ "url": url }))
-            }
-            methods::COMPLETE_SIGN_IN => {
-                #[derive(Deserialize)]
-                struct P {
-                    code: String,
-                }
-                let p: P = parse_params(params)?;
-                self.auth
-                    .complete_sign_in(&p.code)
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+            methods::PUT_REMOTE => {
+                let remote: RemoteEntry = parse_params(params)?;
+                self.store
+                    .put_remote(remote)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
-            methods::SIGN_OUT => {
-                self.auth.sign_out();
-                RpcReply::value(&serde_json::json!({ "ok": true }))
-            }
-            methods::LIST_ORGS => {
-                let orgs = self
-                    .auth
-                    .list_orgs()
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "orgs": orgs }))
-            }
-            methods::CREATE_ORG => {
-                #[derive(Deserialize)]
-                struct P {
-                    name: String,
-                }
-                let p: P = parse_params(params)?;
-                self.auth
-                    .create_org(&p.name)
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "ok": true }))
-            }
-            methods::SELECT_ORG => {
+            methods::RENAME_REMOTE => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]
                 struct P {
-                    organization_id: String,
+                    server_id: ServerId,
+                    name: String,
                 }
                 let p: P = parse_params(params)?;
-                self.auth
-                    .select_org(&p.organization_id)
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                if p.name.trim().is_empty() {
+                    return Err(RpcError::BadParams("remote name cannot be empty".into()));
+                }
+                let renamed = self
+                    .store
+                    .rename_remote(&p.server_id, p.name.trim())
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                if !renamed {
+                    return Err(RpcError::Failed("remote registry row not found".into()));
+                }
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
-            _ => Err(RpcError::UnknownMethod(method.to_string())),
+            methods::REMOVE_REMOTE => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    server_id: ServerId,
+                }
+                let p: P = parse_params(params)?;
+                let removed = self
+                    .store
+                    .remove_remote(&p.server_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "removed": removed }))
+            }
+            methods::REPORT_REMOTE_STATUS => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    server_id: ServerId,
+                    last_state: RemoteConnectionState,
+                    protocol_version: u32,
+                    last_connected_at: Option<chrono::DateTime<chrono::Utc>>,
+                }
+                let p: P = parse_params(params)?;
+                let found = self
+                    .store
+                    .update_remote_status(
+                        &p.server_id,
+                        p.last_state,
+                        p.protocol_version,
+                        p.last_connected_at,
+                    )
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                if !found {
+                    return Err(RpcError::Failed("remote registry row not found".into()));
+                }
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::GET_LAN_SETTINGS => RpcReply::value(&serde_json::json!({
+                "settings": self.store.lan_settings(),
+                "status": self.lan.status(),
+            })),
+            methods::SET_LAN_SETTINGS => {
+                let settings: LanSettings = parse_params(params)?;
+                self.lan
+                    .apply_settings(settings)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::BEGIN_PAIRING => {
+                let (secret, expires_at) = self.lan.begin_pairing();
+                RpcReply::value(&serde_json::json!({
+                    "secret": secret,
+                    "expiresAt": expires_at,
+                }))
+            }
+            methods::WATCH_TRUSTED_CLIENTS => Ok(RpcReply::Stream(watch_stream(
+                self.store.watch_trusted_clients(),
+            ))),
+            methods::REVOKE_TRUSTED_CLIENT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    server_id: ServerId,
+                }
+                let p: P = parse_params(params)?;
+                let removed = self
+                    .store
+                    .revoke_client(&p.server_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                self.lan.close_client(&p.server_id);
+                RpcReply::value(&serde_json::json!({ "removed": removed }))
+            }
+            _ => self.inner.handle(method, params).await,
         }
     }
 }
@@ -928,21 +967,8 @@ impl RpcService for AuthRpc {
 #[async_trait]
 impl RpcService for EngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
-        // Device-addressed routing: forward calls that target another device over its
-        // relay. The target compares the id to its own, so forwards cannot loop.
-        if forwardable(method)
-            && let Some(target) = params.get("targetDeviceId").and_then(|v| v.as_str())
-            && target != self.doc_host.device_id()
-        {
-            let target = target.to_string();
-            return self.forward(&target, method, params).await;
-        }
-        if AuthRpc::handles(method) {
-            return AuthRpc::new(self.auth()?.clone())
-                .handle(method, params)
-                .await;
-        }
         match method {
+            methods::SERVER_HELLO => RpcReply::value(self.server_hello()?),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
@@ -1004,7 +1030,7 @@ impl RpcService for EngineRpc {
             }
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params)?;
-                self.mutate(p)?;
+                self.mutation_authority.run(|| self.mutate(p))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_CHECKOUT_DIFFS => {
@@ -1297,14 +1323,6 @@ mod tests {
         assert_eq!(p.account_id, "acct-1");
         assert_eq!(p.harness, HarnessId::ClaudeCode);
     }
-
-    #[test]
-    fn local_device_is_not_forwardable() {
-        assert!(!forwardable(methods::LOCAL_DEVICE));
-        assert!(forwardable(methods::QUEUE_COMMAND));
-        assert!(forwardable(methods::SEARCH_FILES));
-    }
-
     #[test]
     fn tool_file_paths_keep_workspace_activity_only() {
         assert_eq!(

@@ -1,7 +1,7 @@
 name: deploy
 
-# Autodeploy the edge Worker + Durable Objects (session/device rooms, R2,
-# WorkOS auth routes) on every push to main that touches edge/. Skips
+# Autodeploy the release-distribution Worker on every push to main that touches
+# edge/. It serves only the installer and release artifacts from R2. Skips
 # gracefully until the CLOUDFLARE_API_TOKEN secret is configured (until then:
 # `npm -C edge run deploy` from a wrangler-authenticated machine).
 #
@@ -65,3 +65,17 @@ jobs:
         if: steps.changed.outputs.changed == 'true' && env.CLOUDFLARE_API_TOKEN != ''
         working-directory: edge
         run: npx wrangler deploy
+      - name: remove obsolete WorkOS secret
+        if: steps.changed.outputs.changed == 'true' && env.CLOUDFLARE_API_TOKEN != ''
+        working-directory: edge
+        run: |
+          secrets="$(npx wrangler secret list --format json)"
+          has_workos="$(printf '%s' "$secrets" | node -e '
+            const fs = require("node:fs");
+            const secrets = JSON.parse(fs.readFileSync(0, "utf8"));
+            if (!Array.isArray(secrets)) throw new Error("unexpected Wrangler secret-list response");
+            process.stdout.write(secrets.some((secret) => secret.name === "WORKOS_API_KEY") ? "yes" : "no");
+          ')"
+          if [ "$has_workos" = yes ]; then
+            printf 'y\n' | npx wrangler secret delete WORKOS_API_KEY
+          fi

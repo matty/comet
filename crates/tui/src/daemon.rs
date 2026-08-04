@@ -4,9 +4,9 @@
 //! already knows how to run without a UI (`comet headless`, ARCHITECTURE §1
 //! "Headed / headless"), so the TUI never embeds one the way the gpui app can:
 //! it is always a thin client over localhost RPC. That single decision buys the
-//! herdr property — agents keep running, docs keep syncing, and the DeviceRoom
-//! stays joined when you close the terminal, because the process doing that
-//! work was never the process drawing frames.
+//! desired property — agents keep running in the authoritative local engine
+//! when you close the terminal, because the process doing that work was never
+//! the process drawing frames.
 //!
 //! Two paths:
 //!
@@ -140,19 +140,10 @@ pub async fn reconnect(config: &DaemonConfig) -> anyhow::Result<Connection> {
     connect(config).await
 }
 
-/// The most useful thing we can say when a spawned daemon didn't come up. The
-/// overwhelmingly common cause is "not signed in": a detached `comet headless`
-/// has no TTY to run the paste-code flow on, so it exits immediately with that
-/// message (`terminal_sign_in`'s non-TTY path).
+/// The most useful thing we can say when a spawned daemon didn't come up.
 fn describe_daemon_failure(config: &DaemonConfig) -> String {
     let log = config.log_path();
     match log_tail(&log, 12) {
-        Some(tail) if tail.contains("comet login") => {
-            format!(
-                "The engine needs a session first — run `comet login`, then start me again.\n\nFrom {}:\n{tail}",
-                log.display()
-            )
-        }
         Some(tail) => format!("Last lines of {}:\n{tail}", log.display()),
         None => format!(
             "No log at {} either — check that `comet headless` runs in the foreground.",
@@ -206,7 +197,7 @@ fn spawn_detached(config: &DaemonConfig) -> anyhow::Result<u32> {
         )
         .stderr(log)
         // Pin the two settings that must agree with what this client resolved;
-        // everything else (COMET_EDGE_URL, COMET_WORKOS_CLIENT_ID, PATH, …) is
+        // everything else (release overrides, PATH, etc.) is
         // inherited from our environment exactly as `comet daemon install`
         // captures it.
         .env("COMET_DATA_DIR", &config.data_dir)

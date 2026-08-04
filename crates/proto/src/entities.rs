@@ -279,28 +279,6 @@ pub struct CheckoutDiff {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UserProfile {
-    pub id: String,
-    pub email: String,
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "camelCase")]
-pub enum AuthState {
-    SignedOut,
-    NeedsOrganization {
-        user: UserProfile,
-    },
-    #[serde(rename_all = "camelCase")]
-    SignedIn {
-        user: UserProfile,
-        org_id: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AgentAccount {
     pub id: String,
     pub harness: HarnessId,

@@ -1,19 +1,10 @@
-//! Uploads — attachment staging + the content-addressed edge mirror
-//! (feature-inventory §3.7 "Uploads"; port of comet's `uploads.ts`).
+//! Uploads — local attachment staging and scoped reads.
 //!
-//! The UI streams a file as base64 chunks (~60KB, sized for the relay when the
-//! target device is remote); chunks stage on disk under `{data_dir}/uploads/tmp/
+//! The UI streams a file as base64 chunks; chunks stage on disk under `{data_dir}/uploads/tmp/
 //! {uploadId}/{seq}.b64` (surviving an engine restart mid-upload, unlike comet's
 //! in-memory buffers), and `commit` assembles them into
 //! `{data_dir}/uploads/{id8}-{name}` and returns the absolute path, which the
 //! composer appends to the prompt so the agent can read the file from disk.
-//!
-//! On commit the assembled bytes are also mirrored to the edge, best-effort:
-//! `PUT {edge}/attachments/{sha256}` (bearer auth, content-addressed R2 —
-//! `edge/src/index.ts`). A device that doesn't hold the file locally can fall
-//! back to `GET {edge}/attachments/{sha256}` with the same bearer; native keeps
-//! reads local-first (`read_chunk` proxies through the owning device), so the
-//! GET fallback is the disaster path, not the hot path.
 //!
 //! `read_chunk` serves transcript images back in 45KB base64 chunks. Path jail:
 //! only files under the uploads dir or a workspace-known chat cwd are readable
@@ -27,15 +18,12 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use crate::EngineError;
-use crate::doc_host::EdgeConfig;
-use crate::repos::hex;
 
 /// A pending upload must finish within this window (covers slow mesh links).
 const STAGING_TTL: Duration = Duration::from_secs(10 * 60);
-/// Hard cap on an assembled file (matches the edge's 32MB attachment cap).
+/// Hard cap on an assembled file.
 const MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Multiple of 3 so independent base64 chunks concatenate losslessly.
 const READ_CHUNK_BYTES: u64 = 45_000;
@@ -57,8 +45,6 @@ struct UploadsInner {
     dir: PathBuf,
     /// Chunk staging (`{data_dir}/uploads/tmp/{uploadId}/`).
     tmp: PathBuf,
-    edge: Option<EdgeConfig>,
-    http: reqwest::Client,
 }
 
 #[derive(Clone)]
@@ -67,17 +53,12 @@ pub struct Uploads {
 }
 
 impl Uploads {
-    pub fn new(data_dir: &Path, edge: Option<EdgeConfig>) -> Self {
+    pub fn new(data_dir: &Path) -> Self {
         let dir = data_dir.join("uploads");
         Self {
             inner: Arc::new(UploadsInner {
                 tmp: dir.join("tmp"),
                 dir,
-                edge,
-                http: reqwest::Client::builder()
-                    .timeout(Duration::from_secs(30))
-                    .build()
-                    .unwrap_or_else(|_| reqwest::Client::new()),
             }),
         }
     }
@@ -115,8 +96,7 @@ impl Uploads {
         Ok(())
     }
 
-    /// Assemble the staged chunks into a durable file and return its absolute
-    /// path. Also mirrors the bytes to the edge (content-addressed), best-effort.
+    /// Assemble the staged chunks into a durable file and return its absolute path.
     pub fn commit(&self, upload_id: &str, file_name: &str) -> Result<String, EngineError> {
         let dir = self.staging_dir(upload_id)?;
         let mut parts = chunk_files(&dir)?;
@@ -146,7 +126,6 @@ impl Uploads {
         let path = self.inner.dir.join(format!("{id8}-{name}"));
         std::fs::write(&path, &bytes)?;
         let _ = std::fs::remove_dir_all(&dir);
-        self.mirror_to_edge(&path, bytes);
         Ok(path.to_string_lossy().to_string())
     }
 
@@ -158,14 +137,52 @@ impl Uploads {
         offset: u64,
         extra_roots: &[PathBuf],
     ) -> Result<AttachmentChunk, EngineError> {
+        self.read_chunk_scoped(path, offset, extra_roots, || {})
+    }
+
+    fn read_chunk_scoped<F>(
+        &self,
+        path: &str,
+        offset: u64,
+        extra_roots: &[PathBuf],
+        after_open: F,
+    ) -> Result<AttachmentChunk, EngineError>
+    where
+        F: FnOnce(),
+    {
         use std::io::{Read, Seek};
-        let file = self.inspect(path, extra_roots)?;
-        let size = file.size;
+        let outside = || EngineError::Other("Attachment is outside the upload cache".into());
+        let roots: Vec<PathBuf> = std::iter::once(&self.inner.dir)
+            .chain(extra_roots.iter())
+            .filter_map(|root| std::fs::canonicalize(root).ok())
+            .collect();
+        let mut handle = std::fs::File::open(path).map_err(|_| outside())?;
+        after_open();
+        let resolved = opened_file_path(&handle).map_err(|_| outside())?;
+        if !roots
+            .iter()
+            .any(|root| resolved.starts_with(root) && resolved != *root)
+        {
+            return Err(outside());
+        }
+        let meta = handle.metadata()?;
+        if !meta.is_file() {
+            return Err(EngineError::Other("Attachment is not a file".into()));
+        }
+        if meta.len() > MAX_BYTES {
+            return Err(EngineError::Other("Attachment is too large".into()));
+        }
+        let mime_type = mime_by_ext(&resolved)
+            .ok_or_else(|| EngineError::Other("Attachment is not a supported image".into()))?;
+        let name = resolved
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "attachment".into());
+        let size = meta.len();
         let start = offset.min(size);
         let next_offset = (start + READ_CHUNK_BYTES).min(size);
         // Read ONLY this chunk's byte range — never the whole file per chunk.
         let mut buf = vec![0u8; (next_offset - start) as usize];
-        let mut handle = std::fs::File::open(&file.resolved)?;
         handle.seek(std::io::SeekFrom::Start(start))?;
         let mut read = 0usize;
         while read < buf.len() {
@@ -177,12 +194,26 @@ impl Uploads {
         }
         buf.truncate(read);
         Ok(AttachmentChunk {
-            name: file.name,
-            mime_type: file.mime_type,
+            name,
+            mime_type: mime_type.to_string(),
             data: BASE64.encode(&buf),
             next_offset,
             done: next_offset >= size,
         })
+    }
+
+    #[cfg(test)]
+    fn read_chunk_scoped_with_hook<F>(
+        &self,
+        path: &str,
+        offset: u64,
+        extra_roots: &[PathBuf],
+        after_open: F,
+    ) -> Result<AttachmentChunk, EngineError>
+    where
+        F: FnOnce(),
+    {
+        self.read_chunk_scoped(path, offset, extra_roots, after_open)
     }
 
     // ── internals ───────────────────────────────────────────────────────────
@@ -223,83 +254,65 @@ impl Uploads {
             }
         }
     }
-
-    fn inspect(&self, path: &str, extra_roots: &[PathBuf]) -> Result<InspectedFile, EngineError> {
-        let outside = || EngineError::Other("Attachment is outside the upload cache".into());
-        // Canonicalize BOTH sides so `..` segments and symlinks can't escape.
-        let resolved = std::fs::canonicalize(path).map_err(|_| outside())?;
-        let allowed = std::iter::once(&self.inner.dir)
-            .chain(extra_roots.iter())
-            .filter_map(|root| std::fs::canonicalize(root).ok())
-            .any(|root| resolved.starts_with(&root) && resolved != root);
-        if !allowed {
-            return Err(outside());
-        }
-        let meta = std::fs::metadata(&resolved)?;
-        if !meta.is_file() {
-            return Err(EngineError::Other("Attachment is not a file".into()));
-        }
-        if meta.len() > MAX_BYTES {
-            return Err(EngineError::Other("Attachment is too large".into()));
-        }
-        let mime_type = mime_by_ext(&resolved)
-            .ok_or_else(|| EngineError::Other("Attachment is not a supported image".into()))?;
-        Ok(InspectedFile {
-            name: resolved
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "attachment".into()),
-            mime_type: mime_type.to_string(),
-            size: meta.len(),
-            resolved,
-        })
-    }
-
-    /// Best-effort content-addressed mirror (`PUT /attachments/{sha256}`, bearer
-    /// auth). Failures only log — local commit already succeeded.
-    fn mirror_to_edge(&self, path: &Path, bytes: Vec<u8>) {
-        let Some(edge) = self.inner.edge.clone() else {
-            return;
-        };
-        let sha = hex(&Sha256::digest(&bytes));
-        let mime = mime_by_ext(path)
-            .unwrap_or("application/octet-stream")
-            .to_string();
-        let url = format!("{}/attachments/{sha}", edge.url.trim_end_matches('/'));
-        let http = self.inner.http.clone();
-        tokio::spawn(async move {
-            // Fresh bearer per request — never the boot-time snapshot.
-            let Some(bearer) = edge.bearer().await else {
-                tracing::warn!(sha = %sha, "attachment mirror skipped: signed out");
-                return;
-            };
-            let sent = http
-                .put(&url)
-                .bearer_auth(&bearer)
-                .header("content-type", mime)
-                .body(bytes)
-                .send()
-                .await;
-            match sent {
-                Ok(res) if res.status().is_success() => {
-                    tracing::debug!(sha = %sha, "attachment mirrored to edge");
-                }
-                Ok(res) => {
-                    tracing::warn!(sha = %sha, status = %res.status(), "edge attachment mirror rejected");
-                }
-                Err(err) => {
-                    tracing::warn!(sha = %sha, error = %err, "edge attachment mirror failed");
-                }
-            }
-        });
-    }
 }
 
-struct InspectedFile {
-    resolved: PathBuf,
-    name: String,
-    mime_type: String,
-    size: u64,
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn opened_file_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::canonicalize(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn opened_file_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut buffer = vec![0i8; libc::PATH_MAX as usize];
+    // SAFETY: `buffer` is writable for PATH_MAX bytes and `file` remains open.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful F_GETPATH writes a NUL-terminated path.
+    let bytes = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_bytes();
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+#[cfg(windows)]
+fn opened_file_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    // SAFETY: the handle is valid for the duration of both calls.
+    let needed = unsafe { GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, 0) };
+    if needed == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut buffer = vec![0u16; needed as usize + 1];
+    // SAFETY: `buffer` is writable for its advertised length and handle is valid.
+    let written =
+        unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0) };
+    if written == 0 || written as usize >= buffer.len() {
+        return Err(std::io::Error::last_os_error());
+    }
+    buffer.truncate(written as usize);
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer)))
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    windows
+)))]
+fn opened_file_path(_file: &std::fs::File) -> std::io::Result<PathBuf> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opened attachment path lookup is unsupported on this platform",
+    ))
 }
 
 fn chunk_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>, EngineError> {
@@ -377,6 +390,8 @@ fn mime_by_ext(path: &Path) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+
     use super::*;
 
     #[test]
@@ -384,5 +399,33 @@ mod tests {
         assert_eq!(sanitize("../../etc/passwd"), "passwd");
         assert_eq!(sanitize("my photo (1).png"), "my_photo__1_.png");
         assert_eq!(sanitize(""), "upload");
+    }
+
+    #[test]
+    fn scoped_read_authorizes_the_open_handle_not_a_replaceable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = Uploads::new(dir.path());
+        let local = dir.path().join("local");
+        let foreign = dir.path().join("foreign");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&foreign).unwrap();
+        let requested = local.join("swap.png");
+        let moved = local.join("opened.png");
+        let foreign_file = foreign.join("private.png");
+        std::fs::write(&requested, b"local-bytes").unwrap();
+        std::fs::write(&foreign_file, b"foreign-bytes").unwrap();
+
+        let chunk = uploads
+            .read_chunk_scoped_with_hook(requested.to_str().unwrap(), 0, &[local], || {
+                std::fs::rename(&requested, &moved).unwrap();
+                std::fs::copy(&foreign_file, &requested).unwrap();
+            })
+            .unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(chunk.data)
+                .unwrap(),
+            b"local-bytes"
+        );
     }
 }

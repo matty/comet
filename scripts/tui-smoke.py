@@ -2,9 +2,10 @@
 """End-to-end smoke test for `comet-tui`, driven through a real pty.
 
 The property under test is the one no unit test can reach: that the viewport and
-the engine have independent lifetimes. We start the TUI with nothing running,
-let it spawn a detached daemon, do real work through it, quit, and then check the
-engine is *still there* — and that reattaching finds the work.
+the engine have independent lifetimes. No installed daemon or online account is
+required. We start the TUI with nothing running, let it spawn a detached local
+engine, do real work through it, quit, and then check the engine is *still
+there* — and that reattaching finds the work.
 
 The pty driver and terminal emulator live in `tui_capture`, shared with
 `tui-screenshots.py`: ratatui addresses the cursor per changed run, so the frame
@@ -37,9 +38,6 @@ ENV = dict(
     COMET_IPC_PORT=IPC,
     # The mock harness streams a canned reply, so no agent CLI is needed.
     COMET_HARNESS="mock",
-    # Empty client id forces dev-mode auth (apps/comet's documented escape
-    # hatch), so a detached daemon with no TTY doesn't need `comet login`.
-    COMET_WORKOS_CLIENT_ID="",
     RUST_LOG="warn",
     TERM="xterm-256color",
 )

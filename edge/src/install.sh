@@ -3,16 +3,18 @@
 #
 #   curl -fsSL https://comet.zeron.sh/install.sh | sh
 #
+# Uses Python 3 only while installing to strictly validate release metadata.
 # Installs the self-contained native binary (no runtime deps) to
-# ~/.comet-native/app, puts `comet` on PATH, and — once you've signed in —
-# runs it as a systemd user service that survives reboots. Re-running
+# ~/.comet-native/app, puts `comet` on PATH, and, because this installer targets
+# headless Linux hosts, installs it as a systemd user service. Desktop and TUI
+# use do not otherwise require an installed daemon. Re-running
 # upgrades in place; ~/.comet-native state is preserved.
 #
-# The binary ships with production endpoints baked in: no COMET_EDGE_URL or
-# client-id configuration needed. Overrides (if any) go in ~/.comet-native/env.
+# Release distribution is separate from local/LAN operation. Override only the
+# download source with COMET_RELEASES_URL when mirroring releases.
 set -eu
 
-BASE="${COMET_BASE_URL:-https://comet.zeron.sh}"
+BASE="${COMET_RELEASES_URL:-https://comet.zeron.sh}"
 
 # --- platform ---------------------------------------------------------------
 os="$(uname -s)"
@@ -21,7 +23,7 @@ case "$os" in
   Linux) plat=linux ;;
   Darwin)
     echo "comet install: on macOS, download the desktop app instead:" >&2
-    echo "  $BASE/releases/latest.txt → $BASE/releases/comet-<version>-macos-arm64.dmg" >&2
+    echo "  see $BASE/releases/manifest.json for the current macOS artifact" >&2
     exit 1
     ;;
   *)
@@ -39,22 +41,111 @@ case "$arch" in
 esac
 
 # --- download ----------------------------------------------------------------
-ver="$(curl -fsSL "$BASE/releases/latest.txt" | tr -d '[:space:]')"
-[ -n "$ver" ] || { echo "comet install: could not resolve latest version" >&2; exit 1; }
-file="comet-$ver-$plat-$arch.tar.gz"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+manifest_file="$tmp/manifest.json"
+parsed_file="$tmp/manifest-fields"
+curl -fsSL "$BASE/releases/manifest.json" -o "$manifest_file"
+
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import json' >/dev/null 2>&1; then
+  echo "comet install: strict manifest validation requires python3" >&2
+  exit 1
+fi
+
+python3 - "$manifest_file" "$plat" "$arch" > "$parsed_file" <<'PY'
+import json
+import re
+import sys
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+def fail(message):
+    print(f"comet install: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as source:
+        manifest = json.load(source, object_pairs_hook=unique_object)
+except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+    fail(str(error))
+
+if not isinstance(manifest, dict):
+    fail("manifest JSON must be an object")
+if manifest.get("repository") != "matty/comet":
+    if "repository" not in manifest:
+        fail("missing release repository (expected matty/comet)")
+    fail(f"release repository mismatch (expected matty/comet, got {manifest.get('repository')!r})")
+version = manifest.get("version")
+if not isinstance(version, str):
+    fail("invalid release version")
+version = version.strip()
+if not re.fullmatch(r"v*[0-9]+(?:\.[0-9]+)*", version):
+    fail("invalid release version")
+if any(int(part) > 18446744073709551615 for part in version.lstrip("v").split(".")):
+    fail("invalid release version")
+artifact = f"comet-{version}-{sys.argv[2]}-{sys.argv[3]}.tar.gz"
+files = manifest.get("files")
+metadata = files.get(artifact) if isinstance(files, dict) else None
+if not isinstance(metadata, dict):
+    fail(f"missing artifact metadata for {artifact}")
+checksum = metadata.get("sha256")
+if not isinstance(checksum, str) or not re.fullmatch(r"[0-9A-Fa-f]{64}", checksum):
+    fail(f"invalid SHA-256 for {artifact}")
+print(version)
+print(artifact)
+print(checksum.lower())
+PY
+
+ver="$(sed -n '1p' "$parsed_file")"
+file="$(sed -n '2p' "$parsed_file")"
+expected_sha256="$(sed -n '3p' "$parsed_file")"
+expected_marker="repository=matty/comet
+version=$ver
+artifact=$file
+sha256=$expected_sha256"
 data_root="$HOME/.comet-native"
 app_root="$data_root/app"
 dest="$app_root/$ver"
 
-if [ -x "$dest/comet" ]; then
+if [ -f "$dest/comet" ]; then
+  actual_marker=
+  if [ -f "$dest/.comet-release" ]; then
+    actual_marker="$(cat "$dest/.comet-release")"
+  fi
+  if [ "$actual_marker" != "$expected_marker" ]; then
+    echo "comet install: unverified existing install at $dest; remove it before retrying" >&2
+    exit 1
+  fi
   echo "comet $ver already downloaded — relinking."
 else
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
   echo "downloading comet $ver ($plat-$arch)…"
   curl -fSL --progress-bar "$BASE/releases/$file" -o "$tmp/$file"
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_sha256="$(sha256sum "$tmp/$file" | awk '{print tolower($1)}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual_sha256="$(shasum -a 256 "$tmp/$file" | awk '{print tolower($1)}')"
+  else
+    echo "comet install: SHA-256 verification requires sha256sum or shasum" >&2
+    exit 1
+  fi
+  if [ "$actual_sha256" != "$expected_sha256" ]; then
+    echo "comet install: checksum mismatch for $file" >&2
+    exit 1
+  fi
   mkdir -p "$dest"
   tar -xzf "$tmp/$file" -C "$dest" --strip-components=1
+  [ -f "$dest/comet" ] || {
+    echo "comet install: verified archive did not contain a comet binary" >&2
+    rm -rf "$dest"
+    exit 1
+  }
+  printf '%s\n' "$expected_marker" > "$dest/.comet-release"
 fi
 
 ln -sfn "$dest" "$app_root/current"
@@ -62,12 +153,6 @@ mkdir -p "$HOME/.local/bin"
 ln -sf "$app_root/current/comet" "$HOME/.local/bin/comet"
 
 # --- service -----------------------------------------------------------------
-# Auth is decoupled from the daemon: `comet login` persists the session and a
-# service-managed `comet headless` loads it (exiting with "run comet login
-# first" otherwise) — so the service starts only after first sign-in.
-signed_in=no
-[ -f "$data_root/session.json" ] && signed_in=yes
-
 service=manual
 if command -v systemctl >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
   mkdir -p "$HOME/.config/systemd/user"
@@ -89,12 +174,8 @@ WantedBy=default.target
 UNIT
   systemctl --user daemon-reload
   systemctl --user enable comet-native >/dev/null 2>&1 || true
-  if [ "$signed_in" = yes ]; then
-    systemctl --user restart comet-native
-    service=running
-  else
-    service=ready
-  fi
+  systemctl --user restart comet-native
+  service=running
   # Keep the user manager (and the engine) running without an active login.
   loginctl enable-linger "$USER" 2>/dev/null \
     || sudo -n loginctl enable-linger "$USER" 2>/dev/null \
@@ -120,12 +201,7 @@ case "$service" in
     echo "the engine restarted with the new version."
     echo "  systemctl --user status comet-native    check the service"
     ;;
-  ready)
-    echo "next steps:"
-    echo "  comet login                              sign in (paste-code) and exit"
-    echo "  systemctl --user start comet-native      then start the engine"
-    ;;
   manual)
-    echo "next: \`comet login\` to sign in, then run the engine with \`comet headless\`."
+    echo "next: run the engine with \`comet headless\`."
     ;;
 esac

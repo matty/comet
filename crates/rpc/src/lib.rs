@@ -1,5 +1,5 @@
 //! comet-rpc — the typed control plane (UiRpc / ControlRpc) over WebSocket + in-memory
-//! transports, plus the device-room relay transport ({s,k,to,from} frames — [`device_room`]).
+//! and direct TLS LAN transports.
 //!
 //! Framing: ndjson envelopes, one JSON object per WebSocket text message (or per line on
 //! byte transports), matching the shape of comet's Effect RPC without the Effect runtime:
@@ -19,16 +19,21 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 mod client;
-pub mod device_room;
+mod pairing;
 mod server;
+mod tls;
 
-pub use client::{RpcClient, connect_ws};
-pub use device_room::{
-    DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
-    NudgeHandler, StaticToken, TokenSource, decode_device_frame, device_room_ws_url,
-    encode_device_frame,
+pub use client::{RpcClient, RpcStream, connect_ws};
+pub use pairing::{
+    PairingAttempt, PairingLimit, PairingLimiter, PairingSession, PairingTranscript,
 };
 pub use server::{serve_connection, serve_ws_listener};
+pub use tls::{
+    ClientAuthorizer, LanAcceptError, LanConnectError, LanPairingState, MAX_LAN_TEXT_FRAME_BYTES,
+    PairingAuthorizer, PairingError, PinnedServer, PinnedServerError, TlsIdentity,
+    TlsIdentityError, accept_lan_rpc, connect_lan_rpc, pair_client, pair_client_zeroizing,
+    serve_pairing,
+};
 
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
@@ -49,16 +54,7 @@ pub mod methods {
     /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
     /// the answer is about whichever engine you are directly connected to).
     pub const LOCAL_DEVICE: &str = "LocalDevice";
-    pub const AUTH_STATUS: &str = "AuthStatus";
-    // AuthRpc mutations (feature-inventory §2 AuthRpc; IPC-only).
-    pub const SIGN_IN: &str = "SignIn";
-    pub const SIGN_IN_HEADLESS: &str = "SignInHeadless";
-    pub const COMPLETE_SIGN_IN: &str = "CompleteSignIn";
-    pub const SIGN_OUT: &str = "SignOut";
-    pub const LIST_ORGS: &str = "ListOrgs";
-    pub const CREATE_ORG: &str = "CreateOrg";
-    pub const SELECT_ORG: &str = "SelectOrg";
-    // Repos / worktrees / folders (ControlRpc, relay-forwardable).
+    // Repos / worktrees / folders (served by the explicitly selected server).
     pub const LIST_REPOS: &str = "ListRepos";
     pub const ADD_REPO: &str = "AddRepo";
     pub const CLONE_REPO: &str = "CloneRepo";
@@ -71,16 +67,16 @@ pub mod methods {
     pub const SEARCH_FILES: &str = "SearchFiles";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
-    // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
+    // Terminals (served by the explicitly selected server; SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";
     pub const WRITE_TERMINAL: &str = "WriteTerminal";
     pub const RESIZE_TERMINAL: &str = "ResizeTerminal";
     pub const CLOSE_TERMINAL: &str = "CloseTerminal";
     /// Checkout-diff stream for the target device's chats (DataRpc,
-    /// relay-forwardable — diffs are produced where the checkout lives).
+    /// server-qualified — diffs are produced where the checkout lives).
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
-    // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
+    // Agent accounts (server-qualified — CLI logins are per Comet instance).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
     pub const ACTIVATE_AGENT_ACCOUNT: &str = "ActivateAgentAccount";
     pub const FORGET_AGENT_ACCOUNT: &str = "ForgetAgentAccount";
@@ -88,16 +84,28 @@ pub mod methods {
     pub const COMPLETE_AGENT_LOGIN: &str = "CompleteAgentLogin";
     pub const POLL_AGENT_LOGIN: &str = "PollAgentLogin";
     pub const CANCEL_AGENT_LOGIN: &str = "CancelAgentLogin";
-    // Uploads / attachments (ControlRpc, relay-forwardable — target the chat's host device).
+    // Uploads / attachments (served directly by the chat's owning Comet instance).
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
-    // Updates (ControlRpc, relay-forwardable — a device reports/applies its own
+    // Updates (a selected server reports/applies its own
     // binary's update). Stream: current UpdateStatus, then every change.
     pub const UPDATE_STATUS: &str = "UpdateStatus";
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).
     pub const APPLY_UPDATE: &str = "ApplyUpdate";
+    // Localhost-only administration for direct LAN remotes and trust.
+    pub const SERVER_HELLO: &str = "ServerHello";
+    pub const WATCH_REMOTES: &str = "WatchRemotes";
+    pub const PUT_REMOTE: &str = "PutRemote";
+    pub const RENAME_REMOTE: &str = "RenameRemote";
+    pub const REMOVE_REMOTE: &str = "RemoveRemote";
+    pub const REPORT_REMOTE_STATUS: &str = "ReportRemoteStatus";
+    pub const GET_LAN_SETTINGS: &str = "GetLanSettings";
+    pub const SET_LAN_SETTINGS: &str = "SetLanSettings";
+    pub const BEGIN_PAIRING: &str = "BeginPairing";
+    pub const WATCH_TRUSTED_CLIENTS: &str = "WatchTrustedClients";
+    pub const REVOKE_TRUSTED_CLIENT: &str = "RevokeTrustedClient";
 }
 
 #[derive(Debug, thiserror::Error)]

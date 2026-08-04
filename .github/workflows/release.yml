@@ -4,8 +4,9 @@ name: release
 #   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
 #   - macOS dmg (Apple silicon) via scripts/package-macos.sh
 # then create a GitHub Release AND upload everything to the
-# `comet-native-releases` R2 bucket (served at comet.zeron.sh/releases/* for
-# `curl -fsSL https://comet.zeron.sh/install.sh | sh`), bumping latest.txt.
+# `comet-native-releases` R2 bucket (served by the distribution-only Worker at
+# comet.zeron.sh/releases/* for
+# `curl -fsSL https://comet.zeron.sh/install.sh | sh`).
 #
 # Trigger: push a tag `v<version>` matching the workspace version in
 # Cargo.toml (bump it in the same commit), or run manually via
@@ -71,7 +72,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'matty/comet' && startsWith(github.ref, 'refs/tags/v')
     needs: [linux, macos]
     runs-on: ubuntu-latest
     env:
@@ -102,10 +103,11 @@ jobs:
             npx wrangler@4 r2 object put "comet-native-releases/$(basename "$f")" \
               --file "$f" --remote
           done
-          # manifest.json: version + per-artifact sha256 — the auto-updater
-          # (crates/update) verifies downloads against it. Published before
-          # latest.txt so no client ever sees a version without its checksums.
-          manifest=$(jq -n --arg version "$VERSION" '{version: $version, files: {}}')
+          # manifest.json: canonical repository + version + per-artifact sha256
+          # — the auto-updater verifies provenance and downloads against it.
+          # The provenance-bearing manifest is the sole release pointer.
+          manifest=$(jq -n --arg repository "matty/comet" --arg version "$VERSION" \
+            '{repository: $repository, version: $version, files: {}}')
           for f in dist/*; do
             sha=$(sha256sum "$f" | cut -d' ' -f1)
             manifest=$(jq --arg name "$(basename "$f")" --arg sha "$sha" \
@@ -114,6 +116,3 @@ jobs:
           printf '%s' "$manifest" > manifest.json
           npx wrangler@4 r2 object put comet-native-releases/manifest.json \
             --file manifest.json --remote
-          printf '%s' "$VERSION" > latest.txt
-          npx wrangler@4 r2 object put comet-native-releases/latest.txt \
-            --file latest.txt --remote

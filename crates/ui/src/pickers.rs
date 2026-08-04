@@ -22,7 +22,7 @@ use gpui::{
 
 use comet_engine::registry::HarnessDescriptor;
 use comet_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel,
+    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel, ServerRef,
 };
 use comet_rpc::methods;
 
@@ -35,7 +35,7 @@ use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::motion;
 use crate::popover::{self, Loadable, MenuKey};
 use crate::settings::composer::ComposerDefaults;
-use crate::state::{AppState, EngineHandle};
+use crate::state::{AppState, ServerClient};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -269,15 +269,16 @@ pub struct Pickers {
     data_dir: Option<PathBuf>,
     /// Selection the draft picks belong to — switching chats drops them so a
     /// pick made in one chat never leaks into another.
-    draft_owner: Option<String>,
+    draft_owner: Option<ServerRef>,
     /// Space the branch draft/cache belong to (see the state observer).
-    space_owner: Option<String>,
+    space_owner: Option<ServerRef>,
+    owner_generation: u64,
     open: Option<PickerKind>,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
-    refs_space: Option<String>,
+    refs_space: Option<ServerRef>,
     /// Highlighted row in the open list (keyboard nav).
     active: usize,
     /// Models-list scroll — keyboard nav keeps the highlighted row in view
@@ -332,6 +333,10 @@ impl Pickers {
             let selected = state.read(cx).selected_chat.clone();
             if selected != this.draft_owner {
                 this.draft_owner = selected;
+                this.owner_generation = this.owner_generation.wrapping_add(1);
+                this.load_task = None;
+                this.switch_task = None;
+                this.mutate_task = None;
                 this.config.harness = None;
                 this.config.model = None;
                 this.config.reasoning = None;
@@ -343,6 +348,9 @@ impl Pickers {
             let space = state.read(cx).selected_space.clone();
             if space != this.space_owner {
                 this.space_owner = space;
+                this.owner_generation = this.owner_generation.wrapping_add(1);
+                this.refs_task = None;
+                this.switch_task = None;
                 this.config.branch = None;
                 this.config.checkout = CheckoutKind::default();
                 this.refs = Loadable::Idle;
@@ -376,6 +384,7 @@ impl Pickers {
         Self {
             state,
             space_owner,
+            owner_generation: 0,
             config: DraftConfig::default(),
             defaults,
             data_dir,
@@ -420,19 +429,8 @@ impl Pickers {
         self.state.read(cx).selected_chat.is_some()
     }
 
-    fn engine(&self, cx: &App) -> Option<EngineHandle> {
-        self.state.read(cx).engine().cloned()
-    }
-
-    /// The selected space's device when it differs from the connected
-    /// engine's own — harness/model catalogs come from the device that RUNS
-    /// the agents (the CLIs live there; the viewer may have neither claude
-    /// nor codex installed — user report: "can't load codex models/traits
-    /// anywhere" from a Mac without codex).
-    fn space_target(&self, cx: &App) -> Option<String> {
-        let state = self.state.read(cx);
-        let device = state.selected_space_row()?.device_id.clone();
-        (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
+    fn engine(&self, cx: &App) -> Option<ServerClient> {
+        self.state.read(cx).selected_client()
     }
 
     /// Effective harness: picked, or the chat's config, or the first listed.
@@ -642,21 +640,17 @@ impl Pickers {
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        let target = self.space_target(cx);
+        let generation = self.owner_generation;
         self.harnesses = Loadable::Loading;
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let mut params = serde_json::Map::new();
-            if let Some(target) = &target {
-                params.insert(
-                    "targetDeviceId".into(),
-                    serde_json::Value::String(target.clone()),
-                );
-            }
             let result = engine
                 .client()
-                .call(methods::LIST_HARNESSES, serde_json::Value::Object(params))
+                .call(methods::LIST_HARNESSES, serde_json::Value::Null)
                 .await;
             this.update(cx, |pickers, cx| {
+                if pickers.owner_generation != generation {
+                    return;
+                }
                 pickers.harnesses = match result {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
                         Ok(list) => Loadable::Ready(list),
@@ -686,18 +680,15 @@ impl Pickers {
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        let target = self.space_target(cx);
+        let generation = self.owner_generation;
         self.models.insert(harness, Loadable::Loading);
         cx.spawn(async move |this, cx| {
-            let mut params = serde_json::json!({ "harness": harness });
-            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
-                object.insert(
-                    "targetDeviceId".into(),
-                    serde_json::Value::String(target.clone()),
-                );
-            }
+            let params = serde_json::json!({ "harness": harness });
             let result = engine.client().call(methods::LIST_MODELS, params).await;
             this.update(cx, |pickers, cx| {
+                if pickers.owner_generation != generation {
+                    return;
+                }
                 let loaded = match result {
                     Ok(value) => match serde_json::from_value::<Vec<Model>>(value) {
                         Ok(models) => Loadable::Ready(models),
@@ -726,13 +717,16 @@ impl Pickers {
     /// Rows carry checkout state (`current`, `worktreePath`) so the picker can
     /// tag refs and the checkout-kind selector can offer worktree reuse.
     fn ensure_refs(&mut self, force: bool, cx: &mut Context<Self>) {
+        let Some(space_owner) = self.state.read(cx).selected_space.clone() else {
+            return;
+        };
         let Some(space) = self.state.read(cx).selected_space_row().cloned() else {
             return;
         };
         if !space.git_detected {
             return;
         }
-        let fresh = self.refs_space.as_deref() == Some(space.id.as_str());
+        let fresh = self.refs_space.as_ref() == Some(&space_owner);
         if fresh && matches!(self.refs, Loadable::Loading) {
             return; // a load is already in flight
         }
@@ -747,7 +741,7 @@ impl Pickers {
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        let local = self.state.read(cx).local_device_id.clone();
+        let generation = self.owner_generation;
         // Stale-while-revalidate: a forced refresh of an already-loaded space
         // keeps the current rows on screen while the reload runs — a send that
         // just minted a worktree (or a terminal-side branch) appears on the
@@ -755,24 +749,21 @@ impl Pickers {
         if !(force && fresh && matches!(self.refs, Loadable::Ready(_))) {
             self.refs = Loadable::Loading;
         }
-        self.refs_space = Some(space.id.clone());
+        self.refs_space = Some(space_owner);
         self.refs_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             params.insert(
                 "repoPath".into(),
                 serde_json::Value::String(space.path.clone()),
             );
-            if local.as_deref() != Some(space.device_id.as_str()) {
-                params.insert(
-                    "targetDeviceId".into(),
-                    serde_json::Value::String(space.device_id.clone()),
-                );
-            }
             let result = engine
                 .client()
                 .call(methods::LIST_REFS, serde_json::Value::Object(params))
                 .await;
             this.update(cx, |pickers, cx| {
+                if pickers.owner_generation != generation {
+                    return;
+                }
                 pickers.refs = match result {
                     Ok(value) => match serde_json::from_value::<Vec<RepoRef>>(value) {
                         Ok(refs) => Loadable::Ready(refs),
@@ -834,7 +825,7 @@ impl Pickers {
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        let local = self.state.read(cx).local_device_id.clone();
+        let generation = self.owner_generation;
         self.switch_error = None;
         self.switching = Some(row.name.clone());
         let ref_name = row.name.clone();
@@ -848,17 +839,14 @@ impl Pickers {
                 "refName".into(),
                 serde_json::Value::String(ref_name.clone()),
             );
-            if local.as_deref() != Some(space.device_id.as_str()) {
-                params.insert(
-                    "targetDeviceId".into(),
-                    serde_json::Value::String(space.device_id.clone()),
-                );
-            }
             let result = engine
                 .client()
                 .call(methods::SWITCH_REF, serde_json::Value::Object(params))
                 .await;
             this.update(cx, |pickers, cx| {
+                if pickers.owner_generation != generation {
+                    return;
+                }
                 pickers.switching = None;
                 match result {
                     Ok(_) => {
@@ -899,13 +887,13 @@ impl Pickers {
         let Some(engine) = self.engine(cx) else {
             return;
         };
+        let generation = self.owner_generation;
         if row.worktree_path.as_deref() == Some(cwd.as_str()) {
             // Already this session's worktree — nothing to do.
             self.open = None;
             cx.notify();
             return;
         }
-        let local = self.state.read(cx).local_device_id.clone();
         self.switch_error = None;
         self.switching = Some(row.name.clone());
         let ref_name = row.name.clone();
@@ -937,12 +925,6 @@ impl Pickers {
                         "refName".into(),
                         serde_json::Value::String(ref_name.clone()),
                     );
-                    if local.as_deref() != Some(chat.device_id.as_str()) {
-                        params.insert(
-                            "targetDeviceId".into(),
-                            serde_json::Value::String(chat.device_id.clone()),
-                        );
-                    }
                     engine
                         .client()
                         .call(methods::SWITCH_REF, serde_json::Value::Object(params))
@@ -950,6 +932,9 @@ impl Pickers {
                 }
             };
             this.update(cx, |pickers, cx| {
+                if pickers.owner_generation != generation {
+                    return;
+                }
                 pickers.switching = None;
                 match result {
                     Ok(_) => {
@@ -1070,7 +1055,13 @@ impl Pickers {
     /// row always carries the CONCRETE resolved model/reasoning, with the
     /// reasoning re-clamped to the (possibly just-changed) model's ladder.
     fn update_chat_config(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut ChatConfig)) {
-        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+        let Some(chat_id) = self
+            .state
+            .read(cx)
+            .selected_chat
+            .clone()
+            .map(|id| id.local_id)
+        else {
             return;
         };
         let resolved = self.resolved(cx);

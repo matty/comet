@@ -21,6 +21,7 @@ use gpui::{
     Task, Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
+use comet_proto::ServerId;
 use comet_rpc::methods;
 use gpui_tokio::Tokio;
 
@@ -31,6 +32,7 @@ use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT};
 use crate::popover::{self, Loadable};
 use crate::rail;
+use crate::remotes::RemoteConnectionsPage;
 use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
@@ -41,8 +43,7 @@ use crate::settings::{
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
 use crate::state::{
-    AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, OrgRow, format_time_ago,
-    org_name_valid, parse_orgs, sort_memberships,
+    AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, format_time_ago,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -142,6 +143,7 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Devices,
+    RemoteConnections,
     Agents,
     Appearance,
     Shortcuts,
@@ -149,8 +151,9 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 5] = [
+    pub const ALL: [SettingsSection; 6] = [
         SettingsSection::Devices,
+        SettingsSection::RemoteConnections,
         SettingsSection::Agents,
         SettingsSection::Appearance,
         SettingsSection::Shortcuts,
@@ -162,6 +165,7 @@ impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
             SettingsSection::Devices => "Devices",
+            SettingsSection::RemoteConnections => "Remote",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Shortcuts => "Shortcuts",
@@ -169,6 +173,8 @@ impl SettingsSection {
         }
     }
 }
+
+const BOTTOM_SETTINGS_SECTION: SettingsSection = SettingsSection::Devices;
 
 /// What the main outlet shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,7 +396,7 @@ enum SplashPhase {
 
 /// The chat-row Rename dialog.
 struct RenameChatDialog {
-    chat_id: String,
+    chat_id: comet_proto::ServerRef,
     input: Entity<ComposerInput>,
     /// Focus the input on the dialog's first paint (opened without window access).
     focus_pending: bool,
@@ -404,16 +410,6 @@ enum UpdateFlow {
     /// Staged bundle ready to swap in — one click restarts into it.
     Ready(PathBuf),
     Failed(SharedString),
-}
-
-/// The "Create your workspace" gate (feature-inventory §1.2 OrgGate).
-struct OrgGateUi {
-    name_input: Entity<ComposerInput>,
-    orgs: Loadable<Vec<OrgRow>>,
-    submitting: bool,
-    error: Option<SharedString>,
-    task: Option<Task<()>>,
-    _events: Subscription,
 }
 
 pub struct Shell {
@@ -432,16 +428,17 @@ pub struct Shell {
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
     devices_page: Option<Entity<DevicesPage>>,
+    remote_connections_page: Option<Entity<RemoteConnectionsPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     shortcuts_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
-    chat_menu: Option<(String, Point<Pixels>)>,
+    chat_menu: Option<(comet_proto::ServerRef, Point<Pixels>)>,
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
-    delete_confirm: Option<String>,
+    delete_confirm: Option<comet_proto::ServerRef>,
     /// Space-row context menu: (space id, window position).
     space_menu: Option<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
@@ -472,10 +469,6 @@ pub struct Shell {
     /// Last seen session status per chat — the chime trigger compares against
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, comet_proto::SessionStatus>,
-    user_menu_open: bool,
-    /// Outside-click dismissal instant — suppresses the trigger click that
-    /// follows the same mouse-down from instantly reopening the menu.
-    user_menu_dismissed_at: Option<std::time::Instant>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
@@ -489,9 +482,7 @@ pub struct Shell {
     /// How this binary was installed — decides the strip's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
     install: comet_update::InstallKind,
-    org: Option<OrgGateUi>,
     mutate_task: Option<Task<()>>,
-    auth_task: Option<Task<()>>,
     /// Kept for the failed-gate "Retry" action.
     boot: EngineBootConfig,
     data_dir: PathBuf,
@@ -499,6 +490,9 @@ pub struct Shell {
     /// Session-scoped panel open flags (terminal / changes per chat; §1.10-1.11
     /// parity — heights stay in [`UiSettings`]).
     panels: SessionPanels,
+    /// Authoritative owner of the raw-id shell caches below. Switching servers
+    /// clears them before an equal local id can inherit another server's UI.
+    transient_server: Option<ServerId>,
     /// The panel key of the chat currently shown ("" = new-chat canvas).
     active_chat: String,
     /// Last rendered sidebar order (key + estimated height) — the FLIP baseline
@@ -575,8 +569,7 @@ impl Shell {
                 let alive = this.update(cx, |shell: &mut Shell, cx| {
                     let live = {
                         let s = shell.state.read(cx);
-                        s.selected_chat
-                            .as_deref()
+                        s.selected_chat_id()
                             .is_some_and(|id| s.indicator_for(id, Utc::now()) != Indicator::None)
                     };
                     if live {
@@ -600,6 +593,7 @@ impl Shell {
                 Route::Settings(SettingsSection::Devices)
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
+            Some("settings/remotes") => Route::Settings(SettingsSection::RemoteConnections),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
@@ -613,12 +607,10 @@ impl Shell {
         // More capture knobs of the same kind: `COMET_OPEN_DIALOG=rename|delete`
         // opens that dialog for the first chat once chats land; `=model` pops
         // the combined harness/model menu once the shell is Ready;
-        // `COMET_FORCE_GATE=signin|org|failed` renders that gate regardless of
-        // real auth state (display-only — for styling passes).
+        // `COMET_FORCE_GATE=failed` renders that gate regardless of connection
+        // state (display-only — for styling passes).
         let debug_dialog = std::env::var("COMET_OPEN_DIALOG").ok();
         let debug_gate = match std::env::var("COMET_FORCE_GATE").ok().as_deref() {
-            Some("signin") => Some(GatePhase::SignIn),
-            Some("org") => Some(GatePhase::OrgGate),
             Some("failed") => Some(GatePhase::Failed(
                 "Could not reach the comet engine on port 27901".into(),
             )),
@@ -638,6 +630,7 @@ impl Shell {
             route,
             nav,
             devices_page: None,
+            remote_connections_page: None,
             archived_page: None,
             appearance_page: None,
             shortcuts_page: None,
@@ -659,20 +652,17 @@ impl Shell {
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
-            user_menu_open: false,
-            user_menu_dismissed_at: None,
             sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
             install: comet_update::detect_install(),
-            org: None,
             mutate_task: None,
-            auth_task: None,
             boot,
             data_dir,
             settings,
             panels: SessionPanels::default(),
+            transient_server: None,
             active_chat: String::new(),
             sidebar_prev_order: Vec::new(),
             sidebar_resort: std::collections::HashMap::new(),
@@ -703,6 +693,26 @@ impl Shell {
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        let selected_server = state.read(cx).selected_server_id().cloned();
+        if selected_server != self.transient_server {
+            self.transient_server = selected_server;
+            self.chat_menu = None;
+            self.rename_dialog = None;
+            self.delete_confirm = None;
+            self.space_menu = None;
+            self.rename_space_dialog = None;
+            self.delete_space_confirm = None;
+            self.add_space = None;
+            self.space_last_chat.clear();
+            self.tab_hover = None;
+            self.tab_drag = None;
+            self.space_drag = None;
+            self.tabs_scrolled_to = None;
+            self.sound_prev.clear();
+            self.panels = SessionPanels::default();
+            self.active_chat.clear();
+            self.nav = NavHistory::new(NavEntry::Chat(String::new()));
+        }
         // Capture knob: the add-space palette needs only the device registry.
         if self.debug_dialog.as_deref() == Some("add-space") && !state.read(cx).devices.is_empty() {
             self.debug_dialog = None;
@@ -712,11 +722,19 @@ impl Shell {
         if let Some(which) = self.debug_dialog.clone()
             && let Some(first) = state.read(cx).chats.first().map(|c| c.id.clone())
         {
+            let owner = comet_proto::ServerRef::new(
+                state
+                    .read(cx)
+                    .selected_server_id()
+                    .cloned()
+                    .expect("chat rows require a server bucket"),
+                first,
+            );
             self.debug_dialog = None;
             match which.as_str() {
-                "rename" => self.open_rename_chat(first, cx),
+                "rename" => self.open_rename_chat(owner, cx),
                 "delete" => {
-                    self.delete_confirm = Some(first);
+                    self.delete_confirm = Some(owner);
                 }
                 _ => {}
             }
@@ -781,8 +799,8 @@ impl Shell {
                 let s = state.read(cx);
                 let chat_space = s.selected_chat_row().and_then(|c| c.space_id.clone());
                 (
-                    s.selected_space.clone(),
-                    s.selected_chat.clone(),
+                    s.selected_space.clone().map(|id| id.local_id),
+                    s.selected_chat.clone().map(|id| id.local_id),
                     chat_space,
                 )
             };
@@ -796,7 +814,11 @@ impl Shell {
         }
         // Chat switch: restore THAT chat's panel state (per-session open flags;
         // snap, no tween — the panels belong to the destination chat).
-        let selected = state.read(cx).selected_chat.clone().unwrap_or_default();
+        let selected = state
+            .read(cx)
+            .selected_chat_id()
+            .unwrap_or_default()
+            .to_string();
         if selected != self.active_chat {
             self.active_chat = selected;
             // Route history: a chat switch is a navigation. The very first
@@ -872,8 +894,8 @@ impl Shell {
             let space = self
                 .state
                 .read(cx)
-                .selected_space
-                .clone()
+                .selected_space_id()
+                .map(str::to_string)
                 .unwrap_or_default();
             format!("space-canvas:{space}")
         } else {
@@ -1074,7 +1096,6 @@ impl Shell {
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
-        self.user_menu_open = false;
         self.chat_menu = None;
         cx.notify();
     }
@@ -1107,7 +1128,7 @@ impl Shell {
             NavEntry::Chat(chat_id) => {
                 self.route = Route::Chat;
                 let target = (!chat_id.is_empty()).then_some(chat_id);
-                if self.state.read(cx).selected_chat != target {
+                if self.state.read(cx).selected_chat_id() != target.as_deref() {
                     self.state.update(cx, |s, cx| s.select_chat(target, cx));
                 }
             }
@@ -1115,7 +1136,6 @@ impl Shell {
                 self.route = Route::Settings(section);
             }
         }
-        self.user_menu_open = false;
         self.chat_menu = None;
         cx.notify();
     }
@@ -1129,6 +1149,17 @@ impl Shell {
                     self.devices_page = Some(cx.new(|cx| DevicesPage::new(state, cx)));
                 }
                 match &self.devices_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::RemoteConnections => {
+                if self.remote_connections_page.is_none() {
+                    let state = self.state.clone();
+                    self.remote_connections_page =
+                        Some(cx.new(|cx| RemoteConnectionsPage::new(state, cx)));
+                }
+                match &self.remote_connections_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -1192,7 +1223,7 @@ impl Shell {
 
     /// Fire a Mutate op; failures surface in the sidebar notice strip.
     fn mutate(&mut self, params: serde_json::Value, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             self.sidebar_notice = Some("Engine not connected".into());
             cx.notify();
             return;
@@ -1208,14 +1239,44 @@ impl Shell {
         }));
     }
 
-    fn open_rename_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+    /// Mutate the server that owned a menu/dialog/tab when it was opened.
+    /// Selection is deliberately irrelevant: it may have changed while the
+    /// confirmation UI was open.
+    fn mutate_for(
+        &mut self,
+        owner: comet_proto::ServerRef,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let engine = match self.state.read(cx).mutation_client_for(&owner) {
+            Ok(engine) => engine,
+            Err(err) => {
+                self.sidebar_notice = Some(format!("{err}").into());
+                cx.notify();
+                return;
+            }
+        };
+        self.mutate_task = Some(cx.spawn(async move |this, cx| {
+            if let Err(err) = engine.client().call(methods::MUTATE, params).await {
+                this.update(cx, |shell, cx| {
+                    shell.sidebar_notice = Some(format!("{err}").into());
+                    cx.notify();
+                })
+                .ok();
+            }
+        }));
+    }
+
+    fn open_rename_chat(&mut self, chat_id: comet_proto::ServerRef, cx: &mut Context<Self>) {
         self.chat_menu = None;
         let current = self
             .state
             .read(cx)
-            .chats
-            .iter()
-            .find(|c| c.id == chat_id)
+            .servers
+            .get(&chat_id.server_id)
+            .into_iter()
+            .flat_map(|server| &server.chats)
+            .find(|c| c.id == chat_id.local_id)
             .and_then(|c| c.title.clone())
             .unwrap_or_default();
         let input = cx.new(|cx| ComposerInput::new("Session title", cx));
@@ -1240,193 +1301,38 @@ impl Shell {
         };
         let title = dialog.input.read(cx).text().trim().to_string();
         if !title.is_empty() {
-            self.mutate(
-                serde_json::json!({ "op": "renameChat", "chatId": dialog.chat_id, "title": title }),
+            let owner = dialog.chat_id;
+            self.mutate_for(
+                owner.clone(),
+                serde_json::json!({ "op": "renameChat", "chatId": owner.local_id, "title": title }),
                 cx,
             );
         }
         cx.notify();
     }
 
-    fn archive_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+    fn archive_chat(&mut self, chat_id: comet_proto::ServerRef, cx: &mut Context<Self>) {
         self.chat_menu = None;
-        self.mutate(
-            serde_json::json!({ "op": "setChatArchived", "chatId": chat_id, "archived": true }),
+        self.mutate_for(
+            chat_id.clone(),
+            serde_json::json!({ "op": "setChatArchived", "chatId": chat_id.local_id, "archived": true }),
             cx,
         );
         cx.notify();
     }
 
-    fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+    fn delete_chat(&mut self, chat_id: comet_proto::ServerRef, cx: &mut Context<Self>) {
         self.delete_confirm = None;
-        if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
+        if self.state.read(cx).selected_chat.as_ref() == Some(&chat_id) {
             self.state.update(cx, |s, cx| s.select_chat(None, cx));
         }
         self.composer
             .update(cx, |composer, _| composer.purge_chat(&chat_id));
-        self.mutate(
-            serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
+        self.mutate_for(
+            chat_id.clone(),
+            serde_json::json!({ "op": "deleteChat", "chatId": chat_id.local_id }),
             cx,
         );
-        cx.notify();
-    }
-
-    fn sign_out(&mut self, cx: &mut Context<Self>) {
-        self.user_menu_open = false;
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        self.auth_task = Some(cx.spawn(async move |this, cx| {
-            if let Err(err) = engine
-                .client()
-                .call(methods::SIGN_OUT, serde_json::json!({}))
-                .await
-            {
-                this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(format!("Sign out failed: {err}").into());
-                    cx.notify();
-                })
-                .ok();
-            }
-        }));
-        cx.notify();
-    }
-
-    fn start_sign_in(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        self.auth_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::SIGN_IN, serde_json::json!({}))
-                .await;
-            this.update(cx, |shell, cx| match result {
-                Ok(value) => {
-                    if let Some(url) = value.get("url").and_then(|u| u.as_str()) {
-                        cx.open_url(url);
-                    }
-                }
-                Err(err) => {
-                    shell.sidebar_notice = Some(format!("Sign in failed: {err}").into());
-                    cx.notify();
-                }
-            })
-            .ok();
-        }));
-    }
-
-    // ---- org gate ----
-
-    fn ensure_org_ui(&mut self, cx: &mut Context<Self>) {
-        if self.org.is_some() {
-            return;
-        }
-        let name_input = cx.new(|cx| ComposerInput::new("Workspace name", cx));
-        let events = cx.subscribe(&name_input, |this: &mut Shell, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
-                this.create_org(cx);
-            }
-        });
-        self.org = Some(OrgGateUi {
-            name_input,
-            orgs: Loadable::Idle,
-            submitting: false,
-            error: None,
-            task: None,
-            _events: events,
-        });
-        self.load_orgs(cx);
-    }
-
-    fn load_orgs(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let Some(org) = self.org.as_mut() else { return };
-        org.orgs = Loadable::Loading;
-        org.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::LIST_ORGS, serde_json::json!({}))
-                .await;
-            this.update(cx, |shell, cx| {
-                if let Some(org) = shell.org.as_mut() {
-                    org.orgs = match result {
-                        Ok(value) => Loadable::Ready(sort_memberships(parse_orgs(&value))),
-                        Err(err) => Loadable::Error(err.to_string()),
-                    };
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    fn create_org(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let Some(org) = self.org.as_mut() else { return };
-        if org.submitting {
-            return;
-        }
-        let name = org.name_input.read(cx).text().trim().to_string();
-        if !org_name_valid(&name) {
-            org.error = Some("Enter a workspace name".into());
-            cx.notify();
-            return;
-        }
-        org.submitting = true;
-        org.error = None;
-        org.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::CREATE_ORG, serde_json::json!({ "name": name }))
-                .await;
-            this.update(cx, |shell, cx| {
-                if let Some(org) = shell.org.as_mut() {
-                    org.submitting = false;
-                    if let Err(err) = result {
-                        org.error = Some(format!("{err}").into());
-                    }
-                    // Success: the AuthStatus stream flips to SignedIn and the
-                    // gate falls away on its own.
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    fn select_org(&mut self, organization_id: String, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let Some(org) = self.org.as_mut() else { return };
-        org.submitting = true;
-        org.error = None;
-        org.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::SELECT_ORG,
-                    serde_json::json!({ "organizationId": organization_id }),
-                )
-                .await;
-            this.update(cx, |shell, cx| {
-                if let Some(org) = shell.org.as_mut() {
-                    org.submitting = false;
-                    if let Err(err) = result {
-                        org.error = Some(format!("{err}").into());
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
         cx.notify();
     }
 
@@ -1651,6 +1557,7 @@ impl Shell {
     ) -> AnyElement {
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
+            SettingsSection::RemoteConnections => icons::GLOBAL,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Shortcuts => icons::KEYBOARD,
@@ -1795,7 +1702,14 @@ impl Shell {
         let selected_wash = crate::theme::glass_selected_bg();
         let subline = theme.text_muted.opacity(0.5);
         let select_id = id.clone();
-        let menu_id = id.clone();
+        let menu_id = comet_proto::ServerRef::new(
+            self.state
+                .read(cx)
+                .selected_server_id()
+                .cloned()
+                .expect("chat rows require a server bucket"),
+            id.clone(),
+        );
         // Hover fades over transition-colors (comet session-row.tsx) — both
         // the wash and the title brighten ride the same 150ms blend.
         let fade_key = format!("chat-row-{id}");
@@ -1928,8 +1842,6 @@ impl Shell {
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let user = self.state.read(cx).auth_user().cloned();
-
         // Keyed rows: (stable key, estimated height, element) — the key + height
         // list drives the §1.6 resort FLIP diff below (attention-bucket
         // promotions glide; cleared rows just go).
@@ -1997,12 +1909,7 @@ impl Shell {
         let glass = theme.is_glass();
         let sidebar_fade = theme.surface;
 
-        let user_line: SharedString = user
-            .as_ref()
-            .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
-            .unwrap_or_else(|| SharedString::from("Not signed in"));
-        let user_email: Option<SharedString> = user.as_ref().map(|u| u.email.clone().into());
-        let user_menu = self.render_user_menu(user_line.clone(), user_email.clone(), theme, cx);
+        let settings_button = self.render_settings_button(theme, cx);
 
         let spaces_section = self.render_spaces_section(theme, cx);
 
@@ -2087,7 +1994,7 @@ impl Shell {
                         )
                     }),
             ))
-            // Update strip (above the user menu; below the lists).
+            // Update strip (above the settings button; below the lists).
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
                 el.child(strip)
             })
@@ -2113,11 +2020,16 @@ impl Shell {
                         .child(notice),
                 )
             })
-            .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
+            .child(
+                div()
+                    .p(px(Theme::SPACE_SM))
+                    .flex_none()
+                    .child(settings_button),
+            )
             .into_any_element()
     }
 
-    /// Update strip: shown above the user menu whenever the engine's
+    /// Update strip: shown above the settings button whenever the engine's
     /// UpdateStatus stream reports a newer release. On a macOS bundle install
     /// it drives the whole flow — click to download, then click to restart into
     /// the staged bundle. Elsewhere (managed/source installs) it is advisory
@@ -2160,7 +2072,7 @@ impl Shell {
         let mut strip = div()
             .id("update-strip")
             .mx(px(Theme::SPACE_SM))
-            // No bottom margin: the user-menu block below carries its own
+            // No bottom margin: the settings-button block below carries its own
             // SPACE_SM padding — doubling it read as a hole (user report).
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
@@ -2215,7 +2127,7 @@ impl Shell {
     /// Fetch the manifest and stage the new `Comet.app` under the data dir
     /// (tokio — reqwest); the strip flips to "restart to apply" when done.
     fn begin_update_download(&mut self, cx: &mut Context<Self>) {
-        let edge_url = self.boot.edge_url.clone();
+        let edge_url = self.boot.releases_url.clone();
         let data_dir = self.data_dir.clone();
         self.update_flow = UpdateFlow::Downloading;
         let download = Tokio::spawn(cx, async move {
@@ -2263,26 +2175,9 @@ impl Shell {
         }
     }
 
-    /// UserMenu (§1.6): name/email trigger row; menu with plan badge, Open
-    /// settings, Sign out.
-    fn render_user_menu(
-        &mut self,
-        user_line: SharedString,
-        user_email: Option<SharedString>,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let open = self.user_menu_open;
-        // Bottom-of-sidebar identity (comet user-menu.tsx): avatar circle +
-        // name with the plan label underneath, Alpha badge chip on the right.
-        let initial: SharedString = user_line
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".into())
-            .into();
-        let mut trigger = div()
-            .id("user-menu")
+    fn render_settings_button(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("sidebar-settings")
             .flex_none()
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
@@ -2292,125 +2187,21 @@ impl Shell {
             .items_center()
             .gap(px(10.0))
             .cursor_pointer()
-            // user-menu.tsx trigger: hover `bg-white/[0.04]`, open state
-            // (`data-[state=open]`) the slightly stronger `bg-white/[0.06]`;
-            // the hover wash fades over `transition-colors`.
-            .bg(if open {
-                theme.glass_hover()
-            } else {
-                motion::hover_blend(
-                    "user-menu-trigger",
-                    theme.glass_hover().opacity(0.0),
-                    theme.glass_hover().opacity(0.8),
-                )
-            })
-            .on_hover(motion::hover_listener("user-menu-trigger"))
-            .on_click(cx.listener(|this, _, _, cx| {
-                // A click that just dismissed the menu (outside-click on the
-                // trigger) must not instantly reopen it.
-                let just_dismissed = this
-                    .user_menu_dismissed_at
-                    .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
-                this.user_menu_open = !this.user_menu_open && !just_dismissed;
-                this.user_menu_dismissed_at = None;
-                cx.notify();
-            }))
+            .hover(|style| style.bg(theme.element_hover))
+            .on_click(cx.listener(|this, _, _, cx| this.open_settings(BOTTOM_SETTINGS_SECTION, cx)))
             .child(
-                // Avatar: white circle, initial in near-black (comet user-menu.tsx).
-                div()
-                    .size(px(28.0))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(theme.text)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.bg)
-                    .child(initial),
+                icon(icons::SETTINGS_MINIMALISTIC)
+                    .size(px(18.0))
+                    .text_color(theme.text_muted),
             )
             .child(
-                // Name with the plan label underneath — no chip on the right.
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .line_height(px(17.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .truncate()
-                            .child(user_line.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .line_height(px(15.0))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from("Alpha")),
-                    ),
-            );
-        if open {
-            // user-menu.tsx content: `w-[--radix-dropdown-menu-trigger-width]`
-            // (exactly as wide as the trigger row — sidebar minus its p-2
-            // gutters), `flex-col gap-0.5`, then: one small muted email line
-            // (`px-2 pb-1 pt-1.5 text-[11px] text-muted-foreground/70`),
-            // "Settings", separator, "Sign out". Both rows are plain
-            // `menuItem`s with muted 16px icons — sign-out carries NO
-            // destructive tone in the original.
-            let menu = popover::popover_card(theme)
-                .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.user_menu_open = false;
-                    this.user_menu_dismissed_at = Some(std::time::Instant::now());
-                    cx.notify();
-                }))
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .child(
-                    div()
-                        .px(px(8.0))
-                        .pt(px(6.0))
-                        .pb(px(4.0))
-                        .text_size(px(11.0))
-                        .text_color(theme.text_muted.opacity(0.7))
-                        .truncate()
-                        .child(user_email.unwrap_or(user_line)),
-                )
-                .child(
-                    popover::menu_row(theme, false, "user-menu-settings")
-                        .id("user-menu-settings")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.open_settings(SettingsSection::Devices, cx)
-                        }))
-                        .child(
-                            icon(icons::SETTINGS_MINIMALISTIC)
-                                .size(px(16.0))
-                                .text_color(theme.text_muted),
-                        )
-                        .child(SharedString::from("Settings")),
-                )
-                .child(popover::menu_separator())
-                .child(
-                    popover::menu_row(theme, false, "user-menu-signout")
-                        .id("user-menu-signout")
-                        .on_click(cx.listener(|this, _, _, cx| this.sign_out(cx)))
-                        .child(
-                            icon(icons::LOGOUT_2)
-                                .size(px(16.0))
-                                .text_color(theme.text_muted),
-                        )
-                        .child(SharedString::from("Sign out")),
-                )
-                .into_any_element();
-            trigger = trigger.child(popover::anchored_menu_above("user-menu-popover", menu));
-        }
-        trigger.into_any_element()
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child("Settings"),
+            )
+            .into_any_element()
     }
 
     /// Floating layers owned by the shell: the session context menu and the
@@ -2428,25 +2219,34 @@ impl Shell {
             let rename_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
-            let menu = popover::popover_card(&theme)
-                .w(px(170.0))
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.chat_menu = None;
-                    cx.notify();
-                }))
-                .flex()
-                .flex_col()
-                .child(
-                    popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
+            let menu =
+                popover::popover_card(&theme)
+                    .w(px(170.0))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.chat_menu = None;
+                        cx.notify();
+                    }))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("chat-menu-rename-{}", chat_id.local_id),
+                        )
                         .id("chat-menu-rename")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.open_rename_chat(rename_id.clone(), cx)
                         }))
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from("Rename…")),
-                )
-                .child(
-                    popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
+                    )
+                    .child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("chat-menu-archive-{}", chat_id.local_id),
+                        )
                         .id("chat-menu-archive")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.archive_chat(archive_id.clone(), cx)
@@ -2457,10 +2257,14 @@ impl Shell {
                                 .text_color(theme.text_muted),
                         )
                         .child(SharedString::from("Archive")),
-                )
-                .child(popover::menu_separator())
-                .child(
-                    popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
+                    )
+                    .child(popover::menu_separator())
+                    .child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("chat-menu-delete-{}", chat_id.local_id),
+                        )
                         .id("chat-menu-delete")
                         .text_color(theme.danger)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2474,8 +2278,8 @@ impl Shell {
                                 .text_color(theme.danger),
                         )
                         .child(SharedString::from("Delete…")),
-                )
-                .into_any_element();
+                    )
+                    .into_any_element();
             overlays.push(popover::menu_at("chat-context-menu", position, menu));
         }
 
@@ -2536,7 +2340,7 @@ impl Shell {
                     .read(cx)
                     .chats
                     .iter()
-                    .find(|c| c.id == chat_id)
+                    .find(|c| c.id == chat_id.local_id)
                     .and_then(|c| c.title.clone())
                     .unwrap_or_else(|| "New session".into()),
             );
@@ -2970,7 +2774,7 @@ impl Shell {
             .px(px(Theme::SPACE_LG + 8.0))
             .text_size(px(11.0));
 
-        let Some(chat_id) = state.selected_chat.clone() else {
+        let Some(chat_id) = state.selected_chat.clone().map(|id| id.local_id) else {
             return strip.into_any_element();
         };
         let indicator = state.indicator_for(&chat_id, now);
@@ -3121,65 +2925,7 @@ impl Shell {
                         .child(SharedString::from("Retry")),
                 )
                 .into_any_element(),
-            // Login card (comet App.tsx Gate): centered card on the grid —
-            // logo, "Log in to Comet", copy, full-width white Log in button.
-            _ => div()
-                .w(px(360.0))
-                .px(px(32.0))
-                .py(px(40.0))
-                .rounded(px(12.0))
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.surface_card)
-                .shadow_lg()
-                .flex()
-                .flex_col()
-                .items_center()
-                .text_center()
-                .child(
-                    icon(icons::COMET_LOGO)
-                        .w(px(31.4))
-                        .h(px(36.0))
-                        .text_color(theme.text),
-                )
-                .child(
-                    div()
-                        .mt(px(24.0))
-                        .text_size(px(18.0))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme.text)
-                        .child(SharedString::from("Log in to Comet")),
-                )
-                .child(
-                    div()
-                        .mt(px(6.0))
-                        .mb(px(24.0))
-                        .text_size(px(13.0))
-                        .line_height(px(19.0))
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from(
-                            "This opens your browser to finish logging in — you'll come right back.",
-                        )),
-                )
-                .child(
-                    div()
-                        .id("sign-in")
-                        .w_full()
-                        .h(px(36.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(6.0))
-                        .bg(theme.text)
-                        .text_size(px(14.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.on_solid)
-                        .cursor_pointer()
-                        .hover(|s| s.opacity(0.9))
-                        .on_click(cx.listener(|this, _, _, cx| this.start_sign_in(cx)))
-                        .child(SharedString::from("Log in")),
-                )
-                .into_any_element(),
+            _ => return Empty.into_any_element(),
         };
         div()
             .size_full()
@@ -3198,232 +2944,10 @@ impl Shell {
                     // 0.5s entrance instead of mutating one animated element.
                     .child(motion::fade_in(
                         match phase {
-                            GatePhase::SignIn => "gate-card-signin",
                             _ => "gate-card-failed",
                         },
                         div().child(content),
                     )),
-            )
-            .into_any_element()
-    }
-
-    /// The OrgGate ("Create your workspace"): name form + existing memberships
-    /// + "Use a different account" (feature-inventory §1.2).
-    fn render_org_gate(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        self.ensure_org_ui(cx);
-        let theme = Theme::of(cx).clone();
-        let Some(org) = self.org.as_ref() else {
-            return Empty.into_any_element();
-        };
-        let submitting = org.submitting;
-        let error = org.error.clone();
-        let name_input = org.name_input.clone();
-        let orgs = org.orgs.clone();
-
-        let email: Option<SharedString> = self
-            .state
-            .read(cx)
-            .auth_user()
-            .map(|u| u.email.clone().into());
-
-        let memberships: AnyElement =
-            match &orgs {
-                Loadable::Idle | Loadable::Loading => div()
-                    .mt(px(24.0))
-                    .child(popover::skeleton_rows(
-                        "org-skeleton",
-                        &theme,
-                        2,
-                        cx.entity_id(),
-                        cx,
-                    ))
-                    .into_any_element(),
-                Loadable::Error(message) => div()
-                    .mt(px(24.0))
-                    .child(
-                        popover::error_row(&theme, message).child(
-                            div()
-                                .id("orgs-retry")
-                                .px(px(Theme::SPACE_SM))
-                                .py(px(3.0))
-                                .rounded(px(Theme::CONTROL_RADIUS))
-                                .border_1()
-                                .border_color(theme.border)
-                                .text_color(theme.text)
-                                .cursor_pointer()
-                                .hover(|s| s.bg(theme.glass_hover()))
-                                .on_click(cx.listener(|this, _, _, cx| this.load_orgs(cx)))
-                                .child(SharedString::from("Retry")),
-                        ),
-                    )
-                    .into_any_element(),
-                Loadable::Ready(rows) if rows.is_empty() => Empty.into_any_element(),
-                Loadable::Ready(rows) => div()
-                    .mt(px(24.0))
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .pb(px(8.0))
-                            .text_size(px(11.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text_muted.opacity(0.6))
-                            .child(SharedString::from(
-                                "Or continue in a workspace you belong to",
-                            )),
-                    )
-                    .child(div().flex().flex_col().gap(px(4.0)).children(
-                        rows.iter().enumerate().map(|(ix, row)| {
-                            let org_id = row.organization_id.clone();
-                            div()
-                                .id(("org-row", ix))
-                                .px(px(12.0))
-                                .py(px(8.0))
-                                .rounded(px(8.0))
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.bg)
-                                .text_size(px(13.0))
-                                .text_color(theme.text)
-                                .when(submitting, |el| el.opacity(0.5))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(crate::theme::wash(0.11)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.select_org(org_id.clone(), cx);
-                                }))
-                                .child(SharedString::from(row.name.clone()))
-                        }),
-                    ))
-                    .into_any_element(),
-            };
-
-        // comet App.tsx OrgGate: w-400 card on the grid — logo, headline,
-        // explainer (+ signed-in email), name form with a white Create button,
-        // then existing memberships and the account escape hatch.
-        let blurb: SharedString = match email {
-            Some(email) => format!(
-                "Comet is organized around workspaces — create one for yourself or your team. Signed in as {email}."
-            )
-            .into(),
-            None => {
-                "Comet is organized around workspaces — create one for yourself or your team."
-                    .into()
-            }
-        };
-        let card = div()
-            .w(px(400.0))
-            .px(px(32.0))
-            .py(px(36.0))
-            .rounded(px(12.0))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.surface_card)
-            .shadow_lg()
-            .flex()
-            .flex_col()
-            .child(
-                icon(icons::COMET_LOGO)
-                    .w(px(24.4))
-                    .h(px(28.0))
-                    .text_color(theme.text),
-            )
-            .child(
-                div()
-                    .mt(px(20.0))
-                    .text_size(px(18.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.text)
-                    .child(SharedString::from("Create your workspace")),
-            )
-            .child(
-                div()
-                    .mt(px(6.0))
-                    .mb(px(24.0))
-                    .text_size(px(13.0))
-                    .line_height(px(19.0))
-                    .text_color(theme.text_muted)
-                    .child(blurb),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h(px(36.0))
-                            .flex()
-                            .items_center()
-                            .px(px(12.0))
-                            .rounded(px(8.0))
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.bg)
-                            .text_size(px(13.0))
-                            .child(name_input),
-                    )
-                    .child(
-                        div()
-                            .id("create-org")
-                            .h(px(36.0))
-                            .px(px(16.0))
-                            .flex()
-                            .items_center()
-                            .rounded(px(6.0))
-                            .bg(theme.text)
-                            .text_size(px(14.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.on_solid)
-                            .when(submitting, |el| el.opacity(0.5))
-                            .cursor_pointer()
-                            .hover(|s| s.opacity(0.9))
-                            .on_click(cx.listener(|this, _, _, cx| this.create_org(cx)))
-                            .child(SharedString::from(if submitting {
-                                "Creating…"
-                            } else {
-                                "Create"
-                            })),
-                    ),
-            )
-            .child(memberships)
-            .when_some(error, |el, message| {
-                el.child(
-                    div()
-                        .mt(px(16.0))
-                        .text_size(px(12.0))
-                        .line_height(px(17.0))
-                        .text_color(theme.danger_muted.opacity(0.9)) // red-300
-                        .child(message),
-                )
-            })
-            .child(
-                div().mt(px(24.0)).flex().flex_row().child(
-                    div()
-                        .id("org-signout")
-                        .text_size(px(12.0))
-                        .text_color(theme.text_muted.opacity(0.6))
-                        .cursor_pointer()
-                        .hover(|s| s.text_color(theme.text))
-                        .on_click(cx.listener(|this, _, _, cx| this.sign_out(cx)))
-                        .child(SharedString::from("Use a different account")),
-                ),
-            );
-
-        div()
-            .size_full()
-            .relative()
-            .bg(theme.bg)
-            .child(grid_backdrop(&theme))
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(motion::fade_in("org-gate-card", card)),
             )
             .into_any_element()
     }
@@ -3882,11 +3406,7 @@ impl Render for Shell {
                     .child(motion::fade_in("phase-app", page))
             }
             GatePhase::Loading => root, // splash overlay covers boot
-            GatePhase::OrgGate => {
-                let card = self.render_org_gate(cx);
-                root.child(card)
-            }
-            phase @ (GatePhase::Failed(_) | GatePhase::SignIn) => {
+            phase @ GatePhase::Failed(_) => {
                 let card = self.render_gate_card(phase, cx);
                 root.child(card)
             }
@@ -4162,5 +3682,54 @@ mod tests {
             Some(NavEntry::Settings(SettingsSection::Devices))
         );
         assert_eq!(nav.back(), Some(chat("a")));
+    }
+
+    #[test]
+    fn remote_connections_is_a_first_class_settings_section() {
+        assert!(SettingsSection::ALL.contains(&SettingsSection::RemoteConnections));
+        assert_eq!(SettingsSection::RemoteConnections.label(), "Remote");
+    }
+
+    #[test]
+    fn bottom_settings_button_rendering_targets_devices_without_account_menu() {
+        assert_eq!(BOTTOM_SETTINGS_SECTION, SettingsSection::Devices);
+        assert_eq!(BOTTOM_SETTINGS_SECTION.label(), "Devices");
+
+        let source = include_str!("shell.rs");
+        let production_source = source
+            .split_once("#[cfg(test)]")
+            .expect("shell test-module boundary")
+            .0;
+        let settings_renderer = production_source
+            .split_once("fn render_settings_button")
+            .expect("settings button renderer")
+            .1
+            .split_once("\n    fn ")
+            .expect("next shell method")
+            .0;
+        let listener_token = ["this.", "open_settings", "(BOTTOM_SETTINGS_SECTION, cx)"].concat();
+
+        assert!(
+            production_source.contains(".child(settings_button)"),
+            "the rendered sidebar must include the bottom Settings button"
+        );
+        assert!(settings_renderer.contains(".id(\"sidebar-settings\")"));
+        assert!(
+            settings_renderer.contains(&listener_token),
+            "the actual click listener must open the configured settings section"
+        );
+        for obsolete in [
+            "user_menu_open",
+            "user_menu_dismissed_at",
+            "render_user_menu",
+            "user-menu-settings",
+            "Sign out",
+            "Alpha",
+        ] {
+            assert!(
+                !production_source.contains(obsolete),
+                "obsolete account-menu token remains: {obsolete}"
+            );
+        }
     }
 }

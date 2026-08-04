@@ -1,6 +1,5 @@
-//! Workspace doc schema over `loro` — the per-org entity index that replaces comet's
-//! residual entity sync (ARCHITECTURE.md §2.2). Lives in its own DO room (same
-//! SessionRoom class, doc id `ws/{orgId}`).
+//! Workspace doc schema over `loro` — the authoritative entity index used by
+//! the local Comet server (ARCHITECTURE.md §2.2).
 //!
 //! Container layout — maps keyed by id, NOT lists: entity rows are LWW upserts, and a
 //! map-of-maps means concurrent writers to *different* rows never conflict while writes

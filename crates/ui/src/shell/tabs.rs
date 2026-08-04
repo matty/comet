@@ -126,19 +126,30 @@ impl Shell {
     /// Close a tab = archive the session. Selection moves to a neighbor; the
     /// last tab lands on the new-session canvas.
     pub(super) fn close_session_tab(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        let (selected, order) = {
-            let space = self.state.read(cx).selected_space.clone();
+        let (owner, selected, order) = {
+            let state = self.state.read(cx);
+            let server_id = state
+                .selected_space
+                .as_ref()
+                .map(|space| space.server_id.clone())
+                .or_else(|| state.selected_server_id().cloned())
+                .expect("session tabs require a server bucket");
+            let space = state.selected_space.clone().map(|id| id.local_id);
             let order = space
                 .as_deref()
                 .map(|space| self.tab_ids(space, cx))
                 .unwrap_or_default();
-            (self.state.read(cx).selected_chat.clone(), order)
+            (
+                comet_proto::ServerRef::new(server_id, chat_id.clone()),
+                state.selected_chat.clone(),
+                order,
+            )
         };
-        if selected.as_deref() == Some(chat_id.as_str()) {
+        if selected.as_ref().map(|chat| chat.local_id.as_str()) == Some(chat_id.as_str()) {
             let next = next_after_close(&order, &chat_id);
             self.state.update(cx, |s, cx| s.select_chat(next, cx));
         }
-        self.archive_chat(chat_id, cx);
+        self.archive_chat(owner, cx);
     }
 
     /// Track the drop slot while a tab is dragged over the strip (150ms sibling
@@ -186,7 +197,12 @@ impl Shell {
         if self.tab_drag.is_some() && !cx.has_active_drag() {
             self.tab_drag = None;
         }
-        let space_id = self.state.read(cx).selected_space.clone();
+        let space_id = self
+            .state
+            .read(cx)
+            .selected_space
+            .clone()
+            .map(|id| id.local_id);
         let order: Vec<String> = space_id
             .as_deref()
             .map(|space| self.tab_ids(space, cx))
@@ -213,7 +229,12 @@ impl Shell {
                 })
                 .collect()
         };
-        let selected = self.state.read(cx).selected_chat.clone();
+        let selected = self
+            .state
+            .read(cx)
+            .selected_chat
+            .clone()
+            .map(|id| id.local_id);
         // Keep the selected tab visible: on selection change, scroll it into
         // view (minimal movement — a new session's tab materializes at the far
         // right of an overflowing strip and would otherwise be stranded

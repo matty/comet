@@ -30,7 +30,7 @@ use comet_rpc::methods;
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
-use crate::state::{AppState, EngineHandle};
+use crate::state::{AppState, ServerClient};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -484,7 +484,7 @@ pub struct Changes {
     /// `Some(id)` = a remote chat's host (relay-forwarded). The stream only
     /// carries the TARGET device's checkouts, so a selection change onto a
     /// chat hosted elsewhere tears the watch down and re-subscribes.
-    watch_target: Option<String>,
+    watch_target: Option<comet_proto::ServerId>,
     watch_task: Option<Task<()>>,
     parsed: Option<ParsedDiff>,
     parse_task: Option<Task<()>>,
@@ -513,15 +513,12 @@ impl Changes {
         }
     }
 
-    /// The selected chat's host device when it differs from the connected
-    /// engine's own — diffs are produced where the checkout lives, so a
-    /// remote chat's watch must relay-forward (`targetDeviceId`) to its host.
-    /// Without this the local stream simply never carries the remote checkout
-    /// and the pane sits on "Preparing diff…" forever (user report).
-    fn desired_target(&self, cx: &App) -> Option<String> {
-        let state = self.state.read(cx);
-        let device = state.selected_chat_row()?.device_id.clone();
-        (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
+    fn desired_target(&self, cx: &App) -> Option<comet_proto::ServerId> {
+        self.state
+            .read(cx)
+            .selected_chat
+            .as_ref()
+            .map(|chat| chat.server_id.clone())
     }
 
     /// Start the `WatchCheckoutDiffs` subscription (idempotent per target).
@@ -532,7 +529,7 @@ impl Changes {
         if self.started && self.watch_target == target {
             return;
         }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).selected_client() else {
             // Engine still booting — retry on the next state change via sync().
             return;
         };
@@ -548,25 +545,15 @@ impl Changes {
     }
 
     fn spawn_watch(
-        engine: EngineHandle,
-        target: Option<String>,
+        engine: ServerClient,
+        _target: Option<comet_proto::ServerId>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
-                let mut params = serde_json::Map::new();
-                if let Some(target) = &target {
-                    params.insert(
-                        "targetDeviceId".into(),
-                        serde_json::Value::String(target.clone()),
-                    );
-                }
                 let subscribed = engine
                     .client()
-                    .subscribe(
-                        methods::WATCH_CHECKOUT_DIFFS,
-                        serde_json::Value::Object(params),
-                    )
+                    .subscribe(methods::WATCH_CHECKOUT_DIFFS, serde_json::Value::Null)
                     .await;
                 match subscribed {
                     Ok(mut rx) => {

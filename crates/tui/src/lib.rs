@@ -1,7 +1,9 @@
 //! comet-tui — the terminal viewport.
 //!
 //! A peer of the gpui app in `comet-ui`, not a subset of it: both are thin
-//! clients over the same typed RPC (ARCHITECTURE §1), and both derive their row
+//! clients over the same typed RPC (ARCHITECTURE §1). The TUI attaches or
+//! spawns only the trusted local daemon, then delegates its local-first and
+//! configured-remote model to `comet_client::Federation`; both viewports derive their row
 //! order, status dots and gates from the same pure functions in
 //! `comet_proto::view`. What differs is the renderer and one deliberate
 //! architectural choice — **the TUI never embeds an engine**.
@@ -13,8 +15,8 @@
 //! you close it, the SSH session drops, the laptop lid shuts. So `comet-tui`
 //! attaches to a daemon and starts a detached one if there isn't one
 //! ([`daemon`]). Quitting the viewport is then genuinely *detaching* — agents
-//! keep running, docs keep syncing, the DeviceRoom stays joined — and
-//! reattaching is instant because nothing had to be rebuilt.
+//! keep running in the authoritative local engine, and reattaching is instant
+//! because nothing had to be rebuilt.
 //!
 //! ## Where the performance comes from
 //!

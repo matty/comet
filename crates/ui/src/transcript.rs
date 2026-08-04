@@ -36,7 +36,7 @@ use gpui::{
 };
 
 use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
-use comet_proto::ToolCall;
+use comet_proto::{ServerId, ServerRef, ToolCall};
 
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
@@ -865,7 +865,7 @@ pub struct Transcript {
     state: Entity<AppState>,
     list: ListState,
     rows: Vec<Row>,
-    chat_id: Option<String>,
+    chat_id: Option<ServerRef>,
     row_cache: HashMap<String, CachedRows>,
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
@@ -927,9 +927,9 @@ pub struct Transcript {
     attachment_preview: Option<crate::attachments::PreviewImage>,
     /// In-flight ReadAttachmentChunk loads, keyed `(deviceId, path)` — one per
     /// source; results land in the global attachment cache.
-    attachment_loads: HashMap<(String, String), Task<()>>,
+    attachment_loads: HashMap<(ServerId, String, String), Task<()>>,
     /// Scheduled retry wake-ups for errored sources (the 2s→15s ladder).
-    attachment_retries: HashMap<(String, String), Task<()>>,
+    attachment_retries: HashMap<(ServerId, String, String), Task<()>>,
     _observe: Subscription,
 }
 
@@ -1201,7 +1201,7 @@ impl Transcript {
             )
         };
 
-        let attached = selected != self.chat_id;
+        let attached = transcript_owner_changed(self.chat_id.as_ref(), selected.as_ref());
         if attached {
             self.chat_id = selected;
             self.rows.clear();
@@ -1219,6 +1219,9 @@ impl Transcript {
             self.spring_settled_at = None;
             self.spring_kick = false;
             self.show_jump_button = false;
+            self.attachment_loads.clear();
+            self.attachment_retries.clear();
+            self.attachment_preview = None;
         }
 
         let mut new_rows: Vec<Row> = Vec::new();
@@ -1371,18 +1374,30 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> crate::attachments::AttachmentSnapshot {
         use crate::attachments::{AttachmentSnapshot, attachment_snapshot, begin_load};
+        let Some(server_id) = self.state.read(cx).selected_server_id().cloned() else {
+            return AttachmentSnapshot::Error {
+                retry_in: Duration::MAX,
+            };
+        };
         for dev in device_ids {
-            if let AttachmentSnapshot::Loaded(image) = attachment_snapshot(dev, path) {
+            if let AttachmentSnapshot::Loaded(image) = attachment_snapshot(&server_id, dev, path) {
                 return AttachmentSnapshot::Loaded(image);
             }
         }
         let mut any_loading = false;
         let mut min_retry: Option<Duration> = None;
         for dev in device_ids {
-            if begin_load(dev, path) {
-                self.spawn_attachment_load(dev.clone(), path.to_string(), cx);
+            if begin_load(&server_id, dev, path) {
+                let generation = crate::attachments::attachment_generation(&server_id);
+                self.spawn_attachment_load(
+                    server_id.clone(),
+                    dev.clone(),
+                    path.to_string(),
+                    generation,
+                    cx,
+                );
             }
-            match attachment_snapshot(dev, path) {
+            match attachment_snapshot(&server_id, dev, path) {
                 AttachmentSnapshot::Loaded(image) => return AttachmentSnapshot::Loaded(image),
                 AttachmentSnapshot::Loading => any_loading = true,
                 AttachmentSnapshot::Error { retry_in } => {
@@ -1396,7 +1411,11 @@ impl Transcript {
         match min_retry {
             Some(retry_in) => {
                 if let Some(dev) = device_ids.first() {
-                    self.schedule_attachment_retry((dev.clone(), path.to_string()), retry_in, cx);
+                    self.schedule_attachment_retry(
+                        (server_id, dev.clone(), path.to_string()),
+                        retry_in,
+                        cx,
+                    );
                 }
                 AttachmentSnapshot::Error { retry_in }
             }
@@ -1407,28 +1426,41 @@ impl Transcript {
         }
     }
 
-    fn spawn_attachment_load(&mut self, device_id: String, path: String, cx: &mut Context<Self>) {
-        use crate::attachments::{read_attachment_image, store_error, store_loaded};
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            store_error(&device_id, &path);
+    fn spawn_attachment_load(
+        &mut self,
+        server_id: ServerId,
+        device_id: String,
+        path: String,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::attachments::{
+            read_attachment_image, store_error_for_generation, store_loaded_for_generation,
+        };
+        let owner = ServerRef::new(server_id.clone(), "attachment");
+        let Some(engine) = self.state.read(cx).client_for(&owner) else {
+            store_error_for_generation(&server_id, &device_id, &path, generation);
             return;
         };
-        let local = self.state.read(cx).local_device_id.clone();
-        // Relay-forward only for a genuinely remote owner; the local device's
-        // files are served directly.
-        let target = (local.as_deref() != Some(device_id.as_str())).then(|| device_id.clone());
-        let key = (device_id.clone(), path.clone());
+        let key = (server_id.clone(), device_id.clone(), path.clone());
         let task = cx.spawn(async move |this, cx| {
-            match read_attachment_image(&engine, cx.background_executor(), target.as_deref(), &path)
-                .await
-            {
-                Some(loaded) => store_loaded(&device_id, &path, loaded.name.into(), loaded.image),
-                None => store_error(&device_id, &path),
+            match read_attachment_image(&engine, cx.background_executor(), &path).await {
+                Some(loaded) => store_loaded_for_generation(
+                    &server_id,
+                    &device_id,
+                    &path,
+                    loaded.name.into(),
+                    loaded.image,
+                    generation,
+                ),
+                None => store_error_for_generation(&server_id, &device_id, &path, generation),
             }
             this.update(cx, |transcript, cx| {
-                transcript
-                    .attachment_loads
-                    .remove(&(device_id.clone(), path.clone()));
+                transcript.attachment_loads.remove(&(
+                    server_id.clone(),
+                    device_id.clone(),
+                    path.clone(),
+                ));
                 cx.notify();
             })
             .ok();
@@ -1440,7 +1472,7 @@ impl Transcript {
     /// re-renders the thumb, whose `begin_load` then claims the retry.
     fn schedule_attachment_retry(
         &mut self,
-        key: (String, String),
+        key: (ServerId, String, String),
         delay: Duration,
         cx: &mut Context<Self>,
     ) {
@@ -1948,6 +1980,10 @@ impl Transcript {
     }
 }
 
+fn transcript_owner_changed(previous: Option<&ServerRef>, selected: Option<&ServerRef>) -> bool {
+    previous != selected
+}
+
 /// A sent message's text with its file-mention chips. The same recipe as the
 /// markdown renderer's inline code (`flat_text_element`): chip ranges shape in
 /// the mono font at `code_text` violet, [`StyledText`] supplies wrapped glyph
@@ -2341,6 +2377,14 @@ impl Render for Transcript {
 mod tests {
     use super::*;
     use comet_doc::MessagePart;
+
+    #[test]
+    fn equal_raw_chat_ids_on_different_servers_are_a_new_attachment() {
+        let b = comet_proto::ServerRef::new(comet_proto::ServerId::new("server-b"), "chat-1");
+        let c = comet_proto::ServerRef::new(comet_proto::ServerId::new("server-c"), "chat-1");
+
+        assert!(transcript_owner_changed(Some(&b), Some(&c)));
+    }
 
     // ---- streaming parse wiring (the transcript side, not the parser) ----
 
