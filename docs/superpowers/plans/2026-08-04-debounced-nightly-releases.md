@@ -4,7 +4,7 @@
 
 **Goal:** Publish immutable Linux, macOS, and Windows GitHub prereleases after `main` has been quiet for 30 minutes, with no Cloudflare deployment or R2 publication.
 
-**Architecture:** A single push/manual GitHub Actions workflow owns debounce, version derivation, platform builds, artifact collection, and GitHub Release creation. Workflow-level concurrency cancels the whole pending/building pipeline on a newer commit. A stdlib Python regression test locks down the workflow contract, while PyYAML and local build checks provide syntax and packaging verification.
+**Architecture:** A single push/manual GitHub Actions workflow owns debounce, version derivation, platform builds, artifact collection, and GitHub Release creation. Workflow-level concurrency cancels the whole pending/building pipeline on a newer commit. PyYAML semantic tests inspect the parsed workflow structure, while actionlint and local build checks provide GitHub Actions and packaging verification.
 
 **Tech Stack:** GitHub Actions YAML, Bash, PowerShell, Python `unittest`, Cargo/Rust, `softprops/action-gh-release@v3`.
 
@@ -44,12 +44,15 @@
 
 - [ ] **Step 1: Write the failing regression test**
 
-Create `scripts/tests/test_release_workflow.py`:
+Create `scripts/tests/test_release_workflow.py`. Workflow YAML is the
+human-approved configuration exception to strict TDD; test its parsed semantics
+rather than grepping source text:
 
 ```python
-import re
 import unittest
 from pathlib import Path
+
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -60,7 +63,9 @@ RELEASE = WORKFLOWS / "release.yml"
 class ReleaseWorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.workflow = RELEASE.read_text(encoding="utf-8")
+        cls.workflow = yaml.load(
+            RELEASE.read_text(encoding="utf-8"), Loader=yaml.BaseLoader
+        )
 
     def test_only_release_workflow_remains(self):
         self.assertEqual(
@@ -69,44 +74,55 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
 
     def test_pushes_to_main_and_manual_dispatch_trigger_releases(self):
-        self.assertRegex(
-            self.workflow,
-            r"(?ms)^on:\s*\n\s+push:\s*\n\s+branches: \[main\]\s*\n\s+workflow_dispatch:",
-        )
-        self.assertNotIn("tags:", self.workflow)
-        self.assertNotIn("schedule:", self.workflow)
+        events = self.workflow["on"]
+        self.assertEqual(events["push"]["branches"], ["main"])
+        self.assertIn("workflow_dispatch", events)
+        self.assertNotIn("schedule", events)
 
     def test_new_push_cancels_and_restarts_the_quiet_period(self):
-        self.assertRegex(self.workflow, r"(?ms)^concurrency:\s*\n\s+group: nightly-release\s*\n\s+cancel-in-progress: true")
-        self.assertIn("if: github.event_name == 'push'", self.workflow)
-        self.assertIn("sleep 1800", self.workflow)
+        self.assertEqual(
+            self.workflow["concurrency"],
+            {"group": "nightly-release", "cancel-in-progress": "true"},
+        )
+        steps = self.workflow["jobs"]["prepare"]["steps"]
+        quiet = next(step for step in steps if step.get("name") == "wait for 30 minutes of silence")
+        self.assertEqual(quiet["if"], "github.event_name == 'push'")
+        self.assertEqual(quiet["run"], "sleep 1800")
 
     def test_version_is_immutable_semver_prerelease(self):
-        self.assertIn("github.run_number", self.workflow)
-        self.assertIn('date -u +%Y%m%d', self.workflow)
-        self.assertIn('g${source_sha:0:7}', self.workflow)
-        self.assertIn('tag=v$version', self.workflow)
+        steps = self.workflow["jobs"]["prepare"]["steps"]
+        derive = next(step for step in steps if step.get("id") == "release")["run"]
+        self.assertIn("github.run_number", derive)
+        self.assertIn("date -u +%Y%m%d", derive)
+        self.assertIn("g${source_sha:0:7}", derive)
+        self.assertIn("tag=v$version", derive)
 
     def test_all_platforms_are_packaged(self):
-        for runner in (
-            "ubuntu-24.04",
-            "ubuntu-24.04-arm",
-            "macos-latest",
-            "windows-latest",
-        ):
-            self.assertIn(runner, self.workflow)
-        self.assertIn("scripts/package-linux.sh", self.workflow)
-        self.assertIn("scripts/package-macos.sh", self.workflow)
-        self.assertIn("Compress-Archive", self.workflow)
-        self.assertIn("windows-x86_64.zip", self.workflow)
+        jobs = self.workflow["jobs"]
+        linux_runners = {
+            row["runner"] for row in jobs["linux"]["strategy"]["matrix"]["include"]
+        }
+        self.assertEqual(linux_runners, {"ubuntu-24.04", "ubuntu-24.04-arm"})
+        self.assertEqual(jobs["macos"]["runs-on"], "macos-latest")
+        self.assertEqual(jobs["macos"]["continue-on-error"], "true")
+        self.assertEqual(jobs["windows"]["runs-on"], "windows-latest")
+        windows_package = next(
+            step for step in jobs["windows"]["steps"] if step.get("name") == "build and package"
+        )["run"]
+        self.assertIn("Compress-Archive", windows_package)
+        self.assertIn("windows-x86_64.zip", windows_package)
 
     def test_publication_is_github_only_prerelease(self):
-        self.assertIn("softprops/action-gh-release@v3", self.workflow)
-        self.assertIn("prerelease: true", self.workflow)
-        self.assertIn("make_latest: false", self.workflow)
-        self.assertIn("target_commitish:", self.workflow)
-        for obsolete in ("cloudflare", "wrangler", "r2 object", "manifest.json"):
-            self.assertNotIn(obsolete, self.workflow.lower())
+        publish = self.workflow["jobs"]["publish"]
+        release = next(
+            step for step in publish["steps"] if step.get("uses") == "softprops/action-gh-release@v3"
+        )
+        self.assertEqual(release["with"]["prerelease"], "true")
+        self.assertEqual(release["with"]["make_latest"], "false")
+        self.assertEqual(
+            release["with"]["target_commitish"],
+            "${{ needs.prepare.outputs.source_sha }}",
+        )
 
 
 if __name__ == "__main__":
@@ -281,10 +297,11 @@ Run:
 ```powershell
 python -m unittest scripts.tests.test_release_workflow -v
 python -c "from pathlib import Path; import yaml; [yaml.safe_load(path.read_text()) for path in Path('.github/workflows').glob('*.yml')]; print('workflow YAML parsed')"
+actionlint .github/workflows/release.yml
 git diff --check
 ```
 
-Expected: all unit tests pass, PyYAML prints `workflow YAML parsed`, and `git diff --check` is silent.
+Expected: all unit tests pass, PyYAML prints `workflow YAML parsed`, actionlint exits 0, and `git diff --check` is silent.
 
 - [ ] **Step 10: Commit the workflow implementation**
 
@@ -333,6 +350,7 @@ Expected: Cargo exits 0 and `Test-Path` prints `True`. Do not modify the local w
 ```powershell
 python -m unittest discover -s scripts/tests -p 'test_*.py' -v
 python -c "from pathlib import Path; import yaml; [yaml.safe_load(path.read_text()) for path in Path('.github/workflows').glob('*.yml')]; print('workflow YAML parsed')"
+actionlint .github/workflows/release.yml
 rg -n -i "cloudflare|wrangler|r2 object|manifest\.json" .github/workflows
 git diff --check
 git status --short
