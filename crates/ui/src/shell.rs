@@ -98,6 +98,48 @@ pub fn cluster_clearance(is_macos: bool, fullscreen: bool, container_pad: f32) -
         .max(0.0)
 }
 
+pub const WINDOWS_CAPTION_BUTTON_WIDTH: f32 = 46.0;
+pub const WINDOWS_CAPTION_CLUSTER_WIDTH: f32 = WINDOWS_CAPTION_BUTTON_WIDTH * 3.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+enum WindowsCaptionButton {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+
+pub fn windows_caption_clearance(is_windows: bool, fullscreen: bool) -> f32 {
+    if is_windows && !fullscreen {
+        WINDOWS_CAPTION_CLUSTER_WIDTH
+    } else {
+        0.0
+    }
+}
+
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+fn windows_caption_buttons(is_maximized: bool) -> [WindowsCaptionButton; 3] {
+    [
+        WindowsCaptionButton::Minimize,
+        if is_maximized {
+            WindowsCaptionButton::Restore
+        } else {
+            WindowsCaptionButton::Maximize
+        },
+        WindowsCaptionButton::Close,
+    ]
+}
+
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+fn windows_caption_font_for_build(build: u32) -> &'static str {
+    if build >= 22_000 {
+        "Segoe Fluent Icons"
+    } else {
+        "Segoe MDL2 Assets"
+    }
+}
+
 /// (Re-)apply the whole app keymap: clears every binding, restores the composer
 /// map, then binds the customizable shortcuts from `keymap` (feature-inventory
 /// §1.4). Invalid persisted combos fall back to that shortcut's default.
@@ -1410,6 +1452,13 @@ impl Shell {
         cluster + CLUSTER_BUTTONS_WIDTH + 10.0
     }
 
+    fn windows_caption_clearance(&self) -> f32 {
+        windows_caption_clearance(
+            cfg!(target_os = "windows"),
+            self.fullscreen.unwrap_or(false),
+        )
+    }
+
     /// The unified window titlebar: chat → the session tab strip; settings →
     /// the section label. Full-width on the glass shell; the traffic lights
     /// and control cluster overlay its left end.
@@ -1423,7 +1472,7 @@ impl Shell {
                     .items_center()
                     .pt(px(Theme::TITLEBAR_TOP_PAD))
                     .pl(px(self.title_bar_content_start()))
-                    .pr(px(Theme::SPACE_LG));
+                    .pr(px(Theme::SPACE_LG + self.windows_caption_clearance()));
                 let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
                 self.titlebar_drag_region("settings-header-titlebar", bar, cx)
                     .into_any_element()
@@ -1528,6 +1577,36 @@ impl Shell {
                 cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
             ))
             .into_any_element()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn render_windows_caption_controls(&self, window: &Window, cx: &App) -> Option<AnyElement> {
+        if self.fullscreen.unwrap_or(false) {
+            return None;
+        }
+
+        let theme = Theme::of(cx);
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .h(px(Theme::TITLEBAR_HEIGHT))
+                .flex()
+                .flex_row()
+                .font_family(windows_caption_font())
+                .children(
+                    windows_caption_buttons(window.is_maximized())
+                        .into_iter()
+                        .map(|button| render_windows_caption_button(button, theme)),
+                )
+                .into_any_element(),
+        )
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn render_windows_caption_controls(&self, _window: &Window, _cx: &App) -> Option<AnyElement> {
+        None
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -3089,6 +3168,93 @@ fn window_control_button(
         .child(icon(icon_path).size(px(16.0)).text_color(muted))
 }
 
+#[cfg(target_os = "windows")]
+fn windows_caption_font() -> &'static str {
+    use windows::Wdk::System::SystemServices::RtlGetVersion;
+
+    let mut version = unsafe { std::mem::zeroed() };
+    let status = unsafe { RtlGetVersion(&mut version) };
+    let build = if status.is_ok() {
+        version.dwBuildNumber
+    } else {
+        0
+    };
+    windows_caption_font_for_build(build)
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsCaptionButton {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Minimize => "windows-minimize",
+            Self::Maximize => "windows-maximize",
+            Self::Restore => "windows-restore",
+            Self::Close => "windows-close",
+        }
+    }
+
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::Minimize => "\u{e921}",
+            Self::Maximize => "\u{e922}",
+            Self::Restore => "\u{e923}",
+            Self::Close => "\u{e8bb}",
+        }
+    }
+
+    fn control_area(self) -> WindowControlArea {
+        match self {
+            Self::Minimize => WindowControlArea::Min,
+            Self::Maximize | Self::Restore => WindowControlArea::Max,
+            Self::Close => WindowControlArea::Close,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn render_windows_caption_button(button: WindowsCaptionButton, theme: &Theme) -> AnyElement {
+    let (hover_bg, hover_fg, active_bg, active_fg) = match button {
+        WindowsCaptionButton::Close => {
+            let color: gpui::Hsla = gpui::Rgba {
+                r: 232.0 / 255.0,
+                g: 17.0 / 255.0,
+                b: 32.0 / 255.0,
+                a: 1.0,
+            }
+            .into();
+            (
+                color,
+                gpui::white(),
+                color.opacity(0.8),
+                gpui::white().opacity(0.8),
+            )
+        }
+        _ => (
+            theme.glass_hover(),
+            theme.text,
+            theme.glass_hover().opacity(0.8),
+            theme.text,
+        ),
+    };
+
+    div()
+        .id(button.id())
+        .w(px(WINDOWS_CAPTION_BUTTON_WIDTH))
+        .h(px(Theme::TITLEBAR_HEIGHT))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(10.0))
+        .text_color(theme.text)
+        .hover(|style| style.bg(hover_bg).text_color(hover_fg))
+        .active(|style| style.bg(active_bg).text_color(active_fg))
+        .occlude()
+        .window_control_area(button.control_area())
+        .child(button.glyph())
+        .into_any_element()
+}
+
 /// A titlebar history button (comet window-controls.tsx): enabled it is a
 /// normal window-control button; disabled it dims to 35% opacity and ignores
 /// the pointer (`disabled:pointer-events-none disabled:opacity-35`).
@@ -3401,6 +3567,7 @@ impl Render for Shell {
                             .child(right),
                     )
                     .child(self.render_titlebar_cluster(cx))
+                    .children(self.render_windows_caption_controls(window, cx))
                     .children(overlays);
                 root.child(sidebar_tone)
                     .child(motion::fade_in("phase-app", page))
@@ -3440,6 +3607,40 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_caption_clearance_is_platform_and_fullscreen_aware() {
+        assert_eq!(windows_caption_clearance(true, false), 46.0 * 3.0);
+        assert_eq!(windows_caption_clearance(true, true), 0.0);
+        assert_eq!(windows_caption_clearance(false, false), 0.0);
+        assert_eq!(windows_caption_clearance(false, true), 0.0);
+    }
+
+    #[test]
+    fn windows_caption_sequence_tracks_maximized_state() {
+        assert_eq!(
+            windows_caption_buttons(false),
+            [
+                WindowsCaptionButton::Minimize,
+                WindowsCaptionButton::Maximize,
+                WindowsCaptionButton::Close,
+            ]
+        );
+        assert_eq!(
+            windows_caption_buttons(true),
+            [
+                WindowsCaptionButton::Minimize,
+                WindowsCaptionButton::Restore,
+                WindowsCaptionButton::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_caption_font_changes_at_windows_11_build() {
+        assert_eq!(windows_caption_font_for_build(21_999), "Segoe MDL2 Assets");
+        assert_eq!(windows_caption_font_for_build(22_000), "Segoe Fluent Icons");
+    }
 
     #[test]
     fn titlebar_cluster_matches_comet_window_controls() {
