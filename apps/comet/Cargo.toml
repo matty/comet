@@ -20,6 +20,7 @@ tokio.workspace = true
 clap.workspace = true
 mimalloc.workspace = true
 anyhow.workspace = true
+home.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
