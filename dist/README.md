@@ -73,9 +73,16 @@ needs Metal; no cross-build from Linux):
 
 ## Nightly GitHub releases
 
-Every push to `main` starts a release run after a 30-minute quiet period. A new
-push resets that quiet period by cancelling the in-progress run. A manual
-`workflow_dispatch` run bypasses the wait.
+The workflow runs on a schedule, every two hours (`0 */2 * * *`), and can also
+be started manually with `workflow_dispatch`. Each run pins the current
+`origin/main` commit and checks whether a nightly tag already exists for it;
+if so, the run skips the build entirely and finishes green, and if not, it
+builds and publishes from that commit.
+
+A commit that lands while a build is running does not disturb it: the run in
+flight keeps publishing from the commit it pinned, and the next scheduled run
+picks up the newer commit. Scheduled runs happen only in the canonical
+`matty/comet` repository; forks do no build work.
 
 Each run derives an immutable prerelease version from the workspace version,
 UTC date, GitHub run number, and source commit, for example
