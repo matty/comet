@@ -26,21 +26,22 @@ class ReleaseWorkflowTests(unittest.TestCase):
             ["release.yml"],
         )
 
-    def test_pushes_to_main_and_manual_dispatch_trigger_releases(self):
+    def test_schedule_and_manual_dispatch_trigger_releases(self):
         events = self.workflow["on"]
-        self.assertEqual(events["push"]["branches"], ["main"])
+        self.assertEqual(events["schedule"], [{"cron": "0 */2 * * *"}])
         self.assertIn("workflow_dispatch", events)
-        self.assertNotIn("schedule", events)
+        self.assertNotIn("push", events)
 
-    def test_new_push_cancels_and_restarts_the_quiet_period(self):
+    def test_scheduled_runs_queue_instead_of_cancelling(self):
         self.assertEqual(
             self.workflow["concurrency"],
-            {"group": "nightly-release", "cancel-in-progress": "true"},
+            {"group": "nightly-release", "cancel-in-progress": "false"},
         )
+
+    def test_no_quiet_period_remains(self):
         steps = self.workflow["jobs"]["prepare"]["steps"]
-        quiet = next(step for step in steps if step.get("name") == "wait for 30 minutes of silence")
-        self.assertEqual(quiet["if"], "github.event_name == 'push'")
-        self.assertEqual(quiet["run"], "sleep 1800")
+        sleeps = [step for step in steps if "sleep" in step.get("run", "")]
+        self.assertEqual(sleeps, [], "the debounce quiet period must be removed")
 
     def test_version_is_immutable_semver_prerelease(self):
         steps = self.workflow["jobs"]["prepare"]["steps"]

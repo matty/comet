@@ -1,8 +1,8 @@
 name: nightly release
 
 on:
-  push:
-    branches: [main]
+  schedule:
+    - cron: "0 */2 * * *"
   workflow_dispatch:
 
 permissions:
@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: nightly-release
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   prepare:
@@ -20,9 +20,6 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       source_sha: ${{ steps.release.outputs.source_sha }}
     steps:
-      - name: wait for 30 minutes of silence
-        if: github.event_name == 'push'
-        run: sleep 1800
       - uses: actions/checkout@v6
         with:
           ref: main
