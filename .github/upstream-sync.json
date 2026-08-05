@@ -1,0 +1,121 @@
+{
+  "commits": {
+    "760ea9a44b5d7b69b68fccbca39cf7fff66879fc": {
+      "decision_date": "2026-08-05",
+      "local_commit": "adc28704de3159960b4a9494ce824ab5296113e9",
+      "note": "Implemented by the earlier fork GPU-memory adaptation.",
+      "outcome": "implemented",
+      "subject": "Bound GPU memory: fork rev bump + actually free evicted attachment images",
+      "upstream_sha": "760ea9a44b5d7b69b68fccbca39cf7fff66879fc"
+    },
+    "79c8e22898d8c7b45150c06a8c6e97de64cfbd0d": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable because the LAN-only fork has no hosted workspace snapshot backing service.",
+      "outcome": "not-applicable",
+      "subject": "Expose GET /workspace/:orgId/snapshot for doc repair reads",
+      "upstream_sha": "79c8e22898d8c7b45150c06a8c6e97de64cfbd0d"
+    },
+    "7b52ce1f70b3dddf13756358c4dc1f9d810a0bad": {
+      "decision_date": "2026-08-05",
+      "local_commit": "3e5ea92a87775cd1f56e9ad1790a0a037c95cec6",
+      "note": "Implemented by the earlier fork TUI-removal adaptation.",
+      "outcome": "implemented",
+      "subject": "Remove the TUI: crates/tui, apps/tui, comet tui subcommand, scripts, docs",
+      "upstream_sha": "7b52ce1f70b3dddf13756358c4dc1f9d810a0bad"
+    },
+    "b01943979d3732fd615ab2c002185dbb1016a601": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable because edge/src/session-room.ts was removed with the hosted workspace service.",
+      "outcome": "not-applicable",
+      "subject": "Workspace rooms force-trim only at aged checkpoints, never the live frontier",
+      "upstream_sha": "b01943979d3732fd615ab2c002185dbb1016a601"
+    },
+    "c1243c5ab187f39c58905edc8b195504a005a51f": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable because edge/src/session-room.ts was removed with the hosted workspace service.",
+      "outcome": "not-applicable",
+      "subject": "Penalty-box devices whose imports keep failing — stop the doomed-push DOS",
+      "upstream_sha": "c1243c5ab187f39c58905edc8b195504a005a51f"
+    },
+    "ff124f4142144285b8f10df152837f55c35ab20a": {
+      "decision_date": "2026-08-05",
+      "local_commit": "6a6f6b8fc3c1895f076d2b1b9208eb034b7df67f",
+      "note": "Implemented by the earlier patch-equivalent fork commit.",
+      "outcome": "implemented",
+      "subject": "Show owning device in session rows: space@device",
+      "upstream_sha": "ff124f4142144285b8f10df152837f55c35ab20a"
+    },
+    "ff5e483baf2a25c994c86949183c6ab6a6469612": {
+      "decision_date": "2026-08-05",
+      "local_commit": "4a3c10163dd8e3bdb4994f4c6a7c00b333340315",
+      "note": "Implemented through the earlier merged fork caption-controls PR.",
+      "outcome": "implemented",
+      "subject": "Add native Windows caption controls (#16)",
+      "upstream_sha": "ff5e483baf2a25c994c86949183c6ab6a6469612"
+    }
+  },
+  "runs": [
+    {
+      "date": "2026-08-05",
+      "decisions": [
+        {
+          "local_commit": "6a6f6b8fc3c1895f076d2b1b9208eb034b7df67f",
+          "note": "Implemented by the earlier patch-equivalent fork commit.",
+          "outcome": "implemented",
+          "subject": "Show owning device in session rows: space@device",
+          "upstream_sha": "ff124f4142144285b8f10df152837f55c35ab20a"
+        },
+        {
+          "local_commit": "adc28704de3159960b4a9494ce824ab5296113e9",
+          "note": "Implemented by the earlier fork GPU-memory adaptation.",
+          "outcome": "implemented",
+          "subject": "Bound GPU memory: fork rev bump + actually free evicted attachment images",
+          "upstream_sha": "760ea9a44b5d7b69b68fccbca39cf7fff66879fc"
+        },
+        {
+          "local_commit": "4a3c10163dd8e3bdb4994f4c6a7c00b333340315",
+          "note": "Implemented through the earlier merged fork caption-controls PR.",
+          "outcome": "implemented",
+          "subject": "Add native Windows caption controls (#16)",
+          "upstream_sha": "ff5e483baf2a25c994c86949183c6ab6a6469612"
+        },
+        {
+          "local_commit": "3e5ea92a87775cd1f56e9ad1790a0a037c95cec6",
+          "note": "Implemented by the earlier fork TUI-removal adaptation.",
+          "outcome": "implemented",
+          "subject": "Remove the TUI: crates/tui, apps/tui, comet tui subcommand, scripts, docs",
+          "upstream_sha": "7b52ce1f70b3dddf13756358c4dc1f9d810a0bad"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable because edge/src/session-room.ts was removed with the hosted workspace service.",
+          "outcome": "not-applicable",
+          "subject": "Workspace rooms force-trim only at aged checkpoints, never the live frontier",
+          "upstream_sha": "b01943979d3732fd615ab2c002185dbb1016a601"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable because edge/src/session-room.ts was removed with the hosted workspace service.",
+          "outcome": "not-applicable",
+          "subject": "Penalty-box devices whose imports keep failing — stop the doomed-push DOS",
+          "upstream_sha": "c1243c5ab187f39c58905edc8b195504a005a51f"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable because the LAN-only fork has no hosted workspace snapshot backing service.",
+          "outcome": "not-applicable",
+          "subject": "Expose GET /workspace/:orgId/snapshot for doc repair reads",
+          "upstream_sha": "79c8e22898d8c7b45150c06a8c6e97de64cfbd0d"
+        }
+      ],
+      "kind": "bootstrap",
+      "run_id": "bootstrap-2026-08-05",
+      "sync_branch": null,
+      "target_branch": "main"
+    }
+  ],
+  "schema_version": 1
+}

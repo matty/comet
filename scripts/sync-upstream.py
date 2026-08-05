@@ -1,7 +1,9 @@
 import argparse
 from dataclasses import dataclass
 from datetime import date
+import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import Callable, Sequence, TextIO
@@ -15,6 +17,46 @@ class Commit:
     date: str
     author: str
     subject: str
+
+
+OUTCOMES = frozenset({"implemented", "not-applicable", "deferred"})
+FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+
+
+@dataclass(frozen=True)
+class LedgerEntry:
+    upstream_sha: str
+    subject: str
+    outcome: str
+    decision_date: str
+    note: str
+    local_commit: str | None = None
+
+
+@dataclass(frozen=True)
+class RunDecision:
+    upstream_sha: str
+    subject: str
+    outcome: str
+    note: str
+    local_commit: str | None = None
+
+
+@dataclass(frozen=True)
+class SyncRun:
+    run_id: str
+    kind: str
+    date: str
+    target_branch: str
+    sync_branch: str | None
+    decisions: tuple[RunDecision, ...]
+
+
+@dataclass(frozen=True)
+class Ledger:
+    schema_version: int
+    commits: dict[str, LedgerEntry]
+    runs: tuple[SyncRun, ...]
 
 
 class SyncError(RuntimeError):
@@ -59,6 +101,224 @@ class Git:
         if check and result.returncode != 0:
             raise GitError(list(args), result.returncode, result.stdout, result.stderr)
         return result
+
+
+def _require_object(value: object, context: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise SyncError(f"{context} must be a JSON object.")
+    return value
+
+
+def _require_keys(
+    value: dict[str, object],
+    required: set[str],
+    context: str,
+    optional: set[str] | None = None,
+) -> None:
+    optional = optional or set()
+    missing = required - value.keys()
+    extra = value.keys() - required - optional
+    if missing:
+        raise SyncError(
+            f"{context} is missing fields: {', '.join(sorted(missing))}."
+        )
+    if extra:
+        raise SyncError(
+            f"{context} has unknown fields: {', '.join(sorted(extra))}."
+        )
+
+
+def _require_string(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SyncError(f"{field} must be a non-empty string.")
+    return value
+
+
+def _require_sha(value: object, field: str) -> str:
+    sha = _require_string(value, field)
+    if FULL_SHA.fullmatch(sha) is None:
+        raise SyncError(f"{field} must be a full lowercase SHA.")
+    return sha
+
+
+def _require_date(value: object, field: str) -> str:
+    text = _require_string(value, field)
+    try:
+        date.fromisoformat(text)
+    except ValueError as error:
+        raise SyncError(f"{field} must use YYYY-MM-DD format.") from error
+    return text
+
+
+def _parse_decision(value: object, context: str) -> RunDecision:
+    data = _require_object(value, context)
+    _require_keys(
+        data,
+        {"upstream_sha", "subject", "outcome", "note"},
+        context,
+        {"local_commit"},
+    )
+    upstream_sha = _require_sha(data["upstream_sha"], f"{context}.upstream_sha")
+    subject = _require_string(data["subject"], f"{context}.subject")
+    outcome = _require_string(data["outcome"], f"{context}.outcome")
+    if outcome not in OUTCOMES:
+        raise SyncError(f"{context}.outcome has an unsupported outcome: {outcome}.")
+    note = _require_string(data["note"], f"{context}.note")
+    local_value = data.get("local_commit")
+    local_commit = None
+    if local_value is not None:
+        local_commit = _require_sha(local_value, f"{context}.local_commit")
+    if outcome != "implemented" and local_commit is not None:
+        raise SyncError(
+            f"{context}.local_commit is only valid for implemented commits."
+        )
+    return RunDecision(upstream_sha, subject, outcome, note, local_commit)
+
+
+def _parse_entry(key: str, value: object) -> LedgerEntry:
+    context = f"commits[{key}]"
+    data = _require_object(value, context)
+    _require_keys(
+        data,
+        {
+            "upstream_sha",
+            "subject",
+            "outcome",
+            "decision_date",
+            "note",
+        },
+        context,
+        {"local_commit"},
+    )
+    decision = _parse_decision(
+        {
+            name: data[name]
+            for name in ("upstream_sha", "subject", "outcome", "note")
+        }
+        | ({"local_commit": data["local_commit"]} if "local_commit" in data else {}),
+        context,
+    )
+    if key != decision.upstream_sha:
+        raise SyncError(f"{context}.upstream_sha does not match its object key.")
+    decision_date = _require_date(data["decision_date"], f"{context}.decision_date")
+    return LedgerEntry(
+        decision.upstream_sha,
+        decision.subject,
+        decision.outcome,
+        decision_date,
+        decision.note,
+        decision.local_commit,
+    )
+
+
+def _parse_run(value: object, index: int) -> SyncRun:
+    context = f"runs[{index}]"
+    data = _require_object(value, context)
+    _require_keys(
+        data,
+        {
+            "run_id",
+            "kind",
+            "date",
+            "target_branch",
+            "sync_branch",
+            "decisions",
+        },
+        context,
+    )
+    run_id = _require_string(data["run_id"], f"{context}.run_id")
+    kind = _require_string(data["kind"], f"{context}.kind")
+    if kind not in {"bootstrap", "sync"}:
+        raise SyncError(f"{context}.kind must be bootstrap or sync.")
+    run_date = _require_date(data["date"], f"{context}.date")
+    target = _require_string(data["target_branch"], f"{context}.target_branch")
+    sync_value = data["sync_branch"]
+    if kind == "bootstrap":
+        if sync_value is not None:
+            raise SyncError(f"{context} bootstrap run must not have a sync branch.")
+        sync_branch = None
+    else:
+        sync_branch = _require_string(sync_value, f"{context}.sync_branch")
+    decisions_value = data["decisions"]
+    if not isinstance(decisions_value, list) or not decisions_value:
+        raise SyncError(f"{context}.decisions must be a non-empty list.")
+    decisions = tuple(
+        _parse_decision(item, f"{context}.decisions[{decision_index}]")
+        for decision_index, item in enumerate(decisions_value)
+    )
+    return SyncRun(run_id, kind, run_date, target, sync_branch, decisions)
+
+
+def load_ledger(path: Path) -> Ledger:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise SyncError(f"Unable to read upstream sync ledger: {error}.") from error
+    except json.JSONDecodeError as error:
+        raise SyncError(f"Upstream sync ledger is invalid JSON: {error.msg}.") from error
+    data = _require_object(document, "ledger")
+    _require_keys(data, {"schema_version", "commits", "runs"}, "ledger")
+    if data["schema_version"] != 1:
+        raise SyncError(
+            f"Unsupported upstream sync ledger schema version: "
+            f"{data['schema_version']}."
+        )
+    commits_value = _require_object(data["commits"], "ledger.commits")
+    commits = {key: _parse_entry(key, value) for key, value in commits_value.items()}
+    runs_value = data["runs"]
+    if not isinstance(runs_value, list):
+        raise SyncError("ledger.runs must be a JSON list.")
+    runs = tuple(_parse_run(value, index) for index, value in enumerate(runs_value))
+    run_ids = [run.run_id for run in runs]
+    if len(run_ids) != len(set(run_ids)):
+        raise SyncError("Duplicate run ID in upstream sync ledger.")
+    return Ledger(1, commits, runs)
+
+
+def _decision_document(decision: RunDecision) -> dict[str, object]:
+    return {
+        "upstream_sha": decision.upstream_sha,
+        "subject": decision.subject,
+        "outcome": decision.outcome,
+        "note": decision.note,
+        "local_commit": decision.local_commit,
+    }
+
+
+def serialize_ledger(ledger: Ledger) -> str:
+    document = {
+        "schema_version": ledger.schema_version,
+        "commits": {
+            sha: {
+                "upstream_sha": entry.upstream_sha,
+                "subject": entry.subject,
+                "outcome": entry.outcome,
+                "decision_date": entry.decision_date,
+                "note": entry.note,
+                "local_commit": entry.local_commit,
+            }
+            for sha, entry in ledger.commits.items()
+        },
+        "runs": [
+            {
+                "run_id": run.run_id,
+                "kind": run.kind,
+                "date": run.date,
+                "target_branch": run.target_branch,
+                "sync_branch": run.sync_branch,
+                "decisions": [
+                    _decision_document(decision) for decision in run.decisions
+                ],
+            }
+            for run in ledger.runs
+        ],
+    }
+    return json.dumps(document, indent=2, sort_keys=True) + "\n"
+
+
+def write_ledger(path: Path, ledger: Ledger) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as output:
+        output.write(serialize_ledger(ledger))
 
 
 def repository_root(git: Git) -> Path:
