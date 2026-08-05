@@ -1,4 +1,6 @@
-//! Login-shell PATH snapshot.
+//! The system's own PATH, recovered when our process PATH is not enough.
+//!
+//! ## Unix: the login-shell snapshot
 //!
 //! GUI/service launches (Dock, Finder, launchd, systemd) never run the user's
 //! shell init, so the daemon's own PATH misses everything the shell shapes:
@@ -20,41 +22,246 @@
 //!   printing (or grandchildren inheriting the pipe) can't wedge us.
 //! - A hard per-attempt timeout kills the shell.
 //!
-//! Set `COMET_NO_LOGIN_SHELL=1` to disable the snapshot entirely.
+//! ## Windows: the persisted environment
+//!
+//! Windows has no shell init to consult — a process inherits whatever PATH its
+//! parent held. For a GUI launch the parent is `explorer.exe`, whose copy was
+//! snapshotted when the desktop started: any installer that has edited PATH
+//! since (or that installed while the desktop was already up) is invisible to
+//! the app, though it resolves fine in a freshly-opened console. That is the
+//! exact shape of "harness binary not found: codex" from an app whose console
+//! `codex` works. The authority Explorer itself re-reads is the registry, so
+//! that is what we read: the machine and user `Path` values, composed the way
+//! Windows composes them for a new session.
+//!
+//! Set `COMET_NO_LOGIN_SHELL=1` to disable the recovery entirely (both
+//! platforms).
 
 use std::ffi::OsStr;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::ffi::OsString;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::OnceLock;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 static CACHE: OnceLock<Option<OsString>> = OnceLock::new();
 
-/// The PATH the user's login shell reports, captured once and cached for the
-/// life of the process. `None` when disabled, non-unix, no usable shell, or
-/// the shell never produced a parseable snapshot.
-pub fn login_shell_path() -> Option<&'static OsStr> {
+/// The PATH the system would give a freshly-started user session, captured
+/// once and cached for the life of the process. `None` when disabled, on an
+/// unsupported platform, or when the platform's source yielded nothing usable.
+pub fn system_path() -> Option<&'static OsStr> {
     #[cfg(unix)]
     {
         CACHE.get_or_init(unix::capture).as_deref()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        CACHE.get_or_init(windows_env::capture).as_deref()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         None
     }
 }
 
-/// Kick off the snapshot on a background thread so the first harness resolve
-/// doesn't pay the shell-startup latency inline. Call at daemon startup.
+/// True when the user has switched the recovery off.
+#[cfg(any(unix, windows))]
+fn disabled() -> bool {
+    std::env::var_os("COMET_NO_LOGIN_SHELL").is_some_and(|v| !v.is_empty())
+}
+
+/// Kick off the capture on a background thread so the first harness resolve
+/// doesn't pay for it inline (on unix that is a whole shell startup). Call at
+/// daemon startup.
 pub fn prewarm() {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let _ = std::thread::Builder::new()
             .name("comet-shell-env".into())
             .spawn(|| {
-                let _ = login_shell_path();
+                let _ = system_path();
             });
+    }
+}
+
+#[cfg(windows)]
+mod windows_env {
+    //! The persisted machine + user `Path` from the registry — the values
+    //! Explorer itself reads to build a new session's environment.
+
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ,
+        RRF_RT_REG_SZ, RegGetValueW,
+    };
+
+    const MACHINE_ENV: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+    const USER_ENV: &str = "Environment";
+
+    pub(super) fn capture() -> Option<OsString> {
+        if super::disabled() {
+            return None;
+        }
+        let machine = read_string(HKEY_LOCAL_MACHINE, MACHINE_ENV, "Path");
+        let user = read_string(HKEY_CURRENT_USER, USER_ENV, "Path");
+        compose(machine.as_deref(), user.as_deref())
+    }
+
+    /// Compose the session PATH the way Windows does — machine entries first,
+    /// then the user's — expanding `%VAR%` references and dropping duplicates
+    /// (path comparison on Windows is case-insensitive).
+    pub(super) fn compose(machine: Option<&str>, user: Option<&str>) -> Option<OsString> {
+        let mut seen = std::collections::HashSet::new();
+        let mut entries: Vec<String> = Vec::new();
+        for raw in machine.into_iter().chain(user) {
+            for entry in raw.split(';') {
+                let expanded = expand(entry.trim());
+                let trimmed = expanded.trim_end_matches('\\');
+                // `C:\` is the drive ROOT; `C:` is that drive's current
+                // directory — never let trailing-slash normalization turn one
+                // into the other.
+                let entry = if trimmed.ends_with(':') {
+                    expanded.as_str()
+                } else {
+                    trimmed
+                };
+                if entry.is_empty() || !seen.insert(entry.to_lowercase()) {
+                    continue;
+                }
+                entries.push(entry.to_owned());
+            }
+        }
+        (!entries.is_empty()).then(|| OsString::from(entries.join(";")))
+    }
+
+    /// Expand `%VAR%` against our own environment. An unknown variable is left
+    /// verbatim, exactly as Windows leaves it — the entry then simply fails to
+    /// match any file, which is the correct outcome.
+    fn expand(raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len());
+        let mut rest = raw;
+        while let Some(start) = rest.find('%') {
+            let after = &rest[start + 1..];
+            let Some(end) = after.find('%') else {
+                break;
+            };
+            let name = &after[..end];
+            match std::env::var(name) {
+                Ok(value) if !name.is_empty() => {
+                    out.push_str(&rest[..start]);
+                    out.push_str(&value);
+                }
+                // Unknown (or an empty `%%`): keep the literal text.
+                _ => out.push_str(&rest[..start + 1 + end + 1]),
+            }
+            rest = &after[end + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// Read one REG_SZ/REG_EXPAND_SZ value, unexpanded (we expand ourselves so
+    /// the composition is one testable code path). `None` on any failure — a
+    /// missing value is ordinary, not an error worth surfacing.
+    fn read_string(root: HKEY, subkey: &str, value: &str) -> Option<String> {
+        let subkey = wide(subkey);
+        let value = wide(value);
+        let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+        let mut bytes: u32 = 0;
+        // SAFETY: both name pointers are null-terminated UTF-16 living past the
+        // call; a null data pointer with a live size out-param is the API's
+        // documented size-probe form.
+        let status = unsafe {
+            RegGetValueW(
+                root,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                flags,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut bytes,
+            )
+        };
+        if status != ERROR_SUCCESS || bytes == 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; (bytes as usize).div_ceil(2)];
+        let mut bytes_out = bytes;
+        // SAFETY: as above, with a buffer of exactly the size just reported.
+        let status = unsafe {
+            RegGetValueW(
+                root,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                flags,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut bytes_out,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return None;
+        }
+        let len = (bytes_out as usize / 2).min(buf.len());
+        let text = OsString::from_wide(&buf[..len]);
+        let text = text.to_string_lossy().trim_end_matches('\0').to_owned();
+        (!text.is_empty()).then_some(text)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn composes_machine_then_user_without_duplicates() {
+            let composed = compose(
+                Some(r"C:\Windows\system32;C:\Windows;"),
+                Some(r"C:\Users\u\bin;C:\WINDOWS\SYSTEM32\"),
+            )
+            .unwrap();
+            assert_eq!(
+                composed.to_string_lossy(),
+                r"C:\Windows\system32;C:\Windows;C:\Users\u\bin"
+            );
+        }
+
+        #[test]
+        fn expands_known_variables_and_keeps_unknown_ones() {
+            // SAFETY: test-local variable, read back on this thread only.
+            unsafe { std::env::set_var("COMET_TEST_ROOT", r"C:\root") };
+            let composed =
+                compose(None, Some(r"%COMET_TEST_ROOT%\bin;%COMET_NOT_SET%\bin")).unwrap();
+            assert_eq!(
+                composed.to_string_lossy(),
+                r"C:\root\bin;%COMET_NOT_SET%\bin"
+            );
+        }
+
+        #[test]
+        fn a_drive_root_keeps_its_slash() {
+            let composed = compose(Some(r"C:\;D:\tools\"), None).unwrap();
+            assert_eq!(composed.to_string_lossy(), r"C:\;D:\tools");
+        }
+
+        #[test]
+        fn empty_sources_yield_nothing() {
+            assert!(compose(None, None).is_none());
+            assert!(compose(Some(";  ;"), Some("")).is_none());
+        }
+
+        #[test]
+        fn the_real_machine_path_is_readable() {
+            // Every Windows install has a machine Path; if this regresses, the
+            // registry read itself is broken.
+            assert!(read_string(HKEY_LOCAL_MACHINE, MACHINE_ENV, "Path").is_some());
+        }
     }
 }
 
@@ -77,7 +284,7 @@ mod unix {
     const EXIT_FLUSH_GRACE: Duration = Duration::from_millis(250);
 
     pub(super) fn capture() -> Option<OsString> {
-        if std::env::var_os("COMET_NO_LOGIN_SHELL").is_some_and(|v| !v.is_empty()) {
+        if super::disabled() {
             return None;
         }
         let shell = user_shell()?;

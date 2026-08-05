@@ -515,7 +515,16 @@ impl AgentAccounts {
             .root_dir()
             .join(format!(".login-{login_id}"));
         std::fs::create_dir_all(&home)?;
-        let mut child = match tokio::process::Command::new("codex")
+        // Resolve exactly as a run does, rather than trusting our own PATH: a
+        // GUI launch's PATH can miss the CLI entirely (stale Explorer snapshot
+        // on Windows, no shell init on macOS), and an npm-installed codex is a
+        // `.cmd` shim that a bare "codex" never matches.
+        let exe = comet_harness::resolve_codex_executable().ok_or_else(|| {
+            EngineError::Other(
+                "The `codex` CLI was not found on this device — install it first.".into(),
+            )
+        })?;
+        let mut child = match tokio::process::Command::new(&exe)
             .arg("login")
             .env("CODEX_HOME", &home)
             .stdin(std::process::Stdio::null())

@@ -40,48 +40,37 @@ use normalize::Normalizer;
 use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
 
 /// Locate the device's installed Claude Code CLI: `CLAUDE_CODE_EXECUTABLE`,
-/// then our own PATH, then the login-shell PATH snapshot (the user's shell
-/// init shapes PATH in ways a GUI/service launch never sees — see
-/// [`crate::shell_env`]), then known install locations as a last resort.
-/// Resolved per call — cheap after the snapshot is cached.
-fn resolve_claude_executable() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("CLAUDE_CODE_EXECUTABLE")
-        && !p.is_empty()
-    {
-        return Some(PathBuf::from(p));
+/// then our own PATH, then the system's own PATH (a GUI/service launch's PATH
+/// misses what the user's shell init shapes on unix, and goes stale against
+/// the persisted environment on Windows — see [`crate::shell_env`]), then
+/// known install locations as a last resort. Resolved per call — cheap after
+/// the snapshot is cached.
+pub fn resolve_claude_executable() -> Option<PathBuf> {
+    crate::resolve_cli("CLAUDE_CODE_EXECUTABLE", "claude", claude_install_dirs())
+}
+
+/// Where a Claude Code CLI lands when PATH doesn't name it.
+fn claude_install_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(home) = crate::home_dir() {
+        dirs.push(home.join(".claude").join("local"));
+        // The native installer's per-user dir on every platform, `claude.exe`
+        // included.
+        dirs.push(home.join(".local").join("bin"));
     }
-    let exe = if cfg!(windows) {
-        "claude.exe"
-    } else {
-        "claude"
-    };
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
+    if cfg!(windows) {
+        dirs.extend(
+            crate::env_dir("LOCALAPPDATA")
+                .map(|d| d.join("Microsoft").join("WinGet").join("Links")),
         );
+        if let Some(home) = crate::home_dir() {
+            dirs.push(home.join("scoop").join("shims"));
+        }
+    } else {
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        dirs.push(PathBuf::from("/usr/local/bin"));
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        candidates.push(home.join(".claude").join("local").join("claude"));
-        candidates.push(home.join(".local").join("bin").join("claude"));
-    }
-    candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
-    candidates.push(PathBuf::from("/usr/local/bin/claude"));
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
+    dirs
 }
 
 fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
@@ -135,13 +124,10 @@ impl ClaudeHarness {
             return Ok(p.clone());
         }
         resolve_claude_executable().ok_or_else(|| {
-            HarnessError::NotInstalled(
-                "claude (searched PATH, the login shell's PATH, ~/.claude/local, \
-                 ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, and \
-                 fnm/nvm/volta/pnpm/bun install dirs; set CLAUDE_CODE_EXECUTABLE \
-                 to override)"
-                    .into(),
-            )
+            HarnessError::NotInstalled(crate::not_installed_message(
+                "claude",
+                "CLAUDE_CODE_EXECUTABLE",
+            ))
         })
     }
 

@@ -55,45 +55,42 @@ use normalize::{
 use rpc::{Incoming, RpcClient};
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
-/// PATH, then the login-shell PATH snapshot (the user's shell init shapes
-/// PATH in ways a GUI/service launch never sees — see [`crate::shell_env`]),
-/// then known install locations as a last resort. Resolved per call — cheap
-/// after the snapshot is cached.
-fn resolve_codex_executable() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("CODEX_EXECUTABLE")
-        && !p.is_empty()
-    {
-        return Some(PathBuf::from(p));
+/// PATH, then the system's own PATH (a GUI/service launch's PATH misses what
+/// the user's shell init shapes on unix, and goes stale against the persisted
+/// environment on Windows — see [`crate::shell_env`]), then known install
+/// locations as a last resort. Resolved per call — cheap after the snapshot is
+/// cached.
+pub fn resolve_codex_executable() -> Option<PathBuf> {
+    crate::resolve_cli("CODEX_EXECUTABLE", "codex", codex_install_dirs())
+}
+
+/// Where a Codex CLI lands when PATH doesn't name it.
+fn codex_install_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(home) = crate::home_dir() {
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".codex").join("bin"));
+        dirs.push(home.join(".npm-global").join("bin"));
     }
-    let exe = if cfg!(windows) { "codex.exe" } else { "codex" };
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
+    if cfg!(windows) {
+        // The official Windows installer is per-user under LOCALAPPDATA; the
+        // rest are the package managers' shim dirs (all `.cmd`/`.exe`).
+        dirs.extend(
+            crate::env_dir("LOCALAPPDATA")
+                .map(|d| d.join("Programs").join("OpenAI").join("Codex").join("bin")),
         );
+        dirs.extend(
+            crate::env_dir("LOCALAPPDATA")
+                .map(|d| d.join("Microsoft").join("WinGet").join("Links")),
+        );
+        if let Some(home) = crate::home_dir() {
+            dirs.push(home.join("scoop").join("shims"));
+        }
+    } else {
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        dirs.push(PathBuf::from("/usr/local/bin"));
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        candidates.push(home.join(".local").join("bin").join("codex"));
-        candidates.push(home.join(".codex").join("bin").join("codex"));
-        candidates.push(home.join(".npm-global").join("bin").join("codex"));
-    }
-    candidates.push(PathBuf::from("/opt/homebrew/bin/codex"));
-    candidates.push(PathBuf::from("/usr/local/bin/codex"));
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
+    dirs
 }
 
 /// True when `cwd` is a LINKED git worktree whose checked-out branch name
@@ -167,13 +164,7 @@ impl CodexHarness {
             return Ok(p.clone());
         }
         resolve_codex_executable().ok_or_else(|| {
-            HarnessError::NotInstalled(
-                "codex (searched PATH, the login shell's PATH, ~/.local/bin, \
-                 ~/.codex/bin, ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, \
-                 and fnm/nvm/volta/pnpm/bun install dirs; set CODEX_EXECUTABLE to \
-                 override)"
-                    .into(),
-            )
+            HarnessError::NotInstalled(crate::not_installed_message("codex", "CODEX_EXECUTABLE"))
         })
     }
 }
