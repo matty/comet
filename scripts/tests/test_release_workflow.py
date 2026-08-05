@@ -132,7 +132,8 @@ version = "0.61"
         derive = next(
             step for step in prepare["steps"] if step.get("id") == "release"
         )["run"]
-        self.assertIn("git ls-remote --tags origin", derive)
+        self.assertIn('tags="$(git ls-remote --tags origin)"', derive)
+        self.assertNotIn("| grep", derive)
         self.assertIn(r".g${source_sha:0:7}$", derive)
         self.assertIn('echo "needed=false" >> "$GITHUB_OUTPUT"', derive)
         self.assertIn('echo "needed=true" >> "$GITHUB_OUTPUT"', derive)

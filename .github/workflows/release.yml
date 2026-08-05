@@ -31,7 +31,8 @@ jobs:
         run: |
           git fetch origin main
           source_sha="$(git rev-parse origin/main)"
-          if git ls-remote --tags origin | grep -q "refs/tags/v.*-nightly\..*\.g${source_sha:0:7}$"; then
+          tags="$(git ls-remote --tags origin)"
+          if grep -q "refs/tags/v.*-nightly\..*\.g${source_sha:0:7}$" <<<"$tags"; then
             echo "$source_sha already has a nightly release" >&2
             echo "needed=false" >> "$GITHUB_OUTPUT"
             exit 0
