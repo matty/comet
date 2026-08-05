@@ -573,6 +573,11 @@ class DiscoveryTests(unittest.TestCase):
 
 
 class SelectionTests(unittest.TestCase):
+    def test_blank_selection_is_allowed_only_when_requested(self):
+        self.assertEqual(sync.parse_selection("", DISPLAYED, allow_empty=True), [])
+        with self.assertRaisesRegex(ValueError, "Select at least one"):
+            sync.parse_selection("", DISPLAYED)
+
     def test_parse_single_selection(self):
         self.assertEqual(
             [commit.oid for commit in sync.parse_selection("2", DISPLAYED)],

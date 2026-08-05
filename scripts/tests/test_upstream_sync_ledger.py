@@ -1,5 +1,7 @@
 import importlib.util
+import io
 import json
+from datetime import date
 from pathlib import Path
 import sys
 import tempfile
@@ -154,6 +156,182 @@ class LedgerValidationTests(unittest.TestCase):
         document = valid_document()
         document["runs"][0]["sync_branch"] = "sync/upstream-2026-08-05"
         self.assert_invalid(document, "bootstrap")
+
+
+class LedgerPolicyTests(unittest.TestCase):
+    def commit(self, character, subject):
+        return sync.Commit(
+            character * 40,
+            character * 7,
+            "2026-08-05",
+            "Author",
+            subject,
+        )
+
+    def entry(self, commit, outcome, local_commit=None):
+        return sync.LedgerEntry(
+            commit.oid,
+            commit.subject,
+            outcome,
+            "2026-08-05",
+            f"{outcome} note",
+            local_commit,
+        )
+
+    def test_filter_resolved_keeps_only_deferred_and_unknown(self):
+        implemented = self.commit("a", "Implemented")
+        not_applicable = self.commit("b", "Not applicable")
+        deferred = self.commit("c", "Deferred")
+        unknown = self.commit("d", "Unknown")
+        ledger = sync.Ledger(
+            1,
+            {
+                implemented.oid: self.entry(
+                    implemented, "implemented", "e" * 40
+                ),
+                not_applicable.oid: self.entry(
+                    not_applicable, "not-applicable"
+                ),
+                deferred.oid: self.entry(deferred, "deferred"),
+            },
+            (),
+        )
+
+        self.assertEqual(
+            [
+                commit.oid
+                for commit in sync.filter_resolved(
+                    [implemented, not_applicable, deferred, unknown], ledger
+                )
+            ],
+            [deferred.oid, unknown.oid],
+        )
+
+    def test_unselected_defaults_to_deferred(self):
+        commit = self.commit("a", "Later")
+        decisions = sync.classify_unselected(
+            [commit], set(), lambda prompt: "", io.StringIO()
+        )
+        self.assertEqual(decisions[0].outcome, "deferred")
+        self.assertEqual(
+            decisions[0].note, "Deferred during interactive review."
+        )
+
+    def test_not_applicable_requires_a_reason(self):
+        commit = self.commit("a", "Hosted change")
+        answers = iter(["n", "", "Hosted workspace service was removed."])
+        output = io.StringIO()
+        decisions = sync.classify_unselected(
+            [commit], set(), lambda prompt: next(answers), output
+        )
+        self.assertEqual(decisions[0].outcome, "not-applicable")
+        self.assertEqual(
+            decisions[0].note, "Hosted workspace service was removed."
+        )
+        self.assertIn("Reason is required", output.getvalue())
+
+    def test_selected_commits_are_not_classified(self):
+        commit = self.commit("a", "Selected")
+
+        def unexpected_prompt(prompt):
+            self.fail(f"unexpected prompt: {prompt}")
+
+        self.assertEqual(
+            sync.classify_unselected(
+                [commit], {commit.oid}, unexpected_prompt, io.StringIO()
+            ),
+            [],
+        )
+
+    def test_invalid_classification_is_retried(self):
+        commit = self.commit("a", "Later")
+        answers = iter(["x", "d"])
+        output = io.StringIO()
+        decisions = sync.classify_unselected(
+            [commit], set(), lambda prompt: next(answers), output
+        )
+        self.assertEqual(decisions[0].outcome, "deferred")
+        self.assertIn("Choose d or n", output.getvalue())
+
+    def test_build_sync_run_preserves_exact_upstream_order(self):
+        newest = self.commit("c", "Newest")
+        middle = self.commit("b", "Middle")
+        oldest = self.commit("a", "Oldest")
+        classifications = [
+            sync.RunDecision(
+                newest.oid,
+                newest.subject,
+                "deferred",
+                "Deferred during interactive review.",
+            ),
+            sync.RunDecision(
+                oldest.oid,
+                oldest.subject,
+                "not-applicable",
+                "Not used by this fork.",
+            ),
+        ]
+        branch = "sync/upstream-2026-08-05-2"
+        run = sync.build_sync_run(
+            date(2026, 8, 5),
+            "main",
+            branch,
+            [newest, middle, oldest],
+            {middle.oid: "d" * 40},
+            classifications,
+        )
+        self.assertEqual(run.run_id, branch)
+        self.assertEqual(
+            [decision.upstream_sha for decision in run.decisions],
+            [oldest.oid, middle.oid, newest.oid],
+        )
+        self.assertEqual(run.decisions[1].outcome, "implemented")
+
+    def test_apply_run_updates_current_state_without_mutating_history(self):
+        commit = self.commit("a", "Reconsidered")
+        original = sync.Ledger(
+            1,
+            {commit.oid: self.entry(commit, "deferred")},
+            (),
+        )
+        run = sync.SyncRun(
+            "sync/upstream-2026-08-05",
+            "sync",
+            "2026-08-05",
+            "main",
+            "sync/upstream-2026-08-05",
+            (
+                sync.RunDecision(
+                    commit.oid,
+                    commit.subject,
+                    "not-applicable",
+                    "Not used by this fork.",
+                ),
+            ),
+        )
+        updated = sync.apply_run(original, run)
+        self.assertEqual(original.commits[commit.oid].outcome, "deferred")
+        self.assertEqual(updated.commits[commit.oid].outcome, "not-applicable")
+        self.assertEqual(updated.runs, (run,))
+
+    def test_apply_run_rejects_duplicate_run_id(self):
+        run = sync.SyncRun(
+            "sync/upstream-2026-08-05",
+            "sync",
+            "2026-08-05",
+            "main",
+            "sync/upstream-2026-08-05",
+            (
+                sync.RunDecision(
+                    "a" * 40,
+                    "Change",
+                    "deferred",
+                    "Deferred during interactive review.",
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(sync.SyncError, "Duplicate run ID"):
+            sync.apply_run(sync.Ledger(1, {}, (run,)), run)
 
 
 if __name__ == "__main__":

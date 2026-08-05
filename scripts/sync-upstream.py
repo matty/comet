@@ -371,6 +371,15 @@ def discover_commits(git: Git, target: str) -> list[Commit]:
     return commits
 
 
+def filter_resolved(commits: list[Commit], ledger: Ledger) -> list[Commit]:
+    return [
+        commit
+        for commit in commits
+        if ledger.commits.get(commit.oid) is None
+        or ledger.commits[commit.oid].outcome == "deferred"
+    ]
+
+
 def existing_branches(git: Git) -> set[str]:
     result = git.run(
         "for-each-ref",
@@ -380,8 +389,14 @@ def existing_branches(git: Git) -> set[str]:
     return {line for line in result.stdout.splitlines() if line}
 
 
-def parse_selection(text: str, commits: list[Commit]) -> list[Commit]:
+def parse_selection(
+    text: str,
+    commits: list[Commit],
+    allow_empty: bool = False,
+) -> list[Commit]:
     if not text.strip():
+        if allow_empty:
+            return []
         raise ValueError("Select at least one commit.")
     indexes: set[int] = set()
     for token in (part.strip() for part in text.split(",")):
@@ -404,6 +419,108 @@ def parse_selection(text: str, commits: list[Commit]) -> list[Commit]:
     chosen = [commits[index - 1] for index in indexes]
     position = {commit.oid: index for index, commit in enumerate(commits)}
     return sorted(chosen, key=lambda commit: position[commit.oid], reverse=True)
+
+
+def classify_unselected(
+    commits: list[Commit],
+    selected_oids: set[str],
+    input_fn: Callable[[str], str],
+    output: TextIO,
+) -> list[RunDecision]:
+    decisions = []
+    for commit in commits:
+        if commit.oid in selected_oids:
+            continue
+        while True:
+            answer = input_fn(
+                f"Commit {commit.short_oid} was not selected: "
+                "[d]efer/[n]ot-applicable [d] "
+            ).strip().lower()
+            if answer in {"", "d", "defer", "deferred"}:
+                decisions.append(
+                    RunDecision(
+                        commit.oid,
+                        commit.subject,
+                        "deferred",
+                        "Deferred during interactive review.",
+                    )
+                )
+                break
+            if answer in {"n", "not-applicable"}:
+                while True:
+                    reason = input_fn(
+                        "Reason this commit is not applicable: "
+                    ).strip()
+                    if reason:
+                        decisions.append(
+                            RunDecision(
+                                commit.oid,
+                                commit.subject,
+                                "not-applicable",
+                                reason,
+                            )
+                        )
+                        break
+                    print("Reason is required.", file=output)
+                break
+            print("Choose d or n.", file=output)
+    return decisions
+
+
+def build_sync_run(
+    day: date,
+    target: str,
+    sync_branch: str,
+    commits: list[Commit],
+    local_commits: dict[str, str],
+    classifications: list[RunDecision],
+) -> SyncRun:
+    classifications_by_oid = {
+        decision.upstream_sha: decision for decision in classifications
+    }
+    known_oids = {commit.oid for commit in commits}
+    supplied_oids = set(local_commits) | set(classifications_by_oid)
+    if supplied_oids != known_oids:
+        raise SyncError("Run decisions do not match the discovered commits.")
+    decisions = []
+    for commit in reversed(commits):
+        local_commit = local_commits.get(commit.oid)
+        if local_commit is not None:
+            decisions.append(
+                RunDecision(
+                    commit.oid,
+                    commit.subject,
+                    "implemented",
+                    "Cherry-picked by upstream sync helper.",
+                    local_commit,
+                )
+            )
+        else:
+            decisions.append(classifications_by_oid[commit.oid])
+    return SyncRun(
+        sync_branch,
+        "sync",
+        day.isoformat(),
+        target,
+        sync_branch,
+        tuple(decisions),
+    )
+
+
+def apply_run(ledger: Ledger, run: SyncRun) -> Ledger:
+    if any(existing.run_id == run.run_id for existing in ledger.runs):
+        raise SyncError(f"Duplicate run ID in upstream sync ledger: {run.run_id}.")
+    commits = dict(ledger.commits)
+    for decision in run.decisions:
+        commits[decision.upstream_sha] = LedgerEntry(
+            decision.upstream_sha,
+            decision.subject,
+            decision.outcome,
+            run.date,
+            decision.note,
+            decision.local_commit,
+        )
+    return Ledger(ledger.schema_version, commits, ledger.runs + (run,))
 
 
 def next_branch_name(existing: set[str], day: date) -> str:

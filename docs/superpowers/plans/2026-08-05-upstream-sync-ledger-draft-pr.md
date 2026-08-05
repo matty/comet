@@ -159,7 +159,7 @@ git commit -m "feat: seed upstream sync decision ledger"
 
 **Interfaces:**
 - Consumes: `Commit`, `Ledger`, `LedgerEntry`, `RunDecision`, and `SyncRun` from Task 1.
-- Produces: `filter_resolved(commits: list[Commit], ledger: Ledger) -> list[Commit]`; `parse_selection(text: str, commits: list[Commit], allow_empty: bool = False) -> list[Commit]`; `classify_unselected(commits: list[Commit], selected_oids: set[str], input_fn: Callable[[str], str], output: TextIO) -> list[RunDecision]`; `build_sync_run(day: date, target: str, sync_branch: str, selected: list[Commit], local_commits: dict[str, str], classifications: list[RunDecision]) -> SyncRun`; `apply_run(ledger: Ledger, run: SyncRun) -> Ledger`.
+- Produces: `filter_resolved(commits: list[Commit], ledger: Ledger) -> list[Commit]`; `parse_selection(text: str, commits: list[Commit], allow_empty: bool = False) -> list[Commit]`; `classify_unselected(commits: list[Commit], selected_oids: set[str], input_fn: Callable[[str], str], output: TextIO) -> list[RunDecision]`; `build_sync_run(day: date, target: str, sync_branch: str, commits: list[Commit], local_commits: dict[str, str], classifications: list[RunDecision]) -> SyncRun`; `apply_run(ledger: Ledger, run: SyncRun) -> Ledger`.
 
 - [ ] **Step 1: Add failing filtering and classification tests**
 
