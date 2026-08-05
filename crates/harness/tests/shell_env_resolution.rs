@@ -50,7 +50,7 @@ async fn cli_on_login_shell_path_only_is_resolved() {
         std::env::remove_var("COMET_NO_LOGIN_SHELL");
     }
 
-    let snapshot = comet_harness::shell_env::login_shell_path().expect("snapshot captured");
+    let snapshot = comet_harness::shell_env::system_path().expect("snapshot captured");
     let snapshot = snapshot.to_string_lossy();
     assert!(
         snapshot.starts_with(&format!("{}:", shell_bin.display())),

@@ -69,14 +69,114 @@ pub mod codex;
 pub mod mock;
 pub mod shell_env;
 
+/// The user's home directory. A Windows GUI or service launch routinely has no
+/// `HOME` (Comet's own startup seeds it, but this crate must not depend on the
+/// binary that links it), so `USERPROFILE` is the documented fallback.
+pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()))
+        .map(std::path::PathBuf::from)
+}
+
+/// A directory from an environment variable, ignoring unset/empty values.
+pub(crate) fn env_dir(var: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os(var)
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The file names a CLI can have on this platform, most specific first. Unix
+/// has one; Windows decides executability by EXTENSION, and the npm-installed
+/// CLIs ship there as `.cmd` shims only — never `<name>` or `<name>.exe`.
+/// (`.ps1` is deliberately absent: CreateProcess cannot run it.)
+pub(crate) fn executable_names(stem: &str) -> Vec<String> {
+    if cfg!(windows) {
+        vec![
+            format!("{stem}.exe"),
+            format!("{stem}.cmd"),
+            format!("{stem}.bat"),
+        ]
+    } else {
+        vec![stem.to_owned()]
+    }
+}
+
+/// Resolve an installed CLI: `$override_var`, then our own PATH, then the
+/// system's own PATH (the login-shell snapshot on unix, the persisted machine +
+/// user environment on Windows — see [`shell_env`]), then `known_dirs` and the
+/// Node version managers' bin dirs as a last resort. Each directory is probed
+/// with every [`executable_names`] spelling.
+pub(crate) fn resolve_cli(
+    override_var: &str,
+    stem: &str,
+    known_dirs: Vec<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os(override_var).filter(|p| !p.is_empty()) {
+        return Some(std::path::PathBuf::from(p));
+    }
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    if let Some(system_path) = shell_env::system_path() {
+        dirs.extend(std::env::split_paths(system_path));
+    }
+    dirs.extend(known_dirs);
+    dirs.extend(node_version_manager_bins());
+    let names = executable_names(stem);
+    dirs.into_iter()
+        .filter(|d| !d.as_os_str().is_empty())
+        .flat_map(|dir| {
+            names
+                .iter()
+                .map(|name| dir.join(name))
+                .collect::<Vec<std::path::PathBuf>>()
+        })
+        // `is_file` rather than `exists`: a DIRECTORY named `codex` on PATH
+        // would otherwise resolve and then fail at spawn.
+        .find(|p| p.is_file())
+}
+
+/// The `NotInstalled` message: what was searched and how to override it. The
+/// searched locations differ per platform, so the prose does too.
+pub(crate) fn not_installed_message(stem: &str, override_var: &str) -> String {
+    let locations = if cfg!(windows) {
+        "PATH, the persisted machine/user PATH, %LOCALAPPDATA%\\Programs, \
+         %APPDATA%\\npm, the WinGet/scoop shim dirs, and volta/fnm/pnpm/bun \
+         install dirs"
+    } else {
+        "PATH, the login shell's PATH, ~/.local/bin, the CLI's own install dir, \
+         /opt/homebrew/bin, /usr/local/bin, and fnm/nvm/volta/pnpm/bun install dirs"
+    };
+    format!("{stem} (searched {locations}; set {override_var} to override)")
+}
+
 /// Bin directories where npm-installed CLIs land under Node version managers.
 /// GUI launches never see these on PATH — the managers shape PATH in shell
 /// init (fnm's per-shell multishells, nvm's shell function), which a
 /// Dock/Finder-launched app never runs.
 pub(crate) fn node_version_manager_bins() -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = home_dir();
     let mut dirs: Vec<PathBuf> = Vec::new();
+    if cfg!(windows) {
+        // Windows managers keep shims in fixed per-user dirs, and the version
+        // dirs hold the shims directly (no `bin` subdir).
+        dirs.extend(env_dir("APPDATA").map(|d| d.join("npm")));
+        for root in env_dir("FNM_DIR")
+            .into_iter()
+            .chain(env_dir("APPDATA").map(|d| d.join("fnm")))
+        {
+            dirs.push(root.join("aliases").join("default"));
+        }
+        dirs.extend(env_dir("LOCALAPPDATA").map(|d| d.join("Volta").join("bin")));
+        dirs.extend(env_dir("LOCALAPPDATA").map(|d| d.join("pnpm")));
+        if let Some(home) = &home {
+            dirs.push(home.join(".bun").join("bin"));
+        }
+        return dirs;
+    }
     // fnm: `aliases/default` is a stable symlink to the active default
     // installation (the multishell PATH entries are ephemeral, per-shell).
     let mut fnm_roots: Vec<PathBuf> = std::env::var_os("FNM_DIR")
@@ -123,8 +223,8 @@ pub(crate) fn compose_child_path(cmd: &mut tokio::process::Command, exe: &std::p
     if let Some(path) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&path));
     }
-    if let Some(shell_path) = shell_env::login_shell_path() {
-        paths.extend(std::env::split_paths(shell_path));
+    if let Some(system_path) = shell_env::system_path() {
+        paths.extend(std::env::split_paths(system_path));
     }
     let mut seen = std::collections::HashSet::new();
     paths.retain(|p| !p.as_os_str().is_empty() && seen.insert(p.clone()));
@@ -206,5 +306,5 @@ pub(crate) fn crash_message(
     }
 }
 
-pub use claude::ClaudeHarness;
-pub use codex::CodexHarness;
+pub use claude::{ClaudeHarness, resolve_claude_executable};
+pub use codex::{CodexHarness, resolve_codex_executable};
