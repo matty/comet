@@ -55,6 +55,11 @@ class LocalRepositoryIntegrationTests(unittest.TestCase):
             git("clone", str(upstream), str(fork))
             git("config", "user.name", "Comet Test", cwd=fork)
             git("config", "user.email", "comet-test@example.invalid", cwd=fork)
+            (fork / ".github").mkdir()
+            ledger_path = fork / ".github" / "upstream-sync.json"
+            sync.write_ledger(ledger_path, sync.Ledger(1, {}, ()))
+            git("add", ".github/upstream-sync.json", cwd=fork)
+            git("commit", "-m", "Seed empty upstream ledger", cwd=fork)
             base_oid = git("rev-parse", "main", cwd=fork).stdout.strip()
 
             (source / "first.txt").write_text("first\n", encoding="utf-8")
@@ -66,39 +71,20 @@ class LocalRepositoryIntegrationTests(unittest.TestCase):
             git("push", "origin", "main", cwd=source)
 
             git("remote", "add", "upstream", str(upstream), cwd=fork)
-            offline_entrypoint = """
-import importlib.util
-import sys
+            answers = iter(["1,2", "yes"])
+            output = io.StringIO()
+            with mock.patch.object(sync, "is_expected_upstream", return_value=True):
+                result = sync.start_workflow(
+                    sync.Git(fork),
+                    TrackedWorkflowGh(),
+                    lambda prompt: next(answers),
+                    output,
+                    date(2026, 8, 5),
+                    ledger_path,
+                )
 
-spec = importlib.util.spec_from_file_location("sync_upstream_offline", sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-expected_upstream = module.is_expected_upstream
-module.is_expected_upstream = lambda url: (
-    expected_upstream(url) or url == sys.argv[2]
-)
-raise SystemExit(module.main([]))
-"""
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    offline_entrypoint,
-                    str(SCRIPT_PATH),
-                    str(upstream),
-                ],
-                cwd=fork,
-                input="1,2\nyes\n",
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            eligible_output = result.stdout.split(
-                "Selected commits (oldest first):", 1
-            )[0]
+            self.assertEqual(result, 0)
+            eligible_output = output.getvalue().split("Run summary:", 1)[0]
             self.assertLess(
                 eligible_output.index("Second upstream change"),
                 eligible_output.index("First upstream change"),
@@ -112,7 +98,17 @@ raise SystemExit(module.main([]))
             ).stdout.splitlines()
             self.assertEqual(
                 subjects,
-                ["Second upstream change", "First upstream change"],
+                [
+                    "chore: record upstream sync sync/upstream-2026-08-05",
+                    "Second upstream change",
+                    "First upstream change",
+                ],
+            )
+            ledger = sync.load_ledger(ledger_path)
+            self.assertEqual(len(ledger.runs), 1)
+            self.assertTrue(
+                all(entry.outcome == "implemented"
+                    for entry in ledger.commits.values())
             )
             self.assertEqual(git("status", "--porcelain", cwd=fork).stdout, "")
             self.assertEqual(git("rev-parse", "main", cwd=fork).stdout.strip(), base_oid)
@@ -152,23 +148,55 @@ class ScriptedGh:
         return response
 
 
-class WorkflowGit:
-    def __init__(self, commits=DISPLAYED, existing=None, cherry_pick_failures=None):
+class TrackedWorkflowGit:
+    def __init__(
+        self,
+        root,
+        commits,
+        local_commits=None,
+        cherry_pick_failure=None,
+        push_failure=None,
+    ):
+        self.cwd = Path(root)
         self.commits = commits
-        self.existing = existing or set()
-        self.cherry_pick_failures = cherry_pick_failures or {}
+        self.local_commits = local_commits or {
+            commit.oid: f"{index + 1:x}" * 40
+            for index, commit in enumerate(reversed(commits))
+        }
+        self.cherry_pick_failure = cherry_pick_failure
+        self.push_failure = push_failure
+        self.current_branch = "main"
+        self.branches = {"main"}
+        self.head = "f" * 40
+        self.cherry_pick_head = None
         self.commands = []
+
+    @property
+    def pending_path(self):
+        return self.cwd / ".git" / "upstream-sync-state.json"
+
+    def complete_conflict(self, local_commit):
+        self.head = local_commit
+        self.cherry_pick_head = None
+
+    def abort_conflict(self):
+        self.cherry_pick_head = None
 
     def run(self, *args, check=True):
         self.commands.append((args, check))
+        returncode = 0
+        stdout = ""
+        stderr = ""
         if args == ("status", "--porcelain"):
-            stdout = ""
+            pass
         elif args == ("symbolic-ref", "--quiet", "--short", "HEAD"):
-            stdout = "feature/current\n"
+            stdout = self.current_branch + "\n"
         elif args == ("remote", "get-url", "upstream"):
             stdout = "https://github.com/zeronsh/comet.git\n"
+        elif args == ("remote", "get-url", "origin"):
+            stdout = "https://github.com/matty/comet\n"
         elif args == ("fetch", "--prune", "upstream", "main"):
-            stdout = ""
+            pass
         elif args[:5] == (
             "log",
             "--right-only",
@@ -186,36 +214,85 @@ class WorkflowGit:
             "--format=%(refname:short)",
             "refs/heads/",
         ):
-            stdout = "".join(f"{branch}\n" for branch in sorted(self.existing))
+            stdout = "".join(f"{branch}\n" for branch in sorted(self.branches))
+        elif args == (
+            "rev-parse",
+            "--git-path",
+            "upstream-sync-state.json",
+        ):
+            stdout = str(self.pending_path) + "\n"
         elif args[:2] == ("switch", "-c"):
-            stdout = ""
+            branch = args[2]
+            if branch in self.branches:
+                returncode = 1
+                stderr = "branch exists"
+            else:
+                self.branches.add(branch)
+                self.current_branch = branch
+        elif args == ("rev-parse", "HEAD"):
+            stdout = self.head + "\n"
+        elif args == ("rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"):
+            if self.cherry_pick_head is None:
+                returncode = 1
+            else:
+                stdout = self.cherry_pick_head + "\n"
         elif args[:1] == ("cherry-pick",):
-            result = self.cherry_pick_failures.get(
-                args[1], subprocess.CompletedProcess(args, 0, "", "")
-            )
-            if check and result.returncode:
-                raise sync.GitError(
-                    list(args), result.returncode, result.stdout, result.stderr
-                )
-            return result
+            oid = args[1]
+            if oid == self.cherry_pick_failure:
+                returncode = 1
+                stderr = "conflict in tracked.txt"
+                self.cherry_pick_head = oid
+            else:
+                self.head = self.local_commits[oid]
+        elif args == ("add", "--", ".github/upstream-sync.json"):
+            pass
+        elif args[:2] == ("commit", "-m"):
+            self.head = "e" * 40
+        elif args[:4] == ("push", "--set-upstream", "origin", args[-1]):
+            if self.push_failure is not None:
+                returncode = self.push_failure.returncode
+                stdout = self.push_failure.stdout
+                stderr = self.push_failure.stderr
         else:
             raise AssertionError(f"Unexpected Git command: {args!r}")
-        return subprocess.CompletedProcess(args, 0, stdout, "")
+        result = subprocess.CompletedProcess(args, returncode, stdout, stderr)
+        if check and returncode:
+            raise sync.GitError(list(args), returncode, stdout, stderr)
+        return result
 
 
-class WorkflowTests(unittest.TestCase):
-    def run_workflow(self, git, answers):
-        prompts = []
-        answer_iter = iter(answers)
+class TrackedWorkflowGh:
+    def __init__(self, existing_url=None, create_failure=None):
+        self.existing_url = existing_url
+        self.create_failure = create_failure
+        self.commands = []
+        self.created = False
 
-        def input_fn(prompt):
-            prompts.append(prompt)
-            return next(answer_iter)
+    def run(self, *args, check=True):
+        self.commands.append((args, check))
+        if args == ("auth", "status"):
+            result = subprocess.CompletedProcess(args, 0, "", "")
+        elif args[:2] == ("pr", "list"):
+            matches = [] if self.existing_url is None else [{"url": self.existing_url}]
+            result = subprocess.CompletedProcess(args, 0, json.dumps(matches), "")
+        elif args[:2] == ("pr", "create"):
+            self.created = True
+            if self.create_failure is not None:
+                result = self.create_failure
+            else:
+                result = subprocess.CompletedProcess(
+                    args, 0, "https://example/pr/7\n", ""
+                )
+        else:
+            raise AssertionError(f"Unexpected gh command: {args!r}")
+        if check and result.returncode:
+            raise sync.GhError(
+                list(args), result.returncode, result.stdout, result.stderr
+            )
+        return result
 
-        output = io.StringIO()
-        result = sync.run_workflow(git, input_fn, output, date(2026, 8, 4))
-        return result, output.getvalue(), prompts
 
+class FormattingTests(unittest.TestCase):
     def test_format_commit_numbers_only_browsing_entries(self):
         commit = sync.Commit("oid", "abc1234", "2026-08-04", "Alice", "Subject")
 
@@ -228,93 +305,310 @@ class WorkflowTests(unittest.TestCase):
             "abc1234  2026-08-04  Alice  Subject",
         )
 
-    def test_no_commits_fetches_and_exits_without_creating_branch(self):
-        git = WorkflowGit(commits=[])
 
-        result, output, prompts = self.run_workflow(git, [])
-
-        self.assertEqual(result, 0)
-        self.assertIn("already aligned", output)
-        self.assertEqual(prompts, [])
-        commands = [args for args, _ in git.commands]
-        self.assertIn(("fetch", "--prune", "upstream", "main"), commands)
-        self.assertFalse(any(args[:2] == ("switch", "-c") for args in commands))
-
-    def test_invalid_selection_prints_error_and_prompts_again(self):
-        git = WorkflowGit()
-
-        result, output, prompts = self.run_workflow(git, ["nope", "2", "n"])
-
-        self.assertEqual(result, 0)
-        self.assertIn("Invalid selection: nope", output)
-        selection_prompts = [prompt for prompt in prompts if "Select" in prompt]
-        self.assertEqual(len(selection_prompts), 2)
-
-    def test_declined_confirmation_does_not_mutate_repository(self):
-        git = WorkflowGit()
-
-        result, _, _ = self.run_workflow(git, ["2", "n"])
-
-        self.assertEqual(result, 0)
-        commands = [args for args, _ in git.commands]
-        self.assertFalse(any(args[:2] == ("switch", "-c") for args in commands))
-        self.assertFalse(any(args[:1] == ("cherry-pick",) for args in commands))
-
-    def test_confirmed_selection_creates_unique_branch_and_cherry_picks_oldest_first(self):
-        git = WorkflowGit(
-            existing={"sync/upstream-2026-08-04"},
+class TrackedWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / ".git").mkdir()
+        (self.root / ".github").mkdir()
+        self.ledger_path = self.root / ".github" / "upstream-sync.json"
+        sync.write_ledger(self.ledger_path, sync.Ledger(1, {}, ()))
+        self.oldest = sync.Commit(
+            "a" * 40, "a" * 7, "2026-08-05", "Alice", "Oldest"
         )
+        self.newest = sync.Commit(
+            "b" * 40, "b" * 7, "2026-08-05", "Bob", "Newest"
+        )
+        self.displayed = [self.newest, self.oldest]
 
-        result, output, _ = self.run_workflow(git, ["1,3-4", "yes"])
+    def start(self, git, gh, answers):
+        answer_iter = iter(answers)
+        output = io.StringIO()
+        result = sync.start_workflow(
+            git,
+            gh,
+            lambda prompt: next(answer_iter),
+            output,
+            date(2026, 8, 5),
+            self.ledger_path,
+        )
+        return result, output.getvalue()
+
+    def test_confirmed_run_cherry_picks_updates_ledger_pushes_and_opens_draft(self):
+        git = TrackedWorkflowGit(self.root, self.displayed)
+        gh = TrackedWorkflowGh()
+
+        result, output = self.start(git, gh, ["1-2", "y"])
 
         self.assertEqual(result, 0)
-        state_changes = [
-            args
+        cherry_picks = [
+            args[1]
             for args, _ in git.commands
-            if args[:2] == ("switch", "-c") or args[:1] == ("cherry-pick",)
+            if args[:1] == ("cherry-pick",)
         ]
+        self.assertEqual(cherry_picks, [self.oldest.oid, self.newest.oid])
+        ledger = sync.load_ledger(self.ledger_path)
         self.assertEqual(
-            state_changes,
-            [
-                ("switch", "-c", "sync/upstream-2026-08-04-2"),
-                ("cherry-pick", "c1"),
-                ("cherry-pick", "c2"),
-                ("cherry-pick", "c4"),
-            ],
+            ledger.commits[self.oldest.oid].local_commit, "1" * 40
         )
-        self.assertIn("Selected commits (oldest first):", output)
-        self.assertIn("git diff feature/current...HEAD", output)
-        self.assertIn("git log --oneline feature/current..HEAD", output)
-        self.assertIn("git switch feature/current", output)
-        self.assertIn("git merge --ff-only sync/upstream-2026-08-04-2", output)
-
-    def test_cherry_pick_failure_surfaces_git_detail_and_stops_later_commits(self):
-        failure = subprocess.CompletedProcess(
-            ("cherry-pick", "c3"),
-            1,
-            "",
-            "error: could not apply c3... Third\n"
-            "hint: after resolving the conflicts, mark the corrected paths\n",
+        self.assertEqual(
+            ledger.commits[self.newest.oid].local_commit, "2" * 40
         )
-        git = WorkflowGit(cherry_pick_failures={"c3": failure})
+        self.assertEqual(ledger.runs[-1].sync_branch, git.current_branch)
+        self.assertTrue(
+            any(args[:3] == ("push", "--set-upstream", "origin")
+                for args, _ in git.commands)
+        )
+        self.assertTrue(gh.created)
+        self.assertFalse(git.pending_path.exists())
+        self.assertIn("https://example/pr/7", output)
 
-        result, output, _ = self.run_workflow(git, ["1-3", "y"])
+    def test_declined_confirmation_does_not_create_pending_state_or_branch(self):
+        git = TrackedWorkflowGit(self.root, self.displayed)
+        gh = TrackedWorkflowGh()
+        original = self.ledger_path.read_text(encoding="utf-8")
+
+        result, _ = self.start(git, gh, ["1", "d", "n"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(git.current_branch, "main")
+        self.assertFalse(git.pending_path.exists())
+        self.assertEqual(self.ledger_path.read_text(encoding="utf-8"), original)
+        self.assertFalse(gh.created)
+
+    def test_no_unresolved_commits_exits_without_branch(self):
+        entries = {
+            commit.oid: sync.LedgerEntry(
+                commit.oid,
+                commit.subject,
+                "not-applicable",
+                "2026-08-05",
+                "Not used by this fork.",
+            )
+            for commit in self.displayed
+        }
+        sync.write_ledger(self.ledger_path, sync.Ledger(1, entries, ()))
+        git = TrackedWorkflowGit(self.root, self.displayed)
+        gh = TrackedWorkflowGh()
+
+        result, output = self.start(git, gh, [])
+
+        self.assertEqual(result, 0)
+        self.assertIn("No unresolved upstream commits", output)
+        self.assertEqual(git.current_branch, "main")
+
+    def test_ledger_run_id_reserves_branch_name_after_local_branch_deletion(self):
+        prior = sync.SyncRun(
+            "sync/upstream-2026-08-05",
+            "sync",
+            "2026-08-05",
+            "main",
+            "sync/upstream-2026-08-05",
+            (
+                sync.RunDecision(
+                    self.oldest.oid,
+                    self.oldest.subject,
+                    "deferred",
+                    "Deferred during interactive review.",
+                ),
+            ),
+        )
+        sync.write_ledger(self.ledger_path, sync.Ledger(1, {}, (prior,)))
+        git = TrackedWorkflowGit(self.root, self.displayed)
+
+        result, _ = self.start(
+            git, TrackedWorkflowGh(), ["1-2", "y"]
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(git.current_branch, "sync/upstream-2026-08-05-2")
+
+    def test_bookkeeping_only_run_still_pushes_and_opens_draft(self):
+        git = TrackedWorkflowGit(self.root, self.displayed)
+        gh = TrackedWorkflowGh()
+
+        result, _ = self.start(
+            git, gh, ["", "d", "n", "Not used by this fork.", "y"]
+        )
+
+        self.assertEqual(result, 0)
+        self.assertFalse(
+            any(args[:1] == ("cherry-pick",) for args, _ in git.commands)
+        )
+        ledger = sync.load_ledger(self.ledger_path)
+        self.assertEqual(ledger.commits[self.newest.oid].outcome, "deferred")
+        self.assertEqual(
+            ledger.commits[self.oldest.oid].outcome, "not-applicable"
+        )
+        self.assertTrue(gh.created)
+
+    def test_conflict_preserves_ordered_pending_state_before_ledger_write(self):
+        git = TrackedWorkflowGit(
+            self.root, self.displayed, cherry_pick_failure=self.oldest.oid
+        )
+        gh = TrackedWorkflowGh()
+
+        result, output = self.start(git, gh, ["1-2", "y"])
 
         self.assertEqual(result, 1)
-        self.assertIn(
-            "Cherry-pick stopped at c3 (Third): "
-            "error: could not apply c3... Third hint: after resolving the "
-            "conflicts, mark the corrected paths",
-            output,
-        )
-        self.assertIn("Inspect the repository with git status.", output)
-        self.assertIn("If conflicts or cherry-pick state are present", output)
+        pending = sync.load_pending(git.pending_path)
+        self.assertEqual(pending.phase, "cherry-picking")
+        self.assertEqual(pending.active_upstream_sha, self.oldest.oid)
+        self.assertEqual(pending.considered, tuple(self.displayed))
+        self.assertEqual(sync.load_ledger(self.ledger_path).commits, {})
         self.assertIn("git cherry-pick --continue", output)
-        self.assertIn("git cherry-pick --abort", output)
-        cherry_picks = [
-            args for args, _ in git.commands if args[:1] == ("cherry-pick",)
-        ]
-        self.assertEqual(cherry_picks, [("cherry-pick", "c2"), ("cherry-pick", "c3")])
+        self.assertFalse(gh.created)
+
+    def test_resume_after_manual_conflict_continues_remaining_commits(self):
+        git = TrackedWorkflowGit(
+            self.root, self.displayed, cherry_pick_failure=self.oldest.oid
+        )
+        gh = TrackedWorkflowGh()
+        self.start(git, gh, ["1-2", "y"])
+        git.cherry_pick_failure = None
+        git.complete_conflict("1" * 40)
+
+        output = io.StringIO()
+        result = sync.resume_workflow(
+            git, gh, output, self.ledger_path, git.pending_path
+        )
+
+        self.assertEqual(result, 0)
+        ledger = sync.load_ledger(self.ledger_path)
+        self.assertEqual(ledger.commits[self.oldest.oid].local_commit, "1" * 40)
+        self.assertEqual(ledger.commits[self.newest.oid].local_commit, "2" * 40)
+        self.assertFalse(git.pending_path.exists())
+
+    def test_resume_after_abort_clears_pending_without_deleting_branch(self):
+        git = TrackedWorkflowGit(
+            self.root, self.displayed, cherry_pick_failure=self.oldest.oid
+        )
+        gh = TrackedWorkflowGh()
+        self.start(git, gh, ["1-2", "y"])
+        git.abort_conflict()
+        output = io.StringIO()
+
+        result = sync.resume_workflow(
+            git, gh, output, self.ledger_path, git.pending_path
+        )
+
+        self.assertEqual(result, 1)
+        self.assertFalse(git.pending_path.exists())
+        self.assertIn("cancelled", output.getvalue().lower())
+        self.assertIn("main", output.getvalue())
+        self.assertIn("sync/upstream-2026-08-05", git.branches)
+
+    def pending_after_picks(self, phase):
+        branch = "sync/upstream-2026-08-05"
+        return sync.PendingRun(
+            1,
+            phase,
+            "main",
+            branch,
+            branch,
+            "2026-08-05",
+            (self.oldest, self.newest),
+            (),
+            {self.oldest.oid: "1" * 40, self.newest.oid: "2" * 40},
+            considered=tuple(self.displayed),
+        )
+
+    def test_resume_from_ledger_committed_only_pushes_then_opens_pr(self):
+        git = TrackedWorkflowGit(self.root, self.displayed)
+        branch = "sync/upstream-2026-08-05"
+        git.current_branch = branch
+        git.branches.add(branch)
+        pending = self.pending_after_picks("ledger-committed")
+        sync.write_pending(git.pending_path, pending)
+        gh = TrackedWorkflowGh()
+
+        result = sync.resume_workflow(
+            git, gh, io.StringIO(), self.ledger_path, git.pending_path
+        )
+
+        self.assertEqual(result, 0)
+        self.assertTrue(
+            any(args[:1] == ("push",) for args, _ in git.commands)
+        )
+        self.assertFalse(
+            any(args[:1] in {("cherry-pick",), ("commit",)}
+                for args, _ in git.commands)
+        )
+
+    def test_resume_from_pushed_reuses_existing_pr(self):
+        git = TrackedWorkflowGit(self.root, self.displayed)
+        branch = "sync/upstream-2026-08-05"
+        git.current_branch = branch
+        git.branches.add(branch)
+        sync.write_pending(git.pending_path, self.pending_after_picks("pushed"))
+        gh = TrackedWorkflowGh(existing_url="https://example/pr/existing")
+        output = io.StringIO()
+
+        result = sync.resume_workflow(
+            git, gh, output, self.ledger_path, git.pending_path
+        )
+
+        self.assertEqual(result, 0)
+        self.assertFalse(gh.created)
+        self.assertIn("https://example/pr/existing", output.getvalue())
+        self.assertFalse(
+            any(args[:1] == ("push",) for args, _ in git.commands)
+        )
+
+    def test_push_failure_keeps_ledger_committed_phase_for_retry(self):
+        failure = subprocess.CompletedProcess(
+            ["git", "push"], 3, "", "network unavailable"
+        )
+        git = TrackedWorkflowGit(
+            self.root, self.displayed, push_failure=failure
+        )
+        gh = TrackedWorkflowGh()
+
+        with self.assertRaises(sync.GitError):
+            self.start(git, gh, ["1-2", "y"])
+
+        pending = sync.load_pending(git.pending_path)
+        self.assertEqual(pending.phase, "ledger-committed")
+        git.push_failure = None
+        self.assertEqual(
+            sync.resume_workflow(
+                git, gh, io.StringIO(), self.ledger_path, git.pending_path
+            ),
+            0,
+        )
+
+    def test_pr_failure_keeps_pushed_phase_for_retry(self):
+        failure = subprocess.CompletedProcess(
+            ["gh", "pr", "create"], 4, "", "GitHub unavailable"
+        )
+        git = TrackedWorkflowGit(self.root, self.displayed)
+        gh = TrackedWorkflowGh(create_failure=failure)
+
+        with self.assertRaises(sync.GhError):
+            self.start(git, gh, ["1-2", "y"])
+
+        pending = sync.load_pending(git.pending_path)
+        self.assertEqual(pending.phase, "pushed")
+        gh.create_failure = None
+        self.assertEqual(
+            sync.resume_workflow(
+                git, gh, io.StringIO(), self.ledger_path, git.pending_path
+            ),
+            0,
+        )
+
+    def test_resume_without_pending_state_is_rejected(self):
+        git = TrackedWorkflowGit(self.root, self.displayed)
+        with self.assertRaisesRegex(sync.SyncError, "No pending"):
+            sync.resume_workflow(
+                git,
+                TrackedWorkflowGh(),
+                io.StringIO(),
+                self.ledger_path,
+                git.pending_path,
+            )
 
 
 class FailureDetailTests(unittest.TestCase):
@@ -335,6 +629,45 @@ class FailureDetailTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    @mock.patch.object(sync, "resume_workflow", return_value=0)
+    @mock.patch.object(
+        sync,
+        "pending_state_path",
+        return_value=Path("C:/repo/.git/upstream-sync-state.json"),
+    )
+    @mock.patch.object(
+        sync, "repository_root", return_value=Path("C:/repo")
+    )
+    def test_resume_flag_dispatches_to_resume_workflow(
+        self, repository_root, pending_state_path, resume_workflow
+    ):
+        result = sync.main(["--resume"])
+        self.assertEqual(result, 0)
+        args = resume_workflow.call_args.args
+        self.assertIsInstance(args[0], sync.Git)
+        self.assertIsInstance(args[1], sync.Gh)
+        self.assertEqual(args[3], Path("C:/repo/.github/upstream-sync.json"))
+        self.assertEqual(
+            args[4], Path("C:/repo/.git/upstream-sync-state.json")
+        )
+
+    @mock.patch.object(
+        sync,
+        "repository_root",
+        side_effect=sync.GhError(
+            ["pr", "create"], 7, "partial", "GitHub unavailable"
+        ),
+    )
+    def test_checked_github_errors_are_reported_concisely(self, repository_root):
+        error_output = io.StringIO()
+        with mock.patch("sys.stderr", error_output):
+            result = sync.main([])
+        self.assertEqual(result, 1)
+        self.assertEqual(
+            error_output.getvalue(),
+            "error: gh pr create failed: GitHub unavailable\n",
+        )
+
     def test_help_exits_successfully_and_describes_upstream_selection(self):
         output = io.StringIO()
 
@@ -618,6 +951,7 @@ class PendingStateTests(unittest.TestCase):
             self.commit("a", "First selected"),
             self.commit("b", "Second selected"),
         )
+        not_selected = self.commit("c", "Not selected")
         return sync.PendingRun(
             1,
             phase,
@@ -628,13 +962,14 @@ class PendingStateTests(unittest.TestCase):
             selected,
             (
                 sync.RunDecision(
-                    "c" * 40,
-                    "Not selected",
+                    not_selected.oid,
+                    not_selected.subject,
                     "deferred",
                     "Deferred during interactive review.",
                 ),
             ),
             {},
+            considered=(selected[1], not_selected, selected[0]),
         )
 
     def round_trip(self, pending):

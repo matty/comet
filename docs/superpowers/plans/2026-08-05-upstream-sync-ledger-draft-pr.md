@@ -363,9 +363,10 @@ class PendingRun:
     local_commits: dict[str, str]
     active_upstream_sha: str | None = None
     pre_pick_head: str | None = None
+    considered: tuple[Commit, ...] = ()
 ```
 
-Resolve a relative `--git-path` result against `git.cwd`. Write pending JSON atomically by writing a sibling `.tmp` with `Path.write_text` and replacing the target with `Path.replace`. Before each `git cherry-pick`, store the active upstream SHA and current full `HEAD`. After success, map that upstream SHA to the new full `HEAD` and clear active fields.
+`considered` retains the full newest-first discovery order so final run records can interleave selected and classified same-day commits exactly. Resolve a relative `--git-path` result against `git.cwd`. Write pending JSON atomically by writing a sibling `.tmp` and replacing the target with `Path.replace`. Before each `git cherry-pick`, store the active upstream SHA and current full `HEAD`. After success, map that upstream SHA to the new full `HEAD` and clear active fields.
 
 The `prepared` phase supports the boundary between pending-state creation and branch creation. On resume, if the target is still checked out and the sync branch is absent, create it and advance to `cherry-picking`; if the sync branch is already checked out, advance without recreating it; reject every other branch arrangement.
 

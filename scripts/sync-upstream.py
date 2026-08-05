@@ -72,6 +72,7 @@ class PendingRun:
     local_commits: dict[str, str]
     active_upstream_sha: str | None = None
     pre_pick_head: str | None = None
+    considered: tuple[Commit, ...] = ()
 
 
 class SyncError(RuntimeError):
@@ -437,6 +438,13 @@ def _validate_pending(pending: PendingRun) -> None:
         raise SyncError("Pending classifications contain duplicates.")
     if set(selected_oids) & set(classification_oids):
         raise SyncError("A pending commit cannot be selected and classified.")
+    considered_oids = [commit.oid for commit in pending.considered]
+    if len(considered_oids) != len(set(considered_oids)):
+        raise SyncError("Pending considered commits contain duplicates.")
+    if set(considered_oids) != set(selected_oids) | set(classification_oids):
+        raise SyncError(
+            "Pending considered commits must match selections and classifications."
+        )
     if any(
         decision.outcome not in {"deferred", "not-applicable"}
         or decision.local_commit is not None
@@ -494,6 +502,9 @@ def _pending_document(pending: PendingRun) -> dict[str, object]:
         "local_commits": pending.local_commits,
         "active_upstream_sha": pending.active_upstream_sha,
         "pre_pick_head": pending.pre_pick_head,
+        "considered": [
+            _commit_document(commit) for commit in pending.considered
+        ],
     }
 
 
@@ -513,6 +524,7 @@ def _parse_pending(value: object) -> PendingRun:
             "local_commits",
             "active_upstream_sha",
             "pre_pick_head",
+            "considered",
         },
         "pending",
     )
@@ -520,6 +532,8 @@ def _parse_pending(value: object) -> PendingRun:
         raise SyncError("pending.selected must be a JSON list.")
     if not isinstance(data["classifications"], list):
         raise SyncError("pending.classifications must be a JSON list.")
+    if not isinstance(data["considered"], list):
+        raise SyncError("pending.considered must be a JSON list.")
     local_value = _require_object(data["local_commits"], "pending.local_commits")
     active = data["active_upstream_sha"]
     pre_pick = data["pre_pick_head"]
@@ -545,6 +559,10 @@ def _parse_pending(value: object) -> PendingRun:
         dict(local_value),
         active,
         pre_pick,
+        tuple(
+            _parse_commit(item, f"pending.considered[{index}]")
+            for index, item in enumerate(data["considered"])
+        ),
     )
     _validate_pending(pending)
     return pending
@@ -982,73 +1000,253 @@ def create_draft_pr(
     return url
 
 
-def run_workflow(
+def _current_branch(git: Git) -> str:
+    try:
+        return git.run("symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+    except GitError as error:
+        raise SyncError("The repository is in detached HEAD state.") from error
+
+
+def _current_head(git: Git) -> str:
+    head = git.run("rev-parse", "HEAD").stdout.strip()
+    return _require_sha(head, "Git HEAD")
+
+
+def _print_run_summary(
+    selected: list[Commit],
+    classifications: list[RunDecision],
+    output: TextIO,
+) -> None:
+    print("Run summary:", file=output)
+    print("Implemented by cherry-pick:", file=output)
+    if selected:
+        for commit in selected:
+            print(format_commit(None, commit), file=output)
+    else:
+        print("(none)", file=output)
+    for outcome, heading in (
+        ("not-applicable", "Not applicable:"),
+        ("deferred", "Deferred:"),
+    ):
+        print(heading, file=output)
+        matching = [
+            decision
+            for decision in classifications
+            if decision.outcome == outcome
+        ]
+        if not matching:
+            print("(none)", file=output)
+        for decision in matching:
+            print(
+                f"{decision.upstream_sha[:7]}  {decision.subject} — "
+                f"{decision.note}",
+                file=output,
+            )
+
+
+def _ledger_git_path(git: Git, ledger_path: Path) -> str:
+    root = git.cwd or Path.cwd()
+    try:
+        return ledger_path.relative_to(root).as_posix()
+    except ValueError as error:
+        raise SyncError("The upstream sync ledger is outside the repository.") from error
+
+
+def start_workflow(
     git: Git,
+    gh: Gh,
     input_fn: Callable[[str], str],
     output: TextIO,
     day: date,
+    ledger_path: Path,
 ) -> int:
+    pending_path = pending_state_path(git)
+    if pending_path.exists():
+        raise SyncError(
+            "A pending upstream sync already exists. Run this command with --resume."
+        )
     target = validate_repository(git)
     ensure_upstream(git)
+    validate_origin(git)
+    validate_github(gh)
     git.run("fetch", "--prune", "upstream", "main")
-    commits = discover_commits(git, target)
-
+    ledger = load_ledger(ledger_path)
+    commits = filter_resolved(discover_commits(git, target), ledger)
     if not commits:
-        print(f"{target} is already aligned with upstream/main.", file=output)
+        print("No unresolved upstream commits.", file=output)
         return 0
 
     print("Eligible upstream commits (newest first):", file=output)
     for index, commit in enumerate(commits, start=1):
         print(format_commit(index, commit), file=output)
-
     while True:
         try:
             selected = parse_selection(
-                input_fn("Select commits (for example 1,3-5): "), commits
+                input_fn(
+                    "Select commits to cherry-pick "
+                    "(for example 1,3-5; blank for none): "
+                ),
+                commits,
+                allow_empty=True,
             )
             break
         except ValueError as error:
             print(error, file=output)
-
-    print("Selected commits (oldest first):", file=output)
-    for commit in selected:
-        print(format_commit(None, commit), file=output)
-
+    classifications = classify_unselected(
+        commits,
+        {commit.oid for commit in selected},
+        input_fn,
+        output,
+    )
+    reserved_branches = existing_branches(git) | {
+        run.run_id for run in ledger.runs if run.kind == "sync"
+    }
+    branch = next_branch_name(reserved_branches, day)
+    _print_run_summary(selected, classifications, output)
     confirmation = input_fn(
-        "Create a sync branch and cherry-pick these commits? [y/N] "
+        "Create the sync branch, record this run, push, and open a draft PR? [y/N] "
     )
     if confirmation.strip().lower() not in {"y", "yes"}:
         return 0
 
-    branch = next_branch_name(existing_branches(git), day)
-    git.run("switch", "-c", branch)
-    for commit in selected:
-        result = git.run("cherry-pick", commit.oid, check=False)
-        if result.returncode != 0:
-            detail = format_failure_detail(
-                result.stdout, result.stderr, result.returncode
-            )
-            print(
-                f"Cherry-pick stopped at {commit.short_oid} "
-                f"({commit.subject}): {detail}",
-                file=output,
-            )
-            print("Inspect the repository with git status.", file=output)
-            print(
-                "If conflicts or cherry-pick state are present, resolve them "
-                "and choose:",
-                file=output,
-            )
-            print("git add <resolved-files>", file=output)
-            print("git cherry-pick --continue", file=output)
-            print("git cherry-pick --abort", file=output)
-            return 1
+    pending = PendingRun(
+        1,
+        "prepared",
+        target,
+        branch,
+        branch,
+        day.isoformat(),
+        tuple(selected),
+        tuple(classifications),
+        {},
+        considered=tuple(commits),
+    )
+    write_pending(pending_path, pending)
+    return resume_workflow(git, gh, output, ledger_path, pending_path)
 
-    print("Review and integrate the sync branch with:", file=output)
-    print(f"git diff {target}...HEAD", file=output)
-    print(f"git log --oneline {target}..HEAD", file=output)
-    print(f"git switch {target}", file=output)
-    print(f"git merge --ff-only {branch}", file=output)
+
+def resume_workflow(
+    git: Git,
+    gh: Gh,
+    output: TextIO,
+    ledger_path: Path,
+    pending_path: Path,
+) -> int:
+    if not pending_path.exists():
+        raise SyncError("No pending upstream sync exists to resume.")
+    pending = load_pending(pending_path)
+    validate_origin(git)
+    validate_github(gh)
+    current = _current_branch(git)
+
+    if pending.phase == "prepared":
+        branches = existing_branches(git)
+        if current == pending.target_branch and pending.sync_branch not in branches:
+            git.run("switch", "-c", pending.sync_branch)
+        elif current != pending.sync_branch:
+            raise SyncError(
+                f"Prepared sync expects {pending.target_branch} or "
+                f"{pending.sync_branch}, but {current} is checked out."
+            )
+        pending = replace(pending, phase="cherry-picking")
+        write_pending(pending_path, pending)
+        current = pending.sync_branch
+
+    if current != pending.sync_branch:
+        raise SyncError(
+            f"Pending sync requires branch {pending.sync_branch}, "
+            f"but {current} is checked out."
+        )
+
+    if pending.phase == "cherry-picking":
+        ensure_cherry_pick_resolved(git)
+        if git.run("status", "--porcelain").stdout:
+            raise SyncError("The sync branch must have a clean worktree to resume.")
+        if pending.active_upstream_sha is not None:
+            try:
+                pending = verify_resumed_pick(pending, _current_head(git))
+            except SyncCancelled:
+                clear_pending(pending_path)
+                print(
+                    f"Upstream sync run cancelled. The branch "
+                    f"{pending.sync_branch} was left intact; switch back to "
+                    f"{pending.target_branch} when ready.",
+                    file=output,
+                )
+                return 1
+            write_pending(pending_path, pending)
+
+        while len(pending.local_commits) < len(pending.selected):
+            commit = pending.selected[len(pending.local_commits)]
+            pending = record_pick_start(pending, commit, _current_head(git))
+            write_pending(pending_path, pending)
+            result = git.run("cherry-pick", commit.oid, check=False)
+            if result.returncode != 0:
+                detail = format_failure_detail(
+                    result.stdout, result.stderr, result.returncode
+                )
+                print(
+                    f"Cherry-pick stopped at {commit.short_oid} "
+                    f"({commit.subject}): {detail}",
+                    file=output,
+                )
+                print("Inspect the repository with git status.", file=output)
+                print("Resolve or abort the cherry-pick, then choose:", file=output)
+                print("git add <resolved-files>", file=output)
+                print("git cherry-pick --continue", file=output)
+                print("git cherry-pick --abort", file=output)
+                print("python scripts/sync-upstream.py --resume", file=output)
+                return 1
+            pending = record_pick_success(pending, _current_head(git))
+            write_pending(pending_path, pending)
+
+    return finish_workflow(
+        git, gh, output, ledger_path, pending_path, pending
+    )
+
+
+def finish_workflow(
+    git: Git,
+    gh: Gh,
+    output: TextIO,
+    ledger_path: Path,
+    pending_path: Path,
+    pending: PendingRun,
+) -> int:
+    run = build_sync_run(
+        date.fromisoformat(pending.run_date),
+        pending.target_branch,
+        pending.sync_branch,
+        list(pending.considered),
+        pending.local_commits,
+        list(pending.classifications),
+    )
+    if pending.phase == "cherry-picking":
+        ledger = load_ledger(ledger_path)
+        write_ledger(ledger_path, apply_run(ledger, run))
+        ledger_git_path = _ledger_git_path(git, ledger_path)
+        git.run("add", "--", ledger_git_path)
+        git.run(
+            "commit",
+            "-m",
+            f"chore: record upstream sync {pending.run_id}",
+        )
+        pending = replace(pending, phase="ledger-committed")
+        write_pending(pending_path, pending)
+    if pending.phase == "ledger-committed":
+        git.run("push", "--set-upstream", "origin", pending.sync_branch)
+        pending = replace(pending, phase="pushed")
+        write_pending(pending_path, pending)
+    if pending.phase != "pushed":
+        raise SyncError(f"Cannot finish pending phase {pending.phase}.")
+    title, body = format_pr(run)
+    url = find_existing_pr(
+        gh, pending.sync_branch, pending.target_branch
+    )
+    if url is None:
+        url = create_draft_pr(gh, run, title, body)
+    clear_pending(pending_path)
+    print(f"Draft pull request: {url}", file=output)
     return 0
 
 
@@ -1090,14 +1288,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.parse_args(argv)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume a pending cherry-pick, push, or draft PR operation",
+    )
+    args = parser.parse_args(argv)
 
     try:
         git = Git()
-        git.cwd = repository_root(git)
-        return run_workflow(git, input, sys.stdout, date.today())
+        root = repository_root(git)
+        git.cwd = root
+        gh = Gh(root)
+        ledger_path = root / ".github" / "upstream-sync.json"
+        if args.resume:
+            return resume_workflow(
+                git,
+                gh,
+                sys.stdout,
+                ledger_path,
+                pending_state_path(git),
+            )
+        return start_workflow(
+            git,
+            gh,
+            input,
+            sys.stdout,
+            date.today(),
+            ledger_path,
+        )
     except GitError as error:
         command = "git " + " ".join(error.args_list)
+        detail = format_failure_detail(
+            error.stdout, error.stderr, error.returncode
+        )
+        print(f"error: {command} failed: {detail}", file=sys.stderr)
+        return 1
+    except GhError as error:
+        command = "gh " + " ".join(error.args_list)
         detail = format_failure_detail(
             error.stdout, error.stderr, error.returncode
         )
