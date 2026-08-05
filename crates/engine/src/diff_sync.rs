@@ -45,6 +45,10 @@ const REPAIR_INTERVAL: Duration = Duration::from_secs(120);
 const MAX_WATCH_DIRS: usize = 8_000;
 /// `git hash-object -t tree /dev/null` — diff base for repos with no commits yet.
 const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/// Bytes of git stderr kept for the error message. Anything past this is read
+/// and discarded — a chatty credential helper must never buffer without limit,
+/// and it must never stall on a full stderr pipe either.
+const MAX_STDERR_BYTES: usize = 8 * 1024;
 
 /// One bounded atomic snapshot of a checkout's working tree.
 #[derive(Debug, Clone)]
@@ -435,6 +439,7 @@ async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capt
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
     let mut child = cmd
         .spawn()
         .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
@@ -442,35 +447,64 @@ async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capt
         .stdout
         .take()
         .ok_or_else(|| EngineError::Other("git stdout unavailable".into()))?;
-    let mut out: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 64 * 1024];
-    let mut truncated = false;
-    loop {
-        let n = stdout
-            .read(&mut buf)
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| EngineError::Other("git stderr unavailable".into()))?;
+    let stderr_capture = async move {
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 4 * 1024];
+        loop {
+            let n = stderr
+                .read(&mut buf)
+                .await
+                .map_err(|e| EngineError::Other(format!("git stderr read failed: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            // Keep the head of the message, but keep reading past the cap: a
+            // reader that stops early re-wedges the child on a full pipe.
+            let remaining = MAX_STDERR_BYTES.saturating_sub(bytes.len());
+            if remaining > 0 {
+                bytes.extend_from_slice(&buf[..n.min(remaining)]);
+            }
+        }
+        Ok::<_, EngineError>(bytes)
+    };
+    let stdout_capture = async move {
+        let mut out: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 64 * 1024];
+        let mut truncated = false;
+        loop {
+            let n = stdout
+                .read(&mut buf)
+                .await
+                .map_err(|e| EngineError::Other(format!("git read failed: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            let remaining = max_bytes.saturating_sub(out.len());
+            if n > remaining {
+                out.extend_from_slice(&buf[..remaining]);
+                truncated = true;
+                let _ = child.start_kill();
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        drop(stdout);
+        let status = child
+            .wait()
             .await
-            .map_err(|e| EngineError::Other(format!("git read failed: {e}")))?;
-        if n == 0 {
-            break;
-        }
-        let remaining = max_bytes.saturating_sub(out.len());
-        if n > remaining {
-            out.extend_from_slice(&buf[..remaining]);
-            truncated = true;
-            let _ = child.start_kill();
-            break;
-        }
-        out.extend_from_slice(&buf[..n]);
-    }
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| EngineError::Other(format!("git wait failed: {e}")))?;
-    if !output.status.success() && !truncated {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+            .map_err(|e| EngineError::Other(format!("git wait failed: {e}")))?;
+        Ok::<_, EngineError>((out, truncated, status))
+    };
+    let ((out, truncated, status), stderr) = tokio::try_join!(stdout_capture, stderr_capture)?;
+    if !status.success() && !truncated {
+        let stderr = String::from_utf8_lossy(&stderr);
         let message = stderr.trim();
         return Err(EngineError::Other(if message.is_empty() {
-            format!("git exited {}", output.status)
+            format!("git exited {status}")
         } else {
             format!("git: {message}")
         }));
