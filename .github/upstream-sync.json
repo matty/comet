@@ -1,0 +1,655 @@
+{
+  "commits": {
+    "013a0878ae1b757191bec5c3a5192cbf4a908c0d": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Edge join-wedge root cause: wasm-heap poisoning made joins die in silence",
+      "upstream_sha": "013a0878ae1b757191bec5c3a5192cbf4a908c0d"
+    },
+    "02002cf917624a1d99b94b83d3201d491a3b3d8c": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Salvage importable updates before striking; small-payload penalty probe; attributed /stats",
+      "upstream_sha": "02002cf917624a1d99b94b83d3201d491a3b3d8c"
+    },
+    "0c428118a391f42a67418d071239377e0daffd19": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: depends on the hosted registry service, while this fork uses local-authoritative LAN state.",
+      "outcome": "not-applicable",
+      "subject": "iOS registry sync: port the workspace sidebar from the Loro doc to the row registry",
+      "upstream_sha": "0c428118a391f42a67418d071239377e0daffd19"
+    },
+    "0fdea0fd0fcd0c6de823f4b233a9ca543e24e2c6": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Trim history on cold materialization too \u2014 idle rooms never trimmed",
+      "upstream_sha": "0fdea0fd0fcd0c6de823f4b233a9ca543e24e2c6"
+    },
+    "104e449fd8472415837328edd2f88f4f9e8ba5bc": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: the iOS hosted-room transport is outside the current LAN-only release scope.",
+      "outcome": "not-applicable",
+      "subject": "iOS: kick every room on foreground \u2014 suspension kills sockets silently",
+      "upstream_sha": "104e449fd8472415837328edd2f88f4f9e8ba5bc"
+    },
+    "13704c7bdb8b60edfb67dd19e9db6dc8c616cdf2": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Trim history on log fold, not just the daily alarm",
+      "upstream_sha": "13704c7bdb8b60edfb67dd19e9db6dc8c616cdf2"
+    },
+    "1d63c157f45c88a5ecaf9e1b6c3221b09c878a17": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: depends on the hosted registry service, while this fork uses local-authoritative LAN state.",
+      "outcome": "not-applicable",
+      "subject": "Registry polish: clippy clean, fmt, mock-server tidy",
+      "upstream_sha": "1d63c157f45c88a5ecaf9e1b6c3221b09c878a17"
+    },
+    "1f2152a84fec9f3068b8e9e8cbe03a9f36df00eb": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Never serve a freed doc wrapper; count wasm use-after-free as poison",
+      "upstream_sha": "1f2152a84fec9f3068b8e9e8cbe03a9f36df00eb"
+    },
+    "1f2333d6a3cb961ed50fa1a7104ffe1c1d67aea8": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Relay accepted updates via per-socket fragmentation, not one raw frame",
+      "upstream_sha": "1f2333d6a3cb961ed50fa1a7104ffe1c1d67aea8"
+    },
+    "347c920f2b5c7de9d55c33cbf48d897ffa5c22da": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Deaf-socket healing: probe-on-focus, acks don't feed the probe, edge closes on send failure",
+      "upstream_sha": "347c920f2b5c7de9d55c33cbf48d897ffa5c22da"
+    },
+    "35447940eec1505bfbdbd45f2c2d715b2ac044d4": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Deferred during interactive review.",
+      "outcome": "deferred",
+      "subject": "iOS session polish: interactive keyboard, bottom-edge fade, transcript perf, image attachments",
+      "upstream_sha": "35447940eec1505bfbdbd45f2c2d715b2ac044d4"
+    },
+    "3a89e681039d8a19d95c1f23b68f3cb31c3b51f6": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Recycle DOs: clear stale in-memory import penalties after fleet doc flatten",
+      "upstream_sha": "3a89e681039d8a19d95c1f23b68f3cb31c3b51f6"
+    },
+    "469d18a3cd29f9e562354742dc476d906d7065b9": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Fold the update log when it dwarfs the folded state, not only at fixed budgets",
+      "upstream_sha": "469d18a3cd29f9e562354742dc476d906d7065b9"
+    },
+    "4aacc6d4753f6fde360c02cc532b27865e05401f": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Workspace live-frontier-trim guard: match any ws generation, not the literal ws3/",
+      "upstream_sha": "4aacc6d4753f6fde360c02cc532b27865e05401f"
+    },
+    "4ff80aeaff5c78b6e4e3f571c774aa146ee68f55": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Free loro-wasm objects explicitly \u2014 GC finalizers never fire under wasm pressure",
+      "upstream_sha": "4ff80aeaff5c78b6e4e3f571c774aa146ee68f55"
+    },
+    "5f26832b10fbe72a47aeb09b4d508140d630af90": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Make history trims durable before the join continues",
+      "upstream_sha": "5f26832b10fbe72a47aeb09b4d508140d630af90"
+    },
+    "630f4a02fec58c0adb7685b539f57e60055e449e": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Durable deaf-socket detection + sync telemetry: presence tripwire, comet sync, device-attributed edge logs",
+      "upstream_sha": "630f4a02fec58c0adb7685b539f57e60055e449e"
+    },
+    "67500fc3b9f450d63cc0198a0eb10a19aae71aaa": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Cross-device sync: never wedge silently \u2014 supervised joins, retries, probes",
+      "upstream_sha": "67500fc3b9f450d63cc0198a0eb10a19aae71aaa"
+    },
+    "6adda950133e2fab1fa7197b56b98f7f6b5c2aaf": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Never latch a rejected session; count rejections honestly in comet sync",
+      "upstream_sha": "6adda950133e2fab1fa7197b56b98f7f6b5c2aaf"
+    },
+    "6f19b76c9ffc92d84697d28f18ce5433b6fa0a07": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Revert the aggressive fold triggers; route workspace /append for operator repair",
+      "upstream_sha": "6f19b76c9ffc92d84697d28f18ce5433b6fa0a07"
+    },
+    "760ea9a44b5d7b69b68fccbca39cf7fff66879fc": {
+      "decision_date": "2026-08-05",
+      "local_commit": "adc28704de3159960b4a9494ce824ab5296113e9",
+      "note": "Implemented by the earlier fork GPU-memory adaptation.",
+      "outcome": "implemented",
+      "subject": "Bound GPU memory: fork rev bump + actually free evicted attachment images",
+      "upstream_sha": "760ea9a44b5d7b69b68fccbca39cf7fff66879fc"
+    },
+    "79c8e22898d8c7b45150c06a8c6e97de64cfbd0d": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable because the LAN-only fork has no hosted workspace snapshot backing service.",
+      "outcome": "not-applicable",
+      "subject": "Expose GET /workspace/:orgId/snapshot for doc repair reads",
+      "upstream_sha": "79c8e22898d8c7b45150c06a8c6e97de64cfbd0d"
+    },
+    "7b52ce1f70b3dddf13756358c4dc1f9d810a0bad": {
+      "decision_date": "2026-08-05",
+      "local_commit": "3e5ea92a87775cd1f56e9ad1790a0a037c95cec6",
+      "note": "Implemented by the earlier fork TUI-removal adaptation.",
+      "outcome": "implemented",
+      "subject": "Remove the TUI: crates/tui, apps/tui, comet tui subcommand, scripts, docs",
+      "upstream_sha": "7b52ce1f70b3dddf13756358c4dc1f9d810a0bad"
+    },
+    "81ebf255b1037629eccc93aad7b8a18db743c041": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Gate cutoff trims on lastTrimAt alone \u2014 isShallow re-fired them forever",
+      "upstream_sha": "81ebf255b1037629eccc93aad7b8a18db743c041"
+    },
+    "82ce44193a32b5ae5610f8a4542e5e30b992e6a9": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Automated wedge break boots attached sockets, like /reset-log always did",
+      "upstream_sha": "82ce44193a32b5ae5610f8a4542e5e30b992e6a9"
+    },
+    "8a61311b989580c778aa4078a71f4e6592aa33b7": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: depends on the hosted registry service, while this fork uses local-authoritative LAN state.",
+      "outcome": "not-applicable",
+      "subject": "Registry sidebar sync: row-table workspace state replacing the Loro workspace doc",
+      "upstream_sha": "8a61311b989580c778aa4078a71f4e6592aa33b7"
+    },
+    "9176b510639ab2e25af1faae7ae787d4bb00c92c": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Reset the wasm-poison strike counter on a clean join answer",
+      "upstream_sha": "9176b510639ab2e25af1faae7ae787d4bb00c92c"
+    },
+    "92fba3d62422e75b7ac6b4ae5963cee54984198c": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: demo media documents the hosted registry feature that is absent from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Registry demo media for the PR (screenshots + recording)",
+      "upstream_sha": "92fba3d62422e75b7ac6b4ae5963cee54984198c"
+    },
+    "b01943979d3732fd615ab2c002185dbb1016a601": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable because edge/src/session-room.ts was removed with the hosted workspace service.",
+      "outcome": "not-applicable",
+      "subject": "Workspace rooms force-trim only at aged checkpoints, never the live frontier",
+      "upstream_sha": "b01943979d3732fd615ab2c002185dbb1016a601"
+    },
+    "b08aeb906c508b838b032d819f3ce0928932627b": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: upstream release-only version bump; this fork maintains its own release versioning and provenance.",
+      "outcome": "not-applicable",
+      "subject": "v0.1.19",
+      "upstream_sha": "b08aeb906c508b838b032d819f3ce0928932627b"
+    },
+    "b953b805cb69e656594f49eedc2bcff5397cdd08": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: upstream release-only version bump; this fork maintains its own release versioning and provenance.",
+      "outcome": "not-applicable",
+      "subject": "v0.1.20",
+      "upstream_sha": "b953b805cb69e656594f49eedc2bcff5397cdd08"
+    },
+    "bbe1d1f062feea7a1b62430da0b4588dee60afcb": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: upstream release-only version bump; this fork maintains its own release versioning and provenance.",
+      "outcome": "not-applicable",
+      "subject": "v0.1.16",
+      "upstream_sha": "bbe1d1f062feea7a1b62430da0b4588dee60afcb"
+    },
+    "bf16add11ffb21ea9a8de50608134f38a6eb5463": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "foldLog: recycle the isolate when the fold export dies on a pressed heap",
+      "upstream_sha": "bf16add11ffb21ea9a8de50608134f38a6eb5463"
+    },
+    "c1243c5ab187f39c58905edc8b195504a005a51f": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable because edge/src/session-room.ts was removed with the hosted workspace service.",
+      "outcome": "not-applicable",
+      "subject": "Penalty-box devices whose imports keep failing \u2014 stop the doomed-push DOS",
+      "upstream_sha": "c1243c5ab187f39c58905edc8b195504a005a51f"
+    },
+    "c202e91dfb287f219dd06c2c080f6e27e8caf171": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Free idle docs \u2014 wasm memory outlives DO instances and never shrinks",
+      "upstream_sha": "c202e91dfb287f219dd06c2c080f6e27e8caf171"
+    },
+    "c4a2e46cc9c495589241e4025ffcf379abb858db": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Force-trim oversized rooms that have no aged checkpoint",
+      "upstream_sha": "c4a2e46cc9c495589241e4025ffcf379abb858db"
+    },
+    "d0252cece40725992d50917e5ea760c9c2e2dfaf": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: upstream release-only version bump; this fork maintains its own release versioning and provenance.",
+      "outcome": "not-applicable",
+      "subject": "v0.1.18",
+      "upstream_sha": "d0252cece40725992d50917e5ea760c9c2e2dfaf"
+    },
+    "d2a4b571fc097447eed74ed134790693b78922cd": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Force-trim gate counts log bytes, not just the snapshot",
+      "upstream_sha": "d2a4b571fc097447eed74ed134790693b78922cd"
+    },
+    "f080476ab03f6cf71caf463eb281625a67fc912a": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: upstream release-only version bump; this fork maintains its own release versioning and provenance.",
+      "outcome": "not-applicable",
+      "subject": "v0.1.17",
+      "upstream_sha": "f080476ab03f6cf71caf463eb281625a67fc912a"
+    },
+    "fb6492ca2a450960ab93b97e7e57deccd9e16ba4": {
+      "decision_date": "2026-08-05",
+      "local_commit": null,
+      "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+      "outcome": "not-applicable",
+      "subject": "Retire ws3 workspace rooms \u2014 ws4 allocates virgin DO storage",
+      "upstream_sha": "fb6492ca2a450960ab93b97e7e57deccd9e16ba4"
+    },
+    "ff124f4142144285b8f10df152837f55c35ab20a": {
+      "decision_date": "2026-08-05",
+      "local_commit": "6a6f6b8fc3c1895f076d2b1b9208eb034b7df67f",
+      "note": "Implemented by the earlier patch-equivalent fork commit.",
+      "outcome": "implemented",
+      "subject": "Show owning device in session rows: space@device",
+      "upstream_sha": "ff124f4142144285b8f10df152837f55c35ab20a"
+    },
+    "ff5e483baf2a25c994c86949183c6ab6a6469612": {
+      "decision_date": "2026-08-05",
+      "local_commit": "4a3c10163dd8e3bdb4994f4c6a7c00b333340315",
+      "note": "Implemented through the earlier merged fork caption-controls PR.",
+      "outcome": "implemented",
+      "subject": "Add native Windows caption controls (#16)",
+      "upstream_sha": "ff5e483baf2a25c994c86949183c6ab6a6469612"
+    }
+  },
+  "runs": [
+    {
+      "date": "2026-08-05",
+      "decisions": [
+        {
+          "local_commit": "6a6f6b8fc3c1895f076d2b1b9208eb034b7df67f",
+          "note": "Implemented by the earlier patch-equivalent fork commit.",
+          "outcome": "implemented",
+          "subject": "Show owning device in session rows: space@device",
+          "upstream_sha": "ff124f4142144285b8f10df152837f55c35ab20a"
+        },
+        {
+          "local_commit": "adc28704de3159960b4a9494ce824ab5296113e9",
+          "note": "Implemented by the earlier fork GPU-memory adaptation.",
+          "outcome": "implemented",
+          "subject": "Bound GPU memory: fork rev bump + actually free evicted attachment images",
+          "upstream_sha": "760ea9a44b5d7b69b68fccbca39cf7fff66879fc"
+        },
+        {
+          "local_commit": "4a3c10163dd8e3bdb4994f4c6a7c00b333340315",
+          "note": "Implemented through the earlier merged fork caption-controls PR.",
+          "outcome": "implemented",
+          "subject": "Add native Windows caption controls (#16)",
+          "upstream_sha": "ff5e483baf2a25c994c86949183c6ab6a6469612"
+        },
+        {
+          "local_commit": "3e5ea92a87775cd1f56e9ad1790a0a037c95cec6",
+          "note": "Implemented by the earlier fork TUI-removal adaptation.",
+          "outcome": "implemented",
+          "subject": "Remove the TUI: crates/tui, apps/tui, comet tui subcommand, scripts, docs",
+          "upstream_sha": "7b52ce1f70b3dddf13756358c4dc1f9d810a0bad"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable because edge/src/session-room.ts was removed with the hosted workspace service.",
+          "outcome": "not-applicable",
+          "subject": "Workspace rooms force-trim only at aged checkpoints, never the live frontier",
+          "upstream_sha": "b01943979d3732fd615ab2c002185dbb1016a601"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable because edge/src/session-room.ts was removed with the hosted workspace service.",
+          "outcome": "not-applicable",
+          "subject": "Penalty-box devices whose imports keep failing \u2014 stop the doomed-push DOS",
+          "upstream_sha": "c1243c5ab187f39c58905edc8b195504a005a51f"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable because the LAN-only fork has no hosted workspace snapshot backing service.",
+          "outcome": "not-applicable",
+          "subject": "Expose GET /workspace/:orgId/snapshot for doc repair reads",
+          "upstream_sha": "79c8e22898d8c7b45150c06a8c6e97de64cfbd0d"
+        }
+      ],
+      "kind": "bootstrap",
+      "run_id": "bootstrap-2026-08-05",
+      "sync_branch": null,
+      "target_branch": "main"
+    },
+    {
+      "date": "2026-08-05",
+      "decisions": [
+        {
+          "local_commit": null,
+          "note": "Not applicable: upstream release-only version bump; this fork maintains its own release versioning and provenance.",
+          "outcome": "not-applicable",
+          "subject": "v0.1.16",
+          "upstream_sha": "bbe1d1f062feea7a1b62430da0b4588dee60afcb"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Cross-device sync: never wedge silently \u2014 supervised joins, retries, probes",
+          "upstream_sha": "67500fc3b9f450d63cc0198a0eb10a19aae71aaa"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: upstream release-only version bump; this fork maintains its own release versioning and provenance.",
+          "outcome": "not-applicable",
+          "subject": "v0.1.17",
+          "upstream_sha": "f080476ab03f6cf71caf463eb281625a67fc912a"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Deaf-socket healing: probe-on-focus, acks don't feed the probe, edge closes on send failure",
+          "upstream_sha": "347c920f2b5c7de9d55c33cbf48d897ffa5c22da"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Durable deaf-socket detection + sync telemetry: presence tripwire, comet sync, device-attributed edge logs",
+          "upstream_sha": "630f4a02fec58c0adb7685b539f57e60055e449e"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: upstream release-only version bump; this fork maintains its own release versioning and provenance.",
+          "outcome": "not-applicable",
+          "subject": "v0.1.18",
+          "upstream_sha": "d0252cece40725992d50917e5ea760c9c2e2dfaf"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Edge join-wedge root cause: wasm-heap poisoning made joins die in silence",
+          "upstream_sha": "013a0878ae1b757191bec5c3a5192cbf4a908c0d"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Trim history on log fold, not just the daily alarm",
+          "upstream_sha": "13704c7bdb8b60edfb67dd19e9db6dc8c616cdf2"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Trim history on cold materialization too \u2014 idle rooms never trimmed",
+          "upstream_sha": "0fdea0fd0fcd0c6de823f4b233a9ca543e24e2c6"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Free loro-wasm objects explicitly \u2014 GC finalizers never fire under wasm pressure",
+          "upstream_sha": "4ff80aeaff5c78b6e4e3f571c774aa146ee68f55"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Make history trims durable before the join continues",
+          "upstream_sha": "5f26832b10fbe72a47aeb09b4d508140d630af90"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Free idle docs \u2014 wasm memory outlives DO instances and never shrinks",
+          "upstream_sha": "c202e91dfb287f219dd06c2c080f6e27e8caf171"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Force-trim oversized rooms that have no aged checkpoint",
+          "upstream_sha": "c4a2e46cc9c495589241e4025ffcf379abb858db"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Reset the wasm-poison strike counter on a clean join answer",
+          "upstream_sha": "9176b510639ab2e25af1faae7ae787d4bb00c92c"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Relay accepted updates via per-socket fragmentation, not one raw frame",
+          "upstream_sha": "1f2333d6a3cb961ed50fa1a7104ffe1c1d67aea8"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Gate cutoff trims on lastTrimAt alone \u2014 isShallow re-fired them forever",
+          "upstream_sha": "81ebf255b1037629eccc93aad7b8a18db743c041"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Force-trim gate counts log bytes, not just the snapshot",
+          "upstream_sha": "d2a4b571fc097447eed74ed134790693b78922cd"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Automated wedge break boots attached sockets, like /reset-log always did",
+          "upstream_sha": "82ce44193a32b5ae5610f8a4542e5e30b992e6a9"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: the iOS hosted-room transport is outside the current LAN-only release scope.",
+          "outcome": "not-applicable",
+          "subject": "iOS: kick every room on foreground \u2014 suspension kills sockets silently",
+          "upstream_sha": "104e449fd8472415837328edd2f88f4f9e8ba5bc"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Never latch a rejected session; count rejections honestly in comet sync",
+          "upstream_sha": "6adda950133e2fab1fa7197b56b98f7f6b5c2aaf"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: upstream release-only version bump; this fork maintains its own release versioning and provenance.",
+          "outcome": "not-applicable",
+          "subject": "v0.1.19",
+          "upstream_sha": "b08aeb906c508b838b032d819f3ce0928932627b"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Never serve a freed doc wrapper; count wasm use-after-free as poison",
+          "upstream_sha": "1f2152a84fec9f3068b8e9e8cbe03a9f36df00eb"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Retire ws3 workspace rooms \u2014 ws4 allocates virgin DO storage",
+          "upstream_sha": "fb6492ca2a450960ab93b97e7e57deccd9e16ba4"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Recycle DOs: clear stale in-memory import penalties after fleet doc flatten",
+          "upstream_sha": "3a89e681039d8a19d95c1f23b68f3cb31c3b51f6"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Salvage importable updates before striking; small-payload penalty probe; attributed /stats",
+          "upstream_sha": "02002cf917624a1d99b94b83d3201d491a3b3d8c"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Fold the update log when it dwarfs the folded state, not only at fixed budgets",
+          "upstream_sha": "469d18a3cd29f9e562354742dc476d906d7065b9"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Workspace live-frontier-trim guard: match any ws generation, not the literal ws3/",
+          "upstream_sha": "4aacc6d4753f6fde360c02cc532b27865e05401f"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "foldLog: recycle the isolate when the fold export dies on a pressed heap",
+          "upstream_sha": "bf16add11ffb21ea9a8de50608134f38a6eb5463"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: hardens hosted Cloudflare room or relay infrastructure removed from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Revert the aggressive fold triggers; route workspace /append for operator repair",
+          "upstream_sha": "6f19b76c9ffc92d84697d28f18ce5433b6fa0a07"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: depends on the hosted registry service, while this fork uses local-authoritative LAN state.",
+          "outcome": "not-applicable",
+          "subject": "Registry sidebar sync: row-table workspace state replacing the Loro workspace doc",
+          "upstream_sha": "8a61311b989580c778aa4078a71f4e6592aa33b7"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: depends on the hosted registry service, while this fork uses local-authoritative LAN state.",
+          "outcome": "not-applicable",
+          "subject": "Registry polish: clippy clean, fmt, mock-server tidy",
+          "upstream_sha": "1d63c157f45c88a5ecaf9e1b6c3221b09c878a17"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: demo media documents the hosted registry feature that is absent from this LAN-only fork.",
+          "outcome": "not-applicable",
+          "subject": "Registry demo media for the PR (screenshots + recording)",
+          "upstream_sha": "92fba3d62422e75b7ac6b4ae5963cee54984198c"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: upstream release-only version bump; this fork maintains its own release versioning and provenance.",
+          "outcome": "not-applicable",
+          "subject": "v0.1.20",
+          "upstream_sha": "b953b805cb69e656594f49eedc2bcff5397cdd08"
+        },
+        {
+          "local_commit": null,
+          "note": "Not applicable: depends on the hosted registry service, while this fork uses local-authoritative LAN state.",
+          "outcome": "not-applicable",
+          "subject": "iOS registry sync: port the workspace sidebar from the Loro doc to the row registry",
+          "upstream_sha": "0c428118a391f42a67418d071239377e0daffd19"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "iOS session polish: interactive keyboard, bottom-edge fade, transcript perf, image attachments",
+          "upstream_sha": "35447940eec1505bfbdbd45f2c2d715b2ac044d4"
+        }
+      ],
+      "kind": "sync",
+      "run_id": "sync/upstream-2026-08-05",
+      "sync_branch": "sync/upstream-2026-08-05",
+      "target_branch": "main"
+    }
+  ],
+  "schema_version": 1
+}
