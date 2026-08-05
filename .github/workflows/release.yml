@@ -202,17 +202,10 @@ jobs:
           test -f "dist/comet-$VERSION-linux-x86_64.tar.gz"
           test -f "dist/comet-$VERSION-linux-aarch64.tar.gz"
           test -f "dist/comet-$VERSION-windows-x86_64.zip"
-      - name: verify source and tag are immutable
+      - name: verify tag is unused
         env:
-          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          git fetch origin main
-          current_sha="$(git rev-parse origin/main)"
-          if [ "$current_sha" != "$SOURCE_SHA" ]; then
-            echo "main advanced from $SOURCE_SHA to $current_sha" >&2
-            exit 1
-          fi
           if git ls-remote --exit-code --tags origin "refs/tags/$TAG"; then
             echo "tag $TAG already exists" >&2
             exit 1

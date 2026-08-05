@@ -174,7 +174,7 @@ version = "0.61"
         condition = self.workflow["jobs"]["publish"].get("if", "")
         self.assertIn("github.repository == 'matty/comet'", condition)
 
-    def test_publication_rechecks_main_immediately_before_release(self):
+    def test_publication_refuses_to_reuse_an_existing_tag(self):
         steps = self.workflow["jobs"]["publish"]["steps"]
         release_index = next(
             index
@@ -182,23 +182,23 @@ version = "0.61"
             if step.get("uses") == "softprops/action-gh-release@v3"
         )
         guard = steps[release_index - 1]
-        self.assertEqual(guard.get("name"), "verify source and tag are immutable")
+        self.assertEqual(guard.get("name"), "verify tag is unused")
         self.assertEqual(
-            guard.get("env"),
-            {
-                "SOURCE_SHA": "${{ needs.prepare.outputs.source_sha }}",
-                "TAG": "${{ needs.prepare.outputs.tag }}",
-            },
-        )
-        self.assertIn("git fetch origin main", guard.get("run", ""))
-        self.assertIn(
-            'current_sha="$(git rev-parse origin/main)"',
-            guard.get("run", ""),
+            guard.get("env"), {"TAG": "${{ needs.prepare.outputs.tag }}"}
         )
         self.assertIn(
-            'if [ "$current_sha" != "$SOURCE_SHA" ]; then',
+            'git ls-remote --exit-code --tags origin "refs/tags/$TAG"',
             guard.get("run", ""),
         )
+
+    def test_publication_does_not_require_main_to_be_unchanged(self):
+        guard = next(
+            step
+            for step in self.workflow["jobs"]["publish"]["steps"]
+            if step.get("name") == "verify tag is unused"
+        )
+        self.assertNotIn("SOURCE_SHA", guard.get("run", ""))
+        self.assertNotIn("main advanced", guard.get("run", ""))
 
 
 if __name__ == "__main__":
