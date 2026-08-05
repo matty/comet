@@ -33,10 +33,14 @@ const MAX_REPLAY_BYTES: usize = 1024 * 1024;
 const EXITED_TTL: Duration = Duration::from_secs(30 * 60);
 const REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
-struct LiveTerminal {
+struct TerminalIo {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+}
+
+struct LiveTerminal {
+    io: Option<TerminalIo>,
     subscribers: Vec<mpsc::UnboundedSender<TerminalEvent>>,
     replay: VecDeque<TerminalEvent>,
     replay_bytes: usize,
@@ -141,7 +145,7 @@ impl Terminals {
         self.open_with_shell(cwd, cols, rows, None)
     }
 
-    /// Explicit shell override (tests use `/bin/sh`).
+    /// Explicit shell override (tests use a platform-specific fixture).
     pub fn open_with_shell(
         &self,
         cwd: &str,
@@ -195,9 +199,11 @@ impl Terminals {
 
         let id = new_id();
         let session = Arc::new(Mutex::new(LiveTerminal {
-            master: pair.master,
-            writer,
-            killer,
+            io: Some(TerminalIo {
+                master: pair.master,
+                writer,
+                killer,
+            }),
             subscribers: Vec::new(),
             replay: VecDeque::new(),
             replay_bytes: 0,
@@ -205,16 +211,23 @@ impl Terminals {
             last_active_at: std::time::Instant::now(),
             exited: false,
         }));
-        lock(&self.inner.sessions).insert(id.clone(), session.clone());
-
         // Raw PTY bytes: blocking reader thread → batcher task (12ms windows).
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        std::thread::Builder::new()
+        if let Err(err) = std::thread::Builder::new()
             .name(format!("pty-read-{id}"))
             .spawn(move || read_pty(reader, raw_tx))
-            .map_err(|e| EngineError::Other(format!("pty reader thread: {e}")))?;
+        {
+            let killed = child.kill().is_ok();
+            dispose(&session, false);
+            if killed {
+                let _ = child.wait();
+            }
+            return Err(EngineError::Other(format!("pty reader thread: {err}")));
+        }
+        lock(&self.inner.sessions).insert(id.clone(), session.clone());
         let wait = tokio::task::spawn_blocking(move || child.wait());
-        tokio::spawn(pump_output(Arc::downgrade(&session), raw_rx, wait));
+        let exit = tokio::spawn(wait_for_exit(Arc::downgrade(&session), wait));
+        tokio::spawn(pump_output(Arc::downgrade(&session), raw_rx, exit));
 
         Ok(TerminalSession {
             id,
@@ -272,10 +285,13 @@ impl Terminals {
             return Err(EngineError::Other("Terminal has exited".into()));
         }
         session.last_active_at = std::time::Instant::now();
-        session
-            .writer
+        let io = session
+            .io
+            .as_mut()
+            .ok_or_else(|| EngineError::Other("Terminal has exited".into()))?;
+        io.writer
             .write_all(&bytes)
-            .and_then(|_| session.writer.flush())
+            .and_then(|_| io.writer.flush())
             .map_err(|e| EngineError::Other(format!("Terminal write failed: {e}")))
     }
 
@@ -286,8 +302,10 @@ impl Terminals {
         if session.exited {
             return Ok(());
         }
-        session
-            .master
+        let Some(io) = session.io.as_ref() else {
+            return Ok(());
+        };
+        io.master
             .resize(clamp_size(cols, rows))
             .map_err(|e| EngineError::Other(format!("Terminal resize failed: {e}")))
     }
@@ -319,9 +337,10 @@ impl Terminals {
 fn dispose(session: &Arc<Mutex<LiveTerminal>>, kill: bool) {
     let mut session = lock(session);
     session.subscribers.clear();
-    if kill
+    if let Some(mut io) = session.io.take()
+        && kill
         && !session.exited
-        && let Err(err) = session.killer.kill()
+        && let Err(err) = io.killer.kill()
     {
         tracing::debug!(error = %err, "terminal kill failed (already exited?)");
     }
@@ -343,13 +362,37 @@ fn read_pty(mut reader: Box<dyn Read + Send>, tx: mpsc::UnboundedSender<Vec<u8>>
     }
 }
 
+/// Wait for the child and then release every live PTY handle. Windows ConPTY
+/// does not close the reader while Comet retains the controller handles, so the
+/// output pump cannot observe EOF until this resource is dropped.
+async fn wait_for_exit(
+    session: Weak<Mutex<LiveTerminal>>,
+    wait: tokio::task::JoinHandle<Result<portable_pty::ExitStatus, std::io::Error>>,
+) -> i32 {
+    let exit_code = match wait.await {
+        Ok(Ok(status)) => status.exit_code() as i32,
+        Ok(Err(err)) => {
+            tracing::debug!(error = %err, "terminal wait failed");
+            -1
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "terminal wait task failed");
+            -1
+        }
+    };
+    if let Some(session) = session.upgrade() {
+        lock(&session).io.take();
+    }
+    exit_code
+}
+
 /// Batches raw chunks into `Data` events every [`TERMINAL_OUTPUT_BATCH_MS`], then —
 /// once the reader hits EOF (shell gone) — emits the final `Exit` event. Holds only
 /// a weak session handle so a closed terminal tears this task down.
 async fn pump_output(
     session: Weak<Mutex<LiveTerminal>>,
     mut raw_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    wait: tokio::task::JoinHandle<Result<portable_pty::ExitStatus, std::io::Error>>,
+    exit: tokio::task::JoinHandle<i32>,
 ) {
     let batch = Duration::from_millis(TERMINAL_OUTPUT_BATCH_MS);
     let emit = |buffer: Vec<u8>| -> bool {
@@ -382,14 +425,10 @@ async fn pump_output(
             return; // terminal closed underneath us
         }
     }
-    let exit_code = match wait.await {
-        Ok(Ok(status)) => status.exit_code() as i32,
-        Ok(Err(err)) => {
-            tracing::debug!(error = %err, "terminal wait failed");
-            -1
-        }
+    let exit_code = match exit.await {
+        Ok(exit_code) => exit_code,
         Err(err) => {
-            tracing::debug!(error = %err, "terminal wait task failed");
+            tracing::debug!(error = %err, "terminal exit watcher failed");
             -1
         }
     };
