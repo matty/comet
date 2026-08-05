@@ -113,6 +113,103 @@ class LocalRepositoryIntegrationTests(unittest.TestCase):
             self.assertEqual(git("status", "--porcelain", cwd=fork).stdout, "")
             self.assertEqual(git("rev-parse", "main", cwd=fork).stdout.strip(), base_oid)
 
+    def test_conflicted_pick_resumes_and_records_remaining_commits_once(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            upstream = root / "upstream.git"
+            source = root / "source"
+            fork = root / "fork"
+
+            def git(*args, cwd=None):
+                return subprocess.run(
+                    ["git", *args],
+                    cwd=cwd,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                )
+
+            git("init", "--bare", "--initial-branch=main", str(upstream))
+            git("clone", str(upstream), str(source))
+            git("config", "user.name", "Comet Test", cwd=source)
+            git("config", "user.email", "comet-test@example.invalid", cwd=source)
+            (source / "shared.txt").write_text("base\n", encoding="utf-8")
+            git("add", "shared.txt", cwd=source)
+            git("commit", "-m", "Shared base", cwd=source)
+            git("push", "origin", "main", cwd=source)
+
+            git("clone", str(upstream), str(fork))
+            git("config", "user.name", "Comet Test", cwd=fork)
+            git("config", "user.email", "comet-test@example.invalid", cwd=fork)
+            (fork / ".github").mkdir()
+            ledger_path = fork / ".github" / "upstream-sync.json"
+            sync.write_ledger(ledger_path, sync.Ledger(1, {}, ()))
+            git("add", ".github/upstream-sync.json", cwd=fork)
+            git("commit", "-m", "Seed empty upstream ledger", cwd=fork)
+            (fork / "shared.txt").write_text("fork\n", encoding="utf-8")
+            git("add", "shared.txt", cwd=fork)
+            git("commit", "-m", "Fork edits shared file", cwd=fork)
+            main_oid = git("rev-parse", "main", cwd=fork).stdout.strip()
+
+            (source / "shared.txt").write_text("upstream\n", encoding="utf-8")
+            git("add", "shared.txt", cwd=source)
+            git("commit", "-m", "Upstream edits shared file", cwd=source)
+            conflict_oid = git("rev-parse", "HEAD", cwd=source).stdout.strip()
+            (source / "later.txt").write_text("later\n", encoding="utf-8")
+            git("add", "later.txt", cwd=source)
+            git("commit", "-m", "Later upstream change", cwd=source)
+            later_oid = git("rev-parse", "HEAD", cwd=source).stdout.strip()
+            git("push", "origin", "main", cwd=source)
+
+            git("remote", "add", "upstream", str(upstream), cwd=fork)
+            adapter = sync.Git(fork)
+            gh = TrackedWorkflowGh()
+            answers = iter(["1,2", "yes"])
+            output = io.StringIO()
+            with mock.patch.object(sync, "is_expected_upstream", return_value=True):
+                result = sync.start_workflow(
+                    adapter,
+                    gh,
+                    lambda prompt: next(answers),
+                    output,
+                    date(2026, 8, 5),
+                    ledger_path,
+                )
+
+            self.assertEqual(result, 1)
+            self.assertIn("git cherry-pick --continue", output.getvalue())
+            pending_path = sync.pending_state_path(adapter)
+            self.assertTrue(pending_path.exists())
+            (fork / "shared.txt").write_text(
+                "fork plus upstream\n", encoding="utf-8"
+            )
+            git("add", "shared.txt", cwd=fork)
+            git("cherry-pick", "--continue", cwd=fork)
+
+            resume_output = io.StringIO()
+            result = sync.resume_workflow(
+                adapter, gh, resume_output, ledger_path, pending_path
+            )
+
+            self.assertEqual(result, 0)
+            self.assertFalse(pending_path.exists())
+            self.assertTrue((fork / "later.txt").exists())
+            ledger = sync.load_ledger(ledger_path)
+            self.assertEqual(len(ledger.runs), 1)
+            self.assertEqual(ledger.commits[conflict_oid].outcome, "implemented")
+            self.assertEqual(ledger.commits[later_oid].outcome, "implemented")
+            self.assertRegex(
+                ledger.commits[conflict_oid].local_commit,
+                r"^[0-9a-f]{40}$",
+            )
+            self.assertRegex(
+                ledger.commits[later_oid].local_commit,
+                r"^[0-9a-f]{40}$",
+            )
+            self.assertEqual(git("status", "--porcelain", cwd=fork).stdout, "")
+            self.assertEqual(git("rev-parse", "main", cwd=fork).stdout.strip(), main_oid)
+
 
 class ScriptedGit:
     def __init__(self, responses):
@@ -688,9 +785,14 @@ class CliTests(unittest.TestCase):
         self.assertIn("2, 1,4, or 2-5", help_text)
         self.assertIn("confirmation", help_text)
         self.assertIn("sync/upstream-yyyy-mm-dd", help_text)
-        self.assertIn("resolve conflicts manually", help_text)
-        self.assertIn("prints integration commands", help_text)
-        self.assertIn("never merges or pushes", help_text)
+        self.assertIn("committed ledger", help_text)
+        self.assertIn("deferred", help_text)
+        self.assertIn("gh auth login", help_text)
+        self.assertIn("pushes", help_text)
+        self.assertIn("draft pull request", help_text)
+        self.assertIn("--resume", help_text)
+        self.assertIn("bookkeeping-only", help_text)
+        self.assertIn("never merges", help_text)
 
     @mock.patch.object(sync, "repository_root", side_effect=sync.SyncError("not a repo"))
     def test_sync_errors_are_reported_concisely_to_stderr(self, repository_root):

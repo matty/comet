@@ -85,8 +85,11 @@ C, A cannot see or control C. A must configure and pair C separately.
 
 ## Sync selected upstream changes
 
-With Python 3 and Git installed, run this from a clean Comet worktree with a
-branch checked out. The helper refuses to run when HEAD is detached.
+Install Python 3, Git, and the [GitHub CLI](https://cli.github.com/), then
+authenticate once with `gh auth login`. Run the helper from a clean Comet
+worktree with a branch checked out. It refuses detached HEAD, requires an
+`origin` push remote, and validates GitHub authentication before changing
+history.
 
 ```bash
 python scripts/sync-upstream.py
@@ -94,19 +97,36 @@ python scripts/sync-upstream.py
 
 The helper adds the fixed `upstream` remote for
 `https://github.com/zeronsh/comet.git` when it is missing, fetches `main`, and
-lists eligible commits by number. If an existing `upstream` remote points
-elsewhere, the helper refuses to continue and never overwrites it. Select one
-commit (`2`), a list (`1,4`), or a range (`2-5`). After an affirmative
-confirmation (`y` or `yes`), the helper creates a
-`sync/upstream-YYYY-MM-DD` branch and cherry-picks the selections in
-chronological order. Any other answer exits without changing history.
+lists commits not already resolved by Git patch equivalence or the committed
+`.github/upstream-sync.json` ledger. If an existing `upstream` remote points
+elsewhere, the helper refuses to continue and never overwrites it.
 
-If a cherry-pick conflicts, resolve it and run `git cherry-pick --continue`, or
-cancel it with `git cherry-pick --abort`. On success, the helper prints review
-commands and the commands to switch back and fast-forward the original branch.
-These printed commands are reviewable guidance, not commands the helper runs.
-If a branch name contains unusual shell metacharacters, adapt or quote its
-branch argument for your shell. The helper does not merge or push for you.
+Select one commit (`2`), a list (`1,4`), or a range (`2-5`) to implement by
+cherry-pick. A blank selection creates a bookkeeping-only run. Every
+unselected commit is classified as `deferred` by default or
+`not-applicable` with a reason. Implemented and not-applicable commits stay
+hidden on future runs; deferred commits reappear for reconsideration.
+
+After `y` or `yes` confirms the complete summary, the helper creates a unique
+`sync/upstream-YYYY-MM-DD` branch, cherry-picks selections chronologically,
+records the run in the ledger, commits the ledger, pushes the branch to
+`origin`, and opens a draft pull request. A bookkeeping-only run follows the
+same branch, ledger, push, and draft-PR path so shared decisions are reviewed.
+Any other confirmation exits without creating a branch or changing the ledger.
+
+If a cherry-pick conflicts, either resolve it:
+
+```bash
+git add <resolved-files>
+git cherry-pick --continue
+python scripts/sync-upstream.py --resume
+```
+
+or cancel the Git operation with `git cherry-pick --abort` and run the same
+`--resume` command to clear the pending run. Use `--resume` after a push or PR
+failure too; completed phases are not repeated, and an existing matching PR is
+reused. The helper never merges, force-pushes, deletes branches, changes a PR's
+review state, or overwrites remotes.
 
 ## Updates are separate
 

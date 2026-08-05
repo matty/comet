@@ -1277,14 +1277,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         epilog=(
             "Run from a clean worktree with an attached branch. The helper "
             "configures the fixed upstream remote when missing and refuses a "
-            "collision when that name points elsewhere.\n"
-            "Choose commits with 2, 1,4, or 2-5, then review the oldest-first "
-            "order and give confirmation before any branch is created.\n"
-            "The helper creates a sync/upstream-YYYY-MM-DD safety branch. "
-            "If a cherry-pick stops, resolve conflicts manually and continue "
-            "or abort it yourself.\n"
-            "On success, it prints integration commands for review and a "
-            "fast-forward merge; it never merges or pushes."
+            "collision when that name points elsewhere. A configured origin "
+            "and authenticated GitHub CLI (`gh auth login`) are required.\n"
+            "Choose commits with 2, 1,4, or 2-5, or leave selection blank for "
+            "a bookkeeping-only run. Unselected commits are deferred by "
+            "default or can be marked not applicable. Review the outcomes and "
+            "give confirmation before any branch is created.\n"
+            "The helper creates a sync/upstream-YYYY-MM-DD safety branch, "
+            "records outcomes in the committed ledger, pushes the branch to "
+            "origin, and opens a draft pull request. Bookkeeping-only runs "
+            "also open a draft pull request.\n"
+            "After resolving or aborting a conflict, or after a push or PR "
+            "failure, run with --resume. The helper never merges, force-pushes, "
+            "deletes branches, or overwrites remotes."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
