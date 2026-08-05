@@ -200,6 +200,12 @@ version = "0.61"
         self.assertNotIn("SOURCE_SHA", guard.get("run", ""))
         self.assertNotIn("main advanced", guard.get("run", ""))
 
+    def test_forks_do_not_build_on_the_schedule(self):
+        self.assertEqual(
+            self.workflow["jobs"]["prepare"]["if"],
+            "github.repository == 'matty/comet'",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
