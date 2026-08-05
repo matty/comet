@@ -1052,6 +1052,13 @@ def _ledger_git_path(git: Git, ledger_path: Path) -> str:
         raise SyncError("The upstream sync ledger is outside the repository.") from error
 
 
+def _only_ledger_status(status: str, ledger_git_path: str) -> bool:
+    lines = [line for line in status.splitlines() if line]
+    return bool(lines) and all(
+        len(line) >= 4 and line[3:] == ledger_git_path for line in lines
+    )
+
+
 def start_workflow(
     git: Git,
     gh: Gh,
@@ -1160,7 +1167,12 @@ def resume_workflow(
 
     if pending.phase == "cherry-picking":
         ensure_cherry_pick_resolved(git)
-        if git.run("status", "--porcelain").stdout:
+        status = git.run("status", "--porcelain").stdout
+        picks_complete = (
+            pending.active_upstream_sha is None
+            and len(pending.local_commits) == len(pending.selected)
+        )
+        if status and not picks_complete:
             raise SyncError("The sync branch must have a clean worktree to resume.")
         if pending.active_upstream_sha is not None:
             try:
@@ -1223,14 +1235,41 @@ def finish_workflow(
     )
     if pending.phase == "cherry-picking":
         ledger = load_ledger(ledger_path)
-        write_ledger(ledger_path, apply_run(ledger, run))
         ledger_git_path = _ledger_git_path(git, ledger_path)
-        git.run("add", "--", ledger_git_path)
-        git.run(
-            "commit",
-            "-m",
-            f"chore: record upstream sync {pending.run_id}",
+        status = git.run("status", "--porcelain").stdout
+        existing_run = next(
+            (
+                existing
+                for existing in ledger.runs
+                if existing.run_id == run.run_id
+            ),
+            None,
         )
+        if existing_run is not None:
+            if existing_run != run:
+                raise SyncError(
+                    f"Ledger run {run.run_id} does not match pending state."
+                )
+            if status and not _only_ledger_status(status, ledger_git_path):
+                raise SyncError(
+                    "Only the expected upstream sync ledger may be modified."
+                )
+            needs_commit = bool(status)
+        else:
+            if status:
+                raise SyncError(
+                    "The sync branch must have a clean worktree before "
+                    "recording the ledger."
+                )
+            write_ledger(ledger_path, apply_run(ledger, run))
+            needs_commit = True
+        if needs_commit:
+            git.run("add", "--", ledger_git_path)
+            git.run(
+                "commit",
+                "-m",
+                f"chore: record upstream sync {pending.run_id}",
+            )
         pending = replace(pending, phase="ledger-committed")
         write_pending(pending_path, pending)
     if pending.phase == "ledger-committed":

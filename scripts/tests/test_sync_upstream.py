@@ -253,6 +253,7 @@ class TrackedWorkflowGit:
         local_commits=None,
         cherry_pick_failure=None,
         push_failure=None,
+        status_output="",
     ):
         self.cwd = Path(root)
         self.commits = commits
@@ -262,6 +263,7 @@ class TrackedWorkflowGit:
         }
         self.cherry_pick_failure = cherry_pick_failure
         self.push_failure = push_failure
+        self.status_output = status_output
         self.current_branch = "main"
         self.branches = {"main"}
         self.head = "f" * 40
@@ -285,7 +287,7 @@ class TrackedWorkflowGit:
         stdout = ""
         stderr = ""
         if args == ("status", "--porcelain"):
-            pass
+            stdout = self.status_output
         elif args == ("symbolic-ref", "--quiet", "--short", "HEAD"):
             stdout = self.current_branch + "\n"
         elif args == ("remote", "get-url", "upstream"):
@@ -633,6 +635,77 @@ class TrackedWorkflowTests(unittest.TestCase):
             any(args[:1] in {("cherry-pick",), ("commit",)}
                 for args, _ in git.commands)
         )
+
+    def test_resume_recovers_when_ledger_commit_preceded_phase_update(self):
+        git = TrackedWorkflowGit(self.root, self.displayed)
+        branch = "sync/upstream-2026-08-05"
+        git.current_branch = branch
+        git.branches.add(branch)
+        pending = self.pending_after_picks("cherry-picking")
+        sync.write_pending(git.pending_path, pending)
+        run = sync.build_sync_run(
+            date(2026, 8, 5),
+            "main",
+            branch,
+            self.displayed,
+            pending.local_commits,
+            [],
+        )
+        sync.write_ledger(
+            self.ledger_path,
+            sync.apply_run(sync.load_ledger(self.ledger_path), run),
+        )
+
+        result = sync.resume_workflow(
+            git,
+            TrackedWorkflowGh(),
+            io.StringIO(),
+            self.ledger_path,
+            git.pending_path,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertFalse(
+            any(args[:1] == ("commit",) for args, _ in git.commands)
+        )
+
+    def test_resume_commits_expected_ledger_left_staged_by_interruption(self):
+        git = TrackedWorkflowGit(
+            self.root,
+            self.displayed,
+            status_output="M  .github/upstream-sync.json\n",
+        )
+        branch = "sync/upstream-2026-08-05"
+        git.current_branch = branch
+        git.branches.add(branch)
+        pending = self.pending_after_picks("cherry-picking")
+        sync.write_pending(git.pending_path, pending)
+        run = sync.build_sync_run(
+            date(2026, 8, 5),
+            "main",
+            branch,
+            self.displayed,
+            pending.local_commits,
+            [],
+        )
+        sync.write_ledger(
+            self.ledger_path,
+            sync.apply_run(sync.load_ledger(self.ledger_path), run),
+        )
+
+        result = sync.resume_workflow(
+            git,
+            TrackedWorkflowGh(),
+            io.StringIO(),
+            self.ledger_path,
+            git.pending_path,
+        )
+
+        self.assertEqual(result, 0)
+        commits = [
+            args for args, _ in git.commands if args[:1] == ("commit",)
+        ]
+        self.assertEqual(len(commits), 1)
 
     def test_resume_from_pushed_reuses_existing_pr(self):
         git = TrackedWorkflowGit(self.root, self.displayed)
