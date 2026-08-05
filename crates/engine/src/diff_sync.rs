@@ -45,6 +45,10 @@ const REPAIR_INTERVAL: Duration = Duration::from_secs(120);
 const MAX_WATCH_DIRS: usize = 8_000;
 /// `git hash-object -t tree /dev/null` — diff base for repos with no commits yet.
 const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/// Bytes of git stderr kept for the error message. Anything past this is read
+/// and discarded — a chatty credential helper must never buffer without limit,
+/// and it must never stall on a full stderr pipe either.
+const MAX_STDERR_BYTES: usize = 8 * 1024;
 
 /// One bounded atomic snapshot of a checkout's working tree.
 #[derive(Debug, Clone)]
@@ -448,11 +452,23 @@ async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capt
         .take()
         .ok_or_else(|| EngineError::Other("git stderr unavailable".into()))?;
     let stderr_capture = async move {
-        let mut bytes = Vec::new();
-        stderr
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|e| EngineError::Other(format!("git stderr read failed: {e}")))?;
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 4 * 1024];
+        loop {
+            let n = stderr
+                .read(&mut buf)
+                .await
+                .map_err(|e| EngineError::Other(format!("git stderr read failed: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            // Keep the head of the message, but keep reading past the cap: a
+            // reader that stops early re-wedges the child on a full pipe.
+            let remaining = MAX_STDERR_BYTES.saturating_sub(bytes.len());
+            if remaining > 0 {
+                bytes.extend_from_slice(&buf[..n.min(remaining)]);
+            }
+        }
         Ok::<_, EngineError>(bytes)
     };
     let stdout_capture = async move {
