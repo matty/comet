@@ -124,12 +124,46 @@ version = "0.61"
             "${{ needs.prepare.outputs.source_sha }}",
         )
 
+    def test_prepare_skips_a_commit_that_already_has_a_nightly(self):
+        prepare = self.workflow["jobs"]["prepare"]
+        self.assertEqual(
+            prepare["outputs"]["needed"], "${{ steps.release.outputs.needed }}"
+        )
+        derive = next(
+            step for step in prepare["steps"] if step.get("id") == "release"
+        )["run"]
+        self.assertIn("git ls-remote --tags origin", derive)
+        self.assertIn(r".g${source_sha:0:7}$", derive)
+        self.assertIn('echo "needed=false" >> "$GITHUB_OUTPUT"', derive)
+        self.assertIn('echo "needed=true" >> "$GITHUB_OUTPUT"', derive)
+
+    def test_prepare_no_longer_fails_when_main_advances(self):
+        derive = next(
+            step
+            for step in self.workflow["jobs"]["prepare"]["steps"]
+            if step.get("id") == "release"
+        )["run"]
+        self.assertNotIn("GITHUB_SHA", derive)
+
+    def test_build_and_publish_jobs_gate_on_the_needed_check(self):
+        jobs = self.workflow["jobs"]
+        for name in ("linux", "macos", "windows"):
+            self.assertEqual(
+                jobs[name]["if"],
+                "needs.prepare.outputs.needed == 'true'",
+                f"{name} must skip when no nightly is needed",
+            )
+        self.assertIn(
+            "needs.prepare.outputs.needed == 'true'", jobs["publish"]["if"]
+        )
+
     def test_publication_gate_is_cancellable_and_tolerates_failed_macos(self):
         publish = self.workflow["jobs"]["publish"]
         self.assertEqual(publish["needs"], ["prepare", "linux", "macos", "windows"])
         self.assertEqual(
             publish.get("if"),
-            "${{ github.repository == 'matty/comet' && !cancelled() && "
+            "${{ needs.prepare.outputs.needed == 'true' && "
+            "github.repository == 'matty/comet' && !cancelled() && "
             "needs.prepare.result == 'success' && "
             "needs.linux.result == 'success' && needs.windows.result == 'success' && "
             "(needs.macos.result == 'success' || needs.macos.result == 'failure') }}",

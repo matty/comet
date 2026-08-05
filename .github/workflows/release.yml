@@ -16,6 +16,7 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
+      needed: ${{ steps.release.outputs.needed }}
       version: ${{ steps.release.outputs.version }}
       tag: ${{ steps.release.outputs.tag }}
       source_sha: ${{ steps.release.outputs.source_sha }}
@@ -30,10 +31,12 @@ jobs:
         run: |
           git fetch origin main
           source_sha="$(git rev-parse origin/main)"
-          if [ "${{ github.event_name }}" = push ] && [ "$source_sha" != "$GITHUB_SHA" ]; then
-            echo "main advanced from $GITHUB_SHA to $source_sha" >&2
-            exit 1
+          if git ls-remote --tags origin | grep -q "refs/tags/v.*-nightly\..*\.g${source_sha:0:7}$"; then
+            echo "$source_sha already has a nightly release" >&2
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "needed=true" >> "$GITHUB_OUTPUT"
           base="$(sed -n '0,/^version = /s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
           test -n "$base"
           version="$base-nightly.$(date -u +%Y%m%d).${{ github.run_number }}.g${source_sha:0:7}"
@@ -43,6 +46,7 @@ jobs:
 
   linux:
     needs: prepare
+    if: needs.prepare.outputs.needed == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -97,6 +101,7 @@ jobs:
 
   macos:
     needs: prepare
+    if: needs.prepare.outputs.needed == 'true'
     runs-on: macos-latest
     continue-on-error: true
     steps:
@@ -140,6 +145,7 @@ jobs:
 
   windows:
     needs: prepare
+    if: needs.prepare.outputs.needed == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -177,7 +183,7 @@ jobs:
 
   publish:
     needs: [prepare, linux, macos, windows]
-    if: ${{ github.repository == 'matty/comet' && !cancelled() && needs.prepare.result == 'success' && needs.linux.result == 'success' && needs.windows.result == 'success' && (needs.macos.result == 'success' || needs.macos.result == 'failure') }}
+    if: ${{ needs.prepare.outputs.needed == 'true' && github.repository == 'matty/comet' && !cancelled() && needs.prepare.result == 'success' && needs.linux.result == 'success' && needs.windows.result == 'success' && (needs.macos.result == 'success' || needs.macos.result == 'failure') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
