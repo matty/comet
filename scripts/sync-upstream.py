@@ -78,6 +78,21 @@ class GitError(RuntimeError):
         self.stderr = stderr
 
 
+class GhError(RuntimeError):
+    def __init__(
+        self,
+        args_list: list[str],
+        returncode: int,
+        stdout: str,
+        stderr: str,
+    ) -> None:
+        super().__init__(stderr.strip() or f"GitHub CLI exited with status {returncode}.")
+        self.args_list = args_list
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
 class Git:
     def __init__(self, cwd: Path | None = None) -> None:
         self.cwd = cwd
@@ -100,6 +115,33 @@ class Git:
             raise SyncError("Git is not installed or is not on PATH.") from error
         if check and result.returncode != 0:
             raise GitError(list(args), result.returncode, result.stdout, result.stderr)
+        return result
+
+
+class Gh:
+    def __init__(self, cwd: Path | None = None) -> None:
+        self.cwd = cwd
+
+    def run(
+        self, *args: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            result = subprocess.run(
+                ["gh", *args],
+                cwd=self.cwd,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except FileNotFoundError as error:
+            raise SyncError(
+                "GitHub CLI is not installed or is not on PATH."
+            ) from error
+        if check and result.returncode != 0:
+            raise GhError(list(args), result.returncode, result.stdout, result.stderr)
         return result
 
 
@@ -523,6 +565,26 @@ def apply_run(ledger: Ledger, run: SyncRun) -> Ledger:
     return Ledger(ledger.schema_version, commits, ledger.runs + (run,))
 
 
+def validate_origin(git: Git) -> None:
+    result = git.run("remote", "get-url", "origin", check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        raise SyncError(
+            "Remote 'origin' is required to push the sync branch and open a PR."
+        )
+
+
+def validate_github(gh: Gh) -> None:
+    try:
+        gh.run("auth", "status")
+    except GhError as error:
+        detail = format_failure_detail(
+            error.stdout, error.stderr, error.returncode
+        )
+        raise SyncError(
+            f"GitHub CLI authentication failed: {detail}. Run gh auth login."
+        ) from error
+
+
 def next_branch_name(existing: set[str], day: date) -> str:
     base = f"sync/upstream-{day.isoformat()}"
     if base not in existing:
@@ -547,6 +609,94 @@ def format_failure_detail(stdout: str, stderr: str, returncode: int) -> str:
         if detail:
             return detail
     return f"exit status {returncode}"
+
+
+def format_pr(run: SyncRun) -> tuple[str, str]:
+    title = f"Sync upstream commits ({run.date})"
+    headings = {
+        "implemented": "Implemented",
+        "not-applicable": "Not applicable",
+        "deferred": "Deferred",
+    }
+    sections = []
+    for outcome in ("implemented", "not-applicable", "deferred"):
+        decisions = [
+            decision for decision in run.decisions if decision.outcome == outcome
+        ]
+        if not decisions:
+            continue
+        lines = [f"## {headings[outcome]}", ""]
+        for decision in decisions:
+            upstream = decision.upstream_sha[:7]
+            if decision.local_commit is not None:
+                prefix = f"`{upstream}` → `{decision.local_commit[:7]}`"
+            else:
+                prefix = f"`{upstream}`"
+            lines.append(f"- {prefix} — {decision.subject}")
+            if outcome != "implemented":
+                lines.append(f"  - {decision.note}")
+        sections.append("\n".join(lines))
+    return title, "\n\n".join(sections) + "\n"
+
+
+def find_existing_pr(gh: Gh, head: str, base: str) -> str | None:
+    result = gh.run(
+        "pr",
+        "list",
+        "--state",
+        "open",
+        "--base",
+        base,
+        "--head",
+        head,
+        "--json",
+        "url",
+    )
+    try:
+        matches = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise SyncError("GitHub CLI returned malformed PR data.") from error
+    if not isinstance(matches, list):
+        raise SyncError("GitHub CLI returned malformed PR data.")
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise SyncError("Multiple open PRs match the sync branch and target.")
+    match = matches[0]
+    if (
+        not isinstance(match, dict)
+        or not isinstance(match.get("url"), str)
+        or not match["url"].strip()
+    ):
+        raise SyncError("GitHub CLI returned malformed PR data.")
+    return match["url"]
+
+
+def create_draft_pr(
+    gh: Gh,
+    run: SyncRun,
+    title: str,
+    body: str,
+) -> str:
+    if run.sync_branch is None:
+        raise SyncError("A bootstrap run cannot create a pull request.")
+    result = gh.run(
+        "pr",
+        "create",
+        "--draft",
+        "--base",
+        run.target_branch,
+        "--head",
+        run.sync_branch,
+        "--title",
+        title,
+        "--body",
+        body,
+    )
+    url = result.stdout.strip()
+    if not url:
+        raise SyncError("GitHub CLI did not return the created PR URL.")
+    return url
 
 
 def run_workflow(

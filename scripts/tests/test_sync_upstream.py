@@ -131,6 +131,25 @@ class ScriptedGit:
         return subprocess.CompletedProcess(args, 0, response, "")
 
 
+class ScriptedGh:
+    def __init__(self, responses):
+        self.responses = responses
+        self.commands = []
+
+    def run(self, *args, check=True):
+        self.commands.append((args, check))
+        response = self.responses[args]
+        if isinstance(response, Exception):
+            raise response
+        if not isinstance(response, subprocess.CompletedProcess):
+            response = subprocess.CompletedProcess(args, 0, response, "")
+        if check and response.returncode:
+            raise sync.GhError(
+                list(args), response.returncode, response.stdout, response.stderr
+            )
+        return response
+
+
 class WorkflowGit:
     def __init__(self, commits=DISPLAYED, existing=None, cherry_pick_failures=None):
         self.commits = commits
@@ -423,6 +442,163 @@ class GitAdapterTests(unittest.TestCase):
             sync.SyncError, "Git is not installed or is not on PATH"
         ):
             sync.Git(Path("C:/repo")).run("status")
+
+
+class GitHubAdapterTests(unittest.TestCase):
+    @mock.patch.object(sync.subprocess, "run")
+    def test_run_preserves_failed_command_details(self, run):
+        run.return_value = subprocess.CompletedProcess(
+            ["gh", "auth", "status"], 7, "partial", "not logged in"
+        )
+
+        with self.assertRaises(sync.GhError) as caught:
+            sync.Gh().run("auth", "status")
+
+        error = caught.exception
+        self.assertEqual(error.args_list, ["auth", "status"])
+        self.assertEqual(error.returncode, 7)
+        self.assertEqual(error.stdout, "partial")
+        self.assertEqual(error.stderr, "not logged in")
+        run.assert_called_once_with(
+            ["gh", "auth", "status"],
+            cwd=None,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    @mock.patch.object(sync.subprocess, "run", side_effect=FileNotFoundError)
+    def test_run_reports_missing_github_cli(self, run):
+        with self.assertRaisesRegex(
+            sync.SyncError, "GitHub CLI is not installed or is not on PATH"
+        ):
+            sync.Gh(Path("C:/repo")).run("auth", "status")
+
+    def test_github_preflight_checks_authentication(self):
+        gh = ScriptedGh({("auth", "status"): ""})
+        sync.validate_github(gh)
+        self.assertEqual(gh.commands, [(('auth', 'status'), True)])
+
+    def test_github_preflight_explains_failed_authentication(self):
+        failure = subprocess.CompletedProcess(
+            ["gh", "auth", "status"], 1, "", "not logged in"
+        )
+        gh = ScriptedGh({("auth", "status"): failure})
+        with self.assertRaisesRegex(sync.SyncError, "gh auth login"):
+            sync.validate_github(gh)
+
+    def test_origin_preflight_accepts_configured_remote(self):
+        git = ScriptedGit(
+            {("remote", "get-url", "origin"): "https://github.com/matty/comet\n"}
+        )
+        sync.validate_origin(git)
+        self.assertEqual(
+            git.commands, [(('remote', 'get-url', 'origin'), False)]
+        )
+
+    def test_origin_preflight_rejects_missing_remote(self):
+        missing = subprocess.CompletedProcess(
+            ["git", "remote", "get-url", "origin"], 2, "", "missing"
+        )
+        git = ScriptedGit({("remote", "get-url", "origin"): missing})
+        with self.assertRaisesRegex(sync.SyncError, "origin"):
+            sync.validate_origin(git)
+
+
+class PullRequestTests(unittest.TestCase):
+    def sample_run(self):
+        return sync.SyncRun(
+            "sync/upstream-2026-08-05",
+            "sync",
+            "2026-08-05",
+            "main",
+            "sync/upstream-2026-08-05",
+            (
+                sync.RunDecision(
+                    "a" * 40,
+                    "Applied fix",
+                    "implemented",
+                    "Cherry-picked by upstream sync helper.",
+                    "b" * 40,
+                ),
+                sync.RunDecision(
+                    "c" * 40,
+                    "Hosted fix",
+                    "not-applicable",
+                    "Hosted service was removed.",
+                ),
+                sync.RunDecision(
+                    "d" * 40,
+                    "Later fix",
+                    "deferred",
+                    "Deferred during interactive review.",
+                ),
+            ),
+        )
+
+    def test_pr_body_groups_all_outcomes(self):
+        title, body = sync.format_pr(self.sample_run())
+        self.assertEqual(title, "Sync upstream commits (2026-08-05)")
+        self.assertIn("## Implemented", body)
+        self.assertIn("`aaaaaaa` → `bbbbbbb`", body)
+        self.assertIn("## Not applicable", body)
+        self.assertIn("Hosted service was removed.", body)
+        self.assertIn("## Deferred", body)
+
+    def test_find_existing_pr_returns_none_for_empty_result(self):
+        command = (
+            "pr", "list", "--state", "open", "--base", "main",
+            "--head", "sync/upstream-2026-08-05", "--json", "url",
+        )
+        gh = ScriptedGh({command: "[]\n"})
+        self.assertIsNone(
+            sync.find_existing_pr(
+                gh, "sync/upstream-2026-08-05", "main"
+            )
+        )
+
+    def test_find_existing_pr_returns_single_url(self):
+        command = (
+            "pr", "list", "--state", "open", "--base", "main",
+            "--head", "sync/upstream-2026-08-05", "--json", "url",
+        )
+        gh = ScriptedGh({command: '[{"url":"https://example/pr/1"}]\n'})
+        self.assertEqual(
+            sync.find_existing_pr(
+                gh, "sync/upstream-2026-08-05", "main"
+            ),
+            "https://example/pr/1",
+        )
+
+    def test_find_existing_pr_rejects_malformed_or_multiple_results(self):
+        command = (
+            "pr", "list", "--state", "open", "--base", "main",
+            "--head", "sync/upstream-2026-08-05", "--json", "url",
+        )
+        for response in ("not json", '[{"url":"one"},{"url":"two"}]'):
+            with self.subTest(response=response):
+                gh = ScriptedGh({command: response})
+                with self.assertRaises(sync.SyncError):
+                    sync.find_existing_pr(
+                        gh, "sync/upstream-2026-08-05", "main"
+                    )
+
+    def test_create_pr_is_draft_against_original_target(self):
+        run = self.sample_run()
+        title, body = sync.format_pr(run)
+        command = (
+            "pr", "create", "--draft", "--base", "main", "--head",
+            run.sync_branch, "--title", title, "--body", body,
+        )
+        gh = ScriptedGh({command: "https://example/pr/2\n"})
+        self.assertEqual(
+            sync.create_draft_pr(gh, run, title, body),
+            "https://example/pr/2",
+        )
+        self.assertEqual(gh.commands, [(command, True)])
 
 
 class RepositoryTests(unittest.TestCase):
