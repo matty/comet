@@ -352,13 +352,19 @@ impl Shell {
                             el.shadow(crate::theme::glass_selected_shadows())
                         })
                         .cursor_pointer()
-                        // Tabs sit inside the titlebar drag strip — carve them out.
-                        // NOT `.occlude()`: a BlockMouse hitbox ends the hit test,
-                        // so the scroll container behind the tabs never saw wheel
-                        // events and an overflowing strip could not be scrolled
-                        // (tabs tile the whole region). ExceptScroll keeps the
-                        // drag-region carve-out and lets the strip scroll.
-                        .block_mouse_except_scroll()
+                        // No blocking behavior HERE: the carve-out from the
+                        // titlebar drag strip is the scroll container's
+                        // `.occlude()` (below), which covers the whole strip.
+                        // A `block_mouse_except_scroll()` on the tab does NOT
+                        // carve out — BlockMouseExceptScroll only truncates the
+                        // *hover* half of the hit test (`hover_hitbox_count`),
+                        // while the native Drag control-area test scans EVERY
+                        // hit id, so each tab still reported as the window
+                        // caption (Windows HTCAPTION): the press arrived as a
+                        // non-client click, DefWindowProc's move loop ate the
+                        // release, and the still-armed pending mouse-down made
+                        // the next pointer move pick the tab up as a drag
+                        // instead of selecting it (user-reported).
                         .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
                         // Track hover in Shell state: the trailing slot flips
                         // between dot and close button (hover_blend only fades
@@ -504,6 +510,18 @@ impl Shell {
                     .min_w_0()
                     .overflow_x_scroll()
                     .track_scroll(&self.tabs_scroll)
+                    // The strip is what sits inside the titlebar drag region,
+                    // so the strip is what carves itself out — one BlockMouse
+                    // hitbox for the whole tab area (same idiom as every
+                    // titlebar button, `window_control_button`). The hit test
+                    // records THIS hitbox and then stops, so the drag strip's
+                    // `is_hovered` listeners and the native Drag control-area
+                    // test below it both go quiet, while everything inside the
+                    // strip still works: tabs are ordinary hitboxes above it
+                    // (clicks, hover, drag-reorder), and the container itself
+                    // stays in the hit list, so `should_handle_scroll` is true
+                    // and an overflowing strip still scrolls under the wheel.
+                    .occlude()
                     .on_drag_move::<TabDragPayload>(cx.listener(
                         move |this, event: &gpui::DragMoveEvent<TabDragPayload>, _, cx| {
                             let payload = event.drag(cx);
