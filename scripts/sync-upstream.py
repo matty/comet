@@ -1,5 +1,5 @@
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 import json
 from pathlib import Path
@@ -59,7 +59,26 @@ class Ledger:
     runs: tuple[SyncRun, ...]
 
 
+@dataclass(frozen=True)
+class PendingRun:
+    schema_version: int
+    phase: str
+    target_branch: str
+    sync_branch: str
+    run_id: str
+    run_date: str
+    selected: tuple[Commit, ...]
+    classifications: tuple[RunDecision, ...]
+    local_commits: dict[str, str]
+    active_upstream_sha: str | None = None
+    pre_pick_head: str | None = None
+
+
 class SyncError(RuntimeError):
+    pass
+
+
+class SyncCancelled(SyncError):
     pass
 
 
@@ -361,6 +380,270 @@ def serialize_ledger(ledger: Ledger) -> str:
 def write_ledger(path: Path, ledger: Ledger) -> None:
     with path.open("w", encoding="utf-8", newline="\n") as output:
         output.write(serialize_ledger(ledger))
+
+
+def _commit_document(commit: Commit) -> dict[str, str]:
+    return {
+        "oid": commit.oid,
+        "short_oid": commit.short_oid,
+        "date": commit.date,
+        "author": commit.author,
+        "subject": commit.subject,
+    }
+
+
+def _parse_commit(value: object, context: str) -> Commit:
+    data = _require_object(value, context)
+    _require_keys(
+        data,
+        {"oid", "short_oid", "date", "author", "subject"},
+        context,
+    )
+    oid = _require_sha(data["oid"], f"{context}.oid")
+    short_oid = _require_string(data["short_oid"], f"{context}.short_oid")
+    if short_oid != oid[: len(short_oid)] or len(short_oid) < 7:
+        raise SyncError(f"{context}.short_oid must abbreviate its full SHA.")
+    commit_date = _require_date(data["date"], f"{context}.date")
+    author = _require_string(data["author"], f"{context}.author")
+    subject = _require_string(data["subject"], f"{context}.subject")
+    return Commit(oid, short_oid, commit_date, author, subject)
+
+
+def _validate_pending(pending: PendingRun) -> None:
+    if pending.schema_version != 1:
+        raise SyncError(
+            f"Unsupported pending sync schema version: {pending.schema_version}."
+        )
+    if pending.phase not in {
+        "prepared",
+        "cherry-picking",
+        "ledger-committed",
+        "pushed",
+    }:
+        raise SyncError(f"Unsupported pending sync phase: {pending.phase}.")
+    _require_string(pending.target_branch, "pending.target_branch")
+    _require_string(pending.sync_branch, "pending.sync_branch")
+    _require_string(pending.run_id, "pending.run_id")
+    _require_date(pending.run_date, "pending.run_date")
+    if pending.run_id != pending.sync_branch:
+        raise SyncError("Pending run ID must match its sync branch.")
+    selected_oids = [commit.oid for commit in pending.selected]
+    if len(selected_oids) != len(set(selected_oids)):
+        raise SyncError("Pending selected commits contain duplicates.")
+    classification_oids = [
+        decision.upstream_sha for decision in pending.classifications
+    ]
+    if len(classification_oids) != len(set(classification_oids)):
+        raise SyncError("Pending classifications contain duplicates.")
+    if set(selected_oids) & set(classification_oids):
+        raise SyncError("A pending commit cannot be selected and classified.")
+    if any(
+        decision.outcome not in {"deferred", "not-applicable"}
+        or decision.local_commit is not None
+        for decision in pending.classifications
+    ):
+        raise SyncError("Pending classifications must be deferred or not-applicable.")
+    for upstream_sha, local_commit in pending.local_commits.items():
+        _require_sha(upstream_sha, "pending.local_commits upstream SHA")
+        _require_sha(local_commit, "pending.local_commits local SHA")
+    completed_count = len(pending.local_commits)
+    expected_completed = set(selected_oids[:completed_count])
+    if set(pending.local_commits) != expected_completed:
+        raise SyncError(
+            "Pending local commits must match a chronological prefix of selections."
+        )
+    active_pair = (
+        pending.active_upstream_sha is not None,
+        pending.pre_pick_head is not None,
+    )
+    if active_pair[0] != active_pair[1]:
+        raise SyncError("Pending active commit and pre-pick HEAD must be paired.")
+    if pending.active_upstream_sha is not None:
+        _require_sha(pending.active_upstream_sha, "pending.active_upstream_sha")
+        _require_sha(pending.pre_pick_head, "pending.pre_pick_head")
+        if pending.phase != "cherry-picking":
+            raise SyncError("Only cherry-picking may have an active commit.")
+        if completed_count >= len(selected_oids):
+            raise SyncError("Pending active commit has no remaining selection.")
+        if pending.active_upstream_sha != selected_oids[completed_count]:
+            raise SyncError("Pending active commit is not the next selection.")
+    if pending.phase == "prepared":
+        if pending.local_commits or pending.active_upstream_sha is not None:
+            raise SyncError("A prepared run cannot contain completed picks.")
+    if pending.phase in {"ledger-committed", "pushed"}:
+        if completed_count != len(selected_oids):
+            raise SyncError(
+                f"A {pending.phase} run must contain every local commit mapping."
+            )
+        if pending.active_upstream_sha is not None:
+            raise SyncError(f"A {pending.phase} run cannot have an active pick.")
+
+
+def _pending_document(pending: PendingRun) -> dict[str, object]:
+    return {
+        "schema_version": pending.schema_version,
+        "phase": pending.phase,
+        "target_branch": pending.target_branch,
+        "sync_branch": pending.sync_branch,
+        "run_id": pending.run_id,
+        "run_date": pending.run_date,
+        "selected": [_commit_document(commit) for commit in pending.selected],
+        "classifications": [
+            _decision_document(decision) for decision in pending.classifications
+        ],
+        "local_commits": pending.local_commits,
+        "active_upstream_sha": pending.active_upstream_sha,
+        "pre_pick_head": pending.pre_pick_head,
+    }
+
+
+def _parse_pending(value: object) -> PendingRun:
+    data = _require_object(value, "pending")
+    _require_keys(
+        data,
+        {
+            "schema_version",
+            "phase",
+            "target_branch",
+            "sync_branch",
+            "run_id",
+            "run_date",
+            "selected",
+            "classifications",
+            "local_commits",
+            "active_upstream_sha",
+            "pre_pick_head",
+        },
+        "pending",
+    )
+    if not isinstance(data["selected"], list):
+        raise SyncError("pending.selected must be a JSON list.")
+    if not isinstance(data["classifications"], list):
+        raise SyncError("pending.classifications must be a JSON list.")
+    local_value = _require_object(data["local_commits"], "pending.local_commits")
+    active = data["active_upstream_sha"]
+    pre_pick = data["pre_pick_head"]
+    if active is not None and not isinstance(active, str):
+        raise SyncError("pending.active_upstream_sha must be a string or null.")
+    if pre_pick is not None and not isinstance(pre_pick, str):
+        raise SyncError("pending.pre_pick_head must be a string or null.")
+    pending = PendingRun(
+        data["schema_version"],
+        _require_string(data["phase"], "pending.phase"),
+        _require_string(data["target_branch"], "pending.target_branch"),
+        _require_string(data["sync_branch"], "pending.sync_branch"),
+        _require_string(data["run_id"], "pending.run_id"),
+        _require_date(data["run_date"], "pending.run_date"),
+        tuple(
+            _parse_commit(item, f"pending.selected[{index}]")
+            for index, item in enumerate(data["selected"])
+        ),
+        tuple(
+            _parse_decision(item, f"pending.classifications[{index}]")
+            for index, item in enumerate(data["classifications"])
+        ),
+        dict(local_value),
+        active,
+        pre_pick,
+    )
+    _validate_pending(pending)
+    return pending
+
+
+def load_pending(path: Path) -> PendingRun:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise SyncError(f"Unable to read pending upstream sync state: {error}.") from error
+    except json.JSONDecodeError as error:
+        raise SyncError(f"Pending upstream sync state is invalid JSON: {error.msg}.") from error
+    return _parse_pending(document)
+
+
+def write_pending(path: Path, pending: PendingRun) -> None:
+    _validate_pending(pending)
+    serialized = json.dumps(
+        _pending_document(pending), indent=2, sort_keys=True
+    ) + "\n"
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as output:
+        output.write(serialized)
+    temporary.replace(path)
+
+
+def clear_pending(path: Path) -> None:
+    path.unlink(missing_ok=True)
+
+
+def pending_state_path(git: Git) -> Path:
+    value = git.run(
+        "rev-parse", "--git-path", "upstream-sync-state.json"
+    ).stdout.strip()
+    if not value:
+        raise SyncError("Git returned an empty pending-state path.")
+    path = Path(value)
+    if not path.is_absolute():
+        path = (git.cwd or Path.cwd()) / path
+    return path
+
+
+def record_pick_start(
+    pending: PendingRun,
+    commit: Commit,
+    pre_pick_head: str,
+) -> PendingRun:
+    if pending.phase != "cherry-picking" or pending.active_upstream_sha is not None:
+        raise SyncError("Pending state is not ready to start a cherry-pick.")
+    completed_count = len(pending.local_commits)
+    if (
+        completed_count >= len(pending.selected)
+        or pending.selected[completed_count].oid != commit.oid
+    ):
+        raise SyncError("Cherry-pick is not the next pending selection.")
+    _require_sha(pre_pick_head, "pre-pick HEAD")
+    updated = replace(
+        pending,
+        active_upstream_sha=commit.oid,
+        pre_pick_head=pre_pick_head,
+    )
+    _validate_pending(updated)
+    return updated
+
+
+def record_pick_success(pending: PendingRun, local_commit: str) -> PendingRun:
+    if pending.active_upstream_sha is None:
+        raise SyncError("Pending state has no active cherry-pick.")
+    _require_sha(local_commit, "local cherry-pick SHA")
+    mappings = dict(pending.local_commits)
+    mappings[pending.active_upstream_sha] = local_commit
+    updated = replace(
+        pending,
+        local_commits=mappings,
+        active_upstream_sha=None,
+        pre_pick_head=None,
+    )
+    _validate_pending(updated)
+    return updated
+
+
+def verify_resumed_pick(pending: PendingRun, current_head: str) -> PendingRun:
+    if pending.active_upstream_sha is None or pending.pre_pick_head is None:
+        return pending
+    _require_sha(current_head, "current HEAD")
+    if current_head == pending.pre_pick_head:
+        raise SyncCancelled("The active cherry-pick was aborted.")
+    return record_pick_success(pending, current_head)
+
+
+def ensure_cherry_pick_resolved(git: Git) -> None:
+    result = git.run(
+        "rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD", check=False
+    )
+    if result.returncode == 0:
+        raise SyncError(
+            "A cherry-pick is still in progress. Resolve it and run "
+            "git cherry-pick --continue before resuming."
+        )
 
 
 def repository_root(git: Git) -> Path:

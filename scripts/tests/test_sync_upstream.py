@@ -1,10 +1,12 @@
 import importlib.util
 import io
+import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from datetime import date
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -599,6 +601,163 @@ class PullRequestTests(unittest.TestCase):
             "https://example/pr/2",
         )
         self.assertEqual(gh.commands, [(command, True)])
+
+
+class PendingStateTests(unittest.TestCase):
+    def commit(self, character, subject):
+        return sync.Commit(
+            character * 40,
+            character * 7,
+            "2026-08-05",
+            "Author",
+            subject,
+        )
+
+    def pending(self, phase="prepared"):
+        selected = (
+            self.commit("a", "First selected"),
+            self.commit("b", "Second selected"),
+        )
+        return sync.PendingRun(
+            1,
+            phase,
+            "main",
+            "sync/upstream-2026-08-05",
+            "sync/upstream-2026-08-05",
+            "2026-08-05",
+            selected,
+            (
+                sync.RunDecision(
+                    "c" * 40,
+                    "Not selected",
+                    "deferred",
+                    "Deferred during interactive review.",
+                ),
+            ),
+            {},
+        )
+
+    def round_trip(self, pending):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "pending.json"
+            sync.write_pending(path, pending)
+            first = path.read_text(encoding="utf-8")
+            loaded = sync.load_pending(path)
+            sync.write_pending(path, loaded)
+            self.assertEqual(path.read_text(encoding="utf-8"), first)
+            return loaded
+
+    def test_pending_state_round_trips_each_phase(self):
+        prepared = self.pending()
+        picking = replace(prepared, phase="cherry-picking")
+        ledger_committed = replace(
+            prepared,
+            phase="ledger-committed",
+            local_commits={"a" * 40: "d" * 40, "b" * 40: "e" * 40},
+        )
+        pushed = replace(ledger_committed, phase="pushed")
+
+        for pending in (prepared, picking, ledger_committed, pushed):
+            with self.subTest(phase=pending.phase):
+                self.assertEqual(self.round_trip(pending), pending)
+
+    def invalid_document(self, mutate):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "pending.json"
+            sync.write_pending(path, self.pending())
+            document = json.loads(path.read_text(encoding="utf-8"))
+            mutate(document)
+            path.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaises(sync.SyncError):
+                sync.load_pending(path)
+
+    def test_rejects_unknown_phase(self):
+        self.invalid_document(lambda document: document.update(phase="unknown"))
+
+    def test_rejects_more_local_commits_than_selected(self):
+        def mutate(document):
+            document["phase"] = "ledger-committed"
+            document["local_commits"] = {
+                "a" * 40: "d" * 40,
+                "b" * 40: "e" * 40,
+                "f" * 40: "1" * 40,
+            }
+
+        self.invalid_document(mutate)
+
+    def test_rejects_local_commits_outside_chronological_prefix(self):
+        def mutate(document):
+            document["phase"] = "cherry-picking"
+            document["local_commits"] = {"b" * 40: "e" * 40}
+
+        self.invalid_document(mutate)
+
+    def test_rejects_active_commit_that_is_not_next(self):
+        def mutate(document):
+            document["phase"] = "cherry-picking"
+            document["active_upstream_sha"] = "b" * 40
+            document["pre_pick_head"] = "f" * 40
+
+        self.invalid_document(mutate)
+
+    def test_pending_state_path_resolves_relative_git_path(self):
+        git = ScriptedGit(
+            {
+                ("rev-parse", "--git-path", "upstream-sync-state.json"):
+                    ".git/upstream-sync-state.json\n"
+            }
+        )
+        git.cwd = Path("C:/repo")
+        self.assertEqual(
+            sync.pending_state_path(git),
+            Path("C:/repo/.git/upstream-sync-state.json"),
+        )
+
+    def test_record_pick_start_and_success_capture_exact_heads(self):
+        pending = replace(self.pending(), phase="cherry-picking")
+        started = sync.record_pick_start(
+            pending, pending.selected[0], "d" * 40
+        )
+        self.assertEqual(started.active_upstream_sha, "a" * 40)
+        self.assertEqual(started.pre_pick_head, "d" * 40)
+        completed = sync.record_pick_success(started, "e" * 40)
+        self.assertEqual(completed.local_commits, {"a" * 40: "e" * 40})
+        self.assertIsNone(completed.active_upstream_sha)
+
+    def test_resume_records_manually_continued_cherry_pick(self):
+        pending = replace(self.pending(), phase="cherry-picking")
+        pending = sync.record_pick_start(
+            pending, pending.selected[0], "d" * 40
+        )
+        updated = sync.verify_resumed_pick(pending, current_head="e" * 40)
+        self.assertEqual(updated.local_commits["a" * 40], "e" * 40)
+        self.assertIsNone(updated.active_upstream_sha)
+
+    def test_resume_rejects_unfinished_cherry_pick(self):
+        result = subprocess.CompletedProcess(
+            ["git", "rev-parse"], 0, "c" * 40, ""
+        )
+        git = ScriptedGit(
+            {("rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"): result}
+        )
+        with self.assertRaisesRegex(sync.SyncError, "cherry-pick --continue"):
+            sync.ensure_cherry_pick_resolved(git)
+
+    def test_resume_detects_aborted_cherry_pick(self):
+        pending = replace(self.pending(), phase="cherry-picking")
+        pending = sync.record_pick_start(
+            pending, pending.selected[0], "d" * 40
+        )
+        with self.assertRaises(sync.SyncCancelled):
+            sync.verify_resumed_pick(pending, current_head="d" * 40)
+
+    def test_clear_pending_is_safe_when_file_is_absent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "pending.json"
+            sync.clear_pending(path)
+            path.write_text("pending", encoding="utf-8")
+            sync.clear_pending(path)
+            self.assertFalse(path.exists())
 
 
 class RepositoryTests(unittest.TestCase):
