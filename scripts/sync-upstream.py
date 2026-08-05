@@ -19,6 +19,13 @@ class Commit:
     subject: str
 
 
+@dataclass(frozen=True)
+class HeadState:
+    oid: str
+    parents: tuple[str, ...]
+    subject: str
+
+
 OUTCOMES = frozenset({"implemented", "not-applicable", "deferred"})
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
@@ -379,8 +386,11 @@ def serialize_ledger(ledger: Ledger) -> str:
 
 
 def write_ledger(path: Path, ledger: Ledger) -> None:
-    with path.open("w", encoding="utf-8", newline="\n") as output:
-        output.write(serialize_ledger(ledger))
+    serialized = serialize_ledger(ledger)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as output:
+        output.write(serialized)
+    temporary.replace(path)
 
 
 def _commit_document(commit: Commit) -> dict[str, str]:
@@ -644,13 +654,24 @@ def record_pick_success(pending: PendingRun, local_commit: str) -> PendingRun:
     return updated
 
 
-def verify_resumed_pick(pending: PendingRun, current_head: str) -> PendingRun:
+def verify_resumed_pick(pending: PendingRun, head: HeadState) -> PendingRun:
     if pending.active_upstream_sha is None or pending.pre_pick_head is None:
         return pending
-    _require_sha(current_head, "current HEAD")
-    if current_head == pending.pre_pick_head:
+    _require_sha(head.oid, "current HEAD")
+    if head.oid == pending.pre_pick_head:
         raise SyncCancelled("The active cherry-pick was aborted.")
-    return record_pick_success(pending, current_head)
+    # A HEAD that merely moved is not proof the pick landed: the branch may
+    # carry an unrelated commit made after an abort. Recording that commit
+    # would mark the upstream change implemented and hide it forever.
+    commit = pending.selected[len(pending.local_commits)]
+    if head.parents != (pending.pre_pick_head,) or head.subject != commit.subject:
+        raise SyncError(
+            f"HEAD {head.oid} ({head.subject}) is not the cherry-pick of "
+            f"{commit.short_oid} ({commit.subject}). Restore the original "
+            "subject with git commit --amend if the pick did land, or reset "
+            f"the branch to {pending.pre_pick_head} to redo it, then resume."
+        )
+    return record_pick_success(pending, head.oid)
 
 
 def ensure_cherry_pick_resolved(git: Git) -> None:
@@ -1012,6 +1033,19 @@ def _current_head(git: Git) -> str:
     return _require_sha(head, "Git HEAD")
 
 
+def _head_state(git: Git) -> HeadState:
+    lines = git.run("log", "-1", "--format=%H%n%P%n%s", "HEAD").stdout.splitlines()
+    if len(lines) < 3:
+        raise SyncError("Git returned an unreadable HEAD description.")
+    return HeadState(
+        oid=_require_sha(lines[0].strip(), "Git HEAD"),
+        parents=tuple(
+            _require_sha(parent, "Git HEAD parent") for parent in lines[1].split()
+        ),
+        subject=lines[2].strip(),
+    )
+
+
 def _print_run_summary(
     selected: list[Commit],
     classifications: list[RunDecision],
@@ -1176,7 +1210,7 @@ def resume_workflow(
             raise SyncError("The sync branch must have a clean worktree to resume.")
         if pending.active_upstream_sha is not None:
             try:
-                pending = verify_resumed_pick(pending, _current_head(git))
+                pending = verify_resumed_pick(pending, _head_state(git))
             except SyncCancelled:
                 clear_pending(pending_path)
                 print(

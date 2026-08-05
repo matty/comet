@@ -123,7 +123,10 @@ python scripts/sync-upstream.py --resume
 ```
 
 or cancel the Git operation with `git cherry-pick --abort` and run the same
-`--resume` command to clear the pending run. Use `--resume` after a push or PR
+`--resume` command to clear the pending run. `--resume` records the resolved
+commit only when it sits directly on the pre-pick commit and keeps the upstream
+subject; anything else stops the run with the pending state intact rather than
+marking the upstream commit implemented. Use `--resume` after a push or PR
 failure too; completed phases are not repeated, and an existing matching PR is
 reused. The helper never merges, force-pushes, deletes branches, changes a PR's
 review state, or overwrites remotes.

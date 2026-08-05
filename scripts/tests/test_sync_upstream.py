@@ -267,6 +267,8 @@ class TrackedWorkflowGit:
         self.current_branch = "main"
         self.branches = {"main"}
         self.head = "f" * 40
+        self.head_parents = ("0" * 40,)
+        self.head_subject = "target branch tip"
         self.cherry_pick_head = None
         self.commands = []
 
@@ -275,11 +277,22 @@ class TrackedWorkflowGit:
         return self.cwd / ".git" / "upstream-sync-state.json"
 
     def complete_conflict(self, local_commit):
-        self.head = local_commit
+        self._advance_head(local_commit, self._subject(self.cherry_pick_head))
         self.cherry_pick_head = None
 
     def abort_conflict(self):
         self.cherry_pick_head = None
+
+    def _subject(self, oid):
+        for commit in self.commits:
+            if commit.oid == oid:
+                return commit.subject
+        raise AssertionError(f"Unknown commit: {oid!r}")
+
+    def _advance_head(self, local_commit, subject):
+        self.head_parents = (self.head,)
+        self.head_subject = subject
+        self.head = local_commit
 
     def run(self, *args, check=True):
         self.commands.append((args, check))
@@ -330,6 +343,11 @@ class TrackedWorkflowGit:
                 self.current_branch = branch
         elif args == ("rev-parse", "HEAD"):
             stdout = self.head + "\n"
+        elif args == ("log", "-1", "--format=%H%n%P%n%s", "HEAD"):
+            stdout = (
+                f"{self.head}\n{' '.join(self.head_parents)}\n"
+                f"{self.head_subject}\n"
+            )
         elif args == ("rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"):
             if self.cherry_pick_head is None:
                 returncode = 1
@@ -342,11 +360,11 @@ class TrackedWorkflowGit:
                 stderr = "conflict in tracked.txt"
                 self.cherry_pick_head = oid
             else:
-                self.head = self.local_commits[oid]
+                self._advance_head(self.local_commits[oid], self._subject(oid))
         elif args == ("add", "--", ".github/upstream-sync.json"):
             pass
         elif args[:2] == ("commit", "-m"):
-            self.head = "e" * 40
+            self._advance_head("e" * 40, args[2])
         elif args[:4] == ("push", "--set-upstream", "origin", args[-1]):
             if self.push_failure is not None:
                 returncode = self.push_failure.returncode
@@ -953,6 +971,28 @@ class GitAdapterTests(unittest.TestCase):
         ):
             sync.Git(Path("C:/repo")).run("status")
 
+    def test_head_state_parses_oid_parents_and_subject(self):
+        git = ScriptedGit(
+            {
+                ("log", "-1", "--format=%H%n%P%n%s", "HEAD"):
+                    f"{'a' * 40}\n{'b' * 40} {'c' * 40}\nSubject line\n"
+            }
+        )
+
+        head = sync._head_state(git)
+
+        self.assertEqual(head.oid, "a" * 40)
+        self.assertEqual(head.parents, ("b" * 40, "c" * 40))
+        self.assertEqual(head.subject, "Subject line")
+
+    def test_head_state_rejects_truncated_git_output(self):
+        git = ScriptedGit(
+            {("log", "-1", "--format=%H%n%P%n%s", "HEAD"): f"{'a' * 40}\n"}
+        )
+
+        with self.assertRaisesRegex(sync.SyncError, "unreadable HEAD"):
+            sync._head_state(git)
+
 
 class GitHubAdapterTests(unittest.TestCase):
     @mock.patch.object(sync.subprocess, "run")
@@ -1234,14 +1274,28 @@ class PendingStateTests(unittest.TestCase):
         self.assertEqual(completed.local_commits, {"a" * 40: "e" * 40})
         self.assertIsNone(completed.active_upstream_sha)
 
-    def test_resume_records_manually_continued_cherry_pick(self):
+    def started_pick(self):
         pending = replace(self.pending(), phase="cherry-picking")
-        pending = sync.record_pick_start(
-            pending, pending.selected[0], "d" * 40
-        )
-        updated = sync.verify_resumed_pick(pending, current_head="e" * 40)
+        return sync.record_pick_start(pending, self.pending().selected[0], "d" * 40)
+
+    def test_resume_records_manually_continued_cherry_pick(self):
+        pending = self.started_pick()
+        head = sync.HeadState("e" * 40, ("d" * 40,), "First selected")
+        updated = sync.verify_resumed_pick(pending, head)
         self.assertEqual(updated.local_commits["a" * 40], "e" * 40)
         self.assertIsNone(updated.active_upstream_sha)
+
+    def test_resume_rejects_unrelated_commit_made_after_an_abort(self):
+        pending = self.started_pick()
+        head = sync.HeadState("e" * 40, ("d" * 40,), "Unrelated local work")
+        with self.assertRaisesRegex(sync.SyncError, "is not the cherry-pick of"):
+            sync.verify_resumed_pick(pending, head)
+
+    def test_resume_rejects_head_that_does_not_sit_on_the_pre_pick_commit(self):
+        pending = self.started_pick()
+        head = sync.HeadState("e" * 40, ("f" * 40,), "First selected")
+        with self.assertRaisesRegex(sync.SyncError, "is not the cherry-pick of"):
+            sync.verify_resumed_pick(pending, head)
 
     def test_resume_rejects_unfinished_cherry_pick(self):
         result = subprocess.CompletedProcess(
@@ -1254,12 +1308,22 @@ class PendingStateTests(unittest.TestCase):
             sync.ensure_cherry_pick_resolved(git)
 
     def test_resume_detects_aborted_cherry_pick(self):
-        pending = replace(self.pending(), phase="cherry-picking")
-        pending = sync.record_pick_start(
-            pending, pending.selected[0], "d" * 40
-        )
+        pending = self.started_pick()
+        head = sync.HeadState("d" * 40, ("0" * 40,), "target branch tip")
         with self.assertRaises(sync.SyncCancelled):
-            sync.verify_resumed_pick(pending, current_head="d" * 40)
+            sync.verify_resumed_pick(pending, head)
+
+    def test_failed_ledger_write_leaves_the_previous_ledger_intact(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "upstream-sync.json"
+            sync.write_ledger(path, sync.Ledger(1, {}, ()))
+            original = path.read_text(encoding="utf-8")
+            with mock.patch.object(
+                sync, "serialize_ledger", side_effect=OSError("disk full")
+            ):
+                with self.assertRaises(OSError):
+                    sync.write_ledger(path, sync.Ledger(1, {}, ()))
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
 
     def test_clear_pending_is_safe_when_file_is_absent(self):
         with tempfile.TemporaryDirectory() as temp:
