@@ -26,21 +26,22 @@ class ReleaseWorkflowTests(unittest.TestCase):
             ["release.yml"],
         )
 
-    def test_pushes_to_main_and_manual_dispatch_trigger_releases(self):
+    def test_schedule_and_manual_dispatch_trigger_releases(self):
         events = self.workflow["on"]
-        self.assertEqual(events["push"]["branches"], ["main"])
+        self.assertEqual(events["schedule"], [{"cron": "0 */2 * * *"}])
         self.assertIn("workflow_dispatch", events)
-        self.assertNotIn("schedule", events)
+        self.assertNotIn("push", events)
 
-    def test_new_push_cancels_and_restarts_the_quiet_period(self):
+    def test_scheduled_runs_queue_instead_of_cancelling(self):
         self.assertEqual(
             self.workflow["concurrency"],
-            {"group": "nightly-release", "cancel-in-progress": "true"},
+            {"group": "nightly-release", "cancel-in-progress": "false"},
         )
+
+    def test_no_quiet_period_remains(self):
         steps = self.workflow["jobs"]["prepare"]["steps"]
-        quiet = next(step for step in steps if step.get("name") == "wait for 30 minutes of silence")
-        self.assertEqual(quiet["if"], "github.event_name == 'push'")
-        self.assertEqual(quiet["run"], "sleep 1800")
+        sleeps = [step for step in steps if "sleep" in step.get("run", "")]
+        self.assertEqual(sleeps, [], "the debounce quiet period must be removed")
 
     def test_version_is_immutable_semver_prerelease(self):
         steps = self.workflow["jobs"]["prepare"]["steps"]
@@ -123,12 +124,49 @@ version = "0.61"
             "${{ needs.prepare.outputs.source_sha }}",
         )
 
+    def test_prepare_skips_a_commit_that_already_has_a_nightly(self):
+        prepare = self.workflow["jobs"]["prepare"]
+        self.assertEqual(
+            prepare["outputs"]["needed"], "${{ steps.release.outputs.needed }}"
+        )
+        derive = next(
+            step for step in prepare["steps"] if step.get("id") == "release"
+        )["run"]
+        self.assertIn('tags="$(git ls-remote --tags origin)"', derive)
+        self.assertNotIn("| grep", derive)
+        self.assertIn(
+            r'"refs/tags/v.*-nightly\..*\.g${source_sha:0:7}$"', derive
+        )
+        self.assertIn('echo "needed=false" >> "$GITHUB_OUTPUT"', derive)
+        self.assertIn('echo "needed=true" >> "$GITHUB_OUTPUT"', derive)
+
+    def test_prepare_no_longer_fails_when_main_advances(self):
+        derive = next(
+            step
+            for step in self.workflow["jobs"]["prepare"]["steps"]
+            if step.get("id") == "release"
+        )["run"]
+        self.assertNotIn("GITHUB_SHA", derive)
+
+    def test_build_and_publish_jobs_gate_on_the_needed_check(self):
+        jobs = self.workflow["jobs"]
+        for name in ("linux", "macos", "windows"):
+            self.assertEqual(
+                jobs[name]["if"],
+                "needs.prepare.outputs.needed == 'true'",
+                f"{name} must skip when no nightly is needed",
+            )
+        self.assertIn(
+            "needs.prepare.outputs.needed == 'true'", jobs["publish"]["if"]
+        )
+
     def test_publication_gate_is_cancellable_and_tolerates_failed_macos(self):
         publish = self.workflow["jobs"]["publish"]
         self.assertEqual(publish["needs"], ["prepare", "linux", "macos", "windows"])
         self.assertEqual(
             publish.get("if"),
-            "${{ github.repository == 'matty/comet' && !cancelled() && "
+            "${{ needs.prepare.outputs.needed == 'true' && "
+            "github.repository == 'matty/comet' && !cancelled() && "
             "needs.prepare.result == 'success' && "
             "needs.linux.result == 'success' && needs.windows.result == 'success' && "
             "(needs.macos.result == 'success' || needs.macos.result == 'failure') }}",
@@ -138,7 +176,7 @@ version = "0.61"
         condition = self.workflow["jobs"]["publish"].get("if", "")
         self.assertIn("github.repository == 'matty/comet'", condition)
 
-    def test_publication_rechecks_main_immediately_before_release(self):
+    def test_publication_refuses_to_reuse_an_existing_tag(self):
         steps = self.workflow["jobs"]["publish"]["steps"]
         release_index = next(
             index
@@ -146,22 +184,28 @@ version = "0.61"
             if step.get("uses") == "softprops/action-gh-release@v3"
         )
         guard = steps[release_index - 1]
-        self.assertEqual(guard.get("name"), "verify source and tag are immutable")
+        self.assertEqual(guard.get("name"), "verify tag is unused")
         self.assertEqual(
-            guard.get("env"),
-            {
-                "SOURCE_SHA": "${{ needs.prepare.outputs.source_sha }}",
-                "TAG": "${{ needs.prepare.outputs.tag }}",
-            },
-        )
-        self.assertIn("git fetch origin main", guard.get("run", ""))
-        self.assertIn(
-            'current_sha="$(git rev-parse origin/main)"',
-            guard.get("run", ""),
+            guard.get("env"), {"TAG": "${{ needs.prepare.outputs.tag }}"}
         )
         self.assertIn(
-            'if [ "$current_sha" != "$SOURCE_SHA" ]; then',
+            'git ls-remote --exit-code --tags origin "refs/tags/$TAG"',
             guard.get("run", ""),
+        )
+
+    def test_publication_does_not_require_main_to_be_unchanged(self):
+        guard = next(
+            step
+            for step in self.workflow["jobs"]["publish"]["steps"]
+            if step.get("name") == "verify tag is unused"
+        )
+        self.assertNotIn("SOURCE_SHA", guard.get("run", ""))
+        self.assertNotIn("main advanced", guard.get("run", ""))
+
+    def test_forks_do_not_build_on_the_schedule(self):
+        self.assertEqual(
+            self.workflow["jobs"]["prepare"]["if"],
+            "github.repository == 'matty/comet'",
         )
 
 
