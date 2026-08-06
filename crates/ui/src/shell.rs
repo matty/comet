@@ -2330,12 +2330,46 @@ impl Shell {
                         .children(list_items)
                         .into_any_element()
                 } else {
+                    // Scope-aware empty state: names the scoped space when
+                    // there is one, and its action fires the same handler as
+                    // the Sessions `+` (§6).
+                    let scoped_space_name = {
+                        let state = self.state.read(cx);
+                        state.sidebar_scope.space_id().map(|id| {
+                            state
+                                .spaces
+                                .iter()
+                                .find(|s| s.id == id)
+                                .map(|s| s.display_name().to_string())
+                                .unwrap_or_else(|| id.to_string())
+                        })
+                    };
                     div()
                         .px(px(Theme::SPACE_SM))
                         .pb(px(Theme::SPACE_SM))
-                        .text_size(px(12.0))
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from("No sessions yet"))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(match scoped_space_name {
+                                    Some(name) => format!("Nothing running in {name} yet."),
+                                    None => "No sessions on any space yet.".to_string(),
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("empty-start-session")
+                                .text_size(px(12.0))
+                                .text_color(theme.accent)
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.start_session_from_sidebar(window, cx)
+                                }))
+                                .child(SharedString::from("Start a session →")),
+                        )
                         .into_any_element()
                 },
             ]
@@ -2590,7 +2624,7 @@ impl Shell {
             .flex_none()
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
-            .py(px(Theme::SPACE_SM))
+            .py(px(7.0))
             .flex()
             .flex_row()
             .items_center()

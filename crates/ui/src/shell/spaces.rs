@@ -621,7 +621,7 @@ pub(super) fn header_plus(
         .child(
             icon(icons::PLUS)
                 .size(px(14.0))
-                .text_color(theme.text_muted),
+                .text_color(motion::hover_blend(id, theme.text_muted, theme.text)),
         )
 }
 
@@ -2119,7 +2119,7 @@ impl Shell {
             .gap(px(Theme::SPACE_SM))
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
-            .py(px(6.0));
+            .py(px(5.0));
 
         // The keyboard cursor: a `card_selected_bg()` wash + full text,
         // matching `menu_row_nav`'s contract exactly (`popover.rs`) — NOT the
@@ -2209,7 +2209,7 @@ impl Shell {
                 .min_w_0()
                 .truncate()
                 .text_size(px(13.0))
-                .line_height(px(17.0))
+                .line_height(px(18.0))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .child(name),
         )
@@ -2219,8 +2219,8 @@ impl Shell {
                 .flex_none()
                 .min_w_0()
                 .truncate()
-                .text_size(px(12.0))
-                .line_height(px(17.0))
+                .text_size(px(11.0))
+                .line_height(px(18.0))
                 .text_color(if host_offline {
                     theme.warning.opacity(0.8)
                 } else {
