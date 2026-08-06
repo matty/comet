@@ -2044,6 +2044,13 @@ impl Shell {
             NewSessionTarget::Space(id) => {
                 self.route = Route::Chat;
                 self.state.update(cx, |s, cx| {
+                    // Mirrors `activate_space`: `select_chat(None)` alone
+                    // deliberately leaves `selected_space` untouched (a scope
+                    // switch must not move what's open), so without this the
+                    // canvas — and a submitted session's device — can stay on
+                    // whatever space was previously selected, not the one the
+                    // sidebar is scoped to.
+                    s.select_space(Some(id.clone()), cx);
                     s.sidebar_scope = SidebarScope::Space(id);
                     s.select_chat(None, cx);
                 });
