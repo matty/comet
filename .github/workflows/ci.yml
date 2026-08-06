@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: fmt + clippy + test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: gpui system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      # No `-D warnings` yet: the workspace currently carries ~24 clippy warnings
+      # (mostly `cloned_ref_to_slice_refs` in comet-ui/comet-engine and doc-list
+      # indentation). Clear those, then add `-- -D warnings` here to keep it clean.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets
+      - name: test
+        run: cargo test --workspace
+
+  edge:
+    name: edge typecheck + test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: edge/package-lock.json
+      - run: npm ci
+        working-directory: edge
+      - run: npm run typecheck
+        working-directory: edge
+      - run: npm test
+        working-directory: edge
+
+  scripts:
+    name: python helpers
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      # test_release_workflow.py imports yaml, and unittest discover imports
+      # every module before running anything, so this is needed at discovery
+      # time or the whole job fails. PyYAML is the only non-stdlib import
+      # under scripts/.
+      - run: python -m pip install --disable-pip-version-check pyyaml
+      - run: python -m unittest discover -s scripts/tests
