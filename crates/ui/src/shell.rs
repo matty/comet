@@ -558,6 +558,11 @@ pub struct Shell {
     /// mouse-up `on_click` toggles the (now-closed) state straight back
     /// open).
     space_dropdown_dismissed_at: Option<std::time::Instant>,
+    /// Scroll position of the dropdown panel's space-row region (capped +
+    /// scrollable since the round-1 height cap). Both the drag-reorder
+    /// math and keyboard scroll-into-view need this — `AddSpaceFlow`'s
+    /// `list_scroll` is the precedent.
+    space_panel_scroll: gpui::ScrollHandle,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
     /// UpdateStatus stream says WHETHER one exists; this says how far the
     /// download/stage of it has come in this process.
@@ -781,6 +786,7 @@ impl Shell {
             space_dropdown_focus: cx.focus_handle(),
             space_dropdown_focus_pending: false,
             space_dropdown_dismissed_at: None,
+            space_panel_scroll: gpui::ScrollHandle::new(),
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,

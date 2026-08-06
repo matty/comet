@@ -366,6 +366,20 @@ pub(super) fn dropdown_position_to_space_index(mode: DropdownMode, pos: usize) -
     }
 }
 
+/// Drop-index math (`drop_index`, below) runs in CONTENT coordinates, but
+/// `DragMoveEvent::bounds` is the scroll VIEWPORT — fixed on screen,
+/// invariant under scrolling, because gpui applies the scroll offset to
+/// children only (`with_element_offset`). `scroll_offset_y` is
+/// `ScrollHandle::offset().y`, which is `<= 0` once scrolled down; content-
+/// space y is `bounds.top() - offset.y` (the relation gpui itself states in
+/// `ScrollHandle::top_item`), so the viewport-relative `position_y -
+/// bounds_top` needs `- scroll_offset_y` added back to land in content
+/// space. `shell::tabs`'s horizontal drag (`tabs.rs:534-536`,
+/// `scroll_for_drag.offset().x`) is the exact same fix on the other axis.
+pub(super) fn content_rel_y(position_y: f32, bounds_top: f32, scroll_offset_y: f32) -> f32 {
+    position_y - bounds_top - scroll_offset_y
+}
+
 #[cfg(test)]
 mod panel_tests {
     use super::*;
@@ -534,6 +548,43 @@ mod panel_tests {
             dropdown_position_to_space_index(DropdownMode::PickForNewSession, 2),
             Some(2)
         );
+    }
+
+    #[test]
+    fn content_rel_y_at_zero_scroll_matches_pre_scroll_behaviour() {
+        // Unscrolled: offset().y is 0, so this must reduce to the plain
+        // `position.y - bounds.top()` the round-1 code used (and the
+        // `drop_index` unit tests already pin against fixed pixel values).
+        assert_eq!(content_rel_y(150.0, 20.0, 0.0), 130.0);
+        assert_eq!(content_rel_y(20.0, 20.0, 0.0), 0.0);
+        assert_eq!(content_rel_y(0.0, 20.0, 0.0), -20.0);
+    }
+
+    #[test]
+    fn content_rel_y_scrolled_down_adds_back_the_scrolled_off_distance() {
+        // Scrolled down by 3 rows (93px @ SPACE_ROW_SLOT): gpui reports that
+        // as offset().y == -93.0 (content moved up under a fixed viewport).
+        // A cursor sitting at the very top of the (now-scrolled) viewport is
+        // really over content row 3, not row 0.
+        let scrolled = -(SPACE_ROW_SLOT * 3.0);
+        assert_eq!(content_rel_y(20.0, 20.0, scrolled), SPACE_ROW_SLOT * 3.0);
+        assert_eq!(
+            content_rel_y(20.0 + SPACE_ROW_SLOT, 20.0, scrolled),
+            SPACE_ROW_SLOT * 4.0
+        );
+    }
+
+    #[test]
+    fn content_rel_y_feeds_drop_index_to_the_scrolled_row_not_the_clamped_top() {
+        // The regression scenario itself: 12 spaces, scrolled down 4 rows,
+        // cursor near the viewport top. Viewport-relative math would clamp
+        // this into the visible top rows (the round-2 bug); content-relative
+        // math lands on the actual row under the cursor.
+        let count = 12;
+        let scrolled = -(SPACE_ROW_SLOT * 4.0);
+        let viewport_relative = 5.0; // just below the viewport's own top edge
+        let rel_y = content_rel_y(20.0 + viewport_relative, 20.0, scrolled);
+        assert_eq!(drop_index(rel_y, SPACE_ROW_SLOT, count), 4);
     }
 }
 
@@ -1073,13 +1124,23 @@ impl Shell {
         // Capture keyboard focus once, the moment the panel opens (the
         // `AddSpaceFlow` idiom) — without this ↑↓/Enter/Esc have nothing to
         // dispatch to.
-        if std::mem::take(&mut self.space_dropdown_focus_pending) {
+        let just_opened = std::mem::take(&mut self.space_dropdown_focus_pending);
+        if just_opened {
             let handle = self.space_dropdown_focus.clone();
             window.focus(&handle, cx);
         }
 
         let scope = self.state.read(cx).sidebar_scope.clone();
         let is_pick = mode == DropdownMode::PickForNewSession;
+        // A scoped space below row 8 would otherwise open with its check
+        // mark scrolled out of view — land the panel on it immediately.
+        if just_opened
+            && let Some(ix) = scope
+                .space_id()
+                .and_then(|id| ctx.spaces.iter().position(|s| s.id == id))
+        {
+            self.space_panel_scroll.scroll_to_item(ix);
+        }
         let items = panel_items(&scope, &ctx.spaces);
         let navigable = dropdown_navigable_positions(mode, &ctx.spaces, &ctx.offline_devices);
         let highlighted_pos = self
@@ -1224,6 +1285,10 @@ impl Shell {
         // Drag-reorder only makes sense while switching scope — the picker is
         // a one-shot "where does this session go" prompt.
         let rows_container = if mode == DropdownMode::Switch {
+            // `DragMoveEvent::bounds` is the scroll VIEWPORT, invariant under
+            // scrolling — captured before the `move` closure, the
+            // `shell::tabs` horizontal-drag idiom (`tabs.rs:499`).
+            let scroll_for_drag = self.space_panel_scroll.clone();
             div()
                 .id("space-panel-rows")
                 .flex()
@@ -1231,11 +1296,15 @@ impl Shell {
                 .gap(px(2.0))
                 .max_h(px(PANEL_ROWS_MAX_H))
                 .overflow_y_scroll()
+                .track_scroll(&self.space_panel_scroll)
                 .on_drag_move::<SpaceDragPayload>(cx.listener(
                     move |this, event: &gpui::DragMoveEvent<SpaceDragPayload>, _, cx| {
                         let from = event.drag(cx).from;
-                        let rel_y =
-                            f32::from(event.event.position.y) - f32::from(event.bounds.top());
+                        let rel_y = content_rel_y(
+                            f32::from(event.event.position.y),
+                            f32::from(event.bounds.top()),
+                            f32::from(scroll_for_drag.offset().y),
+                        );
                         let over = drop_index(rel_y, SPACE_ROW_SLOT, count);
                         this.update_space_drag_over(from, over, cx);
                     },
@@ -1259,6 +1328,7 @@ impl Shell {
                 .gap(px(2.0))
                 .max_h(px(PANEL_ROWS_MAX_H))
                 .overflow_y_scroll()
+                .track_scroll(&self.space_panel_scroll)
                 .children(space_rows)
         };
         card = card.child(rows_container);
@@ -1331,6 +1401,18 @@ impl Shell {
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
                 self.space_dropdown_highlight =
                     popover::menu_step(self.space_dropdown_highlight, navigable.len(), delta);
+                // Keep the highlighted row in view — the capped panel can now
+                // scroll past it (`AddSpaceFlow::add_space_key`'s
+                // `list_scroll.scroll_to_item`). `All spaces` (no space
+                // index) sits above the scrollable region, so nothing to do.
+                if let Some(space_ix) = self
+                    .space_dropdown_highlight
+                    .and_then(|h| navigable.get(h))
+                    .copied()
+                    .and_then(|pos| dropdown_position_to_space_index(mode, pos))
+                {
+                    self.space_panel_scroll.scroll_to_item(space_ix);
+                }
                 cx.notify();
             }
             popover::MenuKey::Enter => {
