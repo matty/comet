@@ -411,12 +411,18 @@ pub(crate) enum RowScope {
 /// survivors to the wrong y.
 mod chat_row {
     pub(super) const PY: f32 = 5.0;
-    /// Line 0, `RowScope::All` only: space + device.
+    /// Line 0, `RowScope::All` only: space + device, then the trailing group
+    /// (time-ago, + throbber alongside it while Working) flush right. This is
+    /// the row's TOP line in this scope, so the trailing group lives here —
+    /// the 13px throbber fits inside this 14px line without stretching it.
     pub(super) const SPACE_LINE: f32 = 14.0;
     /// Gap under line 0.
     pub(super) const SPACE_LINE_MB: f32 = 2.0;
-    /// Line 1: title + time-ago (+ throbber, alongside the time, while
-    /// Working). No status rail — that was removed.
+    /// Line 1: title, full width in `RowScope::All` (line 0 above carries the
+    /// trailing group there). In `RowScope::One`, which renders no line 0,
+    /// this IS the row's top line, so it keeps the trailing group instead —
+    /// title + time-ago (+ throbber, alongside the time, while Working). No
+    /// status rail — that was removed.
     pub(super) const TITLE_LINE: f32 = 18.0;
     /// Gap above line 2.
     pub(super) const META_LINE_MT: f32 = 2.0;
@@ -2033,13 +2039,14 @@ impl Shell {
             .into_any_element()
     }
 
-    /// One session row (comet session-row.tsx): status rail on the left
-    /// (a live 2×3 mini spinner while working, a dot otherwise), title +
-    /// relative time on the first line, "folder · device" underneath aligned
-    /// to the title. Right-click always opens the context menu; `on_click`
-    /// decides what a plain click does (the normal list selects the chat in
-    /// place, sidebar search additionally clears the query — see
-    /// `search::Shell::render_search_chat_row`).
+    /// One session row (comet session-row.tsx): the row's TOP line carries
+    /// the trailing time-ago (+ throbber while Working), flush right — line 0
+    /// ("folder · space @ device") in `RowScope::All`, or line 1 (the title
+    /// line) in `RowScope::One`, which renders no line 0 to attach to. The
+    /// title line is otherwise title-only. Right-click always opens the
+    /// context menu; `on_click` decides what a plain click does (the normal
+    /// list selects the chat in place, sidebar search additionally clears the
+    /// query — see `search::Shell::render_search_chat_row`).
     ///
     /// `highlight_query`, when `Some`, tints the first case-insensitive hit in
     /// each of the space/title/branch lines (`search::styled_line`) — `None`
@@ -2071,13 +2078,57 @@ impl Shell {
         // leading dot that used to carry Awaiting-input/Errored/Completed-
         // unseen is gone and NOT replaced — those three statuses now read
         // identically to Idle in the row. Working is the one exception: it
-        // still animates, alongside (not instead of) the time-ago on line 1
-        // rather than a dedicated rail (see the trailing child of line 1
+        // still animates, alongside (not instead of) the time-ago on the
+        // row's TOP line rather than a dedicated rail (see `trailing_group`
         // below).
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
         let subline = theme.text_muted.opacity(0.5);
         let time_tint = theme.text_muted.opacity(0.45);
+        let working = status == comet_proto::ChatIndicator::Working;
+        // The trailing group — time-ago, plus the throbber while Working —
+        // sits on the row's TOP line: line 0 (`RowScope::All`) or line 1
+        // (`RowScope::One`, which has no line 0). Built once, up front, and
+        // attached to whichever line owns it below, so its `line_height`
+        // matches that line without duplicating the throbber/spinner
+        // wiring. `gradient_spinner`'s 2×3 `mini_gradient_spinner` grid
+        // can't be square, so this is the 3×3 `gradient_spinner` instead,
+        // sized 13×13 to match the harness mark on line 2.
+        let trailing_line_height = match &scope {
+            RowScope::All { .. } => chat_row::SPACE_LINE,
+            RowScope::One => chat_row::TITLE_LINE,
+        };
+        let trailing_group = div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(11.0))
+                    .line_height(px(trailing_line_height))
+                    .text_color(time_tint)
+                    .child(time_ago),
+            )
+            .when(working, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(loaders::gradient_spinner(
+                            "chat-working",
+                            theme,
+                            3.25,
+                            cx.entity_id(),
+                            cx,
+                        )),
+                )
+            })
+            .into_any_element();
         let menu_id = comet_proto::ServerRef::new(
             self.state
                 .read(cx)
@@ -2135,20 +2186,23 @@ impl Shell {
                     cx.notify();
                 }),
             )
-            // Line 0 (all-spaces only): the space this session belongs to.
-            // Starts flush at the row's own padding edge, same as lines 1/2
-            // (no leading dot to clear anymore).
-            .when_some(
-                match &scope {
-                    RowScope::All {
-                        space,
-                        device,
-                        host_offline,
-                    } => Some((space.clone(), device.clone(), *host_offline)),
-                    RowScope::One => None,
-                },
-                |el, (space, device, host_offline)| {
-                    el.child(
+            // Line 0 (all-spaces only) and line 1 (title): built together
+            // because the trailing group (time-ago + throbber) attaches to
+            // whichever of the two is the row's TOP line. `RowScope::All`
+            // renders both, with the trailing group flush right on line 0
+            // after `@ device`; `RowScope::One` renders no line 0, so the
+            // trailing group stays on line 1, next to the title, exactly as
+            // it did before line 0 grew one.
+            .map(|el| match scope {
+                RowScope::All {
+                    space,
+                    device,
+                    host_offline,
+                } => el
+                    // Line 0: space + device, then the trailing group flush
+                    // right. Starts flush at the row's own padding edge, same
+                    // as lines 1/2 (no leading dot to clear anymore).
+                    .child(
                         div()
                             .w_full()
                             .flex_none()
@@ -2188,75 +2242,65 @@ impl Shell {
                                     } else {
                                         format!("@ {device}")
                                     })),
-                            ),
+                            )
+                            .child(div().flex_1())
+                            .child(trailing_group),
                     )
-                },
-            )
-            // Line 1: title, then the trailing right-hand column. The
-            // time-ago always shows now — Task 13 made Working replace it
-            // with the throbber; that's reverted (user request after seeing
-            // it run). While Working, the throbber sits beside the time-ago,
-            // flush right, sized 13×13 to match the harness mark on line 3
-            // and using the same `gap(px(4.0))` so the two right-hand marks
-            // line up in one column. `mini_gradient_spinner`'s 2×3 grid can't
-            // be square, so this is `gradient_spinner`'s 3×3 grid instead.
-            .child(
-                div()
-                    .w_full()
-                    .flex_none()
-                    .h(px(chat_row::TITLE_LINE))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(Theme::SPACE_SM))
+                    // Line 1: title only, full width — the trailing group
+                    // moved to line 0 above.
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(13.0))
-                            .line_height(px(chat_row::TITLE_LINE))
-                            .child(search::styled_line(
-                                &title,
-                                highlight_query,
-                                title_color,
-                                theme.accent,
-                                sans.clone(),
-                            )),
-                    )
-                    .child(
-                        div()
+                            .w_full()
                             .flex_none()
+                            .h(px(chat_row::TITLE_LINE))
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(4.0))
                             .child(
                                 div()
-                                    .flex_none()
-                                    .text_size(px(11.0))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(13.0))
                                     .line_height(px(chat_row::TITLE_LINE))
-                                    .text_color(time_tint)
-                                    .child(time_ago),
-                            )
-                            .when(status == comet_proto::ChatIndicator::Working, |el| {
-                                el.child(
-                                    div()
-                                        .flex_none()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(loaders::gradient_spinner(
-                                            "chat-working",
-                                            theme,
-                                            3.25,
-                                            cx.entity_id(),
-                                            cx,
-                                        )),
-                                )
-                            }),
+                                    .child(search::styled_line(
+                                        &title,
+                                        highlight_query,
+                                        title_color,
+                                        theme.accent,
+                                        sans.clone(),
+                                    )),
+                            ),
                     ),
-            )
+                // Line 1 (no line 0 in this scope): title, then the trailing
+                // group, exactly where it has always been here.
+                RowScope::One => el.child(
+                    div()
+                        .w_full()
+                        .flex_none()
+                        .h(px(chat_row::TITLE_LINE))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(Theme::SPACE_SM))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(13.0))
+                                .line_height(px(chat_row::TITLE_LINE))
+                                .child(search::styled_line(
+                                    &title,
+                                    highlight_query,
+                                    title_color,
+                                    theme.accent,
+                                    sans.clone(),
+                                )),
+                        )
+                        .child(trailing_group),
+                ),
+            })
             // Line 2: branch on the left, agent mark pinned right. The mark is
             // flex_none so a long branch truncates into it and the right
             // column never breaks.
