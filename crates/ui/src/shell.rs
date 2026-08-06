@@ -43,7 +43,8 @@ use crate::settings::{
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
 use crate::state::{
-    AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, format_time_ago,
+    AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, SidebarScope,
+    format_time_ago,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -532,6 +533,10 @@ pub struct Shell {
     sound_prev: std::collections::HashMap<String, comet_proto::SessionStatus>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
+    /// `true` while the Sessions-header `+` is asking which space a new
+    /// session should land in (`NewSessionTarget::Pick`). Task 7 turns this
+    /// into the space-picker panel's mode flag.
+    new_session_pick: bool,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
     /// UpdateStatus stream says WHETHER one exists; this says how far the
     /// download/stage of it has come in this process.
@@ -603,6 +608,32 @@ pub struct Shell {
     _ticker: Task<()>,
     _state_observation: Subscription,
     _composer_events: Subscription,
+}
+
+/// Where a sidebar-initiated new session should go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NewSessionTarget {
+    /// Create here, no prompt.
+    Space(String),
+    /// Ask — a session belongs to exactly one space and `All spaces` is not one.
+    Pick(Vec<String>),
+    /// Nowhere to put it yet.
+    AddSpaceFirst,
+}
+
+/// `spaces` is `(space_id, host_online)` in display order.
+pub(crate) fn new_session_target(
+    scope: &SidebarScope,
+    spaces: &[(String, bool)],
+) -> NewSessionTarget {
+    if let Some(id) = scope.space_id() {
+        return NewSessionTarget::Space(id.to_string());
+    }
+    match spaces {
+        [] => NewSessionTarget::AddSpaceFirst,
+        [(only, _)] => NewSessionTarget::Space(only.clone()),
+        many => NewSessionTarget::Pick(many.iter().map(|(id, _)| id.clone()).collect()),
+    }
 }
 
 impl Shell {
@@ -714,6 +745,7 @@ impl Shell {
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             sidebar_notice: None,
+            new_session_pick: false,
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
@@ -1990,14 +2022,40 @@ impl Shell {
         (scrolled > 1.0, scrolled < max_scroll - 1.0)
     }
 
-    /// Sessions header `+`: starts a new session from the sidebar.
-    // Task 5 implements this.
+    /// The Sessions-header `+`. Scoped: straight to the new-session canvas for
+    /// that space — the same thing the tab-strip `+` does. All spaces: ask
+    /// which space first, unless there is only one.
     pub(super) fn start_session_from_sidebar(
         &mut self,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        cx.notify();
+        let (scope, spaces) = {
+            let now = Utc::now();
+            let state = self.state.read(cx);
+            let spaces: Vec<(String, bool)> = state
+                .spaces
+                .iter()
+                .map(|s| (s.id.clone(), state.device_online(&s.device_id, now)))
+                .collect();
+            (state.sidebar_scope.clone(), spaces)
+        };
+        match new_session_target(&scope, &spaces) {
+            NewSessionTarget::Space(id) => {
+                self.route = Route::Chat;
+                self.state.update(cx, |s, cx| {
+                    s.sidebar_scope = SidebarScope::Space(id);
+                    s.select_chat(None, cx);
+                });
+                cx.notify();
+            }
+            // Task 7 replaces this with the panel in "New session in…" mode.
+            NewSessionTarget::Pick(_) => {
+                self.new_session_pick = true;
+                cx.notify();
+            }
+            NewSessionTarget::AddSpaceFirst => self.open_add_space(cx),
+        }
     }
 
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
@@ -3692,6 +3750,57 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_session_target_picks_the_scoped_space() {
+        let spaces = vec![("s1".to_string(), true), ("s2".to_string(), true)];
+        assert_eq!(
+            new_session_target(&SidebarScope::Space("s2".into()), &spaces),
+            NewSessionTarget::Space("s2".into())
+        );
+    }
+
+    #[test]
+    fn new_session_target_routes_to_add_space_when_there_are_none() {
+        assert_eq!(
+            new_session_target(&SidebarScope::All, &[]),
+            NewSessionTarget::AddSpaceFirst,
+            "a disabled button helps nobody — send them to the thing they need"
+        );
+    }
+
+    #[test]
+    fn new_session_target_skips_a_one_item_picker() {
+        let spaces = vec![("s1".to_string(), true)];
+        assert_eq!(
+            new_session_target(&SidebarScope::All, &spaces),
+            NewSessionTarget::Space("s1".into()),
+            "a menu with one entry is a click for nothing"
+        );
+    }
+
+    #[test]
+    fn new_session_target_prompts_across_all_spaces() {
+        let spaces = vec![
+            ("s1".to_string(), true),
+            ("s2".to_string(), false),
+            ("s3".to_string(), true),
+        ];
+        assert_eq!(
+            new_session_target(&SidebarScope::All, &spaces),
+            NewSessionTarget::Pick(vec!["s1".into(), "s2".into(), "s3".into()]),
+            "offline spaces are listed but dimmed, so the picker still shows them"
+        );
+    }
+
+    #[test]
+    fn new_session_target_prompts_even_when_every_host_is_offline() {
+        let spaces = vec![("s1".to_string(), false), ("s2".to_string(), false)];
+        assert_eq!(
+            new_session_target(&SidebarScope::All, &spaces),
+            NewSessionTarget::Pick(vec!["s1".into(), "s2".into()])
+        );
+    }
 
     #[test]
     fn windows_caption_clearance_is_platform_and_fullscreen_aware() {
