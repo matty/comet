@@ -185,6 +185,14 @@ mod tests {
             ["fade-lab-id"],
             "display_name falls back to the basename, so the path has to match too"
         );
+        // c-fade's own title ("Fade exploration"), branch ("main") and device
+        // (d2, unmapped) all miss "acme" — it can only land here through the
+        // owning-space clause (space_id -> fade-lab-id -> path match).
+        assert_eq!(
+            r.chats,
+            ["c-fade"],
+            "a session must surface when its owning space matches, not just its own fields"
+        );
     }
 
     #[test]
@@ -192,7 +200,7 @@ mod tests {
         let r = filter("tab-drag", &spaces(), &chats(), &devices).unwrap();
         assert_eq!(r.chats, ["c-tabs"]);
         let r = filter("mac-studio", &spaces(), &chats(), &devices).unwrap();
-        assert!(!r.chats.is_empty());
+        assert_eq!(r.chats, ["c-tabs"]);
     }
 
     #[test]
