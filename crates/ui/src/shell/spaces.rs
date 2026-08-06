@@ -215,8 +215,86 @@ mod federation_projection_tests {
 
     #[test]
     fn default_browse_target_is_none_when_nothing_is_online() {
-        assert!(default_browse_target(&[], None).is_none());
-        assert!(default_browse_target(&[], Some("d1")).is_none());
+        // `&[]` in, `None` out is close to a tautology on its own — route an
+        // OFFLINE server through the real pipeline
+        // (`project_sidebar_servers` → `browse_targets` →
+        // `default_browse_target`) so this actually exercises the online
+        // filter feeding the default, not just the empty-slice base case.
+        let mut offline = server("nuc", RemoteConnectionState::Offline, &[]);
+        offline.devices = vec![test_device("d1")];
+        let servers = std::collections::HashMap::from([(offline.id.clone(), offline)]);
+        let order = vec![ServerId::new("nuc")];
+
+        let groups = project_sidebar_servers(&servers, &order);
+        let targets = browse_targets(&groups);
+
+        assert!(default_browse_target(&targets, None).is_none());
+        assert!(default_browse_target(&targets, Some("d1")).is_none());
+    }
+
+    fn space_with(id: &str, device_id: &str, path: &str) -> Space {
+        Space {
+            id: id.into(),
+            device_id: device_id.into(),
+            path: path.into(),
+            name: None,
+            git_detected: false,
+            git_checked_at: None,
+            checkout_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn duplicate_space_on_targets_the_owning_server_not_just_any_match() {
+        // THE EXACT MISS THE BRIEF WARNED ABOUT: the same (device, path)
+        // pair exists on both servers under different space ids. A lookup
+        // scoped to server B must return B's id, never A's — scanning a
+        // single merged/active-only list would return whichever one it
+        // happened to see first (or the wrong server's entirely).
+        let mut a = server("a", RemoteConnectionState::Online, &[]);
+        a.spaces = vec![space_with("a-space", "dev1", "/same")];
+        let mut b = server("b", RemoteConnectionState::Online, &[]);
+        b.spaces = vec![space_with("b-space", "dev1", "/same")];
+        let servers = std::collections::HashMap::from([(a.id.clone(), a), (b.id.clone(), b)]);
+        let order = vec![ServerId::new("a"), ServerId::new("b")];
+
+        let groups = project_sidebar_servers(&servers, &order);
+
+        assert_eq!(
+            duplicate_space_on(&groups, &ServerId::new("b"), "dev1", "/same"),
+            Some("b-space".to_string())
+        );
+        assert_eq!(
+            duplicate_space_on(&groups, &ServerId::new("a"), "dev1", "/same"),
+            Some("a-space".to_string())
+        );
+    }
+
+    #[test]
+    fn duplicate_space_on_no_match_returns_none() {
+        let mut a = server("a", RemoteConnectionState::Online, &[]);
+        a.spaces = vec![space_with("a-space", "dev1", "/same")];
+        let servers = std::collections::HashMap::from([(a.id.clone(), a)]);
+        let order = vec![ServerId::new("a")];
+
+        let groups = project_sidebar_servers(&servers, &order);
+
+        // Same server, different path.
+        assert_eq!(
+            duplicate_space_on(&groups, &ServerId::new("a"), "dev1", "/different"),
+            None
+        );
+        // Same server, different device.
+        assert_eq!(
+            duplicate_space_on(&groups, &ServerId::new("a"), "dev2", "/same"),
+            None
+        );
+        // A server that isn't even configured.
+        assert_eq!(
+            duplicate_space_on(&groups, &ServerId::new("missing"), "dev1", "/same"),
+            None
+        );
     }
 
     /// Wraps a single `ServerState` in a `SidebarServerGroup` via the real
@@ -321,6 +399,31 @@ pub(super) fn default_browse_target(
         .find(|target| local_device_id.is_some_and(|id| target.device.id == id))
         .or_else(|| targets.first())
         .cloned()
+}
+
+/// Does a space for `(device_id, path)` already exist on `server_id`? Pure
+/// lookup extracted out of `submit_add_space` so it is reachable from a
+/// unit test rather than only through a live gpui `Context` — this is the
+/// exact behaviour the brief called out by name: scanning `state.spaces`
+/// (the ACTIVE server's projection) instead of the owning server's own
+/// group would silently miss a duplicate that lives on a remote and mint a
+/// dangling id. Private, not `pub(super)`: `SidebarServerGroup` is a
+/// private struct (this module), same E0446 reasoning as `browse_targets`.
+fn duplicate_space_on(
+    groups: &[SidebarServerGroup],
+    server_id: &comet_proto::ServerId,
+    device_id: &str,
+    path: &str,
+) -> Option<String> {
+    groups
+        .iter()
+        .find(|g| &g.server.id == server_id)
+        .and_then(|g| {
+            g.spaces
+                .iter()
+                .find(|s| s.device_id == device_id && s.path == path)
+                .map(|s| s.id.clone())
+        })
 }
 
 fn project_sidebar_servers(
@@ -432,6 +535,13 @@ pub(super) struct AddSpaceFlow {
     /// Folder-list scroll — keyboard navigation keeps the highlighted row in
     /// view (`scroll_to_item`).
     list_scroll: gpui::ScrollHandle,
+    /// Devices-rail scroll. The rail now spans every online server's
+    /// devices (Task 8b) plus a header per server, so past roughly seven
+    /// machines it no longer fits the fixed-height card — bounded and
+    /// scrollable like `list_scroll`, no drag-and-drop on this container so
+    /// `overflow_y_scroll` is safe here (unlike a drag-reorderable list,
+    /// where it breaks `DragMoveEvent::bounds` viewport-vs-content math).
+    rail_scroll: gpui::ScrollHandle,
     focus_pending: bool,
     load_task: Option<Task<()>>,
     submit_task: Option<Task<()>>,
@@ -2187,6 +2297,7 @@ impl Shell {
             error: None,
             focus: cx.focus_handle(),
             list_scroll: gpui::ScrollHandle::new(),
+            rail_scroll: gpui::ScrollHandle::new(),
             focus_pending: true,
             load_task: None,
             submit_task: None,
@@ -2351,12 +2462,25 @@ impl Shell {
         let git_detected = flow.browser_repo;
         let server_id = target.server_id.clone();
         let device = target.device.clone();
-        let Some(engine) = self
+        // `mutation_client_for`, not `client_for`: this is about to MUTATE
+        // (createSpace), and unlike `client_for` it rejects a target that
+        // disappeared or went offline after the palette opened, rather than
+        // handing back a client that's doomed to fail the RPC — surfaced
+        // inline via `flow.error` instead of a silent optimistic-then-
+        // rollback round trip.
+        let engine = match self
             .state
             .read(cx)
-            .client_for(&comet_proto::ServerRef::new(server_id.clone(), ""))
-        else {
-            return;
+            .mutation_client_for(&comet_proto::ServerRef::new(server_id.clone(), ""))
+        {
+            Ok(engine) => engine,
+            Err(err) => {
+                if let Some(flow) = self.add_space.as_mut() {
+                    flow.error = Some(format!("{err}").into());
+                }
+                cx.notify();
+                return;
+            }
         };
         // Same (device, folder) already has a space on the TARGET server →
         // just switch to it. The engine dedupes this case too (a
@@ -2364,20 +2488,12 @@ impl Shell {
         // the minted id dangling. Scanning `state.spaces` (the ACTIVE
         // server's projection) would miss a duplicate on a remote — scan
         // the owning server's own group instead
-        // (`project_sidebar_servers` resolves every configured server's
-        // real space list, active or not).
+        // (`duplicate_space_on`/`project_sidebar_servers` resolve every
+        // configured server's real space list, active or not).
         let existing = {
             let state = self.state.read(cx);
             let groups = project_sidebar_servers(&state.servers, &state.server_order);
-            groups
-                .iter()
-                .find(|g| g.server.id == server_id)
-                .and_then(|g| {
-                    g.spaces
-                        .iter()
-                        .find(|s| s.device_id == device.id && s.path == path)
-                        .map(|s| s.id.clone())
-                })
+            duplicate_space_on(&groups, &server_id, &device.id, &path)
         };
         if let Some(existing) = existing {
             self.add_space = None;
@@ -2579,6 +2695,7 @@ impl Shell {
             listing,
             focus,
             list_scroll,
+            rail_scroll,
             home,
         ) = {
             let flow = self.add_space.as_ref()?;
@@ -2593,6 +2710,7 @@ impl Shell {
                 flow.browser.ready().cloned(),
                 flow.focus.clone(),
                 flow.list_scroll.clone(),
+                flow.rail_scroll.clone(),
                 flow.home.clone(),
             )
         };
@@ -3050,7 +3168,28 @@ impl Shell {
                     .text_color(theme.text_muted.opacity(0.6))
                     .child(SharedString::from("Devices")),
             )
-            .children(device_rows)
+            .child(
+                // Bounded + scrollable (`rail_scroll`, the folder list's
+                // `list_scroll` idiom): the rail now spans every online
+                // server's devices plus a header per server (Task 8b), not
+                // one server's device list, so past roughly seven machines
+                // it no longer fits the fixed-height card. No
+                // drag-and-drop lives on this container, so
+                // `overflow_y_scroll` is safe here — it only breaks
+                // `DragMoveEvent::bounds` viewport-vs-content math on a
+                // drag-reorderable list, which this isn't.
+                div().flex_1().min_h_0().child(
+                    div()
+                        .id("add-space-devices")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&rail_scroll)
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .children(device_rows),
+                ),
+            )
             .child(div().h(px(1.0)).mx(px(2.0)).my(px(6.0)).bg(hairline))
             .child(
                 div()
