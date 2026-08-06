@@ -533,10 +533,23 @@ pub struct Shell {
     sound_prev: std::collections::HashMap<String, comet_proto::SessionStatus>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
-    /// `true` while the Sessions-header `+` is asking which space a new
-    /// session should land in (`NewSessionTarget::Pick`). Task 7 turns this
-    /// into the space-picker panel's mode flag.
-    new_session_pick: bool,
+    /// `Some` while the space-scope dropdown panel is open: `Switch` when
+    /// the trigger itself was clicked (picking what the sidebar is scoped
+    /// to), `PickForNewSession` when the Sessions `+` on `All spaces` is
+    /// asking which space a new session should land in
+    /// (`NewSessionTarget::Pick`).
+    space_dropdown_open: Option<DropdownMode>,
+    /// Keyboard highlight within the open panel's NAVIGABLE rows — an index
+    /// into that reachable subsequence, not the raw item list (offline rows
+    /// in `PickForNewSession` are skipped by both mouse and keyboard).
+    space_dropdown_highlight: Option<usize>,
+    /// Puts the open panel on the keyboard dispatch path (`AddSpaceFlow`'s
+    /// `track_focus` idiom) so ↑↓/Enter/Esc reach it instead of whatever was
+    /// focused before it opened.
+    space_dropdown_focus: gpui::FocusHandle,
+    /// `true` for the one frame after the panel opens — the render pass
+    /// consumes it to call `window.focus`.
+    space_dropdown_focus_pending: bool,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
     /// UpdateStatus stream says WHETHER one exists; this says how far the
     /// download/stage of it has come in this process.
@@ -608,6 +621,16 @@ pub struct Shell {
     _ticker: Task<()>,
     _state_observation: Subscription,
     _composer_events: Subscription,
+}
+
+/// The space-scope dropdown panel's mode (`Shell::space_dropdown_open`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropdownMode {
+    /// Clicking the trigger: pick a scope.
+    Switch,
+    /// Clicking the Sessions `+` on `All spaces`: pick where the new session
+    /// goes.
+    PickForNewSession,
 }
 
 /// Where a sidebar-initiated new session should go.
@@ -745,7 +768,10 @@ impl Shell {
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             sidebar_notice: None,
-            new_session_pick: false,
+            space_dropdown_open: None,
+            space_dropdown_highlight: None,
+            space_dropdown_focus: cx.focus_handle(),
+            space_dropdown_focus_pending: false,
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
@@ -1672,11 +1698,11 @@ impl Shell {
         None
     }
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let inner: AnyElement = match self.route {
             Route::Settings(section) => self.render_settings_nav(section, &theme, cx),
-            Route::Chat => self.render_chat_sidebar(&theme, cx),
+            Route::Chat => self.render_chat_sidebar(window, &theme, cx),
         };
         let target = self.sidebar_target();
         // Transparent — the sidebar sits directly on the frost shell; the main
@@ -2056,19 +2082,37 @@ impl Shell {
                 });
                 cx.notify();
             }
-            // Task 7 replaces this with the panel in "New session in…" mode.
             NewSessionTarget::Pick(_) => {
-                self.new_session_pick = true;
+                self.space_dropdown_open = Some(DropdownMode::PickForNewSession);
+                self.space_dropdown_highlight = None;
+                self.space_dropdown_focus_pending = true;
                 cx.notify();
             }
             NewSessionTarget::AddSpaceFirst => self.open_add_space(cx),
         }
     }
 
+    /// The picker's commit path. Deliberately does not touch `sidebar_scope`:
+    /// starting a session somewhere is not a request to re-scope the column.
+    fn create_session_in(&mut self, space_id: String, cx: &mut Context<Self>) {
+        self.route = Route::Chat;
+        self.state.update(cx, |s, cx| {
+            s.select_space(Some(space_id), cx);
+            s.select_chat(None, cx);
+        });
+        self.space_dropdown_open = None;
+        cx.notify();
+    }
+
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
-    fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_chat_sidebar(
+        &mut self,
+        window: &mut Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         // Keyed rows: (stable key, estimated height, element) — the key + height
         // list drives the §1.6 resort FLIP diff below (attention-bucket
         // promotions glide; cleared rows just go).
@@ -2138,7 +2182,7 @@ impl Shell {
 
         let settings_button = self.render_settings_button(theme, cx);
 
-        let spaces_section = self.render_spaces_section(theme, cx);
+        let spaces_section = self.render_spaces_section(window, theme, cx);
 
         div()
             .w(px(self.settings.sidebar_width))
@@ -3597,7 +3641,7 @@ impl Render for Shell {
                     t.set_rail_enabled(rail::rail_visible(main_width), cx)
                 });
 
-                let sidebar = self.render_sidebar(cx);
+                let sidebar = self.render_sidebar(window, cx);
                 let sidebar_handle = self.resize_handle(
                     "sidebar-resize",
                     || SidebarResize,

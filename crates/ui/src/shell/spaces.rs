@@ -26,6 +26,16 @@ pub(super) struct SpaceDragState {
     prev_over: usize,
 }
 
+/// Spaces (drag-resolved order) + the per-space device/offline/attention
+/// lookups — computed once per frame and shared by the trigger, the dropdown
+/// panel, and its keyboard handler so all three agree on the same list.
+struct SpacesContext {
+    spaces: Vec<Space>,
+    device_names: std::collections::HashMap<String, String>,
+    offline_devices: std::collections::HashSet<String>,
+    attention: std::collections::HashMap<String, ChatIndicator>,
+}
+
 #[cfg(test)]
 mod federation_projection_tests {
     use super::*;
@@ -284,6 +294,93 @@ pub(super) fn header_plus(
         )
 }
 
+/// One entry in the scope-dropdown panel, in display order: `All spaces`
+/// pinned first (when shown), then the spaces in their (already
+/// drag-resolved) order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PanelItem {
+    AllSpaces { active: bool },
+    Space { id: String, active: bool },
+}
+
+/// Panel contents in display order: `All spaces` pinned first, then the spaces
+/// in their (already drag-resolved) order.
+pub(super) fn panel_items(scope: &SidebarScope, spaces: &[Space]) -> Vec<PanelItem> {
+    let mut items = vec![PanelItem::AllSpaces {
+        active: matches!(scope, SidebarScope::All),
+    }];
+    items.extend(spaces.iter().map(|s| PanelItem::Space {
+        id: s.id.clone(),
+        active: scope.space_id() == Some(s.id.as_str()),
+    }));
+    items
+}
+
+#[cfg(test)]
+mod panel_tests {
+    use super::*;
+
+    fn test_space(path: &str) -> Space {
+        Space {
+            id: "test".into(),
+            device_id: "device".into(),
+            path: path.into(),
+            name: None,
+            git_detected: false,
+            git_checked_at: None,
+            checkout_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn panel_lists_all_spaces_first_and_marks_the_active_one() {
+        let spaces = vec![
+            Space {
+                id: "s1".into(),
+                ..test_space("/a")
+            },
+            Space {
+                id: "s2".into(),
+                ..test_space("/b")
+            },
+        ];
+
+        let items = panel_items(&SidebarScope::All, &spaces);
+        assert_eq!(items[0], PanelItem::AllSpaces { active: true });
+        assert_eq!(
+            items[1],
+            PanelItem::Space {
+                id: "s1".into(),
+                active: false
+            }
+        );
+        assert_eq!(
+            items[2],
+            PanelItem::Space {
+                id: "s2".into(),
+                active: false
+            }
+        );
+
+        let items = panel_items(&SidebarScope::Space("s2".into()), &spaces);
+        assert_eq!(items[0], PanelItem::AllSpaces { active: false });
+        assert_eq!(
+            items[2],
+            PanelItem::Space {
+                id: "s2".into(),
+                active: true
+            }
+        );
+    }
+
+    #[test]
+    fn panel_with_no_spaces_still_offers_all_spaces() {
+        let items = panel_items(&SidebarScope::All, &[]);
+        assert_eq!(items, vec![PanelItem::AllSpaces { active: true }]);
+    }
+}
+
 /// A section header: label left, optional `+` right. `first` tucks the
 /// block up under whatever sits above it.
 pub(super) fn section_header(
@@ -364,9 +461,81 @@ impl Shell {
 
     // ---- sidebar sections ----
 
-    /// The "Spaces" section: tracked header + add button, then a row per space.
+    /// Spaces (drag-resolved order) + the per-space device/offline/attention
+    /// lookups — shared by the trigger, the dropdown panel, and its keyboard
+    /// handler so all three agree on the same list.
+    fn spaces_context(&self, cx: &Context<Self>) -> SpacesContext {
+        let now = Utc::now();
+        let state = self.state.read(cx);
+        let spaces = state.spaces.clone();
+        let device_names = spaces
+            .iter()
+            .map(|s| {
+                (
+                    s.device_id.clone(),
+                    state
+                        .device_name(&s.device_id)
+                        .unwrap_or("Unknown device")
+                        .to_string(),
+                )
+            })
+            .collect();
+        // Host-presence (the revived "Remote" signal): a remote space whose
+        // device heartbeat lapsed shows offline — a host outage, not slow sync.
+        let offline_devices = spaces
+            .iter()
+            .map(|s| s.device_id.clone())
+            .filter(|id| !state.device_online(id, now))
+            .collect();
+        // Spaces with a live/awaiting session get an aggregate dot (the
+        // most urgent member status wins) so the attention signal survives
+        // even with the Sessions list scrolled off.
+        let mut attention: std::collections::HashMap<String, ChatIndicator> =
+            std::collections::HashMap::new();
+        for chat in state.visible_chats() {
+            let status = state.display_status_for(chat, now);
+            if !matches!(
+                status,
+                ChatIndicator::Working | ChatIndicator::AwaitingInput
+            ) {
+                continue;
+            }
+            let Some(space_id) = chat.space_id.clone() else {
+                continue;
+            };
+            attention
+                .entry(space_id)
+                .and_modify(|held| {
+                    if crate::state::attention_rank(status) < crate::state::attention_rank(*held) {
+                        *held = status;
+                    }
+                })
+                .or_insert(status);
+        }
+        // Manual (drag) order overrides the synced creation order — device-
+        // local, resolved exactly like the session-tab order.
+        let spaces: Vec<Space> = {
+            let created: Vec<String> = spaces.iter().map(|s| s.id.clone()).collect();
+            let order = super::tabs::resolve_tab_order(&created, &self.settings.space_order);
+            let mut by_id: std::collections::HashMap<String, Space> =
+                spaces.into_iter().map(|s| (s.id.clone(), s)).collect();
+            order.iter().filter_map(|id| by_id.remove(id)).collect()
+        };
+        SpacesContext {
+            spaces,
+            device_names,
+            offline_devices,
+            attention,
+        }
+    }
+
+    /// The "Spaces" section: tracked header + add button, then the scope
+    /// trigger (Task 7 — replaces the old row-per-space list with a single
+    /// 28px row + dropdown panel, so the section's height no longer grows
+    /// with the space count).
     pub(super) fn render_spaces_section(
         &mut self,
+        window: &mut Window,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -383,79 +552,7 @@ impl Shell {
             )
         };
         let grouped_mode = server_groups.len() > 1;
-        let (spaces, selected, device_names, offline_devices, attention): (
-            Vec<Space>,
-            Option<String>,
-            std::collections::HashMap<String, String>,
-            std::collections::HashSet<String>,
-            std::collections::HashMap<String, ChatIndicator>,
-        ) = {
-            let now = Utc::now();
-            let state = self.state.read(cx);
-            let spaces = state.spaces.clone();
-            let device_names = spaces
-                .iter()
-                .map(|s| {
-                    (
-                        s.device_id.clone(),
-                        state
-                            .device_name(&s.device_id)
-                            .unwrap_or("Unknown device")
-                            .to_string(),
-                    )
-                })
-                .collect();
-            // Host-presence (the revived "Remote" signal): a remote space whose
-            // device heartbeat lapsed shows offline — a host outage, not slow sync.
-            let offline_devices = spaces
-                .iter()
-                .map(|s| s.device_id.clone())
-                .filter(|id| !state.device_online(id, now))
-                .collect();
-            // Spaces with a live/awaiting session get an aggregate dot (the
-            // most urgent member status wins) so the attention signal survives
-            // even with the Sessions list scrolled off.
-            let mut attention: std::collections::HashMap<String, ChatIndicator> =
-                std::collections::HashMap::new();
-            for chat in state.visible_chats() {
-                let status = state.display_status_for(chat, now);
-                if !matches!(
-                    status,
-                    ChatIndicator::Working | ChatIndicator::AwaitingInput
-                ) {
-                    continue;
-                }
-                let Some(space_id) = chat.space_id.clone() else {
-                    continue;
-                };
-                attention
-                    .entry(space_id)
-                    .and_modify(|held| {
-                        if crate::state::attention_rank(status)
-                            < crate::state::attention_rank(*held)
-                        {
-                            *held = status;
-                        }
-                    })
-                    .or_insert(status);
-            }
-            (
-                spaces,
-                state.selected_space.clone().map(|id| id.local_id),
-                device_names,
-                offline_devices,
-                attention,
-            )
-        };
-        // Manual (drag) order overrides the synced creation order — device-
-        // local, resolved exactly like the session-tab order.
-        let spaces: Vec<Space> = {
-            let created: Vec<String> = spaces.iter().map(|s| s.id.clone()).collect();
-            let order = super::tabs::resolve_tab_order(&created, &self.settings.space_order);
-            let mut by_id: std::collections::HashMap<String, Space> =
-                spaces.into_iter().map(|s| (s.id.clone(), s)).collect();
-            order.iter().filter_map(|id| by_id.remove(id)).collect()
-        };
+        let ctx = self.spaces_context(cx);
 
         let header = section_header(
             "Spaces",
@@ -653,70 +750,283 @@ impl Shell {
             }
         }
         let render_flat_projection = !grouped_mode;
-        if render_flat_projection && spaces.is_empty() {
-            // Ghost row: the empty-state affordance mirrors a space row.
-            column = column.child(
+        if render_flat_projection {
+            column = column.child(self.render_scope_trigger(window, theme, &ctx, cx));
+        }
+        column.into_any_element()
+    }
+
+    /// The scope trigger: one row reading "All spaces" or the space the
+    /// sidebar is scoped to (Task 7's fixed-height replacement for the old
+    /// per-space row list). Opens/closes [`Self::render_scope_panel`].
+    fn render_scope_trigger(
+        &mut self,
+        window: &mut Window,
+        theme: &Theme,
+        ctx: &SpacesContext,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let scope = self.state.read(cx).sidebar_scope.clone();
+        let mode = self.space_dropdown_open;
+        let open = mode.is_some();
+        let active = scope
+            .space_id()
+            .and_then(|id| ctx.spaces.iter().find(|s| s.id == id));
+        // Step 7: the same total feeds both the trigger (on `All`) and the
+        // panel's `All spaces` row.
+        let session_total = self.state.read(cx).visible_chats().count();
+        // Task 9: aggregate attention across every space when the scope is
+        // `All` (mirrors the per-space dot in the panel below). Placeholder
+        // until Task 9 wires the real aggregate.
+        let scope_attention: Option<ChatIndicator> = None;
+
+        let mut trigger = div()
+            .id("space-scope")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(Theme::SPACE_SM))
+            .rounded(px(8.0))
+            .px(px(Theme::SPACE_SM))
+            .py(px(5.0))
+            .text_size(px(13.0))
+            .line_height(px(18.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .cursor_pointer()
+            // A resting wash so this reads as a control, not a selected row.
+            .bg(if open {
+                crate::theme::glass_selected_bg()
+            } else {
+                motion::hover_blend(
+                    "space-scope",
+                    crate::theme::wash(0.055),
+                    crate::theme::wash(0.085),
+                )
+            })
+            .when(open, |el| el.shadow(crate::theme::glass_selected_shadows()))
+            .on_hover(motion::hover_listener("space-scope"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.space_dropdown_open = match this.space_dropdown_open {
+                    Some(_) => None,
+                    None => Some(DropdownMode::Switch),
+                };
+                this.space_dropdown_highlight = None;
+                this.space_dropdown_focus_pending = this.space_dropdown_open.is_some();
+                cx.notify();
+            }))
+            .child(
                 div()
-                    .id("add-space-ghost")
-                    .mx(px(0.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(Theme::SPACE_SM))
-                    .rounded(px(8.0))
-                    .px(px(Theme::SPACE_SM))
-                    .py(px(6.0))
-                    .text_size(px(13.0))
-                    .text_color(motion::hover_blend(
-                        "add-space-ghost",
-                        theme.text_muted,
-                        theme.text,
-                    ))
-                    .bg(motion::hover_blend(
-                        "add-space-ghost",
-                        theme.glass_hover().opacity(0.0),
-                        theme.glass_hover(),
-                    ))
-                    .on_hover(motion::hover_listener("add-space-ghost"))
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx)))
+                    .size(px(6.0))
+                    .rounded_full()
+                    .flex_none()
+                    .bg(scope_attention
+                        .map(|s| status_dot_color(s, theme))
+                        .unwrap_or_else(|| crate::theme::ink(0.14))),
+            )
+            .child(
+                icon(if active.is_some() {
+                    icons::FOLDER
+                } else {
+                    icons::LIST
+                })
+                .size(px(16.0))
+                .flex_none()
+                .text_color(theme.text_muted),
+            )
+            .child(
+                div().min_w_0().truncate().child(SharedString::from(
+                    active
+                        .map(|s| s.display_name().to_string())
+                        .unwrap_or_else(|| "All spaces".to_string()),
+                )),
+            )
+            .child(div().flex_1())
+            // Trailing slot: the device when scoped, the session total on All.
+            // A scoped trigger goes amber when its host is offline, matching
+            // the space row it replaced.
+            .child({
+                let host_offline =
+                    active.is_some_and(|s| ctx.offline_devices.contains(&s.device_id));
+                div()
+                    .flex_none()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::NORMAL)
+                    .text_color(if host_offline {
+                        theme.warning.opacity(0.8)
+                    } else {
+                        theme.text_muted.opacity(0.55)
+                    })
+                    .child(SharedString::from(match active {
+                        Some(s) => {
+                            let device = ctx
+                                .device_names
+                                .get(&s.device_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            if host_offline {
+                                format!("@ {device} · offline")
+                            } else {
+                                format!("@ {device}")
+                            }
+                        }
+                        None => session_total.to_string(),
+                    }))
+            })
+            .child(
+                icon(icons::ALT_ARROW_DOWN)
+                    .size(px(13.0))
+                    .flex_none()
+                    .text_color(theme.text_muted.opacity(0.5)),
+            );
+
+        if let Some(mode) = mode {
+            let panel = self.render_scope_panel(window, theme, mode, ctx, session_total, cx);
+            trigger = trigger.child(panel);
+        }
+
+        trigger.into_any_element()
+    }
+
+    /// The scope-dropdown panel: `All spaces` (Switch only) + one row per
+    /// space + `Add space…` (Switch only). Mounted through
+    /// [`popover::anchored_menu`] — the trigger-anchored deferred/anchored
+    /// route this codebase already uses for exactly this shape of dropdown
+    /// (`settings::accounts`'s device menu).
+    #[allow(clippy::too_many_arguments)]
+    fn render_scope_panel(
+        &mut self,
+        window: &mut Window,
+        theme: &Theme,
+        mode: DropdownMode,
+        ctx: &SpacesContext,
+        session_total: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Capture keyboard focus once, the moment the panel opens (the
+        // `AddSpaceFlow` idiom) — without this ↑↓/Enter/Esc have nothing to
+        // dispatch to.
+        if std::mem::take(&mut self.space_dropdown_focus_pending) {
+            let handle = self.space_dropdown_focus.clone();
+            window.focus(&handle, cx);
+        }
+
+        let scope = self.state.read(cx).sidebar_scope.clone();
+        let is_pick = mode == DropdownMode::PickForNewSession;
+        let items = panel_items(&scope, &ctx.spaces);
+        let navigable = self.dropdown_navigable_positions(mode, ctx);
+        let highlighted_pos = self
+            .space_dropdown_highlight
+            .and_then(|h| navigable.get(h))
+            .copied();
+        let all_unreachable = is_pick && !ctx.spaces.is_empty() && navigable.is_empty();
+
+        let mut card = popover::popover_card(theme)
+            .w(px(self.settings.sidebar_width - 16.0))
+            .track_focus(&self.space_dropdown_focus)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                this.space_dropdown_key(event, cx)
+            }))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.space_dropdown_open = None;
+                this.space_dropdown_highlight = None;
+                cx.notify();
+            }))
+            .flex()
+            .flex_col();
+
+        if is_pick {
+            // Non-interactive lead — a session cannot go to `All spaces`, so
+            // this mode never shows that item.
+            card = card.child(
+                div()
+                    .px(px(7.0))
+                    .pt(px(6.0))
+                    .pb(px(2.0))
+                    .text_size(px(9.5))
+                    .text_color(theme.text_muted.opacity(0.4))
+                    .child(SharedString::from("New session in…")),
+            );
+        } else {
+            let all_active = matches!(items[0], PanelItem::AllSpaces { active: true });
+            let highlighted = highlighted_pos == Some(0);
+            card = card.child(
+                popover::menu_row_nav(theme, all_active, highlighted, "space-panel-all")
+                    .id("space-panel-all")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.activate_all_spaces(cx);
+                        this.space_dropdown_open = None;
+                        this.space_dropdown_highlight = None;
+                        cx.notify();
+                    }))
                     .child(
-                        icon(icons::FOLDER)
+                        icon(icons::LIST)
                             .size(px(16.0))
+                            .flex_none()
                             .text_color(theme.text_muted),
                     )
-                    .child(SharedString::from("Add space")),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(SharedString::from("All spaces")),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted.opacity(0.55))
+                            .child(session_total.to_string()),
+                    )
+                    .when(all_active, |el| el.child(popover::menu_check(theme))),
             );
-        } else if render_flat_projection {
-            let count = spaces.len();
-            let drag = self
-                .space_drag
-                .as_ref()
-                .map(|d| (d.from, d.over, d.epoch, d.prev_over));
-            let rows: Vec<AnyElement> = spaces
-                .into_iter()
-                .enumerate()
-                .map(|(ix, space)| {
-                    let id = space.id.clone();
-                    let device_name = device_names
-                        .get(&space.device_id)
-                        .cloned()
-                        .unwrap_or_else(|| "Unknown device".to_string());
-                    let host_offline = offline_devices.contains(&space.device_id);
-                    let is_selected = selected.as_deref() == Some(space.id.as_str());
-                    let attention = attention.get(&space.id).copied();
-                    let row = self.render_space_row(
-                        ix,
-                        space,
-                        device_name,
-                        host_offline,
-                        is_selected,
-                        attention,
-                        theme,
-                        cx,
-                    );
-                    // Sliding transform while a sibling is dragged over —
-                    // the session-tab idiom, vertical.
+        }
+
+        // Two different offsets, easy to conflate: `items` always carries
+        // `AllSpaces` at 0 regardless of mode (so a space at `ctx.spaces[ix]`
+        // is always `items[ix + 1]`), while the logical NAVIGATION position
+        // space only reserves slot 0 for `AllSpaces` in `Switch` mode.
+        let position_offset = Self::dropdown_offset(mode);
+        let count = ctx.spaces.len();
+        let drag = self
+            .space_drag
+            .as_ref()
+            .map(|d| (d.from, d.over, d.epoch, d.prev_over));
+        let space_rows: Vec<AnyElement> = ctx
+            .spaces
+            .iter()
+            .enumerate()
+            .map(|(ix, space)| {
+                let id = space.id.clone();
+                let active = matches!(&items[ix + 1], PanelItem::Space { active: true, .. });
+                let host_offline = ctx.offline_devices.contains(&space.device_id);
+                let unreachable = is_pick && host_offline;
+                let device_name = ctx
+                    .device_names
+                    .get(&space.device_id)
+                    .cloned()
+                    .unwrap_or_else(|| "Unknown device".to_string());
+                let attention = ctx.attention.get(&id).copied();
+                let highlighted = highlighted_pos == Some(position_offset + ix);
+                let row = self.render_panel_space_row(
+                    ix,
+                    space,
+                    device_name,
+                    host_offline,
+                    active,
+                    unreachable,
+                    highlighted,
+                    attention,
+                    mode,
+                    theme,
+                    cx,
+                );
+                // Sliding transform while a sibling is dragged over — Task 6's
+                // finding: the machinery moves over verbatim, no coordinate
+                // adjustment needed for the popover.
+                if mode == DropdownMode::Switch {
                     match drag {
                         Some((from, over, epoch, prev_over)) if ix != from => {
                             let target = slide_offset(ix, from, over) * SPACE_ROW_SLOT;
@@ -724,7 +1034,7 @@ impl Shell {
                             div()
                                 .relative()
                                 .child(row.with_animation(
-                                    SharedString::from(format!("space-slide-{id}-{epoch}")),
+                                    SharedString::from(format!("space-panel-slide-{id}-{epoch}")),
                                     TAB_SLIDE.animation(),
                                     move |el, t| el.top(px(motion::lerp(start, target, t))),
                                 ))
@@ -738,36 +1048,299 @@ impl Shell {
                             .into_any_element(),
                         _ => row.into_any_element(),
                     }
-                })
-                .collect();
-            column = column.child(
+                } else {
+                    row.into_any_element()
+                }
+            })
+            .collect();
+
+        // Drag-reorder only makes sense while switching scope — the picker is
+        // a one-shot "where does this session go" prompt.
+        let rows_container = if mode == DropdownMode::Switch {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .on_drag_move::<SpaceDragPayload>(cx.listener(
+                    move |this, event: &gpui::DragMoveEvent<SpaceDragPayload>, _, cx| {
+                        let from = event.drag(cx).from;
+                        let rel_y =
+                            f32::from(event.event.position.y) - f32::from(event.bounds.top());
+                        let over = drop_index(rel_y, SPACE_ROW_SLOT, count);
+                        this.update_space_drag_over(from, over, cx);
+                    },
+                ))
+                .on_drop::<SpaceDragPayload>(cx.listener(
+                    move |this, payload: &SpaceDragPayload, _, cx| {
+                        let to = this
+                            .space_drag
+                            .as_ref()
+                            .map(|d| d.over)
+                            .unwrap_or(payload.from);
+                        this.commit_space_reorder(payload.from, to, cx);
+                    },
+                ))
+                .children(space_rows)
+        } else {
+            div().flex().flex_col().gap(px(2.0)).children(space_rows)
+        };
+        card = card.child(rows_container);
+
+        if all_unreachable {
+            card = card.child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .on_drag_move::<SpaceDragPayload>(cx.listener(
-                        move |this, event: &gpui::DragMoveEvent<SpaceDragPayload>, _, cx| {
-                            let from = event.drag(cx).from;
-                            let rel_y =
-                                f32::from(event.event.position.y) - f32::from(event.bounds.top());
-                            let over = drop_index(rel_y, SPACE_ROW_SLOT, count);
-                            this.update_space_drag_over(from, over, cx);
-                        },
-                    ))
-                    .on_drop::<SpaceDragPayload>(cx.listener(
-                        move |this, payload: &SpaceDragPayload, _, cx| {
-                            let to = this
-                                .space_drag
-                                .as_ref()
-                                .map(|d| d.over)
-                                .unwrap_or(payload.from);
-                            this.commit_space_reorder(payload.from, to, cx);
-                        },
-                    ))
-                    .children(rows),
+                    .px(px(8.0))
+                    .py(px(8.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from("No space is reachable right now.")),
             );
         }
-        column.into_any_element()
+
+        if !is_pick {
+            card = card.child(popover::menu_separator()).child(
+                popover::menu_row(theme, false, "space-panel-add")
+                    .id("space-panel-add")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.space_dropdown_open = None;
+                        this.space_dropdown_highlight = None;
+                        this.open_add_space(cx);
+                    }))
+                    .child(
+                        icon(icons::PLUS)
+                            .size(px(16.0))
+                            .flex_none()
+                            .text_color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(SharedString::from("Add space…")),
+                    )
+                    .child(popover::kbd_hint(theme, "⌘K")),
+            );
+        }
+
+        popover::anchored_menu("space-scope-panel", card.into_any_element())
+    }
+
+    /// `1` when the panel leads with `All spaces` (Switch — it occupies
+    /// position 0), `0` in `PickForNewSession` (that item is skipped
+    /// entirely, so position 0 is the first space).
+    fn dropdown_offset(mode: DropdownMode) -> usize {
+        if mode == DropdownMode::Switch { 1 } else { 0 }
+    }
+
+    /// Positions (within the logical `[All spaces?, space0, space1, ...]`
+    /// list) that keyboard nav and clicks may land on — offline spaces are
+    /// unreachable in `PickForNewSession` (an unclickable row must not be
+    /// keyboard-reachable either).
+    fn dropdown_navigable_positions(&self, mode: DropdownMode, ctx: &SpacesContext) -> Vec<usize> {
+        let offset = Self::dropdown_offset(mode);
+        let mut positions = Vec::new();
+        if mode == DropdownMode::Switch {
+            positions.push(0);
+        }
+        for (ix, space) in ctx.spaces.iter().enumerate() {
+            let host_offline = ctx.offline_devices.contains(&space.device_id);
+            if mode == DropdownMode::Switch || !host_offline {
+                positions.push(offset + ix);
+            }
+        }
+        positions
+    }
+
+    /// Panel keys (bubbling from the focused card): ↑↓ move the highlight
+    /// across the navigable rows, ↵ picks, Esc closes without changing the
+    /// scope (`AddSpaceFlow::add_space_key`'s shape).
+    fn space_dropdown_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(mode) = self.space_dropdown_open else {
+            return;
+        };
+        let key = popover::classify_key(
+            event.keystroke.key.as_str(),
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+        );
+        match key {
+            popover::MenuKey::Escape => {
+                self.space_dropdown_open = None;
+                self.space_dropdown_highlight = None;
+                cx.notify();
+            }
+            popover::MenuKey::Up | popover::MenuKey::Down => {
+                let ctx = self.spaces_context(cx);
+                let navigable = self.dropdown_navigable_positions(mode, &ctx);
+                let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
+                self.space_dropdown_highlight =
+                    popover::menu_step(self.space_dropdown_highlight, navigable.len(), delta);
+                cx.notify();
+            }
+            popover::MenuKey::Enter => {
+                let ctx = self.spaces_context(cx);
+                let navigable = self.dropdown_navigable_positions(mode, &ctx);
+                if let Some(pos) = self
+                    .space_dropdown_highlight
+                    .and_then(|h| navigable.get(h))
+                    .copied()
+                {
+                    let offset = Self::dropdown_offset(mode);
+                    if mode == DropdownMode::Switch && pos == 0 {
+                        self.activate_all_spaces(cx);
+                    } else if let Some(space) = ctx.spaces.get(pos - offset) {
+                        let id = space.id.clone();
+                        match mode {
+                            DropdownMode::Switch => self.activate_space(id, cx),
+                            DropdownMode::PickForNewSession => self.create_session_in(id, cx),
+                        }
+                    }
+                    self.space_dropdown_open = None;
+                    self.space_dropdown_highlight = None;
+                    cx.notify();
+                }
+            }
+            popover::MenuKey::ModEnter | popover::MenuKey::Backspace | popover::MenuKey::Other => {}
+        }
+    }
+
+    /// One panel space row: [`Self::render_space_row`]'s body minus the
+    /// folder glyph (every row here is already a space) — plus a trailing
+    /// check when `active`, and (`PickForNewSession`) an offline host
+    /// rendered unreachable rather than clickable.
+    #[allow(clippy::too_many_arguments)]
+    fn render_panel_space_row(
+        &self,
+        ix: usize,
+        space: &Space,
+        device_name: String,
+        host_offline: bool,
+        active: bool,
+        unreachable: bool,
+        highlighted: bool,
+        attention: Option<ChatIndicator>,
+        mode: DropdownMode,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let id = space.id.clone();
+        let name: SharedString = space.display_name().to_string().into();
+        let fade_key = format!("space-panel-row-{id}");
+        let rest_bg = if active {
+            crate::theme::glass_selected_bg()
+        } else {
+            crate::theme::wash(0.0)
+        };
+        let rest_text = if active {
+            theme.text
+        } else {
+            theme.text.opacity(0.8)
+        };
+        let select_id = id.clone();
+        let menu_id = id.clone();
+
+        let row = div()
+            .id(SharedString::from(format!("space-panel-{id}")))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(Theme::SPACE_SM))
+            .rounded(px(8.0))
+            .px(px(Theme::SPACE_SM))
+            .py(px(6.0))
+            .when(highlighted, |el| {
+                el.shadow(crate::theme::card_selected_shadows())
+            });
+
+        let row = if unreachable {
+            // No hover fill, no click — the row stays listed so the picker
+            // shows the whole shape of your setup, just unreachable.
+            row.opacity(0.45).text_color(rest_text).bg(rest_bg)
+        } else {
+            let mut row = row
+                .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
+                .bg(motion::hover_blend(
+                    &fade_key,
+                    rest_bg,
+                    if active { rest_bg } else { theme.glass_hover() },
+                ))
+                .when(active, |el| {
+                    el.shadow(crate::theme::glass_selected_shadows())
+                })
+                .on_hover(motion::hover_listener(fade_key))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| match mode {
+                    DropdownMode::Switch => {
+                        this.activate_space(select_id.clone(), cx);
+                        this.space_dropdown_open = None;
+                        this.space_dropdown_highlight = None;
+                        cx.notify();
+                    }
+                    DropdownMode::PickForNewSession => {
+                        this.create_session_in(select_id.clone(), cx);
+                    }
+                }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.space_menu = Some((menu_id.clone(), event.position));
+                        this.space_dropdown_open = None;
+                        this.space_dropdown_highlight = None;
+                        cx.notify();
+                    }),
+                );
+            // Drag-reorder only in Switch mode (see `rows_container`).
+            if mode == DropdownMode::Switch {
+                row = row.on_drag(
+                    SpaceDragPayload {
+                        from: ix,
+                        name: name.clone(),
+                    },
+                    |payload, _point, _, cx| {
+                        let name = payload.name.clone();
+                        cx.stop_propagation();
+                        cx.new(|_| SpaceGhost { name })
+                    },
+                );
+            }
+            row
+        };
+
+        row.child(
+            div().size(px(6.0)).rounded_full().flex_none().bg(attention
+                .map(|status| status_dot_color(status, theme))
+                .unwrap_or_else(|| crate::theme::ink(0.14))),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(px(13.0))
+                .line_height(px(17.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(name),
+        )
+        .child(div().flex_1())
+        .child(
+            div()
+                .flex_none()
+                .min_w_0()
+                .truncate()
+                .text_size(px(12.0))
+                .line_height(px(17.0))
+                .text_color(if host_offline {
+                    theme.warning.opacity(0.8)
+                } else {
+                    theme.text_muted.opacity(0.6)
+                })
+                .child(SharedString::from(if host_offline {
+                    format!("@ {device_name} · offline")
+                } else {
+                    format!("@ {device_name}")
+                })),
+        )
+        .when(active, |el| el.child(popover::menu_check(theme)))
     }
 
     /// Track the drop slot while a space row is dragged over the list (150ms
@@ -815,6 +1388,12 @@ impl Shell {
 
     /// One space row: folder icon + folder name, device name subline.
     /// `host_offline` marks a remote host whose presence heartbeat lapsed.
+    ///
+    /// Unused since Task 7 replaced the flat per-space row list with the
+    /// scope trigger + dropdown panel (`render_panel_space_row` is its
+    /// panel-row equivalent, adapted from this body). Kept per the task
+    /// brief rather than deleted.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     fn render_space_row(
         &self,
