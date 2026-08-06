@@ -116,6 +116,52 @@ mod federation_projection_tests {
         );
         assert_ne!(local_target, remote_target);
     }
+
+    /// Wraps a single `ServerState` in a `SidebarServerGroup` via the real
+    /// projection (not a hand-built struct) — `SidebarServerGroup` is
+    /// private, so this is the only route into one from a test.
+    fn sidebar_group(server: &ServerState) -> SidebarServerGroup {
+        let servers = std::collections::HashMap::from([(server.id.clone(), server.clone())]);
+        let order = vec![server.id.clone()];
+        project_sidebar_servers(&servers, &order)
+            .into_iter()
+            .next()
+            .expect("one server in, one group out")
+    }
+
+    #[test]
+    fn panel_groups_by_server_only_when_more_than_one_is_configured() {
+        let local = server("local", RemoteConnectionState::Online, &["s1"]);
+        let groups = vec![sidebar_group(&local)];
+        let items = panel_grouped_items(&SidebarScope::All, &groups);
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i, PanelItem::ServerHeader { .. })),
+            "one server renders flat — a header for a single group is noise"
+        );
+
+        let remote = server("nuc", RemoteConnectionState::Offline, &[]);
+        let groups = vec![sidebar_group(&local), sidebar_group(&remote)];
+        let items = panel_grouped_items(&SidebarScope::All, &groups);
+        assert_eq!(items[0], PanelItem::AllSpaces { active: true });
+        assert!(matches!(
+            items[1],
+            PanelItem::ServerHeader { online: true, .. }
+        ));
+        assert_eq!(
+            items[2],
+            PanelItem::Space {
+                id: "s1".into(),
+                active: false
+            }
+        );
+        assert!(
+            matches!(items[3], PanelItem::ServerHeader { online: false, .. }),
+            "an offline server keeps its header and contributes no children"
+        );
+        assert_eq!(items.len(), 4);
+    }
 }
 
 #[derive(Clone)]
@@ -303,16 +349,29 @@ pub(super) fn header_plus(
 }
 
 /// One entry in the scope-dropdown panel, in display order: `All spaces`
-/// pinned first (when shown), then the spaces in their (already
-/// drag-resolved) order.
+/// pinned first (when shown), then — only when 2+ servers are configured —
+/// a `ServerHeader` per server with that server's spaces nested underneath.
+/// A single server renders flat: no headers, just the spaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PanelItem {
-    AllSpaces { active: bool },
-    Space { id: String, active: bool },
+    AllSpaces {
+        active: bool,
+    },
+    Space {
+        id: String,
+        active: bool,
+    },
+    ServerHeader {
+        server_id: comet_proto::ServerId,
+        name: String,
+        online: bool,
+    },
 }
 
 /// Panel contents in display order: `All spaces` pinned first, then the spaces
-/// in their (already drag-resolved) order.
+/// in their (already drag-resolved) order. The flat-list half of the panel's
+/// logic; `panel_grouped_items` delegates here for `groups.len() <= 1` so
+/// there is exactly one place that turns a space list into `PanelItem`s.
 pub(super) fn panel_items(scope: &SidebarScope, spaces: &[Space]) -> Vec<PanelItem> {
     let mut items = vec![PanelItem::AllSpaces {
         active: matches!(scope, SidebarScope::All),
@@ -321,6 +380,37 @@ pub(super) fn panel_items(scope: &SidebarScope, spaces: &[Space]) -> Vec<PanelIt
         id: s.id.clone(),
         active: scope.space_id() == Some(s.id.as_str()),
     }));
+    items
+}
+
+/// Panel contents when servers are involved. One server renders flat (no
+/// header — delegates to [`panel_items`]); two or more get a header each,
+/// mirroring today's `grouped_mode`. Offline servers keep their header and
+/// contribute no children — `project_sidebar_servers` already empties their
+/// `spaces`.
+///
+/// Private, not `pub(super)`: `SidebarServerGroup` is a private struct
+/// (this module), so a more-visible signature is E0446. Every caller is in
+/// this module.
+fn panel_grouped_items(scope: &SidebarScope, groups: &[SidebarServerGroup]) -> Vec<PanelItem> {
+    if groups.len() <= 1 {
+        let spaces = groups.first().map(|g| g.spaces.as_slice()).unwrap_or(&[]);
+        return panel_items(scope, spaces);
+    }
+    let mut items = vec![PanelItem::AllSpaces {
+        active: matches!(scope, SidebarScope::All),
+    }];
+    for group in groups {
+        items.push(PanelItem::ServerHeader {
+            server_id: group.server.id.clone(),
+            name: group.server.name.clone(),
+            online: group.server.connection == comet_proto::RemoteConnectionState::Online,
+        });
+        items.extend(group.spaces.iter().map(|s| PanelItem::Space {
+            id: s.id.clone(),
+            active: scope.space_id() == Some(s.id.as_str()),
+        }));
+    }
     items
 }
 
@@ -334,21 +424,30 @@ pub(super) fn dropdown_offset(mode: DropdownMode) -> usize {
 /// Positions (within the logical `[All spaces?, space0, space1, ...]` list)
 /// that keyboard nav and clicks may land on — offline spaces are unreachable
 /// in `PickForNewSession` (an unclickable row must not be keyboard-reachable
-/// either). Pure so the off-by-one risk here is actually testable — this
-/// crate has no gpui render-test harness.
+/// either).
+///
+/// `host_offline[i]` is space `i`'s pre-resolved offline flag. Round 1's
+/// shape (`spaces: &[Space]` + a device-id `HashSet`) breaks once a second
+/// server exists: two servers can register the same local device id, so a
+/// merged set would falsely mark a same-named device on another server
+/// offline (`spaces.rs` grouped rendering resolves each space's device
+/// against its OWNING server's own device list, never a merged one — this
+/// mirrors that). Server headers never occupy a position at all — they are
+/// not represented in this slice, so nothing extra is needed to exclude them
+/// from keyboard nav; adding a third `PanelItem` kind does not change this
+/// function's shape. Pure so the off-by-one risk here is actually testable —
+/// this crate has no gpui render-test harness.
 pub(super) fn dropdown_navigable_positions(
     mode: DropdownMode,
-    spaces: &[Space],
-    offline_devices: &std::collections::HashSet<String>,
+    host_offline: &[bool],
 ) -> Vec<usize> {
     let offset = dropdown_offset(mode);
     let mut positions = Vec::new();
     if mode == DropdownMode::Switch {
         positions.push(0);
     }
-    for (ix, space) in spaces.iter().enumerate() {
-        let host_offline = offline_devices.contains(&space.device_id);
-        if mode == DropdownMode::Switch || !host_offline {
+    for (ix, offline) in host_offline.iter().enumerate() {
+        if mode == DropdownMode::Switch || !offline {
             positions.push(offset + ix);
         }
     }
@@ -363,6 +462,138 @@ pub(super) fn dropdown_position_to_space_index(mode: DropdownMode, pos: usize) -
         None
     } else {
         Some(pos - dropdown_offset(mode))
+    }
+}
+
+/// One space row's resolved display + click data for the panel — device
+/// name, offline flag, and attention, resolved against whichever server
+/// actually owns the space. Grouped rows are not always the active server's
+/// spaces, but `ServerState` (`comet_client::ServerState`) carries live
+/// `devices`/`sessions` for every configured server, not just the active
+/// one, so a non-active server's offline/attention state is knowable without
+/// switching to it first.
+struct PanelSpaceEntry {
+    server_id: comet_proto::ServerId,
+    space: Space,
+    device_name: String,
+    host_offline: bool,
+    attention: Option<ChatIndicator>,
+}
+
+/// One rendered row of the panel's scrollable region: either a
+/// non-interactive server header or a space (carrying its resolved display
+/// data). `panel_rows` is the only place that decides which spaces got a
+/// header — everything downstream (nav positions, click handlers, rendering)
+/// walks this list instead of re-deriving grouping.
+enum PanelRow {
+    Header {
+        name: String,
+        connection: comet_proto::RemoteConnectionState,
+    },
+    Space(PanelSpaceEntry),
+}
+
+/// Aggregate attention (the most urgent of Working/AwaitingInput) per space
+/// for one server group — the per-group analogue of `spaces_context`'s own
+/// attention loop (`Shell::spaces_context`, below), scoped to a group that
+/// may not be the active server. `group.chats` and `group.server.sessions`
+/// are that server's own projection (`project_sidebar_servers`), so this
+/// works for any online group, active or not.
+fn group_space_attention(
+    group: &SidebarServerGroup,
+    now: chrono::DateTime<Utc>,
+) -> std::collections::HashMap<String, ChatIndicator> {
+    let mut attention: std::collections::HashMap<String, ChatIndicator> =
+        std::collections::HashMap::new();
+    for chat in group.chats.iter().filter(|c| !c.archived) {
+        let session = group.server.sessions.iter().find(|s| s.chat_id == chat.id);
+        let status = crate::state::display_status(chat, session, now);
+        if !matches!(
+            status,
+            ChatIndicator::Working | ChatIndicator::AwaitingInput
+        ) {
+            continue;
+        }
+        let Some(space_id) = chat.space_id.clone() else {
+            continue;
+        };
+        attention
+            .entry(space_id)
+            .and_modify(|held| {
+                if crate::state::attention_rank(status) < crate::state::attention_rank(*held) {
+                    *held = status;
+                }
+            })
+            .or_insert(status);
+    }
+    attention
+}
+
+/// The panel's row plan, in display order. Flat (0 or 1 servers) uses `ctx`
+/// — the DRAG-REORDER-aware order (`resolve_tab_order`, `Shell::
+/// spaces_context`) — because `SidebarServerGroup::spaces`
+/// (`project_sidebar_servers`) is sorted only by creation and is NOT
+/// reorder-aware; switching the flat case over to it would silently drop the
+/// existing drag-reorder feature. Grouped (2+) walks every group instead,
+/// since `ctx` only ever holds the ACTIVE server's spaces — the whole point
+/// of grouping is showing every configured server's spaces at once.
+fn panel_rows(
+    ctx: &SpacesContext,
+    server_groups: &[SidebarServerGroup],
+    active_server: &comet_proto::ServerId,
+    local_device_id: Option<&str>,
+    now: chrono::DateTime<Utc>,
+) -> Vec<PanelRow> {
+    if server_groups.len() > 1 {
+        let mut rows = Vec::new();
+        for group in server_groups {
+            rows.push(PanelRow::Header {
+                name: group.server.name.clone(),
+                connection: group.server.connection.clone(),
+            });
+            let attention = group_space_attention(group, now);
+            for space in &group.spaces {
+                let device = group
+                    .server
+                    .devices
+                    .iter()
+                    .find(|d| d.id == space.device_id);
+                // Mirrors `AppState::device_online`: the local device is
+                // trivially online, an unknown device gets the benefit of
+                // the doubt.
+                let device_online = local_device_id == Some(space.device_id.as_str())
+                    || device
+                        .map(|d| crate::settings::devices::device_online(d.last_seen_at, now))
+                        .unwrap_or(true);
+                rows.push(PanelRow::Space(PanelSpaceEntry {
+                    server_id: group.server.id.clone(),
+                    device_name: device
+                        .map(|d| d.name.clone())
+                        .unwrap_or_else(|| "Unknown device".to_string()),
+                    host_offline: !device_online,
+                    attention: attention.get(&space.id).copied(),
+                    space: space.clone(),
+                }));
+            }
+        }
+        rows
+    } else {
+        ctx.spaces
+            .iter()
+            .map(|space| {
+                PanelRow::Space(PanelSpaceEntry {
+                    server_id: active_server.clone(),
+                    device_name: ctx
+                        .device_names
+                        .get(&space.device_id)
+                        .cloned()
+                        .unwrap_or_else(|| "Unknown device".to_string()),
+                    host_offline: ctx.offline_devices.contains(&space.device_id),
+                    attention: ctx.attention.get(&space.id).copied(),
+                    space: space.clone(),
+                })
+            })
+            .collect()
     }
 }
 
@@ -444,27 +675,10 @@ mod panel_tests {
         assert_eq!(items, vec![PanelItem::AllSpaces { active: true }]);
     }
 
-    fn spaces_with_devices(devices: &[&str]) -> Vec<Space> {
-        devices
-            .iter()
-            .enumerate()
-            .map(|(ix, device)| Space {
-                id: format!("s{ix}"),
-                device_id: (*device).into(),
-                ..test_space(&format!("/{ix}"))
-            })
-            .collect()
-    }
-
-    fn offline(devices: &[&str]) -> std::collections::HashSet<String> {
-        devices.iter().map(|d| d.to_string()).collect()
-    }
-
     #[test]
     fn navigable_positions_switch_reserves_slot_zero_for_all_spaces() {
-        let spaces = spaces_with_devices(&["d1", "d2"]);
         assert_eq!(
-            dropdown_navigable_positions(DropdownMode::Switch, &spaces, &offline(&[])),
+            dropdown_navigable_positions(DropdownMode::Switch, &[false, false]),
             vec![0, 1, 2]
         );
     }
@@ -473,9 +687,8 @@ mod panel_tests {
     fn navigable_positions_switch_includes_offline_spaces() {
         // Switching scope to an offline space is still meaningful (you land
         // on it and see it's offline) — only the picker excludes them.
-        let spaces = spaces_with_devices(&["d1"]);
         assert_eq!(
-            dropdown_navigable_positions(DropdownMode::Switch, &spaces, &offline(&["d1"])),
+            dropdown_navigable_positions(DropdownMode::Switch, &[true]),
             vec![0, 1]
         );
     }
@@ -483,43 +696,29 @@ mod panel_tests {
     #[test]
     fn navigable_positions_switch_empty_spaces_is_just_all_spaces() {
         assert_eq!(
-            dropdown_navigable_positions(DropdownMode::Switch, &[], &offline(&[])),
+            dropdown_navigable_positions(DropdownMode::Switch, &[]),
             vec![0]
         );
     }
 
     #[test]
     fn navigable_positions_pick_has_no_all_spaces_slot_and_skips_offline() {
-        let spaces = spaces_with_devices(&["d1", "d2", "d3"]);
         assert_eq!(
-            dropdown_navigable_positions(
-                DropdownMode::PickForNewSession,
-                &spaces,
-                &offline(&["d2"])
-            ),
+            dropdown_navigable_positions(DropdownMode::PickForNewSession, &[false, true, false]),
             vec![0, 2]
         );
     }
 
     #[test]
     fn navigable_positions_pick_all_offline_is_empty() {
-        let spaces = spaces_with_devices(&["d1", "d2"]);
         assert!(
-            dropdown_navigable_positions(
-                DropdownMode::PickForNewSession,
-                &spaces,
-                &offline(&["d1", "d2"])
-            )
-            .is_empty()
+            dropdown_navigable_positions(DropdownMode::PickForNewSession, &[true, true]).is_empty()
         );
     }
 
     #[test]
     fn navigable_positions_pick_empty_spaces_is_empty() {
-        assert!(
-            dropdown_navigable_positions(DropdownMode::PickForNewSession, &[], &offline(&[]))
-                .is_empty()
-        );
+        assert!(dropdown_navigable_positions(DropdownMode::PickForNewSession, &[]).is_empty());
     }
 
     #[test]
@@ -614,6 +813,50 @@ pub(super) fn section_header(
         .when_some(plus, |el, plus| el.child(plus))
 }
 
+/// A grouped-panel server header: uppercase name (tracked, `font_mono`,
+/// matching `popover::menu_heading`'s treatment) left, connection status
+/// trailing. Non-interactive — servers switch via picking one of their
+/// spaces, not by clicking the header (spec §7). The status copy is the
+/// same match the old always-expanded server header built (round 1 of this
+/// redesign, before the panel absorbed it).
+fn render_panel_server_header(
+    name: &str,
+    connection: &comet_proto::RemoteConnectionState,
+    theme: &Theme,
+) -> gpui::Div {
+    let status = match connection {
+        comet_proto::RemoteConnectionState::Connecting => "Connecting".to_string(),
+        comet_proto::RemoteConnectionState::Online => "Online".to_string(),
+        comet_proto::RemoteConnectionState::Offline => "Offline".to_string(),
+        comet_proto::RemoteConnectionState::Unreachable { message } => {
+            format!("Unreachable · {message}")
+        }
+        comet_proto::RemoteConnectionState::IdentityChanged => "Identity changed".to_string(),
+        comet_proto::RemoteConnectionState::IncompatibleVersion { remote } => {
+            format!("Incompatible v{remote}")
+        }
+    };
+    div()
+        .px(px(7.0))
+        .pt(px(6.0))
+        .pb(px(2.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(Theme::SPACE_SM))
+        .text_size(px(9.5))
+        .font_family(theme.font_mono.clone())
+        .text_color(theme.text_muted.opacity(0.4))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .child(SharedString::from(popover::tracked_upper(name))),
+        )
+        .child(div().flex_none().child(SharedString::from(status)))
+}
+
 impl Shell {
     // ---- space switching ----
 
@@ -664,6 +907,48 @@ impl Shell {
         self.settings.sidebar_scope_space = None;
         self.schedule_save(cx);
         cx.notify();
+    }
+
+    /// The active server, defaulting to the configured order's head when no
+    /// `ServerChanged` has projected one yet — mirrors `AppState::
+    /// current_server_id`'s own fallback (`state.rs`), which is private to
+    /// that module.
+    fn active_server_id(&self, cx: &Context<Self>) -> comet_proto::ServerId {
+        let state = self.state.read(cx);
+        state
+            .selected_server_id()
+            .cloned()
+            .or_else(|| state.server_order.first().cloned())
+            .unwrap_or_else(|| comet_proto::ServerId::new("local"))
+    }
+
+    /// Route a panel space pick through the right mutator. A plain
+    /// `activate_space`/`create_session_in` qualifies the space id against
+    /// whichever server is CURRENTLY active (`AppState::current_server_id`) —
+    /// wrong when the row belongs to a different (grouped-panel) server.
+    /// Switch first when it does; `select_server_bucket` only actually
+    /// changes anything when the target differs from the active server, so
+    /// this is a no-op for the common flat-panel case. Does not touch
+    /// `space_dropdown_open`/`_highlight` — callers close on their own
+    /// existing terms (the row click and the Enter-key handler already
+    /// differed on this before this change; preserved as-is).
+    fn pick_panel_space(
+        &mut self,
+        server_id: comet_proto::ServerId,
+        space_id: String,
+        mode: DropdownMode,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.read(cx).selected_server_id() != Some(&server_id) {
+            self.state.update(cx, |state, cx| {
+                state.select_server_bucket(server_id);
+                cx.notify();
+            });
+        }
+        match mode {
+            DropdownMode::Switch => self.activate_space(space_id, cx),
+            DropdownMode::PickForNewSession => self.create_session_in(space_id, cx),
+        }
     }
 
     // ---- sidebar sections ----
@@ -736,6 +1021,54 @@ impl Shell {
         }
     }
 
+    /// The `(server_groups, active_server, ctx)` triple `panel_rows` needs —
+    /// factored out so the keyboard handler (`space_dropdown_key`, which runs
+    /// on its own key event, outside any render pass) can recompute the same
+    /// inputs `render_scope_panel` does.
+    fn panel_computation_inputs(
+        &self,
+        cx: &Context<Self>,
+    ) -> (
+        Vec<SidebarServerGroup>,
+        comet_proto::ServerId,
+        SpacesContext,
+    ) {
+        let server_groups = {
+            let state = self.state.read(cx);
+            project_sidebar_servers(&state.servers, &state.server_order)
+        };
+        let active_server = self.active_server_id(cx);
+        let ctx = self.spaces_context(cx);
+        (server_groups, active_server, ctx)
+    }
+
+    /// `(space_row_positions, host_offline)` for the current panel — the
+    /// ↑↓ handler's half of `panel_rows`: which RENDERED row each space is
+    /// (headers shift it in grouped mode — same translation `render_scope_
+    /// panel` uses to land on the scoped space when the panel opens) and
+    /// whether each space is reachable.
+    fn panel_nav_lookup(&self, cx: &Context<Self>) -> (Vec<usize>, Vec<bool>) {
+        let (server_groups, active_server, ctx) = self.panel_computation_inputs(cx);
+        let now = Utc::now();
+        let local_device_id = self.state.read(cx).local_device_id.clone();
+        let rows = panel_rows(
+            &ctx,
+            &server_groups,
+            &active_server,
+            local_device_id.as_deref(),
+            now,
+        );
+        let mut space_row_positions = Vec::new();
+        let mut host_offline = Vec::new();
+        for (row_ix, row) in rows.iter().enumerate() {
+            if let PanelRow::Space(entry) = row {
+                space_row_positions.push(row_ix);
+                host_offline.push(entry.host_offline);
+            }
+        }
+        (space_row_positions, host_offline)
+    }
+
     /// The "Spaces" section: tracked header + add button, then the scope
     /// trigger (Task 7 — replaces the old row-per-space list with a single
     /// 28px row + dropdown panel, so the section's height no longer grows
@@ -751,14 +1084,11 @@ impl Shell {
         if self.space_drag.is_some() && !cx.has_active_drag() {
             self.space_drag = None;
         }
-        let (server_groups, active_server) = {
+        let server_groups = {
             let state = self.state.read(cx);
-            (
-                project_sidebar_servers(&state.servers, &state.server_order),
-                state.selected_server_id().cloned(),
-            )
+            project_sidebar_servers(&state.servers, &state.server_order)
         };
-        let grouped_mode = server_groups.len() > 1;
+        let active_server = self.active_server_id(cx);
         let ctx = self.spaces_context(cx);
 
         let header = section_header(
@@ -772,205 +1102,41 @@ impl Shell {
             )),
         );
 
-        let mut column = div().flex().flex_col().child(header);
-        for (index, group) in server_groups.into_iter().enumerate() {
-            let server = group.server;
-            let id = server.id.clone();
-            let header_id = id.clone();
-            let online = server.connection == comet_proto::RemoteConnectionState::Online;
-            let selected_server = active_server.as_ref() == Some(&id);
-            let status = match server.connection {
-                comet_proto::RemoteConnectionState::Connecting => "Connecting".to_string(),
-                comet_proto::RemoteConnectionState::Online => "Online".to_string(),
-                comet_proto::RemoteConnectionState::Offline => "Offline".to_string(),
-                comet_proto::RemoteConnectionState::Unreachable { message } => {
-                    format!("Unreachable · {message}")
-                }
-                comet_proto::RemoteConnectionState::IdentityChanged => {
-                    "Identity changed".to_string()
-                }
-                comet_proto::RemoteConnectionState::IncompatibleVersion { remote } => {
-                    format!("Incompatible v{remote}")
-                }
-            };
-            column = column.child(
-                div()
-                    .id(SharedString::from(format!("server-header-{index}")))
-                    .mx(px(Theme::SPACE_SM))
-                    .mt(px(4.0))
-                    .px(px(Theme::SPACE_SM))
-                    .py(px(4.0))
-                    .rounded(px(6.0))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .text_size(px(11.0))
-                    .text_color(if online {
-                        theme.text_muted
-                    } else {
-                        theme.warning
-                    })
-                    .when(selected_server, |row| {
-                        row.bg(crate::theme::glass_selected_bg())
-                    })
-                    .when(online, |row| {
-                        row.cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.state.update(cx, |state, cx| {
-                                    state.select_server_bucket(header_id.clone());
-                                    cx.notify();
-                                });
-                            }))
-                    })
-                    .child(SharedString::from(server.name))
-                    .child(SharedString::from(status)),
-            );
-            if online && grouped_mode {
-                for (space_index, space) in group.spaces.into_iter().enumerate() {
-                    let owner = comet_proto::ServerRef::new(id.clone(), space.id.clone());
-                    let selected = self.state.read(cx).selected_space.as_ref() == Some(&owner);
-                    let select_server = id.clone();
-                    let select_space = space.id.clone();
-                    let menu_server = id.clone();
-                    let menu_space = space.id.clone();
-                    let device_name = server
-                        .devices
-                        .iter()
-                        .find(|device| device.id == space.device_id)
-                        .map(|device| device.name.clone())
-                        .unwrap_or_else(|| "Unknown device".into());
-                    column = column.child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "server-{index}-space-{space_index}"
-                            )))
-                            .mx(px(Theme::SPACE_SM))
-                            .px(px(Theme::SPACE_SM))
-                            .py(px(6.0))
-                            .rounded(px(8.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(Theme::SPACE_SM))
-                            .cursor_pointer()
-                            .text_size(px(13.0))
-                            .text_color(theme.text.opacity(0.8))
-                            .when(selected, |row| {
-                                row.bg(crate::theme::glass_selected_bg())
-                                    .shadow(crate::theme::glass_selected_shadows())
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.state.update(cx, |state, cx| {
-                                    state.select_server_bucket(select_server.clone());
-                                    cx.notify();
-                                });
-                                this.activate_space(select_space.clone(), cx);
-                            }))
-                            .on_mouse_down(
-                                MouseButton::Right,
-                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                    this.state.update(cx, |state, cx| {
-                                        state.select_server_bucket(menu_server.clone());
-                                        cx.notify();
-                                    });
-                                    this.space_menu = Some((menu_space.clone(), event.position));
-                                    cx.notify();
-                                }),
-                            )
-                            .child(
-                                icon(icons::FOLDER)
-                                    .size(px(16.0))
-                                    .flex_none()
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .truncate()
-                                    .child(space.display_name().to_string()),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(11.0))
-                                    .text_color(theme.text_muted)
-                                    .child(device_name),
-                            ),
-                    );
-                }
-                for (chat_index, chat) in group
-                    .chats
-                    .into_iter()
-                    .filter(|chat| !chat.archived)
-                    .enumerate()
-                {
-                    let owner = comet_proto::ServerRef::new(id.clone(), chat.id.clone());
-                    let selected = self.state.read(cx).selected_chat.as_ref() == Some(&owner);
-                    let select_server = id.clone();
-                    let select_chat = chat.id.clone();
-                    let menu_owner = grouped_chat_context_target(&id, &chat.id);
-                    column = column.child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "server-{index}-chat-{chat_index}"
-                            )))
-                            .mx(px(Theme::SPACE_SM))
-                            .ml(px(Theme::SPACE_LG))
-                            .px(px(Theme::SPACE_SM))
-                            .py(px(4.0))
-                            .rounded(px(7.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(Theme::SPACE_SM))
-                            .cursor_pointer()
-                            .text_size(px(12.0))
-                            .text_color(theme.text_muted)
-                            .when(selected, |row| row.bg(crate::theme::glass_selected_bg()))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.state.update(cx, |state, cx| {
-                                    state.select_server_bucket(select_server.clone());
-                                    state.select_chat(Some(select_chat.clone()), cx);
-                                });
-                                cx.notify();
-                            }))
-                            .on_mouse_down(
-                                MouseButton::Right,
-                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                    this.chat_menu = Some((menu_owner.clone(), event.position));
-                                    cx.notify();
-                                }),
-                            )
-                            .child(
-                                icon(icons::CHAT_ROUND_LINE)
-                                    .size(px(14.0))
-                                    .flex_none()
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .child(chat.title.unwrap_or_else(|| "New session".into())),
-                            ),
-                    );
-                }
-            }
-        }
-        let render_flat_projection = !grouped_mode;
-        if render_flat_projection {
-            column = column.child(self.render_scope_trigger(window, theme, &ctx, cx));
-        }
-        column.into_any_element()
+        // The old per-server header+space(+chat) tree that rendered whenever
+        // 2+ servers were configured is gone — the scope trigger/panel below
+        // now absorbs it (`PanelItem::ServerHeader`, `panel_grouped_items`)
+        // for BOTH space counts, so there is exactly one Spaces UI regardless
+        // of how many servers are configured. This is also the fix for the
+        // round-1-deferred bug: that gate (`!grouped_mode`) used to skip the
+        // trigger/panel entirely with 2+ servers, so the Sessions `+` (which
+        // opens the panel in `PickForNewSession` mode) rendered nothing and
+        // left `space_dropdown_open` stuck set.
+        div()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(self.render_scope_trigger(
+                window,
+                theme,
+                &ctx,
+                &server_groups,
+                &active_server,
+                cx,
+            ))
+            .into_any_element()
     }
 
     /// The scope trigger: one row reading "All spaces" or the space the
     /// sidebar is scoped to (Task 7's fixed-height replacement for the old
     /// per-space row list). Opens/closes [`Self::render_scope_panel`].
+    #[allow(clippy::too_many_arguments)]
     fn render_scope_trigger(
         &mut self,
         window: &mut Window,
         theme: &Theme,
         ctx: &SpacesContext,
+        server_groups: &[SidebarServerGroup],
+        active_server: &comet_proto::ServerId,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let scope = self.state.read(cx).sidebar_scope.clone();
@@ -982,6 +1148,20 @@ impl Shell {
         // Step 7: the same total feeds both the trigger (on `All`) and the
         // panel's `All spaces` row.
         let session_total = self.state.read(cx).visible_chats().count();
+        // §7: with several servers configured, `comet @ mac-studio` on two
+        // different machines is ambiguous — a scoped trigger disambiguates
+        // with the server name, and `All spaces` swaps the (now
+        // active-server-scoped, no longer global) session count for the
+        // server name outright.
+        let grouped = server_groups.len() > 1;
+        let active_server_name = grouped
+            .then(|| {
+                server_groups
+                    .iter()
+                    .find(|g| &g.server.id == active_server)
+                    .map(|g| g.server.name.clone())
+            })
+            .flatten();
         // Task 9: aggregate attention across every space when the scope is
         // `All` (mirrors the per-space dot in the panel below). Placeholder
         // until Task 9 wires the real aggregate.
@@ -1082,13 +1262,16 @@ impl Shell {
                                 .get(&s.device_id)
                                 .cloned()
                                 .unwrap_or_default();
-                            if host_offline {
-                                format!("@ {device} · offline")
-                            } else {
-                                format!("@ {device}")
+                            match (host_offline, &active_server_name) {
+                                (true, Some(server)) => format!("@ {device} · {server} · offline"),
+                                (true, None) => format!("@ {device} · offline"),
+                                (false, Some(server)) => format!("@ {device} · {server}"),
+                                (false, None) => format!("@ {device}"),
                             }
                         }
-                        None => session_total.to_string(),
+                        None => active_server_name
+                            .clone()
+                            .unwrap_or_else(|| session_total.to_string()),
                     }))
             })
             .child(
@@ -1099,7 +1282,16 @@ impl Shell {
             );
 
         if let Some(mode) = mode {
-            let panel = self.render_scope_panel(window, theme, mode, ctx, session_total, cx);
+            let panel = self.render_scope_panel(
+                window,
+                theme,
+                mode,
+                ctx,
+                server_groups,
+                active_server,
+                session_total,
+                cx,
+            );
             trigger = trigger.child(panel);
         }
 
@@ -1118,6 +1310,8 @@ impl Shell {
         theme: &Theme,
         mode: DropdownMode,
         ctx: &SpacesContext,
+        server_groups: &[SidebarServerGroup],
+        active_server: &comet_proto::ServerId,
         session_total: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1132,22 +1326,69 @@ impl Shell {
 
         let scope = self.state.read(cx).sidebar_scope.clone();
         let is_pick = mode == DropdownMode::PickForNewSession;
+        let grouped = server_groups.len() > 1;
+        let now = Utc::now();
+        let local_device_id = self.state.read(cx).local_device_id.clone();
+        let rows = panel_rows(
+            ctx,
+            server_groups,
+            active_server,
+            local_device_id.as_deref(),
+            now,
+        );
+        // The flat "space index" nav/scroll math keys off (`dropdown_navigable_
+        // positions`, `space_dropdown_key`) and the RENDERED row index (`rows`,
+        // headers included) are different sequences once headers are in play —
+        // `space_row_positions[space_ix]` translates one to the other so
+        // `scroll_to_item` (which addresses rendered children) never targets
+        // the wrong row.
+        let mut space_entries: Vec<&PanelSpaceEntry> = Vec::new();
+        let mut space_row_positions: Vec<usize> = Vec::new();
+        for (row_ix, row) in rows.iter().enumerate() {
+            if let PanelRow::Space(entry) = row {
+                space_entries.push(entry);
+                space_row_positions.push(row_ix);
+            }
+        }
+        // `active` flags, sourced from the same tested function the module's
+        // unit tests pin against — NOT `panel_grouped_items` unconditionally:
+        // its `groups.len() <= 1` branch walks `group.spaces` (creation
+        // order, `project_sidebar_servers`), but `panel_rows`'s flat branch
+        // (and `space_entries` above) walks `ctx.spaces` — the DRAG-REORDER-
+        // aware order. Those two orders diverge the moment a user drags a row,
+        // so mixing them would silently pair the wrong `active` flag with the
+        // wrong row. Call `panel_items` directly on `ctx.spaces` instead when
+        // flat; `panel_grouped_items` is safe as-is when grouped, since then
+        // `panel_rows` ALSO walks `group.spaces` — the two traversals match.
+        let items = if grouped {
+            panel_grouped_items(&scope, server_groups)
+        } else {
+            panel_items(&scope, &ctx.spaces)
+        };
+        let space_active: Vec<bool> = items
+            .iter()
+            .filter_map(|item| match item {
+                PanelItem::Space { active, .. } => Some(*active),
+                _ => None,
+            })
+            .collect();
         // A scoped space below row 8 would otherwise open with its check
         // mark scrolled out of view — land the panel on it immediately.
         if just_opened
-            && let Some(ix) = scope
+            && let Some(space_ix) = scope
                 .space_id()
-                .and_then(|id| ctx.spaces.iter().position(|s| s.id == id))
+                .and_then(|id| space_entries.iter().position(|e| e.space.id == id))
         {
-            self.space_panel_scroll.scroll_to_item(ix);
+            self.space_panel_scroll
+                .scroll_to_item(space_row_positions[space_ix]);
         }
-        let items = panel_items(&scope, &ctx.spaces);
-        let navigable = dropdown_navigable_positions(mode, &ctx.spaces, &ctx.offline_devices);
+        let host_offline: Vec<bool> = space_entries.iter().map(|e| e.host_offline).collect();
+        let navigable = dropdown_navigable_positions(mode, &host_offline);
         let highlighted_pos = self
             .space_dropdown_highlight
             .and_then(|h| navigable.get(h))
             .copied();
-        let all_unreachable = is_pick && !ctx.spaces.is_empty() && navigable.is_empty();
+        let all_unreachable = is_pick && !space_entries.is_empty() && navigable.is_empty();
 
         let mut card = popover::popover_card(theme)
             .w(px(self.settings.sidebar_width - 16.0))
@@ -1212,83 +1453,94 @@ impl Shell {
             );
         }
 
-        // Two different offsets, easy to conflate: `items` always carries
-        // `AllSpaces` at 0 regardless of mode (so a space at `ctx.spaces[ix]`
-        // is always `items[ix + 1]`), while the logical NAVIGATION position
-        // space only reserves slot 0 for `AllSpaces` in `Switch` mode.
+        // Two different offsets, easy to conflate: a space's position among
+        // RENDERED rows (`rows`, headers included) is not its logical
+        // NAVIGATION position — headers occupy a row but never a position,
+        // and the navigation position space only reserves slot 0 for
+        // `AllSpaces` in `Switch` mode. `space_ix` (incremented only on
+        // `PanelRow::Space`) is the latter; `position_offset + space_ix`
+        // matches it to `highlighted_pos`.
         let position_offset = dropdown_offset(mode);
-        let count = ctx.spaces.len();
         let drag = self
             .space_drag
             .as_ref()
             .map(|d| (d.from, d.over, d.epoch, d.prev_over));
-        let space_rows: Vec<AnyElement> = ctx
-            .spaces
+        let mut space_ix = 0usize;
+        let row_elements: Vec<AnyElement> = rows
             .iter()
-            .enumerate()
-            .map(|(ix, space)| {
-                let id = space.id.clone();
-                let active = matches!(&items[ix + 1], PanelItem::Space { active: true, .. });
-                let host_offline = ctx.offline_devices.contains(&space.device_id);
-                let unreachable = is_pick && host_offline;
-                let device_name = ctx
-                    .device_names
-                    .get(&space.device_id)
-                    .cloned()
-                    .unwrap_or_else(|| "Unknown device".to_string());
-                let attention = ctx.attention.get(&id).copied();
-                let highlighted = highlighted_pos == Some(position_offset + ix);
-                let row = self.render_panel_space_row(
-                    ix,
-                    space,
-                    device_name,
-                    host_offline,
-                    active,
-                    unreachable,
-                    highlighted,
-                    attention,
-                    mode,
-                    theme,
-                    cx,
-                );
-                // Sliding transform while a sibling is dragged over — Task 6's
-                // finding: the machinery moves over verbatim, no coordinate
-                // adjustment needed for the popover.
-                if mode == DropdownMode::Switch {
-                    match drag {
-                        Some((from, over, epoch, prev_over)) if ix != from => {
-                            let target = slide_offset(ix, from, over) * SPACE_ROW_SLOT;
-                            let start = slide_offset(ix, from, prev_over) * SPACE_ROW_SLOT;
-                            div()
-                                .relative()
-                                .child(row.with_animation(
-                                    SharedString::from(format!("space-panel-slide-{id}-{epoch}")),
-                                    TAB_SLIDE.animation(),
-                                    move |el, t| el.top(px(motion::lerp(start, target, t))),
-                                ))
-                                .into_any_element()
+            .map(|row| match row {
+                PanelRow::Header { name, connection } => {
+                    render_panel_server_header(name, connection, theme).into_any_element()
+                }
+                PanelRow::Space(entry) => {
+                    let ix = space_ix;
+                    space_ix += 1;
+                    let id = entry.space.id.clone();
+                    let active = space_active.get(ix).copied().unwrap_or(false);
+                    let unreachable = is_pick && entry.host_offline;
+                    let highlighted = highlighted_pos == Some(position_offset + ix);
+                    let row = self.render_panel_space_row(
+                        ix,
+                        &entry.server_id,
+                        &entry.space,
+                        entry.device_name.clone(),
+                        entry.host_offline,
+                        active,
+                        unreachable,
+                        highlighted,
+                        entry.attention,
+                        mode,
+                        !grouped,
+                        theme,
+                        cx,
+                    );
+                    // Sliding transform while a sibling is dragged over —
+                    // Task 6's finding: the machinery moves over verbatim, no
+                    // coordinate adjustment needed for the popover. Grouped
+                    // rows never carry a drag (see `render_panel_space_row`'s
+                    // `draggable` guard below) — `settings.space_order` has
+                    // no notion of which server an id belongs to, so
+                    // reordering across server groups is not attempted.
+                    if !grouped && mode == DropdownMode::Switch {
+                        match drag {
+                            Some((from, over, epoch, prev_over)) if ix != from => {
+                                let target = slide_offset(ix, from, over) * SPACE_ROW_SLOT;
+                                let start = slide_offset(ix, from, prev_over) * SPACE_ROW_SLOT;
+                                div()
+                                    .relative()
+                                    .child(row.with_animation(
+                                        SharedString::from(format!(
+                                            "space-panel-slide-{id}-{epoch}"
+                                        )),
+                                        TAB_SLIDE.animation(),
+                                        move |el, t| el.top(px(motion::lerp(start, target, t))),
+                                    ))
+                                    .into_any_element()
+                            }
+                            // The dragged row renders as an invisible spacer;
+                            // the cursor ghost represents it.
+                            Some((from, ..)) if ix == from => div()
+                                .h(px(SPACE_ROW_SLOT - 2.0))
+                                .flex_none()
+                                .into_any_element(),
+                            _ => row.into_any_element(),
                         }
-                        // The dragged row renders as an invisible spacer; the
-                        // cursor ghost represents it.
-                        Some((from, ..)) if ix == from => div()
-                            .h(px(SPACE_ROW_SLOT - 2.0))
-                            .flex_none()
-                            .into_any_element(),
-                        _ => row.into_any_element(),
+                    } else {
+                        row.into_any_element()
                     }
-                } else {
-                    row.into_any_element()
                 }
             })
             .collect();
 
-        // Drag-reorder only makes sense while switching scope — the picker is
-        // a one-shot "where does this session go" prompt.
-        let rows_container = if mode == DropdownMode::Switch {
+        // Drag-reorder only makes sense while switching scope on a flat
+        // (single-server) panel — the picker is a one-shot "where does this
+        // session go" prompt, and grouped rows never originate a drag.
+        let rows_container = if !grouped && mode == DropdownMode::Switch {
             // `DragMoveEvent::bounds` is the scroll VIEWPORT, invariant under
             // scrolling — captured before the `move` closure, the
             // `shell::tabs` horizontal-drag idiom (`tabs.rs:499`).
             let scroll_for_drag = self.space_panel_scroll.clone();
+            let count = space_entries.len();
             div()
                 .id("space-panel-rows")
                 .flex()
@@ -1319,7 +1571,7 @@ impl Shell {
                         this.commit_space_reorder(payload.from, to, cx);
                     },
                 ))
-                .children(space_rows)
+                .children(row_elements)
         } else {
             div()
                 .id("space-panel-rows")
@@ -1329,7 +1581,7 @@ impl Shell {
                 .max_h(px(PANEL_ROWS_MAX_H))
                 .overflow_y_scroll()
                 .track_scroll(&self.space_panel_scroll)
-                .children(space_rows)
+                .children(row_elements)
         };
         card = card.child(rows_container);
 
@@ -1395,9 +1647,8 @@ impl Shell {
                 cx.notify();
             }
             popover::MenuKey::Up | popover::MenuKey::Down => {
-                let ctx = self.spaces_context(cx);
-                let navigable =
-                    dropdown_navigable_positions(mode, &ctx.spaces, &ctx.offline_devices);
+                let (space_row_positions, host_offline) = self.panel_nav_lookup(cx);
+                let navigable = dropdown_navigable_positions(mode, &host_offline);
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
                 self.space_dropdown_highlight =
                     popover::menu_step(self.space_dropdown_highlight, navigable.len(), delta);
@@ -1405,20 +1656,42 @@ impl Shell {
                 // scroll past it (`AddSpaceFlow::add_space_key`'s
                 // `list_scroll.scroll_to_item`). `All spaces` (no space
                 // index) sits above the scrollable region, so nothing to do.
-                if let Some(space_ix) = self
+                // `space_row_positions` translates a space index to its
+                // RENDERED row index (headers shift it in grouped mode) —
+                // same translation `render_scope_panel` uses to land on the
+                // scoped space when the panel opens.
+                if let Some(row_ix) = self
                     .space_dropdown_highlight
                     .and_then(|h| navigable.get(h))
                     .copied()
                     .and_then(|pos| dropdown_position_to_space_index(mode, pos))
+                    .and_then(|space_ix| space_row_positions.get(space_ix).copied())
                 {
-                    self.space_panel_scroll.scroll_to_item(space_ix);
+                    self.space_panel_scroll.scroll_to_item(row_ix);
                 }
                 cx.notify();
             }
             popover::MenuKey::Enter => {
-                let ctx = self.spaces_context(cx);
-                let navigable =
-                    dropdown_navigable_positions(mode, &ctx.spaces, &ctx.offline_devices);
+                let (server_groups, active_server, ctx) = self.panel_computation_inputs(cx);
+                let now = Utc::now();
+                let local_device_id = self.state.read(cx).local_device_id.clone();
+                let rows = panel_rows(
+                    &ctx,
+                    &server_groups,
+                    &active_server,
+                    local_device_id.as_deref(),
+                    now,
+                );
+                let space_entries: Vec<&PanelSpaceEntry> = rows
+                    .iter()
+                    .filter_map(|r| match r {
+                        PanelRow::Space(e) => Some(e),
+                        PanelRow::Header { .. } => None,
+                    })
+                    .collect();
+                let host_offline: Vec<bool> =
+                    space_entries.iter().map(|e| e.host_offline).collect();
+                let navigable = dropdown_navigable_positions(mode, &host_offline);
                 if let Some(pos) = self
                     .space_dropdown_highlight
                     .and_then(|h| navigable.get(h))
@@ -1427,14 +1700,10 @@ impl Shell {
                     match dropdown_position_to_space_index(mode, pos) {
                         None => self.activate_all_spaces(cx),
                         Some(ix) => {
-                            if let Some(space) = ctx.spaces.get(ix) {
-                                let id = space.id.clone();
-                                match mode {
-                                    DropdownMode::Switch => self.activate_space(id, cx),
-                                    DropdownMode::PickForNewSession => {
-                                        self.create_session_in(id, cx)
-                                    }
-                                }
+                            if let Some(entry) = space_entries.get(ix) {
+                                let server_id = entry.server_id.clone();
+                                let space_id = entry.space.id.clone();
+                                self.pick_panel_space(server_id, space_id, mode, cx);
                             }
                         }
                     }
@@ -1450,10 +1719,14 @@ impl Shell {
     /// One panel space row: a folder-less row (every row here is already a
     /// space) with a trailing check when `active`, and (`PickForNewSession`)
     /// an offline host rendered unreachable rather than clickable.
+    /// `draggable` is `false` for grouped rows: `settings.space_order` has no
+    /// notion of which server an id belongs to, so cross-server drag-reorder
+    /// is not attempted (only within a single server's flat panel).
     #[allow(clippy::too_many_arguments)]
     fn render_panel_space_row(
         &self,
         ix: usize,
+        server_id: &comet_proto::ServerId,
         space: &Space,
         device_name: String,
         host_offline: bool,
@@ -1462,6 +1735,7 @@ impl Shell {
         highlighted: bool,
         attention: Option<ChatIndicator>,
         mode: DropdownMode,
+        draggable: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -1479,7 +1753,9 @@ impl Shell {
             theme.text.opacity(0.8)
         };
         let select_id = id.clone();
+        let select_server = server_id.clone();
         let menu_id = id.clone();
+        let menu_server = server_id.clone();
 
         let row = div()
             .id(SharedString::from(format!("space-panel-{id}")))
@@ -1528,28 +1804,32 @@ impl Shell {
                 })
                 .on_hover(motion::hover_listener(fade_key))
                 .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| match mode {
-                    DropdownMode::Switch => {
-                        this.activate_space(select_id.clone(), cx);
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.pick_panel_space(select_server.clone(), select_id.clone(), mode, cx);
+                    if mode == DropdownMode::Switch {
                         this.space_dropdown_open = None;
                         this.space_dropdown_highlight = None;
-                        cx.notify();
                     }
-                    DropdownMode::PickForNewSession => {
-                        this.create_session_in(select_id.clone(), cx);
-                    }
+                    cx.notify();
                 }))
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        if this.state.read(cx).selected_server_id() != Some(&menu_server) {
+                            this.state.update(cx, |state, cx| {
+                                state.select_server_bucket(menu_server.clone());
+                                cx.notify();
+                            });
+                        }
                         this.space_menu = Some((menu_id.clone(), event.position));
                         this.space_dropdown_open = None;
                         this.space_dropdown_highlight = None;
                         cx.notify();
                     }),
                 );
-            // Drag-reorder only in Switch mode (see `rows_container`).
-            if mode == DropdownMode::Switch {
+            // Drag-reorder only in Switch mode on a flat (single-server)
+            // panel — see this function's doc comment.
+            if draggable && mode == DropdownMode::Switch {
                 row = row.on_drag(
                     SpaceDragPayload {
                         from: ix,
