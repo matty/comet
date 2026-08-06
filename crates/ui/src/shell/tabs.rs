@@ -473,7 +473,7 @@ impl Shell {
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                this.route = Route::Chat;
+                this.set_route(Route::Chat, cx);
                 this.state.update(cx, |s, cx| s.select_chat(None, cx));
                 cx.notify();
             }))

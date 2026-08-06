@@ -685,10 +685,9 @@ pub(super) fn panel_items(scope: &SidebarScope, spaces: &[Space]) -> Vec<PanelIt
 }
 
 /// Panel contents when servers are involved. One server renders flat (no
-/// header — delegates to [`panel_items`]); two or more get a header each,
-/// mirroring today's `grouped_mode`. Offline servers keep their header and
-/// contribute no children — `project_sidebar_servers` already empties their
-/// `spaces`.
+/// header — delegates to [`panel_items`]); two or more get a header each.
+/// Offline servers keep their header and contribute no children —
+/// `project_sidebar_servers` already empties their `spaces`.
 ///
 /// Private, not `pub(super)`: `SidebarServerGroup` is a private struct
 /// (this module), so a more-visible signature is E0446. Every caller is in
@@ -1228,7 +1227,7 @@ impl Shell {
     /// Land in a space: remembered tab if alive, else the most recent chat in
     /// the space, else the new-session canvas. Persists `last_space_id`.
     pub(super) fn activate_space(&mut self, space_id: String, cx: &mut Context<Self>) {
-        self.route = Route::Chat;
+        self.set_route(Route::Chat, cx);
         self.state.update(cx, |s, cx| {
             s.select_space(Some(space_id.clone()), cx);
         });
@@ -1346,10 +1345,13 @@ impl Shell {
             .collect();
         // Spaces with a live/awaiting session get an aggregate dot (the
         // most urgent member status wins) so the attention signal survives
-        // even with the Sessions list scrolled off.
+        // even with the Sessions list scrolled off. Keyed off
+        // `listed_chats` — the same predicate the Sessions list and the
+        // trigger's count use, so a chat whose space is gone can no longer
+        // light up a badge for a space nothing will ever list under.
         let mut attention: std::collections::HashMap<String, ChatIndicator> =
             std::collections::HashMap::new();
-        for chat in state.visible_chats() {
+        for chat in state.listed_chats() {
             let status = state.display_status_for(chat, now);
             if !matches!(
                 status,
@@ -1357,6 +1359,8 @@ impl Shell {
             ) {
                 continue;
             }
+            // `listed_chats` guarantees this resolves; the `else` is a
+            // total-match formality, not a live branch.
             let Some(space_id) = chat.space_id.clone() else {
                 continue;
             };
@@ -1511,8 +1515,10 @@ impl Shell {
             .space_id()
             .and_then(|id| ctx.spaces.iter().find(|s| s.id == id));
         // Step 7: the same total feeds both the trigger (on `All`) and the
-        // panel's `All spaces` row.
-        let session_total = self.state.read(cx).visible_chats().count();
+        // panel's `All spaces` row — and it counts what the Sessions list
+        // below actually renders (`AppState::listed_chats`), not every
+        // non-archived chat. A chat with no live space is in neither.
+        let session_total = self.state.read(cx).listed_chats().count();
         // §7: with several servers configured, `comet @ mac-studio` on two
         // different machines is ambiguous — a scoped trigger disambiguates
         // with the server name, and `All spaces` swaps the (now
@@ -1677,11 +1683,18 @@ impl Shell {
                     )
                 },
             )
+            // §2.1: the chevron flips 180° while the panel is open. gpui divs
+            // have no rotation transform at the pinned rev (see `changes.rs`'s
+            // fold chevron), so the flip is a glyph swap to the rotated asset.
             .child(
-                icon(icons::ALT_ARROW_DOWN)
-                    .size(px(13.0))
-                    .flex_none()
-                    .text_color(theme.text_muted.opacity(0.5)),
+                icon(if open {
+                    icons::ALT_ARROW_UP
+                } else {
+                    icons::ALT_ARROW_DOWN
+                })
+                .size(px(13.0))
+                .flex_none()
+                .text_color(theme.text_muted.opacity(0.5)),
             );
 
         if let Some(mode) = mode {

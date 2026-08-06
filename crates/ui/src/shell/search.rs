@@ -231,6 +231,19 @@ fn search_count_chip(n: usize, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
+/// One result group's rows, in the SAME gapped column the normal Sessions
+/// list wraps its rows in (`SIDEBAR_LIST_GAP`). Results used to be flat
+/// children of the gapless scroll container, so identical rows sat flush
+/// against each other here and 2px apart three keystrokes earlier.
+fn result_rows(rows: Vec<AnyElement>) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(super::SIDEBAR_LIST_GAP))
+        .children(rows)
+        .into_any_element()
+}
+
 /// The `↑↓ move · ↵ open · esc clear` legend under the results list.
 fn render_search_footer(theme: &Theme) -> AnyElement {
     div()
@@ -269,6 +282,13 @@ impl Shell {
 
     /// Search is a lens, not a mode: opening a session never re-scopes the
     /// column. Only picking a *space* result changes the scope.
+    ///
+    /// Focus follows the result out of the field: without this it stayed in
+    /// the (now cleared) search input, so the first keystroke aimed at the
+    /// session just opened went to search instead. Every other way of
+    /// selecting a session leaves you in the composer; this one now does too.
+    /// The move itself is deferred one frame — see `composer_focus_pending`,
+    /// this path has no `Window`.
     pub(super) fn open_search_result(&mut self, result: SearchHit, cx: &mut Context<Self>) {
         match result {
             SearchHit::Chat(id) => {
@@ -277,6 +297,7 @@ impl Shell {
             SearchHit::Space(id) => self.activate_space(id, cx),
         }
         self.clear_search(cx);
+        self.composer_focus_pending = true;
     }
 
     /// Bubbled ↑↓/⏎/esc from the focused search input — the `"SidebarSearch"`
@@ -469,6 +490,7 @@ impl Shell {
                     .child(search_count_chip(results.spaces.len(), theme))
                     .into_any_element(),
             );
+            let mut rows: Vec<AnyElement> = Vec::new();
             for (i, id) in results.spaces.iter().enumerate() {
                 let space = self.state.read(cx).space_row(id).cloned();
                 let Some(space) = space else { continue };
@@ -477,8 +499,9 @@ impl Shell {
                     results.spaces.len(),
                     results.chats.len(),
                 ) == Some(HighlightTarget::Space(i));
-                children.push(self.render_search_space_row(&space, query, highlighted, theme, cx));
+                rows.push(self.render_search_space_row(&space, query, highlighted, theme, cx));
             }
+            children.push(result_rows(rows));
         }
 
         if !results.chats.is_empty() {
@@ -491,6 +514,7 @@ impl Shell {
                     .child(search_count_chip(results.chats.len(), theme))
                     .into_any_element(),
             );
+            let mut rows: Vec<AnyElement> = Vec::new();
             for (i, id) in results.chats.iter().enumerate() {
                 let chat = self
                     .state
@@ -505,8 +529,9 @@ impl Shell {
                     results.spaces.len(),
                     results.chats.len(),
                 ) == Some(HighlightTarget::Chat(i));
-                children.push(self.render_search_chat_row(&chat, query, highlighted, theme, cx));
+                rows.push(self.render_search_chat_row(&chat, query, highlighted, theme, cx));
             }
+            children.push(result_rows(rows));
         }
 
         children.push(render_search_footer(theme));

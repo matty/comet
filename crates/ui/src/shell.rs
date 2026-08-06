@@ -399,16 +399,40 @@ pub(crate) enum RowScope {
     One,
 }
 
+/// Session-row vertical metrics. [`Shell::render_chat_row`] lays out with
+/// exactly these and [`chat_row_height`] sums them, so the predicted height
+/// and the painted one cannot drift apart.
+///
+/// Every line is given an EXPLICIT height. Line 2 (branch + harness mark) used
+/// to take its height from its children and so collapsed to 13 with no branch
+/// and to 0 with neither a branch nor a harness (a chat whose config frame
+/// hasn't landed yet), making a mixed list 60/59/46 px tall against a
+/// `chat_row_height` that always claimed 60 — every resort then glided the
+/// survivors to the wrong y.
+mod chat_row {
+    pub(super) const PY: f32 = 5.0;
+    /// Line 0, `RowScope::All` only: space + device.
+    pub(super) const SPACE_LINE: f32 = 14.0;
+    /// Gap under line 0.
+    pub(super) const SPACE_LINE_MB: f32 = 2.0;
+    /// Line 1: status rail + title + time-ago.
+    pub(super) const TITLE_LINE: f32 = 18.0;
+    /// Gap above line 2.
+    pub(super) const META_LINE_MT: f32 = 2.0;
+    /// Line 2: branch + harness mark. Fixed regardless of what it carries.
+    pub(super) const META_LINE: f32 = 14.0;
+}
+
 /// Session-row height. Uniform *within* a scope, which is what the §1.6 resort
 /// FLIP diff requires — `resort_offsets` must be fed the same value the render
 /// pass used, or surviving rows glide to the wrong y on a scope switch.
 pub(crate) fn chat_row_height(scope: &RowScope) -> f32 {
-    match scope {
-        // py 5 + space 14 + mb 2 + title 18 + mt 2 + branch 14 + py 5
-        RowScope::All { .. } => 60.0,
-        // py 5 + title 18 + mt 2 + branch 14 + py 5
-        RowScope::One => 44.0,
-    }
+    let body = chat_row::TITLE_LINE + chat_row::META_LINE_MT + chat_row::META_LINE;
+    let lead = match scope {
+        RowScope::All { .. } => chat_row::SPACE_LINE + chat_row::SPACE_LINE_MB,
+        RowScope::One => 0.0,
+    };
+    chat_row::PY + lead + body + chat_row::PY
 }
 
 /// Flex gap between sidebar list items.
@@ -495,6 +519,10 @@ pub struct Shell {
     /// reset to 0 on every edit ([`search::highlight_target`] maps it to the
     /// row it actually selects).
     search_active: usize,
+    /// `true` for the one frame after a search result is opened; the render
+    /// pass consumes it to hand focus back to the composer (the dialogs'
+    /// `focus_pending` idiom — these handlers run without window access).
+    composer_focus_pending: bool,
     /// External file drag hovering the conversation column — shows the
     /// "Drop images to attach" veil over the whole chat area; a drop stages
     /// the files in the composer.
@@ -675,18 +703,22 @@ pub(crate) enum NewSessionTarget {
     AddSpaceFirst,
 }
 
-/// `spaces` is `(space_id, host_online)` in display order.
-pub(crate) fn new_session_target(
-    scope: &SidebarScope,
-    spaces: &[(String, bool)],
-) -> NewSessionTarget {
+/// `spaces` is the space ids in display order.
+///
+/// Host reachability is deliberately NOT an input: an offline space is still
+/// a legitimate destination (the picker lists it, dimmed, and
+/// `dropdown_navigable_positions` decides what can be committed there), and
+/// with every host offline the answer is still the picker rather than a
+/// silent no-op. The parameter used to carry an `online` flag that nothing
+/// here read.
+pub(crate) fn new_session_target(scope: &SidebarScope, spaces: &[String]) -> NewSessionTarget {
     if let Some(id) = scope.space_id() {
         return NewSessionTarget::Space(id.to_string());
     }
     match spaces {
         [] => NewSessionTarget::AddSpaceFirst,
-        [(only, _)] => NewSessionTarget::Space(only.clone()),
-        many => NewSessionTarget::Pick(many.iter().map(|(id, _)| id.clone()).collect()),
+        [only] => NewSessionTarget::Space(only.clone()),
+        many => NewSessionTarget::Pick(many.to_vec()),
     }
 }
 
@@ -734,6 +766,13 @@ impl Shell {
         let search_events = cx.subscribe(&search_input, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
                 this.search_active = 0;
+                // Results mode swaps out `render_spaces_section` wholesale, so
+                // the first character typed UNMOUNTS the scope trigger and its
+                // panel. An unmounted panel cannot close itself; leaving the
+                // flag set reopens it — mode and all — the moment the query is
+                // cleared. Closing at the gate covers every way text can arrive
+                // (⌘P then typing, paste, an IME commit).
+                this.close_space_dropdown();
                 cx.notify();
             }
         });
@@ -782,6 +821,7 @@ impl Shell {
             composer,
             search_input,
             search_active: 0,
+            composer_focus_pending: false,
             file_drag_active: false,
             terminal: None,
             changes: None,
@@ -976,6 +1016,20 @@ impl Shell {
                 });
             }
         }
+        // The persisted scope mirrors the live one. `activate_space` and
+        // `activate_all_spaces` write it on the way in, but `heal_sidebar_scope`
+        // resets the scope behind their backs whenever the projection drops the
+        // scoped space (deleted elsewhere, or a server switch replacing
+        // `spaces` wholesale) — without this the healed-away scope came back
+        // on the next launch. Gated on the boot restore having run, or this
+        // would erase the stored scope before it is applied.
+        if self.space_boot_applied {
+            let live = state.read(cx).sidebar_scope.space_id().map(str::to_string);
+            if live != self.settings.sidebar_scope_space {
+                self.settings.sidebar_scope_space = live;
+                self.schedule_save(cx);
+            }
+        }
         // Track the per-space last chat + persist the selected space.
         {
             let (selected_space, selected_chat, chat_space) = {
@@ -1111,11 +1165,108 @@ impl Shell {
         cx.notify();
     }
 
+    /// Roll the sidebar open if it is collapsed, on the same [`WidthTween`]
+    /// path [`Self::toggle_sidebar`] uses. Anything that focuses or reveals
+    /// something *inside* the column has to call this first: a collapsed
+    /// sidebar is still MOUNTED (`pane_container` clips a full-width child
+    /// inside `w(0) + overflow_hidden`), so focus lands on a typable but
+    /// invisible field and silently steals keystrokes from the composer.
+    fn reveal_sidebar(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.sidebar_collapsed {
+            return;
+        }
+        let from = self.sidebar_target();
+        self.settings.sidebar_collapsed = false;
+        self.sidebar_tween = Some(WidthTween::new(from, self.sidebar_target()));
+        self.schedule_save(cx);
+    }
+
+    /// Transient, sidebar-local UI that must not survive the column being
+    /// re-rendered from scratch: the scope dropdown's open flag/highlight.
+    ///
+    /// The panel is a CHILD of the scope trigger, so anything that stops
+    /// rendering `render_spaces_section` (entering search-results mode,
+    /// leaving the Chat route) unmounts it — and an unmounted panel can never
+    /// run its own `on_mouse_down_out`/Escape teardown. Left set, the flag
+    /// reopens the panel the moment the section comes back, in whatever mode
+    /// it was in ("New session in…" included).
+    fn close_space_dropdown(&mut self) {
+        self.space_dropdown_open = None;
+        self.space_dropdown_highlight = None;
+        self.space_dropdown_focus_pending = false;
+    }
+
+    /// The single funnel for route changes. A route swap replaces the whole
+    /// sidebar column (Settings renders `render_settings_nav` instead of
+    /// `render_chat_sidebar`), so it takes both pieces of transient sidebar
+    /// state with it: a stuck dropdown flag, and a stale query that would
+    /// otherwise still be filtering the list on the way back from Settings.
+    fn set_route(&mut self, route: Route, cx: &mut Context<Self>) {
+        if self.route == route {
+            return;
+        }
+        self.route = route;
+        self.close_space_dropdown();
+        if !self.search_query(cx).is_empty() {
+            self.clear_search(cx);
+        }
+    }
+
     /// ⌘P (`FocusSearch`): focus the pinned sidebar search field from
     /// anywhere in chat mode.
+    ///
+    /// Rolls the sidebar open first — the field is otherwise focused while
+    /// clipped to zero width. Closes the scope dropdown too: this is a bare
+    /// `window.focus` with no mouse-down anywhere, so the panel's
+    /// `on_mouse_down_out` never fires, and typing one character would then
+    /// unmount the panel (search-results mode) with the flag still set.
     fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reveal_sidebar(cx);
+        self.close_space_dropdown();
         let handle = self.search_input.focus_handle(cx);
         window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// Escape clears the sidebar query from OUTSIDE the sidebar. The full
+    /// ↑↓/⏎/esc handler ([`Self::search_key`]) is mounted on the sidebar
+    /// column and only sees keys dispatched through it, so once focus moves
+    /// away (clicking the transcript hands it to the composer via
+    /// `on_focus_lost`) the clear button was the only way out.
+    ///
+    /// Deliberately narrow: Escape only, never ↑↓/⏎ — those belong to whatever
+    /// is focused (Enter in the composer sends). It also stands down while a
+    /// shell dialog, menu, or palette is up, since Escape is theirs; the inner
+    /// handler having already cleared the query makes this a no-op on the
+    /// bubble up from the field itself.
+    fn search_escape_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        if !matches!(self.route, Route::Chat) || self.overlay_open() {
+            return;
+        }
+        if self.search_query(cx).is_empty() {
+            return;
+        }
+        let key = popover::classify_key(
+            event.keystroke.key.as_str(),
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+        );
+        if key == popover::MenuKey::Escape {
+            self.clear_search(cx);
+        }
+    }
+
+    /// Is a shell-owned dialog, context menu, or palette on screen? Escape
+    /// belongs to it, not to the sidebar query.
+    fn overlay_open(&self) -> bool {
+        self.chat_menu.is_some()
+            || self.rename_dialog.is_some()
+            || self.delete_confirm.is_some()
+            || self.space_menu.is_some()
+            || self.rename_space_dialog.is_some()
+            || self.delete_space_confirm.is_some()
+            || self.add_space.is_some()
+            || self.space_dropdown_open.is_some()
     }
 
     fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
@@ -1284,14 +1435,14 @@ impl Shell {
     // ---- routes / settings ----
 
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
-        self.route = Route::Settings(section);
+        self.set_route(Route::Settings(section), cx);
         self.nav.push(NavEntry::Settings(section));
         self.chat_menu = None;
         cx.notify();
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
-        self.route = Route::Chat;
+        self.set_route(Route::Chat, cx);
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
         cx.notify();
     }
@@ -1316,14 +1467,14 @@ impl Shell {
     fn apply_nav(&mut self, entry: NavEntry, cx: &mut Context<Self>) {
         match entry {
             NavEntry::Chat(chat_id) => {
-                self.route = Route::Chat;
+                self.set_route(Route::Chat, cx);
                 let target = (!chat_id.is_empty()).then_some(chat_id);
                 if self.state.read(cx).selected_chat_id() != target.as_deref() {
                     self.state.update(cx, |s, cx| s.select_chat(target, cx));
                 }
             }
             NavEntry::Settings(section) => {
-                self.route = Route::Settings(section);
+                self.set_route(Route::Settings(section), cx);
             }
         }
         self.chat_menu = None;
@@ -1983,7 +2134,7 @@ impl Shell {
             .flex_col()
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
-            .py(px(5.0))
+            .py(px(chat_row::PY))
             .text_color(title_color)
             .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
             .when(keyboard_highlighted, |el| {
@@ -2017,14 +2168,16 @@ impl Shell {
                     el.child(
                         div()
                             .w_full()
-                            .mb(px(2.0))
+                            .flex_none()
+                            .h(px(chat_row::SPACE_LINE))
+                            .mb(px(chat_row::SPACE_LINE_MB))
                             .pl(px(14.0))
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap(px(4.0))
                             .text_size(px(11.0))
-                            .line_height(px(14.0))
+                            .line_height(px(chat_row::SPACE_LINE))
                             .child(
                                 icon(icons::FOLDER)
                                     .size(px(11.0))
@@ -2061,6 +2214,8 @@ impl Shell {
             .child(
                 div()
                     .w_full()
+                    .flex_none()
+                    .h(px(chat_row::TITLE_LINE))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -2072,7 +2227,7 @@ impl Shell {
                             .min_w_0()
                             .truncate()
                             .text_size(px(13.0))
-                            .line_height(px(18.0))
+                            .line_height(px(chat_row::TITLE_LINE))
                             .child(search::styled_line(
                                 &title,
                                 highlight_query,
@@ -2085,7 +2240,7 @@ impl Shell {
                         div()
                             .flex_none()
                             .text_size(px(11.0))
-                            .line_height(px(18.0))
+                            .line_height(px(chat_row::TITLE_LINE))
                             .text_color(time_tint)
                             .child(time_ago),
                     ),
@@ -2093,17 +2248,26 @@ impl Shell {
             // Line 2: branch on the left, agent mark pinned right. The mark is
             // flex_none so a long branch truncates into it and the right
             // column never breaks.
+            //
+            // The EXPLICIT height is load-bearing, not cosmetic: this line has
+            // no text node of its own, so without it the row is 14/13/0 px
+            // shorter depending on whether it carries a branch, only a harness
+            // mark, or neither (a chat whose config frame hasn't landed) —
+            // three different row heights against one `chat_row_height`, and
+            // the resort FLIP glides every survivor to the wrong y.
             .child(
                 div()
                     .w_full()
-                    .mt(px(2.0))
+                    .flex_none()
+                    .h(px(chat_row::META_LINE))
+                    .mt(px(chat_row::META_LINE_MT))
                     .pl(px(14.0))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(4.0))
                     .text_size(px(11.0))
-                    .line_height(px(14.0))
+                    .line_height(px(chat_row::META_LINE))
                     .text_color(subline)
                     .when_some(branch, |el, branch| {
                         el.child(
@@ -2153,18 +2317,13 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let (scope, spaces) = {
-            let now = Utc::now();
             let state = self.state.read(cx);
-            let spaces: Vec<(String, bool)> = state
-                .spaces
-                .iter()
-                .map(|s| (s.id.clone(), state.device_online(&s.device_id, now)))
-                .collect();
+            let spaces: Vec<String> = state.spaces.iter().map(|s| s.id.clone()).collect();
             (state.sidebar_scope.clone(), spaces)
         };
         match new_session_target(&scope, &spaces) {
             NewSessionTarget::Space(id) => {
-                self.route = Route::Chat;
+                self.set_route(Route::Chat, cx);
                 self.state.update(cx, |s, cx| {
                     // Mirrors `activate_space`: `select_chat(None)` alone
                     // deliberately leaves `selected_space` untouched (a scope
@@ -2172,8 +2331,17 @@ impl Shell {
                     // canvas — and a submitted session's device — can stay on
                     // whatever space was previously selected, not the one the
                     // sidebar is scoped to.
-                    s.select_space(Some(id.clone()), cx);
-                    s.sidebar_scope = SidebarScope::Space(id);
+                    //
+                    // `sidebar_scope` is deliberately NOT written here, for the
+                    // same reason [`Self::create_session_in`] (the picker's
+                    // commit) doesn't: starting a session somewhere is not a
+                    // request to re-scope the column, and the spec's action
+                    // table doesn't list the `+` as scope-changing. It used to
+                    // be written, which made the `+` on `All spaces` narrow the
+                    // sidebar with exactly one space and not with two (the two
+                    // arms disagreed), and the narrowing then evaporated on
+                    // restart because it bypassed `settings.sidebar_scope_space`.
+                    s.select_space(Some(id), cx);
                     s.select_chat(None, cx);
                 });
                 cx.notify();
@@ -2190,13 +2358,15 @@ impl Shell {
 
     /// The picker's commit path. Deliberately does not touch `sidebar_scope`:
     /// starting a session somewhere is not a request to re-scope the column.
+    /// [`Self::start_session_from_sidebar`]'s no-prompt arm agrees — the two
+    /// are the same action reached two ways and must land identically.
     fn create_session_in(&mut self, space_id: String, cx: &mut Context<Self>) {
-        self.route = Route::Chat;
+        self.set_route(Route::Chat, cx);
         self.state.update(cx, |s, cx| {
             s.select_space(Some(space_id), cx);
             s.select_chat(None, cx);
         });
-        self.space_dropdown_open = None;
+        self.close_space_dropdown();
         cx.notify();
     }
 
@@ -2233,9 +2403,10 @@ impl Shell {
         // Opaque platforms melt overflow into the surface tone with painted
         // gradient overlays. Over GLASS no overlay can work — the backdrop is
         // see-through blur, so tone stacks into a smudge and black reads as a
-        // shadow (user reports). Instead the ROWS fade themselves: prepaint-
-        // measured bounds drive per-row opacity toward the viewport edges
-        // ([`Shell::sidebar_row_alpha`]), dissolving the edge to pure glass.
+        // shadow (user reports). Instead the whole scroll region paints inside
+        // a [`crate::edge_fade::edge_faded`] scope: a per-primitive gradient at
+        // the active overflow edges, so text dissolves per glyph into pure
+        // glass.
         let glass = theme.is_glass();
         let sidebar_fade = theme.surface;
 
@@ -2325,7 +2496,7 @@ impl Shell {
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(2.0))
+                        .gap(px(SIDEBAR_LIST_GAP))
                         .pb(px(Theme::SPACE_SM))
                         .children(list_items)
                         .into_any_element()
@@ -3740,6 +3911,14 @@ impl Render for Shell {
         {
             window.focus(&self.composer.focus_handle(cx), cx);
         }
+        // Opening a search result hands focus back to the composer, matching
+        // what selecting a session anywhere else leaves you with — otherwise
+        // focus stays in the search field and the first thing typed at the
+        // session you just opened goes to search instead. Deferred to here
+        // because those handlers have no `window`.
+        if std::mem::take(&mut self.composer_focus_pending) && matches!(self.route, Route::Chat) {
+            window.focus(&self.composer.focus_handle(cx), cx);
+        }
 
         let root = div()
             .id("shell-root")
@@ -3751,6 +3930,12 @@ impl Render for Shell {
             .text_color(text)
             .font_family(font)
             .text_size(px(14.0))
+            // Escape clears the sidebar query from anywhere — the column's own
+            // `search_key` only sees keys dispatched through the sidebar, and
+            // focus leaves it as soon as you click the transcript.
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                this.search_escape_key(event, cx)
+            }))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
             .on_drag_move(cx.listener(Self::on_terminal_drag))
@@ -3977,12 +4162,30 @@ impl Render for Shell {
 mod tests {
     use super::*;
 
+    fn space_ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
     #[test]
     fn new_session_target_picks_the_scoped_space() {
-        let spaces = vec![("s1".to_string(), true), ("s2".to_string(), true)];
         assert_eq!(
-            new_session_target(&SidebarScope::Space("s2".into()), &spaces),
-            NewSessionTarget::Space("s2".into())
+            new_session_target(&SidebarScope::Space("s2".into()), &space_ids(&["s1", "s2"])),
+            NewSessionTarget::Space("s2".into()),
+            "a scoped sidebar already answers the question the picker would ask"
+        );
+    }
+
+    #[test]
+    fn new_session_target_ignores_a_scope_the_space_list_no_longer_contains() {
+        // `heal_sidebar_scope` normally clears this, but the two are read from
+        // the same frame: the scope wins, and the space id it names is used
+        // verbatim rather than falling through to the picker.
+        assert_eq!(
+            new_session_target(
+                &SidebarScope::Space("gone".into()),
+                &space_ids(&["s1", "s2"])
+            ),
+            NewSessionTarget::Space("gone".into())
         );
     }
 
@@ -3997,34 +4200,40 @@ mod tests {
 
     #[test]
     fn new_session_target_skips_a_one_item_picker() {
-        let spaces = vec![("s1".to_string(), true)];
         assert_eq!(
-            new_session_target(&SidebarScope::All, &spaces),
+            new_session_target(&SidebarScope::All, &space_ids(&["s1"])),
             NewSessionTarget::Space("s1".into()),
             "a menu with one entry is a click for nothing"
         );
     }
 
     #[test]
-    fn new_session_target_prompts_across_all_spaces() {
-        let spaces = vec![
-            ("s1".to_string(), true),
-            ("s2".to_string(), false),
-            ("s3".to_string(), true),
-        ];
+    fn new_session_target_prompts_across_all_spaces_in_display_order() {
         assert_eq!(
-            new_session_target(&SidebarScope::All, &spaces),
-            NewSessionTarget::Pick(vec!["s1".into(), "s2".into(), "s3".into()]),
-            "offline spaces are listed but dimmed, so the picker still shows them"
+            new_session_target(&SidebarScope::All, &space_ids(&["s3", "s1", "s2"])),
+            NewSessionTarget::Pick(vec!["s3".into(), "s1".into(), "s2".into()]),
+            "the picker offers every space, in the order the sidebar shows them"
         );
     }
 
+    /// §1.6's FLIP precondition: a session row is a UNIFORM height within a
+    /// scope, and `chat_row_height` reports exactly what `render_chat_row`
+    /// lays out. Both now read the same `chat_row` metrics, so a row that
+    /// carries no branch and no harness mark (config frame not landed) can no
+    /// longer come out 14px short of what `resort_offsets` was told.
     #[test]
-    fn new_session_target_prompts_even_when_every_host_is_offline() {
-        let spaces = vec![("s1".to_string(), false), ("s2".to_string(), false)];
+    fn chat_row_height_is_the_sum_of_the_metrics_the_row_is_built_from() {
+        let all = RowScope::All {
+            space: "comet".into(),
+            device: "mac-studio".into(),
+            host_offline: false,
+        };
+        assert_eq!(chat_row_height(&all), 60.0);
+        assert_eq!(chat_row_height(&RowScope::One), 44.0);
         assert_eq!(
-            new_session_target(&SidebarScope::All, &spaces),
-            NewSessionTarget::Pick(vec!["s1".into(), "s2".into()])
+            chat_row_height(&all) - chat_row_height(&RowScope::One),
+            chat_row::SPACE_LINE + chat_row::SPACE_LINE_MB,
+            "the only difference between the scopes is line 0"
         );
     }
 

@@ -877,18 +877,30 @@ impl AppState {
         display_status(chat, self.session_for(&chat.id), now)
     }
 
-    /// The sidebar's Sessions list: the non-archived chats of every live
-    /// space, or of the scoped space, on any device — idle included, in pure
-    /// recency order.
+    /// THE definition of "a session the sidebar can show": non-archived AND
+    /// owned by a space that is currently projected. Scope-independent — a
+    /// scoped list narrows this set, it never widens it.
+    ///
+    /// Every count, list, and per-space aggregate in the sidebar goes through
+    /// here. Three call sites used to spell the condition out themselves and
+    /// two got it wrong (the scope trigger's total and the panel's `All spaces`
+    /// row counted bare `visible_chats`, the per-space attention map keyed off
+    /// a raw `space_id`), so a chat with a `None`/dangling `space_id` was
+    /// counted by the chrome and then never appeared in the list it claimed to
+    /// summarise. `search::filter` applies the same rule to its own snapshot
+    /// (it matches over `&[Space]`/`&[Chat]` slices, not `AppState`).
+    pub fn listed_chats(&self) -> impl Iterator<Item = &Chat> {
+        self.visible_chats()
+            .filter(|c| self.space_for_chat(c).is_some())
+    }
+
+    /// The sidebar's Sessions list: [`Self::listed_chats`] narrowed to the
+    /// scoped space (all of them on `All`), idle included, attention-sorted.
     pub fn overview_chats(&self, now: DateTime<Utc>) -> Vec<(ChatIndicator, &Chat)> {
         let scope = self.sidebar_scope.space_id();
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
-            .visible_chats()
-            .filter(|c| {
-                c.space_id.as_deref().is_some_and(|id| {
-                    self.space_row(id).is_some() && scope.is_none_or(|scoped| scoped == id)
-                })
-            })
+            .listed_chats()
+            .filter(|c| scope.is_none_or(|scoped| c.space_id.as_deref() == Some(scoped)))
             .map(|c| (display_status(c, self.session_for(&c.id), now), c))
             .collect();
         sort_active(&mut rows);
@@ -1976,6 +1988,35 @@ mod tests {
             .map(|(_, c)| c.id.as_str())
             .collect();
         assert_eq!(overview, ["old", "new"]);
+    }
+
+    /// The whole point of [`AppState::listed_chats`]: the sidebar's counts and
+    /// its list must be the same set. A chat with no `space_id` (config frame
+    /// not landed) or a dangling one (space deleted elsewhere) is in neither.
+    #[test]
+    fn listed_chats_is_the_same_set_the_sessions_list_shows() {
+        let mut state = AppState::new();
+        state.apply_spaces(vec![space("s1", "dev", "/a", 1)]);
+        let mut live = chat("live", 1, None);
+        live.space_id = Some("s1".into());
+        let mut dangling = chat("dangling", 2, None);
+        dangling.space_id = Some("deleted".into());
+        let spaceless = chat("spaceless", 3, None); // space_id: None
+        let mut archived = chat("archived", 4, None);
+        archived.space_id = Some("s1".into());
+        archived.archived = true;
+        state.apply_chats(vec![live, dangling, spaceless, archived]);
+
+        let listed: Vec<&str> = state.listed_chats().map(|c| c.id.as_str()).collect();
+        assert_eq!(listed, ["live"]);
+        // The trigger/panel count is `listed_chats().count()`; on `All` it must
+        // equal exactly what the list below it renders.
+        assert_eq!(state.sidebar_scope, SidebarScope::All);
+        assert_eq!(
+            state.listed_chats().count(),
+            state.overview_chats(Utc::now()).len(),
+            "the count in the chrome and the rows in the list are one set"
+        );
     }
 
     #[test]
