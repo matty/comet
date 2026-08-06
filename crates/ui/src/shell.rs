@@ -376,12 +376,31 @@ pub fn resort_offsets(
     offsets
 }
 
-/// Estimated sidebar row height for the resort diff (title line 17px inside
-/// 6px vertical padding + the location subline's 14px line + 2px gap — Active
-/// rows always carry the folder · device subline).
-/// Session row height (FLIP estimate): space line + title + meta line
-/// (harness mark, plus branch for worktrees).
-const CHAT_ROW_HEIGHT: f32 = 61.0;
+/// What line 2 of a session row carries, which is also what decides its height.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RowScope {
+    /// Listing every space: a space line sits above the title.
+    All {
+        space: SharedString,
+        device: SharedString,
+        host_offline: bool,
+    },
+    /// Listing one space: the space line is not rendered.
+    One,
+}
+
+/// Session-row height. Uniform *within* a scope, which is what the §1.6 resort
+/// FLIP diff requires — `resort_offsets` must be fed the same value the render
+/// pass used, or surviving rows glide to the wrong y on a scope switch.
+pub(crate) fn chat_row_height(scope: &RowScope) -> f32 {
+    match scope {
+        // py 5 + space 14 + mb 2 + title 18 + mt 2 + branch 14 + py 5
+        RowScope::All { .. } => 60.0,
+        // py 5 + title 18 + mt 2 + branch 14 + py 5
+        RowScope::One => 44.0,
+    }
+}
+
 /// Flex gap between sidebar list items.
 const SIDEBAR_LIST_GAP: f32 = 2.0;
 
@@ -1755,7 +1774,7 @@ impl Shell {
         id: String,
         title: SharedString,
         time_ago: SharedString,
-        space_name: SharedString,
+        scope: RowScope,
         branch: Option<SharedString>,
         harness: Option<comet_proto::HarnessId>,
         status: comet_proto::ChatIndicator,
@@ -1792,6 +1811,7 @@ impl Shell {
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
         let subline = theme.text_muted.opacity(0.5);
+        let time_tint = theme.text_muted.opacity(0.45);
         let select_id = id.clone();
         let menu_id = comet_proto::ServerRef::new(
             self.state
@@ -1819,10 +1839,9 @@ impl Shell {
             .id(SharedString::from(format!("chat-{id}")))
             .flex()
             .flex_col()
-            .gap(px(2.0))
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
+            .py(px(5.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, text))
             .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
             .when(selected, |el| {
@@ -1841,7 +1860,62 @@ impl Shell {
                     cx.notify();
                 }),
             )
-            // Line 1: status rail, space name, time-ago.
+            // Line 0 (all-spaces only): the space this session belongs to.
+            // Hangs at pl 14 — dot 6 + gap 8 — so it starts under the title.
+            .when_some(
+                match &scope {
+                    RowScope::All {
+                        space,
+                        device,
+                        host_offline,
+                    } => Some((space.clone(), device.clone(), *host_offline)),
+                    RowScope::One => None,
+                },
+                |el, (space, device, host_offline)| {
+                    el.child(
+                        div()
+                            .w_full()
+                            .mb(px(2.0))
+                            .pl(px(14.0))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .text_size(px(11.0))
+                            .line_height(px(14.0))
+                            .child(
+                                icon(icons::FOLDER)
+                                    .size(px(11.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted.opacity(0.5)),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme.text_muted.opacity(0.75))
+                                    .child(space),
+                            )
+                            // The device never truncates: which machine a
+                            // session runs on cannot be inferred anywhere else.
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(if host_offline {
+                                        theme.warning.opacity(0.8)
+                                    } else {
+                                        theme.text_muted.opacity(0.5)
+                                    })
+                                    .child(SharedString::from(if host_offline {
+                                        format!("@ {device} · offline")
+                                    } else {
+                                        format!("@ {device}")
+                                    })),
+                            ),
+                    )
+                },
+            )
+            // Line 1: status rail, title, time-ago.
             .child(
                 div()
                     .w_full()
@@ -1855,51 +1929,34 @@ impl Shell {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.0))
-                            .line_height(px(14.0))
-                            .text_color(subline)
-                            .child(space_name),
+                            .text_size(px(13.0))
+                            .line_height(px(18.0))
+                            .child(title),
                     )
                     .child(
                         div()
                             .flex_none()
                             .text_size(px(11.0))
-                            .text_color(subline)
+                            .line_height(px(18.0))
+                            .text_color(time_tint)
                             .child(time_ago),
                     ),
             )
-            // Line 2: the session title, aligned under the folder icon
-            // (rail 6 + gap 8).
+            // Line 2: branch on the left, agent mark pinned right. The mark is
+            // flex_none so a long branch truncates into it and the right
+            // column never breaks.
             .child(
                 div()
                     .w_full()
-                    .pl(px(14.0))
-                    .truncate()
-                    .text_size(px(13.0))
-                    .line_height(px(17.0))
-                    .child(title),
-            )
-            // Line 3 (always): harness brand mark; worktree sessions append
-            // the branch icon + name.
-            .child(
-                div()
-                    .w_full()
+                    .mt(px(2.0))
                     .pl(px(14.0))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(4.0))
-                    .when_some(
-                        harness.map(crate::pickers::harness_brand_icon),
-                        |el, (path, tint)| {
-                            el.child(
-                                icon(path)
-                                    .size(px(11.0))
-                                    .flex_none()
-                                    .text_color(tint.unwrap_or(subline).opacity(0.8)),
-                            )
-                        },
-                    )
+                    .text_size(px(11.0))
+                    .line_height(px(14.0))
+                    .text_color(subline)
                     .when_some(branch, |el, branch| {
                         el.child(
                             icon(icons::GIT_BRANCH)
@@ -1907,16 +1964,20 @@ impl Shell {
                                 .flex_none()
                                 .text_color(subline),
                         )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(11.0))
-                                .line_height(px(14.0))
-                                .text_color(subline)
-                                .child(branch),
-                        )
-                    }),
+                        .child(div().min_w_0().truncate().child(branch))
+                    })
+                    .child(div().flex_1().min_w(px(8.0)))
+                    .when_some(
+                        harness.map(crate::pickers::harness_brand_icon),
+                        |el, (path, tint)| {
+                            el.child(
+                                icon(path)
+                                    .size(px(13.0))
+                                    .flex_none()
+                                    .text_color(tint.unwrap_or(theme.text_muted.opacity(0.75))),
+                            )
+                        },
+                    ),
             )
             .into_any_element()
     }
@@ -3747,6 +3808,56 @@ mod tests {
 
     fn keys(list: &[(&str, f32)]) -> Vec<(String, f32)> {
         list.iter().map(|(k, h)| (k.to_string(), *h)).collect()
+    }
+
+    fn all_scope() -> RowScope {
+        RowScope::All {
+            space: "comet".into(),
+            device: "mac-studio".into(),
+            host_offline: false,
+        }
+    }
+
+    #[test]
+    fn chat_row_height_adds_exactly_the_space_line() {
+        // Two lines inside one space: py5 + title 18 + mt2 + branch 14 + py5.
+        assert_eq!(chat_row_height(&RowScope::One), 44.0);
+        // The all-spaces form is the same row plus the 14px space line and its
+        // 2px margin — nothing else may differ, or the two scopes have drifted
+        // apart and the row is no longer one design.
+        assert_eq!(
+            chat_row_height(&all_scope()) - chat_row_height(&RowScope::One),
+            16.0
+        );
+        // The device text does not change the height; it truncates instead.
+        assert_eq!(
+            chat_row_height(&RowScope::All {
+                space: "a-very-long-space-name-indeed".into(),
+                device: "a-very-long-device-name".into(),
+                host_offline: true,
+            }),
+            chat_row_height(&all_scope())
+        );
+    }
+
+    /// The spec's highest-risk item: `CHAT_ROW_HEIGHT` stops being a constant, and
+    /// `resort_offsets` must be fed the same heights the render pass used. If a
+    /// caller ever passes a stale height, surviving rows glide to the wrong y.
+    #[test]
+    fn resort_offsets_track_the_scope_height_change() {
+        // Same three rows, same order, but the scope narrowed: every row shrank
+        // 60 -> 44, so each one after the first has genuinely moved up.
+        let wide = keys(&[("a", 60.0), ("b", 60.0), ("c", 60.0)]);
+        let narrow = keys(&[("a", 44.0), ("b", 44.0), ("c", 44.0)]);
+        let offsets = resort_offsets(&wide, &narrow, SIDEBAR_LIST_GAP);
+
+        assert!(!offsets.contains_key("a"), "the first row does not move");
+        assert_eq!(offsets.get("b").copied(), Some(16.0));
+        assert_eq!(offsets.get("c").copied(), Some(32.0));
+
+        // And feeding it the OLD height for the new pass produces no offsets at
+        // all — the silent-wrong-glide failure mode, asserted so it stays visible.
+        assert!(resort_offsets(&wide, &wide, SIDEBAR_LIST_GAP).is_empty());
     }
 
     #[test]

@@ -916,21 +916,31 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Vec<(String, f32, AnyElement)> {
+        let scoped = self.state.read(cx).sidebar_scope.space_id().is_some();
         let now = Utc::now();
-        let rows: Vec<(ChatIndicator, comet_proto::Chat, String, Option<String>)> = {
+        let rows: Vec<(ChatIndicator, comet_proto::Chat, RowScope, Option<String>)> = {
             let state = self.state.read(cx);
             state
                 .overview_chats(now)
                 .into_iter()
                 .map(|(status, chat)| {
                     let space = state.space_for_chat(chat);
-                    let mut folder = space
-                        .map(|s| s.display_name().to_string())
-                        .unwrap_or_else(|| "?".to_string());
-                    // Unknown device → no fragment, same as the archived list.
-                    if let Some(device) = state.device_name(&chat.device_id) {
-                        folder = format!("{folder}@{device}");
-                    }
+                    let scope = if scoped {
+                        RowScope::One
+                    } else {
+                        RowScope::All {
+                            space: space
+                                .map(|s| s.display_name().to_string())
+                                .unwrap_or_else(|| "?".to_string())
+                                .into(),
+                            device: state
+                                .device_name(&chat.device_id)
+                                .unwrap_or("Unknown device")
+                                .to_string()
+                                .into(),
+                            host_offline: !state.device_online(&chat.device_id, now),
+                        }
+                    };
                     // The branch shows whenever the engine has stamped one —
                     // main-checkout sessions included, not just worktrees.
                     let branch = chat
@@ -939,7 +949,7 @@ impl Shell {
                         .map(str::trim)
                         .filter(|b| !b.is_empty())
                         .map(str::to_string);
-                    (status, chat.clone(), folder, branch)
+                    (status, chat.clone(), scope, branch)
                 })
                 .collect()
         };
@@ -950,11 +960,11 @@ impl Shell {
             .clone()
             .map(|id| id.local_id);
         rows.into_iter()
-            .map(|(status, chat, folder, branch)| {
+            .map(|(status, chat, scope, branch)| {
                 let time_ago: SharedString =
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
                 let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                let height = super::CHAT_ROW_HEIGHT;
+                let height = super::chat_row_height(&scope);
                 let harness = chat.config.as_ref().map(|c| c.harness);
                 let element = self.render_chat_row(
                     chat.id.clone(),
@@ -963,7 +973,7 @@ impl Shell {
                     )
                     .into(),
                     time_ago,
-                    folder.into(),
+                    scope,
                     branch.map(SharedString::from),
                     harness,
                     status,
