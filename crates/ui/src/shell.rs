@@ -56,7 +56,10 @@ mod tabs;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
-actions!(shell, [ToggleSidebar, ToggleChanges, AddSpacePalette]);
+actions!(
+    shell,
+    [ToggleSidebar, ToggleChanges, AddSpacePalette, FocusSearch]
+);
 
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
@@ -175,6 +178,11 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         KeyBinding::new(
             &valid_or_default(&keymap.toggle_terminal, "mod-j"),
             ToggleTerminal,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.focus_search, "mod-p"),
+            FocusSearch,
             None,
         ),
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
@@ -479,6 +487,14 @@ pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
+    /// The pinned sidebar search field ("SidebarSearch" context: navigation
+    /// keys stay unbound so ↑↓/⏎ bubble to the sidebar frame). Search is
+    /// transient — never persisted, never restored on boot.
+    search_input: Entity<ComposerInput>,
+    /// Keyboard highlight into the flat (spaces-then-sessions) results list —
+    /// reset to 0 on every edit ([`search::highlight_target`] maps it to the
+    /// row it actually selects).
+    search_active: usize,
     /// External file drag hovering the conversation column — shows the
     /// "Drop images to attach" veil over the whole chat area; a drop stages
     /// the files in the composer.
@@ -635,6 +651,7 @@ pub struct Shell {
     _ticker: Task<()>,
     _state_observation: Subscription,
     _composer_events: Subscription,
+    _search_events: Subscription,
 }
 
 /// The space-scope dropdown panel's mode (`Shell::space_dropdown_open`).
@@ -710,6 +727,16 @@ impl Shell {
                 }
             }
         });
+        // "SidebarSearch" context: navigation keys stay unbound so ↑↓/⏎ bubble
+        // to the sidebar frame instead of moving the caret — same reason the
+        // add-space palette uses its own context.
+        let search_input = cx.new(|cx| ComposerInput::with_context("Search", "SidebarSearch", cx));
+        let search_events = cx.subscribe(&search_input, |this: &mut Shell, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Edited) {
+                this.search_active = 0;
+                cx.notify();
+            }
+        });
         let data_dir = boot.data_dir.clone();
         let settings = UiSettings::load(&data_dir);
         // Bind the customizable shortcuts from the persisted keymap.
@@ -753,6 +780,8 @@ impl Shell {
             state,
             transcript,
             composer,
+            search_input,
+            search_active: 0,
             file_drag_active: false,
             terminal: None,
             changes: None,
@@ -822,6 +851,7 @@ impl Shell {
             _ticker: ticker,
             _state_observation: observation,
             _composer_events: composer_events,
+            _search_events: search_events,
         }
     }
 
@@ -847,6 +877,12 @@ impl Shell {
             self.panels = SessionPanels::default();
             self.active_chat.clear();
             self.nav = NavHistory::new(NavEntry::Chat(String::new()));
+            // The query is transient and scoped to whatever server bucket it
+            // was typed against — a raw chat/space id from the old bucket
+            // could otherwise collide with an unrelated row on the new one.
+            self.search_input
+                .update(cx, |input, cx| input.set_text("", cx));
+            self.search_active = 0;
         }
         // Capture knob: the add-space palette needs only the device registry.
         if self.debug_dialog.as_deref() == Some("add-space") && !state.read(cx).devices.is_empty() {
@@ -1073,6 +1109,13 @@ impl Shell {
         self.sidebar_tween = Some(WidthTween::new(from, self.sidebar_target()));
         self.schedule_save(cx);
         cx.notify();
+    }
+
+    /// ⌘P (`FocusSearch`): focus the pinned sidebar search field from
+    /// anywhere in chat mode.
+    fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.search_input.focus_handle(cx);
+        window.focus(&handle, cx);
     }
 
     fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
@@ -2129,60 +2172,18 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Keyed rows: (stable key, estimated height, element) — the key + height
-        // list drives the §1.6 resort FLIP diff below (attention-bucket
-        // promotions glide; cleared rows just go).
-        let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, cx);
-
-        // Resort glide (§1.6 View Transitions parity): when the ORDER of a live
-        // list changes (new activity resort, grouping flip), surviving rows
-        // glide from their old y to the new one — layout is already at the new
-        // position; the offset is a paint-only relative inset animated to 0
-        // over 260ms cubic-bezier(0.22,1,0.36,1). New rows fade in; removals
-        // just go (matching the original). First fill and chat switches (which
-        // don't reorder) never animate.
-        let order: Vec<(String, f32)> = keyed.iter().map(|(k, h, _)| (k.clone(), *h)).collect();
-        if self.sidebar_prev_order != order {
-            if !self.sidebar_prev_order.is_empty() {
-                let offsets = resort_offsets(&self.sidebar_prev_order, &order, SIDEBAR_LIST_GAP);
-                let prev_keys: std::collections::HashSet<&str> = self
-                    .sidebar_prev_order
-                    .iter()
-                    .map(|(k, _)| k.as_str())
-                    .collect();
-                let new_keys: std::collections::HashSet<String> = order
-                    .iter()
-                    .filter(|(k, _)| !prev_keys.contains(k.as_str()))
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                if !offsets.is_empty() || !new_keys.is_empty() {
-                    self.resort_epoch += 1;
-                    self.sidebar_resort = offsets;
-                    self.sidebar_new_keys = new_keys;
-                }
-            }
-            self.sidebar_prev_order = order;
-        }
-        let epoch = self.resort_epoch;
-        let list_items: Vec<AnyElement> = keyed
-            .into_iter()
-            .map(|(key, _, element)| {
-                if let Some(dy) = self.sidebar_resort.get(&key).copied() {
-                    let id = SharedString::from(format!("resort-{epoch}-{key}"));
-                    div()
-                        .child(element)
-                        .with_animation(id, RESORT.animation(), move |el, t| {
-                            el.relative().top(px(dy * (1.0 - t)))
-                        })
-                        .into_any_element()
-                } else if self.sidebar_new_keys.contains(&key) {
-                    let id = SharedString::from(format!("row-in-{epoch}-{key}"));
-                    motion::fade_quick(id, div().child(element)).into_any_element()
-                } else {
-                    element
-                }
+        // Search ignores the current scope — it always reads the whole
+        // projected set (`search::filter`'s doc comment). `None` = not
+        // searching; `Some(empty)` = searching with no matches, a DIFFERENT
+        // state from "not searching" that renders differently below.
+        let query = self.search_query(cx).to_string();
+        let results = {
+            let state = self.state.read(cx);
+            search::filter(&query, &state.spaces, &state.chats, &|id| {
+                state.device_name(id).map(str::to_string)
             })
-            .collect();
+        };
+        let searching = results.is_some();
 
         // Overflow edge fades for the lists scroll region — the tab strip's
         // idiom, vertical (offset from the LAST frame; the lag is invisible).
@@ -2197,14 +2198,120 @@ impl Shell {
         let sidebar_fade = theme.surface;
 
         let settings_button = self.render_settings_button(theme, cx);
+        let search_field = self.render_search_field(searching, theme, cx);
 
-        let spaces_section = self.render_spaces_section(window, theme, cx);
+        // Results mode swaps the Spaces + Sessions sections wholesale for the
+        // matching rows (`search::Shell::render_search_results`) — the resort
+        // FLIP bookkeeping below is a live-list concept that doesn't apply to
+        // a filtered snapshot, so it's skipped entirely while searching.
+        let lists_children: Vec<AnyElement> = if let Some(results) = &results {
+            self.render_search_results(results, query.trim(), theme, cx)
+        } else {
+            // Keyed rows: (stable key, estimated height, element) — the key +
+            // height list drives the §1.6 resort FLIP diff below
+            // (attention-bucket promotions glide; cleared rows just go).
+            let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, cx);
+
+            // Resort glide (§1.6 View Transitions parity): when the ORDER of a
+            // live list changes (new activity resort, grouping flip), surviving
+            // rows glide from their old y to the new one — layout is already at
+            // the new position; the offset is a paint-only relative inset
+            // animated to 0 over 260ms cubic-bezier(0.22,1,0.36,1). New rows
+            // fade in; removals just go (matching the original). First fill and
+            // chat switches (which don't reorder) never animate.
+            let order: Vec<(String, f32)> = keyed.iter().map(|(k, h, _)| (k.clone(), *h)).collect();
+            if self.sidebar_prev_order != order {
+                if !self.sidebar_prev_order.is_empty() {
+                    let offsets =
+                        resort_offsets(&self.sidebar_prev_order, &order, SIDEBAR_LIST_GAP);
+                    let prev_keys: std::collections::HashSet<&str> = self
+                        .sidebar_prev_order
+                        .iter()
+                        .map(|(k, _)| k.as_str())
+                        .collect();
+                    let new_keys: std::collections::HashSet<String> = order
+                        .iter()
+                        .filter(|(k, _)| !prev_keys.contains(k.as_str()))
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    if !offsets.is_empty() || !new_keys.is_empty() {
+                        self.resort_epoch += 1;
+                        self.sidebar_resort = offsets;
+                        self.sidebar_new_keys = new_keys;
+                    }
+                }
+                self.sidebar_prev_order = order;
+            }
+            let epoch = self.resort_epoch;
+            let list_items: Vec<AnyElement> = keyed
+                .into_iter()
+                .map(|(key, _, element)| {
+                    if let Some(dy) = self.sidebar_resort.get(&key).copied() {
+                        let id = SharedString::from(format!("resort-{epoch}-{key}"));
+                        div()
+                            .child(element)
+                            .with_animation(id, RESORT.animation(), move |el, t| {
+                                el.relative().top(px(dy * (1.0 - t)))
+                            })
+                            .into_any_element()
+                    } else if self.sidebar_new_keys.contains(&key) {
+                        let id = SharedString::from(format!("row-in-{epoch}-{key}"));
+                        motion::fade_quick(id, div().child(element)).into_any_element()
+                    } else {
+                        element
+                    }
+                })
+                .collect();
+
+            let spaces_section = self.render_spaces_section(window, theme, cx);
+            vec![
+                spaces_section,
+                spaces::section_header(
+                    "Sessions",
+                    false,
+                    theme,
+                    Some(spaces::header_plus(
+                        "new-session",
+                        theme,
+                        cx.listener(|this, _, window, cx| {
+                            this.start_session_from_sidebar(window, cx)
+                        }),
+                    )),
+                )
+                .into_any_element(),
+                if !list_items.is_empty() {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .pb(px(Theme::SPACE_SM))
+                        .children(list_items)
+                        .into_any_element()
+                } else {
+                    div()
+                        .px(px(Theme::SPACE_SM))
+                        .pb(px(Theme::SPACE_SM))
+                        .text_size(px(12.0))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from("No sessions yet"))
+                        .into_any_element()
+                },
+            ]
+        };
 
         div()
             .w(px(self.settings.sidebar_width))
             .h_full()
             .flex()
             .flex_col()
+            .on_key_down(
+                cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| this.search_key(event, cx)),
+            )
+            // The pinned search field: first child of the column, OUTSIDE the
+            // scroll region below, so it never scrolls away. As a result the
+            // `SIDEBAR_GLASS_FADE_BAND` top fade now starts below this block,
+            // not at the column's top edge.
+            .child(search_field)
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
             // Spaces + the global Active list share one scroll region. On
@@ -2227,36 +2334,7 @@ impl Shell {
                             .px(px(Theme::SPACE_SM))
                             .flex()
                             .flex_col()
-                            .child(spaces_section)
-                            .child(spaces::section_header(
-                                "Sessions",
-                                false,
-                                theme,
-                                Some(spaces::header_plus(
-                                    "new-session",
-                                    theme,
-                                    cx.listener(|this, _, window, cx| {
-                                        this.start_session_from_sidebar(window, cx)
-                                    }),
-                                )),
-                            ))
-                            .child(if !list_items.is_empty() {
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.0))
-                                    .pb(px(Theme::SPACE_SM))
-                                    .children(list_items)
-                                    .into_any_element()
-                            } else {
-                                div()
-                                    .px(px(Theme::SPACE_SM))
-                                    .pb(px(Theme::SPACE_SM))
-                                    .text_size(px(12.0))
-                                    .text_color(theme.text_faint)
-                                    .child(SharedString::from("No sessions yet"))
-                                    .into_any_element()
-                            }),
+                            .children(lists_children),
                     )
                     .when(lists_fade_top && !glass, |el| {
                         el.child(div().absolute().top_0().left_0().right_0().h(px(24.0)).bg(
@@ -3610,6 +3688,11 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                if matches!(this.route, Route::Chat) {
+                    this.focus_search(window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleChanges, _, cx| {
                 if matches!(this.route, Route::Chat) {
                     this.toggle_right_pane(cx)
