@@ -834,6 +834,18 @@ impl Shell {
             {
                 state.update(cx, |s, cx| s.select_space(Some(last), cx));
             }
+            // Restore the sidebar scope. A scope naming a space that no longer
+            // exists silently becomes All — `heal_sidebar_scope` would do it on
+            // the next frame anyway, but doing it here avoids one wrong render.
+            if let Some(scoped) = self.settings.sidebar_scope_space.clone() {
+                state.update(cx, |s, _| {
+                    s.sidebar_scope = if s.space_row(&scoped).is_some() {
+                        crate::state::SidebarScope::Space(scoped)
+                    } else {
+                        crate::state::SidebarScope::All
+                    };
+                });
+            }
         }
         // Track the per-space last chat + persist the selected space.
         {

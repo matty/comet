@@ -286,7 +286,23 @@ impl Shell {
                 })
         };
         self.state.update(cx, |s, cx| s.select_chat(target, cx));
+        self.state.update(cx, |s, _| {
+            s.sidebar_scope = crate::state::SidebarScope::Space(space_id.clone());
+        });
+        self.settings.sidebar_scope_space = Some(space_id.clone());
         self.settings.last_space_id = Some(space_id);
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// Widen the sidebar to every space. Deliberately does **not** touch
+    /// `selected_space` or `selected_chat`: changing the scope never changes
+    /// what is open.
+    pub(super) fn activate_all_spaces(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |s, _| {
+            s.sidebar_scope = crate::state::SidebarScope::All;
+        });
+        self.settings.sidebar_scope_space = None;
         self.schedule_save(cx);
         cx.notify();
     }
