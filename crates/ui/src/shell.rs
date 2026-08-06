@@ -550,6 +550,14 @@ pub struct Shell {
     /// `true` for the one frame after the panel opens — the render pass
     /// consumes it to call `window.focus`.
     space_dropdown_focus_pending: bool,
+    /// Outside-click dismissal instant — suppresses the trigger click that
+    /// follows the same mouse-down from instantly reopening the panel
+    /// (`settings::accounts`'s `device_menu_dismissed_at` idiom: the panel's
+    /// `on_mouse_down_out` is a capture-phase mouse-DOWN listener, so a click
+    /// on the trigger itself fires it first, then the trigger's own
+    /// mouse-up `on_click` toggles the (now-closed) state straight back
+    /// open).
+    space_dropdown_dismissed_at: Option<std::time::Instant>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
     /// UpdateStatus stream says WHETHER one exists; this says how far the
     /// download/stage of it has come in this process.
@@ -772,6 +780,7 @@ impl Shell {
             space_dropdown_highlight: None,
             space_dropdown_focus: cx.focus_handle(),
             space_dropdown_focus_pending: false,
+            space_dropdown_dismissed_at: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,

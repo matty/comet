@@ -17,6 +17,14 @@ use gpui::FocusHandle;
 /// plus the 2px column gap.
 const SPACE_ROW_SLOT: f32 = 31.0;
 
+/// Cap on the dropdown panel's space-row region (~8 rows) — every other list
+/// popover in this crate caps and scrolls (`pickers.rs`'s branch/checkout
+/// lists, `composer.rs`'s file-mention popup); without this, a long space
+/// list defeats the whole point of the fixed-height trigger by overflowing
+/// the window (`snap_to_window_with_margin` repositions the panel, it does
+/// not shrink it).
+const PANEL_ROWS_MAX_H: f32 = SPACE_ROW_SLOT * 8.0;
+
 /// Drag-reorder state for the spaces list; `epoch` keys the 150ms slide
 /// animation restarts (the session-tab idiom, vertical).
 pub(super) struct SpaceDragState {
@@ -316,6 +324,48 @@ pub(super) fn panel_items(scope: &SidebarScope, spaces: &[Space]) -> Vec<PanelIt
     items
 }
 
+/// `1` when the panel leads with `All spaces` (Switch — it occupies logical
+/// position 0), `0` in `PickForNewSession` (that item is skipped entirely,
+/// so position 0 is the first space).
+pub(super) fn dropdown_offset(mode: DropdownMode) -> usize {
+    if mode == DropdownMode::Switch { 1 } else { 0 }
+}
+
+/// Positions (within the logical `[All spaces?, space0, space1, ...]` list)
+/// that keyboard nav and clicks may land on — offline spaces are unreachable
+/// in `PickForNewSession` (an unclickable row must not be keyboard-reachable
+/// either). Pure so the off-by-one risk here is actually testable — this
+/// crate has no gpui render-test harness.
+pub(super) fn dropdown_navigable_positions(
+    mode: DropdownMode,
+    spaces: &[Space],
+    offline_devices: &std::collections::HashSet<String>,
+) -> Vec<usize> {
+    let offset = dropdown_offset(mode);
+    let mut positions = Vec::new();
+    if mode == DropdownMode::Switch {
+        positions.push(0);
+    }
+    for (ix, space) in spaces.iter().enumerate() {
+        let host_offline = offline_devices.contains(&space.device_id);
+        if mode == DropdownMode::Switch || !host_offline {
+            positions.push(offset + ix);
+        }
+    }
+    positions
+}
+
+/// Maps a navigable logical position back to a `spaces` index — `None` when
+/// the position is the `All spaces` row (only reachable at position 0, and
+/// only in `Switch` mode).
+pub(super) fn dropdown_position_to_space_index(mode: DropdownMode, pos: usize) -> Option<usize> {
+    if mode == DropdownMode::Switch && pos == 0 {
+        None
+    } else {
+        Some(pos - dropdown_offset(mode))
+    }
+}
+
 #[cfg(test)]
 mod panel_tests {
     use super::*;
@@ -378,6 +428,112 @@ mod panel_tests {
     fn panel_with_no_spaces_still_offers_all_spaces() {
         let items = panel_items(&SidebarScope::All, &[]);
         assert_eq!(items, vec![PanelItem::AllSpaces { active: true }]);
+    }
+
+    fn spaces_with_devices(devices: &[&str]) -> Vec<Space> {
+        devices
+            .iter()
+            .enumerate()
+            .map(|(ix, device)| Space {
+                id: format!("s{ix}"),
+                device_id: (*device).into(),
+                ..test_space(&format!("/{ix}"))
+            })
+            .collect()
+    }
+
+    fn offline(devices: &[&str]) -> std::collections::HashSet<String> {
+        devices.iter().map(|d| d.to_string()).collect()
+    }
+
+    #[test]
+    fn navigable_positions_switch_reserves_slot_zero_for_all_spaces() {
+        let spaces = spaces_with_devices(&["d1", "d2"]);
+        assert_eq!(
+            dropdown_navigable_positions(DropdownMode::Switch, &spaces, &offline(&[])),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn navigable_positions_switch_includes_offline_spaces() {
+        // Switching scope to an offline space is still meaningful (you land
+        // on it and see it's offline) — only the picker excludes them.
+        let spaces = spaces_with_devices(&["d1"]);
+        assert_eq!(
+            dropdown_navigable_positions(DropdownMode::Switch, &spaces, &offline(&["d1"])),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn navigable_positions_switch_empty_spaces_is_just_all_spaces() {
+        assert_eq!(
+            dropdown_navigable_positions(DropdownMode::Switch, &[], &offline(&[])),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn navigable_positions_pick_has_no_all_spaces_slot_and_skips_offline() {
+        let spaces = spaces_with_devices(&["d1", "d2", "d3"]);
+        assert_eq!(
+            dropdown_navigable_positions(
+                DropdownMode::PickForNewSession,
+                &spaces,
+                &offline(&["d2"])
+            ),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn navigable_positions_pick_all_offline_is_empty() {
+        let spaces = spaces_with_devices(&["d1", "d2"]);
+        assert!(
+            dropdown_navigable_positions(
+                DropdownMode::PickForNewSession,
+                &spaces,
+                &offline(&["d1", "d2"])
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn navigable_positions_pick_empty_spaces_is_empty() {
+        assert!(
+            dropdown_navigable_positions(DropdownMode::PickForNewSession, &[], &offline(&[]))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn position_to_space_index_switch_zero_is_all_spaces() {
+        assert_eq!(
+            dropdown_position_to_space_index(DropdownMode::Switch, 0),
+            None
+        );
+        assert_eq!(
+            dropdown_position_to_space_index(DropdownMode::Switch, 1),
+            Some(0)
+        );
+        assert_eq!(
+            dropdown_position_to_space_index(DropdownMode::Switch, 3),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn position_to_space_index_pick_has_no_all_spaces_slot() {
+        assert_eq!(
+            dropdown_position_to_space_index(DropdownMode::PickForNewSession, 0),
+            Some(0)
+        );
+        assert_eq!(
+            dropdown_position_to_space_index(DropdownMode::PickForNewSession, 2),
+            Some(2)
+        );
     }
 }
 
@@ -806,10 +962,20 @@ impl Shell {
             .when(open, |el| el.shadow(crate::theme::glass_selected_shadows()))
             .on_hover(motion::hover_listener("space-scope"))
             .on_click(cx.listener(|this, _, _, cx| {
+                // `on_mouse_down_out` on the panel fires on the mouse-DOWN of
+                // this same click (capture phase) when the panel is open —
+                // it closes the panel first, then this `on_click` (mouse-up)
+                // would otherwise see `None` and reopen it. Suppress that
+                // one reopen (`settings::accounts`'s `device_menu_dismissed_at`).
+                let just_dismissed = this
+                    .space_dropdown_dismissed_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
                 this.space_dropdown_open = match this.space_dropdown_open {
                     Some(_) => None,
+                    None if just_dismissed => None,
                     None => Some(DropdownMode::Switch),
                 };
+                this.space_dropdown_dismissed_at = None;
                 this.space_dropdown_highlight = None;
                 this.space_dropdown_focus_pending = this.space_dropdown_open.is_some();
                 cx.notify();
@@ -891,9 +1057,9 @@ impl Shell {
 
     /// The scope-dropdown panel: `All spaces` (Switch only) + one row per
     /// space + `Add space…` (Switch only). Mounted through
-    /// [`popover::anchored_menu`] — the trigger-anchored deferred/anchored
-    /// route this codebase already uses for exactly this shape of dropdown
-    /// (`settings::accounts`'s device menu).
+    /// [`popover::anchored_menu_below`] — the trigger is a real 28px row (not
+    /// an icon button), so it needs the bottom-pinned variant, not
+    /// `anchored_menu` (which would cover most of the trigger).
     #[allow(clippy::too_many_arguments)]
     fn render_scope_panel(
         &mut self,
@@ -915,7 +1081,7 @@ impl Shell {
         let scope = self.state.read(cx).sidebar_scope.clone();
         let is_pick = mode == DropdownMode::PickForNewSession;
         let items = panel_items(&scope, &ctx.spaces);
-        let navigable = self.dropdown_navigable_positions(mode, ctx);
+        let navigable = dropdown_navigable_positions(mode, &ctx.spaces, &ctx.offline_devices);
         let highlighted_pos = self
             .space_dropdown_highlight
             .and_then(|h| navigable.get(h))
@@ -931,6 +1097,7 @@ impl Shell {
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.space_dropdown_open = None;
                 this.space_dropdown_highlight = None;
+                this.space_dropdown_dismissed_at = Some(std::time::Instant::now());
                 cx.notify();
             }))
             .flex()
@@ -988,7 +1155,7 @@ impl Shell {
         // `AllSpaces` at 0 regardless of mode (so a space at `ctx.spaces[ix]`
         // is always `items[ix + 1]`), while the logical NAVIGATION position
         // space only reserves slot 0 for `AllSpaces` in `Switch` mode.
-        let position_offset = Self::dropdown_offset(mode);
+        let position_offset = dropdown_offset(mode);
         let count = ctx.spaces.len();
         let drag = self
             .space_drag
@@ -1058,9 +1225,12 @@ impl Shell {
         // a one-shot "where does this session go" prompt.
         let rows_container = if mode == DropdownMode::Switch {
             div()
+                .id("space-panel-rows")
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
+                .max_h(px(PANEL_ROWS_MAX_H))
+                .overflow_y_scroll()
                 .on_drag_move::<SpaceDragPayload>(cx.listener(
                     move |this, event: &gpui::DragMoveEvent<SpaceDragPayload>, _, cx| {
                         let from = event.drag(cx).from;
@@ -1082,7 +1252,14 @@ impl Shell {
                 ))
                 .children(space_rows)
         } else {
-            div().flex().flex_col().gap(px(2.0)).children(space_rows)
+            div()
+                .id("space-panel-rows")
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .max_h(px(PANEL_ROWS_MAX_H))
+                .overflow_y_scroll()
+                .children(space_rows)
         };
         card = card.child(rows_container);
 
@@ -1119,37 +1296,14 @@ impl Shell {
                             .truncate()
                             .child(SharedString::from("Add space…")),
                     )
-                    .child(popover::kbd_hint(theme, "⌘K")),
+                    .child(popover::kbd_hint(
+                        theme,
+                        &crate::settings::display_combo("mod-k"),
+                    )),
             );
         }
 
-        popover::anchored_menu("space-scope-panel", card.into_any_element())
-    }
-
-    /// `1` when the panel leads with `All spaces` (Switch — it occupies
-    /// position 0), `0` in `PickForNewSession` (that item is skipped
-    /// entirely, so position 0 is the first space).
-    fn dropdown_offset(mode: DropdownMode) -> usize {
-        if mode == DropdownMode::Switch { 1 } else { 0 }
-    }
-
-    /// Positions (within the logical `[All spaces?, space0, space1, ...]`
-    /// list) that keyboard nav and clicks may land on — offline spaces are
-    /// unreachable in `PickForNewSession` (an unclickable row must not be
-    /// keyboard-reachable either).
-    fn dropdown_navigable_positions(&self, mode: DropdownMode, ctx: &SpacesContext) -> Vec<usize> {
-        let offset = Self::dropdown_offset(mode);
-        let mut positions = Vec::new();
-        if mode == DropdownMode::Switch {
-            positions.push(0);
-        }
-        for (ix, space) in ctx.spaces.iter().enumerate() {
-            let host_offline = ctx.offline_devices.contains(&space.device_id);
-            if mode == DropdownMode::Switch || !host_offline {
-                positions.push(offset + ix);
-            }
-        }
-        positions
+        popover::anchored_menu_below("space-scope-panel", card.into_any_element())
     }
 
     /// Panel keys (bubbling from the focused card): ↑↓ move the highlight
@@ -1172,7 +1326,8 @@ impl Shell {
             }
             popover::MenuKey::Up | popover::MenuKey::Down => {
                 let ctx = self.spaces_context(cx);
-                let navigable = self.dropdown_navigable_positions(mode, &ctx);
+                let navigable =
+                    dropdown_navigable_positions(mode, &ctx.spaces, &ctx.offline_devices);
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
                 self.space_dropdown_highlight =
                     popover::menu_step(self.space_dropdown_highlight, navigable.len(), delta);
@@ -1180,20 +1335,25 @@ impl Shell {
             }
             popover::MenuKey::Enter => {
                 let ctx = self.spaces_context(cx);
-                let navigable = self.dropdown_navigable_positions(mode, &ctx);
+                let navigable =
+                    dropdown_navigable_positions(mode, &ctx.spaces, &ctx.offline_devices);
                 if let Some(pos) = self
                     .space_dropdown_highlight
                     .and_then(|h| navigable.get(h))
                     .copied()
                 {
-                    let offset = Self::dropdown_offset(mode);
-                    if mode == DropdownMode::Switch && pos == 0 {
-                        self.activate_all_spaces(cx);
-                    } else if let Some(space) = ctx.spaces.get(pos - offset) {
-                        let id = space.id.clone();
-                        match mode {
-                            DropdownMode::Switch => self.activate_space(id, cx),
-                            DropdownMode::PickForNewSession => self.create_session_in(id, cx),
+                    match dropdown_position_to_space_index(mode, pos) {
+                        None => self.activate_all_spaces(cx),
+                        Some(ix) => {
+                            if let Some(space) = ctx.spaces.get(ix) {
+                                let id = space.id.clone();
+                                match mode {
+                                    DropdownMode::Switch => self.activate_space(id, cx),
+                                    DropdownMode::PickForNewSession => {
+                                        self.create_session_in(id, cx)
+                                    }
+                                }
+                            }
                         }
                     }
                     self.space_dropdown_open = None;
@@ -1205,10 +1365,9 @@ impl Shell {
         }
     }
 
-    /// One panel space row: [`Self::render_space_row`]'s body minus the
-    /// folder glyph (every row here is already a space) — plus a trailing
-    /// check when `active`, and (`PickForNewSession`) an offline host
-    /// rendered unreachable rather than clickable.
+    /// One panel space row: a folder-less row (every row here is already a
+    /// space) with a trailing check when `active`, and (`PickForNewSession`)
+    /// an offline host rendered unreachable rather than clickable.
     #[allow(clippy::too_many_arguments)]
     fn render_panel_space_row(
         &self,
@@ -1248,23 +1407,40 @@ impl Shell {
             .gap(px(Theme::SPACE_SM))
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
-            .when(highlighted, |el| {
-                el.shadow(crate::theme::card_selected_shadows())
-            });
+            .py(px(6.0));
+
+        // The keyboard cursor: a `card_selected_bg()` wash + full text,
+        // matching `menu_row_nav`'s contract exactly (`popover.rs`) — NOT the
+        // same treatment as `active` (a `glass_selected_shadows()` ring),
+        // else arrowing a non-active row painted the identical ring as
+        // selection, and highlighting the already-active row painted
+        // nothing extra at all. `!active` here mirrors `menu_row_nav`'s own
+        // `!selected && highlighted`: an active row never needs a second
+        // "this one" indicator.
+        let show_highlight = highlighted && !active;
 
         let row = if unreachable {
             // No hover fill, no click — the row stays listed so the picker
-            // shows the whole shape of your setup, just unreachable.
+            // shows the whole shape of your setup, just unreachable. (Never
+            // highlighted in practice: `dropdown_navigable_positions` skips
+            // unreachable rows in `PickForNewSession`.)
             row.opacity(0.45).text_color(rest_text).bg(rest_bg)
         } else {
             let mut row = row
-                .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
-                .bg(motion::hover_blend(
-                    &fade_key,
-                    rest_bg,
-                    if active { rest_bg } else { theme.glass_hover() },
-                ))
+                .text_color(if show_highlight {
+                    theme.text
+                } else {
+                    motion::hover_blend(&fade_key, rest_text, theme.text)
+                })
+                .bg(if show_highlight {
+                    crate::theme::card_selected_bg()
+                } else {
+                    motion::hover_blend(
+                        &fade_key,
+                        rest_bg,
+                        if active { rest_bg } else { theme.glass_hover() },
+                    )
+                })
                 .when(active, |el| {
                     el.shadow(crate::theme::glass_selected_shadows())
                 })
@@ -1384,136 +1560,6 @@ impl Shell {
         }
         self.space_drag = None;
         cx.notify();
-    }
-
-    /// One space row: folder icon + folder name, device name subline.
-    /// `host_offline` marks a remote host whose presence heartbeat lapsed.
-    ///
-    /// Unused since Task 7 replaced the flat per-space row list with the
-    /// scope trigger + dropdown panel (`render_panel_space_row` is its
-    /// panel-row equivalent, adapted from this body). Kept per the task
-    /// brief rather than deleted.
-    #[allow(dead_code)]
-    #[allow(clippy::too_many_arguments)]
-    fn render_space_row(
-        &self,
-        ix: usize,
-        space: Space,
-        device_name: String,
-        host_offline: bool,
-        selected: bool,
-        attention: Option<ChatIndicator>,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let id = space.id.clone();
-        let name: SharedString = space.display_name().to_string().into();
-        let fade_key = format!("space-row-{id}");
-        let rest_bg = if selected {
-            crate::theme::glass_selected_bg()
-        } else {
-            crate::theme::wash(0.0)
-        };
-        let rest_text = if selected {
-            theme.text
-        } else {
-            theme.text.opacity(0.8)
-        };
-        let select_id = id.clone();
-        let menu_id = id.clone();
-        // One line: "name @ device" — the folder name carries the weight, the
-        // device tag rides along slightly muted. Long names truncate; the
-        // device tag stays visible.
-        div()
-            .id(SharedString::from(format!("space-{id}")))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(Theme::SPACE_SM))
-            .rounded(px(8.0))
-            .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
-            .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
-            // Selected rows pin their hover target to the selected fill — see
-            // the chat-row comment in shell.rs (light hover sits below the
-            // near-opaque selected fill; blending toward it dims the row).
-            .bg(motion::hover_blend(
-                &fade_key,
-                rest_bg,
-                if selected {
-                    rest_bg
-                } else {
-                    theme.glass_hover()
-                },
-            ))
-            .when(selected, |el| {
-                el.shadow(crate::theme::glass_selected_shadows())
-            })
-            .on_hover(motion::hover_listener(fade_key))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.activate_space(select_id.clone(), cx);
-            }))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.space_menu = Some((menu_id.clone(), event.position));
-                    cx.notify();
-                }),
-            )
-            .on_drag(
-                SpaceDragPayload {
-                    from: ix,
-                    name: name.clone(),
-                },
-                |payload, _point, _, cx| {
-                    let name = payload.name.clone();
-                    cx.stop_propagation();
-                    cx.new(|_| SpaceGhost { name })
-                },
-            )
-            // Status dot LEADS the row (like session rows) so its position is
-            // stable — appearing/disappearing at the right edge made the row
-            // jitter (user request). Faint at rest, colored under attention.
-            .child(
-                div().size(px(6.0)).rounded_full().flex_none().bg(attention
-                    .map(|status| status_dot_color(status, theme))
-                    .unwrap_or_else(|| crate::theme::ink(0.14))),
-            )
-            .child(
-                icon(icons::FOLDER)
-                    .size(px(16.0))
-                    .flex_none()
-                    .text_color(theme.text_muted),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(13.0))
-                    .line_height(px(17.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(name),
-            )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .flex_none()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(12.0))
-                    .line_height(px(17.0))
-                    .text_color(if host_offline {
-                        theme.warning.opacity(0.8)
-                    } else {
-                        theme.text_muted.opacity(0.6)
-                    })
-                    .child(SharedString::from(if host_offline {
-                        format!("@ {device_name} · offline")
-                    } else {
-                        format!("@ {device_name}")
-                    })),
-            )
     }
 
     /// The global "Sessions" list: every session across all spaces (idle

@@ -226,6 +226,41 @@ pub fn anchored_menu_above(id: impl Into<ElementId>, content: AnyElement) -> Any
     )
 }
 
+/// [`pinned_layer`], but pinned to the trigger's BOTTOM-left corner instead
+/// of its top-left.
+fn pinned_layer_below(layer: AnyElement) -> AnyElement {
+    div()
+        .absolute()
+        .bottom_0()
+        .left_0()
+        .size_0()
+        .child(layer)
+        .into_any_element()
+}
+
+/// [`anchored_menu`], but pinned below the trigger's own BOTTOM edge instead
+/// of overlapping down from its top. `anchored_menu` suits triggers with
+/// negligible visible height (icon buttons — its 6px nudge already clears
+/// them); a trigger with real height (a full row, a header bar) needs this
+/// one instead, or the floating layer covers most of it — which also makes
+/// "click the trigger again to close" physically unreachable.
+pub fn anchored_menu_below(id: impl Into<ElementId>, content: AnyElement) -> AnyElement {
+    let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
+    pinned_layer_below(
+        gpui::deferred(
+            gpui::anchored()
+                .anchor(Anchor::TopLeft)
+                .snap_to_window_with_margin(px(8.0))
+                .child(motion::menu_in(
+                    id,
+                    div().occlude().pt(px(6.0)).child(content),
+                )),
+        )
+        .priority(1)
+        .into_any_element(),
+    )
+}
+
 /// Open an upward menu at a point inside a relative trigger. Useful for text
 /// completions, whose natural anchor is the token/caret rather than the input
 /// element's outer edge.
