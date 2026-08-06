@@ -127,3 +127,7 @@ opt-level = 0
 
 [profile.dev.package."*"]
 opt-level = 2
+# Dependency DWARF dominated target/debug/deps (43 GB of it). Line tables keep
+# file/line in backtraces; only locals and types are lost when stepping into a
+# dependency such as gpui. Workspace crates keep full debug info.
+debug = "line-tables-only"
