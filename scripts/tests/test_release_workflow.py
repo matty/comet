@@ -20,10 +20,13 @@ class ReleaseWorkflowTests(unittest.TestCase):
             RELEASE.read_text(encoding="utf-8"), Loader=yaml.BaseLoader
         )
 
-    def test_only_release_workflow_remains(self):
+    def test_workflow_set_is_pinned(self):
+        # Guards deploy.yml's removal in #4: the set is pinned so a deleted
+        # workflow cannot quietly return. ci.yml is a deliberate addition, so
+        # it joins the expected set rather than the check being relaxed.
         self.assertEqual(
             [path.name for path in sorted(WORKFLOWS.glob("*.yml"))],
-            ["release.yml"],
+            ["ci.yml", "release.yml"],
         )
 
     def test_schedule_and_manual_dispatch_trigger_releases(self):
