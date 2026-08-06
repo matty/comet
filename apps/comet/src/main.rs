@@ -91,7 +91,7 @@ fn initialize_home() -> anyhow::Result<()> {
         unsafe { std::env::remove_var("HOME") };
     }
 
-    if let Some(home) = home_to_initialize(existing_home, home::home_dir)? {
+    if let Some(home) = home_to_initialize(existing_home, std::env::home_dir)? {
         // SAFETY: this runs as the first operation in main, before Comet starts
         // any threads or child processes.
         unsafe { std::env::set_var("HOME", home) };
