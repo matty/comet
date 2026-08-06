@@ -2844,23 +2844,27 @@ impl Shell {
         }
     }
 
+    /// Row metrics track the settings sidebar's Back row
+    /// ([`Shell::render_settings_nav`]): the two rows occupy the same corner and
+    /// swap when settings open, so a taller row or heavier icon here read as a
+    /// jump (user-reported).
     fn render_settings_button(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("sidebar-settings")
             .flex_none()
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
-            .py(px(7.0))
+            .py(px(6.0))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(10.0))
+            .gap(px(6.0))
             .cursor_pointer()
             .hover(|style| style.bg(theme.element_hover))
             .on_click(cx.listener(|this, _, _, cx| this.open_settings(BOTTOM_SETTINGS_SECTION, cx)))
             .child(
                 icon(icons::SETTINGS_MINIMALISTIC)
-                    .size(px(18.0))
+                    .size(px(16.0))
                     .text_color(theme.text_muted),
             )
             .child(
