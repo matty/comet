@@ -76,6 +76,10 @@ icon_assets![
     // terminal/plus/close ports) — the set has no return glyph.
     (RETURN, "return"),
     (ALT_ARROW_DOWN, "alt-arrow-down"),
+    // alt-arrow-down rotated 180° (like the sidebar/arrow-down flips) — gpui
+    // divs have no rotation transform at the pinned rev, so an open-state
+    // chevron is a second asset, not a transform on the first.
+    (ALT_ARROW_UP, "alt-arrow-up"),
     (ALT_ARROW_LEFT, "alt-arrow-left"),
     (ALT_ARROW_RIGHT, "alt-arrow-right"),
     (SMARTPHONE, "smartphone"),

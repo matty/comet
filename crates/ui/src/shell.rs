@@ -43,18 +43,23 @@ use crate::settings::{
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
 use crate::state::{
-    AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, format_time_ago,
+    AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, SidebarScope,
+    format_time_ago,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript};
 
+mod search;
 mod spaces;
 mod tabs;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
-actions!(shell, [ToggleSidebar, ToggleChanges, AddSpacePalette]);
+actions!(
+    shell,
+    [ToggleSidebar, ToggleChanges, AddSpacePalette, FocusSearch]
+);
 
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
@@ -173,6 +178,11 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         KeyBinding::new(
             &valid_or_default(&keymap.toggle_terminal, "mod-j"),
             ToggleTerminal,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.focus_search, "mod-p"),
+            FocusSearch,
             None,
         ),
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
@@ -376,12 +386,62 @@ pub fn resort_offsets(
     offsets
 }
 
-/// Estimated sidebar row height for the resort diff (title line 17px inside
-/// 6px vertical padding + the location subline's 14px line + 2px gap — Active
-/// rows always carry the folder · device subline).
-/// Session row height (FLIP estimate): space line + title + meta line
-/// (harness mark, plus branch for worktrees).
-const CHAT_ROW_HEIGHT: f32 = 61.0;
+/// What line 2 of a session row carries, which is also what decides its height.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RowScope {
+    /// Listing every space: a space line sits above the title.
+    All {
+        space: SharedString,
+        device: SharedString,
+        host_offline: bool,
+    },
+    /// Listing one space: the space line is not rendered.
+    One,
+}
+
+/// Session-row vertical metrics. [`Shell::render_chat_row`] lays out with
+/// exactly these and [`chat_row_height`] sums them, so the predicted height
+/// and the painted one cannot drift apart.
+///
+/// Every line is given an EXPLICIT height. Line 2 (branch + harness mark) used
+/// to take its height from its children and so collapsed to 13 with no branch
+/// and to 0 with neither a branch nor a harness (a chat whose config frame
+/// hasn't landed yet), making a mixed list 60/59/46 px tall against a
+/// `chat_row_height` that always claimed 60 — every resort then glided the
+/// survivors to the wrong y.
+mod chat_row {
+    pub(super) const PY: f32 = 5.0;
+    /// Line 0, `RowScope::All` only: space + device, then the trailing group
+    /// (time-ago, + throbber alongside it while Working) flush right. This is
+    /// the row's TOP line in this scope, so the trailing group lives here —
+    /// the 13px throbber fits inside this 14px line without stretching it.
+    pub(super) const SPACE_LINE: f32 = 14.0;
+    /// Gap under line 0.
+    pub(super) const SPACE_LINE_MB: f32 = 2.0;
+    /// Line 1: title, full width in `RowScope::All` (line 0 above carries the
+    /// trailing group there). In `RowScope::One`, which renders no line 0,
+    /// this IS the row's top line, so it keeps the trailing group instead —
+    /// title + time-ago (+ throbber, alongside the time, while Working). No
+    /// status rail — that was removed.
+    pub(super) const TITLE_LINE: f32 = 18.0;
+    /// Gap above line 2.
+    pub(super) const META_LINE_MT: f32 = 2.0;
+    /// Line 2: branch + harness mark. Fixed regardless of what it carries.
+    pub(super) const META_LINE: f32 = 14.0;
+}
+
+/// Session-row height. Uniform *within* a scope, which is what the §1.6 resort
+/// FLIP diff requires — `resort_offsets` must be fed the same value the render
+/// pass used, or surviving rows glide to the wrong y on a scope switch.
+pub(crate) fn chat_row_height(scope: &RowScope) -> f32 {
+    let body = chat_row::TITLE_LINE + chat_row::META_LINE_MT + chat_row::META_LINE;
+    let lead = match scope {
+        RowScope::All { .. } => chat_row::SPACE_LINE + chat_row::SPACE_LINE_MB,
+        RowScope::One => 0.0,
+    };
+    chat_row::PY + lead + body + chat_row::PY
+}
+
 /// Flex gap between sidebar list items.
 const SIDEBAR_LIST_GAP: f32 = 2.0;
 
@@ -458,6 +518,18 @@ pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
+    /// The pinned sidebar search field ("SidebarSearch" context: navigation
+    /// keys stay unbound so ↑↓/⏎ bubble to the sidebar frame). Search is
+    /// transient — never persisted, never restored on boot.
+    search_input: Entity<ComposerInput>,
+    /// Keyboard highlight into the flat (spaces-then-sessions) results list —
+    /// reset to 0 on every edit ([`search::highlight_target`] maps it to the
+    /// row it actually selects).
+    search_active: usize,
+    /// `true` for the one frame after a search result is opened; the render
+    /// pass consumes it to hand focus back to the composer (the dialogs'
+    /// `focus_pending` idiom — these handlers run without window access).
+    composer_focus_pending: bool,
     /// External file drag hovering the conversation column — shows the
     /// "Drop images to attach" veil over the whole chat area; a drop stages
     /// the files in the composer.
@@ -513,6 +585,36 @@ pub struct Shell {
     sound_prev: std::collections::HashMap<String, comet_proto::SessionStatus>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
+    /// `Some` while the space-scope dropdown panel is open: `Switch` when
+    /// the trigger itself was clicked (picking what the sidebar is scoped
+    /// to), `PickForNewSession` when the Sessions `+` on `All spaces` is
+    /// asking which space a new session should land in
+    /// (`NewSessionTarget::Pick`).
+    space_dropdown_open: Option<DropdownMode>,
+    /// Keyboard highlight within the open panel's NAVIGABLE rows — an index
+    /// into that reachable subsequence, not the raw item list (offline rows
+    /// in `PickForNewSession` are skipped by both mouse and keyboard).
+    space_dropdown_highlight: Option<usize>,
+    /// Puts the open panel on the keyboard dispatch path (`AddSpaceFlow`'s
+    /// `track_focus` idiom) so ↑↓/Enter/Esc reach it instead of whatever was
+    /// focused before it opened.
+    space_dropdown_focus: gpui::FocusHandle,
+    /// `true` for the one frame after the panel opens — the render pass
+    /// consumes it to call `window.focus`.
+    space_dropdown_focus_pending: bool,
+    /// Outside-click dismissal instant — suppresses the trigger click that
+    /// follows the same mouse-down from instantly reopening the panel
+    /// (`settings::accounts`'s `device_menu_dismissed_at` idiom: the panel's
+    /// `on_mouse_down_out` is a capture-phase mouse-DOWN listener, so a click
+    /// on the trigger itself fires it first, then the trigger's own
+    /// mouse-up `on_click` toggles the (now-closed) state straight back
+    /// open).
+    space_dropdown_dismissed_at: Option<std::time::Instant>,
+    /// Scroll position of the dropdown panel's space-row region (capped +
+    /// scrollable since the round-1 height cap). Both the drag-reorder
+    /// math and keyboard scroll-into-view need this — `AddSpaceFlow`'s
+    /// `list_scroll` is the precedent.
+    space_panel_scroll: gpui::ScrollHandle,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
     /// UpdateStatus stream says WHETHER one exists; this says how far the
     /// download/stage of it has come in this process.
@@ -584,6 +686,47 @@ pub struct Shell {
     _ticker: Task<()>,
     _state_observation: Subscription,
     _composer_events: Subscription,
+    _search_events: Subscription,
+}
+
+/// The space-scope dropdown panel's mode (`Shell::space_dropdown_open`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropdownMode {
+    /// Clicking the trigger: pick a scope.
+    Switch,
+    /// Clicking the Sessions `+` on `All spaces`: pick where the new session
+    /// goes.
+    PickForNewSession,
+}
+
+/// Where a sidebar-initiated new session should go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NewSessionTarget {
+    /// Create here, no prompt.
+    Space(String),
+    /// Ask — a session belongs to exactly one space and `All spaces` is not one.
+    Pick(Vec<String>),
+    /// Nowhere to put it yet.
+    AddSpaceFirst,
+}
+
+/// `spaces` is the space ids in display order.
+///
+/// Host reachability is deliberately NOT an input: an offline space is still
+/// a legitimate destination (the picker lists it, dimmed, and
+/// `dropdown_navigable_positions` decides what can be committed there), and
+/// with every host offline the answer is still the picker rather than a
+/// silent no-op. The parameter used to carry an `online` flag that nothing
+/// here read.
+pub(crate) fn new_session_target(scope: &SidebarScope, spaces: &[String]) -> NewSessionTarget {
+    if let Some(id) = scope.space_id() {
+        return NewSessionTarget::Space(id.to_string());
+    }
+    match spaces {
+        [] => NewSessionTarget::AddSpaceFirst,
+        [only] => NewSessionTarget::Space(only.clone()),
+        many => NewSessionTarget::Pick(many.to_vec()),
+    }
 }
 
 impl Shell {
@@ -621,6 +764,23 @@ impl Shell {
                 if alive.is_err() {
                     break;
                 }
+            }
+        });
+        // "SidebarSearch" context: navigation keys stay unbound so ↑↓/⏎ bubble
+        // to the sidebar frame instead of moving the caret — same reason the
+        // add-space palette uses its own context.
+        let search_input = cx.new(|cx| ComposerInput::with_context("Search", "SidebarSearch", cx));
+        let search_events = cx.subscribe(&search_input, |this: &mut Shell, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Edited) {
+                this.search_active = 0;
+                // Results mode swaps out `render_spaces_section` wholesale, so
+                // the first character typed UNMOUNTS the scope trigger and its
+                // panel. An unmounted panel cannot close itself; leaving the
+                // flag set reopens it — mode and all — the moment the query is
+                // cleared. Closing at the gate covers every way text can arrive
+                // (⌘P then typing, paste, an IME commit).
+                this.close_space_dropdown();
+                cx.notify();
             }
         });
         let data_dir = boot.data_dir.clone();
@@ -666,6 +826,9 @@ impl Shell {
             state,
             transcript,
             composer,
+            search_input,
+            search_active: 0,
+            composer_focus_pending: false,
             file_drag_active: false,
             terminal: None,
             changes: None,
@@ -695,6 +858,12 @@ impl Shell {
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             sidebar_notice: None,
+            space_dropdown_open: None,
+            space_dropdown_highlight: None,
+            space_dropdown_focus: cx.focus_handle(),
+            space_dropdown_focus_pending: false,
+            space_dropdown_dismissed_at: None,
+            space_panel_scroll: gpui::ScrollHandle::new(),
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
@@ -729,6 +898,7 @@ impl Shell {
             _ticker: ticker,
             _state_observation: observation,
             _composer_events: composer_events,
+            _search_events: search_events,
         }
     }
 
@@ -754,6 +924,12 @@ impl Shell {
             self.panels = SessionPanels::default();
             self.active_chat.clear();
             self.nav = NavHistory::new(NavEntry::Chat(String::new()));
+            // The query is transient and scoped to whatever server bucket it
+            // was typed against — a raw chat/space id from the old bucket
+            // could otherwise collide with an unrelated row on the new one.
+            self.search_input
+                .update(cx, |input, cx| input.set_text("", cx));
+            self.search_active = 0;
         }
         // Capture knob: the add-space palette needs only the device registry.
         if self.debug_dialog.as_deref() == Some("add-space") && !state.read(cx).devices.is_empty() {
@@ -833,6 +1009,32 @@ impl Shell {
                 && state.read(cx).space_row(&last).is_some()
             {
                 state.update(cx, |s, cx| s.select_space(Some(last), cx));
+            }
+            // Restore the sidebar scope. A scope naming a space that no longer
+            // exists silently becomes All — `heal_sidebar_scope` would do it on
+            // the next frame anyway, but doing it here avoids one wrong render.
+            if let Some(scoped) = self.settings.sidebar_scope_space.clone() {
+                state.update(cx, |s, _| {
+                    s.sidebar_scope = if s.space_row(&scoped).is_some() {
+                        crate::state::SidebarScope::Space(scoped)
+                    } else {
+                        crate::state::SidebarScope::All
+                    };
+                });
+            }
+        }
+        // The persisted scope mirrors the live one. `activate_space` and
+        // `activate_all_spaces` write it on the way in, but `heal_sidebar_scope`
+        // resets the scope behind their backs whenever the projection drops the
+        // scoped space (deleted elsewhere, or a server switch replacing
+        // `spaces` wholesale) — without this the healed-away scope came back
+        // on the next launch. Gated on the boot restore having run, or this
+        // would erase the stored scope before it is applied.
+        if self.space_boot_applied {
+            let live = state.read(cx).sidebar_scope.space_id().map(str::to_string);
+            if live != self.settings.sidebar_scope_space {
+                self.settings.sidebar_scope_space = live;
+                self.schedule_save(cx);
             }
         }
         // Track the per-space last chat + persist the selected space.
@@ -968,6 +1170,110 @@ impl Shell {
         self.sidebar_tween = Some(WidthTween::new(from, self.sidebar_target()));
         self.schedule_save(cx);
         cx.notify();
+    }
+
+    /// Roll the sidebar open if it is collapsed, on the same [`WidthTween`]
+    /// path [`Self::toggle_sidebar`] uses. Anything that focuses or reveals
+    /// something *inside* the column has to call this first: a collapsed
+    /// sidebar is still MOUNTED (`pane_container` clips a full-width child
+    /// inside `w(0) + overflow_hidden`), so focus lands on a typable but
+    /// invisible field and silently steals keystrokes from the composer.
+    fn reveal_sidebar(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.sidebar_collapsed {
+            return;
+        }
+        let from = self.sidebar_target();
+        self.settings.sidebar_collapsed = false;
+        self.sidebar_tween = Some(WidthTween::new(from, self.sidebar_target()));
+        self.schedule_save(cx);
+    }
+
+    /// Transient, sidebar-local UI that must not survive the column being
+    /// re-rendered from scratch: the scope dropdown's open flag/highlight.
+    ///
+    /// The panel is a CHILD of the scope trigger, so anything that stops
+    /// rendering `render_spaces_section` (entering search-results mode,
+    /// leaving the Chat route) unmounts it — and an unmounted panel can never
+    /// run its own `on_mouse_down_out`/Escape teardown. Left set, the flag
+    /// reopens the panel the moment the section comes back, in whatever mode
+    /// it was in ("New session in…" included).
+    fn close_space_dropdown(&mut self) {
+        self.space_dropdown_open = None;
+        self.space_dropdown_highlight = None;
+        self.space_dropdown_focus_pending = false;
+    }
+
+    /// The single funnel for route changes. A route swap replaces the whole
+    /// sidebar column (Settings renders `render_settings_nav` instead of
+    /// `render_chat_sidebar`), so it takes both pieces of transient sidebar
+    /// state with it: a stuck dropdown flag, and a stale query that would
+    /// otherwise still be filtering the list on the way back from Settings.
+    fn set_route(&mut self, route: Route, cx: &mut Context<Self>) {
+        if self.route == route {
+            return;
+        }
+        self.route = route;
+        self.close_space_dropdown();
+        if !self.search_query(cx).is_empty() {
+            self.clear_search(cx);
+        }
+    }
+
+    /// ⌘P (`FocusSearch`): focus the pinned sidebar search field from
+    /// anywhere in chat mode.
+    ///
+    /// Rolls the sidebar open first — the field is otherwise focused while
+    /// clipped to zero width. Closes the scope dropdown too: this is a bare
+    /// `window.focus` with no mouse-down anywhere, so the panel's
+    /// `on_mouse_down_out` never fires, and typing one character would then
+    /// unmount the panel (search-results mode) with the flag still set.
+    fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reveal_sidebar(cx);
+        self.close_space_dropdown();
+        let handle = self.search_input.focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// Escape clears the sidebar query from OUTSIDE the sidebar. The full
+    /// ↑↓/⏎/esc handler ([`Self::search_key`]) is mounted on the sidebar
+    /// column and only sees keys dispatched through it, so once focus moves
+    /// away (clicking the transcript hands it to the composer via
+    /// `on_focus_lost`) the clear button was the only way out.
+    ///
+    /// Deliberately narrow: Escape only, never ↑↓/⏎ — those belong to whatever
+    /// is focused (Enter in the composer sends). It also stands down while a
+    /// shell dialog, menu, or palette is up, since Escape is theirs; the inner
+    /// handler having already cleared the query makes this a no-op on the
+    /// bubble up from the field itself.
+    fn search_escape_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        if !matches!(self.route, Route::Chat) || self.overlay_open() {
+            return;
+        }
+        if self.search_query(cx).is_empty() {
+            return;
+        }
+        let key = popover::classify_key(
+            event.keystroke.key.as_str(),
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+        );
+        if key == popover::MenuKey::Escape {
+            self.clear_search(cx);
+        }
+    }
+
+    /// Is a shell-owned dialog, context menu, or palette on screen? Escape
+    /// belongs to it, not to the sidebar query.
+    fn overlay_open(&self) -> bool {
+        self.chat_menu.is_some()
+            || self.rename_dialog.is_some()
+            || self.delete_confirm.is_some()
+            || self.space_menu.is_some()
+            || self.rename_space_dialog.is_some()
+            || self.delete_space_confirm.is_some()
+            || self.add_space.is_some()
+            || self.space_dropdown_open.is_some()
     }
 
     fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
@@ -1136,14 +1442,14 @@ impl Shell {
     // ---- routes / settings ----
 
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
-        self.route = Route::Settings(section);
+        self.set_route(Route::Settings(section), cx);
         self.nav.push(NavEntry::Settings(section));
         self.chat_menu = None;
         cx.notify();
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
-        self.route = Route::Chat;
+        self.set_route(Route::Chat, cx);
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
         cx.notify();
     }
@@ -1168,14 +1474,14 @@ impl Shell {
     fn apply_nav(&mut self, entry: NavEntry, cx: &mut Context<Self>) {
         match entry {
             NavEntry::Chat(chat_id) => {
-                self.route = Route::Chat;
+                self.set_route(Route::Chat, cx);
                 let target = (!chat_id.is_empty()).then_some(chat_id);
                 if self.state.read(cx).selected_chat_id() != target.as_deref() {
                     self.state.update(cx, |s, cx| s.select_chat(target, cx));
                 }
             }
             NavEntry::Settings(section) => {
-                self.route = Route::Settings(section);
+                self.set_route(Route::Settings(section), cx);
             }
         }
         self.chat_menu = None;
@@ -1609,11 +1915,11 @@ impl Shell {
         None
     }
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let inner: AnyElement = match self.route {
             Route::Settings(section) => self.render_settings_nav(section, &theme, cx),
-            Route::Chat => self.render_chat_sidebar(&theme, cx),
+            Route::Chat => self.render_chat_sidebar(window, &theme, cx),
         };
         let target = self.sidebar_target();
         // Transparent — the sidebar sits directly on the frost shell; the main
@@ -1733,54 +2039,96 @@ impl Shell {
             .into_any_element()
     }
 
-    /// One session row (comet session-row.tsx): status rail on the left
-    /// (a live 2×3 mini spinner while working, a dot otherwise), title +
-    /// relative time on the first line, "folder · device" underneath aligned
-    /// to the title. Click selects; right-click opens the context menu.
+    /// One session row (comet session-row.tsx): the row's TOP line carries
+    /// the trailing time-ago (+ throbber while Working), flush right — line 0
+    /// ("folder · space @ device") in `RowScope::All`, or line 1 (the title
+    /// line) in `RowScope::One`, which renders no line 0 to attach to. The
+    /// title line is otherwise title-only. Right-click always opens the
+    /// context menu; `on_click` decides what a plain click does (the normal
+    /// list selects the chat in place, sidebar search additionally clears the
+    /// query — see `search::Shell::render_search_chat_row`).
+    ///
+    /// `highlight_query`, when `Some`, tints the first case-insensitive hit in
+    /// each of the space/title/branch lines (`search::styled_line`) — `None`
+    /// for the normal list, which never tints anything. `keyboard_highlighted`
+    /// is the search results' arrow-key cursor: a DIFFERENT visual from
+    /// `selected` (the open chat) that can coincide with it, so both get their
+    /// own `when`. This is the single row every session list in the sidebar
+    /// draws through — an earlier revision had sidebar search build its own
+    /// copy for tinting and it silently diverged (missing spinner, hover
+    /// brighten, selected shadow, context menu) within a day.
     #[allow(clippy::too_many_arguments)]
     fn render_chat_row(
         &self,
         id: String,
         title: SharedString,
         time_ago: SharedString,
-        space_name: SharedString,
+        scope: RowScope,
         branch: Option<SharedString>,
         harness: Option<comet_proto::HarnessId>,
         status: comet_proto::ChatIndicator,
         selected: bool,
+        highlight_query: Option<&str>,
+        keyboard_highlighted: bool,
+        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Status is a rail, not a word (comet session-row.tsx): always present
-        // so rows align and state changes read in place. Working animates (the
-        // composer-strip spinner, miniaturized); every other status is a dot.
-        let dot_color = spaces::status_dot_color(status, theme);
-        let status_rail: AnyElement = if status == comet_proto::ChatIndicator::Working {
-            div()
-                .w(px(6.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(loaders::mini_gradient_spinner(
-                    format!("chat-working-{id}"),
-                    2.0,
-                    cx.entity_id(),
-                    cx,
-                ))
-                .into_any_element()
-        } else {
-            div()
-                .size(px(6.0))
-                .rounded_full()
-                .flex_none()
-                .bg(dot_color)
-                .into_any_element()
-        };
+        // No per-row status mark (user decision, 2026-08-06 revision): the
+        // leading dot that used to carry Awaiting-input/Errored/Completed-
+        // unseen is gone and NOT replaced — those three statuses now read
+        // identically to Idle in the row. Working is the one exception: it
+        // still animates, alongside (not instead of) the time-ago on the
+        // row's TOP line rather than a dedicated rail (see `trailing_group`
+        // below).
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
         let subline = theme.text_muted.opacity(0.5);
-        let select_id = id.clone();
+        let time_tint = theme.text_muted.opacity(0.45);
+        let working = status == comet_proto::ChatIndicator::Working;
+        // The trailing group — time-ago, plus the throbber while Working —
+        // sits on the row's TOP line: line 0 (`RowScope::All`) or line 1
+        // (`RowScope::One`, which has no line 0). Built once, up front, and
+        // attached to whichever line owns it below, so its `line_height`
+        // matches that line without duplicating the throbber/spinner
+        // wiring. `gradient_spinner`'s 2×3 `mini_gradient_spinner` grid
+        // can't be square, so this is the 3×3 `gradient_spinner` instead,
+        // sized 13×13 to match the harness mark on line 2.
+        let trailing_line_height = match &scope {
+            RowScope::All { .. } => chat_row::SPACE_LINE,
+            RowScope::One => chat_row::TITLE_LINE,
+        };
+        let trailing_group = div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(11.0))
+                    .line_height(px(trailing_line_height))
+                    .text_color(time_tint)
+                    .child(time_ago),
+            )
+            .when(working, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(loaders::gradient_spinner(
+                            "chat-working",
+                            theme,
+                            3.25,
+                            cx.entity_id(),
+                            cx,
+                        )),
+                )
+            })
+            .into_any_element();
         let menu_id = comet_proto::ServerRef::new(
             self.state
                 .read(cx)
@@ -1792,36 +2140,45 @@ impl Shell {
         // Hover fades over transition-colors (comet session-row.tsx) — both
         // the wash and the title brighten ride the same 150ms blend.
         let fade_key = format!("chat-row-{id}");
-        let rest_bg = if selected {
+        // `selected` (the open chat) and `keyboard_highlighted` (the search
+        // results' arrow-key cursor) are different states that can coincide;
+        // both get the same wash — a merely-selected row must not visually
+        // outrank the keyboard cursor, or arrowing onto the already-open chat
+        // reads as "less highlighted" than any other row (round-1 review).
+        // Only the SHADOW differs: highlighted draws the inset accent ring,
+        // selected (when not also highlighted) keeps the drop-seat shadow.
+        let lit = selected || keyboard_highlighted;
+        let rest_bg = if lit {
             selected_wash
         } else {
             crate::theme::wash(0.0)
         };
-        // A selected row must NOT drift toward the hover wash: in dark the two
+        // A lit row must NOT drift toward the hover wash: in dark the two
         // fills are identical so the blend is a no-op, but light's hover sits
         // below its near-opaque selected fill, and blending toward it visibly
         // dimmed the active row under the pointer (user report).
-        let hover_bg = if selected { selected_wash } else { hover };
-        let rest_text = if selected { text } else { text.opacity(0.8) };
+        let hover_bg = if lit { selected_wash } else { hover };
+        let rest_text = if lit { text } else { text.opacity(0.8) };
+        let title_color = motion::hover_blend(&fade_key, rest_text, text);
+        let sans = gpui::font(theme.font_sans.clone());
         div()
             .id(SharedString::from(format!("chat-{id}")))
             .flex()
             .flex_col()
-            .gap(px(2.0))
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
-            .text_color(motion::hover_blend(&fade_key, rest_text, text))
+            .py(px(chat_row::PY))
+            .text_color(title_color)
             .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
-            .when(selected, |el| {
+            .when(keyboard_highlighted, |el| {
+                el.shadow(search::highlight_ring(theme))
+            })
+            .when(!keyboard_highlighted && selected, |el| {
                 el.shadow(crate::theme::glass_selected_shadows())
             })
             .on_hover(motion::hover_listener(fade_key))
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let id = select_id.clone();
-                this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
-            }))
+            .on_click(cx.listener(move |this, _, _, cx| on_click(this, cx)))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -1829,65 +2186,144 @@ impl Shell {
                     cx.notify();
                 }),
             )
-            // Line 1: status rail, space name, time-ago.
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(Theme::SPACE_SM))
-                    .child(status_rail)
+            // Line 0 (all-spaces only) and line 1 (title): built together
+            // because the trailing group (time-ago + throbber) attaches to
+            // whichever of the two is the row's TOP line. `RowScope::All`
+            // renders both, with the trailing group flush right on line 0
+            // after `@ device`; `RowScope::One` renders no line 0, so the
+            // trailing group stays on line 1, next to the title, exactly as
+            // it did before line 0 grew one.
+            .map(|el| match scope {
+                RowScope::All {
+                    space,
+                    device,
+                    host_offline,
+                } => el
+                    // Line 0: space + device, then the trailing group flush
+                    // right. Starts flush at the row's own padding edge, same
+                    // as lines 1/2 (no leading dot to clear anymore).
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(11.0))
-                            .line_height(px(14.0))
-                            .text_color(subline)
-                            .child(space_name),
-                    )
-                    .child(
-                        div()
+                            .w_full()
                             .flex_none()
+                            .h(px(chat_row::SPACE_LINE))
+                            .mb(px(chat_row::SPACE_LINE_MB))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
                             .text_size(px(11.0))
-                            .text_color(subline)
-                            .child(time_ago),
+                            .line_height(px(chat_row::SPACE_LINE))
+                            .child(
+                                icon(icons::FOLDER)
+                                    .size(px(11.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted.opacity(0.5)),
+                            )
+                            .child(div().min_w_0().truncate().child(search::styled_line(
+                                &space,
+                                highlight_query,
+                                theme.text_muted.opacity(0.75),
+                                theme.accent,
+                                sans.clone(),
+                            )))
+                            // The device never truncates: which machine a
+                            // session runs on cannot be inferred anywhere else.
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(if host_offline {
+                                        theme.warning.opacity(0.8)
+                                    } else {
+                                        theme.text_muted.opacity(0.5)
+                                    })
+                                    .child(SharedString::from(if host_offline {
+                                        format!("@ {device} · offline")
+                                    } else {
+                                        format!("@ {device}")
+                                    })),
+                            )
+                            .child(div().flex_1())
+                            .child(trailing_group),
+                    )
+                    // Line 1: title only, full width — the trailing group
+                    // moved to line 0 above.
+                    .child(
+                        div()
+                            .w_full()
+                            .flex_none()
+                            .h(px(chat_row::TITLE_LINE))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(13.0))
+                                    .line_height(px(chat_row::TITLE_LINE))
+                                    .child(search::styled_line(
+                                        &title,
+                                        highlight_query,
+                                        title_color,
+                                        theme.accent,
+                                        sans.clone(),
+                                    )),
+                            ),
                     ),
-            )
-            // Line 2: the session title, aligned under the folder icon
-            // (rail 6 + gap 8).
+                // Line 1 (no line 0 in this scope): title, then the trailing
+                // group, exactly where it has always been here.
+                RowScope::One => el.child(
+                    div()
+                        .w_full()
+                        .flex_none()
+                        .h(px(chat_row::TITLE_LINE))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(Theme::SPACE_SM))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(13.0))
+                                .line_height(px(chat_row::TITLE_LINE))
+                                .child(search::styled_line(
+                                    &title,
+                                    highlight_query,
+                                    title_color,
+                                    theme.accent,
+                                    sans.clone(),
+                                )),
+                        )
+                        .child(trailing_group),
+                ),
+            })
+            // Line 2: branch on the left, agent mark pinned right. The mark is
+            // flex_none so a long branch truncates into it and the right
+            // column never breaks.
+            //
+            // The EXPLICIT height is load-bearing, not cosmetic: this line has
+            // no text node of its own, so without it the row is 14/13/0 px
+            // shorter depending on whether it carries a branch, only a harness
+            // mark, or neither (a chat whose config frame hasn't landed) —
+            // three different row heights against one `chat_row_height`, and
+            // the resort FLIP glides every survivor to the wrong y.
             .child(
                 div()
                     .w_full()
-                    .pl(px(14.0))
-                    .truncate()
-                    .text_size(px(13.0))
-                    .line_height(px(17.0))
-                    .child(title),
-            )
-            // Line 3 (always): harness brand mark; worktree sessions append
-            // the branch icon + name.
-            .child(
-                div()
-                    .w_full()
-                    .pl(px(14.0))
+                    .flex_none()
+                    .h(px(chat_row::META_LINE))
+                    .mt(px(chat_row::META_LINE_MT))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(4.0))
-                    .when_some(
-                        harness.map(crate::pickers::harness_brand_icon),
-                        |el, (path, tint)| {
-                            el.child(
-                                icon(path)
-                                    .size(px(11.0))
-                                    .flex_none()
-                                    .text_color(tint.unwrap_or(subline).opacity(0.8)),
-                            )
-                        },
-                    )
+                    .text_size(px(11.0))
+                    .line_height(px(chat_row::META_LINE))
+                    .text_color(subline)
                     .when_some(branch, |el, branch| {
                         el.child(
                             icon(icons::GIT_BRANCH)
@@ -1895,16 +2331,26 @@ impl Shell {
                                 .flex_none()
                                 .text_color(subline),
                         )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(11.0))
-                                .line_height(px(14.0))
-                                .text_color(subline)
-                                .child(branch),
-                        )
-                    }),
+                        .child(div().min_w_0().truncate().child(search::styled_line(
+                            &branch,
+                            highlight_query,
+                            subline,
+                            theme.accent,
+                            sans.clone(),
+                        )))
+                    })
+                    .child(div().flex_1().min_w(px(8.0)))
+                    .when_some(
+                        harness.map(crate::pickers::harness_brand_icon),
+                        |el, (path, tint)| {
+                            el.child(
+                                icon(path)
+                                    .size(px(13.0))
+                                    .flex_none()
+                                    .text_color(tint.unwrap_or(theme.text_muted.opacity(0.75))),
+                            )
+                        },
+                    ),
             )
             .into_any_element()
     }
@@ -1917,64 +2363,94 @@ impl Shell {
         (scrolled > 1.0, scrolled < max_scroll - 1.0)
     }
 
+    /// The Sessions-header `+`. Scoped: straight to the new-session canvas for
+    /// that space — the same thing the tab-strip `+` does. All spaces: ask
+    /// which space first, unless there is only one.
+    pub(super) fn start_session_from_sidebar(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (scope, spaces) = {
+            let state = self.state.read(cx);
+            let spaces: Vec<String> = state.spaces.iter().map(|s| s.id.clone()).collect();
+            (state.sidebar_scope.clone(), spaces)
+        };
+        match new_session_target(&scope, &spaces) {
+            NewSessionTarget::Space(id) => {
+                self.set_route(Route::Chat, cx);
+                self.state.update(cx, |s, cx| {
+                    // Mirrors `activate_space`: `select_chat(None)` alone
+                    // deliberately leaves `selected_space` untouched (a scope
+                    // switch must not move what's open), so without this the
+                    // canvas — and a submitted session's device — can stay on
+                    // whatever space was previously selected, not the one the
+                    // sidebar is scoped to.
+                    //
+                    // `sidebar_scope` is deliberately NOT written here, for the
+                    // same reason [`Self::create_session_in`] (the picker's
+                    // commit) doesn't: starting a session somewhere is not a
+                    // request to re-scope the column, and the spec's action
+                    // table doesn't list the `+` as scope-changing. It used to
+                    // be written, which made the `+` on `All spaces` narrow the
+                    // sidebar with exactly one space and not with two (the two
+                    // arms disagreed), and the narrowing then evaporated on
+                    // restart because it bypassed `settings.sidebar_scope_space`.
+                    s.select_space(Some(id), cx);
+                    s.select_chat(None, cx);
+                });
+                cx.notify();
+            }
+            NewSessionTarget::Pick(_) => {
+                self.space_dropdown_open = Some(DropdownMode::PickForNewSession);
+                self.space_dropdown_highlight = None;
+                self.space_dropdown_focus_pending = true;
+                cx.notify();
+            }
+            NewSessionTarget::AddSpaceFirst => self.open_add_space(cx),
+        }
+    }
+
+    /// The picker's commit path. Deliberately does not touch `sidebar_scope`:
+    /// starting a session somewhere is not a request to re-scope the column.
+    /// [`Self::start_session_from_sidebar`]'s no-prompt arm agrees — the two
+    /// are the same action reached two ways and must land identically.
+    fn create_session_in(&mut self, space_id: String, cx: &mut Context<Self>) {
+        self.set_route(Route::Chat, cx);
+        self.state.update(cx, |s, cx| {
+            s.select_space(Some(space_id), cx);
+            s.select_chat(None, cx);
+        });
+        self.close_space_dropdown();
+        cx.notify();
+    }
+
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
-    fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        // Keyed rows: (stable key, estimated height, element) — the key + height
-        // list drives the §1.6 resort FLIP diff below (attention-bucket
-        // promotions glide; cleared rows just go).
-        let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, cx);
-
-        // Resort glide (§1.6 View Transitions parity): when the ORDER of a live
-        // list changes (new activity resort, grouping flip), surviving rows
-        // glide from their old y to the new one — layout is already at the new
-        // position; the offset is a paint-only relative inset animated to 0
-        // over 260ms cubic-bezier(0.22,1,0.36,1). New rows fade in; removals
-        // just go (matching the original). First fill and chat switches (which
-        // don't reorder) never animate.
-        let order: Vec<(String, f32)> = keyed.iter().map(|(k, h, _)| (k.clone(), *h)).collect();
-        if self.sidebar_prev_order != order {
-            if !self.sidebar_prev_order.is_empty() {
-                let offsets = resort_offsets(&self.sidebar_prev_order, &order, SIDEBAR_LIST_GAP);
-                let prev_keys: std::collections::HashSet<&str> = self
-                    .sidebar_prev_order
-                    .iter()
-                    .map(|(k, _)| k.as_str())
-                    .collect();
-                let new_keys: std::collections::HashSet<String> = order
-                    .iter()
-                    .filter(|(k, _)| !prev_keys.contains(k.as_str()))
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                if !offsets.is_empty() || !new_keys.is_empty() {
-                    self.resort_epoch += 1;
-                    self.sidebar_resort = offsets;
-                    self.sidebar_new_keys = new_keys;
-                }
-            }
-            self.sidebar_prev_order = order;
-        }
-        let epoch = self.resort_epoch;
-        let list_items: Vec<AnyElement> = keyed
-            .into_iter()
-            .map(|(key, _, element)| {
-                if let Some(dy) = self.sidebar_resort.get(&key).copied() {
-                    let id = SharedString::from(format!("resort-{epoch}-{key}"));
-                    div()
-                        .child(element)
-                        .with_animation(id, RESORT.animation(), move |el, t| {
-                            el.relative().top(px(dy * (1.0 - t)))
-                        })
-                        .into_any_element()
-                } else if self.sidebar_new_keys.contains(&key) {
-                    let id = SharedString::from(format!("row-in-{epoch}-{key}"));
-                    motion::fade_quick(id, div().child(element)).into_any_element()
-                } else {
-                    element
-                }
+    fn render_chat_sidebar(
+        &mut self,
+        window: &mut Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Search ignores the current scope — it always reads the whole
+        // projected set (`search::filter`'s doc comment). `None` = not
+        // searching; `Some(empty)` = searching with no matches, a DIFFERENT
+        // state from "not searching" that renders differently below.
+        let query = self.search_query(cx).to_string();
+        // The FIELD's own chrome keys off the raw (untrimmed) text — NOT
+        // `results.is_some()`. `filter` trims, so a whitespace-only query is
+        // `None` results; keying the clear-button/hint-chip swap off that
+        // left a dead end where a lone space showed the ⌘P hint (implying
+        // nothing to clear) yet visibly sat in the field (round-1 review).
+        let has_text = !query.is_empty();
+        let results = {
+            let state = self.state.read(cx);
+            search::filter(&query, &state.spaces, &state.chats, &|id| {
+                state.device_name(id).map(str::to_string)
             })
-            .collect();
+        };
 
         // Overflow edge fades for the lists scroll region — the tab strip's
         // idiom, vertical (offset from the LAST frame; the lag is invisible).
@@ -1982,21 +2458,162 @@ impl Shell {
         // Opaque platforms melt overflow into the surface tone with painted
         // gradient overlays. Over GLASS no overlay can work — the backdrop is
         // see-through blur, so tone stacks into a smudge and black reads as a
-        // shadow (user reports). Instead the ROWS fade themselves: prepaint-
-        // measured bounds drive per-row opacity toward the viewport edges
-        // ([`Shell::sidebar_row_alpha`]), dissolving the edge to pure glass.
+        // shadow (user reports). Instead the whole scroll region paints inside
+        // a [`crate::edge_fade::edge_faded`] scope: a per-primitive gradient at
+        // the active overflow edges, so text dissolves per glyph into pure
+        // glass.
         let glass = theme.is_glass();
         let sidebar_fade = theme.surface;
 
         let settings_button = self.render_settings_button(theme, cx);
+        let search_field = self.render_search_field(has_text, theme, cx);
 
-        let spaces_section = self.render_spaces_section(theme, cx);
+        // Results mode swaps the Spaces + Sessions sections wholesale for the
+        // matching rows (`search::Shell::render_search_results`) — the resort
+        // FLIP bookkeeping below is a live-list concept that doesn't apply to
+        // a filtered snapshot, so it's skipped entirely while searching.
+        let lists_children: Vec<AnyElement> = if let Some(results) = &results {
+            self.render_search_results(results, query.trim(), theme, cx)
+        } else {
+            // Keyed rows: (stable key, estimated height, element) — the key +
+            // height list drives the §1.6 resort FLIP diff below
+            // (attention-bucket promotions glide; cleared rows just go).
+            let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, cx);
+
+            // Resort glide (§1.6 View Transitions parity): when the ORDER of a
+            // live list changes (new activity resort, grouping flip), surviving
+            // rows glide from their old y to the new one — layout is already at
+            // the new position; the offset is a paint-only relative inset
+            // animated to 0 over 260ms cubic-bezier(0.22,1,0.36,1). New rows
+            // fade in; removals just go (matching the original). First fill and
+            // chat switches (which don't reorder) never animate.
+            let order: Vec<(String, f32)> = keyed.iter().map(|(k, h, _)| (k.clone(), *h)).collect();
+            if self.sidebar_prev_order != order {
+                if !self.sidebar_prev_order.is_empty() {
+                    let offsets =
+                        resort_offsets(&self.sidebar_prev_order, &order, SIDEBAR_LIST_GAP);
+                    let prev_keys: std::collections::HashSet<&str> = self
+                        .sidebar_prev_order
+                        .iter()
+                        .map(|(k, _)| k.as_str())
+                        .collect();
+                    let new_keys: std::collections::HashSet<String> = order
+                        .iter()
+                        .filter(|(k, _)| !prev_keys.contains(k.as_str()))
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    if !offsets.is_empty() || !new_keys.is_empty() {
+                        self.resort_epoch += 1;
+                        self.sidebar_resort = offsets;
+                        self.sidebar_new_keys = new_keys;
+                    }
+                }
+                self.sidebar_prev_order = order;
+            }
+            let epoch = self.resort_epoch;
+            let list_items: Vec<AnyElement> = keyed
+                .into_iter()
+                .map(|(key, _, element)| {
+                    if let Some(dy) = self.sidebar_resort.get(&key).copied() {
+                        let id = SharedString::from(format!("resort-{epoch}-{key}"));
+                        div()
+                            .child(element)
+                            .with_animation(id, RESORT.animation(), move |el, t| {
+                                el.relative().top(px(dy * (1.0 - t)))
+                            })
+                            .into_any_element()
+                    } else if self.sidebar_new_keys.contains(&key) {
+                        let id = SharedString::from(format!("row-in-{epoch}-{key}"));
+                        motion::fade_quick(id, div().child(element)).into_any_element()
+                    } else {
+                        element
+                    }
+                })
+                .collect();
+
+            let spaces_section = self.render_spaces_section(window, theme, cx);
+            vec![
+                spaces_section,
+                spaces::section_header(
+                    "Sessions",
+                    false,
+                    theme,
+                    Some(spaces::header_plus(
+                        "new-session",
+                        theme,
+                        cx.listener(|this, _, window, cx| {
+                            this.start_session_from_sidebar(window, cx)
+                        }),
+                    )),
+                )
+                .into_any_element(),
+                if !list_items.is_empty() {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(SIDEBAR_LIST_GAP))
+                        .pb(px(Theme::SPACE_SM))
+                        .children(list_items)
+                        .into_any_element()
+                } else {
+                    // Scope-aware empty state: names the scoped space when
+                    // there is one, and its action fires the same handler as
+                    // the Sessions `+` (§6).
+                    let scoped_space_name = {
+                        let state = self.state.read(cx);
+                        state.sidebar_scope.space_id().map(|id| {
+                            state
+                                .spaces
+                                .iter()
+                                .find(|s| s.id == id)
+                                .map(|s| s.display_name().to_string())
+                                .unwrap_or_else(|| id.to_string())
+                        })
+                    };
+                    div()
+                        .px(px(Theme::SPACE_SM))
+                        .pb(px(Theme::SPACE_SM))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(match scoped_space_name {
+                                    Some(name) => format!("Nothing running in {name} yet."),
+                                    None => "No sessions on any space yet.".to_string(),
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("empty-start-session")
+                                .text_size(px(12.0))
+                                .text_color(theme.accent)
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.start_session_from_sidebar(window, cx)
+                                }))
+                                .child(SharedString::from("Start a session →")),
+                        )
+                        .into_any_element()
+                },
+            ]
+        };
 
         div()
             .w(px(self.settings.sidebar_width))
             .h_full()
             .flex()
             .flex_col()
+            .on_key_down(
+                cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| this.search_key(event, cx)),
+            )
+            // The pinned search field: first child of the column, OUTSIDE the
+            // scroll region below, so it never scrolls away. As a result the
+            // `SIDEBAR_GLASS_FADE_BAND` top fade now starts below this block,
+            // not at the column's top edge.
+            .child(search_field)
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
             // Spaces + the global Active list share one scroll region. On
@@ -2019,34 +2636,7 @@ impl Shell {
                             .px(px(Theme::SPACE_SM))
                             .flex()
                             .flex_col()
-                            .child(spaces_section)
-                            .child(
-                                div()
-                                    .px(px(Theme::SPACE_SM))
-                                    .pt(px(12.0))
-                                    .pb(px(4.0))
-                                    .text_size(px(11.0))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from("Sessions")),
-                            )
-                            .child(if !list_items.is_empty() {
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.0))
-                                    .pb(px(Theme::SPACE_SM))
-                                    .children(list_items)
-                                    .into_any_element()
-                            } else {
-                                div()
-                                    .px(px(Theme::SPACE_SM))
-                                    .pb(px(Theme::SPACE_SM))
-                                    .text_size(px(12.0))
-                                    .text_color(theme.text_faint)
-                                    .child(SharedString::from("No sessions yet"))
-                                    .into_any_element()
-                            }),
+                            .children(lists_children),
                     )
                     .when(lists_fade_top && !glass, |el| {
                         el.child(div().absolute().top_0().left_0().right_0().h(px(24.0)).bg(
@@ -2260,7 +2850,7 @@ impl Shell {
             .flex_none()
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
-            .py(px(Theme::SPACE_SM))
+            .py(px(7.0))
             .flex()
             .flex_row()
             .items_center()
@@ -3376,6 +3966,14 @@ impl Render for Shell {
         {
             window.focus(&self.composer.focus_handle(cx), cx);
         }
+        // Opening a search result hands focus back to the composer, matching
+        // what selecting a session anywhere else leaves you with — otherwise
+        // focus stays in the search field and the first thing typed at the
+        // session you just opened goes to search instead. Deferred to here
+        // because those handlers have no `window`.
+        if std::mem::take(&mut self.composer_focus_pending) && matches!(self.route, Route::Chat) {
+            window.focus(&self.composer.focus_handle(cx), cx);
+        }
 
         let root = div()
             .id("shell-root")
@@ -3387,6 +3985,12 @@ impl Render for Shell {
             .text_color(text)
             .font_family(font)
             .text_size(px(14.0))
+            // Escape clears the sidebar query from anywhere — the column's own
+            // `search_key` only sees keys dispatched through the sidebar, and
+            // focus leaves it as soon as you click the transcript.
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                this.search_escape_key(event, cx)
+            }))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
             .on_drag_move(cx.listener(Self::on_terminal_drag))
@@ -3400,6 +4004,11 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                if matches!(this.route, Route::Chat) {
+                    this.focus_search(window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleChanges, _, cx| {
                 if matches!(this.route, Route::Chat) {
                     this.toggle_right_pane(cx)
@@ -3447,7 +4056,7 @@ impl Render for Shell {
                     t.set_rail_enabled(rail::rail_visible(main_width), cx)
                 });
 
-                let sidebar = self.render_sidebar(cx);
+                let sidebar = self.render_sidebar(window, cx);
                 let sidebar_handle = self.resize_handle(
                     "sidebar-resize",
                     || SidebarResize,
@@ -3608,6 +4217,81 @@ impl Render for Shell {
 mod tests {
     use super::*;
 
+    fn space_ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    #[test]
+    fn new_session_target_picks_the_scoped_space() {
+        assert_eq!(
+            new_session_target(&SidebarScope::Space("s2".into()), &space_ids(&["s1", "s2"])),
+            NewSessionTarget::Space("s2".into()),
+            "a scoped sidebar already answers the question the picker would ask"
+        );
+    }
+
+    #[test]
+    fn new_session_target_ignores_a_scope_the_space_list_no_longer_contains() {
+        // `heal_sidebar_scope` normally clears this, but the two are read from
+        // the same frame: the scope wins, and the space id it names is used
+        // verbatim rather than falling through to the picker.
+        assert_eq!(
+            new_session_target(
+                &SidebarScope::Space("gone".into()),
+                &space_ids(&["s1", "s2"])
+            ),
+            NewSessionTarget::Space("gone".into())
+        );
+    }
+
+    #[test]
+    fn new_session_target_routes_to_add_space_when_there_are_none() {
+        assert_eq!(
+            new_session_target(&SidebarScope::All, &[]),
+            NewSessionTarget::AddSpaceFirst,
+            "a disabled button helps nobody — send them to the thing they need"
+        );
+    }
+
+    #[test]
+    fn new_session_target_skips_a_one_item_picker() {
+        assert_eq!(
+            new_session_target(&SidebarScope::All, &space_ids(&["s1"])),
+            NewSessionTarget::Space("s1".into()),
+            "a menu with one entry is a click for nothing"
+        );
+    }
+
+    #[test]
+    fn new_session_target_prompts_across_all_spaces_in_display_order() {
+        assert_eq!(
+            new_session_target(&SidebarScope::All, &space_ids(&["s3", "s1", "s2"])),
+            NewSessionTarget::Pick(vec!["s3".into(), "s1".into(), "s2".into()]),
+            "the picker offers every space, in the order the sidebar shows them"
+        );
+    }
+
+    /// §1.6's FLIP precondition: a session row is a UNIFORM height within a
+    /// scope, and `chat_row_height` reports exactly what `render_chat_row`
+    /// lays out. Both now read the same `chat_row` metrics, so a row that
+    /// carries no branch and no harness mark (config frame not landed) can no
+    /// longer come out 14px short of what `resort_offsets` was told.
+    #[test]
+    fn chat_row_height_is_the_sum_of_the_metrics_the_row_is_built_from() {
+        let all = RowScope::All {
+            space: "comet".into(),
+            device: "mac-studio".into(),
+            host_offline: false,
+        };
+        assert_eq!(chat_row_height(&all), 60.0);
+        assert_eq!(chat_row_height(&RowScope::One), 44.0);
+        assert_eq!(
+            chat_row_height(&all) - chat_row_height(&RowScope::One),
+            chat_row::SPACE_LINE + chat_row::SPACE_LINE_MB,
+            "the only difference between the scopes is line 0"
+        );
+    }
+
     #[test]
     fn windows_caption_clearance_is_platform_and_fullscreen_aware() {
         assert_eq!(windows_caption_clearance(true, false), 46.0 * 3.0);
@@ -3735,6 +4419,56 @@ mod tests {
 
     fn keys(list: &[(&str, f32)]) -> Vec<(String, f32)> {
         list.iter().map(|(k, h)| (k.to_string(), *h)).collect()
+    }
+
+    fn all_scope() -> RowScope {
+        RowScope::All {
+            space: "comet".into(),
+            device: "mac-studio".into(),
+            host_offline: false,
+        }
+    }
+
+    #[test]
+    fn chat_row_height_adds_exactly_the_space_line() {
+        // Two lines inside one space: py5 + title 18 + mt2 + branch 14 + py5.
+        assert_eq!(chat_row_height(&RowScope::One), 44.0);
+        // The all-spaces form is the same row plus the 14px space line and its
+        // 2px margin — nothing else may differ, or the two scopes have drifted
+        // apart and the row is no longer one design.
+        assert_eq!(
+            chat_row_height(&all_scope()) - chat_row_height(&RowScope::One),
+            16.0
+        );
+        // The device text does not change the height; it truncates instead.
+        assert_eq!(
+            chat_row_height(&RowScope::All {
+                space: "a-very-long-space-name-indeed".into(),
+                device: "a-very-long-device-name".into(),
+                host_offline: true,
+            }),
+            chat_row_height(&all_scope())
+        );
+    }
+
+    /// The spec's highest-risk item: `CHAT_ROW_HEIGHT` stops being a constant, and
+    /// `resort_offsets` must be fed the same heights the render pass used. If a
+    /// caller ever passes a stale height, surviving rows glide to the wrong y.
+    #[test]
+    fn resort_offsets_track_the_scope_height_change() {
+        // Same three rows, same order, but the scope narrowed: every row shrank
+        // 60 -> 44, so each one after the first has genuinely moved up.
+        let wide = keys(&[("a", 60.0), ("b", 60.0), ("c", 60.0)]);
+        let narrow = keys(&[("a", 44.0), ("b", 44.0), ("c", 44.0)]);
+        let offsets = resort_offsets(&wide, &narrow, SIDEBAR_LIST_GAP);
+
+        assert!(!offsets.contains_key("a"), "the first row does not move");
+        assert_eq!(offsets.get("b").copied(), Some(16.0));
+        assert_eq!(offsets.get("c").copied(), Some(32.0));
+
+        // And feeding it the OLD height for the new pass produces no offsets at
+        // all — the silent-wrong-glide failure mode, asserted so it stays visible.
+        assert!(resort_offsets(&wide, &wide, SIDEBAR_LIST_GAP).is_empty());
     }
 
     #[test]

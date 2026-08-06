@@ -60,6 +60,11 @@ pub struct UiSettings {
     /// are skipped; new spaces append in creation order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
+    /// Sidebar session scope (device-local). `None` = All spaces, the default;
+    /// `Some(id)` = scoped to that space. Healed to `None` on load when the
+    /// space no longer exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_scope_space: Option<String>,
     /// Session notification chimes (done / awaiting-input). `COMET_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
@@ -86,6 +91,7 @@ impl Default for UiSettings {
             last_space_id: None,
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
+            sidebar_scope_space: None,
             sound_enabled: true,
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
@@ -107,13 +113,15 @@ pub enum ShortcutId {
     ToggleSidebar,
     ToggleChanges,
     ToggleTerminal,
+    FocusSearch,
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 3] = [
+    pub const ALL: [ShortcutId; 4] = [
         ShortcutId::ToggleSidebar,
         ShortcutId::ToggleChanges,
         ShortcutId::ToggleTerminal,
+        ShortcutId::FocusSearch,
     ];
 
     /// Row label (comet lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
@@ -122,6 +130,7 @@ impl ShortcutId {
             ShortcutId::ToggleSidebar => "Toggle left sidebar",
             ShortcutId::ToggleChanges => "Toggle right sidebar",
             ShortcutId::ToggleTerminal => "Toggle terminal",
+            ShortcutId::FocusSearch => "Focus sidebar search",
         }
     }
 
@@ -130,6 +139,7 @@ impl ShortcutId {
             ShortcutId::ToggleSidebar => "mod-s",
             ShortcutId::ToggleChanges => "mod-b",
             ShortcutId::ToggleTerminal => "mod-j",
+            ShortcutId::FocusSearch => "mod-p",
         }
     }
 }
@@ -142,6 +152,7 @@ pub struct KeymapConfig {
     pub toggle_sidebar: String,
     pub toggle_changes: String,
     pub toggle_terminal: String,
+    pub focus_search: String,
 }
 
 impl Default for KeymapConfig {
@@ -150,6 +161,7 @@ impl Default for KeymapConfig {
             toggle_sidebar: ShortcutId::ToggleSidebar.default_combo().into(),
             toggle_changes: ShortcutId::ToggleChanges.default_combo().into(),
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
+            focus_search: ShortcutId::FocusSearch.default_combo().into(),
         }
     }
 }
@@ -160,6 +172,7 @@ impl KeymapConfig {
             ShortcutId::ToggleSidebar => &self.toggle_sidebar,
             ShortcutId::ToggleChanges => &self.toggle_changes,
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
+            ShortcutId::FocusSearch => &self.focus_search,
         }
     }
 
@@ -168,6 +181,7 @@ impl KeymapConfig {
             ShortcutId::ToggleSidebar => self.toggle_sidebar = combo,
             ShortcutId::ToggleChanges => self.toggle_changes = combo,
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
+            ShortcutId::FocusSearch => self.focus_search = combo,
         }
     }
 
@@ -342,6 +356,7 @@ mod tests {
                 vec!["b".to_string(), "a".to_string()],
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
+            sidebar_scope_space: Some("space-1".to_string()),
             sound_enabled: false,
             right_pane_width: 700.0,
             right_pane_open: true,
@@ -372,6 +387,30 @@ mod tests {
         assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");
+    }
+
+    #[test]
+    fn sidebar_scope_defaults_to_all_and_survives_old_files() {
+        // A settings file written before this field existed.
+        let legacy = r#"{"sidebarWidth":256,"sidebarCollapsed":false}"#;
+        let loaded: UiSettings = serde_json::from_str(legacy).expect("legacy file still parses");
+        assert_eq!(
+            loaded.sidebar_scope_space, None,
+            "absent field means All spaces"
+        );
+
+        let scoped = UiSettings {
+            sidebar_scope_space: Some("space-1".into()),
+            ..UiSettings::default()
+        };
+        let json = serde_json::to_string(&scoped).unwrap();
+        assert!(json.contains("sidebarScopeSpace"));
+        let round: UiSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(round.sidebar_scope_space, Some("space-1".into()));
+
+        // All spaces writes nothing.
+        let json = serde_json::to_string(&UiSettings::default()).unwrap();
+        assert!(!json.contains("sidebarScopeSpace"));
     }
 
     #[test]
