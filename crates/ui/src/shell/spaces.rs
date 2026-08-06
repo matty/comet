@@ -98,23 +98,125 @@ mod federation_projection_tests {
         assert!(groups[2].spaces.is_empty());
     }
 
+    fn test_device(id: &str) -> Device {
+        Device {
+            id: id.into(),
+            name: id.into(),
+            platform: "macos".into(),
+            last_seen_at: None,
+            created_at: None,
+            version: None,
+        }
+    }
+
     #[test]
-    fn grouped_chat_context_targets_preserve_the_owning_server() {
-        let local = ServerId::new("local");
-        let remote = ServerId::new("remote");
+    fn browse_targets_span_every_online_server() {
+        let mut local = server("local", RemoteConnectionState::Online, &[]);
+        local.devices = vec![test_device("d1")];
+        let mut remote = server("remote", RemoteConnectionState::Online, &[]);
+        remote.devices = vec![test_device("d2"), test_device("d3")];
+        let servers = std::collections::HashMap::from([
+            (local.id.clone(), local),
+            (remote.id.clone(), remote),
+        ]);
+        let order = vec![ServerId::new("local"), ServerId::new("remote")];
 
-        let local_target = grouped_chat_context_target(&local, "same-chat");
-        let remote_target = grouped_chat_context_target(&remote, "same-chat");
+        let groups = project_sidebar_servers(&servers, &order);
+        let targets = browse_targets(&groups);
 
         assert_eq!(
-            local_target,
-            comet_proto::ServerRef::new(local, "same-chat")
+            targets
+                .iter()
+                .map(|t| (t.server_id.clone(), t.device.id.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ServerId::new("local"), "d1".to_string()),
+                (ServerId::new("remote"), "d2".to_string()),
+                (ServerId::new("remote"), "d3".to_string()),
+            ]
         );
+    }
+
+    #[test]
+    fn browse_targets_exclude_offline_servers() {
+        let mut offline = server("nuc", RemoteConnectionState::Offline, &[]);
+        offline.devices = vec![test_device("d1")];
+        let servers = std::collections::HashMap::from([(offline.id.clone(), offline)]);
+        let order = vec![ServerId::new("nuc")];
+
+        let groups = project_sidebar_servers(&servers, &order);
+
+        assert!(browse_targets(&groups).is_empty());
+    }
+
+    #[test]
+    fn browse_targets_include_a_server_with_zero_spaces() {
+        // THE REGRESSION THIS TASK EXISTS FOR: a freshly paired remote with
+        // no spaces must still be offered, or it can never receive its
+        // first one.
+        let mut remote = server("nuc", RemoteConnectionState::Online, &[]);
+        remote.devices = vec![test_device("d1")];
+        let servers = std::collections::HashMap::from([(remote.id.clone(), remote)]);
+        let order = vec![ServerId::new("nuc")];
+
+        let groups = project_sidebar_servers(&servers, &order);
+        let targets = browse_targets(&groups);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].device.id, "d1");
+    }
+
+    #[test]
+    fn default_browse_target_prefers_the_local_device() {
+        let targets = vec![
+            BrowseTarget {
+                server_id: ServerId::new("a"),
+                server_name: "A".into(),
+                device: test_device("d1"),
+            },
+            BrowseTarget {
+                server_id: ServerId::new("b"),
+                server_name: "B".into(),
+                device: test_device("d2"),
+            },
+        ];
+
+        let picked = default_browse_target(&targets, Some("d2")).expect("a target");
+        assert_eq!(picked.device.id, "d2");
+        assert_eq!(picked.server_id, ServerId::new("b"));
+    }
+
+    #[test]
+    fn default_browse_target_falls_back_to_the_first() {
+        let targets = vec![
+            BrowseTarget {
+                server_id: ServerId::new("a"),
+                server_name: "A".into(),
+                device: test_device("d1"),
+            },
+            BrowseTarget {
+                server_id: ServerId::new("b"),
+                server_name: "B".into(),
+                device: test_device("d2"),
+            },
+        ];
+
+        // No local id at all.
         assert_eq!(
-            remote_target,
-            comet_proto::ServerRef::new(remote, "same-chat")
+            default_browse_target(&targets, None).map(|t| t.device.id),
+            Some("d1".to_string())
         );
-        assert_ne!(local_target, remote_target);
+        // A local id that names a device not present in the list.
+        assert_eq!(
+            default_browse_target(&targets, Some("unknown")).map(|t| t.device.id),
+            Some("d1".to_string())
+        );
+    }
+
+    #[test]
+    fn default_browse_target_is_none_when_nothing_is_online() {
+        assert!(default_browse_target(&[], None).is_none());
+        assert!(default_browse_target(&[], Some("d1")).is_none());
     }
 
     /// Wraps a single `ServerState` in a `SidebarServerGroup` via the real
@@ -171,11 +273,54 @@ struct SidebarServerGroup {
     chats: Vec<comet_proto::Chat>,
 }
 
-fn grouped_chat_context_target(
-    server_id: &comet_proto::ServerId,
-    chat_id: &str,
-) -> comet_proto::ServerRef {
-    comet_proto::ServerRef::new(server_id.clone(), chat_id)
+/// A machine the add-space palette can browse: the device plus the server
+/// that owns it. The server is what every RPC in that flow must be
+/// addressed to — the active server is NOT necessarily the one being
+/// browsed (Task 8b).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct BrowseTarget {
+    pub server_id: comet_proto::ServerId,
+    pub server_name: String,
+    pub device: Device,
+}
+
+/// Every device of every ONLINE server, in server order then device order —
+/// the machines a space can actually be created on. Offline servers are
+/// excluded entirely: `project_sidebar_servers` does not clear their raw
+/// `server.devices`, so this filters on connection state itself rather than
+/// trusting an empty list; an RPC to an offline server cannot succeed
+/// anyway. Private, not `pub(super)`: `SidebarServerGroup` is a private
+/// struct (this module), so a more-visible signature is E0446 — same
+/// reasoning as `panel_grouped_items`, below.
+fn browse_targets(groups: &[SidebarServerGroup]) -> Vec<BrowseTarget> {
+    groups
+        .iter()
+        .filter(|group| group.server.connection == comet_proto::RemoteConnectionState::Online)
+        .flat_map(|group| {
+            let server_id = group.server.id.clone();
+            let server_name = group.server.name.clone();
+            group.server.devices.iter().map(move |device| BrowseTarget {
+                server_id: server_id.clone(),
+                server_name: server_name.clone(),
+                device: device.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Where the rail opens: this installation's own device when it is present
+/// among the ONLINE targets, else the first target. `None` only when there
+/// are no online machines at all — a freshly paired remote with zero spaces
+/// still counts (Task 8b, the whole point of this task).
+pub(super) fn default_browse_target(
+    targets: &[BrowseTarget],
+    local_device_id: Option<&str>,
+) -> Option<BrowseTarget> {
+    targets
+        .iter()
+        .find(|target| local_device_id.is_some_and(|id| target.device.id == id))
+        .or_else(|| targets.first())
+        .cloned()
 }
 
 fn project_sidebar_servers(
@@ -260,8 +405,10 @@ impl Render for SpaceGhost {
 /// kbd-hint footer. One surface — picking a device in the rail rebrowses in
 /// place, no step wizard.
 pub(super) struct AddSpaceFlow {
-    /// The device currently browsed (the highlighted rail row).
-    device: Option<Device>,
+    /// The machine currently browsed (the highlighted rail row) — a device
+    /// AND its owning server, since the rail spans every online server, not
+    /// only the active one (Task 8b).
+    device: Option<BrowseTarget>,
     /// Filter input; Enter descends into the highlighted folder.
     search: Entity<ComposerInput>,
     browser: Loadable<FolderListing>,
@@ -2004,14 +2151,16 @@ impl Shell {
     // ---- add-space flow (the ⌘K palette) ----
 
     pub(super) fn open_add_space(&mut self, cx: &mut Context<Self>) {
-        let devices: Vec<Device> = self.state.read(cx).devices.clone();
-        let local = self.state.read(cx).local_device_id.clone();
-        // Land on this device's tab (else the first registered device).
-        let device = devices
-            .iter()
-            .find(|d| local.as_deref() == Some(d.id.as_str()))
-            .or_else(|| devices.first())
-            .cloned();
+        let (targets, local) = {
+            let state = self.state.read(cx);
+            let groups = project_sidebar_servers(&state.servers, &state.server_order);
+            (browse_targets(&groups), state.local_device_id.clone())
+        };
+        // Land on this installation's own device (else the first online
+        // target) — `browse_targets` spans every ONLINE server, so a
+        // freshly paired remote with zero spaces is reachable here even
+        // though it has no space row of its own yet (Task 8b).
+        let device = default_browse_target(&targets, local.as_deref());
         // "PaletteSearch" context: navigation keys stay unbound so ↑↓/←/→/⏎
         // bubble to the palette frame (`add_space_key`) instead of moving the
         // text caret — Enter and ⌘Enter are both handled there.
@@ -2049,15 +2198,21 @@ impl Shell {
         cx.notify();
     }
 
-    /// Devices-rail click: rebrowse the same palette on another device.
-    fn add_space_pick_device(&mut self, device: Device, cx: &mut Context<Self>) {
+    /// Devices-rail click: rebrowse the same palette on another machine
+    /// (device + owning server) — the rail spans every online server, not
+    /// only the active one (Task 8b).
+    fn add_space_pick_target(&mut self, target: BrowseTarget, cx: &mut Context<Self>) {
         let Some(flow) = self.add_space.as_mut() else {
             return;
         };
-        if flow.device.as_ref().is_some_and(|d| d.id == device.id) {
+        if flow
+            .device
+            .as_ref()
+            .is_some_and(|d| d.server_id == target.server_id && d.device.id == target.device.id)
+        {
             return;
         }
-        flow.device = Some(device);
+        flow.device = Some(target);
         flow.browser = Loadable::Idle;
         flow.browser_path = None;
         flow.home = None;
@@ -2121,9 +2276,18 @@ impl Shell {
         self.load_space_folders(Some(full), cx);
     }
 
-    /// ListFolders on the flow's device (relay-forwarded when remote).
+    /// ListFolders on the flow's target device (relay-forwarded when
+    /// remote) — resolved via `client_for` against the TARGET's owning
+    /// server, which may not be the active one (Task 8b).
     pub(super) fn load_space_folders(&mut self, path: Option<String>, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).selected_client() else {
+        let Some(target) = self.add_space.as_ref().and_then(|f| f.device.clone()) else {
+            return;
+        };
+        let Some(engine) = self
+            .state
+            .read(cx)
+            .client_for(&comet_proto::ServerRef::new(target.server_id, ""))
+        else {
             return;
         };
         let Some(flow) = self.add_space.as_mut() else {
@@ -2167,18 +2331,17 @@ impl Shell {
         }));
     }
 
-    /// Create the space for the browser's current folder.
+    /// Create the space for the browser's current folder, on the TARGET's
+    /// owning server — never just the active one, which may differ (Task
+    /// 8b: the palette must reach any online machine).
     fn submit_add_space(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).selected_client() else {
-            return;
-        };
         let Some(flow) = self.add_space.as_ref() else {
             return;
         };
         if flow.submit_busy {
             return;
         }
-        let Some(device) = flow.device.clone() else {
+        let Some(target) = flow.device.clone() else {
             return;
         };
         let Some(listing) = flow.browser.ready() else {
@@ -2186,19 +2349,44 @@ impl Shell {
         };
         let path = listing.path.clone();
         let git_detected = flow.browser_repo;
-        // Same (device, folder) already has a space → just switch to it. The
-        // engine dedupes this case too (a createSpace for a duplicate pair
-        // no-ops), so creating would leave the minted id dangling.
-        if let Some(existing) = self
+        let server_id = target.server_id.clone();
+        let device = target.device.clone();
+        let Some(engine) = self
             .state
             .read(cx)
-            .spaces
-            .iter()
-            .find(|s| s.device_id == device.id && s.path == path)
-            .map(|s| s.id.clone())
-        {
+            .client_for(&comet_proto::ServerRef::new(server_id.clone(), ""))
+        else {
+            return;
+        };
+        // Same (device, folder) already has a space on the TARGET server →
+        // just switch to it. The engine dedupes this case too (a
+        // createSpace for a duplicate pair no-ops), so creating would leave
+        // the minted id dangling. Scanning `state.spaces` (the ACTIVE
+        // server's projection) would miss a duplicate on a remote — scan
+        // the owning server's own group instead
+        // (`project_sidebar_servers` resolves every configured server's
+        // real space list, active or not).
+        let existing = {
+            let state = self.state.read(cx);
+            let groups = project_sidebar_servers(&state.servers, &state.server_order);
+            groups
+                .iter()
+                .find(|g| g.server.id == server_id)
+                .and_then(|g| {
+                    g.spaces
+                        .iter()
+                        .find(|s| s.device_id == device.id && s.path == path)
+                        .map(|s| s.id.clone())
+                })
+        };
+        if let Some(existing) = existing {
             self.add_space = None;
-            self.activate_space(existing, cx);
+            // Route through the switch-then-activate sequence
+            // (`pick_panel_space`), not a bare `activate_space`: handing a
+            // foreign-server id to `activate_space` while a different
+            // server is active leaves `sidebar_scope` pointing at a row
+            // that doesn't exist (Task 8's review, M1).
+            self.pick_panel_space(server_id, existing, DropdownMode::Switch, cx);
             return;
         }
         let Some(flow) = self.add_space.as_mut() else {
@@ -2207,8 +2395,17 @@ impl Shell {
         flow.submit_busy = true;
         flow.error = None;
         let space_id = uuid::Uuid::new_v4().to_string();
-        // Optimistic echo: the watch frame carrying the real row replaces it
-        // by id (apply_spaces re-sorts; same-id upsert is idempotent).
+        // Optimistic echo: the next watch frame for this server
+        // (`FederationEvent::ServerChanged`) replaces its ENTIRE space list
+        // wholesale (`apply_federation`, state.rs), so this row is
+        // transient by construction — it lives only until that real
+        // snapshot lands, same-id or not. Lands in the TARGET server's own
+        // bucket — mutating `state.servers` directly (a public field) — so
+        // a non-active remote's grouped-panel entry appears immediately
+        // too; also mirrored into `state.spaces` when the target IS the
+        // active server, matching the instant-appears behaviour the
+        // single-server case already had (that projection is only
+        // re-derived when the active server actually changes).
         let space = Space {
             id: space_id.clone(),
             device_id: device.id.clone(),
@@ -2220,8 +2417,14 @@ impl Shell {
             created_at: Utc::now(),
         };
         self.state.update(cx, |s, cx| {
-            if !s.spaces.iter().any(|existing| existing.id == space.id) {
-                s.spaces.push(space);
+            let is_active = s.selected_server_id() == Some(&server_id);
+            if let Some(server) = s.servers.get_mut(&server_id)
+                && !server.spaces.iter().any(|existing| existing.id == space.id)
+            {
+                server.spaces.push(space.clone());
+            }
+            if is_active && !s.spaces.iter().any(|existing| existing.id == space.id) {
+                s.spaces.push(space.clone());
             }
             cx.notify();
         });
@@ -2233,17 +2436,27 @@ impl Shell {
             "gitDetected": git_detected,
         });
         let submit_id = space_id.clone();
+        let target_server = server_id.clone();
         let task = cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::MUTATE, params).await;
             this.update(cx, |shell, cx| {
                 match result {
                     Ok(_) => {
                         shell.add_space = None;
-                        shell.activate_space(submit_id.clone(), cx);
+                        shell.pick_panel_space(
+                            target_server.clone(),
+                            submit_id.clone(),
+                            DropdownMode::Switch,
+                            cx,
+                        );
                     }
                     Err(err) => {
-                        // Roll the optimistic row back; surface the error inline.
+                        // Roll the optimistic row back in both places;
+                        // surface the error inline.
                         shell.state.update(cx, |s, cx| {
+                            if let Some(server) = s.servers.get_mut(&target_server) {
+                                server.spaces.retain(|space| space.id != submit_id);
+                            }
                             s.spaces.retain(|space| space.id != submit_id);
                             cx.notify();
                         });
@@ -2356,7 +2569,7 @@ impl Shell {
             }
         }
         let (
-            device,
+            target,
             search,
             error,
             submit_busy,
@@ -2383,23 +2596,41 @@ impl Shell {
                 flow.home.clone(),
             )
         };
-        let devices = self.state.read(cx).devices.clone();
+        // The rail spans every device of every ONLINE server, not just the
+        // active one (Task 8b) — `targets` replaces the old
+        // `state.devices` (active-server-only) source.
+        let (targets, multi_server, local_device_id): (Vec<BrowseTarget>, bool, Option<String>) = {
+            let state = self.state.read(cx);
+            let groups = project_sidebar_servers(&state.servers, &state.server_order);
+            let online_servers = groups
+                .iter()
+                .filter(|g| g.server.connection == comet_proto::RemoteConnectionState::Online)
+                .count();
+            (
+                browse_targets(&groups),
+                online_servers > 1,
+                state.local_device_id.clone(),
+            )
+        };
         let rows = self.add_space_filtered(cx);
         let query_empty = search.read(cx).is_empty();
         let hairline = crate::theme::hairline(0.06);
         let now = Utc::now();
-        // (browsed device name, online) per rail row — presence is the same
-        // signal the sidebar space rows use.
-        let device_presence: Vec<bool> = {
-            let state = self.state.read(cx);
-            devices
-                .iter()
-                .map(|d| state.device_online(&d.id, now))
-                .collect()
-        };
-        let device_name: SharedString = device
+        // (online) per rail row — presence is the same signal the sidebar
+        // space rows use, resolved directly against each target's own
+        // device record rather than `AppState::device_online` (which only
+        // knows the ACTIVE server's devices — the same reasoning
+        // `panel_rows`' per-group presence check uses, above).
+        let device_presence: Vec<bool> = targets
+            .iter()
+            .map(|t| {
+                local_device_id.as_deref() == Some(t.device.id.as_str())
+                    || crate::settings::devices::device_online(t.device.last_seen_at, now)
+            })
+            .collect();
+        let device_name: SharedString = target
             .as_ref()
-            .map(|d| d.name.clone())
+            .map(|t| t.device.name.clone())
             .unwrap_or_else(|| "This device".to_string())
             .into();
 
@@ -2606,9 +2837,9 @@ impl Shell {
                 ))
                 .into_any_element()
         } else if let Some(message) = load_error {
-            let device_line = device
+            let device_line = target
                 .as_ref()
-                .map(|d| format!("{} didn't respond — is it online?", d.name))
+                .map(|t| format!("{} didn't respond — is it online?", t.device.name))
                 .unwrap_or(message);
             popover::error_row(&theme, &device_line)
                 .px(px(14.0))
@@ -2706,7 +2937,99 @@ impl Shell {
 
         // ── devices rail (mock right column): platform glyph + name +
         //    presence dot per row, an info line naming the browsed device.
-        //    Rows are the tab recipe (h-28 rounded-8 washes), vertical.
+        //    Rows are the tab recipe (h-28 rounded-8 washes), vertical. When
+        //    more than one server is online, a non-interactive server header
+        //    (the same tone `render_panel_server_header` uses for the scope
+        //    dropdown) precedes that server's devices — a bare device name
+        //    is ambiguous once machines from different servers can collide.
+        //    A single online server renders flat, same as today.
+        let mut last_server: Option<comet_proto::ServerId> = None;
+        let device_rows: Vec<AnyElement> = targets
+            .iter()
+            .enumerate()
+            .flat_map(|(ix, t)| {
+                let mut group: Vec<AnyElement> = Vec::new();
+                if multi_server && last_server.as_ref() != Some(&t.server_id) {
+                    group.push(
+                        render_panel_server_header(
+                            &t.server_name,
+                            &comet_proto::RemoteConnectionState::Online,
+                            &theme,
+                        )
+                        .into_any_element(),
+                    );
+                }
+                last_server = Some(t.server_id.clone());
+                let is_active = target
+                    .as_ref()
+                    .is_some_and(|d| d.server_id == t.server_id && d.device.id == t.device.id);
+                let online = device_presence.get(ix).copied().unwrap_or(false);
+                // The Devices-page platform mapping (settings::devices).
+                let platform_icon = match t.device.platform.as_str() {
+                    "macos" | "darwin" => icons::LAPTOP,
+                    "web" => icons::GLOBAL,
+                    "ios" | "android" => icons::SMARTPHONE,
+                    _ => icons::MONITOR,
+                };
+                let name: SharedString = t.device.name.clone().into();
+                let pick = t.clone();
+                group.push(
+                    div()
+                        .id(("add-space-device", ix))
+                        .h(px(28.0))
+                        .px(px(8.0))
+                        .rounded(px(8.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .text_size(px(12.5))
+                        .cursor_pointer()
+                        .when(is_active, |el| {
+                            // The floating-card selection language: wash +
+                            // ring-only inset outline.
+                            el.bg(crate::theme::card_selected_bg())
+                                .shadow(crate::theme::card_selected_shadows())
+                                .text_color(theme.text)
+                        })
+                        .when(!is_active, |el| {
+                            el.text_color(theme.text_muted.opacity(0.7))
+                                .hover(|s| s.bg(theme.element_hover))
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.add_space_pick_target(pick.clone(), cx);
+                        }))
+                        .child(
+                            icon(platform_icon)
+                                .size(px(14.0))
+                                .flex_none()
+                                .text_color(theme.text_muted.opacity(0.8)),
+                        )
+                        .child(div().flex_1().min_w_0().truncate().child(name))
+                        .child(
+                            div()
+                                .size(px(5.0))
+                                .rounded_full()
+                                .flex_none()
+                                .when(online, |el| {
+                                    // The Devices-page presence emerald, soft glow
+                                    // included.
+                                    let emerald = theme.success;
+                                    el.bg(emerald.opacity(0.9)).shadow(vec![gpui::BoxShadow {
+                                        color: emerald.opacity(0.55),
+                                        offset: gpui::point(px(0.0), px(0.0)),
+                                        blur_radius: px(6.0),
+                                        spread_radius: px(0.0),
+                                        inset: false,
+                                    }])
+                                })
+                                .when(!online, |el| el.bg(crate::theme::ink(0.22))),
+                        )
+                        .into_any_element(),
+                );
+                group
+            })
+            .collect();
         let rail = div()
             .w(px(196.0))
             .flex_none()
@@ -2727,70 +3050,7 @@ impl Shell {
                     .text_color(theme.text_muted.opacity(0.6))
                     .child(SharedString::from("Devices")),
             )
-            .children(devices.into_iter().enumerate().map(|(ix, dev)| {
-                let is_active = device.as_ref().is_some_and(|d| d.id == dev.id);
-                let online = device_presence.get(ix).copied().unwrap_or(false);
-                // The Devices-page platform mapping (settings::devices).
-                let platform_icon = match dev.platform.as_str() {
-                    "macos" | "darwin" => icons::LAPTOP,
-                    "web" => icons::GLOBAL,
-                    "ios" | "android" => icons::SMARTPHONE,
-                    _ => icons::MONITOR,
-                };
-                let name: SharedString = dev.name.clone().into();
-                let pick = dev.clone();
-                div()
-                    .id(("add-space-device", ix))
-                    .h(px(28.0))
-                    .px(px(8.0))
-                    .rounded(px(8.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .text_size(px(12.5))
-                    .cursor_pointer()
-                    .when(is_active, |el| {
-                        // The floating-card selection language: wash +
-                        // ring-only inset outline.
-                        el.bg(crate::theme::card_selected_bg())
-                            .shadow(crate::theme::card_selected_shadows())
-                            .text_color(theme.text)
-                    })
-                    .when(!is_active, |el| {
-                        el.text_color(theme.text_muted.opacity(0.7))
-                            .hover(|s| s.bg(theme.element_hover))
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.add_space_pick_device(pick.clone(), cx);
-                    }))
-                    .child(
-                        icon(platform_icon)
-                            .size(px(14.0))
-                            .flex_none()
-                            .text_color(theme.text_muted.opacity(0.8)),
-                    )
-                    .child(div().flex_1().min_w_0().truncate().child(name))
-                    .child(
-                        div()
-                            .size(px(5.0))
-                            .rounded_full()
-                            .flex_none()
-                            .when(online, |el| {
-                                // The Devices-page presence emerald, soft glow
-                                // included.
-                                let emerald = theme.success;
-                                el.bg(emerald.opacity(0.9)).shadow(vec![gpui::BoxShadow {
-                                    color: emerald.opacity(0.55),
-                                    offset: gpui::point(px(0.0), px(0.0)),
-                                    blur_radius: px(6.0),
-                                    spread_radius: px(0.0),
-                                    inset: false,
-                                }])
-                            })
-                            .when(!online, |el| el.bg(crate::theme::ink(0.22))),
-                    )
-            }))
+            .children(device_rows)
             .child(div().h(px(1.0)).mx(px(2.0)).my(px(6.0)).bg(hairline))
             .child(
                 div()
