@@ -1990,6 +1990,16 @@ impl Shell {
         (scrolled > 1.0, scrolled < max_scroll - 1.0)
     }
 
+    /// Sessions header `+`: starts a new session from the sidebar.
+    // Task 5 implements this.
+    pub(super) fn start_session_from_sidebar(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.notify();
+    }
+
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
@@ -2093,16 +2103,18 @@ impl Shell {
                             .flex()
                             .flex_col()
                             .child(spaces_section)
-                            .child(
-                                div()
-                                    .px(px(Theme::SPACE_SM))
-                                    .pt(px(12.0))
-                                    .pb(px(4.0))
-                                    .text_size(px(11.0))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from("Sessions")),
-                            )
+                            .child(spaces::section_header(
+                                "Sessions",
+                                false,
+                                theme,
+                                Some(spaces::header_plus(
+                                    "new-session",
+                                    theme,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.start_session_from_sidebar(window, cx)
+                                    }),
+                                )),
+                            ))
                             .child(if !list_items.is_empty() {
                                 div()
                                     .flex()

@@ -255,6 +255,61 @@ pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hs
     }
 }
 
+/// The 20×20 `+` that trails a section header. Both sections use this —
+/// they must be visually identical.
+pub(super) fn header_plus(
+    id: &'static str,
+    theme: &Theme,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size(px(20.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(5.0))
+        .cursor_pointer()
+        .bg(motion::hover_blend(
+            id,
+            crate::theme::wash(0.0),
+            crate::theme::wash(0.14),
+        ))
+        .on_hover(motion::hover_listener(id))
+        .on_click(on_click)
+        .child(
+            icon(icons::PLUS)
+                .size(px(14.0))
+                .text_color(theme.text_muted),
+        )
+}
+
+/// A section header: label left, optional `+` right. `first` tucks the
+/// block up under whatever sits above it.
+pub(super) fn section_header(
+    label: &'static str,
+    first: bool,
+    theme: &Theme,
+    plus: Option<gpui::Stateful<gpui::Div>>,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .px(px(Theme::SPACE_SM))
+        .pt(px(if first { 6.0 } else { 12.0 }))
+        .pb(px(4.0))
+        .child(
+            div()
+                .text_size(px(11.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text_muted.opacity(0.55))
+                .child(SharedString::from(label)),
+        )
+        .when_some(plus, |el, plus| el.child(plus))
+}
+
 impl Shell {
     // ---- space switching ----
 
@@ -402,43 +457,16 @@ impl Shell {
             order.iter().filter_map(|id| by_id.remove(id)).collect()
         };
 
-        let header = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .px(px(Theme::SPACE_SM))
-            .pt(px(8.0))
-            .pb(px(4.0))
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted.opacity(0.6))
-                    .child(SharedString::from("Spaces")),
-            )
-            .child(
-                div()
-                    .id("add-space")
-                    .size(px(20.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(5.0))
-                    .cursor_pointer()
-                    .bg(motion::hover_blend(
-                        "add-space",
-                        crate::theme::wash(0.0),
-                        crate::theme::wash(0.14),
-                    ))
-                    .on_hover(motion::hover_listener("add-space"))
-                    .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx)))
-                    .child(
-                        icon(icons::PLUS)
-                            .size(px(14.0))
-                            .text_color(theme.text_muted.opacity(0.7)),
-                    ),
-            );
+        let header = section_header(
+            "Spaces",
+            true,
+            theme,
+            Some(header_plus(
+                "add-space",
+                theme,
+                cx.listener(|this, _, _, cx| this.open_add_space(cx)),
+            )),
+        );
 
         let mut column = div().flex().flex_col().child(header);
         for (index, group) in server_groups.into_iter().enumerate() {
