@@ -6,16 +6,20 @@
 //! Search deliberately ignores [`SidebarScope`] — it always reads the whole
 //! projected set. A scoped list is a convenience, never a wall.
 //!
-//! Result rows deliberately do NOT go through [`super::Shell::render_chat_row`]
-//! / [`super::RowScope`]: that shared row needs plain `SharedString` title and
-//! branch text, but a search hit has to tint the matched run wherever it
-//! landed (title, branch, or the space name), which means building three
-//! colored spans instead of one string. Rather than widen a well-tested,
-//! shared type to carry element children (which would also force `RowScope`
-//! off `Clone`/`PartialEq`, both load-bearing elsewhere), results render
-//! through a parallel, self-contained set of row builders below that
-//! reproduce the SAME shape `RowScope::All` draws — space+device line always
-//! on top, regardless of the sidebar's current scope — just with tinting.
+//! Session result rows go through the SAME [`super::Shell::render_chat_row`]
+//! the normal Sessions list uses, built with `RowScope::All` (space+device
+//! line always on top, regardless of the sidebar's current scope — a hit
+//! elsewhere is useless if it can't say which one). An earlier version of
+//! this file rebuilt that row from scratch to get per-span tinting, and
+//! within a day of landing had four properties (the working spinner, the
+//! hover text-brighten, the selected shadow, the right-click context menu)
+//! silently missing relative to the real row — a review caught it. Tinting
+//! is instead threaded INTO `render_chat_row` via its `highlight_query`
+//! parameter, so there is exactly one place that draws a session row and it
+//! cannot drift out of sync with itself. [`styled_line`] is the tinting
+//! primitive both that row and the space row (below, which has no shared
+//! production row to reuse — the normal list shows spaces through the scope
+//! trigger/dropdown, not a flat row list) build their tinted spans with.
 
 use comet_proto::{Chat, Space};
 
@@ -62,6 +66,17 @@ pub(super) fn filter(
     let matching_chats: Vec<String> = chats
         .iter()
         .filter(|c| !c.archived)
+        // A chat whose `space_id` doesn't resolve to a live space is invisible
+        // to the normal sidebar too (`AppState::overview_chats`'s own
+        // `space_row(id).is_some()` guard, state.rs) — search must agree, or
+        // it can hand back a hit the sidebar has nowhere to render (space name
+        // "?", and selecting it lands the app in a state the normal list
+        // can't represent).
+        .filter(|c| {
+            c.space_id
+                .as_deref()
+                .is_some_and(|id| spaces.iter().any(|s| s.id == id))
+        })
         .filter(|c| {
             let title_hit = c.title.as_deref().is_some_and(hit);
             let branch_hit = c.branch.as_deref().is_some_and(hit);
@@ -106,31 +121,50 @@ pub(super) fn match_run(text: &str, needle: &str) -> Option<(String, String, Str
 }
 
 /// Render `text` as a single line, tinting the first case-insensitive hit of
-/// `query` (if any) in `accent` — the rest stays `base`. Falls back to a
-/// plain line when there is no match (a hit that landed on a DIFFERENT line
-/// of the same row, e.g. the branch, must not force every other line to tint
-/// nothing).
-fn tinted_line(text: &str, query: &str, base: gpui::Hsla, accent: gpui::Hsla) -> AnyElement {
-    match match_run(text, query) {
-        Some((before, matched, after)) => div()
-            .flex()
-            .flex_row()
-            .min_w_0()
-            .text_color(base)
-            .child(SharedString::from(before))
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(accent)
-                    .child(SharedString::from(matched)),
-            )
-            .child(SharedString::from(after))
-            .into_any_element(),
-        None => div()
-            .text_color(base)
-            .child(SharedString::from(text.to_string()))
-            .into_any_element(),
-    }
+/// `query` (if any) in `accent` — the rest stays `base`.
+///
+/// This renders through ONE [`gpui::StyledText`] carrying multiple
+/// [`gpui::TextRun`]s, not a `flex_row` of sibling text elements. That
+/// distinction matters: `gpui`'s `.truncate()` (`overflow_hidden` +
+/// `whitespace_nowrap` + `text_ellipsis`) operates on a single text node's
+/// layout as a whole. Three sibling divs are each their own layout box, so a
+/// long line built that way ellipsized EACH span independently (`Make the
+/// … fade dis…` instead of one clean cut) — round-1 review caught this
+/// before it shipped. A single styled-run text node truncates exactly like
+/// the plain, untinted string it replaces.
+pub(super) fn styled_line(
+    text: &str,
+    query: Option<&str>,
+    base: gpui::Hsla,
+    accent: gpui::Hsla,
+    font: gpui::Font,
+) -> AnyElement {
+    let hit = query.and_then(|q| match_run(text, q));
+    let run = |len: usize, color: gpui::Hsla, font: gpui::Font| gpui::TextRun {
+        len,
+        font,
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let runs = match hit {
+        Some((before, matched, after)) => {
+            let mut runs = Vec::with_capacity(3);
+            if !before.is_empty() {
+                runs.push(run(before.len(), base, font.clone()));
+            }
+            runs.push(run(matched.len(), accent, font.clone()));
+            if !after.is_empty() {
+                runs.push(run(after.len(), base, font));
+            }
+            runs
+        }
+        None => vec![run(text.len(), base, font)],
+    };
+    gpui::StyledText::new(text.to_string())
+        .with_runs(runs)
+        .into_any_element()
 }
 
 /// One openable result. `Chat` selects a session in place (never re-scopes
@@ -174,7 +208,7 @@ pub(super) fn highlight_target(
 /// The inset accent ring for the keyboard-highlighted result row (spec §4):
 /// `box_shadow` with `inset: true` rather than [`crate::theme::glass_selected_shadows`]'s
 /// drop-seat treatment — a result row's highlight is a cursor, not a selection.
-fn highlight_ring(theme: &Theme) -> Vec<gpui::BoxShadow> {
+pub(super) fn highlight_ring(theme: &Theme) -> Vec<gpui::BoxShadow> {
     vec![gpui::BoxShadow {
         color: theme.accent.opacity(0.45),
         offset: gpui::point(px(0.0), px(0.0)),
@@ -249,8 +283,28 @@ impl Shell {
     /// context leaves them unbound (see [`crate::composer::init`]) so they
     /// reach here instead of moving the caret, the same shape as
     /// `AddSpaceFlow::add_space_key`.
+    ///
+    /// Escape is checked against the RAW (untrimmed) text, before anything
+    /// else: `filter` trims, so a whitespace-only query is `None` results —
+    /// gating Escape on "has results" left a dead end where a lone space
+    /// showed the clear button but the only way to actually clear it was
+    /// Backspace (round-1 review). ↑↓/Enter still need real results and stay
+    /// gated on the trimmed query.
     pub(super) fn search_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
-        let query = self.search_query(cx).trim().to_string();
+        let raw = self.search_query(cx).to_string();
+        if raw.is_empty() {
+            return;
+        }
+        let key = popover::classify_key(
+            event.keystroke.key.as_str(),
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+        );
+        if key == popover::MenuKey::Escape {
+            self.clear_search(cx);
+            return;
+        }
+        let query = raw.trim().to_string();
         if query.is_empty() {
             return;
         }
@@ -261,14 +315,8 @@ impl Shell {
             })
         };
         let Some(results) = results else { return };
-        let key = popover::classify_key(
-            event.keystroke.key.as_str(),
-            event.keystroke.modifiers.platform,
-            event.keystroke.modifiers.control,
-        );
         let total = results.spaces.len() + results.chats.len();
         match key {
-            popover::MenuKey::Escape => self.clear_search(cx),
             popover::MenuKey::Up | popover::MenuKey::Down => {
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
                 self.search_active =
@@ -296,9 +344,16 @@ impl Shell {
     /// column, outside the scroll region, so it can never scroll away. As a
     /// consequence `SIDEBAR_GLASS_FADE_BAND`'s top fade now starts below this
     /// block rather than at the column's top edge.
+    ///
+    /// `has_text` drives this field's own chrome and is deliberately the RAW
+    /// (untrimmed) query being non-empty, not "has results": a whitespace-only
+    /// query has no results (`filter` trims), but the field still needs to
+    /// show the clear button rather than the ⌘P hint, and `search_key` clears
+    /// it on Escape the same as any other non-empty text (round-1 review — the
+    /// two were conflated and a lone space was a dead end).
     pub(super) fn render_search_field(
         &mut self,
-        searching: bool,
+        has_text: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -312,12 +367,12 @@ impl Shell {
             .px(px(Theme::SPACE_SM))
             .rounded(px(Theme::CONTROL_RADIUS))
             .border_1()
-            .border_color(if searching {
+            .border_color(if has_text {
                 theme.accent.opacity(0.55)
             } else {
                 theme.border
             })
-            .bg(if searching {
+            .bg(if has_text {
                 crate::theme::wash(0.055)
             } else {
                 crate::theme::wash(0.03)
@@ -330,14 +385,14 @@ impl Shell {
                 icon(icons::MAGNIFER)
                     .size(px(14.0))
                     .flex_none()
-                    .text_color(if searching {
+                    .text_color(if has_text {
                         theme.accent
                     } else {
                         theme.text_faint
                     }),
             )
             .child(div().flex_1().min_w_0().child(self.search_input.clone()))
-            .when(!searching, |el| {
+            .when(!has_text, |el| {
                 el.child(
                     div()
                         .flex_none()
@@ -348,7 +403,7 @@ impl Shell {
                         ))),
                 )
             })
-            .when(searching, |el| {
+            .when(has_text, |el| {
                 el.child(
                     div()
                         .id("search-clear")
@@ -375,8 +430,14 @@ impl Shell {
     /// `Sessions` headers (counted, no `+`) each followed by their matching
     /// rows, or the empty-state line when neither group has anything, plus
     /// the keyboard-hint footer. Replaces `render_spaces_section` + the
-    /// normal Sessions list wholesale — see the module doc for why these rows
-    /// don't go through `render_chat_row`.
+    /// normal Sessions list wholesale.
+    ///
+    /// A group with zero matches skips its header entirely (round-1 review:
+    /// a query matching only sessions used to still show a dangling
+    /// "Spaces 0"). Session rows render through the SAME [`Self::render_chat_row`]
+    /// the normal list uses (see the module doc) rather than a parallel
+    /// builder, so the working spinner, hover text-brighten, selected shadow,
+    /// and right-click context menu can't drift out of sync with it again.
     pub(super) fn render_search_results(
         &mut self,
         results: &SearchResults,
@@ -402,42 +463,50 @@ impl Shell {
 
         let mut children: Vec<AnyElement> = Vec::new();
 
-        children.push(
-            spaces::section_header("Spaces", true, theme, None)
-                .child(search_count_chip(results.spaces.len(), theme))
-                .into_any_element(),
-        );
-        for (i, id) in results.spaces.iter().enumerate() {
-            let space = self.state.read(cx).space_row(id).cloned();
-            let Some(space) = space else { continue };
-            let highlighted = highlight_target(
-                self.search_active,
-                results.spaces.len(),
-                results.chats.len(),
-            ) == Some(HighlightTarget::Space(i));
-            children.push(self.render_search_space_row(&space, query, highlighted, theme, cx));
+        if !results.spaces.is_empty() {
+            children.push(
+                spaces::section_header("Spaces", true, theme, None)
+                    .child(search_count_chip(results.spaces.len(), theme))
+                    .into_any_element(),
+            );
+            for (i, id) in results.spaces.iter().enumerate() {
+                let space = self.state.read(cx).space_row(id).cloned();
+                let Some(space) = space else { continue };
+                let highlighted = highlight_target(
+                    self.search_active,
+                    results.spaces.len(),
+                    results.chats.len(),
+                ) == Some(HighlightTarget::Space(i));
+                children.push(self.render_search_space_row(&space, query, highlighted, theme, cx));
+            }
         }
 
-        children.push(
-            spaces::section_header("Sessions", false, theme, None)
-                .child(search_count_chip(results.chats.len(), theme))
-                .into_any_element(),
-        );
-        for (i, id) in results.chats.iter().enumerate() {
-            let chat = self
-                .state
-                .read(cx)
-                .chats
-                .iter()
-                .find(|c| &c.id == id)
-                .cloned();
-            let Some(chat) = chat else { continue };
-            let highlighted = highlight_target(
-                self.search_active,
-                results.spaces.len(),
-                results.chats.len(),
-            ) == Some(HighlightTarget::Chat(i));
-            children.push(self.render_search_chat_row(&chat, query, highlighted, theme, cx));
+        if !results.chats.is_empty() {
+            // "First" (tighter top padding) whenever Spaces didn't render —
+            // Sessions is then visually the top of the list, same as the
+            // normal (non-search) list tucks its first section up.
+            let sessions_first = results.spaces.is_empty();
+            children.push(
+                spaces::section_header("Sessions", sessions_first, theme, None)
+                    .child(search_count_chip(results.chats.len(), theme))
+                    .into_any_element(),
+            );
+            for (i, id) in results.chats.iter().enumerate() {
+                let chat = self
+                    .state
+                    .read(cx)
+                    .chats
+                    .iter()
+                    .find(|c| &c.id == id)
+                    .cloned();
+                let Some(chat) = chat else { continue };
+                let highlighted = highlight_target(
+                    self.search_active,
+                    results.spaces.len(),
+                    results.chats.len(),
+                ) == Some(HighlightTarget::Chat(i));
+                children.push(self.render_search_chat_row(&chat, query, highlighted, theme, cx));
+            }
         }
 
         children.push(render_search_footer(theme));
@@ -446,7 +515,10 @@ impl Shell {
 
     /// One space result row: folder icon, tinted display name. Always opens
     /// via [`Self::open_search_result`], which is the only path that switches
-    /// `sidebar_scope`.
+    /// `sidebar_scope`. No shared production row to reuse here (unlike
+    /// sessions) — the normal sidebar shows spaces through the scope
+    /// trigger/dropdown, not a flat row list — so this stays a small,
+    /// self-contained builder.
     fn render_search_space_row(
         &mut self,
         space: &Space,
@@ -459,7 +531,15 @@ impl Shell {
         let click_id = id.clone();
         let name = space.display_name().to_string();
         let fade_key = format!("search-space-{id}");
-        let title = tinted_line(&name, query, theme.text.opacity(0.85), theme.accent);
+        let mut font = gpui::font(theme.font_sans.clone());
+        font.weight = gpui::FontWeight::MEDIUM;
+        let title = styled_line(
+            &name,
+            Some(query),
+            theme.text.opacity(0.85),
+            theme.accent,
+            font,
+        );
 
         div()
             .id(SharedString::from(format!("search-space-{id}")))
@@ -496,17 +576,19 @@ impl Shell {
                     .truncate()
                     .text_size(px(13.0))
                     .line_height(px(18.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
                     .child(title),
             )
             .into_any_element()
     }
 
-    /// One session result row — the `RowScope::All` shape (space+device line,
-    /// title+time, branch+harness), rebuilt here rather than through
-    /// `render_chat_row` so title/branch/space can each tint their matched
-    /// run. Always shows the owning space, regardless of the sidebar's
-    /// current scope.
+    /// One session result row. Builds the exact same arguments
+    /// `render_active_rows` builds for the normal list — `RowScope::All`
+    /// (always, regardless of the sidebar's current scope: a hit elsewhere is
+    /// useless if it can't say which one), the same status/time/branch/harness
+    /// projection — and hands them to the shared [`Self::render_chat_row`]
+    /// with `highlight_query` set and a click handler that opens through
+    /// [`Self::open_search_result`] (clears the query) instead of selecting
+    /// directly.
     fn render_search_chat_row(
         &mut self,
         chat: &Chat,
@@ -516,7 +598,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let now = Utc::now();
-        let (status, space_name, device, host_offline, selected) = {
+        let (status, scope, selected) = {
             let state = self.state.read(cx);
             let status = state.display_status_for(chat, now);
             let space_name = state
@@ -529,166 +611,44 @@ impl Shell {
                 .to_string();
             let host_offline = !state.device_online(&chat.device_id, now);
             let selected = state.selected_chat_id() == Some(chat.id.as_str());
-            (status, space_name, device, host_offline, selected)
+            let scope = super::RowScope::All {
+                space: space_name.into(),
+                device: device.into(),
+                host_offline,
+            };
+            (status, scope, selected)
         };
         let time_ago: SharedString =
             format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
-        let title_text =
-            transcript::single_line(&chat.title.clone().unwrap_or_else(|| "New session".into()));
-        let branch_text = chat
+        let title: SharedString =
+            transcript::single_line(&chat.title.clone().unwrap_or_else(|| "New session".into()))
+                .into();
+        let branch = chat
             .branch
             .as_deref()
             .map(str::trim)
-            .filter(|b| !b.is_empty());
-
-        let id = chat.id.clone();
-        let click_id = id.clone();
-        let fade_key = format!("search-chat-{id}");
-        let dot_color = spaces::status_dot_color(status, theme);
-        let selected_wash = crate::theme::glass_selected_bg();
-        let rest_bg = if selected {
-            selected_wash
-        } else {
-            crate::theme::wash(0.0)
-        };
-        let hover_bg = if selected {
-            selected_wash
-        } else {
-            theme.glass_hover()
-        };
-        let rest_text = if selected {
-            theme.text
-        } else {
-            theme.text.opacity(0.8)
-        };
-
-        let title_el = tinted_line(&title_text, query, rest_text, theme.accent);
-        let space_el = tinted_line(
-            &space_name,
-            query,
-            theme.text_muted.opacity(0.75),
-            theme.accent,
-        );
-
+            .filter(|b| !b.is_empty())
+            .map(SharedString::from);
         let harness = chat.config.as_ref().map(|c| c.harness);
+        let click_id = chat.id.clone();
 
-        div()
-            .id(SharedString::from(format!("search-chat-{id}")))
-            .flex()
-            .flex_col()
-            .rounded(px(8.0))
-            .px(px(Theme::SPACE_SM))
-            .py(px(5.0))
-            .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
-            .when(highlighted, |el| el.shadow(highlight_ring(theme)))
-            .on_hover(motion::hover_listener(fade_key))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
+        self.render_chat_row(
+            chat.id.clone(),
+            title,
+            time_ago,
+            scope,
+            branch,
+            harness,
+            status,
+            selected,
+            Some(query),
+            highlighted,
+            move |this: &mut Shell, cx: &mut Context<Shell>| {
                 this.open_search_result(SearchHit::Chat(click_id.clone()), cx);
-            }))
-            // Line 0: the owning space — ALWAYS shown here (the `RowScope::All`
-            // line), regardless of the sidebar's current scope: a hit in
-            // another space is useless if it can't say which one.
-            .child(
-                div()
-                    .w_full()
-                    .mb(px(2.0))
-                    .pl(px(14.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.0))
-                    .text_size(px(11.0))
-                    .line_height(px(14.0))
-                    .child(
-                        icon(icons::FOLDER)
-                            .size(px(11.0))
-                            .flex_none()
-                            .text_color(theme.text_muted.opacity(0.5)),
-                    )
-                    .child(div().min_w_0().truncate().child(space_el))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_color(if host_offline {
-                                theme.warning.opacity(0.8)
-                            } else {
-                                theme.text_muted.opacity(0.5)
-                            })
-                            .child(SharedString::from(if host_offline {
-                                format!("@ {device} · offline")
-                            } else {
-                                format!("@ {device}")
-                            })),
-                    ),
-            )
-            // Line 1: status dot, title, time-ago.
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(Theme::SPACE_SM))
-                    .child(div().size(px(6.0)).rounded_full().flex_none().bg(dot_color))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(13.0))
-                            .line_height(px(18.0))
-                            .child(title_el),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(11.0))
-                            .line_height(px(18.0))
-                            .text_color(theme.text_muted.opacity(0.45))
-                            .child(time_ago),
-                    ),
-            )
-            // Line 2: branch, agent mark pinned right.
-            .child(
-                div()
-                    .w_full()
-                    .mt(px(2.0))
-                    .pl(px(14.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.0))
-                    .text_size(px(11.0))
-                    .line_height(px(14.0))
-                    .when_some(branch_text, |el, branch| {
-                        el.child(
-                            icon(icons::GIT_BRANCH)
-                                .size(px(11.0))
-                                .flex_none()
-                                .text_color(theme.text_muted.opacity(0.5)),
-                        )
-                        .child(div().min_w_0().truncate().child(tinted_line(
-                            branch,
-                            query,
-                            theme.text_muted.opacity(0.5),
-                            theme.accent,
-                        )))
-                    })
-                    .child(div().flex_1().min_w(px(8.0)))
-                    .when_some(
-                        harness.map(crate::pickers::harness_brand_icon),
-                        |el, (path, tint)| {
-                            el.child(
-                                icon(path)
-                                    .size(px(13.0))
-                                    .flex_none()
-                                    .text_color(tint.unwrap_or(theme.text_muted.opacity(0.75))),
-                            )
-                        },
-                    ),
-            )
-            .into_any_element()
+            },
+            theme,
+            cx,
+        )
     }
 }
 
@@ -838,6 +798,36 @@ mod tests {
         all.push(archived_chat_titled("fade something"));
         let r = filter("fade", &spaces(), &all, &devices).unwrap();
         assert!(!r.chats.iter().any(|id| id == "c-archived"));
+    }
+
+    /// `overview_chats` (the normal sidebar list) only shows a chat when its
+    /// `space_id` resolves to a live space row; search must apply the same
+    /// guard or it can hand back a hit the sidebar has nowhere to render.
+    #[test]
+    fn chats_with_a_dangling_space_id_are_never_returned() {
+        let mut all = chats();
+        all.push(Chat {
+            id: "c-dangling".into(),
+            device_id: "d1".into(),
+            title: Some("fade orphan".into()),
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: Some("deleted-space-id".into()),
+            last_seen_at: None,
+        });
+        let r = filter("fade", &spaces(), &all, &devices).unwrap();
+        assert!(
+            !r.chats.iter().any(|id| id == "c-dangling"),
+            "a chat whose space no longer exists must not surface, even on a title hit"
+        );
     }
 
     #[test]

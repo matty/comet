@@ -2335,6 +2335,7 @@ impl Shell {
                 let is_selected = selected.as_deref() == Some(chat.id.as_str());
                 let height = super::chat_row_height(&scope);
                 let harness = chat.config.as_ref().map(|c| c.harness);
+                let click_id = chat.id.clone();
                 let element = self.render_chat_row(
                     chat.id.clone(),
                     transcript::single_line(
@@ -2347,6 +2348,14 @@ impl Shell {
                     harness,
                     status,
                     is_selected,
+                    // The normal list never tints or keyboard-highlights —
+                    // that's exclusively a sidebar-search concept.
+                    None,
+                    false,
+                    move |this: &mut Shell, cx: &mut Context<Shell>| {
+                        let id = click_id.clone();
+                        this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
+                    },
                     theme,
                     cx,
                 );

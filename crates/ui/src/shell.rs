@@ -1884,7 +1884,20 @@ impl Shell {
     /// One session row (comet session-row.tsx): status rail on the left
     /// (a live 2×3 mini spinner while working, a dot otherwise), title +
     /// relative time on the first line, "folder · device" underneath aligned
-    /// to the title. Click selects; right-click opens the context menu.
+    /// to the title. Right-click always opens the context menu; `on_click`
+    /// decides what a plain click does (the normal list selects the chat in
+    /// place, sidebar search additionally clears the query — see
+    /// `search::Shell::render_search_chat_row`).
+    ///
+    /// `highlight_query`, when `Some`, tints the first case-insensitive hit in
+    /// each of the space/title/branch lines (`search::styled_line`) — `None`
+    /// for the normal list, which never tints anything. `keyboard_highlighted`
+    /// is the search results' arrow-key cursor: a DIFFERENT visual from
+    /// `selected` (the open chat) that can coincide with it, so both get their
+    /// own `when`. This is the single row every session list in the sidebar
+    /// draws through — an earlier revision had sidebar search build its own
+    /// copy for tinting and it silently diverged (missing spinner, hover
+    /// brighten, selected shadow, context menu) within a day.
     #[allow(clippy::too_many_arguments)]
     fn render_chat_row(
         &self,
@@ -1896,6 +1909,9 @@ impl Shell {
         harness: Option<comet_proto::HarnessId>,
         status: comet_proto::ChatIndicator,
         selected: bool,
+        highlight_query: Option<&str>,
+        keyboard_highlighted: bool,
+        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1929,7 +1945,6 @@ impl Shell {
         let selected_wash = crate::theme::glass_selected_bg();
         let subline = theme.text_muted.opacity(0.5);
         let time_tint = theme.text_muted.opacity(0.45);
-        let select_id = id.clone();
         let menu_id = comet_proto::ServerRef::new(
             self.state
                 .read(cx)
@@ -1941,17 +1956,27 @@ impl Shell {
         // Hover fades over transition-colors (comet session-row.tsx) — both
         // the wash and the title brighten ride the same 150ms blend.
         let fade_key = format!("chat-row-{id}");
-        let rest_bg = if selected {
+        // `selected` (the open chat) and `keyboard_highlighted` (the search
+        // results' arrow-key cursor) are different states that can coincide;
+        // both get the same wash — a merely-selected row must not visually
+        // outrank the keyboard cursor, or arrowing onto the already-open chat
+        // reads as "less highlighted" than any other row (round-1 review).
+        // Only the SHADOW differs: highlighted draws the inset accent ring,
+        // selected (when not also highlighted) keeps the drop-seat shadow.
+        let lit = selected || keyboard_highlighted;
+        let rest_bg = if lit {
             selected_wash
         } else {
             crate::theme::wash(0.0)
         };
-        // A selected row must NOT drift toward the hover wash: in dark the two
+        // A lit row must NOT drift toward the hover wash: in dark the two
         // fills are identical so the blend is a no-op, but light's hover sits
         // below its near-opaque selected fill, and blending toward it visibly
         // dimmed the active row under the pointer (user report).
-        let hover_bg = if selected { selected_wash } else { hover };
-        let rest_text = if selected { text } else { text.opacity(0.8) };
+        let hover_bg = if lit { selected_wash } else { hover };
+        let rest_text = if lit { text } else { text.opacity(0.8) };
+        let title_color = motion::hover_blend(&fade_key, rest_text, text);
+        let sans = gpui::font(theme.font_sans.clone());
         div()
             .id(SharedString::from(format!("chat-{id}")))
             .flex()
@@ -1959,17 +1984,17 @@ impl Shell {
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
             .py(px(5.0))
-            .text_color(motion::hover_blend(&fade_key, rest_text, text))
+            .text_color(title_color)
             .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
-            .when(selected, |el| {
+            .when(keyboard_highlighted, |el| {
+                el.shadow(search::highlight_ring(theme))
+            })
+            .when(!keyboard_highlighted && selected, |el| {
                 el.shadow(crate::theme::glass_selected_shadows())
             })
             .on_hover(motion::hover_listener(fade_key))
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let id = select_id.clone();
-                this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
-            }))
+            .on_click(cx.listener(move |this, _, _, cx| on_click(this, cx)))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -2006,13 +2031,13 @@ impl Shell {
                                     .flex_none()
                                     .text_color(theme.text_muted.opacity(0.5)),
                             )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(theme.text_muted.opacity(0.75))
-                                    .child(space),
-                            )
+                            .child(div().min_w_0().truncate().child(search::styled_line(
+                                &space,
+                                highlight_query,
+                                theme.text_muted.opacity(0.75),
+                                theme.accent,
+                                sans.clone(),
+                            )))
                             // The device never truncates: which machine a
                             // session runs on cannot be inferred anywhere else.
                             .child(
@@ -2048,7 +2073,13 @@ impl Shell {
                             .truncate()
                             .text_size(px(13.0))
                             .line_height(px(18.0))
-                            .child(title),
+                            .child(search::styled_line(
+                                &title,
+                                highlight_query,
+                                title_color,
+                                theme.accent,
+                                sans.clone(),
+                            )),
                     )
                     .child(
                         div()
@@ -2081,7 +2112,13 @@ impl Shell {
                                 .flex_none()
                                 .text_color(subline),
                         )
-                        .child(div().min_w_0().truncate().child(branch))
+                        .child(div().min_w_0().truncate().child(search::styled_line(
+                            &branch,
+                            highlight_query,
+                            subline,
+                            theme.accent,
+                            sans.clone(),
+                        )))
                     })
                     .child(div().flex_1().min_w(px(8.0)))
                     .when_some(
@@ -2177,13 +2214,18 @@ impl Shell {
         // searching; `Some(empty)` = searching with no matches, a DIFFERENT
         // state from "not searching" that renders differently below.
         let query = self.search_query(cx).to_string();
+        // The FIELD's own chrome keys off the raw (untrimmed) text — NOT
+        // `results.is_some()`. `filter` trims, so a whitespace-only query is
+        // `None` results; keying the clear-button/hint-chip swap off that
+        // left a dead end where a lone space showed the ⌘P hint (implying
+        // nothing to clear) yet visibly sat in the field (round-1 review).
+        let has_text = !query.is_empty();
         let results = {
             let state = self.state.read(cx);
             search::filter(&query, &state.spaces, &state.chats, &|id| {
                 state.device_name(id).map(str::to_string)
             })
         };
-        let searching = results.is_some();
 
         // Overflow edge fades for the lists scroll region — the tab strip's
         // idiom, vertical (offset from the LAST frame; the lag is invisible).
@@ -2198,7 +2240,7 @@ impl Shell {
         let sidebar_fade = theme.surface;
 
         let settings_button = self.render_settings_button(theme, cx);
-        let search_field = self.render_search_field(searching, theme, cx);
+        let search_field = self.render_search_field(has_text, theme, cx);
 
         // Results mode swaps the Spaces + Sessions sections wholesale for the
         // matching rows (`search::Shell::render_search_results`) — the resort
