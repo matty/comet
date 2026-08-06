@@ -1234,7 +1234,6 @@ dependencies = [
  "comet-ui",
  "comet-update",
  "data-encoding",
- "home",
  "mimalloc",
  "rpassword",
  "serde",

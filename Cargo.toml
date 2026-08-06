@@ -77,7 +77,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # permanent RSS - measured as the top residency cause in docs/memory-plan.md.
 mimalloc = "0.1"
 anyhow = "1"
-home = "0.5"
 tempfile = "3"
 thiserror = "2"
 tracing = "0.1"
