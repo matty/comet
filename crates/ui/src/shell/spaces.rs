@@ -576,6 +576,26 @@ pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hs
     }
 }
 
+/// Attention outside the current scope, for the trigger's badge: the count of
+/// out-of-scope spaces wanting attention, and the most urgent status among
+/// them. `None` on `All` — nothing is elsewhere.
+pub(super) fn elsewhere_attention(
+    scope: &SidebarScope,
+    attention: &std::collections::HashMap<String, ChatIndicator>,
+) -> Option<(ChatIndicator, usize)> {
+    let scoped = scope.space_id()?;
+    let others: Vec<ChatIndicator> = attention
+        .iter()
+        .filter(|(id, _)| id.as_str() != scoped)
+        .map(|(_, status)| *status)
+        .collect();
+    let winner = others
+        .iter()
+        .copied()
+        .min_by_key(|s| crate::state::attention_rank(*s))?;
+    Some((winner, others.len()))
+}
+
 /// The 20×20 `+` that trails a section header. Both sections use this —
 /// they must be visually identical.
 pub(super) fn header_plus(
@@ -1042,6 +1062,45 @@ mod panel_tests {
         let rel_y = content_rel_y(20.0 + viewport_relative, 20.0, scrolled);
         assert_eq!(drop_index(rel_y, SPACE_ROW_SLOT, count), 4);
     }
+
+    #[test]
+    fn elsewhere_counts_only_out_of_scope_spaces() {
+        let attention = std::collections::HashMap::from([
+            ("s1".to_string(), ChatIndicator::Working),
+            ("s2".to_string(), ChatIndicator::AwaitingInput),
+            ("s3".to_string(), ChatIndicator::Working),
+        ]);
+        let (status, count) =
+            elsewhere_attention(&SidebarScope::Space("s1".into()), &attention).unwrap();
+        assert_eq!(count, 2, "s1 is in scope and does not count");
+        assert_eq!(
+            status,
+            ChatIndicator::AwaitingInput,
+            "the attention_rank winner picks the colour"
+        );
+    }
+
+    #[test]
+    fn elsewhere_is_empty_on_all_spaces() {
+        let attention =
+            std::collections::HashMap::from([("s1".to_string(), ChatIndicator::Working)]);
+        assert_eq!(
+            elsewhere_attention(&SidebarScope::All, &attention),
+            None,
+            "nothing is elsewhere when everything is in scope"
+        );
+    }
+
+    #[test]
+    fn elsewhere_is_empty_when_nothing_wants_attention() {
+        assert_eq!(
+            elsewhere_attention(
+                &SidebarScope::Space("s1".into()),
+                &std::collections::HashMap::new()
+            ),
+            None
+        );
+    }
 }
 
 /// A section header: label left, optional `+` right. `first` tucks the
@@ -1419,10 +1478,20 @@ impl Shell {
                     .map(|g| g.server.name.clone())
             })
             .flatten();
-        // Task 9: aggregate attention across every space when the scope is
-        // `All` (mirrors the per-space dot in the panel below). Placeholder
-        // until Task 9 wires the real aggregate.
-        let scope_attention: Option<ChatIndicator> = None;
+        // Task 9: the leading dot is the aggregate of what IS in scope — the
+        // scoped space's own entry, or (on `All`) the `attention_rank`
+        // winner across every entry, mirroring the per-space dot in the
+        // panel below. This is distinct from the trailing badge
+        // (`elsewhere_attention`, below), which reports OUT-of-scope
+        // attention only.
+        let scope_attention: Option<ChatIndicator> = match scope.space_id() {
+            Some(id) => ctx.attention.get(id).copied(),
+            None => ctx
+                .attention
+                .values()
+                .copied()
+                .min_by_key(|s| crate::state::attention_rank(*s)),
+        };
 
         let mut trigger = div()
             .id("space-scope")
@@ -1531,6 +1600,34 @@ impl Shell {
                             .unwrap_or_else(|| session_total.to_string()),
                     }))
             })
+            // Task 9: out-of-scope attention only — `None` on `All` (nothing
+            // is elsewhere) or when no out-of-scope space wants attention.
+            .when_some(
+                elsewhere_attention(&scope, &ctx.attention),
+                |el, (status, count)| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .h(px(16.0))
+                            .px(px(5.0))
+                            .rounded_full()
+                            .bg(crate::theme::wash(0.07))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .text_size(px(9.5))
+                            .text_color(theme.text_muted.opacity(0.8))
+                            .child(
+                                div()
+                                    .size(px(5.0))
+                                    .rounded_full()
+                                    .bg(status_dot_color(status, theme)),
+                            )
+                            .child(SharedString::from(count.to_string())),
+                    )
+                },
+            )
             .child(
                 icon(icons::ALT_ARROW_DOWN)
                     .size(px(13.0))
