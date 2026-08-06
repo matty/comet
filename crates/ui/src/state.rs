@@ -347,6 +347,34 @@ pub use comet_proto::view::{
 // AppState entity
 // ---------------------------------------------------------------------------
 
+/// Which sessions the sidebar lists.
+///
+/// Deliberately separate from [`AppState::selected_space`], which drives the
+/// main area and tab strip. `selected_space` cannot express "all": a spaces
+/// frame forces it to `Some(first)` when it is `None` (`apply_spaces`), and
+/// selecting a chat sets it from that chat (`select_chat`) — so overloading it
+/// would silently drop the user out of the all-spaces view on any click.
+///
+/// Changing the scope never changes what is open.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SidebarScope {
+    /// Every space on the active server — the historical behaviour, and the
+    /// default.
+    #[default]
+    All,
+    /// One space, by local id.
+    Space(String),
+}
+
+impl SidebarScope {
+    pub fn space_id(&self) -> Option<&str> {
+        match self {
+            SidebarScope::All => None,
+            SidebarScope::Space(id) => Some(id.as_str()),
+        }
+    }
+}
+
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
@@ -366,6 +394,9 @@ pub struct AppState {
     /// The space whose tabs fill the main area. Healed by [`Self::apply_spaces`]
     /// when the row vanishes; selecting a chat implies its space.
     pub selected_space: Option<ServerRef>,
+    /// Sidebar session scope — see [`SidebarScope`]. Independent of
+    /// `selected_space`.
+    pub sidebar_scope: SidebarScope,
     pub selected_chat: Option<ServerRef>,
     /// Boot auto-select happened (or a manual selection superseded it).
     pub auto_selected: bool,
@@ -407,6 +438,7 @@ impl AppState {
             server_order: Vec::new(),
             active_server: None,
             selected_space: None,
+            sidebar_scope: SidebarScope::All,
             selected_chat: None,
             transcript: Vec::new(),
             echoes: HashMap::new(),
@@ -528,6 +560,7 @@ impl AppState {
             self.spaces.clear();
             self.chats.clear();
             self.sessions.clear();
+            self.sidebar_scope = SidebarScope::All;
             return;
         };
         self.devices = server.devices.clone();
@@ -536,6 +569,18 @@ impl AppState {
         self.chats = server.chats.clone();
         sort_chats(&mut self.chats);
         self.sessions = server.sessions.clone();
+        self.heal_sidebar_scope();
+    }
+
+    /// A scoped sidebar pointing at a space that is no longer projected falls
+    /// back to `All`. Covers both a space deleted elsewhere and a change of
+    /// active server (whose projection replaces `self.spaces` wholesale).
+    fn heal_sidebar_scope(&mut self) {
+        if let SidebarScope::Space(id) = &self.sidebar_scope
+            && !self.spaces.iter().any(|s| s.id == *id)
+        {
+            self.sidebar_scope = SidebarScope::All;
+        }
     }
 
     fn heal_resource_selection(&mut self) {
@@ -666,6 +711,7 @@ impl AppState {
                 .first()
                 .map(|s| ServerRef::new(self.current_server_id(), s.id.clone()));
         }
+        self.heal_sidebar_scope();
     }
 
     /// Optimistic local echo of a `setChatConfig` mutate: stamp the row now so
@@ -831,16 +877,17 @@ impl AppState {
         display_status(chat, self.session_for(&chat.id), now)
     }
 
-    /// The sidebar's Sessions list: every non-archived chat of a LIVE space,
-    /// on any device — idle included — in pure recency order (status drives
-    /// the dot, never the position; see [`sort_active`]).
+    /// The sidebar's Sessions list: the non-archived chats of every live
+    /// space, or of the scoped space, on any device — idle included, in pure
+    /// recency order.
     pub fn overview_chats(&self, now: DateTime<Utc>) -> Vec<(ChatIndicator, &Chat)> {
+        let scope = self.sidebar_scope.space_id();
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
             .visible_chats()
             .filter(|c| {
-                c.space_id
-                    .as_deref()
-                    .is_some_and(|id| self.space_row(id).is_some())
+                c.space_id.as_deref().is_some_and(|id| {
+                    self.space_row(id).is_some() && scope.is_none_or(|scoped| scoped == id)
+                })
             })
             .map(|c| (display_status(c, self.session_for(&c.id), now), c))
             .collect();
@@ -1813,6 +1860,90 @@ mod tests {
         // No spaces at all: selection clears.
         state.apply_spaces(vec![]);
         assert_eq!(state.selected_space, None);
+    }
+
+    #[test]
+    fn overview_chats_defaults_to_every_space() {
+        let mut state = AppState::new();
+        state.apply_spaces(vec![
+            space("s1", "dev", "/a", 1),
+            space("s2", "dev", "/b", 2),
+        ]);
+        let mut a = chat("c1", 1, None);
+        a.space_id = Some("s1".into());
+        let mut b = chat("c2", 2, None);
+        b.space_id = Some("s2".into());
+        state.apply_chats(vec![a, b]);
+
+        assert_eq!(state.sidebar_scope, SidebarScope::All);
+        let ids: Vec<&str> = state
+            .overview_chats(Utc::now())
+            .iter()
+            .map(|(_, c)| c.id.as_str())
+            .collect();
+        assert_eq!(ids.len(), 2, "All scope lists every space's chats");
+    }
+
+    #[test]
+    fn overview_chats_filters_to_the_scoped_space() {
+        let mut state = AppState::new();
+        state.apply_spaces(vec![
+            space("s1", "dev", "/a", 1),
+            space("s2", "dev", "/b", 2),
+        ]);
+        let mut a = chat("c1", 1, None);
+        a.space_id = Some("s1".into());
+        let mut b = chat("c2", 2, None);
+        b.space_id = Some("s2".into());
+        state.apply_chats(vec![a, b]);
+
+        state.sidebar_scope = SidebarScope::Space("s1".into());
+        let ids: Vec<&str> = state
+            .overview_chats(Utc::now())
+            .iter()
+            .map(|(_, c)| c.id.as_str())
+            .collect();
+        assert_eq!(ids, ["c1"]);
+    }
+
+    #[test]
+    fn scope_heals_to_all_when_its_space_vanishes() {
+        let mut state = AppState::new();
+        state.apply_spaces(vec![
+            space("s1", "dev", "/a", 1),
+            space("s2", "dev", "/b", 2),
+        ]);
+        state.sidebar_scope = SidebarScope::Space("s2".into());
+
+        // s2 deleted elsewhere.
+        state.apply_spaces(vec![space("s1", "dev", "/a", 1)]);
+
+        assert_eq!(
+            state.sidebar_scope,
+            SidebarScope::All,
+            "a dangling scope falls back to All, not to an arbitrary neighbour"
+        );
+    }
+
+    #[test]
+    fn scope_survives_a_spaces_frame_that_still_contains_it() {
+        let mut state = AppState::new();
+        state.apply_spaces(vec![
+            space("s1", "dev", "/a", 1),
+            space("s2", "dev", "/b", 2),
+        ]);
+        state.sidebar_scope = SidebarScope::Space("s2".into());
+        state.apply_spaces(vec![
+            space("s1", "dev", "/a", 1),
+            space("s2", "dev", "/b", 2),
+        ]);
+        assert_eq!(state.sidebar_scope, SidebarScope::Space("s2".into()));
+    }
+
+    #[test]
+    fn scope_space_id_accessor() {
+        assert_eq!(SidebarScope::All.space_id(), None);
+        assert_eq!(SidebarScope::Space("s1".into()).space_id(), Some("s1"));
     }
 
     #[test]
