@@ -2066,32 +2066,12 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Status is a rail, not a word (comet session-row.tsx): always present
-        // so rows align and state changes read in place. Working animates (the
-        // composer-strip spinner, miniaturized); every other status is a dot.
-        let dot_color = spaces::status_dot_color(status, theme);
-        let status_rail: AnyElement = if status == comet_proto::ChatIndicator::Working {
-            div()
-                .w(px(6.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(loaders::mini_gradient_spinner(
-                    format!("chat-working-{id}"),
-                    2.0,
-                    cx.entity_id(),
-                    cx,
-                ))
-                .into_any_element()
-        } else {
-            div()
-                .size(px(6.0))
-                .rounded_full()
-                .flex_none()
-                .bg(dot_color)
-                .into_any_element()
-        };
+        // No per-row status mark (user decision, 2026-08-06 revision): the
+        // leading dot that used to carry Awaiting-input/Errored/Completed-
+        // unseen is gone and NOT replaced — those three statuses now read
+        // identically to Idle in the row. Working is the one exception: it
+        // still animates, but in the time-ago's slot on line 1 rather than a
+        // dedicated rail (see the trailing child of line 1 below).
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
         let subline = theme.text_muted.opacity(0.5);
@@ -2154,7 +2134,8 @@ impl Shell {
                 }),
             )
             // Line 0 (all-spaces only): the space this session belongs to.
-            // Hangs at pl 14 — dot 6 + gap 8 — so it starts under the title.
+            // Starts flush at the row's own padding edge, same as lines 1/2
+            // (no leading dot to clear anymore).
             .when_some(
                 match &scope {
                     RowScope::All {
@@ -2171,7 +2152,6 @@ impl Shell {
                             .flex_none()
                             .h(px(chat_row::SPACE_LINE))
                             .mb(px(chat_row::SPACE_LINE_MB))
-                            .pl(px(14.0))
                             .flex()
                             .flex_row()
                             .items_center()
@@ -2210,7 +2190,11 @@ impl Shell {
                     )
                 },
             )
-            // Line 1: status rail, title, time-ago.
+            // Line 1: title, then the trailing status slot. That slot is the
+            // time-ago normally; while Working it shows the animated
+            // throbber INSTEAD of the time-ago (not beside it) — the same
+            // `mini_gradient_spinner` the leading rail used to host, now
+            // sized for the wider time-ago slot rather than a 6px dot.
             .child(
                 div()
                     .w_full()
@@ -2220,7 +2204,6 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .gap(px(Theme::SPACE_SM))
-                    .child(status_rail)
                     .child(
                         div()
                             .flex_1()
@@ -2236,14 +2219,28 @@ impl Shell {
                                 sans.clone(),
                             )),
                     )
-                    .child(
+                    .child(if status == comet_proto::ChatIndicator::Working {
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(loaders::mini_gradient_spinner(
+                                format!("chat-working-{id}"),
+                                2.5,
+                                cx.entity_id(),
+                                cx,
+                            ))
+                            .into_any_element()
+                    } else {
                         div()
                             .flex_none()
                             .text_size(px(11.0))
                             .line_height(px(chat_row::TITLE_LINE))
                             .text_color(time_tint)
-                            .child(time_ago),
-                    ),
+                            .child(time_ago)
+                            .into_any_element()
+                    }),
             )
             // Line 2: branch on the left, agent mark pinned right. The mark is
             // flex_none so a long branch truncates into it and the right
@@ -2261,7 +2258,6 @@ impl Shell {
                     .flex_none()
                     .h(px(chat_row::META_LINE))
                     .mt(px(chat_row::META_LINE_MT))
-                    .pl(px(14.0))
                     .flex()
                     .flex_row()
                     .items_center()
