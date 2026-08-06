@@ -13,9 +13,31 @@ use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
 use comet_proto::{ChatIndicator, Device, FolderListing, Space};
 use gpui::FocusHandle;
 
-/// Space-row slot height for drag drop-index math: py(6)×2 + 17px line ≈ 29,
-/// plus the 2px column gap.
-const SPACE_ROW_SLOT: f32 = 31.0;
+/// The panel space row's own top/bottom padding (`render_panel_space_row`).
+/// Named — not a literal — so it can feed [`SPACE_ROW_SLOT`] directly: round-1
+/// review found the row's `py`/`line_height` changed (6/17 → 5/18) without
+/// `SPACE_ROW_SLOT` following, quietly mis-aiming every drag drop index. The
+/// render code below uses this same constant, so the two cannot drift apart
+/// again without a compile error.
+const PANEL_SPACE_ROW_PY: f32 = 5.0;
+
+/// The panel space row's tallest text line (the name, 13px/18 line-height) —
+/// see [`PANEL_SPACE_ROW_PY`]'s doc comment.
+const PANEL_SPACE_ROW_LINE: f32 = 18.0;
+
+/// The panel space row's full rendered height: `py` top + bottom + the line.
+/// Also what [`SpaceGhost`]'s drag-preview height mirrors.
+const PANEL_SPACE_ROW_HEIGHT: f32 = PANEL_SPACE_ROW_PY * 2.0 + PANEL_SPACE_ROW_LINE;
+
+/// Flex gap between rows in the panel's space list (`#space-panel-rows`).
+const PANEL_LIST_GAP: f32 = 2.0;
+
+/// Space-row slot height for drag drop-index math: the row's own height
+/// (`PANEL_SPACE_ROW_HEIGHT`, py 5×2 + 18px line = 28) plus the 2px gap
+/// between rows (`PANEL_LIST_GAP`) = 30. Derived from those constants, not a
+/// standalone literal, specifically so it cannot silently disagree with the
+/// row it describes — see `space_row_slot_matches_the_row_it_describes`.
+const SPACE_ROW_SLOT: f32 = PANEL_SPACE_ROW_HEIGHT + PANEL_LIST_GAP;
 
 /// Cap on the dropdown panel's space-row region (~8 rows) — every other list
 /// popover in this crate caps and scrolls (`pickers.rs`'s branch/checkout
@@ -470,7 +492,9 @@ struct SpaceDragPayload {
     name: SharedString,
 }
 
-/// The floating row rendered at the cursor while dragging.
+/// The floating row rendered at the cursor while dragging. Its height mirrors
+/// [`PANEL_SPACE_ROW_HEIGHT`] — the real row it stands in for while the
+/// actual row collapses to a spacer — so it must move if that does.
 struct SpaceGhost {
     name: SharedString,
 }
@@ -480,7 +504,7 @@ impl Render for SpaceGhost {
         let theme = Theme::of(cx);
         div()
             .w(px(200.0))
-            .h(px(29.0))
+            .h(px(PANEL_SPACE_ROW_HEIGHT))
             .px(px(Theme::SPACE_SM))
             .flex()
             .items_center()
@@ -1061,6 +1085,31 @@ mod panel_tests {
         let viewport_relative = 5.0; // just below the viewport's own top edge
         let rel_y = content_rel_y(20.0 + viewport_relative, 20.0, scrolled);
         assert_eq!(drop_index(rel_y, SPACE_ROW_SLOT, count), 4);
+    }
+
+    /// Round-1 review finding: `SPACE_ROW_SLOT` drives `drop_index` and
+    /// `slide_offset`'s pixel targets, but the tests above assert
+    /// relationships expressed symbolically in terms of `SPACE_ROW_SLOT` —
+    /// they pass whether it's 30 or 31, so they never catch it disagreeing
+    /// with the row it describes (exactly what happened when the row's `py`
+    /// went 6 → 5 and its `line_height` went 17 → 18 without this constant
+    /// following). Pinning the formula here, against literal pixel values
+    /// pulled from the row's own render code rather than from
+    /// `SPACE_ROW_SLOT`'s definition, means a future edit to the row's
+    /// padding/line-height that forgets to touch the named constants (or
+    /// reintroduces a hardcoded `py`/`line_height` literal in
+    /// `render_panel_space_row`) fails this test instead of silently
+    /// mis-aiming every drag drop index.
+    #[test]
+    fn space_row_slot_matches_the_row_it_describes() {
+        // The row's real geometry, independent of any of the constants under
+        // test: py 5 top + 18px line + py 5 bottom = 28px row, plus the 2px
+        // gap between rows in the panel's list.
+        let row_height = 5.0 + 18.0 + 5.0;
+        let list_gap = 2.0;
+        assert_eq!(PANEL_SPACE_ROW_HEIGHT, row_height);
+        assert_eq!(PANEL_LIST_GAP, list_gap);
+        assert_eq!(SPACE_ROW_SLOT, row_height + list_gap);
     }
 
     #[test]
@@ -1874,7 +1923,7 @@ impl Shell {
                             // The dragged row renders as an invisible spacer;
                             // the cursor ghost represents it.
                             Some((from, ..)) if ix == from => div()
-                                .h(px(SPACE_ROW_SLOT - 2.0))
+                                .h(px(PANEL_SPACE_ROW_HEIGHT))
                                 .flex_none()
                                 .into_any_element(),
                             _ => row.into_any_element(),
@@ -1899,7 +1948,7 @@ impl Shell {
                 .id("space-panel-rows")
                 .flex()
                 .flex_col()
-                .gap(px(2.0))
+                .gap(px(PANEL_LIST_GAP))
                 .max_h(px(PANEL_ROWS_MAX_H))
                 .overflow_y_scroll()
                 .track_scroll(&self.space_panel_scroll)
@@ -1931,7 +1980,7 @@ impl Shell {
                 .id("space-panel-rows")
                 .flex()
                 .flex_col()
-                .gap(px(2.0))
+                .gap(px(PANEL_LIST_GAP))
                 .max_h(px(PANEL_ROWS_MAX_H))
                 .overflow_y_scroll()
                 .track_scroll(&self.space_panel_scroll)
@@ -2119,7 +2168,7 @@ impl Shell {
             .gap(px(Theme::SPACE_SM))
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
-            .py(px(5.0));
+            .py(px(PANEL_SPACE_ROW_PY));
 
         // The keyboard cursor: a `card_selected_bg()` wash + full text,
         // matching `menu_row_nav`'s contract exactly (`popover.rs`) — NOT the
@@ -2209,7 +2258,7 @@ impl Shell {
                 .min_w_0()
                 .truncate()
                 .text_size(px(13.0))
-                .line_height(px(18.0))
+                .line_height(px(PANEL_SPACE_ROW_LINE))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .child(name),
         )
@@ -2220,7 +2269,7 @@ impl Shell {
                 .min_w_0()
                 .truncate()
                 .text_size(px(11.0))
-                .line_height(px(18.0))
+                .line_height(px(PANEL_SPACE_ROW_LINE))
                 .text_color(if host_offline {
                     theme.warning.opacity(0.8)
                 } else {
