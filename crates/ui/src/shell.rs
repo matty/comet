@@ -50,6 +50,7 @@ use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_heigh
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript};
 
+mod search;
 mod spaces;
 mod tabs;
 
