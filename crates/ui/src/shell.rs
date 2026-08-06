@@ -415,7 +415,8 @@ mod chat_row {
     pub(super) const SPACE_LINE: f32 = 14.0;
     /// Gap under line 0.
     pub(super) const SPACE_LINE_MB: f32 = 2.0;
-    /// Line 1: status rail + title + time-ago.
+    /// Line 1: title + time-ago (+ throbber, alongside the time, while
+    /// Working). No status rail — that was removed.
     pub(super) const TITLE_LINE: f32 = 18.0;
     /// Gap above line 2.
     pub(super) const META_LINE_MT: f32 = 2.0;
@@ -2070,8 +2071,9 @@ impl Shell {
         // leading dot that used to carry Awaiting-input/Errored/Completed-
         // unseen is gone and NOT replaced — those three statuses now read
         // identically to Idle in the row. Working is the one exception: it
-        // still animates, but in the time-ago's slot on line 1 rather than a
-        // dedicated rail (see the trailing child of line 1 below).
+        // still animates, alongside (not instead of) the time-ago on line 1
+        // rather than a dedicated rail (see the trailing child of line 1
+        // below).
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
         let subline = theme.text_muted.opacity(0.5);
@@ -2190,11 +2192,14 @@ impl Shell {
                     )
                 },
             )
-            // Line 1: title, then the trailing status slot. That slot is the
-            // time-ago normally; while Working it shows the animated
-            // throbber INSTEAD of the time-ago (not beside it) — the same
-            // `mini_gradient_spinner` the leading rail used to host, now
-            // sized for the wider time-ago slot rather than a 6px dot.
+            // Line 1: title, then the trailing right-hand column. The
+            // time-ago always shows now — Task 13 made Working replace it
+            // with the throbber; that's reverted (user request after seeing
+            // it run). While Working, the throbber sits beside the time-ago,
+            // flush right, sized 13×13 to match the harness mark on line 3
+            // and using the same `gap(px(4.0))` so the two right-hand marks
+            // line up in one column. `mini_gradient_spinner`'s 2×3 grid can't
+            // be square, so this is `gradient_spinner`'s 3×3 grid instead.
             .child(
                 div()
                     .w_full()
@@ -2219,28 +2224,38 @@ impl Shell {
                                 sans.clone(),
                             )),
                     )
-                    .child(if status == comet_proto::ChatIndicator::Working {
+                    .child(
                         div()
                             .flex_none()
                             .flex()
+                            .flex_row()
                             .items_center()
-                            .justify_center()
-                            .child(loaders::mini_gradient_spinner(
-                                format!("chat-working-{id}"),
-                                2.5,
-                                cx.entity_id(),
-                                cx,
-                            ))
-                            .into_any_element()
-                    } else {
-                        div()
-                            .flex_none()
-                            .text_size(px(11.0))
-                            .line_height(px(chat_row::TITLE_LINE))
-                            .text_color(time_tint)
-                            .child(time_ago)
-                            .into_any_element()
-                    }),
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(11.0))
+                                    .line_height(px(chat_row::TITLE_LINE))
+                                    .text_color(time_tint)
+                                    .child(time_ago),
+                            )
+                            .when(status == comet_proto::ChatIndicator::Working, |el| {
+                                el.child(
+                                    div()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(loaders::gradient_spinner(
+                                            "chat-working",
+                                            theme,
+                                            3.25,
+                                            cx.entity_id(),
+                                            cx,
+                                        )),
+                                )
+                            }),
+                    ),
             )
             // Line 2: branch on the left, agent mark pinned right. The mark is
             // flex_none so a long branch truncates into it and the right
