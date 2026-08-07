@@ -30,8 +30,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessCapabilities, HarnessId, Model, ReasoningLevel, RunRequest,
-    SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessAvailability, HarnessCapabilities, HarnessId, Model,
+    ReasoningLevel, RunRequest, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
@@ -233,6 +233,15 @@ impl Harness for ClaudeHarness {
     }
     fn capabilities(&self) -> HarnessCapabilities {
         Self::capabilities()
+    }
+
+    async fn availability(&self) -> HarnessAvailability {
+        match self.resolve_executable() {
+            Ok(exe) => crate::probe_cli_version(&exe).await,
+            Err(err) => HarnessAvailability::Unavailable {
+                reason: err.to_string(),
+            },
+        }
     }
 
     /// The curated static catalog (see [`catalog`]); requires an installed CLI

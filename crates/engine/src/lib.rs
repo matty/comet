@@ -156,6 +156,9 @@ impl EngineCore {
         let store = Arc::new(DocsStore::open(&local_root)?);
         let journal = Arc::new(RunJournal::open(local_root.join("journals"))?);
         let detected_device_name = local_device_name();
+        // Probe provider CLIs off the boot path. Fire-and-forget: nothing here
+        // waits on it, and a harness stays selectable until its result lands.
+        registry.spawn_availability_probes();
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
         let doc_host = DocHost::new(
             store.clone(),
