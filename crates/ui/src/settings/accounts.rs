@@ -22,6 +22,7 @@ use comet_proto::{
 use comet_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::errors;
 use crate::popover::{self, Loadable};
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -405,7 +406,8 @@ impl AccountsPage {
 
     fn load(&mut self, force_usage: bool, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).selected_client() else {
-            self.snapshot = Loadable::Error("Engine not connected".into());
+            self.snapshot =
+                Loadable::Error("Couldn't load your accounts — Comet isn't connected.".into());
             return;
         };
         self.snapshot = Loadable::Loading;
@@ -419,9 +421,13 @@ impl AccountsPage {
                 page.snapshot = match result {
                     Ok(value) => match serde_json::from_value::<AgentAccountsSnapshot>(value) {
                         Ok(snapshot) => Loadable::Ready(snapshot),
-                        Err(err) => Loadable::Error(err.to_string()),
+                        Err(err) => {
+                            Loadable::Error(errors::decode_failure(errors::Loading::Accounts, &err))
+                        }
                     },
-                    Err(err) => Loadable::Error(err.to_string()),
+                    Err(err) => {
+                        Loadable::Error(errors::load_failure(errors::Loading::Accounts, &err))
+                    }
                 };
                 cx.notify();
             })

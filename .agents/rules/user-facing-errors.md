@@ -46,20 +46,42 @@ Rules of thumb for the copy:
 - Amber (`warning_muted`) for a state to resolve; red (`danger`) for something
   that actually failed. "Not installed" is amber.
 
+## Where the translation lives
+
+`crates/ui/src/errors.rs`. Every failing load goes through it:
+
+```rust
+Err(err) => Loadable::Error(errors::load_failure(errors::Loading::Agents, &err)),
+```
+
+It picks copy from the `RpcError` *variant* plus the caller's `Loading` context
+and never reads the error's message, because the message is the developer-facing
+part. `RpcError::Failed` carries `EngineError`'s Display, whose arms are prefixed
+`store:`, `doc:`, `io:` — which is why pass-through is not an option even though
+some of those messages look presentable. Adding a surface means adding a
+`Loading` variant, not writing a new sentence at the call site.
+
+Two distinctions the copy makes, both load-bearing:
+
+- Transient (`Closed`, `Transport`) says the engine isn't responding. A version
+  mismatch (`UnknownMethod`, `BadParams`) says to restart — retrying cannot fix
+  it, and the Retry control is sitting right there implying it can.
+- A single sentence is enough where a Retry affordance is adjacent: the button
+  *is* the hint. The summary/hint split matters where there is no such control,
+  as on the harness rail rows.
+
 ## Known debt — check before adding more
 
-Do not extend these patterns; fix the one you touch.
-
-- `Err(e) => Loadable::Error(e.to_string())` appears in ~12 places across
-  `pickers.rs`, `settings/accounts.rs`, and `shell/spaces.rs`. Each one puts an
-  `RpcError` on screen verbatim, including `BadParams` — which wraps
-  `serde_json::Error`, so a wire mismatch shows the user
-  "bad params: missing field `capabilities` at line 1 column 87".
 - **`RpcClient::call` has no timeout** (`crates/rpc/src/client.rs`). `rx.await`
   resolves when the reply lands or when the connection drops — a live engine
   whose handler never answers leaves the caller pending forever, and the
   `Loadable` slot stays `Loading` with no Retry. Handlers shell out to `git` and
-  spawn agent CLIs, so a hang is reachable, not theoretical.
+  spawn agent CLIs, so a hang is reachable, not theoretical. **This is the open
+  half of the rule: the "no raw errors" half now holds, the "no unbounded wait"
+  half does not.** Fixing it needs a decision first — a blanket timeout breaks
+  legitimately slow calls (a large `git diff`, a cold repo scan), so the
+  candidates are a per-method budget or a "still working — cancel?" state that
+  never hard-fails.
 
 The error surfaces themselves are fine: `popover::error_row` and
 `widgets::error_strip` both carry a Retry affordance. It is the *message text*

@@ -511,7 +511,13 @@ enum UpdateFlow {
     Downloading,
     /// Staged bundle ready to swap in — one click restarts into it.
     Ready(PathBuf),
-    Failed(SharedString),
+    /// Carries no message on purpose. The failure is an anyhow chain from
+    /// `comet_update` ("staging failed: io error: Access is denied. (os error
+    /// 5)"), and this renders in a narrow sidebar chip — it was neither
+    /// readable there nor useful to a user. The chain is logged at the point
+    /// of failure instead; the chip offers the retry, which is the only action
+    /// available either way.
+    Failed,
 }
 
 pub struct Shell {
@@ -2719,7 +2725,7 @@ impl Shell {
                 UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
                 UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
                 UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
-                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
+                UpdateFlow::Failed => ("Update failed — click to retry".into(), true),
             }
         } else {
             (
@@ -2727,7 +2733,7 @@ impl Shell {
                 true,
             )
         };
-        let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
+        let failed = matches!(self.update_flow, UpdateFlow::Failed);
         let tone = if failed { theme.danger } else { theme.accent };
         // The chip fill is the sidebar's WHITE wash language, not an accent
         // tint: an indigo fill over the glass composited into a dark slab that
@@ -2787,7 +2793,7 @@ impl Shell {
             return;
         }
         match std::mem::replace(&mut self.update_flow, UpdateFlow::Idle) {
-            UpdateFlow::Idle | UpdateFlow::Failed(_) => self.begin_update_download(cx),
+            UpdateFlow::Idle | UpdateFlow::Failed => self.begin_update_download(cx),
             UpdateFlow::Downloading => self.update_flow = UpdateFlow::Downloading,
             UpdateFlow::Ready(staged) => self.apply_staged_update(staged, cx),
         }
@@ -2814,7 +2820,7 @@ impl Shell {
                     Ok(staged) => UpdateFlow::Ready(staged),
                     Err(message) => {
                         tracing::warn!(%message, "update download failed");
-                        UpdateFlow::Failed(message.into())
+                        UpdateFlow::Failed
                     }
                 };
                 cx.notify();
@@ -2838,7 +2844,7 @@ impl Shell {
             }
             Err(err) => {
                 tracing::error!(error = %err, "update apply failed");
-                self.update_flow = UpdateFlow::Failed(format!("{err:#}").into());
+                self.update_flow = UpdateFlow::Failed;
                 cx.notify();
             }
         }

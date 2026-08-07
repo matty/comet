@@ -42,6 +42,7 @@ const HARNESS_REVALIDATE_INTERVAL: Duration = Duration::from_millis(500);
 const HARNESS_REVALIDATE_ATTEMPTS: usize = 20;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::errors;
 use crate::motion;
 use crate::popover::{self, Loadable, MenuKey};
 use crate::settings::composer::ComposerDefaults;
@@ -688,9 +689,13 @@ impl Pickers {
                 pickers.harnesses = match result {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
                         Ok(list) => Loadable::Ready(list),
-                        Err(err) => Loadable::Error(err.to_string()),
+                        Err(err) => {
+                            Loadable::Error(errors::decode_failure(errors::Loading::Agents, &err))
+                        }
                     },
-                    Err(err) => Loadable::Error(err.to_string()),
+                    Err(err) => {
+                        Loadable::Error(errors::load_failure(errors::Loading::Agents, &err))
+                    }
                 };
                 if let Some(harness) = pickers.effective_harness(cx) {
                     pickers.ensure_models(harness, cx);
@@ -817,9 +822,13 @@ impl Pickers {
                 let loaded = match result {
                     Ok(value) => match serde_json::from_value::<Vec<Model>>(value) {
                         Ok(models) => Loadable::Ready(models),
-                        Err(err) => Loadable::Error(err.to_string()),
+                        Err(err) => {
+                            Loadable::Error(errors::decode_failure(errors::Loading::Models, &err))
+                        }
                     },
-                    Err(err) => Loadable::Error(err.to_string()),
+                    Err(err) => {
+                        Loadable::Error(errors::load_failure(errors::Loading::Models, &err))
+                    }
                 };
                 if let Loadable::Ready(models) = &loaded {
                     let fresh = pickers
@@ -892,9 +901,13 @@ impl Pickers {
                 pickers.refs = match result {
                     Ok(value) => match serde_json::from_value::<Vec<RepoRef>>(value) {
                         Ok(refs) => Loadable::Ready(refs),
-                        Err(err) => Loadable::Error(err.to_string()),
+                        Err(err) => {
+                            Loadable::Error(errors::decode_failure(errors::Loading::Branches, &err))
+                        }
                     },
-                    Err(err) => Loadable::Error(err.to_string()),
+                    Err(err) => {
+                        Loadable::Error(errors::load_failure(errors::Loading::Branches, &err))
+                    }
                 };
                 // Rows landed under an open, un-searched popover: re-home the
                 // nav highlight to the selected row.
@@ -979,7 +992,7 @@ impl Pickers {
                         pickers.open = None;
                         pickers.ensure_refs(true, cx);
                     }
-                    Err(err) => pickers.switch_error = Some(err.to_string()),
+                    Err(err) => pickers.switch_error = Some(errors::switch_failure(&err)),
                 }
                 cx.notify();
             })
@@ -1067,7 +1080,7 @@ impl Pickers {
                         // Checkout state changed — refresh tags/current.
                         pickers.ensure_refs(true, cx);
                     }
-                    Err(err) => pickers.switch_error = Some(err.to_string()),
+                    Err(err) => pickers.switch_error = Some(errors::switch_failure(&err)),
                 }
                 cx.notify();
             })
