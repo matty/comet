@@ -20,7 +20,11 @@ use comet_proto::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum HarnessError {
-    #[error("harness binary not found: {0}")]
+    // "Agent CLI", not "harness binary": this string reaches the models pane
+    // verbatim, and "harness" is our internal word for something the UI calls
+    // an Agent. Every constructor passes either a CLI name, a path, or a
+    // sentence, so the prefix has to read as a lead-in to all three.
+    #[error("Agent CLI not found: {0}")]
     NotInstalled(String),
     #[error("harness protocol error: {0}")]
     Protocol(String),
@@ -150,18 +154,71 @@ pub(crate) fn resolve_cli(
         .find(|p| p.is_file())
 }
 
-/// The `NotInstalled` message: what was searched and how to override it. The
-/// searched locations differ per platform, so the prose does too.
-pub(crate) fn not_installed_message(stem: &str, override_var: &str) -> String {
-    let locations = if cfg!(windows) {
+/// Every place [`find_on_path`] and its callers look for a CLI. Diagnostic
+/// detail: it names ten locations and differs per platform, which is useful in
+/// a log and unreadable in a picker row.
+///
+/// This used to be concatenated into the user-facing message, ahead of the
+/// override hint. That put the only actionable clause last, behind ~180
+/// characters of inventory — so it was both the hardest part to reach and the
+/// first part any truncation dropped.
+pub(crate) fn searched_locations() -> &'static str {
+    if cfg!(windows) {
         "PATH, the persisted machine/user PATH, %LOCALAPPDATA%\\Programs, \
          %APPDATA%\\npm, the WinGet/scoop shim dirs, and volta/fnm/pnpm/bun \
          install dirs"
     } else {
         "PATH, the login shell's PATH, ~/.local/bin, the CLI's own install dir, \
          /opt/homebrew/bin, /usr/local/bin, and fnm/nvm/volta/pnpm/bun install dirs"
-    };
-    format!("{stem} (searched {locations}; set {override_var} to override)")
+    }
+}
+
+/// The user-facing halves of "this CLI could not be found": a row label and the
+/// one sentence that says what to do. Logs the searched locations as a side
+/// effect, which is the only place that inventory is now reachable.
+pub(crate) fn not_installed(stem: &str, override_var: &str) -> (String, String) {
+    tracing::debug!(
+        cli = stem,
+        searched = searched_locations(),
+        "cli did not resolve"
+    );
+    (
+        "Not installed".to_string(),
+        format!("Install {stem}, or set {override_var} to its path."),
+    )
+}
+
+/// The same failure as one line, for [`HarnessError::NotInstalled`] — an error
+/// that surfaces without a row to label it and so has to name the CLI itself.
+///
+/// Says only the CLI name and the fix: the error's own Display already supplies
+/// "not found", and stating it twice is how this read before
+/// ("Agent CLI not found: codex isn't installed…").
+pub(crate) fn not_installed_message(stem: &str, override_var: &str) -> String {
+    let (_, hint) = not_installed(stem, override_var);
+    format!("{stem}. {hint}")
+}
+
+/// Availability for a CLI that never resolved far enough to be probed.
+///
+/// Kept out of the adapters so both name the same summaries: the picker groups
+/// rows by that label, and two adapters inventing their own wording for the
+/// same failure is exactly the drift this collapses.
+pub(crate) fn unavailable_from_resolve(
+    err: &HarnessError,
+    stem: &str,
+    override_var: &str,
+) -> HarnessAvailability {
+    match err {
+        HarnessError::NotInstalled(_) => {
+            let (summary, hint) = not_installed(stem, override_var);
+            HarnessAvailability::unavailable(summary, Some(hint))
+        }
+        // Anything else is a configured-but-broken install (a bad override
+        // path, a permissions failure) — it has no install hint to offer, so
+        // the error itself is the most useful sentence available.
+        other => HarnessAvailability::unavailable("Not working", Some(other.to_string())),
+    }
 }
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
@@ -279,27 +336,38 @@ pub(crate) async fn probe_cli_version(exe: &std::path::Path) -> HarnessAvailabil
         Ok(Ok(output)) if output.status.success() => HarnessAvailability::Available {
             version: parse_cli_version(&String::from_utf8_lossy(&output.stdout)),
         },
+        // A resolved-but-broken CLI keeps its own stderr: "not installed" would
+        // be actively misleading, and the stderr line is usually the only thing
+        // that explains a half-finished install. It goes in the hint, where the
+        // full text is reachable, while the summary stays row-sized.
         Ok(Ok(output)) => {
             let status = describe_exit(Some(output.status));
             let stderr = String::from_utf8_lossy(&output.stderr);
             let detail = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-            HarnessAvailability::Unavailable {
-                reason: if detail.is_empty() {
-                    format!("{name} --version failed ({status})")
+            tracing::debug!(cli = %name, %status, detail, "cli --version failed");
+            HarnessAvailability::unavailable(
+                "Not working",
+                Some(if detail.is_empty() {
+                    format!("`--version` failed ({status}).")
                 } else {
-                    format!("{name} --version failed ({status}): {}", detail.trim())
-                },
-            }
+                    format!("`--version` failed ({status}): {}", detail.trim())
+                }),
+            )
         }
-        Ok(Err(err)) => HarnessAvailability::Unavailable {
-            reason: format!("{name} could not be started: {err}"),
-        },
-        Err(_) => HarnessAvailability::Unavailable {
-            reason: format!(
-                "{name} did not answer --version within {}s",
+        Ok(Err(err)) => {
+            tracing::debug!(cli = %name, error = %err, "cli could not be started");
+            HarnessAvailability::unavailable(
+                "Not working",
+                Some(format!("{name} could not be started: {err}")),
+            )
+        }
+        Err(_) => HarnessAvailability::unavailable(
+            "Not responding",
+            Some(format!(
+                "{name} did not answer `--version` within {}s.",
                 PROBE_TIMEOUT.as_secs()
-            ),
-        },
+            )),
+        ),
     }
 }
 
@@ -509,8 +577,13 @@ mod probe_tests {
         );
     }
 
-    /// A CLI that resolves but fails carries its own stderr into the reason —
-    /// "not installed" would be actively misleading for a broken install.
+    /// A CLI that resolves but fails carries its own stderr into the hint —
+    /// "Not installed" would be actively misleading for a broken install.
+    ///
+    /// The hint deliberately does NOT repeat the binary path: this string is
+    /// rendered against a row that already names the agent, and re-stating a
+    /// full Windows path there is what made the old single-string reason too
+    /// long to read.
     #[cfg(windows)]
     #[tokio::test]
     async fn a_failing_cli_reports_its_own_error() {
@@ -518,34 +591,64 @@ mod probe_tests {
         let shim = dir.path().join("broken-cli.cmd");
         std::fs::write(&shim, "@echo off\r\necho boom 1>&2\r\nexit /b 3\r\n").unwrap();
 
-        let reason = probe_cli_version(&shim)
-            .await
-            .unavailable_reason()
-            .expect("a non-zero exit is unavailable")
-            .to_owned();
-        assert!(
-            reason.contains("broken-cli"),
-            "must name the binary: {reason}"
+        let availability = probe_cli_version(&shim).await;
+        assert_eq!(
+            availability.unavailable_summary(),
+            Some("Not working"),
+            "a broken install must not claim to be missing"
         );
-        assert!(
-            reason.contains("exit code 3"),
-            "must carry status: {reason}"
-        );
-        assert!(reason.contains("boom"), "must carry stderr: {reason}");
+        let hint = availability
+            .unavailable_hint()
+            .expect("a non-zero exit has something to say");
+        assert!(hint.contains("exit code 3"), "must carry status: {hint}");
+        assert!(hint.contains("boom"), "must carry stderr: {hint}");
     }
 
-    /// A binary that does not exist must produce prose naming it, not a
-    /// generic io error — the string is rendered verbatim in the picker.
+    /// A binary that does not exist names itself in the hint — this is the
+    /// bad-override case, where *which* path failed is the whole diagnosis.
     #[tokio::test]
     async fn a_missing_binary_probes_as_unavailable() {
         let missing = std::path::Path::new("comet-definitely-not-a-real-cli");
         let availability = probe_cli_version(missing).await;
-        let reason = availability
-            .unavailable_reason()
+        assert_eq!(availability.unavailable_summary(), Some("Not working"));
+        let hint = availability
+            .unavailable_hint()
             .expect("a missing binary is unavailable");
         assert!(
-            reason.contains("comet-definitely-not-a-real-cli"),
-            "reason must name the binary: {reason}"
+            hint.contains("comet-definitely-not-a-real-cli"),
+            "hint must name the binary it could not start: {hint}"
+        );
+    }
+
+    /// The summary is a ROW LABEL: the rail is 148px, so anything long enough
+    /// to truncate there defeats the caption and sends the user back to hover.
+    /// Every summary this crate can produce is checked, not just a sample.
+    #[test]
+    fn every_summary_is_short_enough_to_render_in_the_rail() {
+        let (not_installed_summary, hint) = not_installed("codex", "CODEX_EXECUTABLE");
+        for summary in [
+            not_installed_summary.as_str(),
+            "Not working",
+            "Not responding",
+        ] {
+            assert!(
+                summary.len() <= 16,
+                "summary must fit the rail caption: {summary:?}"
+            );
+            assert!(
+                !summary.contains("searched"),
+                "the searched-location inventory belongs in the log: {summary:?}"
+            );
+        }
+        // The hint is the actionable half, and the override variable is the
+        // action — burying it behind an inventory is the bug being fixed.
+        assert!(
+            hint.contains("CODEX_EXECUTABLE"),
+            "hint must name the override: {hint}"
+        );
+        assert!(
+            !hint.contains("searched"),
+            "hint must not carry the inventory: {hint}"
         );
     }
 }

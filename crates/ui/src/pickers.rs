@@ -2028,6 +2028,11 @@ impl Pickers {
                 {
                     descriptors.insert(0, descriptor.clone());
                 }
+                // The agent the session is committed to, named so a locked-out
+                // row can say *why* it is inert instead of just looking faded.
+                let committed_name: Option<SharedString> = effective
+                    .and_then(|id| descriptors.iter().find(|d| d.id == id))
+                    .map(|d| SharedString::from(d.name.clone()));
                 // Vertical agents rail (the palette's Devices-rail language):
                 // brand icon + name per row, active carries the glass ring.
                 div()
@@ -2042,16 +2047,34 @@ impl Pickers {
                         // An unavailable provider greys out whether or not it
                         // is the viewed one: a committed harness whose CLI has
                         // gone missing is exactly the case worth surfacing.
-                        let unavailable: Option<SharedString> = descriptor
+                        //
+                        // Kept apart from the lock because they are different
+                        // facts that used to paint identically: "not installed
+                        // on this machine" is durable and worth acting on,
+                        // while "the session is already using another agent" is
+                        // transient and needs no action. One shared 0.35 dim
+                        // made them indistinguishable, and only one of the two
+                        // ever explained itself.
+                        let summary: Option<SharedString> = descriptor
                             .availability
-                            .unavailable_reason()
-                            .map(|reason| SharedString::from(reason.to_owned()));
-                        let is_disabled = (locked && !is_viewed) || unavailable.is_some();
+                            .unavailable_summary()
+                            .map(|s| SharedString::from(s.to_owned()));
+                        let hint: Option<SharedString> = descriptor
+                            .availability
+                            .unavailable_hint()
+                            .map(|h| SharedString::from(h.to_owned()));
+                        let state = RailRowState::of(locked, is_viewed, summary.is_some());
+                        let locked_out = state == RailRowState::LockedOut;
+                        let is_disabled = state.is_disabled();
                         let (icon_path, tint) = harness_brand_icon(harness);
                         let name: SharedString = descriptor.name.clone().into();
                         div()
                             .id(("harness-tab", ix))
-                            .h(px(30.0))
+                            // Tall enough for the caption when there is one.
+                            // Both heights are constants: an unavailable row is
+                            // taller because it says more, never because of
+                            // which appearance is painting it.
+                            .h(px(if summary.is_some() { 42.0 } else { 30.0 }))
                             .px(px(8.0))
                             .flex()
                             .flex_row()
@@ -2069,7 +2092,15 @@ impl Pickers {
                                 el.bg(crate::theme::card_selected_bg())
                                     .shadow(crate::theme::card_selected_shadows())
                             })
-                            .when(is_disabled, |el| el.opacity(0.35))
+                            // Only the LOCK dims wholesale. An unavailable row
+                            // has to stay readable: it is carrying a caption
+                            // the user is meant to act on, and 0.35 opacity
+                            // drove that text under the contrast floor the
+                            // theme's paired text tokens exist to guarantee.
+                            // It reads as inert through `text_faint` (the
+                            // documented disabled token, AA at 4.5:1) instead.
+                            .when(locked_out, |el| el.opacity(0.35))
+                            .when(summary.is_some(), |el| el.text_color(theme.text_faint))
                             .when(!is_disabled, |el| el.cursor_pointer())
                             // Hover must not replace the viewed row's selected
                             // fill with the weaker wash — that dims the active
@@ -2078,18 +2109,45 @@ impl Pickers {
                             .when(!is_disabled && !is_viewed, |el| {
                                 el.hover(|s| s.bg(crate::theme::ink(0.06)))
                             })
-                            // The greyed-out row still answers "why?" on hover;
-                            // that is the only place the untruncated reason
-                            // (including the override hint) is reachable.
-                            .when_some(unavailable, |el, reason| {
+                            // Hover carries the FIX only. The state itself is
+                            // in the caption, so this no longer has to restate
+                            // it — which is what made the old tooltip a
+                            // five-line block that covered the Retry control in
+                            // the models pane behind it.
+                            //
+                            // Suppressed on the VIEWED row, where the models
+                            // pane is already showing this same sentence a few
+                            // pixels to the right: a tooltip that duplicates
+                            // visible text earns nothing and lands on top of
+                            // the Retry control while doing it.
+                            .when_some(hint.filter(|_| !is_viewed), |el, hint| {
                                 el.tooltip(move |_, cx| {
-                                    cx.new(|_| HarnessUnavailableTooltip {
-                                        reason: reason.clone(),
+                                    cx.new(|_| HarnessRowTooltip {
+                                        message: hint.clone(),
                                         row: ix,
                                     })
                                     .into()
                                 })
                             })
+                            // A locked row explains itself too. Without this it
+                            // was the one dimmed state on screen with no way to
+                            // find out why.
+                            .when_some(
+                                committed_name.clone().filter(|_| locked_out),
+                                |el, committed| {
+                                    el.tooltip(move |_, cx| {
+                                        cx.new(|_| HarnessRowTooltip {
+                                            message: format!(
+                                                "This session is using {committed}. Start a new \
+                                                 session to use a different agent."
+                                            )
+                                            .into(),
+                                            row: ix,
+                                        })
+                                        .into()
+                                    })
+                                },
+                            )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.pick_harness(harness, cx);
                             }))
@@ -2103,7 +2161,35 @@ impl Pickers {
                                         theme.text_muted
                                     })),
                             )
-                            .child(div().min_w_0().truncate().child(name))
+                            .child(
+                                // The state rides UNDER the name, visible with
+                                // no hover at all. The rail is 148px wide and
+                                // this label is two words, so it fits where the
+                                // old full-sentence reason could not — that
+                                // width is exactly why the reason was banished
+                                // to a tooltip in the first place.
+                                div()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.0))
+                                    .child(div().min_w_0().truncate().child(name))
+                                    .when_some(summary, |el, summary| {
+                                        el.child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(px(10.0))
+                                                .font_weight(gpui::FontWeight::NORMAL)
+                                                // Amber, not red: an agent that
+                                                // isn't installed is a state to
+                                                // resolve, not an error the
+                                                // user just caused.
+                                                .text_color(theme.warning_muted)
+                                                .child(summary),
+                                        )
+                                    }),
+                            )
                     }))
                     .into_any_element()
             }
@@ -2516,6 +2602,42 @@ fn harness_catalog_settled(slot: &Loadable<Vec<HarnessDescriptor>>) -> bool {
         .is_some_and(|list| !catalog_awaits_probes(list))
 }
 
+/// Why a rail row cannot be picked, if it cannot.
+///
+/// The two inert states are genuinely different facts and must not paint the
+/// same: [`Unavailable`] is durable, machine-wide, and worth acting on, while
+/// [`LockedOut`] is a property of *this* session and needs no action at all.
+///
+/// [`Unavailable`]: RailRowState::Unavailable
+/// [`LockedOut`]: RailRowState::LockedOut
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RailRowState {
+    Pickable,
+    /// The session is committed to a different agent.
+    LockedOut,
+    /// The CLI is missing or broken on this machine.
+    Unavailable,
+}
+
+impl RailRowState {
+    /// `unavailable` outranks the lock: a missing CLI stays true after this
+    /// session ends, so it is the more useful of the two to report — and it is
+    /// the one the *viewed* row can be in, which the lock never is.
+    fn of(locked: bool, is_viewed: bool, unavailable: bool) -> Self {
+        if unavailable {
+            Self::Unavailable
+        } else if locked && !is_viewed {
+            Self::LockedOut
+        } else {
+            Self::Pickable
+        }
+    }
+
+    fn is_disabled(self) -> bool {
+        !matches!(self, Self::Pickable)
+    }
+}
+
 /// Whether a probed harness came back unusable.
 ///
 /// A harness the catalog does not list, and one whose probe has not landed,
@@ -2525,31 +2647,32 @@ fn harness_catalog_settled(slot: &Loadable<Vec<HarnessDescriptor>>) -> bool {
 fn harness_is_unavailable(list: &[HarnessDescriptor], harness: HarnessId) -> bool {
     list.iter()
         .find(|d| d.id == harness)
-        .is_some_and(|d| d.availability.unavailable_reason().is_some())
+        .is_some_and(|d| d.availability.is_unavailable())
 }
 
-/// Why a greyed-out harness cannot be used, shown on hover over its rail row.
+/// What to do about a rail row that cannot be picked — the install hint for an
+/// unavailable agent, or which agent the session is locked to.
 ///
-/// The rail is a fixed 148px column and the reason is a full sentence whose
-/// actionable half — the override variable — is its last clause, so truncating
-/// it into the row would drop exactly the part worth reading. The tooltip is
-/// where the untruncated prose fits.
-struct HarnessUnavailableTooltip {
-    reason: SharedString,
-    /// Distinct per rail row, so moving between two unavailable harnesses
-    /// re-runs the fade instead of reusing the previous row's animation.
+/// Carries the ACTION, never the state: the row itself now shows the state in
+/// a caption. The predecessor to this struct restated the whole failure here,
+/// which produced a five-line block sitting on top of the models pane and the
+/// Retry control the user needed to reach.
+struct HarnessRowTooltip {
+    message: SharedString,
+    /// Distinct per rail row, so moving between two disabled harnesses re-runs
+    /// the fade instead of reusing the previous row's animation.
     row: usize,
 }
 
-impl gpui::Render for HarnessUnavailableTooltip {
+impl gpui::Render for HarnessRowTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
         motion::fade_quick(
-            ("harness-unavailable-tooltip", self.row),
+            ("harness-row-tooltip", self.row),
             div()
-                // Wraps rather than truncates — the reason is prose, and the
-                // override hint sits at the end of it.
-                .max_w(px(320.0))
+                // Wraps rather than truncates — one sentence, but a path in an
+                // override hint can still be long.
+                .max_w(px(260.0))
                 .px(px(8.0))
                 .py(px(6.0))
                 .rounded(px(5.0))
@@ -2558,7 +2681,7 @@ impl gpui::Render for HarnessUnavailableTooltip {
                 .bg(theme.surface_raised)
                 .text_size(px(11.0))
                 .text_color(theme.text_muted)
-                .child(self.reason.clone()),
+                .child(self.message.clone()),
         )
     }
 }
@@ -2970,9 +3093,10 @@ mod tests {
             ),
             with(
                 HarnessId::Codex,
-                HarnessAvailability::Unavailable {
-                    reason: "codex (searched PATH; set CODEX_EXECUTABLE to override)".into(),
-                },
+                HarnessAvailability::unavailable(
+                    "Not installed",
+                    Some("Install codex, or set CODEX_EXECUTABLE to its path.".into()),
+                ),
             ),
         ];
         assert!(
@@ -3009,9 +3133,7 @@ mod tests {
         )])));
         assert!(harness_catalog_settled(&Loadable::Ready(vec![
             with(HarnessAvailability::Available { version: None }),
-            with(HarnessAvailability::Unavailable {
-                reason: "not installed".into()
-            }),
+            with(HarnessAvailability::unavailable("Not installed", None)),
         ])));
         // An empty catalog is vacuously settled — there is nothing to probe.
         assert!(harness_catalog_settled(&Loadable::Ready(vec![])));
@@ -3033,9 +3155,10 @@ mod tests {
             with(HarnessId::ClaudeCode, HarnessAvailability::Unknown),
             with(
                 HarnessId::Codex,
-                HarnessAvailability::Unavailable {
-                    reason: "codex (searched PATH; set CODEX_EXECUTABLE to override)".into(),
-                },
+                HarnessAvailability::unavailable(
+                    "Not installed",
+                    Some("Install codex, or set CODEX_EXECUTABLE to its path.".into()),
+                ),
             ),
             with(
                 HarnessId::Mock,
@@ -3054,6 +3177,47 @@ mod tests {
         assert!(!harness_is_unavailable(&list, HarnessId::Cursor));
         // An empty catalog must not block everything.
         assert!(!harness_is_unavailable(&[], HarnessId::Codex));
+    }
+
+    /// The two inert states must stay tellable apart. They previously shared a
+    /// single `is_disabled` flag and painted identically, so a missing CLI and
+    /// a session already committed to another agent looked the same and only
+    /// one of them ever said why.
+    #[test]
+    fn a_locked_row_and_an_unavailable_row_are_different_states() {
+        // Locked out: another agent owns the session. Transient, no action.
+        assert_eq!(
+            RailRowState::of(true, false, false),
+            RailRowState::LockedOut
+        );
+        // The viewed row is never locked out — the lock is what makes it the
+        // viewed one.
+        assert_eq!(RailRowState::of(true, true, false), RailRowState::Pickable);
+        // Unavailable outranks the lock, and unlike the lock it applies to the
+        // viewed row: a committed agent whose CLI vanished is exactly the case
+        // worth surfacing.
+        assert_eq!(
+            RailRowState::of(true, true, true),
+            RailRowState::Unavailable
+        );
+        assert_eq!(
+            RailRowState::of(true, false, true),
+            RailRowState::Unavailable
+        );
+        assert_eq!(
+            RailRowState::of(false, false, true),
+            RailRowState::Unavailable
+        );
+        // Nothing wrong, nothing committed.
+        assert_eq!(
+            RailRowState::of(false, false, false),
+            RailRowState::Pickable
+        );
+        // Both inert states block the pick, which is what `pick_harness` and
+        // the hover wash key off.
+        assert!(RailRowState::LockedOut.is_disabled());
+        assert!(RailRowState::Unavailable.is_disabled());
+        assert!(!RailRowState::Pickable.is_disabled());
     }
 
     #[test]

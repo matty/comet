@@ -238,9 +238,7 @@ impl Harness for ClaudeHarness {
     async fn availability(&self) -> HarnessAvailability {
         match self.resolve_executable() {
             Ok(exe) => crate::probe_cli_version(&exe).await,
-            Err(err) => HarnessAvailability::Unavailable {
-                reason: err.to_string(),
-            },
+            Err(err) => crate::unavailable_from_resolve(&err, "claude", "CLAUDE_CODE_EXECUTABLE"),
         }
     }
 
