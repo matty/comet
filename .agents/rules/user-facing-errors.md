@@ -70,6 +70,44 @@ Two distinctions the copy makes, both load-bearing:
   *is* the hint. The summary/hint split matters where there is no such control,
   as on the harness rail rows.
 
+## Waiting: the slow-request toast
+
+`crates/ui/src/toast.rs`. After `SLOW_AFTER` (4s) a request stops being silent:
+a top-anchored toast names what is loading and offers Cancel. The wait is never
+cut short — a hard timeout would fail work that was about to succeed — so the
+bound is on *silence*, not on the request.
+
+Registering a load takes three lines at the call site:
+
+```rust
+let (request_id, cancelled) = toast::begin(cx, errors::Loading::Models);
+let call = std::pin::pin!(engine.client().call(method, params));
+let outcome = futures::future::select(call, cancelled).await;
+// …then toast::end(cx, request_id) on every path out, and resolve the slot to
+// toast::cancelled_message(what) on the Right arm.
+```
+
+Cancel is real: losing the select race drops the RPC future, and `RpcClient`'s
+`PendingGuard` turns that drop into a `{id, cancel}` frame, so the engine stops
+too. A cancelled slot must then be **re-armed on the next discrete demand**
+(`Pickers::rearm_cancelled_models`) — never from render, which runs `ensure_*`
+every frame and would restart the request as fast as it was cancelled.
+
+### Not yet registered
+
+Only the **model list** is wired. These four still load without a toast, and
+each is the same three-line transformation above:
+
+| Surface | Function |
+| --- | --- |
+| Harness catalog | `pickers.rs` `ensure_harnesses` |
+| Branch list | `pickers.rs` `ensure_refs` |
+| Folder browser | `shell/spaces.rs` folder listing |
+| Accounts page | `settings/accounts.rs` `load` |
+
+Wire one when you touch it. Each needs its own re-arm decision — the discrete
+"asked for it again" event differs per surface (picker open, page revisit).
+
 ## Known debt — check before adding more
 
 - **`RpcClient::call` has no timeout** (`crates/rpc/src/client.rs`). `rx.await`

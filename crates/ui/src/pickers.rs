@@ -48,6 +48,7 @@ use crate::popover::{self, Loadable, MenuKey};
 use crate::settings::composer::ComposerDefaults;
 use crate::state::{AppState, ServerClient};
 use crate::theme::Theme;
+use crate::toast;
 
 // ---------------------------------------------------------------------------
 // Draft config (what the pickers accumulate)
@@ -318,6 +319,17 @@ pub struct Pickers {
     switch_task: Option<Task<()>>,
     /// Last mid-session switch failure (shown in the ref popover).
     switch_error: Option<String>,
+    /// Harnesses whose model load the user cancelled from the slow-request
+    /// toast.
+    ///
+    /// A cancelled slot holds an `Error`, which `ensure_models` refuses to
+    /// reload — that is deliberate for a real failure (render re-runs
+    /// `ensure_*` every frame, so a self-reloading error state would spam the
+    /// engine). But a cancel is not a failure: the user stopped *this*
+    /// attempt, not the feature. So the cancel is remembered here and the slot
+    /// is re-armed on the next DISCRETE demand — opening the picker, or picking
+    /// the harness — never from render.
+    models_cancelled: std::collections::HashSet<HarnessId>,
     mutate_task: Option<Task<()>>,
     _search_events: Subscription,
     _state_observe: Subscription,
@@ -422,6 +434,7 @@ impl Pickers {
             switching: None,
             switch_task: None,
             switch_error: None,
+            models_cancelled: std::collections::HashSet::new(),
             mutate_task: None,
             _search_events: search_events,
             _state_observe: state_observe,
@@ -588,6 +601,17 @@ impl Pickers {
         }
     }
 
+    /// Put cancelled model slots back to `Idle` so the next `ensure_models`
+    /// loads them again.
+    ///
+    /// Called only from discrete user demand (opening the picker, picking a
+    /// harness), never from render: render runs `ensure_models` every frame, so
+    /// re-arming there would restart the request the moment it was cancelled
+    /// and the toast would never go away.
+    fn rearm_cancelled_models(&mut self) {
+        rearm_cancelled(&mut self.models, &mut self.models_cancelled);
+    }
+
     fn toggle(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
         // Model + traits merged into ONE menu (user request): the traits chip
         // opens the combined harness/model/reasoning popover.
@@ -626,6 +650,8 @@ impl Pickers {
         };
         if kind == PickerKind::HarnessModel {
             self.model_scroll.set_offset(gpui::Point::default());
+            // Opening the menu IS asking for the models again.
+            self.rearm_cancelled_models();
         }
         // Searchable pickers focus the filter input (it sits inside the frame,
         // so the frame's key handler still sees arrows/Enter); the rest focus
@@ -811,14 +837,46 @@ impl Pickers {
             return;
         };
         let generation = self.owner_generation;
+        // A load is starting, so any cancel marker for this harness is spent —
+        // whatever re-armed the slot (the Retry row, a space switch clearing
+        // the map, `rearm_cancelled_models` itself) has now been honoured.
+        //
+        // Clearing it HERE rather than only in `rearm_cancelled_models` is what
+        // keeps the marker from outliving its slot: left set, the next picker
+        // open would put a freshly `Ready` slot back to `Idle`, blanking loaded
+        // models into a skeleton and firing a second identical request.
+        self.models_cancelled.remove(&harness);
         self.models.insert(harness, Loadable::Loading);
+        // Registered so a wait longer than `SLOW_AFTER` becomes visible, and
+        // so the toast's Cancel has something to resolve. `end` runs on every
+        // path out, including the cancelled one.
+        let (request_id, cancelled) = toast::begin(cx, errors::Loading::Models);
         cx.spawn(async move |this, cx| {
             let params = serde_json::json!({ "harness": harness });
-            let result = engine.client().call(methods::LIST_MODELS, params).await;
+            let call = std::pin::pin!(engine.client().call(methods::LIST_MODELS, params));
+            // Losing this race DROPS the RPC future, which is what makes cancel
+            // real rather than cosmetic: `PendingGuard` turns the drop into a
+            // `{id, cancel}` frame, so the engine stops working on it too.
+            let outcome = futures::future::select(call, cancelled).await;
             this.update(cx, |pickers, cx| {
+                toast::end(cx, request_id);
                 if pickers.owner_generation != generation {
                     return;
                 }
+                let result = match outcome {
+                    futures::future::Either::Left((result, _)) => result,
+                    futures::future::Either::Right(_) => {
+                        pickers.models.insert(
+                            harness,
+                            Loadable::Error(toast::cancelled_message(errors::Loading::Models)),
+                        );
+                        // Ask for it again and it tries again — see
+                        // `rearm_cancelled_models`.
+                        pickers.models_cancelled.insert(harness);
+                        cx.notify();
+                        return;
+                    }
+                };
                 let loaded = match result {
                     Ok(value) => match serde_json::from_value::<Vec<Model>>(value) {
                         Ok(models) => Loadable::Ready(models),
@@ -1139,6 +1197,9 @@ impl Pickers {
         self.defaults.harness = Some(harness);
         self.save_defaults();
         self.model_scroll.set_offset(gpui::Point::default());
+        // Picking the harness IS asking for its models again, so a cancelled
+        // slot must not stay cancelled here either.
+        self.rearm_cancelled_models();
         self.ensure_models(harness, cx);
         cx.notify();
     }
@@ -2628,6 +2689,26 @@ fn harness_catalog_settled(slot: &Loadable<Vec<HarnessDescriptor>>) -> bool {
         .is_some_and(|list| !catalog_awaits_probes(list))
 }
 
+/// Put cancelled slots back to `Idle` so the next `ensure_*` reloads them.
+///
+/// Re-arms **only a slot still holding an `Error`**. A marker can outlive the
+/// state it described — a Retry, or a space switch clearing the map, reloads
+/// the slot without going through the cancel path — and re-arming
+/// unconditionally would then overwrite a `Ready` slot with `Idle`, blanking
+/// loaded rows into a skeleton and firing a second identical request. The
+/// marker is also cleared when a load starts (see `ensure_models`); this is the
+/// second half of the same guard, for the window where no load has begun yet.
+fn rearm_cancelled<T>(
+    slots: &mut HashMap<HarnessId, Loadable<T>>,
+    cancelled: &mut std::collections::HashSet<HarnessId>,
+) {
+    for harness in cancelled.drain() {
+        if matches!(slots.get(&harness), Some(Loadable::Error(_))) {
+            slots.insert(harness, Loadable::Idle);
+        }
+    }
+}
+
 /// Why a rail row cannot be picked, if it cannot.
 ///
 /// The two inert states are genuinely different facts and must not paint the
@@ -3203,6 +3284,39 @@ mod tests {
         assert!(!harness_is_unavailable(&list, HarnessId::Cursor));
         // An empty catalog must not block everything.
         assert!(!harness_is_unavailable(&[], HarnessId::Codex));
+    }
+
+    /// A cancel marker must never outlive the state it described. If it does,
+    /// the next picker open replaces a freshly loaded slot with `Idle` — the
+    /// rows vanish into a skeleton and a second identical request fires.
+    #[test]
+    fn re_arming_never_discards_a_slot_that_already_reloaded() {
+        let mut slots: HashMap<HarnessId, Loadable<Vec<u8>>> = HashMap::new();
+        let mut cancelled = std::collections::HashSet::new();
+
+        // The slot the user actually cancelled: re-arm it.
+        slots.insert(HarnessId::Codex, Loadable::Error("Stopped loading".into()));
+        // Same harness family, but this one was retried and succeeded before
+        // the picker reopened — its marker is stale.
+        slots.insert(HarnessId::ClaudeCode, Loadable::Ready(vec![1, 2, 3]));
+        // And this one is mid-flight from a retry.
+        slots.insert(HarnessId::Mock, Loadable::Loading);
+        cancelled.extend([HarnessId::Codex, HarnessId::ClaudeCode, HarnessId::Mock]);
+
+        rearm_cancelled(&mut slots, &mut cancelled);
+
+        assert_eq!(slots.get(&HarnessId::Codex), Some(&Loadable::Idle));
+        assert_eq!(
+            slots.get(&HarnessId::ClaudeCode),
+            Some(&Loadable::Ready(vec![1, 2, 3])),
+            "a reloaded slot must survive a stale marker"
+        );
+        assert_eq!(
+            slots.get(&HarnessId::Mock),
+            Some(&Loadable::Loading),
+            "an in-flight reload must not be restarted"
+        );
+        assert!(cancelled.is_empty(), "markers are spent either way");
     }
 
     /// The two inert states must stay tellable apart. They previously shared a

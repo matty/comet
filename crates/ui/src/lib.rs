@@ -34,6 +34,7 @@ pub mod sound;
 pub mod state;
 pub mod terminal;
 pub mod theme;
+pub mod toast;
 pub mod transcript;
 
 use std::borrow::Cow;

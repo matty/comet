@@ -591,6 +591,10 @@ pub struct Shell {
     sound_prev: std::collections::HashMap<String, comet_proto::SessionStatus>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
+    /// Design prototype: `COMET_SLOW_TOAST_DEMO=1` pins the slow-request toast
+    /// open so it can be reviewed in the app before it is wired to real request
+    /// timing. Clicking Cancel clears it. Not a shipping code path.
+    slow_request_demo: bool,
     /// `Some` while the space-scope dropdown panel is open: `Switch` when
     /// the trigger itself was clicked (picking what the sidebar is scoped
     /// to), `PickForNewSession` when the Sessions `+` on `All spaces` is
@@ -864,6 +868,8 @@ impl Shell {
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             sidebar_notice: None,
+            slow_request_demo: std::env::var_os("COMET_SLOW_TOAST_DEMO")
+                .is_some_and(|v| !v.is_empty()),
             space_dropdown_open: None,
             space_dropdown_highlight: None,
             space_dropdown_focus: cx.focus_handle(),
@@ -4205,6 +4211,49 @@ impl Render for Shell {
         if self.motion_active.get() | motion::hover_fades_active() {
             window.request_animation_frame();
         }
+
+        // Slow-request toast, above the app and below the splash.
+        //
+        // Nothing fires an event when a request crosses `SLOW_AFTER` — it is a
+        // clock, so while anything is in flight we keep frames coming and look.
+        // Requests normally finish in milliseconds, so this costs nothing in
+        // the common case, and once the toast is up its spinner drives frames
+        // anyway.
+        if crate::toast::any_in_flight(cx) {
+            window.request_animation_frame();
+        }
+        // `COMET_SLOW_TOAST_DEMO=1` pins it open with a stand-in request, for
+        // reviewing the design without waiting for something to actually hang.
+        let slow = crate::toast::slow(cx).or(if self.slow_request_demo {
+            Some((0, crate::errors::Loading::Models))
+        } else {
+            None
+        });
+        let root = if let Some((request_id, what)) = slow {
+            let theme = Theme::of(cx).clone();
+            let view = cx.entity_id();
+            let cancel = crate::toast::cancel_link(&theme).on_click(cx.listener(
+                move |shell, _, _, cx: &mut Context<Self>| {
+                    crate::toast::cancel(cx, request_id);
+                    shell.slow_request_demo = false;
+                    cx.notify();
+                },
+            ));
+            // The LIVE sidebar width, from the same tween the column itself
+            // rides, so the toast tracks a collapse rather than snapping when
+            // it lands.
+            let left_inset = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+            root.child(crate::toast::slow_request_toast(
+                &theme,
+                crate::toast::waiting_message(what),
+                cancel,
+                left_inset,
+                view,
+                cx,
+            ))
+        } else {
+            root
+        };
 
         // Boot splash overlay: visible → crossfades out on Ready → removed.
         match self.splash {
