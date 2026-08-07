@@ -172,14 +172,20 @@ EnvironmentFile=-%h/.comet-native/env
 [Install]
 WantedBy=default.target
 UNIT
-  systemctl --user daemon-reload
+  # The binary is already installed and linked by this point, so a user manager
+  # that refuses to start the unit is a degraded install, not a failed one.
+  # Under `set -e` an unguarded systemctl would abort and leave no way to retry.
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
   systemctl --user enable comet-native >/dev/null 2>&1 || true
-  systemctl --user restart comet-native
-  service=running
-  # Keep the user manager (and the engine) running without an active login.
-  loginctl enable-linger "$USER" 2>/dev/null \
-    || sudo -n loginctl enable-linger "$USER" 2>/dev/null \
-    || echo "warn: could not enable linger — the engine stops when you log out (run: sudo loginctl enable-linger $USER)"
+  if systemctl --user restart comet-native; then
+    service=running
+    # Keep the user manager (and the engine) running without an active login.
+    loginctl enable-linger "$USER" 2>/dev/null \
+      || sudo -n loginctl enable-linger "$USER" 2>/dev/null \
+      || echo "warn: could not enable linger — the engine stops when you log out (run: sudo loginctl enable-linger $USER)"
+  else
+    echo "warn: could not start the systemd user service — run the engine manually with: comet headless"
+  fi
 else
   echo "warn: systemd user session not available — run the engine manually with: comet headless"
 fi
