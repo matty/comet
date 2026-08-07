@@ -31,6 +31,16 @@ use comet_rpc::methods;
 /// pagination plumbing).
 const MAX_REF_ROWS: usize = 300;
 
+/// How often an open harness picker re-asks for the catalog while provider
+/// probes are still landing. Local IPC returning three small objects, so the
+/// cost is negligible next to keeping a stale row selectable.
+const HARNESS_REVALIDATE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Cap on those re-asks. `HARNESS_REVALIDATE_INTERVAL * ATTEMPTS` covers the
+/// harness crate's own 10s `--version` timeout, so a probe that is merely slow
+/// is still waited out, while one that never answers cannot poll forever.
+const HARNESS_REVALIDATE_ATTEMPTS: usize = 20;
+
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::motion;
 use crate::popover::{self, Loadable, MenuKey};
@@ -691,27 +701,40 @@ impl Pickers {
         }));
     }
 
-    /// Re-fetch the catalog when it still holds unprobed entries, keeping the
-    /// current rows on screen while the reload runs.
+    /// Whether the cached catalog has an availability answer for every entry.
+    ///
+    /// `Loading` counts as unsettled as much as a `Unknown` row does: a picker
+    /// opened while the very first fetch is still in flight would otherwise see
+    /// nothing to revalidate, and the all-`Unknown` result would land with
+    /// nothing left to correct it.
+    fn harness_catalog_settled(&self) -> bool {
+        harness_catalog_settled(&self.harnesses)
+    }
+
+    /// Poll the catalog while the picker is open and probes are still landing.
     ///
     /// Availability lands on the engine after boot, but the UI caches the
-    /// catalog from its first render and only re-arms on a space switch or the
-    /// Retry row — so without this the picker would show the pre-probe
-    /// snapshot for the whole session and never grey anything out.
+    /// catalog from its FIRST RENDER and only re-arms on a space switch or the
+    /// Retry row — so without this the picker shows the pre-probe snapshot for
+    /// the whole session and never greys anything out.
+    ///
+    /// A single refetch on open is not enough. Two windows leave the catalog
+    /// stuck: opening before the initial fetch returns (nothing to revalidate
+    /// yet), and a refetch that itself completes before the probes do. Both end
+    /// with an all-`Unknown` catalog and no pending work to correct it, so an
+    /// unusable provider stays selectable until the picker is closed and
+    /// reopened. Retrying until the answer settles closes both.
     ///
     /// Driven by the picker OPENING, never by render: `ensure_harnesses` runs
     /// every frame, and a revalidation there would spawn an RPC per frame.
-    /// Self-limiting on two counts — it stops once every entry has been probed,
-    /// and `harness_revalidating` keeps a second open from racing the first.
+    ///
+    /// Bounded three ways — it stops once every entry has an answer (a probed
+    /// *failure* is an answer), when the picker closes, and after
+    /// [`HARNESS_REVALIDATE_ATTEMPTS`] tries regardless. Hitting the cap just
+    /// leaves the harness selectable, which is the same conservative state an
+    /// unprobed harness always has.
     fn revalidate_harnesses(&mut self, cx: &mut Context<Self>) {
-        if self.harness_revalidating {
-            return;
-        }
-        if !self
-            .harnesses
-            .ready()
-            .is_some_and(|list| catalog_awaits_probes(list))
-        {
+        if self.harness_revalidating || self.harness_catalog_settled() {
             return;
         }
         let Some(engine) = self.engine(cx) else {
@@ -719,30 +742,54 @@ impl Pickers {
         };
         let generation = self.owner_generation;
         self.harness_revalidating = true;
-        // Deliberately NOT flipped to `Loading`: the rail keeps painting the
+        // Deliberately never flipped to `Loading`: the rail keeps painting the
         // rows it already has, so an open never flashes to a skeleton.
         self.revalidate_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::LIST_HARNESSES, serde_json::Value::Null)
-                .await;
-            this.update(cx, |pickers, cx| {
-                pickers.harness_revalidating = false;
-                if pickers.owner_generation != generation {
-                    return;
+            for _ in 0..HARNESS_REVALIDATE_ATTEMPTS {
+                // Delay first: on the open that races the initial fetch, this
+                // lets that request land instead of duplicating it.
+                cx.background_executor()
+                    .timer(HARNESS_REVALIDATE_INTERVAL)
+                    .await;
+                let result = engine
+                    .client()
+                    .call(methods::LIST_HARNESSES, serde_json::Value::Null)
+                    .await;
+                let stop = this
+                    .update(cx, |pickers, cx| {
+                        if pickers.owner_generation != generation {
+                            return true;
+                        }
+                        // A failed poll is silent: the rows on screen are still
+                        // the best answer we have, and replacing them with an
+                        // error would throw away a working catalog over a
+                        // transient blip. Keep polling — it may be transient.
+                        if let Ok(value) = result
+                            && let Ok(list) =
+                                serde_json::from_value::<Vec<HarnessDescriptor>>(value)
+                        {
+                            pickers.harnesses = Loadable::Ready(list);
+                            cx.notify();
+                        }
+                        pickers.harness_catalog_settled() || !pickers.harness_picker_open()
+                    })
+                    .unwrap_or(true);
+                if stop {
+                    break;
                 }
-                // A failed revalidation is silent: the rows on screen are still
-                // the best answer we have, and replacing them with an error
-                // would throw away a working catalog over a transient blip.
-                if let Ok(value) = result
-                    && let Ok(list) = serde_json::from_value::<Vec<HarnessDescriptor>>(value)
-                {
-                    pickers.harnesses = Loadable::Ready(list);
-                }
-                cx.notify();
-            })
-            .ok();
+            }
+            this.update(cx, |pickers, _| pickers.harness_revalidating = false)
+                .ok();
         }));
+    }
+
+    /// Whether a popover that renders the harness catalog is currently open.
+    /// Both read `availability`, so both are worth polling for.
+    fn harness_picker_open(&self) -> bool {
+        matches!(
+            self.open,
+            Some(PickerKind::HarnessModel) | Some(PickerKind::Traits)
+        )
     }
 
     fn ensure_models(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
@@ -2458,6 +2505,17 @@ fn catalog_awaits_probes(list: &[HarnessDescriptor]) -> bool {
     list.iter().any(|d| d.availability.is_unprobed())
 }
 
+/// Whether the catalog slot holds an availability answer for every entry.
+///
+/// Only a `Ready` list with no unprobed row settles. `Idle` and `Loading` are
+/// unsettled by construction — a picker opened while the first fetch is still
+/// in flight has nothing to revalidate yet, and if that counted as settled the
+/// all-`Unknown` result would land with nothing left to correct it.
+fn harness_catalog_settled(slot: &Loadable<Vec<HarnessDescriptor>>) -> bool {
+    slot.ready()
+        .is_some_and(|list| !catalog_awaits_probes(list))
+}
+
 /// Whether a probed harness came back unusable.
 ///
 /// A harness the catalog does not list, and one whose probe has not landed,
@@ -2922,6 +2980,41 @@ mod tests {
             "a settled catalog must stop triggering refetches"
         );
         assert!(!catalog_awaits_probes(&[]));
+    }
+
+    /// The poll must keep running until an answer exists, and must treat an
+    /// in-flight first fetch as unsettled. Both windows Greptile flagged end
+    /// with an all-`Unknown` catalog and nothing pending to correct it, so a
+    /// slot state wrongly counted as settled leaves a broken provider
+    /// selectable until the picker is closed and reopened.
+    #[test]
+    fn only_a_fully_probed_ready_catalog_counts_as_settled() {
+        use comet_proto::HarnessAvailability;
+        let with = |availability: HarnessAvailability| HarnessDescriptor {
+            id: HarnessId::Codex,
+            name: "n".into(),
+            capabilities: comet_proto::HarnessCapabilities::default(),
+            availability,
+        };
+
+        // Nothing fetched yet, and a fetch in flight: both unsettled, so the
+        // poll arms rather than concluding there is nothing to wait for.
+        assert!(!harness_catalog_settled(&Loadable::Idle));
+        assert!(!harness_catalog_settled(&Loadable::Loading));
+        // An error slot has no rows to correct; the Retry row owns that path.
+        assert!(!harness_catalog_settled(&Loadable::Error("boom".into())));
+
+        assert!(!harness_catalog_settled(&Loadable::Ready(vec![with(
+            HarnessAvailability::Unknown
+        )])));
+        assert!(harness_catalog_settled(&Loadable::Ready(vec![
+            with(HarnessAvailability::Available { version: None }),
+            with(HarnessAvailability::Unavailable {
+                reason: "not installed".into()
+            }),
+        ])));
+        // An empty catalog is vacuously settled — there is nothing to probe.
+        assert!(harness_catalog_settled(&Loadable::Ready(vec![])));
     }
 
     /// Only a landed `Unavailable` blocks a pick. This predicate gates both the
