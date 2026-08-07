@@ -95,6 +95,14 @@ numbers and never depend on which color is painted; every color comes from a `Th
 light mode is designed, not inverted; anything caching paint across frames keys on
 `theme_generation()`.
 
+## What the user is allowed to see when something fails
+
+Read `.agents/rules/user-facing-errors.md` before writing any surface that can fail or wait.
+Two hard rules: the user never sees a raw technical error (no `err.to_string()` on screen),
+and no waiting state can last forever — every skeleton needs a reply, a timeout, or a bounded
+retry that gives up into something actionable. Failures split into a short `summary` and an
+actionable `hint`, with the diagnostic detail left in `tracing`.
+
 ## Shared procedures
 
 Agent-agnostic procedures live in `.agents/`. Read the relevant one before starting that kind
@@ -106,6 +114,7 @@ of task:
 | Pull selected commits from `upstream` | `.agents/workflows/sync-upstream.md` |
 | Commit, push, open a PR | `.agents/workflows/commit-pr.md` |
 | Write UI code in `crates/ui` | `.agents/rules/gpui-ui.md` |
+| Write a surface that can fail or wait | `.agents/rules/user-facing-errors.md` |
 
 Claude Code exposes these as the slash commands `/verify`, `/sync-upstream`, and
 `/commit-pr` via thin wrappers in `.claude/skills/`, which read the files above rather than
