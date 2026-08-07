@@ -330,6 +330,15 @@ pub struct Pickers {
     /// is re-armed on the next DISCRETE demand — opening the picker, or picking
     /// the harness — never from render.
     models_cancelled: std::collections::HashSet<HarnessId>,
+    /// The same, for the agent catalog — one slot, so one flag.
+    ///
+    /// The catalog is the only one of the four toasted loads that needs a
+    /// marker at all. The branch list, the folder browser and the accounts page
+    /// all reload unconditionally on their discrete triggers (a forced reopen, a
+    /// navigation, Retry/Refresh), so a cancelled slot there re-arms by
+    /// construction. `ensure_harnesses` cannot: render calls it every frame, so
+    /// it has to refuse to reload an `Error`, and a cancel leaves exactly that.
+    harnesses_cancelled: bool,
     mutate_task: Option<Task<()>>,
     _search_events: Subscription,
     _state_observe: Subscription,
@@ -435,6 +444,7 @@ impl Pickers {
             switch_task: None,
             switch_error: None,
             models_cancelled: std::collections::HashSet::new(),
+            harnesses_cancelled: false,
             mutate_task: None,
             _search_events: search_events,
             _state_observe: state_observe,
@@ -612,6 +622,15 @@ impl Pickers {
         rearm_cancelled(&mut self.models, &mut self.models_cancelled);
     }
 
+    /// The catalog's half of [`Self::rearm_cancelled_models`], with the same
+    /// only-a-still-`Error` slot guard: the marker can outlive the state it
+    /// described (the Retry row sets `Idle` without going through the cancel
+    /// path), and re-arming a `Ready` catalog would blank loaded rows into a
+    /// skeleton and fire a second identical request.
+    fn rearm_cancelled_harnesses(&mut self) {
+        rearm_cancelled_slot(&mut self.harnesses, &mut self.harnesses_cancelled);
+    }
+
     fn toggle(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
         // Model + traits merged into ONE menu (user request): the traits chip
         // opens the combined harness/model/reasoning popover.
@@ -673,6 +692,10 @@ impl Pickers {
             // revalidates, keeping stale rows visible until fresh ones land.
             PickerKind::Branch | PickerKind::Checkout => self.ensure_refs(true, cx),
             PickerKind::HarnessModel | PickerKind::Traits => {
+                // Opening either menu IS asking for the catalog again. Both
+                // render it, so both re-arm — unlike the model re-arm above,
+                // which the traits chip shares a popover with but does not own.
+                self.rearm_cancelled_harnesses();
                 self.ensure_harnesses(cx);
                 // Availability is probed in the background at engine boot,
                 // while the catalog is fetched eagerly on the first render —
@@ -702,16 +725,40 @@ impl Pickers {
             return;
         };
         let generation = self.owner_generation;
+        // A load is starting, so the cancel marker is spent — whatever re-armed
+        // the slot has now been honoured. Same second-half-of-the-guard
+        // reasoning as `ensure_models`.
+        self.harnesses_cancelled = false;
         self.harnesses = Loadable::Loading;
+        // Always a skeleton by construction (this loads only from `Idle`), so
+        // the wait is the whole of what the user can see and Cancel is offered.
+        let (request_id, cancelled) = toast::begin(cx, errors::Loading::Agents);
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::LIST_HARNESSES, serde_json::Value::Null)
-                .await;
+            let call = std::pin::pin!(
+                engine
+                    .client()
+                    .call(methods::LIST_HARNESSES, serde_json::Value::Null)
+            );
+            // Losing this race drops the RPC future, which is what makes cancel
+            // real — see `ensure_models`.
+            let outcome = futures::future::select(call, cancelled).await;
             this.update(cx, |pickers, cx| {
+                toast::end(cx, request_id);
                 if pickers.owner_generation != generation {
                     return;
                 }
+                let result = match outcome {
+                    futures::future::Either::Left((result, _)) => result,
+                    futures::future::Either::Right(_) => {
+                        pickers.harnesses =
+                            Loadable::Error(toast::cancelled_message(errors::Loading::Agents));
+                        // Ask for it again and it tries again — see
+                        // `rearm_cancelled_harnesses`.
+                        pickers.harnesses_cancelled = true;
+                        cx.notify();
+                        return;
+                    }
+                };
                 pickers.harnesses = match result {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
                         Ok(list) => Loadable::Ready(list),
@@ -782,10 +829,23 @@ impl Pickers {
                 cx.background_executor()
                     .timer(HARNESS_REVALIDATE_INTERVAL)
                     .await;
+                // Registered WITHOUT a cancel: the rail is painting its rows
+                // throughout (this poll never flips the slot to `Loading`), so
+                // stopping it would change nothing on screen. The wait is still
+                // worth naming — it is the answer to "why is this row still
+                // greyed out / still selectable?".
+                // `_alive` is the registration's liveness handle, not a cancel
+                // channel — nothing sends on it. Holding it to the end of the
+                // iteration is what lets a dropped task retire its own entry.
+                let (request_id, _alive) =
+                    cx.update(|cx| toast::begin_uncancellable(cx, errors::Loading::Agents));
                 let result = engine
                     .client()
                     .call(methods::LIST_HARNESSES, serde_json::Value::Null)
                     .await;
+                // Outside the entity update so a `Pickers` dropped mid-poll
+                // cannot strand the entry and leave the toast up for good.
+                cx.update(|cx| toast::end(cx, request_id));
                 let stop = this
                     .update(cx, |pickers, cx| {
                         if pickers.owner_generation != generation {
@@ -938,24 +998,59 @@ impl Pickers {
         // keeps the current rows on screen while the reload runs — a send that
         // just minted a worktree (or a terminal-side branch) appears on the
         // popover's next open without the list ever flashing to a skeleton.
-        if !(force && fresh && matches!(self.refs, Loadable::Ready(_))) {
+        let revalidating = force && fresh && matches!(self.refs, Loadable::Ready(_));
+        if !revalidating {
             self.refs = Loadable::Loading;
         }
         self.refs_space = Some(space_owner);
+        // Cancel is offered only when the popover has nothing else to show. A
+        // stale-while-revalidate refresh keeps its rows painted either way, so
+        // there Cancel would be a control with no visible effect — and its
+        // handler would have to decide whether to throw away a good list, which
+        // is a choice not worth putting in front of anyone.
+        let (request_id, waiter) = if revalidating {
+            toast::begin_uncancellable(cx, errors::Loading::Branches)
+        } else {
+            toast::begin(cx, errors::Loading::Branches)
+        };
         self.refs_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             params.insert(
                 "repoPath".into(),
                 serde_json::Value::String(space.path.clone()),
             );
-            let result = engine
-                .client()
-                .call(methods::LIST_REFS, serde_json::Value::Object(params))
-                .await;
+            let call = std::pin::pin!(
+                engine
+                    .client()
+                    .call(methods::LIST_REFS, serde_json::Value::Object(params))
+            );
+            // `None` is the cancelled arm; losing the select race drops the RPC
+            // future, which is what stops the engine too. The revalidating arm
+            // still holds `waiter`, because it is also the liveness handle that
+            // retires this entry if the task is superseded.
+            let result = if revalidating {
+                let _alive = waiter;
+                Some(call.await)
+            } else {
+                match futures::future::select(call, waiter).await {
+                    futures::future::Either::Left((result, _)) => Some(result),
+                    futures::future::Either::Right(_) => None,
+                }
+            };
             this.update(cx, |pickers, cx| {
+                toast::end(cx, request_id);
                 if pickers.owner_generation != generation {
                     return;
                 }
+                let Some(result) = result else {
+                    // No marker to set: the branch list re-arms structurally,
+                    // because every popover open calls `ensure_refs(true, …)`
+                    // and a forced load reloads from any state.
+                    pickers.refs =
+                        Loadable::Error(toast::cancelled_message(errors::Loading::Branches));
+                    cx.notify();
+                    return;
+                };
                 pickers.refs = match result {
                     Ok(value) => match serde_json::from_value::<Vec<RepoRef>>(value) {
                         Ok(refs) => Loadable::Ready(refs),
@@ -2709,6 +2804,16 @@ fn rearm_cancelled<T>(
     }
 }
 
+/// [`rearm_cancelled`] for a surface with one slot rather than a map.
+///
+/// Same guard, same reason: the marker is spent whether or not it applied, and
+/// only a slot still holding an `Error` is put back.
+fn rearm_cancelled_slot<T>(slot: &mut Loadable<T>, cancelled: &mut bool) {
+    if std::mem::take(cancelled) && matches!(slot, Loadable::Error(_)) {
+        *slot = Loadable::Idle;
+    }
+}
+
 /// Why a rail row cannot be picked, if it cannot.
 ///
 /// The two inert states are genuinely different facts and must not paint the
@@ -3317,6 +3422,35 @@ mod tests {
             "an in-flight reload must not be restarted"
         );
         assert!(cancelled.is_empty(), "markers are spent either way");
+    }
+
+    /// The agent catalog is the one toasted load that needs a marker at all —
+    /// render calls `ensure_harnesses` every frame, so it refuses to reload an
+    /// `Error` and a cancel would otherwise disable the picker for the session.
+    /// Its single-slot re-arm carries the same guard as the map version.
+    #[test]
+    fn a_cancelled_catalog_re_arms_without_discarding_a_reload() {
+        // The cancel the marker describes: put it back to `Idle`.
+        let mut slot: Loadable<Vec<u8>> = Loadable::Error("Stopped loading".into());
+        let mut cancelled = true;
+        rearm_cancelled_slot(&mut slot, &mut cancelled);
+        assert_eq!(slot, Loadable::Idle);
+        assert!(!cancelled, "the marker is spent");
+
+        // A stale marker — the Retry row reloaded the catalog without going
+        // through the cancel path — must not blank the rows it already has.
+        let mut reloaded = Loadable::Ready(vec![1, 2, 3]);
+        let mut stale = true;
+        rearm_cancelled_slot(&mut reloaded, &mut stale);
+        assert_eq!(reloaded, Loadable::Ready(vec![1, 2, 3]));
+        assert!(!stale);
+
+        // And an ordinary failure re-arms only on Retry, never on a reopen:
+        // without a marker the `Error` has to stand.
+        let mut failed: Loadable<Vec<u8>> = Loadable::Error("Couldn't load".into());
+        let mut none = false;
+        rearm_cancelled_slot(&mut failed, &mut none);
+        assert!(matches!(failed, Loadable::Error(_)));
     }
 
     /// The two inert states must stay tellable apart. They previously shared a
