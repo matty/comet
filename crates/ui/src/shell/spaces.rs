@@ -7,6 +7,7 @@
 //! `shell` so it renders straight off `Shell`'s private state.
 
 use super::*;
+use crate::errors;
 use crate::motion::TAB_SLIDE;
 use crate::pickers::{breadcrumbs, browser_rows, parent_path};
 use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
@@ -2599,9 +2600,14 @@ impl Shell {
                                 }
                                 Loadable::Ready(listing)
                             }
-                            Err(err) => Loadable::Error(err.to_string()),
+                            Err(err) => Loadable::Error(errors::decode_failure(
+                                errors::Loading::Folders,
+                                &err,
+                            )),
                         },
-                        Err(err) => Loadable::Error(err.to_string()),
+                        Err(err) => {
+                            Loadable::Error(errors::load_failure(errors::Loading::Folders, &err))
+                        }
                     };
                 }
                 cx.notify();

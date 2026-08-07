@@ -18,6 +18,7 @@ pub mod attachments;
 pub mod changes;
 pub mod composer;
 pub mod edge_fade;
+pub mod errors;
 pub mod frost;
 pub mod icons;
 pub mod loaders;
