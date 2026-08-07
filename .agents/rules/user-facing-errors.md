@@ -93,6 +93,17 @@ too. A cancelled slot must then be **re-armed on the next discrete demand**
 (`Pickers::rearm_cancelled_models`) — never from render, which runs `ensure_*`
 every frame and would restart the request as fast as it was cancelled.
 
+**The receiver `begin` hands back is also the registration's liveness handle, so
+it must live inside the spawned task and nowhere else.** gpui `Task`s are
+cancel-on-drop, and most of these loads store theirs in a field, so a second
+navigation, reopen or Refresh drops the first future before it can reach `end`.
+The registry treats a dropped receiver as an abandoned request and stops
+reporting it; without that the entry would raise a toast for work that is not
+running — one waiting cannot resolve, because nothing is going to land — and
+keep `any_in_flight` true, so the render loop requests frames for the rest of
+the session. An uncancellable registration has the same handle for the same
+reason even though nothing ever sends on it: hold it as `_alive`.
+
 ### Two decisions per surface
 
 **Does it register?** Every load that leaves the user looking at a skeleton, yes.

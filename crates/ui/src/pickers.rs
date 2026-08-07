@@ -834,7 +834,10 @@ impl Pickers {
                 // stopping it would change nothing on screen. The wait is still
                 // worth naming — it is the answer to "why is this row still
                 // greyed out / still selectable?".
-                let request_id =
+                // `_alive` is the registration's liveness handle, not a cancel
+                // channel — nothing sends on it. Holding it to the end of the
+                // iteration is what lets a dropped task retire its own entry.
+                let (request_id, _alive) =
                     cx.update(|cx| toast::begin_uncancellable(cx, errors::Loading::Agents));
                 let result = engine
                     .client()
@@ -1005,14 +1008,10 @@ impl Pickers {
         // there Cancel would be a control with no visible effect — and its
         // handler would have to decide whether to throw away a good list, which
         // is a choice not worth putting in front of anyone.
-        let (request_id, cancelled) = if revalidating {
-            (
-                toast::begin_uncancellable(cx, errors::Loading::Branches),
-                None,
-            )
+        let (request_id, waiter) = if revalidating {
+            toast::begin_uncancellable(cx, errors::Loading::Branches)
         } else {
-            let (id, rx) = toast::begin(cx, errors::Loading::Branches);
-            (id, Some(rx))
+            toast::begin(cx, errors::Loading::Branches)
         };
         self.refs_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
@@ -1026,13 +1025,17 @@ impl Pickers {
                     .call(methods::LIST_REFS, serde_json::Value::Object(params))
             );
             // `None` is the cancelled arm; losing the select race drops the RPC
-            // future, which is what stops the engine too.
-            let result = match cancelled {
-                Some(cancelled) => match futures::future::select(call, cancelled).await {
+            // future, which is what stops the engine too. The revalidating arm
+            // still holds `waiter`, because it is also the liveness handle that
+            // retires this entry if the task is superseded.
+            let result = if revalidating {
+                let _alive = waiter;
+                Some(call.await)
+            } else {
+                match futures::future::select(call, waiter).await {
                     futures::future::Either::Left((result, _)) => Some(result),
                     futures::future::Either::Right(_) => None,
-                },
-                None => Some(call.await),
+                }
             };
             this.update(cx, |pickers, cx| {
                 toast::end(cx, request_id);

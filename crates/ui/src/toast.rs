@@ -173,14 +173,30 @@ struct Entry {
     id: u64,
     what: Loading,
     started: std::time::Instant,
-    /// Taken by [`cancel`]. Sending it resolves the waiter's select arm, which
-    /// drops the RPC future — and `RpcClient`'s `PendingGuard` turns that drop
-    /// into a `{id, cancel}` frame, so the engine stops working on it too.
+    /// Whether to offer Cancel — see [`begin_uncancellable`].
+    cancellable: bool,
+    /// Two jobs, both riding the same channel.
     ///
-    /// `None` from the start for a wait registered via [`begin_uncancellable`].
-    /// It is never `None` for a cancellable entry that is still in the registry:
-    /// [`cancel`] takes the sender and removes the entry in the same breath.
-    cancel: Option<futures::channel::oneshot::Sender<()>>,
+    /// **Cancelling:** [`cancel`] sends on it, which resolves the waiter's
+    /// select arm and drops the RPC future — and `RpcClient`'s `PendingGuard`
+    /// turns that drop into a `{id, cancel}` frame, so the engine stops too.
+    ///
+    /// **Liveness:** the receiver lives inside the spawned task, so
+    /// `is_canceled()` means that task was dropped without reaching [`end`].
+    /// gpui `Task`s are cancel-on-drop and these loads store theirs in a field,
+    /// so a second navigation, reopen or Refresh drops the first future
+    /// mid-flight; without this the entry would sit in the registry forever,
+    /// eventually raising a toast for work that is not running and keeping
+    /// `any_in_flight` — and with it the render loop's frame requests — alive
+    /// for the rest of the session.
+    signal: futures::channel::oneshot::Sender<()>,
+}
+
+impl Entry {
+    /// Whether the task that owns this request is still running.
+    fn live(&self) -> bool {
+        !self.signal.is_canceled()
+    }
 }
 
 impl gpui::Global for SlowRequests {}
@@ -194,11 +210,13 @@ pub struct SlowRequest {
     pub cancellable: bool,
 }
 
-/// Register a request as in flight. The receiver resolves if the user cancels.
+/// Register a request as in flight.
+///
+/// The receiver resolves if the user cancels — select on it, and treat the
+/// right arm as the cancelled path. It is also the registration's liveness
+/// handle, so it must live inside the spawned task and nowhere else.
 pub fn begin(cx: &mut App, what: Loading) -> (u64, futures::channel::oneshot::Receiver<()>) {
-    let (tx, rx) = futures::channel::oneshot::channel();
-    let id = push(cx, what, Some(tx));
-    (id, rx)
+    push(cx, what, true)
 }
 
 /// Register a wait that the user is told about but is not offered a way out of.
@@ -211,29 +229,42 @@ pub fn begin(cx: &mut App, what: Loading) -> (u64, futures::channel::oneshot::Re
 /// Not an escape hatch from the no-unbounded-wait rule. Use it only where the
 /// surface has something to show *now*; a skeleton must always be cancellable,
 /// because there the wait is the whole of what the user can see.
-pub fn begin_uncancellable(cx: &mut App, what: Loading) -> u64 {
-    push(cx, what, None)
+///
+/// The receiver will never resolve — nothing sends on it — but it is still the
+/// liveness handle, so hold it (`let _alive = …`) for the life of the request.
+pub fn begin_uncancellable(
+    cx: &mut App,
+    what: Loading,
+) -> (u64, futures::channel::oneshot::Receiver<()>) {
+    push(cx, what, false)
 }
 
-fn push(cx: &mut App, what: Loading, cancel: Option<futures::channel::oneshot::Sender<()>>) -> u64 {
+fn push(
+    cx: &mut App,
+    what: Loading,
+    cancellable: bool,
+) -> (u64, futures::channel::oneshot::Receiver<()>) {
+    let (signal, rx) = futures::channel::oneshot::channel();
     let registry = cx.default_global::<SlowRequests>();
+    registry.forget_abandoned();
     registry.next_id += 1;
     let id = registry.next_id;
     registry.entries.push(Entry {
         id,
         what,
         started: std::time::Instant::now(),
-        cancel,
+        cancellable,
+        signal,
     });
-    id
+    (id, rx)
 }
 
 /// Deregister a finished request. Idempotent — a cancelled request is removed
 /// when it is cancelled *and* again when its task unwinds.
 pub fn end(cx: &mut App, id: u64) {
-    cx.default_global::<SlowRequests>()
-        .entries
-        .retain(|e| e.id != id);
+    let registry = cx.default_global::<SlowRequests>();
+    registry.entries.retain(|e| e.id != id);
+    registry.forget_abandoned();
 }
 
 /// The request that has been waiting longest, if it has been waiting long
@@ -253,13 +284,21 @@ impl SlowRequests {
     fn slow_at(&self, now: std::time::Instant) -> Option<SlowRequest> {
         self.entries
             .iter()
-            .filter(|e| now.duration_since(e.started) >= SLOW_AFTER)
+            .filter(|e| e.live() && now.duration_since(e.started) >= SLOW_AFTER)
             .min_by_key(|e| e.started)
             .map(|e| SlowRequest {
                 id: e.id,
                 what: e.what,
-                cancellable: e.cancel.is_some(),
+                cancellable: e.cancellable,
             })
+    }
+
+    /// Drop entries whose task is gone. Only housekeeping — [`slow_at`] and
+    /// [`any_in_flight`] already ignore them, because both run from `render`
+    /// with a shared `&App` and cannot mutate. This runs on the paths that do
+    /// hold `&mut App`, so an abandoned entry cannot accumulate indefinitely.
+    fn forget_abandoned(&mut self) {
+        self.entries.retain(Entry::live);
     }
 }
 
@@ -268,7 +307,7 @@ impl SlowRequests {
 /// an event at that moment; it is a clock, so someone has to look.
 pub fn any_in_flight(cx: &App) -> bool {
     cx.try_global::<SlowRequests>()
-        .is_some_and(|r| !r.entries.is_empty())
+        .is_some_and(|r| r.entries.iter().any(Entry::live))
 }
 
 /// Cancel a request: resolve its waiter, then forget it.
@@ -279,14 +318,16 @@ pub fn any_in_flight(cx: &App) -> bool {
 /// the control that was supposed to be the way out.
 pub fn cancel(cx: &mut App, id: u64) {
     let registry = cx.default_global::<SlowRequests>();
-    let Some(entry) = registry.entries.iter_mut().find(|e| e.id == id) else {
+    let Some(at) = registry
+        .entries
+        .iter()
+        .position(|e| e.id == id && e.cancellable)
+    else {
         return;
     };
-    let Some(tx) = entry.cancel.take() else {
-        return;
-    };
-    let _ = tx.send(());
-    registry.entries.retain(|e| e.id != id);
+    // Removed first so the send cannot leave a spent entry behind.
+    let _ = registry.entries.remove(at).signal.send(());
+    registry.forget_abandoned();
 }
 
 /// What the user sees in the slot they were waiting on after cancelling.
@@ -316,42 +357,52 @@ pub const SLOW_AFTER: std::time::Duration = std::time::Duration::from_secs(4);
 mod tests {
     use super::*;
 
-    /// The threshold has to sit above real work and below a user's patience.
-    /// Pinned so a later "let's make it snappier" edit has to argue with both
-    /// bounds rather than just lowering a number.
-    /// Build a registry with entries at given ages, ids 1..n. Every entry is
-    /// cancellable; [`uncancellable_registry`] covers the other kind.
+    /// Build a registry with entries at given ages, ids 1..n, all cancellable.
+    ///
+    /// The receivers come back with it and **must be kept alive**: they stand in
+    /// for the spawned tasks, and an entry whose receiver has dropped is an
+    /// abandoned one. Dropping them is how a test simulates a superseded task.
     ///
     /// Takes `now` rather than reading the clock itself: capturing a second
     /// instant in here put every entry a few microseconds "younger" than the
     /// test's own `now`, which is invisible for the coarse cases and flips the
     /// exact-threshold one.
-    fn registry(now: std::time::Instant, ages: &[std::time::Duration]) -> SlowRequests {
-        SlowRequests {
-            next_id: ages.len() as u64,
-            entries: ages
-                .iter()
-                .enumerate()
-                .map(|(i, age)| Entry {
-                    id: i as u64 + 1,
-                    what: Loading::Models,
-                    started: now - *age,
-                    cancel: Some(futures::channel::oneshot::channel().0),
-                })
-                .collect(),
+    fn registry(
+        now: std::time::Instant,
+        ages: &[std::time::Duration],
+    ) -> (SlowRequests, Vec<futures::channel::oneshot::Receiver<()>>) {
+        let mut entries = Vec::new();
+        let mut waiters = Vec::new();
+        for (i, age) in ages.iter().enumerate() {
+            let (signal, rx) = futures::channel::oneshot::channel();
+            entries.push(Entry {
+                id: i as u64 + 1,
+                what: Loading::Models,
+                started: now - *age,
+                cancellable: true,
+                signal,
+            });
+            waiters.push(rx);
         }
+        (
+            SlowRequests {
+                next_id: ages.len() as u64,
+                entries,
+            },
+            waiters,
+        )
     }
 
     /// The same, for waits registered via [`begin_uncancellable`].
     fn uncancellable_registry(
         now: std::time::Instant,
         ages: &[std::time::Duration],
-    ) -> SlowRequests {
-        let mut registry = registry(now, ages);
+    ) -> (SlowRequests, Vec<futures::channel::oneshot::Receiver<()>>) {
+        let (mut registry, waiters) = registry(now, ages);
         for entry in &mut registry.entries {
-            entry.cancel = None;
+            entry.cancellable = false;
         }
-        registry
+        (registry, waiters)
     }
 
     /// A fast request must never raise the toast. This is the guard on the
@@ -360,11 +411,11 @@ mod tests {
     #[test]
     fn a_request_under_the_threshold_is_not_slow() {
         let now = std::time::Instant::now();
-        let quick = registry(now, &[std::time::Duration::from_millis(80)]);
+        let (quick, _waiters) = registry(now, &[std::time::Duration::from_millis(80)]);
         assert_eq!(quick.slow_at(now), None);
         // Exactly at the threshold counts — the boundary belongs to "slow", so
         // there is no window where a request is over time and still silent.
-        let boundary = registry(now, &[SLOW_AFTER]);
+        let (boundary, _waiters) = registry(now, &[SLOW_AFTER]);
         assert_eq!(boundary.slow_at(now).map(|s| s.id), Some(1));
     }
 
@@ -373,7 +424,7 @@ mod tests {
     #[test]
     fn the_longest_wait_is_the_one_reported() {
         let now = std::time::Instant::now();
-        let mixed = registry(
+        let (mixed, _waiters) = registry(
             now,
             &[
                 std::time::Duration::from_millis(10), // fast, ignored
@@ -391,12 +442,12 @@ mod tests {
     #[test]
     fn an_uncancellable_wait_is_still_reported() {
         let now = std::time::Instant::now();
-        let quiet = uncancellable_registry(now, &[std::time::Duration::from_secs(9)]);
+        let (quiet, _waiters) = uncancellable_registry(now, &[std::time::Duration::from_secs(9)]);
         let reported = quiet.slow_at(now).expect("a 9s wait is worth naming");
         assert_eq!(reported.what, Loading::Models);
         assert!(!reported.cancellable);
         // And an ordinary registration still offers the way out.
-        let ordinary = registry(now, &[std::time::Duration::from_secs(9)]);
+        let (ordinary, _more) = registry(now, &[std::time::Duration::from_secs(9)]);
         assert!(ordinary.slow_at(now).expect("slow").cancellable);
     }
 
@@ -406,14 +457,14 @@ mod tests {
     #[test]
     fn cancellability_does_not_change_which_wait_is_reported() {
         let now = std::time::Instant::now();
-        let mut mixed = uncancellable_registry(
+        let (mut mixed, _waiters) = uncancellable_registry(
             now,
             &[
                 std::time::Duration::from_secs(30), // oldest, uncancellable
                 std::time::Duration::from_secs(5),
             ],
         );
-        mixed.entries[1].cancel = Some(futures::channel::oneshot::channel().0);
+        mixed.entries[1].cancellable = true;
         let reported = mixed.slow_at(now).expect("slow");
         assert_eq!(reported.id, 1);
         assert!(!reported.cancellable);
@@ -423,11 +474,54 @@ mod tests {
     #[test]
     fn nothing_in_flight_shows_nothing() {
         let now = std::time::Instant::now();
-        assert_eq!(registry(now, &[]).slow_at(now), None);
-        assert_eq!(
-            registry(now, &[std::time::Duration::from_millis(1); 5]).slow_at(now),
-            None
+        let (empty, _none) = registry(now, &[]);
+        assert_eq!(empty.slow_at(now), None);
+        let (fast, _waiters) = registry(now, &[std::time::Duration::from_millis(1); 5]);
+        assert_eq!(fast.slow_at(now), None);
+    }
+
+    /// A load whose task was superseded must stop being reported.
+    ///
+    /// gpui `Task`s are cancel-on-drop and these loads store theirs in a field,
+    /// so a second navigation or reopen drops the first future mid-flight and it
+    /// never reaches `end`. Left in the registry, that entry eventually raises a
+    /// toast for work that is not running — one the user cannot resolve by
+    /// waiting, because nothing is going to land — and keeps `any_in_flight`
+    /// true, so the render loop requests frames forever. Found in review of
+    /// PR #25.
+    #[test]
+    fn a_superseded_load_stops_being_reported() {
+        let now = std::time::Instant::now();
+        let (mut live, mut waiters) = registry(
+            now,
+            &[
+                std::time::Duration::from_secs(30), // superseded, and the oldest
+                std::time::Duration::from_secs(5),  // still running
+            ],
         );
+        assert_eq!(live.slow_at(now).map(|s| s.id), Some(1));
+
+        // The first load's task is dropped: a newer one replaced it.
+        drop(waiters.remove(0));
+
+        assert_eq!(
+            live.slow_at(now).map(|s| s.id),
+            Some(2),
+            "an abandoned request must not be the one the toast names"
+        );
+        assert!(
+            live.entries.iter().any(|e| e.id == 1),
+            "still present until something with &mut App sweeps it"
+        );
+        live.forget_abandoned();
+        assert_eq!(live.entries.len(), 1);
+        assert_eq!(live.entries[0].id, 2);
+
+        // With every task gone the registry falls silent rather than pinning a
+        // toast open on work that no longer exists.
+        drop(waiters);
+        assert_eq!(live.slow_at(now), None);
+        assert!(!live.entries.iter().any(Entry::live));
     }
 
     /// Cancelling must not be permanent. The slot holds an `Error` so the user
@@ -466,6 +560,9 @@ mod tests {
         assert!(waiting_message(Loading::Models).contains("the model list"));
     }
 
+    /// The threshold has to sit above real work and below a user's patience.
+    /// Pinned so a later "let's make it snappier" edit has to argue with both
+    /// bounds rather than just lowering a number.
     #[test]
     fn the_slow_threshold_is_above_ordinary_work() {
         assert!(
