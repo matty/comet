@@ -280,14 +280,15 @@ pub async fn connect_lan_rpc<A>(
 where
     A: ToSocketAddrs,
 {
-    let _provider = selected_crypto_provider();
     let mismatch = Arc::new(AtomicBool::new(false));
     let verifier = Arc::new(PinnedServerVerifier {
         expected: pin.spki_sha256,
         mismatch: mismatch.clone(),
         algorithms: supported_algorithms(),
     });
-    let config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+    let config = ClientConfig::builder_with_provider(crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|error| LanConnectError::Transport(error.to_string()))?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(identity.certificate_chain(), identity.private_key())
@@ -460,11 +461,12 @@ pub async fn pair_client_zeroizing<A>(
 where
     A: ToSocketAddrs,
 {
-    let _provider = selected_crypto_provider();
     let verifier = Arc::new(UnpinnedPairingVerifier {
         algorithms: supported_algorithms(),
     });
-    let config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+    let config = ClientConfig::builder_with_provider(crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|error| PairingError::Transport(error.to_string()))?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
@@ -681,8 +683,8 @@ fn lan_websocket_config() -> WebSocketConfig {
 }
 
 fn optional_client_server_config(identity: &TlsIdentity) -> Result<ServerConfig, TlsError> {
-    let _provider = selected_crypto_provider();
-    ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+    ServerConfig::builder_with_provider(crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(Arc::new(OptionalClientVerifier {
             hints: Vec::new(),
             algorithms: supported_algorithms(),
@@ -702,10 +704,19 @@ fn certificate_fingerprint(certificate_der: &[u8]) -> Result<[u8; 32], TlsIdenti
 }
 
 fn supported_algorithms() -> WebPkiSupportedAlgorithms {
-    selected_crypto_provider().signature_verification_algorithms
+    crypto_provider().signature_verification_algorithms
 }
 
-fn selected_crypto_provider() -> Arc<CryptoProvider> {
+/// The `CryptoProvider` every TLS config in this crate is built from.
+///
+/// rustls can only infer a process-level default when exactly one of its
+/// `aws-lc-rs` and `ring` features is enabled. Under `cargo test --workspace`
+/// the unified feature graph enables both — this crate pulls `aws-lc-rs`,
+/// `reqwest` pulls `ring` — so inference fails and any builder that relies on
+/// it panics. Name the provider explicitly instead of installing one and
+/// hoping the builder finds it. Exported so tests can build their own configs
+/// from the same provider.
+pub fn crypto_provider() -> Arc<CryptoProvider> {
     if let Some(installed) = CryptoProvider::get_default() {
         return installed.clone();
     }
