@@ -8,13 +8,18 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde::{Deserialize, Serialize};
 
 use comet_harness::{Harness, HarnessError, mock::MockHarness};
-use comet_proto::{AgentEvent, DoneStatus, HarnessCapabilities, HarnessId};
+use comet_proto::{AgentEvent, DoneStatus, HarnessAvailability, HarnessCapabilities, HarnessId};
 
 /// What `ListHarnesses` reports per harness.
 ///
 /// `capabilities` is flattened, so the wire shape is unchanged from when these
 /// were three sibling fields — a remote client on an older build decodes this
 /// descriptor byte-identically.
+///
+/// `availability` is a sibling rather than a capability, and is serde-defaulted
+/// so an older engine that omits it reads as `Unknown` (selectable) instead of
+/// failing the whole reply. See [`HarnessAvailability`] for why it is kept out
+/// of [`HarnessCapabilities`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HarnessDescriptor {
@@ -22,6 +27,8 @@ pub struct HarnessDescriptor {
     pub name: String,
     #[serde(flatten)]
     pub capabilities: HarnessCapabilities,
+    #[serde(default)]
+    pub availability: HarnessAvailability,
 }
 
 fn describe(harness: &dyn Harness) -> HarnessDescriptor {
@@ -29,6 +36,9 @@ fn describe(harness: &dyn Harness) -> HarnessDescriptor {
         id: harness.id(),
         name: harness.display_name().to_string(),
         capabilities: harness.capabilities(),
+        // Availability is not the harness's to answer synchronously — it is
+        // overlaid from the probe cache by `descriptors()`.
+        availability: HarnessAvailability::Unknown,
     }
 }
 
@@ -45,6 +55,9 @@ enum Slot {
 pub struct HarnessRegistry {
     slots: Mutex<HashMap<HarnessId, Slot>>,
     order: Mutex<Vec<HarnessId>>,
+    /// Probe results, overlaid onto every descriptor. Absent = never probed,
+    /// which reports as `Unknown` and leaves the harness selectable.
+    availability: Mutex<HashMap<HarnessId, HarnessAvailability>>,
 }
 
 impl Default for HarnessRegistry {
@@ -58,6 +71,7 @@ impl HarnessRegistry {
         Self {
             slots: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
+            availability: Mutex::new(HashMap::new()),
         }
     }
 
@@ -107,17 +121,72 @@ impl HarnessRegistry {
         }
     }
 
+    fn availability(&self) -> MutexGuard<'_, HashMap<HarnessId, HarnessAvailability>> {
+        self.availability
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Record a probe result. Idempotent; a later probe replaces an earlier one.
+    pub fn set_availability(&self, id: HarnessId, availability: HarnessAvailability) {
+        self.availability().insert(id, availability);
+    }
+
     /// Catalog for `ListHarnesses` — never forces a lazy resolve.
     pub fn descriptors(&self) -> Vec<HarnessDescriptor> {
         let slots = self.slots();
+        let availability = self.availability();
         self.order()
             .iter()
-            .filter_map(|id| match slots.get(id) {
-                Some(Slot::Ready(harness)) => Some(describe(harness.as_ref())),
-                Some(Slot::Lazy { descriptor, .. }) => Some(descriptor.clone()),
-                None => None,
+            .filter_map(|id| {
+                let mut descriptor = match slots.get(id) {
+                    Some(Slot::Ready(harness)) => describe(harness.as_ref()),
+                    Some(Slot::Lazy { descriptor, .. }) => descriptor.clone(),
+                    None => return None,
+                };
+                // Overlaid here rather than stored on the slot, so the probe
+                // never has to reach into a descriptor a lazy slot owns.
+                if let Some(probed) = availability.get(id) {
+                    descriptor.availability = probed.clone();
+                }
+                Some(descriptor)
             })
             .collect()
+    }
+
+    /// Probe every registered harness in the background, one task each.
+    ///
+    /// Deliberately fire-and-forget: `ListHarnesses` is request/response with
+    /// no push channel, so results are simply read by whichever `descriptors()`
+    /// call comes after they land. Until then a harness reports `Unknown` and
+    /// stays selectable — the picker opens long after boot, so in practice the
+    /// probe has finished, and when it has not the user loses nothing.
+    ///
+    /// A no-op outside a tokio runtime, which is what test callers of
+    /// [`default_registry`] get; nothing depends on the probe having run.
+    pub fn spawn_availability_probes(self: &Arc<Self>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let ids: Vec<HarnessId> = self.order().clone();
+        for id in ids {
+            let registry = self.clone();
+            handle.spawn(async move {
+                // Resolving a lazy slot only constructs the harness — CLI
+                // discovery still happens inside `availability()`. A slot whose
+                // factory fails is itself the reason it is unusable.
+                let availability = match registry.resolve(id) {
+                    Ok(harness) => harness.availability().await,
+                    Err(err) => HarnessAvailability::Unavailable {
+                        reason: err.to_string(),
+                    },
+                };
+                if let Some(reason) = availability.unavailable_reason() {
+                    tracing::info!(?id, reason, "harness unavailable");
+                }
+                registry.set_availability(id, availability);
+            });
+        }
     }
 }
 
@@ -178,6 +247,7 @@ pub fn default_registry() -> HarnessRegistry {
             id: HarnessId::ClaudeCode,
             name: "Claude Code".into(),
             capabilities: comet_harness::ClaudeHarness::capabilities(),
+            availability: HarnessAvailability::Unknown,
         },
         Box::new(|| Ok(Arc::new(comet_harness::ClaudeHarness::new()) as Arc<dyn Harness>)),
     );
@@ -188,6 +258,7 @@ pub fn default_registry() -> HarnessRegistry {
             // HARNESS_LABEL; must match CodexHarness::display_name().
             name: "Codex".into(),
             capabilities: comet_harness::CodexHarness::capabilities(),
+            availability: HarnessAvailability::Unknown,
         },
         Box::new(|| Ok(Arc::new(comet_harness::CodexHarness::new()) as Arc<dyn Harness>)),
     );
@@ -209,6 +280,7 @@ mod tests {
                 id: HarnessId::Mock,
                 name: "Lazy Mock".into(),
                 capabilities: HarnessCapabilities::default(),
+                availability: HarnessAvailability::Unknown,
             },
             Box::new(move || {
                 counted.fetch_add(1, Ordering::SeqCst);
@@ -279,6 +351,117 @@ mod tests {
         }
     }
 
+    /// A harness nobody has probed reports `Unknown`, not `Unavailable`. The
+    /// picker keeps `Unknown` selectable, so getting this backwards would
+    /// disable every provider for the whole window between boot and the first
+    /// probe landing.
+    #[test]
+    fn unprobed_harnesses_report_unknown() {
+        let registry = default_registry();
+        for descriptor in registry.descriptors() {
+            assert_eq!(
+                descriptor.availability,
+                HarnessAvailability::Unknown,
+                "{:?} should be unprobed",
+                descriptor.id
+            );
+            assert_eq!(descriptor.availability.unavailable_reason(), None);
+        }
+    }
+
+    /// A probe result reaches the catalog, and reaches it for the right
+    /// harness only.
+    #[test]
+    fn a_probe_result_is_overlaid_onto_its_descriptor() {
+        let registry = default_registry();
+        registry.set_availability(
+            HarnessId::Codex,
+            HarnessAvailability::Unavailable {
+                reason: "codex (searched PATH; set CODEX_EXECUTABLE to override)".into(),
+            },
+        );
+        registry.set_availability(
+            HarnessId::ClaudeCode,
+            HarnessAvailability::Available {
+                version: Some("1.0.30".into()),
+            },
+        );
+
+        let by_id = |id: HarnessId| {
+            registry
+                .descriptors()
+                .into_iter()
+                .find(|d| d.id == id)
+                .expect("harness in catalog")
+                .availability
+        };
+        assert_eq!(
+            by_id(HarnessId::Codex).unavailable_reason(),
+            Some("codex (searched PATH; set CODEX_EXECUTABLE to override)")
+        );
+        assert_eq!(
+            by_id(HarnessId::ClaudeCode),
+            HarnessAvailability::Available {
+                version: Some("1.0.30".into())
+            }
+        );
+        // Untouched slots stay unprobed rather than inheriting a neighbour's.
+        assert_eq!(by_id(HarnessId::Mock), HarnessAvailability::Unknown);
+    }
+
+    /// The overlay must survive a lazy slot resolving, which swaps the stored
+    /// descriptor for a `describe()`-derived one. `describe()` cannot know the
+    /// probe result, so a naive implementation loses it on first use.
+    #[test]
+    fn availability_survives_a_lazy_resolve() {
+        let registry = default_registry();
+        registry.set_availability(
+            HarnessId::Codex,
+            HarnessAvailability::Available {
+                version: Some("0.20.0".into()),
+            },
+        );
+        registry.resolve(HarnessId::Codex).unwrap();
+        let after = registry
+            .descriptors()
+            .into_iter()
+            .find(|d| d.id == HarnessId::Codex)
+            .unwrap();
+        assert_eq!(
+            after.availability,
+            HarnessAvailability::Available {
+                version: Some("0.20.0".into())
+            },
+            "resolving the slot dropped the probe result"
+        );
+    }
+
+    /// Probing must not be a precondition for anything: `default_registry()` is
+    /// constructed off-runtime in tests and by sync callers.
+    #[test]
+    fn spawning_probes_off_runtime_is_a_no_op() {
+        let registry = Arc::new(default_registry());
+        registry.spawn_availability_probes();
+        assert!(
+            registry
+                .descriptors()
+                .iter()
+                .all(|d| d.availability == HarnessAvailability::Unknown)
+        );
+    }
+
+    /// The mock harness has no CLI, so the trait default applies and it probes
+    /// as available — a fixture harness must never render disabled.
+    #[tokio::test]
+    async fn an_in_process_harness_probes_as_available() {
+        let registry = Arc::new(default_registry());
+        let mock = registry.resolve(HarnessId::Mock).unwrap();
+        assert_eq!(
+            mock.availability().await,
+            HarnessAvailability::Available { version: None }
+        );
+    }
+
     /// `capabilities` is `#[serde(flatten)]`, so the descriptor keeps the wire
     /// shape it had when these were three sibling fields. A remote client on a
     /// build that predates `HarnessCapabilities` must still decode it.
@@ -288,6 +471,7 @@ mod tests {
             id: HarnessId::Codex,
             name: "Codex".into(),
             capabilities: comet_harness::CodexHarness::capabilities(),
+            availability: HarnessAvailability::Unknown,
         };
         let json = serde_json::to_value(&descriptor).unwrap();
         let object = json

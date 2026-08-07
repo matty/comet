@@ -76,6 +76,111 @@ pub struct HarnessCapabilities {
     pub reasoning_levels: Vec<ReasoningLevel>,
 }
 
+/// Whether a harness's CLI is usable on this device, as of the last probe.
+///
+/// This is deliberately **not** part of [`HarnessCapabilities`]. Capabilities
+/// are static per harness — declared once by an associated `capabilities()`
+/// that the engine's lazy descriptor and the resolved harness both name, which
+/// is what makes drift between them unrepresentable. Availability is the
+/// opposite: it is discovered at run time, changes with the device, and is
+/// published asynchronously. Folding it in would either break that equality or
+/// make it vacuous.
+///
+/// [`Unknown`] is the default and means *not probed yet*, never *broken*. An
+/// unprobed harness must stay selectable — presenting a working provider as
+/// unusable because a background probe has not landed is worse than the delay.
+///
+/// [`Unknown`]: HarnessAvailability::Unknown
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum HarnessAvailability {
+    /// No probe has completed. Selectable; renders exactly like an available
+    /// harness, because we do not yet know otherwise.
+    #[default]
+    Unknown,
+    /// The CLI resolved and answered `--version`.
+    Available {
+        /// Whatever the CLI reported, when a version could be read out of it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+    },
+    /// The CLI is missing or did not answer. `reason` is user-facing prose and
+    /// carries the override hint, so it must not be truncated for display.
+    Unavailable { reason: String },
+}
+
+impl HarnessAvailability {
+    /// The reason this harness cannot be used, when that is known.
+    ///
+    /// `Unknown` yields `None` alongside `Available`: an unfinished probe is
+    /// not evidence of a problem, and every caller that dims or blocks a
+    /// harness keys off this returning `Some`.
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        match self {
+            Self::Unavailable { reason } => Some(reason),
+            Self::Unknown | Self::Available { .. } => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod availability_tests {
+    use super::*;
+
+    /// An absent `availability` decodes to `Unknown` — an older engine that
+    /// does not send the field must not have its harnesses read as broken.
+    #[test]
+    fn absent_availability_is_unknown_not_unavailable() {
+        let decoded: HarnessAvailability = serde_json::from_str(r#"{"state":"unknown"}"#).unwrap();
+        assert_eq!(decoded, HarnessAvailability::default());
+        assert_eq!(decoded.unavailable_reason(), None);
+    }
+
+    /// Only `Unavailable` blocks. This is the predicate the picker dims on, so
+    /// a wrong answer here silently disables a working provider.
+    #[test]
+    fn only_unavailable_reports_a_reason() {
+        assert_eq!(HarnessAvailability::Unknown.unavailable_reason(), None);
+        assert_eq!(
+            HarnessAvailability::Available {
+                version: Some("1.2.3".into())
+            }
+            .unavailable_reason(),
+            None
+        );
+        assert_eq!(
+            HarnessAvailability::Unavailable {
+                reason: "not installed".into()
+            }
+            .unavailable_reason(),
+            Some("not installed")
+        );
+    }
+
+    #[test]
+    fn availability_round_trips_through_its_tagged_shape() {
+        for value in [
+            HarnessAvailability::Unknown,
+            HarnessAvailability::Available { version: None },
+            HarnessAvailability::Available {
+                version: Some("2.0.0".into()),
+            },
+            HarnessAvailability::Unavailable {
+                reason: "claude (searched PATH; set CLAUDE_CODE_EXECUTABLE to override)".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&value).unwrap();
+            let round: HarnessAvailability = serde_json::from_str(&json).unwrap();
+            assert_eq!(round, value, "{json} did not round-trip");
+        }
+        // An available harness with no readable version omits the key rather
+        // than sending `null`.
+        let json =
+            serde_json::to_string(&HarnessAvailability::Available { version: None }).unwrap();
+        assert_eq!(json, r#"{"state":"available"}"#);
+    }
+}
+
 #[cfg(test)]
 mod capability_tests {
     use super::*;

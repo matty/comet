@@ -429,6 +429,17 @@ impl Pickers {
         self.state.read(cx).selected_chat.is_some()
     }
 
+    /// Whether a probe has come back saying this harness cannot run.
+    ///
+    /// False whenever the catalog has not loaded or the probe has not landed —
+    /// `Unknown` is not evidence of a problem, and blocking on it would make a
+    /// working provider unpickable for the window before its probe returns.
+    fn harness_unavailable(&self, harness: HarnessId) -> bool {
+        self.harnesses
+            .ready()
+            .is_some_and(|list| harness_is_unavailable(list, harness))
+    }
+
     fn engine(&self, cx: &App) -> Option<ServerClient> {
         self.state.read(cx).selected_client()
     }
@@ -969,6 +980,12 @@ impl Pickers {
 
     fn pick_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
         if self.harness_locked(cx) {
+            return;
+        }
+        // Guarded here as well as by the row's disabled rendering: the click
+        // handler is attached unconditionally, so this is what actually makes
+        // an unusable provider unpickable.
+        if self.harness_unavailable(harness) {
             return;
         }
         if self.config.harness != Some(harness) {
@@ -1908,7 +1925,14 @@ impl Pickers {
                     .children(descriptors.into_iter().enumerate().map(|(ix, descriptor)| {
                         let harness = descriptor.id;
                         let is_viewed = effective == Some(harness);
-                        let is_disabled = locked && !is_viewed;
+                        // An unavailable provider greys out whether or not it
+                        // is the viewed one: a committed harness whose CLI has
+                        // gone missing is exactly the case worth surfacing.
+                        let unavailable: Option<SharedString> = descriptor
+                            .availability
+                            .unavailable_reason()
+                            .map(|reason| SharedString::from(reason.to_owned()));
+                        let is_disabled = (locked && !is_viewed) || unavailable.is_some();
                         let (icon_path, tint) = harness_brand_icon(harness);
                         let name: SharedString = descriptor.name.clone().into();
                         div()
@@ -1939,6 +1963,18 @@ impl Pickers {
                             // rows in shell.rs).
                             .when(!is_disabled && !is_viewed, |el| {
                                 el.hover(|s| s.bg(crate::theme::ink(0.06)))
+                            })
+                            // The greyed-out row still answers "why?" on hover;
+                            // that is the only place the untruncated reason
+                            // (including the override hint) is reachable.
+                            .when_some(unavailable, |el, reason| {
+                                el.tooltip(move |_, cx| {
+                                    cx.new(|_| HarnessUnavailableTooltip {
+                                        reason: reason.clone(),
+                                        row: ix,
+                                    })
+                                    .into()
+                                })
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.pick_harness(harness, cx);
@@ -2346,6 +2382,53 @@ fn visible_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<H
     if real.is_empty() { list.to_vec() } else { real }
 }
 
+/// Whether a probed harness came back unusable.
+///
+/// A harness the catalog does not list, and one whose probe has not landed,
+/// both answer `false`. `Unknown` means *not probed yet*, never *broken*, so
+/// treating it as unavailable would grey out every provider for the window
+/// between the picker opening and the probes returning.
+fn harness_is_unavailable(list: &[HarnessDescriptor], harness: HarnessId) -> bool {
+    list.iter()
+        .find(|d| d.id == harness)
+        .is_some_and(|d| d.availability.unavailable_reason().is_some())
+}
+
+/// Why a greyed-out harness cannot be used, shown on hover over its rail row.
+///
+/// The rail is a fixed 148px column and the reason is a full sentence whose
+/// actionable half — the override variable — is its last clause, so truncating
+/// it into the row would drop exactly the part worth reading. The tooltip is
+/// where the untruncated prose fits.
+struct HarnessUnavailableTooltip {
+    reason: SharedString,
+    /// Distinct per rail row, so moving between two unavailable harnesses
+    /// re-runs the fade instead of reusing the previous row's animation.
+    row: usize,
+}
+
+impl gpui::Render for HarnessUnavailableTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        motion::fade_quick(
+            ("harness-unavailable-tooltip", self.row),
+            div()
+                // Wraps rather than truncates — the reason is prose, and the
+                // override hint sits at the end of it.
+                .max_w(px(320.0))
+                .px(px(8.0))
+                .py(px(6.0))
+                .rounded(px(5.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .bg(theme.surface_raised)
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .child(self.reason.clone()),
+        )
+    }
+}
+
 /// Attach the (single) open popover overlay to its trigger chip.
 fn attach_overlay(
     chip: gpui::Stateful<gpui::Div>,
@@ -2712,6 +2795,45 @@ mod tests {
         assert_eq!(clamp_reasoning(Some(High), &[]), None);
     }
 
+    /// Only a landed `Unavailable` blocks a pick. This predicate gates both the
+    /// greyed-out rendering and `pick_harness`, so a false positive silently
+    /// makes a working provider unselectable.
+    #[test]
+    fn only_a_probed_failure_marks_a_harness_unavailable() {
+        use comet_proto::HarnessAvailability;
+        let with = |id: HarnessId, availability: HarnessAvailability| HarnessDescriptor {
+            id,
+            name: "n".into(),
+            capabilities: comet_proto::HarnessCapabilities::default(),
+            availability,
+        };
+        let list = vec![
+            with(HarnessId::ClaudeCode, HarnessAvailability::Unknown),
+            with(
+                HarnessId::Codex,
+                HarnessAvailability::Unavailable {
+                    reason: "codex (searched PATH; set CODEX_EXECUTABLE to override)".into(),
+                },
+            ),
+            with(
+                HarnessId::Mock,
+                HarnessAvailability::Available {
+                    version: Some("1.0.0".into()),
+                },
+            ),
+        ];
+
+        assert!(harness_is_unavailable(&list, HarnessId::Codex));
+        // Unprobed stays pickable — the whole point of `Unknown`.
+        assert!(!harness_is_unavailable(&list, HarnessId::ClaudeCode));
+        assert!(!harness_is_unavailable(&list, HarnessId::Mock));
+        // A harness absent from the catalog is not "unavailable" either; it is
+        // simply not offered, and the rail never renders a row for it.
+        assert!(!harness_is_unavailable(&list, HarnessId::Cursor));
+        // An empty catalog must not block everything.
+        assert!(!harness_is_unavailable(&[], HarnessId::Codex));
+    }
+
     #[test]
     fn mock_harness_hidden_unless_alone() {
         // Visibility keys off the id alone, so the capability block is inert here.
@@ -2719,6 +2841,7 @@ mod tests {
             id,
             name: name.into(),
             capabilities: comet_proto::HarnessCapabilities::default(),
+            availability: comet_proto::HarnessAvailability::Unknown,
         };
         let mixed = vec![
             descriptor(HarnessId::Mock, "Mock"),

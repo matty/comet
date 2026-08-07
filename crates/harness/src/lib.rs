@@ -14,8 +14,8 @@ use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
 
 use comet_proto::{
-    AgentEvent, HarnessCapabilities, HarnessId, Model, RunRequest, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, HarnessAvailability, HarnessCapabilities, HarnessId, Model, RunRequest,
+    UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +56,17 @@ pub trait Harness: Send + Sync {
     /// associated `capabilities()` so the engine registry can name the same
     /// value without re-typing it — see [`comet_proto::HarnessCapabilities`].
     fn capabilities(&self) -> HarnessCapabilities;
+    /// Whether this harness is usable on this device right now.
+    ///
+    /// Defaults to available: an in-process harness (the mock, and every test
+    /// fixture) has no CLI to resolve, so there is nothing that could be
+    /// missing. Only the harnesses that spawn a real binary override this.
+    ///
+    /// Called off the hot path — the engine probes in the background at boot
+    /// and caches the result, because this spawns a subprocess.
+    async fn availability(&self) -> HarnessAvailability {
+        HarnessAvailability::Available { version: None }
+    }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
     async fn run(
@@ -234,6 +245,83 @@ pub(crate) fn compose_child_path(cmd: &mut tokio::process::Command, exe: &std::p
     }
 }
 
+/// How long a `--version` probe may run before the CLI is called unusable. A
+/// hung probe must not keep a harness in `Unknown` forever, but the bound is
+/// generous: the npm shims start a Node runtime, and a cold first run on
+/// Windows also pays Defender's scan of the shim.
+pub(crate) const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ask an already-resolved CLI for its version.
+///
+/// Every failure mode collapses to `Unavailable` with prose naming the binary,
+/// because the caller renders this string verbatim and "something went wrong"
+/// is not actionable. Success with an unreadable version is still `Available`
+/// — the CLI answered, which is the question being asked.
+pub(crate) async fn probe_cli_version(exe: &std::path::Path) -> HarnessAvailability {
+    let mut cmd = tokio::process::Command::new(exe);
+    compose_child_path(&mut cmd, exe);
+    cmd.arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // The timeout arm drops the future; without this the child outlives
+        // the probe and we leak a process per boot.
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW: the `.cmd` shims are console apps, so without this
+        // every boot flashes a console window for a probe the user never asked
+        // to see. `tokio::process::Command` exposes this directly on Windows.
+        cmd.creation_flags(0x0800_0000);
+    }
+    let name = exe.display();
+    match tokio::time::timeout(PROBE_TIMEOUT, cmd.output()).await {
+        Ok(Ok(output)) if output.status.success() => HarnessAvailability::Available {
+            version: parse_cli_version(&String::from_utf8_lossy(&output.stdout)),
+        },
+        Ok(Ok(output)) => {
+            let status = describe_exit(Some(output.status));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+            HarnessAvailability::Unavailable {
+                reason: if detail.is_empty() {
+                    format!("{name} --version failed ({status})")
+                } else {
+                    format!("{name} --version failed ({status}): {}", detail.trim())
+                },
+            }
+        }
+        Ok(Err(err)) => HarnessAvailability::Unavailable {
+            reason: format!("{name} could not be started: {err}"),
+        },
+        Err(_) => HarnessAvailability::Unavailable {
+            reason: format!(
+                "{name} did not answer --version within {}s",
+                PROBE_TIMEOUT.as_secs()
+            ),
+        },
+    }
+}
+
+/// Pull a version out of `--version` output.
+///
+/// The CLIs disagree on shape — Claude prints `1.0.30 (Claude Code)`, Codex
+/// prints `codex-cli 0.20.0` — so take the first dotted-numeric token rather
+/// than a fixed position. An unrecognized line yields `None`, which still
+/// reads as available; the version is a nicety, the answer is the signal.
+pub(crate) fn parse_cli_version(output: &str) -> Option<String> {
+    let line = output.lines().find(|l| !l.trim().is_empty())?.trim();
+    line.split_whitespace()
+        .map(|token| token.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
+        // A leading `v` is a conventional prefix, not part of the version.
+        .map(|token| match token.strip_prefix(['v', 'V']) {
+            Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => rest,
+            _ => token,
+        })
+        .find(|token| token.contains('.') && token.starts_with(|c: char| c.is_ascii_digit()))
+        .map(str::to_owned)
+}
+
 /// Rolling tail of a child's stderr, shared between the reader task and the
 /// crash-message composer: an unexpected exit surfaces "<name> exited
 /// unexpectedly (<status>): <last stderr lines>" instead of a bare shrug —
@@ -365,3 +453,99 @@ pub(crate) fn send_signal(_pid: u32, _signal: Signal) {
 
 pub use claude::{ClaudeHarness, resolve_claude_executable};
 pub use codex::{CodexHarness, resolve_codex_executable};
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    /// The two CLIs put the version in different positions — Claude leads with
+    /// it, Codex leads with a name containing no dot — so the parse is
+    /// positional-agnostic. Both strings are real `--version` output, captured
+    /// from the installed CLIs rather than invented.
+    #[test]
+    fn version_is_read_from_either_cli_shape() {
+        assert_eq!(
+            parse_cli_version("2.1.224 (Claude Code)\n").as_deref(),
+            Some("2.1.224")
+        );
+        assert_eq!(
+            parse_cli_version("codex-cli 0.146.0\n").as_deref(),
+            Some("0.146.0")
+        );
+        // Leading blank lines and a `v` prefix both survive.
+        assert_eq!(parse_cli_version("\n\nv2.1.4\n").as_deref(), Some("2.1.4"));
+    }
+
+    /// No version is not a failure — the CLI answered, which is the question.
+    #[test]
+    fn unreadable_version_is_none_rather_than_an_error() {
+        assert_eq!(parse_cli_version(""), None);
+        assert_eq!(parse_cli_version("   \n  \n"), None);
+        assert_eq!(parse_cli_version("no version here\n"), None);
+        // A bare integer is not a version; requiring the dot avoids reporting
+        // "2" from prose like "codex 2 beta".
+        assert_eq!(parse_cli_version("codex 2 beta\n"), None);
+    }
+
+    /// Windows resolves these CLIs to `.cmd` shims when they come from npm —
+    /// [`executable_names`] exists precisely because that is the only spelling
+    /// present. `CreateProcess` handling of batch files is a real trip hazard
+    /// on this repo's primary dev platform, so pin that a shim is probeable
+    /// rather than assuming it behaves like an `.exe`.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_windows_cmd_shim_is_probeable() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("fake-cli.cmd");
+        std::fs::write(&shim, "@echo off\r\necho fake-cli 4.5.6\r\n").unwrap();
+
+        let availability = probe_cli_version(&shim).await;
+        assert_eq!(
+            availability,
+            HarnessAvailability::Available {
+                version: Some("4.5.6".into())
+            },
+            "a .cmd shim must probe like any other executable"
+        );
+    }
+
+    /// A CLI that resolves but fails carries its own stderr into the reason —
+    /// "not installed" would be actively misleading for a broken install.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_failing_cli_reports_its_own_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("broken-cli.cmd");
+        std::fs::write(&shim, "@echo off\r\necho boom 1>&2\r\nexit /b 3\r\n").unwrap();
+
+        let reason = probe_cli_version(&shim)
+            .await
+            .unavailable_reason()
+            .expect("a non-zero exit is unavailable")
+            .to_owned();
+        assert!(
+            reason.contains("broken-cli"),
+            "must name the binary: {reason}"
+        );
+        assert!(
+            reason.contains("exit code 3"),
+            "must carry status: {reason}"
+        );
+        assert!(reason.contains("boom"), "must carry stderr: {reason}");
+    }
+
+    /// A binary that does not exist must produce prose naming it, not a
+    /// generic io error — the string is rendered verbatim in the picker.
+    #[tokio::test]
+    async fn a_missing_binary_probes_as_unavailable() {
+        let missing = std::path::Path::new("comet-definitely-not-a-real-cli");
+        let availability = probe_cli_version(missing).await;
+        let reason = availability
+            .unavailable_reason()
+            .expect("a missing binary is unavailable");
+        assert!(
+            reason.contains("comet-definitely-not-a-real-cli"),
+            "reason must name the binary: {reason}"
+        );
+    }
+}
