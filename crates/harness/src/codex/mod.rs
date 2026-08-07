@@ -47,7 +47,7 @@ use comet_proto::{
     UserInputAnswer, UserInputQuestion,
 };
 
-use crate::{Harness, HarnessError, RunControls};
+use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
     Phase, delta_text, item_id, item_type, map_item, turn_error_message, turn_id, usage_event,
@@ -1113,29 +1113,6 @@ async fn shutdown_child(child: &mut Child, kill_grace: Duration) {
     }
     let _ = child.start_kill();
     let _ = child.wait().await;
-}
-
-#[derive(Clone, Copy)]
-enum Signal {
-    Term,
-    Kill,
-}
-
-#[cfg(unix)]
-fn send_signal(pid: u32, signal: Signal) {
-    let sig = match signal {
-        Signal::Term => libc::SIGTERM,
-        Signal::Kill => libc::SIGKILL,
-    };
-    // SAFETY: plain kill(2) on a pid we spawned and have not yet reaped.
-    unsafe {
-        libc::kill(pid as libc::pid_t, sig);
-    }
-}
-
-#[cfg(not(unix))]
-fn send_signal(_pid: u32, _signal: Signal) {
-    // No SIGTERM off unix; `start_kill`/`kill_on_drop` handle termination.
 }
 
 #[cfg(test)]
