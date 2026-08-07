@@ -53,3 +53,49 @@ the same convention as a commit subject. In the body: what changed, why, and the
 verification commands you ran with their result.
 
 Confirm with the user before merging. Do not merge your own PR unless asked.
+
+### Never force-push unless it is unavoidable
+
+Default to fast-forward pushes. To revise a PR after review, **add a commit** — the review
+history stays legible and nothing already published moves.
+
+`--force-with-lease` only protects against clobbering a push you have not seen. It does not
+protect a human or a bot mid-review: rewriting a pushed commit can orphan inline review
+comments anchored to it and forces a full re-review instead of an incremental one.
+
+There is one routine exception, and it is caused by squash merges. When a base PR merges, its
+commits become **one new commit** with a different SHA, so a stacked branch still carries the
+originals — which are not in `main`. That branch must be rebased before it can merge:
+
+```bash
+git fetch origin
+git rebase --onto origin/main <old-base-tip>   # the parent of THIS branch's own first commit
+git push --force-with-lease
+```
+
+`<old-base-tip>` is the base branch's tip *as this branch saw it*, not the base's current SHA.
+Read it out of `git log --oneline <branch>` — passing a SHA that is not an ancestor makes git
+replay the already-merged commits and conflict against itself.
+
+Rebase only when a base has actually merged. Say so before doing it, and re-run the gate
+afterwards: a rebase produces commits that have never been tested in that arrangement.
+
+### Deleting branches: last, never with `--delete-branch` on a stack
+
+`gh pr merge --delete-branch` removes the branch immediately, and **GitHub closes any PR whose
+base branch is deleted**. On a stack that silently closes the next PR as collateral. Recovering
+is awkward — a closed PR cannot be retargeted, and it cannot be reopened while its base is
+missing, so the base has to be pushed back first just to break the deadlock.
+
+Merge without `--delete-branch` while anything is stacked on the branch, then delete branches
+at the end once nothing depends on them:
+
+```bash
+gh pr merge <n> --squash
+# …after the whole stack has landed:
+git diff --stat main..<branch>     # expect empty, or deletions only
+git branch -D <branch> && git push origin --delete <branch>
+```
+
+`git branch -d` will refuse a squash-merged branch because no merge commit references it.
+Confirm the content landed with the `git diff` above before reaching for `-D`.
