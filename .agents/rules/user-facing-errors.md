@@ -93,33 +93,55 @@ too. A cancelled slot must then be **re-armed on the next discrete demand**
 (`Pickers::rearm_cancelled_models`) — never from render, which runs `ensure_*`
 every frame and would restart the request as fast as it was cancelled.
 
-### Not yet registered
+### Two decisions per surface
 
-Only the **model list** is wired. These four still load without a toast, and
-each is the same three-line transformation above:
+**Does it register?** Every load that leaves the user looking at a skeleton, yes.
 
-| Surface | Function |
-| --- | --- |
-| Harness catalog | `pickers.rs` `ensure_harnesses` |
-| Branch list | `pickers.rs` `ensure_refs` |
-| Folder browser | `shell/spaces.rs` folder listing |
-| Accounts page | `settings/accounts.rs` `load` |
+**Does it offer Cancel?** Only if stopping it changes what is on screen. A load
+that *revalidates rows already painted* registers with `begin_uncancellable`: it
+gets the sentence, not the affordance, because a control with no visible effect
+is worse than none — and because its handler would otherwise have to decide
+whether to throw away a good list. `ensure_refs`' stale-while-revalidate refresh
+and `revalidate_harnesses`' poll loop are the two. This is not an escape hatch:
+a skeleton is always cancellable, because there the wait is all the user has.
 
-Wire one when you touch it. Each needs its own re-arm decision — the discrete
-"asked for it again" event differs per surface (picker open, page revisit).
+**Then: how does the cancelled slot re-arm?** Usually it already does. Of the
+five registered loads only `ensure_harnesses` needs a marker, because it is the
+only one render calls every frame — so it must refuse to reload an `Error`, and
+a cancel leaves exactly that. The other four reload unconditionally from their
+discrete triggers (`ensure_refs` gets `force: true` on every popover open;
+`load_space_folders` is called by every crumb, row and Retry; `accounts::load`
+by Retry, Refresh, a device switch and every post-action refresh), so a cancel
+there re-arms by construction. Check the call sites before adding a marker.
+
+### A cancel is not a failure, even when it lands in the error slot
+
+Both end up in `Loadable::Error`, so any surface that *rewrites* its error text
+will rewrite the cancel too. The folder browser did: it replaced the message
+with "{device} didn't respond — is it online?", which turned "you stopped this"
+into a machine diagnosis pointing at the wrong thing. `browser_error_line` in
+`shell/spaces.rs` is the fix and the worked example — if a surface derives copy
+from the fact of an error, it has to know which kind it has.
 
 ## Known debt — check before adding more
 
 - **`RpcClient::call` has no timeout** (`crates/rpc/src/client.rs`). `rx.await`
   resolves when the reply lands or when the connection drops — a live engine
-  whose handler never answers leaves the caller pending forever, and the
-  `Loadable` slot stays `Loading` with no Retry. Handlers shell out to `git` and
-  spawn agent CLIs, so a hang is reachable, not theoretical. **This is the open
-  half of the rule: the "no raw errors" half now holds, the "no unbounded wait"
-  half does not.** Fixing it needs a decision first — a blanket timeout breaks
-  legitimately slow calls (a large `git diff`, a cold repo scan), so the
-  candidates are a per-method budget or a "still working — cancel?" state that
-  never hard-fails.
+  whose handler never answers leaves the caller pending forever. Every *load*
+  now answers that with the toast, so the slot is explained and escapable; a
+  **mutation** still has nothing. Fixing it properly needs a decision first — a
+  blanket timeout breaks legitimately slow calls (a large `git diff`, a cold
+  repo scan), so the candidates are a per-method budget or a "still working —
+  cancel?" state that never hard-fails.
+- **Mutations still render raw errors.** Rule 1 holds for loads and not for the
+  rest: `format!("{err}")` on an `RpcError` reaches the user from
+  `settings/accounts.rs` (switch/forget, login start, poll),
+  `shell/spaces.rs` (space create, delete), `shell.rs` (sidebar notices),
+  `composer.rs` (stop, answer), `settings/devices.rs` (rename) and
+  `settings/archived.rs` (unarchive) — thirteen sites. `errors.rs` is where the
+  copy goes; each needs its own context the way `switch_failure` and
+  `session_move_failure` did, because "try again" is wrong advice for some of
+  them.
 
 The error surfaces themselves are fine: `popover::error_row` and
 `widgets::error_strip` both carry a Retry affordance. It is the *message text*

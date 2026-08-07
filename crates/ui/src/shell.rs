@@ -591,10 +591,14 @@ pub struct Shell {
     sound_prev: std::collections::HashMap<String, comet_proto::SessionStatus>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
-    /// Design prototype: `COMET_SLOW_TOAST_DEMO=1` pins the slow-request toast
-    /// open so it can be reviewed in the app before it is wired to real request
-    /// timing. Clicking Cancel clears it. Not a shipping code path.
-    slow_request_demo: bool,
+    /// Design prototype: `COMET_SLOW_TOAST_DEMO` pins the slow-request toast
+    /// open so it can be reviewed in the app without waiting for something to
+    /// actually hang. `=1` shows the cancellable card, `=quiet` the one a
+    /// background revalidation raises — which has no Cancel, so its only way out
+    /// is to unset the variable. Not a shipping code path.
+    ///
+    /// `Some(cancellable)`.
+    slow_request_demo: Option<bool>,
     /// `Some` while the space-scope dropdown panel is open: `Switch` when
     /// the trigger itself was clicked (picking what the sidebar is scoped
     /// to), `PickForNewSession` when the Sessions `+` on `All spaces` is
@@ -868,8 +872,11 @@ impl Shell {
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             sidebar_notice: None,
-            slow_request_demo: std::env::var_os("COMET_SLOW_TOAST_DEMO")
-                .is_some_and(|v| !v.is_empty()),
+            slow_request_demo: match std::env::var("COMET_SLOW_TOAST_DEMO").ok().as_deref() {
+                None | Some("") => None,
+                Some("quiet") => Some(false),
+                Some(_) => Some(true),
+            },
             space_dropdown_open: None,
             space_dropdown_highlight: None,
             space_dropdown_focus: cx.focus_handle(),
@@ -4224,28 +4231,35 @@ impl Render for Shell {
         }
         // `COMET_SLOW_TOAST_DEMO=1` pins it open with a stand-in request, for
         // reviewing the design without waiting for something to actually hang.
-        let slow = crate::toast::slow(cx).or(if self.slow_request_demo {
-            Some((0, crate::errors::Loading::Models))
-        } else {
-            None
-        });
-        let root = if let Some((request_id, what)) = slow {
+        let slow = crate::toast::slow(cx).or(self.slow_request_demo.map(|cancellable| {
+            crate::toast::SlowRequest {
+                id: 0,
+                what: crate::errors::Loading::Models,
+                cancellable,
+            }
+        }));
+        let root = if let Some(slow) = slow {
+            let request_id = slow.id;
             let theme = Theme::of(cx).clone();
             let view = cx.entity_id();
-            let cancel = crate::toast::cancel_link(&theme).on_click(cx.listener(
-                move |shell, _, _, cx: &mut Context<Self>| {
-                    crate::toast::cancel(cx, request_id);
-                    shell.slow_request_demo = false;
-                    cx.notify();
-                },
-            ));
+            // Absent for a wait that revalidates rows already on screen: there
+            // is nothing for a Cancel to change, so none is offered.
+            let cancel = slow.cancellable.then(|| {
+                crate::toast::cancel_link(&theme).on_click(cx.listener(
+                    move |shell, _, _, cx: &mut Context<Self>| {
+                        crate::toast::cancel(cx, request_id);
+                        shell.slow_request_demo = None;
+                        cx.notify();
+                    },
+                ))
+            });
             // The LIVE sidebar width, from the same tween the column itself
             // rides, so the toast tracks a collapse rather than snapping when
             // it lands.
             let left_inset = self.eval_tween(self.sidebar_tween, self.sidebar_target());
             root.child(crate::toast::slow_request_toast(
                 &theme,
-                crate::toast::waiting_message(what),
+                crate::toast::waiting_message(slow.what),
                 cancel,
                 left_inset,
                 view,

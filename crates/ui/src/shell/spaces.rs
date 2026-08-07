@@ -529,6 +529,24 @@ impl Render for SpaceGhost {
 }
 
 /// The add-space palette (a command-K surface, summoned by ⌘K): search bar
+/// What the folder browser's error row says.
+///
+/// A failure with a known device gets a diagnosis — the browse is a remote call
+/// and "that machine went quiet" is both the likely cause and the thing the user
+/// can act on, which the generic load copy cannot say.
+///
+/// A **cancel is not a failure** and must not borrow that sentence: the user
+/// stopped the listing themselves, and telling them the machine is offline
+/// invents a problem and points them at the wrong one. It keeps
+/// `toast::cancelled_message`, which is also what makes the adjacent Retry read
+/// as "resume" rather than "try that broken thing again".
+fn browser_error_line(message: &str, device: Option<&str>, cancelled: bool) -> String {
+    match device {
+        Some(device) if !cancelled => format!("{device} didn't respond — is it online?"),
+        _ => message.to_string(),
+    }
+}
+
 /// across the top, folder browser on the left, a Devices rail on the right,
 /// kbd-hint footer. One surface — picking a device in the rail rebrowses in
 /// place, no step wizard.
@@ -540,6 +558,13 @@ pub(super) struct AddSpaceFlow {
     /// Filter input; Enter descends into the highlighted folder.
     search: Entity<ComposerInput>,
     browser: Loadable<FolderListing>,
+    /// Whether the browser's `Error` is a cancel rather than a failure.
+    ///
+    /// The two must not paint the same: the error row rewrites any failure to
+    /// "{device} didn't respond — is it online?", which is a diagnosis, and
+    /// applying it to a listing the *user* stopped would tell them the machine
+    /// is offline when nothing of the sort happened.
+    browser_cancelled: bool,
     /// Requested browser path (`None` = the device's default, i.e. home).
     browser_path: Option<String>,
     /// The device's home (the path a `None` browse resolved to) — breadcrumbs
@@ -2458,6 +2483,7 @@ impl Shell {
             device,
             search,
             browser: Loadable::Idle,
+            browser_cancelled: false,
             browser_path: None,
             home: None,
             browser_repo: false,
@@ -2576,18 +2602,39 @@ impl Shell {
         let went_home = path.is_none();
         flow.browser_path = path.clone();
         flow.browser = Loadable::Loading;
+        flow.browser_cancelled = false;
         flow.active = 0;
         flow.list_scroll.set_offset(gpui::Point::default());
+        // Always a skeleton, so always cancellable. No re-arm marker is needed:
+        // every way back into the browser (a crumb, a row, Retry, the device
+        // rail) calls this function, which reloads from any state.
+        let (request_id, cancelled) = crate::toast::begin(cx, errors::Loading::Folders);
         flow.load_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             if let Some(p) = &path {
                 params.insert("path".into(), serde_json::Value::String(p.clone()));
             }
-            let result = engine
-                .client()
-                .call(methods::LIST_FOLDERS, serde_json::Value::Object(params))
-                .await;
+            let call = std::pin::pin!(
+                engine
+                    .client()
+                    .call(methods::LIST_FOLDERS, serde_json::Value::Object(params))
+            );
+            let outcome = futures::future::select(call, cancelled).await;
             this.update(cx, |shell, cx| {
+                crate::toast::end(cx, request_id);
+                let result = match outcome {
+                    futures::future::Either::Left((result, _)) => result,
+                    futures::future::Either::Right(_) => {
+                        if let Some(flow) = shell.add_space.as_mut() {
+                            flow.browser = Loadable::Error(crate::toast::cancelled_message(
+                                errors::Loading::Folders,
+                            ));
+                            flow.browser_cancelled = true;
+                        }
+                        cx.notify();
+                        return;
+                    }
+                };
                 if let Some(flow) = shell.add_space.as_mut() {
                     flow.browser = match result {
                         Ok(value) => match serde_json::from_value::<FolderListing>(value) {
@@ -2880,7 +2927,15 @@ impl Shell {
                 flow.submit_busy,
                 flow.active,
                 matches!(flow.browser, Loadable::Loading | Loadable::Idle),
-                flow.browser.error().map(str::to_string),
+                // Resolved here, where the device and the cancel flag are both
+                // in scope, so the row below has one string to paint.
+                flow.browser.error().map(|message| {
+                    browser_error_line(
+                        message,
+                        flow.device.as_ref().map(|t| t.device.name.as_str()),
+                        flow.browser_cancelled,
+                    )
+                }),
                 flow.browser.ready().cloned(),
                 flow.focus.clone(),
                 flow.list_scroll.clone(),
@@ -3129,11 +3184,7 @@ impl Shell {
                 ))
                 .into_any_element()
         } else if let Some(message) = load_error {
-            let device_line = target
-                .as_ref()
-                .map(|t| format!("{} didn't respond — is it online?", t.device.name))
-                .unwrap_or(message);
-            popover::error_row(&theme, &device_line)
+            popover::error_row(&theme, &message)
                 .px(px(14.0))
                 .py(px(10.0))
                 .child(
@@ -3678,5 +3729,36 @@ impl Shell {
         }
 
         overlays
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The folder browser's error row rewrites any failure into a diagnosis
+    /// about the browsed machine. A cancel reaches the same slot and must not
+    /// inherit it — the user stopped the listing, and "is it online?" both
+    /// invents a fault and sends them to check the wrong thing.
+    #[test]
+    fn a_cancelled_listing_is_not_reported_as_an_offline_device() {
+        let stopped = crate::toast::cancelled_message(errors::Loading::Folders);
+        let shown = browser_error_line(&stopped, Some("studio"), true);
+        assert_eq!(shown, stopped);
+        assert!(!shown.contains("studio"), "{shown}");
+        assert!(!shown.contains("online"), "{shown}");
+    }
+
+    /// A real failure still gets the diagnosis: the browse is a remote call, so
+    /// naming the machine is the actionable part, and the generic load copy
+    /// cannot say it.
+    #[test]
+    fn a_failed_listing_names_the_machine_that_went_quiet() {
+        let failure = errors::load_failure(errors::Loading::Folders, &comet_rpc::RpcError::Closed);
+        let shown = browser_error_line(&failure, Some("studio"), false);
+        assert!(shown.starts_with("studio didn't respond"), "{shown}");
+        // With no device to name there is nothing to diagnose, so the load
+        // copy stands on its own rather than being dropped for a vaguer line.
+        assert_eq!(browser_error_line(&failure, None, false), failure);
     }
 }

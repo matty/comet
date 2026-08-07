@@ -412,12 +412,26 @@ impl AccountsPage {
         };
         self.snapshot = Loadable::Loading;
         let params = self.params(serde_json::json!({ "forceUsage": force_usage }));
+        // Every entry point here blanks the page to a skeleton first, so the
+        // wait is the whole of what the user can see and Cancel is offered. No
+        // re-arm marker: this reloads from any state, and Retry, Refresh, a
+        // device switch and every post-action refresh all call it.
+        let (request_id, cancelled) = crate::toast::begin(cx, errors::Loading::Accounts);
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::LIST_AGENT_ACCOUNTS, params)
-                .await;
+            let call = std::pin::pin!(engine.client().call(methods::LIST_AGENT_ACCOUNTS, params));
+            let outcome = futures::future::select(call, cancelled).await;
             this.update(cx, |page, cx| {
+                crate::toast::end(cx, request_id);
+                let result = match outcome {
+                    futures::future::Either::Left((result, _)) => result,
+                    futures::future::Either::Right(_) => {
+                        page.snapshot = Loadable::Error(crate::toast::cancelled_message(
+                            errors::Loading::Accounts,
+                        ));
+                        cx.notify();
+                        return;
+                    }
+                };
                 page.snapshot = match result {
                     Ok(value) => match serde_json::from_value::<AgentAccountsSnapshot>(value) {
                         Ok(snapshot) => Loadable::Ready(snapshot),
