@@ -178,11 +178,17 @@ impl HarnessRegistry {
                 let availability = match registry.resolve(id) {
                     Ok(harness) => harness.availability().await,
                     Err(err) => HarnessAvailability::Unavailable {
-                        reason: err.to_string(),
+                        summary: "Not working".to_string(),
+                        hint: Some(err.to_string()),
                     },
                 };
-                if let Some(reason) = availability.unavailable_reason() {
-                    tracing::info!(?id, reason, "harness unavailable");
+                if let Some(summary) = availability.unavailable_summary() {
+                    tracing::info!(
+                        ?id,
+                        summary,
+                        hint = availability.unavailable_hint().unwrap_or("-"),
+                        "harness unavailable"
+                    );
                 }
                 registry.set_availability(id, availability);
             });
@@ -365,7 +371,7 @@ mod tests {
                 "{:?} should be unprobed",
                 descriptor.id
             );
-            assert_eq!(descriptor.availability.unavailable_reason(), None);
+            assert!(!descriptor.availability.is_unavailable());
         }
     }
 
@@ -377,7 +383,8 @@ mod tests {
         registry.set_availability(
             HarnessId::Codex,
             HarnessAvailability::Unavailable {
-                reason: "codex (searched PATH; set CODEX_EXECUTABLE to override)".into(),
+                summary: "Not installed".into(),
+                hint: Some("Install codex, or set CODEX_EXECUTABLE to its path.".into()),
             },
         );
         registry.set_availability(
@@ -396,8 +403,12 @@ mod tests {
                 .availability
         };
         assert_eq!(
-            by_id(HarnessId::Codex).unavailable_reason(),
-            Some("codex (searched PATH; set CODEX_EXECUTABLE to override)")
+            by_id(HarnessId::Codex).unavailable_summary(),
+            Some("Not installed")
+        );
+        assert_eq!(
+            by_id(HarnessId::Codex).unavailable_hint(),
+            Some("Install codex, or set CODEX_EXECUTABLE to its path.")
         );
         assert_eq!(
             by_id(HarnessId::ClaudeCode),

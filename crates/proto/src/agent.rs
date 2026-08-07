@@ -104,20 +104,62 @@ pub enum HarnessAvailability {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         version: Option<String>,
     },
-    /// The CLI is missing or did not answer. `reason` is user-facing prose and
-    /// carries the override hint, so it must not be truncated for display.
-    Unavailable { reason: String },
+    /// The CLI is missing or did not answer.
+    ///
+    /// Split into two fields rather than one prose blob, because the single
+    /// `reason` string this replaces was unusable in the UI: it concatenated a
+    /// diagnostic inventory of every searched location ahead of the one clause
+    /// worth reading, so the actionable half landed five lines down in the
+    /// picker and was the first thing any truncation dropped. `summary` is a
+    /// short label a row can show *without* hover; `hint` is the single
+    /// actionable sentence. The searched-location inventory is diagnostic and
+    /// belongs in the log, not on a surface a user reads.
+    Unavailable {
+        /// Short label, e.g. `"Not installed"`. The row names the agent, so
+        /// this must not repeat it.
+        #[serde(default = "unavailable_summary_fallback")]
+        summary: String,
+        /// One sentence naming what to do about it, when there is one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+    },
+}
+
+/// Decoding fallback for a payload written before `Unavailable` was split.
+///
+/// Decoding a `HarnessDescriptor` vector is all-or-nothing: one strict field
+/// rejects the whole `ListHarnesses` answer and blanks *every* harness, not
+/// just the odd one out (the blast radius found in review on the capabilities
+/// slice). A peer still sending `{"state":"unavailable","reason":"…"}` must
+/// therefore degrade to a usable label rather than fail the batch.
+fn unavailable_summary_fallback() -> String {
+    "Unavailable".to_string()
 }
 
 impl HarnessAvailability {
-    /// The reason this harness cannot be used, when that is known.
+    /// Whether this harness is known to be unusable.
     ///
-    /// `Unknown` yields `None` alongside `Available`: an unfinished probe is
-    /// not evidence of a problem, and every caller that dims or blocks a
-    /// harness keys off this returning `Some`.
-    pub fn unavailable_reason(&self) -> Option<&str> {
+    /// `Unknown` answers `false` alongside `Available`: an unfinished probe is
+    /// not evidence of a problem. This is the predicate that dims and blocks a
+    /// harness, so a wrong answer here silently disables a working provider.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable { .. })
+    }
+
+    /// The short label for why this harness cannot be used.
+    pub fn unavailable_summary(&self) -> Option<&str> {
         match self {
-            Self::Unavailable { reason } => Some(reason),
+            Self::Unavailable { summary, .. } => Some(summary),
+            Self::Unknown | Self::Available { .. } => None,
+        }
+    }
+
+    /// The actionable sentence, when the failure has one. A harness can be
+    /// unavailable with nothing useful to suggest (a CLI that crashed on
+    /// `--version`), which is why this is separate from the summary.
+    pub fn unavailable_hint(&self) -> Option<&str> {
+        match self {
+            Self::Unavailable { hint, .. } => hint.as_deref(),
             Self::Unknown | Self::Available { .. } => None,
         }
     }
@@ -142,28 +184,57 @@ mod availability_tests {
     fn absent_availability_is_unknown_not_unavailable() {
         let decoded: HarnessAvailability = serde_json::from_str(r#"{"state":"unknown"}"#).unwrap();
         assert_eq!(decoded, HarnessAvailability::default());
-        assert_eq!(decoded.unavailable_reason(), None);
+        assert!(!decoded.is_unavailable());
     }
 
     /// Only `Unavailable` blocks. This is the predicate the picker dims on, so
     /// a wrong answer here silently disables a working provider.
     #[test]
     fn only_unavailable_reports_a_reason() {
-        assert_eq!(HarnessAvailability::Unknown.unavailable_reason(), None);
-        assert_eq!(
-            HarnessAvailability::Available {
+        assert!(!HarnessAvailability::Unknown.is_unavailable());
+        assert!(
+            !HarnessAvailability::Available {
                 version: Some("1.2.3".into())
             }
-            .unavailable_reason(),
-            None
+            .is_unavailable()
         );
+        let missing = HarnessAvailability::Unavailable {
+            summary: "Not installed".into(),
+            hint: Some("Set CODEX_EXECUTABLE to the codex binary.".into()),
+        };
+        assert!(missing.is_unavailable());
+        assert_eq!(missing.unavailable_summary(), Some("Not installed"));
         assert_eq!(
-            HarnessAvailability::Unavailable {
-                reason: "not installed".into()
-            }
-            .unavailable_reason(),
-            Some("not installed")
+            missing.unavailable_hint(),
+            Some("Set CODEX_EXECUTABLE to the codex binary.")
         );
+    }
+
+    /// A failure with nothing to suggest still has a label. The summary is what
+    /// the row renders, so it can never be the empty half of the pair.
+    #[test]
+    fn a_hintless_failure_still_carries_a_summary() {
+        let crashed = HarnessAvailability::Unavailable {
+            summary: "Did not respond".into(),
+            hint: None,
+        };
+        assert_eq!(crashed.unavailable_summary(), Some("Did not respond"));
+        assert_eq!(crashed.unavailable_hint(), None);
+        assert!(crashed.is_unavailable());
+    }
+
+    /// A peer still sending the pre-split `reason` field must decode to a
+    /// usable row rather than failing — the whole `ListHarnesses` vector rides
+    /// on this one field, so a hard error would blank every harness at once.
+    #[test]
+    fn a_pre_split_payload_degrades_instead_of_failing_the_batch() {
+        let decoded: HarnessAvailability = serde_json::from_str(
+            r#"{"state":"unavailable","reason":"codex (searched PATH; set CODEX_EXECUTABLE)"}"#,
+        )
+        .expect("an older peer's payload must still decode");
+        assert!(decoded.is_unavailable(), "it must still block the harness");
+        assert_eq!(decoded.unavailable_summary(), Some("Unavailable"));
+        assert_eq!(decoded.unavailable_hint(), None);
     }
 
     #[test]
@@ -175,7 +246,12 @@ mod availability_tests {
                 version: Some("2.0.0".into()),
             },
             HarnessAvailability::Unavailable {
-                reason: "claude (searched PATH; set CLAUDE_CODE_EXECUTABLE to override)".into(),
+                summary: "Not installed".into(),
+                hint: Some("Set CLAUDE_CODE_EXECUTABLE to the claude binary.".into()),
+            },
+            HarnessAvailability::Unavailable {
+                summary: "Did not respond".into(),
+                hint: None,
             },
         ] {
             let json = serde_json::to_string(&value).unwrap();
