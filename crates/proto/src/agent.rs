@@ -45,6 +45,41 @@ pub enum SteeringMode {
     TurnBoundary,
 }
 
+/// What a harness can honor, declared once per harness.
+///
+/// The engine's `HarnessDescriptor` used to re-state these values by hand for
+/// each lazily-registered slot, so the catalog could change the moment a
+/// harness resolved. Owning them here lets the registry name the *same*
+/// expression the trait returns.
+///
+/// Every field is serde-defaulted: later slices add capabilities (permission
+/// modes, supervised approval, image modality) and a remote client on an older
+/// build must keep decoding the descriptor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessCapabilities {
+    /// Whether a steer mid-run is accepted at all.
+    #[serde(default)]
+    pub supports_steering: bool,
+    /// Where an accepted steer is delivered.
+    pub steering_mode: SteeringMode,
+    /// The effort ladder offered in the traits picker.
+    #[serde(default)]
+    pub reasoning_levels: Vec<ReasoningLevel>,
+}
+
+impl Default for HarnessCapabilities {
+    fn default() -> Self {
+        Self {
+            supports_steering: false,
+            // Only meaningful when `supports_steering`; the conservative
+            // boundary is the one that never injects into a live turn.
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Model {

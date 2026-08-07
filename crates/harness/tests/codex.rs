@@ -586,5 +586,8 @@ async fn models_returns_curated_catalog() {
     // "Codex" — comet composer/defaults.ts HARNESS_LABEL (and the registry's
     // lazy descriptor must stay in lockstep).
     assert_eq!(missing.display_name(), "Codex");
-    assert_eq!(missing.reasoning_levels().len(), 7);
+    assert_eq!(missing.capabilities().reasoning_levels.len(), 7);
+    // The trait impl must hand back the associated declaration verbatim —
+    // that identity is what lets the registry's lazy descriptor name it.
+    assert_eq!(missing.capabilities(), CodexHarness::capabilities());
 }

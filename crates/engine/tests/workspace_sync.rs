@@ -13,8 +13,8 @@ use comet_doc::{CommandBasedOn, SessionCommandEntry, SessionCommandPayload, Sess
 use comet_engine::{EngineCore, HarnessRegistry};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
-    AgentEvent, ChatConfig, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SessionStatus, SteeringMode,
+    AgentEvent, ChatConfig, DoneStatus, HarnessCapabilities, HarnessId, Model, RunRequest,
+    SandboxLevel, SessionStatus,
 };
 use comet_rpc::methods;
 
@@ -36,14 +36,8 @@ impl Harness for ScriptedHarness {
     fn display_name(&self) -> &str {
         "Scripted"
     }
-    fn supports_steering(&self) -> bool {
-        false
-    }
-    fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::TurnBoundary
-    }
-    fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        &[]
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities::default()
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         Ok(vec![])

@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
 
 use comet_proto::{
-    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, UserInputAnswer,
+    AgentEvent, HarnessCapabilities, HarnessId, Model, RunRequest, UserInputAnswer,
     UserInputQuestion,
 };
 
@@ -52,9 +52,10 @@ pub struct RunControls {
 pub trait Harness: Send + Sync {
     fn id(&self) -> HarnessId;
     fn display_name(&self) -> &str;
-    fn supports_steering(&self) -> bool;
-    fn steering_mode(&self) -> SteeringMode;
-    fn reasoning_levels(&self) -> &[ReasoningLevel];
+    /// What this harness can honor. Each implementor delegates to its own
+    /// associated `capabilities()` so the engine registry can name the same
+    /// value without re-typing it — see [`comet_proto::HarnessCapabilities`].
+    fn capabilities(&self) -> HarnessCapabilities;
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
     async fn run(

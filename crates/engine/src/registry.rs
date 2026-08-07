@@ -8,26 +8,27 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde::{Deserialize, Serialize};
 
 use comet_harness::{Harness, HarnessError, mock::MockHarness};
-use comet_proto::{AgentEvent, DoneStatus, HarnessId, ReasoningLevel, SteeringMode};
+use comet_proto::{AgentEvent, DoneStatus, HarnessCapabilities, HarnessId};
 
 /// What `ListHarnesses` reports per harness.
+///
+/// `capabilities` is flattened, so the wire shape is unchanged from when these
+/// were three sibling fields — a remote client on an older build decodes this
+/// descriptor byte-identically.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HarnessDescriptor {
     pub id: HarnessId,
     pub name: String,
-    pub supports_steering: bool,
-    pub steering_mode: SteeringMode,
-    pub reasoning_levels: Vec<ReasoningLevel>,
+    #[serde(flatten)]
+    pub capabilities: HarnessCapabilities,
 }
 
 fn describe(harness: &dyn Harness) -> HarnessDescriptor {
     HarnessDescriptor {
         id: harness.id(),
         name: harness.display_name().to_string(),
-        supports_steering: harness.supports_steering(),
-        steering_mode: harness.steering_mode(),
-        reasoning_levels: harness.reasoning_levels().to_vec(),
+        capabilities: harness.capabilities(),
     }
 }
 
@@ -168,45 +169,25 @@ pub fn default_registry() -> HarnessRegistry {
             },
         ],
     }));
+    // The lazy descriptors name the harness's own `capabilities()`, so the
+    // catalog entry `ListHarnesses` reports before first use is the same value
+    // `describe()` produces after the slot resolves. CLI discovery still only
+    // happens when a run/model call actually resolves the slot.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::ClaudeCode,
             name: "Claude Code".into(),
-            supports_steering: true,
-            steering_mode: SteeringMode::StepBoundary,
-            // Must mirror ClaudeHarness::reasoning_levels() exactly — the
-            // descriptor-stability rule (see the codex test below).
-            reasoning_levels: vec![
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max,
-            ],
+            capabilities: comet_harness::ClaudeHarness::capabilities(),
         },
         Box::new(|| Ok(Arc::new(comet_harness::ClaudeHarness::new()) as Arc<dyn Harness>)),
     );
-    // Codex, same lazy pattern: the static descriptor mirrors CodexHarness
-    // exactly (`describe()` after the first resolve must not change the
-    // catalog entry) — "Codex" per the original HARNESS_LABEL, StepBoundary
-    // steering via native `turn/steer`, and the unified reasoning ladder from
-    // comet_harness::codex::catalog. CLI discovery only happens when a
-    // run/model call actually resolves the slot.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Codex,
+            // "Codex" (not "Codex CLI") — comet composer/defaults.ts
+            // HARNESS_LABEL; must match CodexHarness::display_name().
             name: "Codex".into(),
-            supports_steering: true,
-            steering_mode: SteeringMode::StepBoundary,
-            reasoning_levels: vec![
-                ReasoningLevel::Minimal,
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max,
-                ReasoningLevel::Ultra,
-            ],
+            capabilities: comet_harness::CodexHarness::capabilities(),
         },
         Box::new(|| Ok(Arc::new(comet_harness::CodexHarness::new()) as Arc<dyn Harness>)),
     );
@@ -227,9 +208,7 @@ mod tests {
             HarnessDescriptor {
                 id: HarnessId::Mock,
                 name: "Lazy Mock".into(),
-                supports_steering: true,
-                steering_mode: SteeringMode::StepBoundary,
-                reasoning_levels: vec![],
+                capabilities: HarnessCapabilities::default(),
             },
             Box::new(move || {
                 counted.fetch_add(1, Ordering::SeqCst);
@@ -264,29 +243,70 @@ mod tests {
         assert_eq!(codex.id(), HarnessId::Codex);
     }
 
-    /// The Codex lazy descriptor must be indistinguishable from `describe()`
-    /// after the first resolve — otherwise the catalog entry silently changes
-    /// the moment the harness is used (name/ladder flip in the picker rail).
-    /// (KNOWN GAP, predates this slot: the claude-code descriptor advertises
-    /// `[Ultrathink]` while the resolved adapter reports `[Low..Max]` — left
-    /// as-is here; flagged for its own pass.)
+    /// A lazy descriptor must be indistinguishable from `describe()` after the
+    /// first resolve — otherwise the catalog entry silently changes the moment
+    /// the harness is used (name/ladder flip in the picker rail). Both lazy
+    /// slots are covered; `Mock` is registered eagerly, so it is always
+    /// `describe()`-derived and has no second declaration to drift from.
+    ///
+    /// This previously covered Codex alone, and carried a comment claiming the
+    /// claude-code descriptor was drifted; extending the test to that slot
+    /// shows the claim was stale, so it is gone rather than restated. Both
+    /// descriptors now name the harness's own `capabilities()`, making drift
+    /// unrepresentable rather than merely tested for — these assertions stand
+    /// as a guard against someone re-inlining a literal.
     #[test]
-    fn codex_lazy_descriptor_matches_resolved_harness() {
-        let registry = default_registry();
-        let before = registry
-            .descriptors()
-            .into_iter()
-            .find(|d| d.id == HarnessId::Codex)
-            .unwrap();
-        registry.resolve(HarnessId::Codex).unwrap();
-        let after = registry
-            .descriptors()
-            .into_iter()
-            .find(|d| d.id == HarnessId::Codex)
-            .unwrap();
-        assert_eq!(before.name, after.name);
-        assert_eq!(before.supports_steering, after.supports_steering);
-        assert_eq!(before.steering_mode, after.steering_mode);
-        assert_eq!(before.reasoning_levels, after.reasoning_levels);
+    fn lazy_descriptors_match_resolved_harnesses() {
+        for id in [HarnessId::ClaudeCode, HarnessId::Codex] {
+            let registry = default_registry();
+            let find = |registry: &HarnessRegistry| {
+                registry
+                    .descriptors()
+                    .into_iter()
+                    .find(|d| d.id == id)
+                    .unwrap_or_else(|| panic!("{id:?} missing from the catalog"))
+            };
+            let before = find(&registry);
+            registry
+                .resolve(id)
+                .unwrap_or_else(|e| panic!("{id:?} failed to resolve: {e}"));
+            let after = find(&registry);
+            assert_eq!(before.name, after.name, "{id:?} name drifted on resolve");
+            assert_eq!(
+                before.capabilities, after.capabilities,
+                "{id:?} capabilities drifted on resolve"
+            );
+        }
+    }
+
+    /// `capabilities` is `#[serde(flatten)]`, so the descriptor keeps the wire
+    /// shape it had when these were three sibling fields. A remote client on a
+    /// build that predates `HarnessCapabilities` must still decode it.
+    #[test]
+    fn descriptor_wire_shape_is_flat() {
+        let descriptor = HarnessDescriptor {
+            id: HarnessId::Codex,
+            name: "Codex".into(),
+            capabilities: comet_harness::CodexHarness::capabilities(),
+        };
+        let json = serde_json::to_value(&descriptor).unwrap();
+        let object = json
+            .as_object()
+            .expect("descriptor serializes to an object");
+        assert!(
+            object.get("capabilities").is_none(),
+            "capabilities must flatten, not nest: {json}"
+        );
+        for key in [
+            "id",
+            "name",
+            "supportsSteering",
+            "steeringMode",
+            "reasoningLevels",
+        ] {
+            assert!(object.contains_key(key), "missing `{key}` in {json}");
+        }
+        let round: HarnessDescriptor = serde_json::from_value(json).unwrap();
+        assert_eq!(round.capabilities, descriptor.capabilities);
     }
 }

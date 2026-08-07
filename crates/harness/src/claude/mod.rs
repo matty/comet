@@ -30,8 +30,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessCapabilities, HarnessId, Model, ReasoningLevel, RunRequest,
+    SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls};
@@ -104,6 +104,26 @@ impl Default for ClaudeHarness {
 impl ClaudeHarness {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The single declaration of what Claude Code can honor. `default_registry`
+    /// calls this for the lazy slot's descriptor and the trait impl returns it
+    /// once resolved, so the catalog cannot change on first use.
+    ///
+    /// Steering rides the persistent stdin stream, so an accepted steer lands
+    /// at the next step boundary within the live turn.
+    pub fn capabilities() -> HarnessCapabilities {
+        HarnessCapabilities {
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ],
+        }
     }
 
     /// Use a fixed CLI binary instead of PATH/known-location resolution.
@@ -211,20 +231,8 @@ impl Harness for ClaudeHarness {
     fn display_name(&self) -> &str {
         "Claude Code"
     }
-    fn supports_steering(&self) -> bool {
-        true
-    }
-    fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::StepBoundary
-    }
-    fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        &[
-            ReasoningLevel::Low,
-            ReasoningLevel::Medium,
-            ReasoningLevel::High,
-            ReasoningLevel::XHigh,
-            ReasoningLevel::Max,
-        ]
+    fn capabilities(&self) -> HarnessCapabilities {
+        Self::capabilities()
     }
 
     /// The curated static catalog (see [`catalog`]); requires an installed CLI
