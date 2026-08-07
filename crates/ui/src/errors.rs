@@ -96,6 +96,30 @@ pub fn switch_failure(err: &RpcError) -> String {
     }
 }
 
+/// Moving a session onto an existing worktree.
+///
+/// Separate from [`switch_failure`] even though both surface in the same ref
+/// popover, because they are different operations: this path is two `Mutate`
+/// document ops (`setChatCwd`, `setChatBranch`) and performs **no git
+/// checkout**. Sending the user to look for uncommitted changes here is advice
+/// that cannot resolve a document, store, or I/O failure — it points at a
+/// working tree that was never touched.
+pub fn session_move_failure(err: &RpcError) -> String {
+    tracing::warn!(error = %err, "session retarget failed");
+    match err {
+        RpcError::Closed | RpcError::Transport(_) => {
+            "Couldn't move the session — Comet's engine isn't responding.".to_string()
+        }
+        RpcError::UnknownMethod(_) | RpcError::BadParams(_) => {
+            "Couldn't move the session — this copy of Comet doesn't match its engine.".to_string()
+        }
+        // The engine reached the mutation and it failed. There is no user-side
+        // remedy to name — the working tree is not involved — so the copy says
+        // what happened and stops rather than inventing a step.
+        RpcError::Failed(_) => "Couldn't move the session to that worktree.".to_string(),
+    }
+}
+
 /// A reply that arrived but would not decode.
 ///
 /// Same cause as [`RpcError::BadParams`] — this build and the engine disagree
@@ -155,6 +179,24 @@ mod tests {
             );
             assert!(shown.starts_with("Couldn't load "), "{shown}");
         }
+    }
+
+    /// A document mutation must not be described as a git problem. The two
+    /// operations behind the ref popover look alike to the user and are not:
+    /// only one of them checks anything out.
+    #[test]
+    fn moving_a_session_is_not_described_as_a_checkout() {
+        let moved = session_move_failure(&RpcError::Failed("store: disk full".into()));
+        assert!(
+            !moved.contains("uncommitted"),
+            "no checkout happened, so uncommitted changes cannot be the cause: {moved}"
+        );
+        assert!(moved.contains("move the session"), "{moved}");
+        // The checkout path keeps the advice that IS relevant to it.
+        let checkout = switch_failure(&RpcError::Failed("git: would be overwritten".into()));
+        assert!(checkout.contains("uncommitted"), "{checkout}");
+        // Neither leaks the engine's own prefixed message.
+        assert!(!moved.contains("store:") && !checkout.contains("git:"));
     }
 
     /// A version mismatch is not fixed by retrying, and the copy must not

@@ -1036,6 +1036,9 @@ impl Pickers {
         self.switching = Some(row.name.clone());
         let ref_name = row.name.clone();
         let retarget = row.worktree_path.clone();
+        // Which of the two operations ran decides the copy on failure: the
+        // retarget arm mutates the document and never checks anything out.
+        let is_retarget = retarget.is_some();
         self.switch_task = Some(cx.spawn(async move |this, cx| {
             let result = match retarget {
                 // Reuse the ref's existing worktree: move the session there.
@@ -1080,7 +1083,17 @@ impl Pickers {
                         // Checkout state changed — refresh tags/current.
                         pickers.ensure_refs(true, cx);
                     }
-                    Err(err) => pickers.switch_error = Some(errors::switch_failure(&err)),
+                    // Two different operations reach here. Only the plain-ref
+                    // arm ran a git checkout; the retarget arm mutated the
+                    // document, where "check for uncommitted changes" is advice
+                    // about a working tree that was never touched.
+                    Err(err) => {
+                        pickers.switch_error = Some(if is_retarget {
+                            errors::session_move_failure(&err)
+                        } else {
+                            errors::switch_failure(&err)
+                        })
+                    }
                 }
                 cx.notify();
             })
