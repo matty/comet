@@ -1,7 +1,6 @@
 //! CodexHarness integration tests against the fake app server in
-//! `tests/fixtures/fake-codex.sh` (no real `codex` binary involved).
+//! `tests/fixtures/fake_codex.rs` (no real `codex` binary involved).
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,17 +15,9 @@ use comet_proto::{
     ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
-fn fixture_path() -> PathBuf {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("fake-codex.sh");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
-    }
-    path
+/// The `fake-codex` bin target, built by cargo alongside this test.
+fn fixture_path() -> &'static str {
+    env!("CARGO_BIN_EXE_fake-codex")
 }
 
 fn harness() -> CodexHarness {

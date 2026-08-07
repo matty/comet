@@ -27,3 +27,14 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# Scripted fake CLIs for the adapter integration suites, spawned through
+# `CARGO_BIN_EXE_*`. Rust rather than shell scripts so they are spawnable on
+# Windows too — `CreateProcess` rejects a `#!/bin/sh` file (os error 193).
+[[bin]]
+name = "fake-claude"
+path = "tests/fixtures/fake_claude.rs"
+
+[[bin]]
+name = "fake-codex"
+path = "tests/fixtures/fake_codex.rs"

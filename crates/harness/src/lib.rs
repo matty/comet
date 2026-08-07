@@ -307,5 +307,61 @@ pub(crate) fn crash_message(
     }
 }
 
+/// How hard to hit a child during interrupt escalation.
+#[derive(Clone, Copy)]
+pub(crate) enum Signal {
+    /// Wind down: on unix SIGTERM, which also tears down bash trees and lets
+    /// the CLI run its SessionEnd hooks. Windows has no equivalent for a
+    /// piped, console-less child, so escalation there is kill-only.
+    Term,
+    /// Last resort: SIGKILL / `TerminateProcess`.
+    Kill,
+}
+
+/// Signal a child by pid. Safe against pid reuse only while the caller still
+/// holds the unreaped `Child` — every call site does.
+#[cfg(unix)]
+pub(crate) fn send_signal(pid: u32, signal: Signal) {
+    let sig = match signal {
+        Signal::Term => libc::SIGTERM,
+        Signal::Kill => libc::SIGKILL,
+    };
+    // SAFETY: plain kill(2) on a pid we spawned and have not yet reaped.
+    unsafe {
+        libc::kill(pid as libc::pid_t, sig);
+    }
+}
+
+/// Windows has no graceful signal to send a piped child, so `Term` is a no-op
+/// and `Kill` is `TerminateProcess`. Without this the escalation task was
+/// inert off unix: an unresponsive CLI was never reaped, and the run loop —
+/// which only ends on stdout EOF — hung until the child chose to exit.
+///
+/// Only the process itself dies, not the tree it spawned; that is the same
+/// caveat `start_kill`/`kill_on_drop` already carry.
+#[cfg(windows)]
+pub(crate) fn send_signal(pid: u32, signal: Signal) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+    if matches!(signal, Signal::Term) {
+        return;
+    }
+    // SAFETY: the caller still owns the unreaped child, so Windows cannot have
+    // recycled the pid; a failed open yields a null handle we simply skip.
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if !handle.is_null() {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn send_signal(_pid: u32, _signal: Signal) {
+    // `start_kill`/`kill_on_drop` are the only lever on other platforms.
+}
+
 pub use claude::{ClaudeHarness, resolve_claude_executable};
 pub use codex::{CodexHarness, resolve_codex_executable};

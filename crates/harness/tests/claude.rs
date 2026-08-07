@@ -1,7 +1,6 @@
 //! ClaudeHarness integration tests against the fake CLI in
-//! `tests/fixtures/fake-claude.sh` (no real `claude` binary involved).
+//! `tests/fixtures/fake_claude.rs` (no real `claude` binary involved).
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,17 +15,9 @@ use comet_proto::{
     UserInputQuestion,
 };
 
-fn fixture_path() -> PathBuf {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("fake-claude.sh");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
-    }
-    path
+/// The `fake-claude` bin target, built by cargo alongside this test.
+fn fixture_path() -> &'static str {
+    env!("CARGO_BIN_EXE_fake-claude")
 }
 
 fn harness() -> ClaudeHarness {
