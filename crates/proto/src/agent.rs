@@ -121,6 +121,15 @@ impl HarnessAvailability {
             Self::Unknown | Self::Available { .. } => None,
         }
     }
+
+    /// Whether this harness is still awaiting its probe.
+    ///
+    /// A client that cached the catalog before the probes landed uses this to
+    /// decide the answer is worth asking for again — probing happens after
+    /// boot, so a snapshot taken at startup reports `Unknown` for everything.
+    pub fn is_unprobed(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
 }
 
 #[cfg(test)]
