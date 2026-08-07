@@ -319,6 +319,17 @@ pub struct Pickers {
     switch_task: Option<Task<()>>,
     /// Last mid-session switch failure (shown in the ref popover).
     switch_error: Option<String>,
+    /// Harnesses whose model load the user cancelled from the slow-request
+    /// toast.
+    ///
+    /// A cancelled slot holds an `Error`, which `ensure_models` refuses to
+    /// reload — that is deliberate for a real failure (render re-runs
+    /// `ensure_*` every frame, so a self-reloading error state would spam the
+    /// engine). But a cancel is not a failure: the user stopped *this*
+    /// attempt, not the feature. So the cancel is remembered here and the slot
+    /// is re-armed on the next DISCRETE demand — opening the picker, or picking
+    /// the harness — never from render.
+    models_cancelled: std::collections::HashSet<HarnessId>,
     mutate_task: Option<Task<()>>,
     _search_events: Subscription,
     _state_observe: Subscription,
@@ -423,6 +434,7 @@ impl Pickers {
             switching: None,
             switch_task: None,
             switch_error: None,
+            models_cancelled: std::collections::HashSet::new(),
             mutate_task: None,
             _search_events: search_events,
             _state_observe: state_observe,
@@ -589,6 +601,19 @@ impl Pickers {
         }
     }
 
+    /// Put cancelled model slots back to `Idle` so the next `ensure_models`
+    /// loads them again.
+    ///
+    /// Called only from discrete user demand (opening the picker, picking a
+    /// harness), never from render: render runs `ensure_models` every frame, so
+    /// re-arming there would restart the request the moment it was cancelled
+    /// and the toast would never go away.
+    fn rearm_cancelled_models(&mut self) {
+        for harness in self.models_cancelled.drain() {
+            self.models.insert(harness, Loadable::Idle);
+        }
+    }
+
     fn toggle(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
         // Model + traits merged into ONE menu (user request): the traits chip
         // opens the combined harness/model/reasoning popover.
@@ -627,6 +652,8 @@ impl Pickers {
         };
         if kind == PickerKind::HarnessModel {
             self.model_scroll.set_offset(gpui::Point::default());
+            // Opening the menu IS asking for the models again.
+            self.rearm_cancelled_models();
         }
         // Searchable pickers focus the filter input (it sits inside the frame,
         // so the frame's key handler still sees arrows/Enter); the rest focus
@@ -836,6 +863,9 @@ impl Pickers {
                             harness,
                             Loadable::Error(toast::cancelled_message(errors::Loading::Models)),
                         );
+                        // Ask for it again and it tries again — see
+                        // `rearm_cancelled_models`.
+                        pickers.models_cancelled.insert(harness);
                         cx.notify();
                         return;
                     }
@@ -1160,6 +1190,9 @@ impl Pickers {
         self.defaults.harness = Some(harness);
         self.save_defaults();
         self.model_scroll.set_offset(gpui::Point::default());
+        // Picking the harness IS asking for its models again, so a cancelled
+        // slot must not stay cancelled here either.
+        self.rearm_cancelled_models();
         self.ensure_models(harness, cx);
         cx.notify();
     }

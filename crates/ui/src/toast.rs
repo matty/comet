@@ -329,6 +329,31 @@ mod tests {
         );
     }
 
+    /// Cancelling must not be permanent. The slot holds an `Error` so the user
+    /// sees what happened, and `Pickers::rearm_cancelled_models` puts it back
+    /// to `Idle` on the next discrete demand — otherwise `ensure_models`'
+    /// refuse-to-reload-an-Error rule would make one cancel disable the model
+    /// list for the rest of the session.
+    ///
+    /// The re-arm deliberately does NOT happen from render: `ensure_models`
+    /// runs every frame, so re-arming there would restart the request the
+    /// instant it was cancelled and the toast could never be dismissed.
+    #[test]
+    fn a_cancel_is_remembered_as_re_armable_not_as_a_dead_slot() {
+        // The contract lives in Pickers; this pins the reasoning next to the
+        // cancel machinery so a later edit to either has to meet both halves:
+        // a cancelled slot must be (a) visibly explained and (b) reloadable.
+        let explained = cancelled_message(Loading::Models);
+        assert!(
+            explained.starts_with("Stopped loading"),
+            "a cancel must not read as a failure: {explained}"
+        );
+        assert!(
+            !explained.contains("Couldn't"),
+            "cancel copy must not borrow failure wording: {explained}"
+        );
+    }
+
     /// The cancelled slot must land on a message, never an empty slot — an
     /// empty slot is the unbounded wait again with extra steps.
     #[test]
