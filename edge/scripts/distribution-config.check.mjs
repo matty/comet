@@ -2,8 +2,11 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
+// The deploy workflow this check also used to assert on was removed in #4;
+// the Worker is deployed manually with `npm run deploy`, so there is no
+// pipeline left to hold to fail-closed secret-cleanup ordering. Restore those
+// assertions deliberately if `.github/workflows/deploy.yml` ever comes back.
 const config = JSON.parse(readFileSync(`${root}/edge/wrangler.jsonc`, "utf8"));
-const workflow = readFileSync(`${root}/.github/workflows/deploy.yml`, "utf8");
 const release = readFileSync(`${root}/.github/workflows/release.yml`, "utf8");
 
 const migration = config.migrations?.at(-1);
@@ -28,19 +31,10 @@ if (
 ) {
   throw new Error("distribution Worker retains an obsolete route");
 }
-const deployStep = workflow.indexOf("- name: deploy");
-const cleanupStep = workflow.indexOf("- name: remove obsolete WorkOS secret");
-if (
-  deployStep < 0 ||
-  cleanupStep <= deployStep ||
-  !workflow.includes("wrangler secret list --format json") ||
-  !workflow.includes("wrangler secret delete WORKOS_API_KEY") ||
-  workflow.includes("continue-on-error: true") ||
-  workflow.includes("|| true")
-) {
-  throw new Error("secret cleanup is not ordered after deploy with fail-closed list/delete semantics");
-}
-if (!release.includes("github.repository == 'matty/comet'") || !release.includes("--arg repository \"matty/comet\"")) {
+// The `--arg repository` half of this check went with the jq manifest step
+// that #4 dropped; manifest.json is now uploaded to R2 out of band. The job
+// guard is what still keeps a fork from publishing, so assert that alone.
+if (!release.includes("github.repository == 'matty/comet'")) {
   throw new Error("release publishing is not pinned to the canonical repository");
 }
 if (release.includes("latest.txt")) {
