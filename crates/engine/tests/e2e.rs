@@ -17,8 +17,8 @@ use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
 use comet_harness::mock::MockHarness;
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SessionStatus, SteeringMode, ToolCall,
+    AgentEvent, DoneStatus, HarnessCapabilities, HarnessId, Model, ReasoningLevel, RunRequest,
+    SandboxLevel, SessionStatus, SteeringMode, ToolCall,
 };
 use comet_sync::DocsStore;
 
@@ -91,14 +91,12 @@ impl Harness for ScriptedHarness {
     fn display_name(&self) -> &str {
         "Scripted"
     }
-    fn supports_steering(&self) -> bool {
-        true
-    }
-    fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::StepBoundary
-    }
-    fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        &[ReasoningLevel::Medium]
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities {
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: vec![ReasoningLevel::Medium],
+        }
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         Ok(vec![])
@@ -783,14 +781,8 @@ async fn respond_input_resolves_pending_question() {
         fn display_name(&self) -> &str {
             "Asking"
         }
-        fn supports_steering(&self) -> bool {
-            false
-        }
-        fn steering_mode(&self) -> SteeringMode {
-            SteeringMode::TurnBoundary
-        }
-        fn reasoning_levels(&self) -> &[ReasoningLevel] {
-            &[]
+        fn capabilities(&self) -> HarnessCapabilities {
+            HarnessCapabilities::default()
         }
         async fn models(&self) -> Result<Vec<Model>, HarnessError> {
             Ok(vec![])
@@ -936,14 +928,8 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
         fn display_name(&self) -> &str {
             "Asking"
         }
-        fn supports_steering(&self) -> bool {
-            false
-        }
-        fn steering_mode(&self) -> SteeringMode {
-            SteeringMode::TurnBoundary
-        }
-        fn reasoning_levels(&self) -> &[ReasoningLevel] {
-            &[]
+        fn capabilities(&self) -> HarnessCapabilities {
+            HarnessCapabilities::default()
         }
         async fn models(&self) -> Result<Vec<Model>, HarnessError> {
             Ok(vec![])
@@ -1112,14 +1098,8 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
         fn display_name(&self) -> &str {
             "Blocking"
         }
-        fn supports_steering(&self) -> bool {
-            false
-        }
-        fn steering_mode(&self) -> SteeringMode {
-            SteeringMode::TurnBoundary
-        }
-        fn reasoning_levels(&self) -> &[ReasoningLevel] {
-            &[]
+        fn capabilities(&self) -> HarnessCapabilities {
+            HarnessCapabilities::default()
         }
         async fn models(&self) -> Result<Vec<Model>, HarnessError> {
             Ok(vec![])
@@ -1274,14 +1254,8 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
         fn display_name(&self) -> &str {
             "DoubleEmit"
         }
-        fn supports_steering(&self) -> bool {
-            false
-        }
-        fn steering_mode(&self) -> SteeringMode {
-            SteeringMode::TurnBoundary
-        }
-        fn reasoning_levels(&self) -> &[ReasoningLevel] {
-            &[]
+        fn capabilities(&self) -> HarnessCapabilities {
+            HarnessCapabilities::default()
         }
         async fn models(&self) -> Result<Vec<Model>, HarnessError> {
             Ok(vec![])
@@ -1459,14 +1433,12 @@ impl Harness for CapturingHarness {
     fn display_name(&self) -> &str {
         "Capturing"
     }
-    fn supports_steering(&self) -> bool {
-        true
-    }
-    fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::StepBoundary
-    }
-    fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        &[ReasoningLevel::Medium]
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities {
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: vec![ReasoningLevel::Medium],
+        }
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         Ok(vec![])

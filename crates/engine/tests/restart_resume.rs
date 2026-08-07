@@ -25,8 +25,8 @@ use comet_doc::{
 use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SteeringMode,
+    AgentEvent, DoneStatus, HarnessCapabilities, HarnessId, Model, ReasoningLevel, RunRequest,
+    SandboxLevel, SteeringMode,
 };
 use comet_sync::DocsStore;
 
@@ -67,14 +67,12 @@ impl Harness for RecordingHarness {
     fn display_name(&self) -> &str {
         "Recording"
     }
-    fn supports_steering(&self) -> bool {
-        false
-    }
-    fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::TurnBoundary
-    }
-    fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        &[ReasoningLevel::Medium]
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities {
+            supports_steering: false,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: vec![ReasoningLevel::Medium],
+        }
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         Ok(vec![])
@@ -431,14 +429,12 @@ impl Harness for PersistentHarness {
     fn display_name(&self) -> &str {
         "Persistent"
     }
-    fn supports_steering(&self) -> bool {
-        true
-    }
-    fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::StepBoundary
-    }
-    fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        &[ReasoningLevel::Medium]
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities {
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: vec![ReasoningLevel::Medium],
+        }
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         Ok(vec![])

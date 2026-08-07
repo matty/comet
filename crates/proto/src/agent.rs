@@ -36,13 +36,76 @@ pub enum SandboxLevel {
     DangerFullAccess,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SteeringMode {
     /// Steer delivered at the next step boundary within the live turn.
     StepBoundary,
-    /// Steer delivered only between turns.
+    /// Steer delivered only between turns. The default because it is the
+    /// conservative boundary: an unspecified mode never injects into a turn
+    /// that is already running.
+    #[default]
     TurnBoundary,
+}
+
+/// What a harness can honor, declared once per harness.
+///
+/// The engine's `HarnessDescriptor` used to re-state these values by hand for
+/// each lazily-registered slot, so the catalog could change the moment a
+/// harness resolved. Owning them here lets the registry name the *same*
+/// expression the trait returns.
+///
+/// **Every** field is serde-defaulted, including the ones present today. Later
+/// slices add capabilities (permission modes, supervised approval, image
+/// modality), and a descriptor that arrives missing a field must degrade to the
+/// conservative value rather than failing to decode — a single unparseable
+/// entry would otherwise reject the whole `ListHarnesses` reply.
+///
+/// The defaults live on the field types, so `Default` is derived rather than
+/// written out: "conservative" is stated once per field, not twice.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HarnessCapabilities {
+    /// Whether a steer mid-run is accepted at all.
+    pub supports_steering: bool,
+    /// Where an accepted steer is delivered. Only meaningful when
+    /// `supports_steering`; see [`SteeringMode::TurnBoundary`] for why the
+    /// default is the boundary that never injects into a live turn.
+    pub steering_mode: SteeringMode,
+    /// The effort ladder offered in the traits picker.
+    pub reasoning_levels: Vec<ReasoningLevel>,
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    /// A descriptor missing any capability field decodes to the conservative
+    /// value instead of failing. Deserialization is all-or-nothing across the
+    /// `ListHarnesses` vector, so one strict field would drop every harness.
+    #[test]
+    fn absent_capability_fields_fall_back_to_conservative_defaults() {
+        let caps: HarnessCapabilities = serde_json::from_str("{}").unwrap();
+        assert_eq!(caps, HarnessCapabilities::default());
+        assert!(!caps.supports_steering);
+        assert_eq!(caps.steering_mode, SteeringMode::TurnBoundary);
+        assert!(caps.reasoning_levels.is_empty());
+
+        // A partial payload keeps what it states and defaults the rest.
+        let partial: HarnessCapabilities =
+            serde_json::from_str(r#"{"supportsSteering":true}"#).unwrap();
+        assert!(partial.supports_steering);
+        assert_eq!(partial.steering_mode, SteeringMode::TurnBoundary);
+    }
+
+    /// The derived `Default` must agree with the field-level serde defaults —
+    /// they are the same statement and drifting them apart would mean an
+    /// absent field and an explicit `Default::default()` disagreeing.
+    #[test]
+    fn derived_default_matches_empty_payload() {
+        let decoded: HarnessCapabilities = serde_json::from_str("{}").unwrap();
+        assert_eq!(decoded, HarnessCapabilities::default());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -207,7 +207,12 @@ async fn open_unauthenticated_ws(
     tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
     tokio_tungstenite::tungstenite::Error,
 > {
-    let config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+    // Name the provider rather than relying on a process-level default: the
+    // workspace feature graph leaves rustls unable to infer one, so a bare
+    // builder here panics unless some other test happened to install one first.
+    let config = ClientConfig::builder_with_provider(comet_rpc::crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(TestAnyServerCertificate))
         .with_no_client_auth();

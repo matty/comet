@@ -5,14 +5,24 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
-    UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessCapabilities, HarnessId, Model, ReasoningLevel, RunRequest,
+    SteeringMode, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls};
 
 pub struct MockHarness {
     pub script: Vec<AgentEvent>,
+}
+
+impl MockHarness {
+    pub fn capabilities() -> HarnessCapabilities {
+        HarnessCapabilities {
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: vec![ReasoningLevel::Medium],
+        }
+    }
 }
 
 /// The scripted question set for the `COMET_MOCK_QUESTION` variant (exercises
@@ -52,14 +62,8 @@ impl Harness for MockHarness {
     fn display_name(&self) -> &str {
         "Mock"
     }
-    fn supports_steering(&self) -> bool {
-        true
-    }
-    fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::StepBoundary
-    }
-    fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        &[ReasoningLevel::Medium]
+    fn capabilities(&self) -> HarnessCapabilities {
+        Self::capabilities()
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         Ok(vec![

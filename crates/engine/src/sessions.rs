@@ -320,7 +320,7 @@ impl SessionsEngine {
             chat_id.to_string(),
             RunHandle {
                 run_id: run_id.clone(),
-                steerable: harness.supports_steering(),
+                steerable: harness.capabilities().supports_steering,
                 steer_tx,
                 interrupt_token,
                 cancel: cancel_tx,
@@ -964,7 +964,7 @@ async fn drive_run(
     // a session nobody comes back to (comet SESSION_IDLE_MS).
     const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
     let mut idle_since: Option<tokio::time::Instant> = None;
-    let steerable = harness.supports_steering();
+    let steerable = harness.capabilities().supports_steering;
 
     let final_status = loop {
         let event: AgentEvent = tokio::select! {

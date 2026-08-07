@@ -13,8 +13,8 @@ use comet_engine::{
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_identity::DeviceIdentity;
 use comet_proto::{
-    AgentEvent, Device, HarnessId, Model, PROTOCOL_VERSION, ReasoningLevel, RemoteConnectionState,
-    RemoteEndpoint, RemoteEntry, RunRequest, ServerId, SteeringMode, TrustedClient,
+    AgentEvent, Device, HarnessCapabilities, HarnessId, Model, PROTOCOL_VERSION,
+    RemoteConnectionState, RemoteEndpoint, RemoteEntry, RunRequest, ServerId, TrustedClient,
 };
 use comet_rpc::{
     RpcError, RpcReply, RpcService, TlsIdentity, connect_lan_rpc, methods, pair_client,
@@ -34,16 +34,8 @@ impl Harness for EmptyHarness {
         "Empty"
     }
 
-    fn supports_steering(&self) -> bool {
-        false
-    }
-
-    fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::TurnBoundary
-    }
-
-    fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        &[]
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities::default()
     }
 
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {

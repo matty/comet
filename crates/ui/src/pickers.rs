@@ -1094,7 +1094,7 @@ impl Pickers {
                     .ready()
                     .and_then(|list| list.iter().find(|d| d.id == config.harness))
             {
-                ladder = descriptor.reasoning_levels.clone();
+                ladder = descriptor.capabilities.reasoning_levels.clone();
             }
             if !ladder.is_empty() {
                 config.reasoning = clamp_reasoning(config.reasoning, &ladder);
@@ -1135,7 +1135,7 @@ impl Pickers {
                 self.harnesses
                     .ready()
                     .and_then(|list| list.iter().find(|d| d.id == h))
-                    .map(|d| d.reasoning_levels.clone())
+                    .map(|d| d.capabilities.reasoning_levels.clone())
             })
             .unwrap_or_default()
     }
@@ -2714,12 +2714,11 @@ mod tests {
 
     #[test]
     fn mock_harness_hidden_unless_alone() {
+        // Visibility keys off the id alone, so the capability block is inert here.
         let descriptor = |id: HarnessId, name: &str| HarnessDescriptor {
             id,
             name: name.into(),
-            supports_steering: true,
-            steering_mode: comet_proto::SteeringMode::StepBoundary,
-            reasoning_levels: vec![],
+            capabilities: comet_proto::HarnessCapabilities::default(),
         };
         let mixed = vec![
             descriptor(HarnessId::Mock, "Mock"),

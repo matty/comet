@@ -43,7 +43,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
+    AgentEvent, DoneStatus, HarnessCapabilities, HarnessId, Model, RunRequest, SteeringMode,
     UserInputAnswer, UserInputQuestion,
 };
 
@@ -146,6 +146,20 @@ impl CodexHarness {
         Self::default()
     }
 
+    /// The single declaration of what Codex can honor. `default_registry`
+    /// calls this for the lazy slot's descriptor and the trait impl returns it
+    /// once resolved, so the catalog cannot change on first use.
+    ///
+    /// Native `turn/steer` injects into the active turn; a steer that misses
+    /// the turn falls back to a follow-up `turn/start` on the same thread.
+    pub fn capabilities() -> HarnessCapabilities {
+        HarnessCapabilities {
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: REASONING_LEVELS.to_vec(),
+        }
+    }
+
     /// Use a fixed CLI binary instead of PATH/known-location resolution.
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
@@ -180,16 +194,8 @@ impl Harness for CodexHarness {
         // the catalog entry doesn't change after the first resolve.
         "Codex"
     }
-    fn supports_steering(&self) -> bool {
-        true
-    }
-    /// Native `turn/steer` injects into the active turn; a steer that misses
-    /// the turn falls back to a follow-up `turn/start` on the same thread.
-    fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::StepBoundary
-    }
-    fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        REASONING_LEVELS
+    fn capabilities(&self) -> HarnessCapabilities {
+        Self::capabilities()
     }
 
     /// The curated static catalog (see [`catalog`]); requires an installed CLI
