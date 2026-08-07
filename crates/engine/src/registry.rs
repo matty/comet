@@ -177,10 +177,9 @@ impl HarnessRegistry {
                 // factory fails is itself the reason it is unusable.
                 let availability = match registry.resolve(id) {
                     Ok(harness) => harness.availability().await,
-                    Err(err) => HarnessAvailability::Unavailable {
-                        summary: "Not working".to_string(),
-                        hint: Some(err.to_string()),
-                    },
+                    Err(err) => {
+                        HarnessAvailability::unavailable("Not working", Some(err.to_string()))
+                    }
                 };
                 if let Some(summary) = availability.unavailable_summary() {
                     tracing::info!(
@@ -382,10 +381,10 @@ mod tests {
         let registry = default_registry();
         registry.set_availability(
             HarnessId::Codex,
-            HarnessAvailability::Unavailable {
-                summary: "Not installed".into(),
-                hint: Some("Install codex, or set CODEX_EXECUTABLE to its path.".into()),
-            },
+            HarnessAvailability::unavailable(
+                "Not installed",
+                Some("Install codex, or set CODEX_EXECUTABLE to its path.".into()),
+            ),
         );
         registry.set_availability(
             HarnessId::ClaudeCode,

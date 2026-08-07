@@ -3093,10 +3093,10 @@ mod tests {
             ),
             with(
                 HarnessId::Codex,
-                HarnessAvailability::Unavailable {
-                    summary: "Not installed".into(),
-                    hint: Some("Install codex, or set CODEX_EXECUTABLE to its path.".into()),
-                },
+                HarnessAvailability::unavailable(
+                    "Not installed",
+                    Some("Install codex, or set CODEX_EXECUTABLE to its path.".into()),
+                ),
             ),
         ];
         assert!(
@@ -3133,10 +3133,7 @@ mod tests {
         )])));
         assert!(harness_catalog_settled(&Loadable::Ready(vec![
             with(HarnessAvailability::Available { version: None }),
-            with(HarnessAvailability::Unavailable {
-                summary: "Not installed".into(),
-                hint: None
-            }),
+            with(HarnessAvailability::unavailable("Not installed", None)),
         ])));
         // An empty catalog is vacuously settled — there is nothing to probe.
         assert!(harness_catalog_settled(&Loadable::Ready(vec![])));
@@ -3158,10 +3155,10 @@ mod tests {
             with(HarnessId::ClaudeCode, HarnessAvailability::Unknown),
             with(
                 HarnessId::Codex,
-                HarnessAvailability::Unavailable {
-                    summary: "Not installed".into(),
-                    hint: Some("Install codex, or set CODEX_EXECUTABLE to its path.".into()),
-                },
+                HarnessAvailability::unavailable(
+                    "Not installed",
+                    Some("Install codex, or set CODEX_EXECUTABLE to its path.".into()),
+                ),
             ),
             with(
                 HarnessId::Mock,

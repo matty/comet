@@ -212,18 +212,12 @@ pub(crate) fn unavailable_from_resolve(
     match err {
         HarnessError::NotInstalled(_) => {
             let (summary, hint) = not_installed(stem, override_var);
-            HarnessAvailability::Unavailable {
-                summary,
-                hint: Some(hint),
-            }
+            HarnessAvailability::unavailable(summary, Some(hint))
         }
         // Anything else is a configured-but-broken install (a bad override
         // path, a permissions failure) — it has no install hint to offer, so
         // the error itself is the most useful sentence available.
-        other => HarnessAvailability::Unavailable {
-            summary: "Not working".to_string(),
-            hint: Some(other.to_string()),
-        },
+        other => HarnessAvailability::unavailable("Not working", Some(other.to_string())),
     }
 }
 
@@ -351,29 +345,29 @@ pub(crate) async fn probe_cli_version(exe: &std::path::Path) -> HarnessAvailabil
             let stderr = String::from_utf8_lossy(&output.stderr);
             let detail = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
             tracing::debug!(cli = %name, %status, detail, "cli --version failed");
-            HarnessAvailability::Unavailable {
-                summary: "Not working".to_string(),
-                hint: Some(if detail.is_empty() {
+            HarnessAvailability::unavailable(
+                "Not working",
+                Some(if detail.is_empty() {
                     format!("`--version` failed ({status}).")
                 } else {
                     format!("`--version` failed ({status}): {}", detail.trim())
                 }),
-            }
+            )
         }
         Ok(Err(err)) => {
             tracing::debug!(cli = %name, error = %err, "cli could not be started");
-            HarnessAvailability::Unavailable {
-                summary: "Not working".to_string(),
-                hint: Some(format!("{name} could not be started: {err}")),
-            }
+            HarnessAvailability::unavailable(
+                "Not working",
+                Some(format!("{name} could not be started: {err}")),
+            )
         }
-        Err(_) => HarnessAvailability::Unavailable {
-            summary: "Not responding".to_string(),
-            hint: Some(format!(
+        Err(_) => HarnessAvailability::unavailable(
+            "Not responding",
+            Some(format!(
                 "{name} did not answer `--version` within {}s.",
                 PROBE_TIMEOUT.as_secs()
             )),
-        },
+        ),
     }
 }
 

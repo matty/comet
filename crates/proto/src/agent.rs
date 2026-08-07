@@ -122,6 +122,22 @@ pub enum HarnessAvailability {
         /// One sentence naming what to do about it, when there is one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hint: Option<String>,
+        /// Compatibility only: `summary` and `hint` rejoined, for peers built
+        /// before the split.
+        ///
+        /// `ListHarnesses` is in `remote_method_allowed`, so a LAN-paired
+        /// machine on an older build decodes this payload — and its `reason`
+        /// is a REQUIRED field. Omitting it fails the whole
+        /// `Vec<HarnessDescriptor>` decode, which blanks that machine's entire
+        /// agent catalog rather than degrading one row. Same all-or-nothing
+        /// blast radius the capabilities slice was reviewed for, in the other
+        /// direction.
+        ///
+        /// Never read by this build — always derive it through
+        /// [`HarnessAvailability::unavailable`] rather than setting it, and
+        /// delete the field once no peer predates the split.
+        #[serde(default)]
+        reason: String,
     },
 }
 
@@ -137,6 +153,24 @@ fn unavailable_summary_fallback() -> String {
 }
 
 impl HarnessAvailability {
+    /// Build an [`Unavailable`], deriving the compatibility `reason` from the
+    /// two halves. The only sanctioned way to construct one — setting the
+    /// fields directly lets `reason` drift out of step with what is displayed.
+    ///
+    /// [`Unavailable`]: HarnessAvailability::Unavailable
+    pub fn unavailable(summary: impl Into<String>, hint: Option<String>) -> Self {
+        let summary = summary.into();
+        let reason = match &hint {
+            Some(hint) => format!("{summary}. {hint}"),
+            None => summary.clone(),
+        };
+        Self::Unavailable {
+            summary,
+            hint,
+            reason,
+        }
+    }
+
     /// Whether this harness is known to be unusable.
     ///
     /// `Unknown` answers `false` alongside `Available`: an unfinished probe is
@@ -198,10 +232,10 @@ mod availability_tests {
             }
             .is_unavailable()
         );
-        let missing = HarnessAvailability::Unavailable {
-            summary: "Not installed".into(),
-            hint: Some("Set CODEX_EXECUTABLE to the codex binary.".into()),
-        };
+        let missing = HarnessAvailability::unavailable(
+            "Not installed",
+            Some("Set CODEX_EXECUTABLE to the codex binary.".into()),
+        );
         assert!(missing.is_unavailable());
         assert_eq!(missing.unavailable_summary(), Some("Not installed"));
         assert_eq!(
@@ -214,13 +248,43 @@ mod availability_tests {
     /// the row renders, so it can never be the empty half of the pair.
     #[test]
     fn a_hintless_failure_still_carries_a_summary() {
-        let crashed = HarnessAvailability::Unavailable {
-            summary: "Did not respond".into(),
-            hint: None,
-        };
+        let crashed = HarnessAvailability::unavailable("Did not respond", None);
         assert_eq!(crashed.unavailable_summary(), Some("Did not respond"));
         assert_eq!(crashed.unavailable_hint(), None);
         assert!(crashed.is_unavailable());
+    }
+
+    /// The reverse direction of the compatibility problem, and the one that
+    /// actually bites: an OLDER peer decoding a NEWER payload. `ListHarnesses`
+    /// is remote-allowed, its `reason` was a required field, and a missing
+    /// required field fails the whole `Vec<HarnessDescriptor>` — so the older
+    /// machine's entire agent catalog goes blank, not one row.
+    #[test]
+    fn an_older_peer_still_finds_the_reason_field() {
+        let value = serde_json::to_value(HarnessAvailability::unavailable(
+            "Not installed",
+            Some("Install codex, or set CODEX_EXECUTABLE to its path.".into()),
+        ))
+        .unwrap();
+        let reason = value
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .expect("the compatibility field must be emitted, not skipped");
+        // Both halves survive in it, in reading order, so an old client's
+        // single-string render is no worse than what it showed before.
+        assert!(reason.starts_with("Not installed"), "{reason}");
+        assert!(reason.contains("CODEX_EXECUTABLE"), "{reason}");
+
+        // A failure with no hint still emits a non-empty reason: an old client
+        // renders that string directly, and an empty one would read as a blank
+        // error row.
+        let hintless =
+            serde_json::to_value(HarnessAvailability::unavailable("Did not respond", None))
+                .unwrap();
+        assert_eq!(
+            hintless.get("reason").and_then(|r| r.as_str()),
+            Some("Did not respond")
+        );
     }
 
     /// A peer still sending the pre-split `reason` field must decode to a
@@ -245,14 +309,11 @@ mod availability_tests {
             HarnessAvailability::Available {
                 version: Some("2.0.0".into()),
             },
-            HarnessAvailability::Unavailable {
-                summary: "Not installed".into(),
-                hint: Some("Set CLAUDE_CODE_EXECUTABLE to the claude binary.".into()),
-            },
-            HarnessAvailability::Unavailable {
-                summary: "Did not respond".into(),
-                hint: None,
-            },
+            HarnessAvailability::unavailable(
+                "Not installed",
+                Some("Set CLAUDE_CODE_EXECUTABLE to the claude binary.".into()),
+            ),
+            HarnessAvailability::unavailable("Did not respond", None),
         ] {
             let json = serde_json::to_string(&value).unwrap();
             let round: HarnessAvailability = serde_json::from_str(&json).unwrap();
