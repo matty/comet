@@ -48,6 +48,7 @@ use crate::popover::{self, Loadable, MenuKey};
 use crate::settings::composer::ComposerDefaults;
 use crate::state::{AppState, ServerClient};
 use crate::theme::Theme;
+use crate::toast;
 
 // ---------------------------------------------------------------------------
 // Draft config (what the pickers accumulate)
@@ -812,13 +813,33 @@ impl Pickers {
         };
         let generation = self.owner_generation;
         self.models.insert(harness, Loadable::Loading);
+        // Registered so a wait longer than `SLOW_AFTER` becomes visible, and
+        // so the toast's Cancel has something to resolve. `end` runs on every
+        // path out, including the cancelled one.
+        let (request_id, cancelled) = toast::begin(cx, errors::Loading::Models);
         cx.spawn(async move |this, cx| {
             let params = serde_json::json!({ "harness": harness });
-            let result = engine.client().call(methods::LIST_MODELS, params).await;
+            let call = std::pin::pin!(engine.client().call(methods::LIST_MODELS, params));
+            // Losing this race DROPS the RPC future, which is what makes cancel
+            // real rather than cosmetic: `PendingGuard` turns the drop into a
+            // `{id, cancel}` frame, so the engine stops working on it too.
+            let outcome = futures::future::select(call, cancelled).await;
             this.update(cx, |pickers, cx| {
+                toast::end(cx, request_id);
                 if pickers.owner_generation != generation {
                     return;
                 }
+                let result = match outcome {
+                    futures::future::Either::Left((result, _)) => result,
+                    futures::future::Either::Right(_) => {
+                        pickers.models.insert(
+                            harness,
+                            Loadable::Error(toast::cancelled_message(errors::Loading::Models)),
+                        );
+                        cx.notify();
+                        return;
+                    }
+                };
                 let loaded = match result {
                     Ok(value) => match serde_json::from_value::<Vec<Model>>(value) {
                         Ok(models) => Loadable::Ready(models),

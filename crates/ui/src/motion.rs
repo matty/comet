@@ -308,6 +308,13 @@ pub const EASE_TAILWIND: CubicBezier = CubicBezier::new(0.4, 0.0, 0.2, 1.0);
 /// CSS `transition-colors` default: 150ms over [`EASE_TAILWIND`] — the temporal
 /// blend every interactive hover wash rides in the original.
 pub const HOVER_FADE: MotionSpec = MotionSpec::new(150, EASE_TAILWIND);
+/// Top-anchored toast entrance: 0.28s expo-out, dropping 14px.
+///
+/// Longer and further than [`MENU_IN`] on purpose. A popover appears where the
+/// pointer already is, so 2px is enough to read as "arrived"; this drops into
+/// the top edge unprompted, and has to catch the eye of someone looking at a
+/// skeleton somewhere else on screen.
+pub const TOAST_IN: MotionSpec = MotionSpec::new(280, EASE_OUT_EXPO);
 /// Comet loader pulse period: 2.4s.
 pub const COMET_PULSE: MotionSpec = MotionSpec::new(2400, EASE);
 /// Gradient matrix spinner wave period: 750ms.
@@ -345,6 +352,19 @@ where
         el.relative()
             .opacity(0.3 + 0.7 * t)
             .top(px(-2.0 * (1.0 - t)))
+    })
+}
+
+/// Top-anchored toast entrance over [`TOAST_IN`]: fade + drop 14→0.
+///
+/// The only entrance in the catalog that moves DOWNWARD. Everything else rises
+/// into place; this one has to read as having come from the window's top edge.
+pub fn toast_in<E>(id: impl Into<ElementId>, element: E) -> AnimationElement<E>
+where
+    E: Styled + IntoElement + 'static,
+{
+    element.with_animation(id, TOAST_IN.animation(), |el, t| {
+        el.relative().opacity(t).top(px(-14.0 * (1.0 - t)))
     })
 }
 

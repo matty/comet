@@ -31,7 +31,10 @@ pub enum Loading {
 
 impl Loading {
     /// The noun phrase, used as "Couldn't load {noun}".
-    fn noun(self) -> &'static str {
+    ///
+    /// Shared with the slow-request toast so a wait, a cancel, and a failure
+    /// all name the same thing the same way.
+    pub(crate) fn noun(self) -> &'static str {
         match self {
             Self::Agents => "the agent list",
             Self::Models => "the model list",
