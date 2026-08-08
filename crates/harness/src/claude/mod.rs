@@ -636,7 +636,10 @@ fn handle_control_request(
 ) -> Option<AgentEvent> {
     if req.request.subtype != "can_use_tool" {
         // Sink 3: an unclaimed inbound control request — counted, and
-        // deliberately NOT answered (recorded as debt; see DEBT.md). ~53
+        // deliberately NOT answered. The SDK's `request_user_dialog` contract
+        // says hosts should reply `{behavior:"cancelled"}` to dialog kinds
+        // they don't recognize; adopting that is a behaviour change deferred
+        // to whichever slice first claims a control-request subtype. ~53
         // subtypes exist in the SDK's inbound union and the capture saw none
         // fire, so their frequency is unknown, not zero.
         tracing::warn!(
@@ -825,10 +828,11 @@ mod control_request_tests {
     }
 
     /// Sink 3: an unclaimed subtype is counted (Unknown, control_request/-
-    /// prefixed) and — deliberately, recorded as debt in DEBT.md — not
-    /// answered. The SDK's request_user_dialog contract says hosts must reply
+    /// prefixed) and — deliberately — not answered. The SDK's
+    /// request_user_dialog contract says hosts must reply
     /// {behavior:"cancelled"}; replying is a behaviour change to a frame the
-    /// capture never saw fire, out of this slice's scope.
+    /// capture never saw fire, deferred to whichever slice first claims a
+    /// control-request subtype.
     #[test]
     fn an_unclaimed_control_request_becomes_a_diagnostic_and_no_reply() {
         use comet_proto::DiagnosticSeverity;
