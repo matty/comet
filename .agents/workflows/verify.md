@@ -25,6 +25,32 @@ cargo test --workspace
 - The first build after a `gpui` change is slow — gpui and its deps build at `opt-level = 2`
   even in dev (`[profile.dev.package."*"]`). Don't interpret a long build as a hang.
 
+## A failure that matches a known-flaky target still has to be measured
+
+Never write off a failure as "the known flake" from its name or its assertion
+text. Both have been wrong here. Establish it with two cheap checks, in this
+order:
+
+1. **Can your diff even reach the failing path?** Read the diff against the test.
+   A change the test never executes settles the question outright — faster and
+   more conclusive than any amount of re-running.
+2. **If it can, run the target several times on your commit *and* on the merge
+   base.** A single failure is not signal, and neither is a single pass. Compare
+   rates, not one run against the other.
+
+Two traps this exists for, both real:
+
+- **A recorded flake rate can be badly out of date.** One target documented as
+  failing ~1-in-3 was measured at 5-of-6, which reads as a fresh regression.
+- **A target can pass under full-workspace parallelism and fail in isolation.**
+  The extra latency lets a racing write land. So `cargo test --workspace` looks
+  clean, a targeted re-run fails, and the re-run looks like the break.
+
+When a measurement disagrees with what is recorded, correct the record and keep
+the wrong version with a note on why it misled. A wrong explanation that sounds
+right is what costs the next person their afternoon — the failure's symptom
+routinely names the wrong culprit.
+
 ## When the change touches `edge/`
 
 ```bash

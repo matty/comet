@@ -99,3 +99,17 @@ git branch -D <branch> && git push origin --delete <branch>
 
 `git branch -d` will refuse a squash-merged branch because no merge commit references it.
 Confirm the content landed with the `git diff` above before reaching for `-D`.
+
+## 5. Responding to review
+
+Verify a finding before applying it. A reviewer can be right about the symptom and wrong
+about the cause, and the fix that follows from the wrong cause still looks like it works.
+
+**Name the competing explanation and rule it out with evidence you can point at.** A flaky
+test that a changed wait condition fixes may equally be a product bug whose error arm is
+swallowed by a `tracing::warn!`. "It passes now" cannot tell those apart; "the wait resolves
+in 2s instead of hitting the 15s timeout" can.
+
+Revise by adding a commit, per the force-push rule above. Reply with what you changed, why
+the finding was valid, and the verification you ran — and say plainly when the finding was
+right and your original reasoning was wrong. That is the useful part of the record.
