@@ -5,7 +5,7 @@
 //! (`delta`/`textDelta`, `exitCode`/`exit_code`, camelCase/snake_case item
 //! types) are accepted, and unknown item types map to nothing.
 
-use comet_proto::{AgentEvent, TodoItem, ToolCall};
+use comet_proto::{AgentEvent, NoticeKind, NoticeSeverity, TodoItem, ToolCall};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +210,110 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
     }
 }
 
+/// Stateless notification → notice mapping for the three claimed Codex
+/// methods that need no per-session state. `account/rateLimits/updated` goes
+/// through [`rate_limit_notice`] instead — it fires continuously and must be
+/// threshold-filtered. Unclaimed methods answer `None` and stay with the run
+/// loop's tolerated catch-all (slice 0b.2 reads from there).
+pub(crate) fn notice_for(method: &str, params: &Value) -> Option<AgentEvent> {
+    match method {
+        "mcpServer/startupStatus/updated" => {
+            let name = str_field(params, &["name"]);
+            let status = str_field(params, &["status"]);
+            let error = str_field(params, &["error"]);
+            match status.as_str() {
+                "failed" => Some(AgentEvent::Notice {
+                    kind: NoticeKind::McpStatus,
+                    severity: NoticeSeverity::Warning,
+                    summary: format!("MCP server {name} failed to start"),
+                    detail: (!error.is_empty())
+                        .then(|| crate::cap_prose(&error, crate::NOTICE_DETAIL_MAX)),
+                    key: Some(format!("mcp:{name}")),
+                }),
+                "ready" => Some(AgentEvent::Notice {
+                    kind: NoticeKind::McpStatus,
+                    severity: NoticeSeverity::Info,
+                    summary: format!("MCP server {name} is ready"),
+                    detail: None,
+                    key: Some(format!("mcp:{name}")),
+                }),
+                // "starting"/"cancelled" are transient churn a user can't act
+                // on; the terminal states above are the message.
+                _ => None,
+            }
+        }
+        "mcpServer/oauthLogin/completed" => {
+            let name = str_field(params, &["name"]);
+            let success = params
+                .get("success")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let error = str_field(params, &["error"]);
+            Some(AgentEvent::Notice {
+                kind: NoticeKind::AuthStatus,
+                severity: NoticeSeverity::Info,
+                summary: if success {
+                    format!("Signed in to MCP server {name}")
+                } else {
+                    format!("Sign-in to MCP server {name} didn't finish")
+                },
+                detail: (!error.is_empty())
+                    .then(|| crate::cap_prose(&error, crate::NOTICE_DETAIL_MAX)),
+                key: Some(format!("mcp:{name}")),
+            })
+        }
+        "thread/environment/disconnected" => Some(AgentEvent::Notice {
+            kind: NoticeKind::McpStatus,
+            severity: NoticeSeverity::Warning,
+            summary: "Remote environment disconnected".into(),
+            detail: None,
+            key: Some("environment".into()),
+        }),
+        _ => None,
+    }
+}
+
+/// Per-run threshold latch for `account/rateLimits/updated`. Notices fire
+/// only on the FIRST crossing of 80% and of 95% — the same thresholds the
+/// accounts pane's usage meter recolors at
+/// (`crates/ui/src/settings/accounts.rs`, indigo → amber ≥80 → red ≥95).
+#[derive(Debug, Default)]
+pub(crate) struct RateLimitThresholds {
+    crossed_80: bool,
+    crossed_95: bool,
+}
+
+pub(crate) fn rate_limit_notice(
+    params: &Value,
+    state: &mut RateLimitThresholds,
+) -> Option<AgentEvent> {
+    let limits = params.get("rateLimits")?;
+    // Sparse rolling update: the fullest window drives the crossing.
+    let used = ["primary", "secondary"]
+        .iter()
+        .filter_map(|w| limits.get(*w))
+        .filter_map(|w| w.get("usedPercent"))
+        .filter_map(Value::as_i64)
+        .max()?;
+    let fire = if used >= 95 && !state.crossed_95 {
+        state.crossed_95 = true;
+        state.crossed_80 = true;
+        true
+    } else if used >= 80 && !state.crossed_80 {
+        state.crossed_80 = true;
+        true
+    } else {
+        false
+    };
+    fire.then(|| AgentEvent::Notice {
+        kind: NoticeKind::RateLimit,
+        severity: NoticeSeverity::Warning,
+        summary: format!("Codex usage is at {used}% of its limit"),
+        detail: None,
+        key: Some("rateLimit".into()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +434,124 @@ mod tests {
         );
         assert_eq!(turn_error_message(&json!({"turn": {"id": "t"}})), None);
         assert_eq!(turn_error_message(&json!({"turn": {"error": null}})), None);
+    }
+
+    #[test]
+    fn mcp_startup_status_maps_terminal_states_only() {
+        use comet_proto::{NoticeKind, NoticeSeverity};
+        assert_eq!(
+            notice_for(
+                "mcpServer/startupStatus/updated",
+                &json!({"name": "linear", "status": "failed", "error": "connect ECONNREFUSED"}),
+            ),
+            Some(AgentEvent::Notice {
+                kind: NoticeKind::McpStatus,
+                severity: NoticeSeverity::Warning,
+                summary: "MCP server linear failed to start".into(),
+                detail: Some("connect ECONNREFUSED".into()),
+                key: Some("mcp:linear".into()),
+            })
+        );
+        assert_eq!(
+            notice_for(
+                "mcpServer/startupStatus/updated",
+                &json!({"name": "linear", "status": "ready"}),
+            ),
+            Some(AgentEvent::Notice {
+                kind: NoticeKind::McpStatus,
+                severity: NoticeSeverity::Info,
+                summary: "MCP server linear is ready".into(),
+                detail: None,
+                key: Some("mcp:linear".into()),
+            })
+        );
+        // Transient churn a user can't act on.
+        assert_eq!(
+            notice_for(
+                "mcpServer/startupStatus/updated",
+                &json!({"name": "linear", "status": "starting"}),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn oauth_completed_and_environment_disconnected_map_to_notices() {
+        use comet_proto::{NoticeKind, NoticeSeverity};
+        assert_eq!(
+            notice_for(
+                "mcpServer/oauthLogin/completed",
+                &json!({"name": "linear", "success": true}),
+            ),
+            Some(AgentEvent::Notice {
+                kind: NoticeKind::AuthStatus,
+                severity: NoticeSeverity::Info,
+                summary: "Signed in to MCP server linear".into(),
+                detail: None,
+                key: Some("mcp:linear".into()),
+            })
+        );
+        assert_eq!(
+            notice_for(
+                "thread/environment/disconnected",
+                &json!({"environmentId": "env-1", "threadId": "th-1"}),
+            ),
+            Some(AgentEvent::Notice {
+                kind: NoticeKind::McpStatus,
+                severity: NoticeSeverity::Warning,
+                summary: "Remote environment disconnected".into(),
+                detail: None,
+                key: Some("environment".into()),
+            })
+        );
+        // Unclaimed methods answer None (they stay with the tolerated arm).
+        assert_eq!(notice_for("thread/status/changed", &json!({})), None);
+    }
+
+    /// `account/rateLimits/updated` fires continuously; only the FIRST
+    /// crossing of 80% and the FIRST crossing of 95% notice. Collapse must
+    /// not be doing a filter's job.
+    #[test]
+    fn rate_limit_notices_fire_on_threshold_crossings_only() {
+        let mut state = RateLimitThresholds::default();
+        let update = |pct: i64| json!({"rateLimits": {"primary": {"usedPercent": pct}}});
+
+        assert_eq!(rate_limit_notice(&update(50), &mut state), None);
+        let first = rate_limit_notice(&update(85), &mut state).expect("80% crossing fires");
+        match &first {
+            AgentEvent::Notice { summary, .. } => {
+                assert_eq!(summary, "Codex usage is at 85% of its limit")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Still inside the 80 band: quiet.
+        assert_eq!(rate_limit_notice(&update(90), &mut state), None);
+        let second = rate_limit_notice(&update(97), &mut state).expect("95% crossing fires");
+        match &second {
+            AgentEvent::Notice { summary, .. } => {
+                assert_eq!(summary, "Codex usage is at 97% of its limit")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(rate_limit_notice(&update(99), &mut state), None);
+
+        // A run that starts already over 95 fires exactly once.
+        let mut fresh = RateLimitThresholds::default();
+        assert!(rate_limit_notice(&update(96), &mut fresh).is_some());
+        assert_eq!(rate_limit_notice(&update(97), &mut fresh), None);
+
+        // The larger of primary/secondary drives the crossing.
+        let mut both = RateLimitThresholds::default();
+        let two = json!({"rateLimits": {"primary": {"usedPercent": 10}, "secondary": {"usedPercent": 82}}});
+        assert!(rate_limit_notice(&two, &mut both).is_some());
+
+        // A sparse update with no windows is quiet, not a panic.
+        assert_eq!(
+            rate_limit_notice(
+                &json!({"rateLimits": {}}),
+                &mut RateLimitThresholds::default()
+            ),
+            None
+        );
     }
 }
