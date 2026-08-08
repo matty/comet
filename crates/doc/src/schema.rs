@@ -903,12 +903,14 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     if let Some(summary) = &doc_part.summary {
         map.insert("summary", summary.as_str())?;
     }
-    if let Some(detail) = &doc_part.detail {
-        map.insert("detail", detail.as_str())?;
-    }
-    if let Some(key) = &doc_part.key {
-        map.insert("key", key.as_str())?;
-    }
+    // NULLABLE notice fields: set-or-clear, not insert-only. Audit of the
+    // rest: `noticeKind`/`severity`/`summary`/`occurrences` are always `Some`
+    // for a notice, `call`/`questions` always `Some` for their kind,
+    // `resolved` always `Some` for an input, and `isError` only ever goes
+    // absent → present (tool resolution is monotonic). `detail` and `key` are
+    // the only two an in-place refresh can legitimately clear.
+    set_or_clear(map, "detail", doc_part.detail.as_deref())?;
+    set_or_clear(map, "key", doc_part.key.as_deref())?;
     if let Some(occurrences) = doc_part.occurrences {
         map.insert("occurrences", occurrences as i64)?;
     }
@@ -918,6 +920,26 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
             t.update(text, Default::default())
                 .map_err(|e| DocError::Schema(e.to_string()))?;
         }
+    }
+    Ok(())
+}
+
+/// Write `value` under `key`, or REMOVE the key when `value` is `None`.
+///
+/// An in-place refresh can *clear* a nullable field, not just change it: the
+/// notice fold collapses a repeat into the trailing part and refreshes
+/// `detail` from the newest event, including `Some(detail)` → `None` (a failing
+/// MCP server that comes back ready). Insert-only refresh left the old value
+/// in the doc permanently — the writer's mirror moves to the new part either
+/// way, so the divergence never self-heals, and the stale detail would follow
+/// the doc to every LAN peer and across restarts.
+fn set_or_clear(map: &LoroMap, key: &str, value: Option<&str>) -> Result<(), DocError> {
+    match value {
+        Some(v) => map.insert(key, v)?,
+        // Only delete a key that is actually present: this runs for every part
+        // kind, and most kinds legitimately have no `detail`/`key` at all.
+        None if map.get(key).is_some() => map.delete(key)?,
+        None => {}
     }
     Ok(())
 }
@@ -1113,6 +1135,94 @@ mod tests {
             } => {
                 assert!(*resolved);
                 assert!(!*is_error);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// REGRESSION: an in-place notice refresh that CLEARS a nullable field
+    /// must clear it in the doc too. `update_part_fields` was insert-only, so
+    /// a failing MCP server coming back ready collapsed into a part whose
+    /// persisted `detail` still held the old connection error — forever, since
+    /// the writer's mirror advances to the new part and never re-diffs it.
+    #[test]
+    fn notice_refresh_clears_nullable_fields_through_the_doc() {
+        use comet_proto::{NoticeKind, NoticeSeverity};
+        let notice = |severity, summary: &str, detail: Option<&str>| AgentEvent::Notice {
+            kind: NoticeKind::McpStatus,
+            severity,
+            summary: summary.into(),
+            detail: detail.map(str::to_owned),
+            key: Some("mcp:linear".into()),
+        };
+
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a1", "dev-a", 5).unwrap();
+        let mut folded = Vec::new();
+        fold_event_into_parts(
+            &mut folded,
+            &notice(
+                NoticeSeverity::Warning,
+                "MCP server linear failed to start",
+                Some("connect ECONNREFUSED 127.0.0.1:3845"),
+            ),
+        );
+        writer.sync(&folded).unwrap();
+
+        // Same kind, same key, trailing part → collapse, with detail cleared.
+        fold_event_into_parts(
+            &mut folded,
+            &notice(NoticeSeverity::Info, "MCP server linear is ready", None),
+        );
+        assert_eq!(
+            folded.len(),
+            1,
+            "the repeat collapsed into the trailing part"
+        );
+        writer.sync(&folded).unwrap();
+
+        match &doc.read_entries().unwrap()[0].parts[0] {
+            MessagePart::Notice {
+                severity,
+                summary,
+                detail,
+                key,
+                occurrences,
+                ..
+            } => {
+                assert_eq!(*severity, NoticeSeverity::Info);
+                assert_eq!(summary, "MCP server linear is ready");
+                assert_eq!(*detail, None, "stale detail survived the collapse");
+                assert_eq!(key.as_deref(), Some("mcp:linear"));
+                assert_eq!(*occurrences, 2);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // `key` is the other nullable notice field. Collapse can't clear it
+        // (a differing key is what *prevents* collapse), so drive the writer
+        // directly — the doc must still drop the key rather than keep it.
+        let MessagePart::Notice { id, kind, .. } = &folded[0] else {
+            panic!("notice part")
+        };
+        let keyless = vec![MessagePart::Notice {
+            id: id.clone(),
+            kind: *kind,
+            severity: NoticeSeverity::Info,
+            summary: "MCP server linear is ready".into(),
+            detail: None,
+            key: None,
+            occurrences: 2,
+        }];
+        writer.sync(&keyless).unwrap();
+        writer.finish(&keyless, MessageStatus::Complete).unwrap();
+
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries[0].status, Some(MessageStatus::Complete));
+        match &entries[0].parts[0] {
+            MessagePart::Notice { detail, key, .. } => {
+                assert_eq!(*detail, None);
+                assert_eq!(*key, None, "stale key survived the refresh");
             }
             other => panic!("unexpected {other:?}"),
         }
