@@ -134,7 +134,7 @@ fn main() {
     } else if turn_line.contains("scenario:notices") {
         notices(&tid);
     } else if turn_line.contains("scenario:diagnostics") {
-        diagnostics(&tid);
+        diagnostics(&mut stdin, &tid);
     } else {
         fail_turn(&tid, "unknown scenario");
     }
@@ -424,7 +424,7 @@ fn notices(tid: &str) {
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
 }
 
-fn diagnostics(tid: &str) {
+fn diagnostics(stdin: &mut StdinLock<'_>, tid: &str) {
     emit(&format!(
         r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
     ));
@@ -447,10 +447,15 @@ fn diagnostics(tid: &str) {
     emit(
         r#"{"method":"item/completed","params":{"item":{"id":"cc1","type":"contextCompaction","status":"completed"}}}"#,
     );
-    // An unknown server→client REQUEST: the harness answers -32601 (the fake
-    // does not read the reply; one small line sits in the pipe buffer), then
-    // counts it.
+    // An unknown server→client REQUEST: the harness must answer -32601 before
+    // counting it — verified here the same way approve()/decline() verify an
+    // approval reply, by reading it back off stdin.
     emit(r#"{"id":99,"method":"some/unknownRequest","params":{}}"#);
+    let reply = read_line(stdin);
+    if !(reply.contains(r#""id":99"#) && reply.contains(r#""code":-32601"#)) {
+        fail_turn(tid, "expected -32601 reply to unknown request");
+        return;
+    }
     emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"ok"}}"#);
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
 }
