@@ -215,10 +215,20 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
             key,
         } => {
             // Collapse: only when the TRAILING part is a Notice with the same
-            // kind and key — occurrences increments and the text follows the
-            // newest event (severity and detail refresh in the same spirit).
-            // A notice recurring after other content gets its own part: its
-            // position is what makes it meaningful.
+            // kind and the same PRESENT key — occurrences increments and the
+            // text follows the newest event (severity and detail refresh in
+            // the same spirit). A notice recurring after other content gets
+            // its own part: its position is what makes it meaningful.
+            //
+            // `key` is the provider's own dedupe id, carried verbatim where it
+            // gives us one (`informational.tool_use_id`, `notification.key`)
+            // and a per-kind constant for the structured kinds. Two absent keys
+            // are the ABSENCE of evidence that two notices are the same thing,
+            // not evidence that they are — and `tool_use_id` is documented as
+            // scoping a message to one tool use, so an ordinary informational
+            // message simply has none. Collapsing on `None == None` merged two
+            // unrelated CLI messages and let the second overwrite the first's
+            // text, in a persisted transcript that replays over the LAN.
             if let Some(MessagePart::Notice {
                 kind: prev_kind,
                 severity: prev_severity,
@@ -229,6 +239,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 ..
             }) = out.last_mut()
                 && *prev_kind == *kind
+                && prev_key.is_some()
                 && *prev_key == *key
             {
                 *occurrences = occurrences.saturating_add(1);
@@ -557,6 +568,19 @@ mod tests {
         }
     }
 
+    /// A notice the provider gave no dedupe id for — what Claude's
+    /// `informational` and `notification` emitters produce whenever
+    /// `tool_use_id` / `key` are absent from the frame.
+    fn keyless_notice(kind: NoticeKind, summary: &str, detail: &str) -> AgentEvent {
+        AgentEvent::Notice {
+            kind,
+            severity: NoticeSeverity::Info,
+            summary: summary.into(),
+            detail: Some(detail.into()),
+            key: None,
+        }
+    }
+
     /// Consecutive same-kind-same-key notices collapse into the TRAILING part:
     /// occurrences increments, summary follows the newest text. Five retry
     /// frames paint one chip reading "attempt 5 of 5".
@@ -580,6 +604,52 @@ mod tests {
             } => {
                 assert_eq!(*occurrences, 2);
                 assert_eq!(summary, "Retrying — attempt 2 of 3");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Two notices the provider gave no key for are NOT the same notice.
+    /// `informational` carries `tool_use_id` only when the message is scoped to
+    /// a tool use, so ordinary CLI messages arrive keyless — collapsing them on
+    /// `None == None` merged unrelated text and dropped the first message's
+    /// summary and detail from the persisted transcript.
+    #[test]
+    fn keyless_notices_never_collapse() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &keyless_notice(
+                NoticeKind::Info,
+                "Consider running /doctor.",
+                "first detail",
+            ),
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &keyless_notice(NoticeKind::Info, "A plugin was disabled.", "second detail"),
+        );
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        match (&parts[0], &parts[1]) {
+            (
+                MessagePart::Notice {
+                    summary: first,
+                    detail: first_detail,
+                    occurrences: first_count,
+                    ..
+                },
+                MessagePart::Notice {
+                    summary: second,
+                    occurrences: second_count,
+                    ..
+                },
+            ) => {
+                // The first message survives intact — the bug overwrote it.
+                assert_eq!(first, "Consider running /doctor.");
+                assert_eq!(first_detail.as_deref(), Some("first detail"));
+                assert_eq!(second, "A plugin was disabled.");
+                assert_eq!(*first_count, 1);
+                assert_eq!(*second_count, 1);
             }
             other => panic!("unexpected {other:?}"),
         }
