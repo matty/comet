@@ -569,13 +569,28 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .expect("dispatch");
 
     // The mock's scripted reply doubles as the titling model's output.
-    let chat = wait_for("chat title", || {
+    //
+    // Gate on BOTH fields this test asserts on, because their visibility to a
+    // reader is not ordered. The titler renames the worktree branch (step 5)
+    // before it writes the title (step 6), yet a snapshot taken on a non-empty
+    // title routinely still held the PRE-rename branch — so write order buys
+    // nothing here, and gating on either field alone leaves the other racy in
+    // whichever direction that reader happens to lose.
+    //
+    // Wait for both to have CHANGED, then assert their values: a wrong title or
+    // a wrongly derived branch name still fails the assertions below rather than
+    // being absorbed into the wait.
+    let original_branch = worktree.branch.clone();
+    let chat = wait_for("titled chat on its renamed branch", || {
         core.workspace
             .doc()
             .chat(chat_id)
             .ok()
             .flatten()
-            .filter(|c| c.title.as_deref().is_some_and(|t| !t.is_empty()))
+            .filter(|c| {
+                c.title.as_deref().is_some_and(|t| !t.is_empty())
+                    && c.branch.as_deref().is_some_and(|b| b != original_branch)
+            })
     })
     .await;
     assert_eq!(chat.title.as_deref(), Some("Fix Login Flow"));
