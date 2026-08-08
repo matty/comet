@@ -79,6 +79,15 @@ pinned TLS transport, and pairing. `comet-engine` owns storage and authoritative
 operations. `comet-client` supervises direct connections, and `comet-ui` is the
 supported remote UX surface.
 
+`comet-proto`'s `PROTOCOL_VERSION` gates LAN pairing with an exact match. The
+bump rule: a new *field* on an existing wire type stays additive and does not
+bump — absent fields must decode to conservative defaults. A new *variant* of
+an enum that crosses the RPC boundary inside a decoded container (such as
+`MessagePart` inside a `TranscriptFrame`) does bump, because the container
+decode is all-or-nothing and the receiving side has no tolerant arm for an
+unknown variant. A new RPC *method* needs no bump — an older peer answers
+`UnknownMethod`, which the UI already translates into "restart to update".
+
 ## Network and release boundary
 
 LAN control is intended for local networks. Operators must permit the selected

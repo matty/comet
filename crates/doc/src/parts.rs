@@ -207,6 +207,47 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 });
             }
         }
+        AgentEvent::Notice {
+            kind,
+            severity,
+            summary,
+            detail,
+            key,
+        } => {
+            // Collapse: only when the TRAILING part is a Notice with the same
+            // kind and key — occurrences increments and the text follows the
+            // newest event (severity and detail refresh in the same spirit).
+            // A notice recurring after other content gets its own part: its
+            // position is what makes it meaningful.
+            if let Some(MessagePart::Notice {
+                kind: prev_kind,
+                severity: prev_severity,
+                summary: prev_summary,
+                detail: prev_detail,
+                key: prev_key,
+                occurrences,
+                ..
+            }) = out.last_mut()
+                && *prev_kind == *kind
+                && *prev_key == *key
+            {
+                *occurrences = occurrences.saturating_add(1);
+                *prev_severity = *severity;
+                *prev_summary = summary.clone();
+                *prev_detail = detail.clone();
+            } else {
+                let id = format!("n{}", out.len());
+                out.push(MessagePart::Notice {
+                    id,
+                    kind: *kind,
+                    severity: *severity,
+                    summary: summary.clone(),
+                    detail: detail.clone(),
+                    key: key.clone(),
+                    occurrences: 1,
+                });
+            }
+        }
         AgentEvent::AssistantMessageCompleted { .. } | AgentEvent::Usage { .. } => {}
     }
 }
@@ -504,5 +545,100 @@ mod tests {
         };
         assert_eq!(part.byte_len(), 8);
         assert_eq!(part.id(), "n0");
+    }
+
+    fn notice(kind: NoticeKind, key: &str, summary: &str) -> AgentEvent {
+        AgentEvent::Notice {
+            kind,
+            severity: NoticeSeverity::Warning,
+            summary: summary.into(),
+            detail: None,
+            key: Some(key.into()),
+        }
+    }
+
+    /// Consecutive same-kind-same-key notices collapse into the TRAILING part:
+    /// occurrences increments, summary follows the newest text. Five retry
+    /// frames paint one chip reading "attempt 5 of 5".
+    #[test]
+    fn trailing_same_kind_same_key_notices_collapse() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeKind::Retrying, "retry", "Retrying — attempt 1 of 3"),
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeKind::Retrying, "retry", "Retrying — attempt 2 of 3"),
+        );
+        assert_eq!(parts.len(), 1);
+        match &parts[0] {
+            MessagePart::Notice {
+                occurrences,
+                summary,
+                ..
+            } => {
+                assert_eq!(*occurrences, 2);
+                assert_eq!(summary, "Retrying — attempt 2 of 3");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// A different key does not collapse, even with the same kind.
+    #[test]
+    fn different_key_notices_do_not_collapse() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeKind::McpStatus, "mcp:a", "A failed"),
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeKind::McpStatus, "mcp:b", "B failed"),
+        );
+        assert_eq!(parts.len(), 2);
+    }
+
+    /// Only the TRAILING part collapses: a notice recurring after other
+    /// content gets its own chip, because its position is the message.
+    #[test]
+    fn a_notice_separated_by_text_does_not_collapse() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeKind::Compaction, "compaction", "Compacted"),
+        );
+        fold_event_into_parts(&mut parts, &text_delta("more output"));
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeKind::Compaction, "compaction", "Compacted"),
+        );
+        assert_eq!(parts.len(), 3);
+    }
+
+    /// DECISION (pinned): a notice folding into an empty accumulator produces
+    /// a part — i.e. a notice arriving between turns is WRITTEN as a
+    /// notice-only entry, not held. The engine's `sync_segment`
+    /// (crates/engine/src/sessions.rs:837) lazily begins the entry when the
+    /// fold is non-empty, and the `SessionStarted`/`Steered` clear at the top
+    /// of this fold is not a loss risk: the engine finalizes a segment at
+    /// those boundaries before the clear runs.
+    #[test]
+    fn notice_into_empty_accumulator_creates_a_part() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &notice(
+                NoticeKind::McpStatus,
+                "mcp:linear",
+                "MCP server linear failed to start",
+            ),
+        );
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Notice { occurrences: 1, .. }
+        ));
     }
 }

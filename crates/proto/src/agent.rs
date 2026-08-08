@@ -599,6 +599,21 @@ pub enum AgentEvent {
         assistant_message_id: Option<String>,
         next_assistant_message_id: Option<String>,
     },
+    /// A provider notice the user should see in the transcript: compaction,
+    /// model reroute, retry backoff, MCP/auth status, rate-limit warnings.
+    /// `summary` is one line — Comet copy for structured kinds; provider
+    /// prose, capped at the harness boundary, for the passthrough kinds.
+    #[serde(rename_all = "camelCase")]
+    Notice {
+        kind: NoticeKind,
+        severity: NoticeSeverity,
+        summary: String,
+        #[serde(default)]
+        detail: Option<String>,
+        /// Collapse key — from the wire where the provider gives us one.
+        #[serde(default)]
+        key: Option<String>,
+    },
     #[serde(rename_all = "camelCase")]
     Done {
         status: DoneStatus,
@@ -703,5 +718,47 @@ mod tests {
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(serde_json::from_str::<NoticeKind>(&json).unwrap(), kind);
         }
+    }
+
+    /// An AgentEvent::Notice with an unknown kind/severity decodes (degraded)
+    /// inside a batch instead of failing the whole vector — the 0.1-review
+    /// blast radius, tested in the direction that can actually fail.
+    #[test]
+    fn notice_event_with_unknown_values_does_not_poison_a_batch() {
+        let json = r#"[
+            {"type":"textDelta","text":"hi"},
+            {"type":"notice","kind":"someFutureKind","severity":"someFutureSeverity","summary":"s"}
+        ]"#;
+        let events: Vec<AgentEvent> = serde_json::from_str(json).unwrap();
+        assert_eq!(events.len(), 2);
+        match &events[1] {
+            AgentEvent::Notice {
+                kind,
+                severity,
+                summary,
+                detail,
+                key,
+            } => {
+                assert_eq!(*kind, NoticeKind::Info);
+                assert_eq!(*severity, NoticeSeverity::Warning);
+                assert_eq!(summary, "s");
+                assert_eq!(*detail, None);
+                assert_eq!(*key, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notice_event_round_trips() {
+        let ev = AgentEvent::Notice {
+            kind: NoticeKind::Retrying,
+            severity: NoticeSeverity::Warning,
+            summary: "Retrying — attempt 2 of 3".into(),
+            detail: Some("Next attempt in 4s.".into()),
+            key: Some("retry".into()),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
     }
 }

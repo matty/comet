@@ -1,7 +1,17 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Exact-match gate for LAN pairing (`manager.rs` refuses any peer whose
+/// `ServerHello.protocol_version` differs). Bump rule, stated in
+/// ARCHITECTURE.md: a new FIELD on an existing wire type stays additive and
+/// does not bump; a new VARIANT of an enum that crosses the RPC boundary
+/// inside a decoded container (e.g. `MessagePart` in a `TranscriptFrame`)
+/// DOES bump, because the container decode is all-or-nothing and the
+/// receiver has no tolerant arm. A new RPC method needs no bump — an older
+/// peer answers `UnknownMethod`.
+///
+/// 2: `MessagePart::Notice` (slice 0b.1).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
