@@ -11,8 +11,9 @@ use comet_harness::{
     CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, ReasoningLevel, RunRequest,
-    SandboxLevel, TodoItem, ToolCall, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessId, NoticeKind, NoticeSeverity,
+    ReasoningLevel, RunRequest, SandboxLevel, TodoItem, ToolCall, UserInputAnswer,
+    UserInputQuestion,
 };
 
 /// The `fake-codex` bin target, built by cargo alongside this test.
@@ -251,6 +252,32 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
             error: None,
             session_id: Some("th-1".into()),
         })
+    );
+
+    // fake_codex's happy stream includes `some/unknownNotification`
+    // (fixtures/fake_codex.rs:219) — since 0b.2 it surfaces as exactly one
+    // diagnostic, and it precedes Done, so the positional assertions above
+    // (usage before done, done last) still hold.
+    let diag_pos = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::Diagnostic {
+                    discriminator,
+                    severity: DiagnosticSeverity::Unknown,
+                    ..
+                } if discriminator == "some/unknownNotification"
+            )
+        })
+        .expect("unknown notification surfaced as a diagnostic");
+    assert!(diag_pos < done_pos);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Diagnostic { .. }))
+            .count(),
+        1
     );
 }
 
