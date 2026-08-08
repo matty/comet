@@ -508,6 +508,37 @@ pub enum DoneStatus {
     Errored,
 }
 
+/// What a provider notice is about. Providers drive this over the wire, so an
+/// unknown value must not poison the batch: `#[serde(other)]` degrades it to
+/// `Info` — quiet, because we do not know what it is. This IS valid on a
+/// plain externally-tagged unit-variant enum (verified empirically; the serde
+/// book's wording about internally/adjacently tagged enums reads as a
+/// restriction and is not one). Do not rewrite as a hand-written Deserialize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NoticeKind {
+    Compaction,
+    ModelRerouted,
+    Retrying,
+    McpStatus,
+    AuthStatus,
+    RateLimit,
+    #[serde(other)]
+    Info,
+}
+
+/// How loudly a notice paints. Unknown severities degrade LOUD (`Warning`),
+/// the opposite direction from `NoticeKind`: a level we cannot interpret is
+/// more likely to matter than less, and the cost of over-showing is an amber
+/// chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NoticeSeverity {
+    Info,
+    #[serde(other)]
+    Warning,
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors comet's `AgentEvent` tagged enum.
@@ -568,6 +599,21 @@ pub enum AgentEvent {
         assistant_message_id: Option<String>,
         next_assistant_message_id: Option<String>,
     },
+    /// A provider notice the user should see in the transcript: compaction,
+    /// model reroute, retry backoff, MCP/auth status, rate-limit warnings.
+    /// `summary` is one line — Comet copy for structured kinds; provider
+    /// prose, capped at the harness boundary, for the passthrough kinds.
+    #[serde(rename_all = "camelCase")]
+    Notice {
+        kind: NoticeKind,
+        severity: NoticeSeverity,
+        summary: String,
+        #[serde(default)]
+        detail: Option<String>,
+        /// Collapse key — from the wire where the provider gives us one.
+        #[serde(default)]
+        key: Option<String>,
+    },
     #[serde(rename_all = "camelCase")]
     Done {
         status: DoneStatus,
@@ -618,5 +664,101 @@ mod tests {
             serde_json::to_string(&HarnessId::ClaudeCode).unwrap(),
             "\"claude-code\""
         );
+    }
+
+    /// Unknown provider-driven enum values must degrade, not fail: decoding
+    /// is all-or-nothing across a containing vector, so one strict value
+    /// rejects every element. An unknown KIND degrades quiet (`Info` — we do
+    /// not dress up what we cannot name); an unknown SEVERITY degrades loud
+    /// (`Warning` — a level we cannot interpret is more likely to matter).
+    #[test]
+    fn unknown_notice_kind_and_severity_degrade_instead_of_failing() {
+        assert_eq!(
+            serde_json::from_str::<NoticeKind>("\"compaction\"").unwrap(),
+            NoticeKind::Compaction
+        );
+        assert_eq!(
+            serde_json::from_str::<NoticeKind>("\"modelRerouted\"").unwrap(),
+            NoticeKind::ModelRerouted
+        );
+        assert_eq!(
+            serde_json::from_str::<NoticeKind>("\"someFutureKind\"").unwrap(),
+            NoticeKind::Info
+        );
+        assert_eq!(
+            serde_json::from_str::<NoticeSeverity>("\"info\"").unwrap(),
+            NoticeSeverity::Info
+        );
+        assert_eq!(
+            serde_json::from_str::<NoticeSeverity>("\"someFutureSeverity\"").unwrap(),
+            NoticeSeverity::Warning
+        );
+    }
+
+    /// Wire names are camelCase strings and round-trip.
+    #[test]
+    fn notice_enums_round_trip_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&NoticeKind::McpStatus).unwrap(),
+            "\"mcpStatus\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NoticeSeverity::Warning).unwrap(),
+            "\"warning\""
+        );
+        for kind in [
+            NoticeKind::Compaction,
+            NoticeKind::ModelRerouted,
+            NoticeKind::Retrying,
+            NoticeKind::McpStatus,
+            NoticeKind::AuthStatus,
+            NoticeKind::RateLimit,
+            NoticeKind::Info,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(serde_json::from_str::<NoticeKind>(&json).unwrap(), kind);
+        }
+    }
+
+    /// An AgentEvent::Notice with an unknown kind/severity decodes (degraded)
+    /// inside a batch instead of failing the whole vector — the 0.1-review
+    /// blast radius, tested in the direction that can actually fail.
+    #[test]
+    fn notice_event_with_unknown_values_does_not_poison_a_batch() {
+        let json = r#"[
+            {"type":"textDelta","text":"hi"},
+            {"type":"notice","kind":"someFutureKind","severity":"someFutureSeverity","summary":"s"}
+        ]"#;
+        let events: Vec<AgentEvent> = serde_json::from_str(json).unwrap();
+        assert_eq!(events.len(), 2);
+        match &events[1] {
+            AgentEvent::Notice {
+                kind,
+                severity,
+                summary,
+                detail,
+                key,
+            } => {
+                assert_eq!(*kind, NoticeKind::Info);
+                assert_eq!(*severity, NoticeSeverity::Warning);
+                assert_eq!(summary, "s");
+                assert_eq!(*detail, None);
+                assert_eq!(*key, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notice_event_round_trips() {
+        let ev = AgentEvent::Notice {
+            kind: NoticeKind::Retrying,
+            severity: NoticeSeverity::Warning,
+            summary: "Retrying — attempt 2 of 3".into(),
+            detail: Some("Next attempt in 4s.".into()),
+            key: Some("retry".into()),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
     }
 }

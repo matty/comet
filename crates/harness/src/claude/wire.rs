@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 #[derive(Debug)]
 pub(crate) enum Frame {
     System(SystemFrame),
+    /// An allowlisted `system` notice subtype (see [`NOTICE_SUBTYPES`]).
+    SystemNotice(SystemNoticeFrame),
     StreamEvent(StreamEventFrame),
     Assistant(MessageFrame),
     User(MessageFrame),
@@ -33,6 +35,66 @@ pub(crate) struct SystemFrame {
     pub cwd: String,
     #[serde(default)]
     pub session_id: String,
+}
+
+/// The `system` subtypes claimed as notices. An explicit allowlist on
+/// purpose: everything else still becomes [`Frame::Other`], which is where
+/// slice 0b.2's diagnostics will read from — a subtype nobody claimed must
+/// surface there, not vanish.
+pub(crate) const NOTICE_SUBTYPES: &[&str] = &[
+    "compact_boundary",
+    "model_refusal_fallback",
+    "api_retry",
+    "informational",
+    "notification",
+];
+
+/// One tolerant struct for every allowlisted notice subtype — every field
+/// defaults, consistent with this module's "tolerant by construction" header.
+/// Only the fields the emitters read are declared.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct SystemNoticeFrame {
+    #[serde(default)]
+    pub subtype: String,
+    // compact_boundary
+    #[serde(default)]
+    pub compact_metadata: CompactMetadata,
+    // model_refusal_fallback
+    #[serde(default)]
+    pub original_model: String,
+    #[serde(default)]
+    pub fallback_model: String,
+    // api_retry
+    #[serde(default)]
+    pub attempt: u64,
+    #[serde(default)]
+    pub max_retries: u64,
+    #[serde(default)]
+    pub retry_delay_ms: u64,
+    // informational
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub level: String,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    // notification
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub priority: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct CompactMetadata {
+    #[serde(default)]
+    pub trigger: String,
+    #[serde(default)]
+    pub pre_tokens: u64,
+    #[serde(default)]
+    pub post_tokens: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -167,7 +229,20 @@ pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
     let value: Value = serde_json::from_str(line)?;
     let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
     let frame = match kind {
-        "system" => Frame::System(serde_json::from_value(value)?),
+        "system" => {
+            let subtype = value
+                .get("subtype")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            match subtype.as_str() {
+                "init" => Frame::System(serde_json::from_value(value)?),
+                s if NOTICE_SUBTYPES.contains(&s) => {
+                    Frame::SystemNotice(serde_json::from_value(value)?)
+                }
+                _ => Frame::Other,
+            }
+        }
         "stream_event" => Frame::StreamEvent(serde_json::from_value(value)?),
         "assistant" => Frame::Assistant(serde_json::from_value(value)?),
         "user" => Frame::User(serde_json::from_value(value)?),
@@ -310,5 +385,39 @@ mod tests {
             user_message_line_with_images("hi", &[]),
             user_message_line("hi")
         );
+    }
+
+    #[test]
+    fn system_subtypes_split_init_notice_and_other() {
+        // init keeps its dedicated SystemFrame (SessionStarted decoding
+        // untouched).
+        assert!(matches!(
+            parse_frame(r#"{"type":"system","subtype":"init","session_id":"s"}"#).unwrap(),
+            Frame::System(_)
+        ));
+        // Allowlisted notice subtypes become SystemNotice.
+        match parse_frame(
+            r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":68000,"post_tokens":12000}}"#,
+        )
+        .unwrap()
+        {
+            Frame::SystemNotice(f) => {
+                assert_eq!(f.subtype, "compact_boundary");
+                assert_eq!(f.compact_metadata.trigger, "auto");
+                assert_eq!(f.compact_metadata.pre_tokens, 68000);
+                assert_eq!(f.compact_metadata.post_tokens, Some(12000));
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+        // Everything else lands in Other — the 0b.2 interlock: a subtype
+        // nobody claimed must show up there, not vanish inside System.
+        assert!(matches!(
+            parse_frame(r#"{"type":"system","subtype":"someFutureSubtype"}"#).unwrap(),
+            Frame::Other
+        ));
+        assert!(matches!(
+            parse_frame(r#"{"type":"system","subtype":"status","status":"compacting"}"#).unwrap(),
+            Frame::Other
+        ));
     }
 }

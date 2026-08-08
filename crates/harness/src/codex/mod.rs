@@ -50,7 +50,8 @@ use comet_proto::{
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
-    Phase, delta_text, item_id, item_type, map_item, turn_error_message, turn_id, usage_event,
+    Phase, RateLimitThresholds, delta_text, item_id, item_type, map_item, notice_for,
+    rate_limit_notice, turn_error_message, turn_id, usage_event,
 };
 use rpc::{Incoming, RpcClient};
 
@@ -577,6 +578,9 @@ async fn run_session(session: Session) {
     // Deltas seen per agent-message item, so a model that never streams
     // (item/completed only) still emits its text exactly once.
     let mut streamed_text: HashSet<String> = HashSet::new();
+    // Threshold latch for account/rateLimits/updated (per run, not per turn:
+    // a session that crossed 80% stays crossed).
+    let mut rate_thresholds = RateLimitThresholds::default();
     // Token usage is held until the turn ends, emitted just before Done.
     let mut pending_usage: Option<AgentEvent> = None;
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
@@ -780,8 +784,27 @@ async fn run_session(session: Session) {
                         }
                     }
 
-                    // thread/status, mcpServer startup, account noise, … —
-                    // unknown notification methods are tolerated by design.
+                    "mcpServer/startupStatus/updated"
+                    | "mcpServer/oauthLogin/completed"
+                    | "thread/environment/disconnected" => {
+                        if let Some(ev) = notice_for(&method, &params)
+                            && !send(&event_tx, ev).await
+                        {
+                            break 'main;
+                        }
+                    }
+
+                    "account/rateLimits/updated" => {
+                        if let Some(ev) = rate_limit_notice(&params, &mut rate_thresholds)
+                            && !send(&event_tx, ev).await
+                        {
+                            break 'main;
+                        }
+                    }
+
+                    // thread/status, account/updated, skills/changed, … —
+                    // unknown notification methods are tolerated by design
+                    // (slice 0b.2 turns this arm into diagnostics).
                     _ => {}
                 },
 

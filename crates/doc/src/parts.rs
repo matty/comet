@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use comet_proto::{AgentEvent, ToolCall, UserInputQuestion};
+use comet_proto::{AgentEvent, NoticeKind, NoticeSeverity, ToolCall, UserInputQuestion};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -15,6 +15,12 @@ pub enum MessageStatus {
     Streaming,
     Complete,
     Aborted,
+}
+
+/// Serde default for `MessagePart::Notice::occurrences` — a payload written
+/// before collapse existed represents a single occurrence.
+fn one() -> u32 {
+    1
 }
 
 /// One rendered part of an assistant message.
@@ -47,6 +53,25 @@ pub enum MessagePart {
         id: String,
         message: String,
     },
+    /// A provider notice (compaction, model reroute, retry, MCP status…).
+    /// Positional: "the context was compacted HERE" is the whole message.
+    #[serde(rename_all = "camelCase")]
+    Notice {
+        id: String,
+        /// Stored as `noticeKind` on the wire — `kind` is the part-type tag.
+        #[serde(rename = "noticeKind")]
+        kind: NoticeKind,
+        severity: NoticeSeverity,
+        summary: String,
+        #[serde(default)]
+        detail: Option<String>,
+        /// Collapse key — from the wire where the provider gives us one.
+        #[serde(default)]
+        key: Option<String>,
+        /// 1 for a single occurrence; >1 after collapse.
+        #[serde(default = "one")]
+        occurrences: u32,
+    },
 }
 
 impl MessagePart {
@@ -55,7 +80,8 @@ impl MessagePart {
             MessagePart::Text { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
-            | MessagePart::Error { id, .. } => id,
+            | MessagePart::Error { id, .. }
+            | MessagePart::Notice { id, .. } => id,
         }
     }
 
@@ -67,6 +93,9 @@ impl MessagePart {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
             }
             MessagePart::Error { message, .. } => message.len(),
+            MessagePart::Notice {
+                summary, detail, ..
+            } => summary.len() + detail.as_deref().map_or(0, str::len),
         }
     }
 }
@@ -175,6 +204,58 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 out.push(MessagePart::Error {
                     id,
                     message: message.clone(),
+                });
+            }
+        }
+        AgentEvent::Notice {
+            kind,
+            severity,
+            summary,
+            detail,
+            key,
+        } => {
+            // Collapse: only when the TRAILING part is a Notice with the same
+            // kind and the same PRESENT key — occurrences increments and the
+            // text follows the newest event (severity and detail refresh in
+            // the same spirit). A notice recurring after other content gets
+            // its own part: its position is what makes it meaningful.
+            //
+            // `key` is the provider's own dedupe id, carried verbatim where it
+            // gives us one (`informational.tool_use_id`, `notification.key`)
+            // and a per-kind constant for the structured kinds. Two absent keys
+            // are the ABSENCE of evidence that two notices are the same thing,
+            // not evidence that they are — and `tool_use_id` is documented as
+            // scoping a message to one tool use, so an ordinary informational
+            // message simply has none. Collapsing on `None == None` merged two
+            // unrelated CLI messages and let the second overwrite the first's
+            // text, in a persisted transcript that replays over the LAN.
+            if let Some(MessagePart::Notice {
+                kind: prev_kind,
+                severity: prev_severity,
+                summary: prev_summary,
+                detail: prev_detail,
+                key: prev_key,
+                occurrences,
+                ..
+            }) = out.last_mut()
+                && *prev_kind == *kind
+                && prev_key.is_some()
+                && *prev_key == *key
+            {
+                *occurrences = occurrences.saturating_add(1);
+                *prev_severity = *severity;
+                *prev_summary = summary.clone();
+                *prev_detail = detail.clone();
+            } else {
+                let id = format!("n{}", out.len());
+                out.push(MessagePart::Notice {
+                    id,
+                    kind: *kind,
+                    severity: *severity,
+                    summary: summary.clone(),
+                    detail: detail.clone(),
+                    key: key.clone(),
+                    occurrences: 1,
                 });
             }
         }
@@ -431,5 +512,229 @@ mod tests {
     #[test]
     fn continuation_ids_are_deterministic() {
         assert_eq!(continuation_id("m1", 1), "m1#c1");
+    }
+
+    #[test]
+    fn notice_part_serde_defaults_occurrences_to_one() {
+        // A payload written before collapse existed (no `occurrences`).
+        let json = r#"{"kind":"notice","id":"n0","noticeKind":"retrying","severity":"warning","summary":"Retrying — attempt 1 of 3"}"#;
+        let part: MessagePart = serde_json::from_str(json).unwrap();
+        match &part {
+            MessagePart::Notice {
+                occurrences,
+                kind,
+                severity,
+                summary,
+                detail,
+                key,
+                ..
+            } => {
+                assert_eq!(*occurrences, 1);
+                assert_eq!(*kind, comet_proto::NoticeKind::Retrying);
+                assert_eq!(*severity, comet_proto::NoticeSeverity::Warning);
+                assert_eq!(summary, "Retrying — attempt 1 of 3");
+                assert_eq!(*detail, None);
+                assert_eq!(*key, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Round trip.
+        let json = serde_json::to_string(&part).unwrap();
+        assert_eq!(serde_json::from_str::<MessagePart>(&json).unwrap(), part);
+    }
+
+    #[test]
+    fn notice_byte_len_counts_summary_and_detail() {
+        let part = MessagePart::Notice {
+            id: "n0".into(),
+            kind: comet_proto::NoticeKind::Info,
+            severity: comet_proto::NoticeSeverity::Info,
+            summary: "abcd".into(),
+            detail: Some("efgh".into()),
+            key: None,
+            occurrences: 1,
+        };
+        assert_eq!(part.byte_len(), 8);
+        assert_eq!(part.id(), "n0");
+    }
+
+    fn notice(kind: NoticeKind, key: &str, summary: &str) -> AgentEvent {
+        AgentEvent::Notice {
+            kind,
+            severity: NoticeSeverity::Warning,
+            summary: summary.into(),
+            detail: None,
+            key: Some(key.into()),
+        }
+    }
+
+    /// A notice the provider gave no dedupe id for — what Claude's
+    /// `informational` and `notification` emitters produce whenever
+    /// `tool_use_id` / `key` are absent from the frame.
+    fn keyless_notice(kind: NoticeKind, summary: &str, detail: &str) -> AgentEvent {
+        AgentEvent::Notice {
+            kind,
+            severity: NoticeSeverity::Info,
+            summary: summary.into(),
+            detail: Some(detail.into()),
+            key: None,
+        }
+    }
+
+    /// Consecutive same-kind-same-key notices collapse into the TRAILING part:
+    /// occurrences increments, summary follows the newest text. Five retry
+    /// frames paint one chip reading "attempt 5 of 5".
+    #[test]
+    fn trailing_same_kind_same_key_notices_collapse() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeKind::Retrying, "retry", "Retrying — attempt 1 of 3"),
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeKind::Retrying, "retry", "Retrying — attempt 2 of 3"),
+        );
+        assert_eq!(parts.len(), 1);
+        match &parts[0] {
+            MessagePart::Notice {
+                occurrences,
+                summary,
+                ..
+            } => {
+                assert_eq!(*occurrences, 2);
+                assert_eq!(summary, "Retrying — attempt 2 of 3");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Two notices the provider gave no key for are NOT the same notice.
+    /// `informational` carries `tool_use_id` only when the message is scoped to
+    /// a tool use, so ordinary CLI messages arrive keyless — collapsing them on
+    /// `None == None` merged unrelated text and dropped the first message's
+    /// summary and detail from the persisted transcript.
+    #[test]
+    fn keyless_notices_never_collapse() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &keyless_notice(
+                NoticeKind::Info,
+                "Consider running /doctor.",
+                "first detail",
+            ),
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &keyless_notice(NoticeKind::Info, "A plugin was disabled.", "second detail"),
+        );
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        match (&parts[0], &parts[1]) {
+            (
+                MessagePart::Notice {
+                    summary: first,
+                    detail: first_detail,
+                    occurrences: first_count,
+                    ..
+                },
+                MessagePart::Notice {
+                    summary: second,
+                    occurrences: second_count,
+                    ..
+                },
+            ) => {
+                // The first message survives intact — the bug overwrote it.
+                assert_eq!(first, "Consider running /doctor.");
+                assert_eq!(first_detail.as_deref(), Some("first detail"));
+                assert_eq!(second, "A plugin was disabled.");
+                assert_eq!(*first_count, 1);
+                assert_eq!(*second_count, 1);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// A different key does not collapse, even with the same kind.
+    #[test]
+    fn different_key_notices_do_not_collapse() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeKind::McpStatus, "mcp:a", "A failed"),
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeKind::McpStatus, "mcp:b", "B failed"),
+        );
+        assert_eq!(parts.len(), 2);
+    }
+
+    /// A different kind does not collapse, even with the same key — the
+    /// guard is `kind == kind && key == key`, not key alone.
+    #[test]
+    fn different_kind_same_key_notices_do_not_collapse() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeKind::Compaction, "shared", "Compacted"),
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeKind::McpStatus, "shared", "MCP failed"),
+        );
+        assert_eq!(parts.len(), 2);
+    }
+
+    /// Only the TRAILING part collapses: a notice recurring after other
+    /// content gets its own chip, because its position is the message.
+    #[test]
+    fn a_notice_separated_by_text_does_not_collapse() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeKind::Compaction, "compaction", "Compacted"),
+        );
+        fold_event_into_parts(&mut parts, &text_delta("more output"));
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeKind::Compaction, "compaction", "Compacted"),
+        );
+        assert_eq!(parts.len(), 3);
+        // Part count alone would still pass with a leaked counter: the new
+        // chip must read as a first occurrence, not "×2".
+        assert!(
+            matches!(&parts[0], MessagePart::Notice { occurrences: 1, .. }),
+            "{parts:?}"
+        );
+        assert!(
+            matches!(&parts[2], MessagePart::Notice { occurrences: 1, .. }),
+            "{parts:?}"
+        );
+    }
+
+    /// DECISION (pinned): a notice folding into an empty accumulator produces
+    /// a part — i.e. a notice arriving between turns is WRITTEN as a
+    /// notice-only entry, not held. The engine's `sync_segment`
+    /// (crates/engine/src/sessions.rs:837) lazily begins the entry when the
+    /// fold is non-empty, and the `SessionStarted`/`Steered` clear at the top
+    /// of this fold is not a loss risk: the engine finalizes a segment at
+    /// those boundaries before the clear runs.
+    #[test]
+    fn notice_into_empty_accumulator_creates_a_part() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &notice(
+                NoticeKind::McpStatus,
+                "mcp:linear",
+                "MCP server linear failed to start",
+            ),
+        );
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Notice { occurrences: 1, .. }
+        ));
     }
 }

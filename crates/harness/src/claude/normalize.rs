@@ -1,10 +1,12 @@
 //! Frame → [`AgentEvent`] normalization, ported from claude.ts's `normalize`
 //! (init dedupe, subagent filtering, tool decoding, error-code mapping).
 
-use comet_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
+use comet_proto::{
+    AgentEvent, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, TodoItem, ToolCall,
+};
 use serde_json::Value;
 
-use super::wire::{ContentBlock, Frame};
+use super::wire::{ContentBlock, Frame, SystemNoticeFrame};
 
 /// Human-readable text for the CLI's assistant-level error codes. These arrive
 /// as a terse `error` field on an `assistant` frame — usually with NO text
@@ -131,6 +133,95 @@ fn new_message_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// Map one allowlisted `system` notice frame to its notice event. Structured
+/// kinds carry Comet copy; the passthrough kinds (informational,
+/// notification) carry capped provider prose and are claimed by the
+/// passthrough emitters. The structured kinds use a per-kind constant
+/// collapse key.
+fn notice_events(f: &SystemNoticeFrame) -> Vec<AgentEvent> {
+    let notice = match f.subtype.as_str() {
+        "compact_boundary" => {
+            let m = &f.compact_metadata;
+            let summary = if m.trigger == "manual" {
+                "Context compacted".to_string()
+            } else {
+                "Context compacted automatically".to_string()
+            };
+            let detail = match m.post_tokens {
+                Some(post) => format!("{} tokens → {}", m.pre_tokens, post),
+                None => format!("{} tokens before compaction", m.pre_tokens),
+            };
+            Some(AgentEvent::Notice {
+                kind: NoticeKind::Compaction,
+                severity: NoticeSeverity::Info,
+                summary,
+                detail: Some(detail),
+                key: Some("compaction".into()),
+            })
+        }
+        "model_refusal_fallback" => Some(AgentEvent::Notice {
+            kind: NoticeKind::ModelRerouted,
+            severity: NoticeSeverity::Warning,
+            summary: format!("Model changed to {}", f.fallback_model),
+            detail: Some(format!(
+                "{} refused the request; replies now come from {}.",
+                f.original_model, f.fallback_model
+            )),
+            key: Some("model".into()),
+        }),
+        "api_retry" => Some(AgentEvent::Notice {
+            kind: NoticeKind::Retrying,
+            severity: NoticeSeverity::Warning,
+            summary: format!("Retrying — attempt {} of {}", f.attempt, f.max_retries),
+            detail: Some(format!(
+                "Next attempt in {}s.",
+                f.retry_delay_ms.div_ceil(1000)
+            )),
+            key: Some("retry".into()),
+        }),
+        "informational" => {
+            tracing::debug!(
+                target: "comet_harness::claude",
+                "informational (full text): {}", f.content
+            );
+            // sdk.d.ts documents `level` as the CLI's own render level —
+            // read it rather than inventing a severity.
+            let severity = match f.level.as_str() {
+                "suggestion" | "warning" => NoticeSeverity::Warning,
+                _ => NoticeSeverity::Info,
+            };
+            Some(AgentEvent::Notice {
+                kind: NoticeKind::Info,
+                severity,
+                summary: crate::cap_prose(&f.content, crate::NOTICE_SUMMARY_MAX),
+                detail: (f.content.len() > crate::NOTICE_SUMMARY_MAX)
+                    .then(|| crate::cap_prose(&f.content, crate::NOTICE_DETAIL_MAX)),
+                key: f.tool_use_id.clone(),
+            })
+        }
+        "notification" => {
+            tracing::debug!(
+                target: "comet_harness::claude",
+                "notification (full text): {}", f.text
+            );
+            let severity = match f.priority.as_str() {
+                "high" | "immediate" => NoticeSeverity::Warning,
+                _ => NoticeSeverity::Info,
+            };
+            Some(AgentEvent::Notice {
+                kind: NoticeKind::Info,
+                severity,
+                summary: crate::cap_prose(&f.text, crate::NOTICE_SUMMARY_MAX),
+                detail: (f.text.len() > crate::NOTICE_SUMMARY_MAX)
+                    .then(|| crate::cap_prose(&f.text, crate::NOTICE_DETAIL_MAX)),
+                key: f.key.clone(),
+            })
+        }
+        _ => None,
+    };
+    notice.into_iter().collect()
+}
+
 /// Per-run normalization state.
 ///
 /// `saw_init` dedupes `system:init` — the CLI re-emits it every time the model
@@ -182,6 +273,8 @@ impl Normalizer {
                     assistant_message_id: self.assistant_message_id.clone(),
                 }]
             }
+
+            Frame::SystemNotice(f) => notice_events(&f),
 
             // Frames with `parent_tool_use_id` set belong to a SUBAGENT's
             // nested transcript; a background Task runs concurrently with the
@@ -255,19 +348,28 @@ impl Normalizer {
                     .collect()
             }
 
-            // A claude.ai plan window was hit. A hard `rejected` blocks the
-            // turn — make it visible; allowed/allowed_warning stay quiet.
+            // A claude.ai plan window. `rejected` blocks the turn and stays an
+            // Error (deliberately unchanged this slice). `allowed_warning` is
+            // the provider telling us the window is nearly spent — a state to
+            // resolve, not a failure: a Warning notice. `allowed` stays quiet.
             Frame::RateLimit(f) => {
-                if f.rate_limit_info.status != "rejected" {
-                    return Vec::new();
-                }
                 let window =
                     rate_window_label(f.rate_limit_info.rate_limit_type.as_deref().unwrap_or(""));
-                vec![AgentEvent::Error {
-                    message: format!(
-                        "Claude {window} limit reached — the turn was blocked. Try again after it resets."
-                    ),
-                }]
+                match f.rate_limit_info.status.as_str() {
+                    "rejected" => vec![AgentEvent::Error {
+                        message: format!(
+                            "Claude {window} limit reached — the turn was blocked. Try again after it resets."
+                        ),
+                    }],
+                    "allowed_warning" => vec![AgentEvent::Notice {
+                        kind: NoticeKind::RateLimit,
+                        severity: NoticeSeverity::Warning,
+                        summary: format!("Approaching the Claude {window} usage limit"),
+                        detail: None,
+                        key: Some("rateLimit".into()),
+                    }],
+                    _ => Vec::new(),
+                }
             }
 
             Frame::Result(f) => {
@@ -501,5 +603,170 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    fn notice_of(raw: &str) -> AgentEvent {
+        let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
+        let events = Normalizer::new().normalize(frame, false);
+        assert_eq!(events.len(), 1, "{events:?}");
+        events.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn structured_system_subtypes_map_to_notices() {
+        use comet_proto::{NoticeKind, NoticeSeverity};
+
+        assert_eq!(
+            notice_of(
+                r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":68000,"post_tokens":12000}}"#
+            ),
+            AgentEvent::Notice {
+                kind: NoticeKind::Compaction,
+                severity: NoticeSeverity::Info,
+                summary: "Context compacted automatically".into(),
+                detail: Some("68000 tokens → 12000".into()),
+                key: Some("compaction".into()),
+            }
+        );
+        assert_eq!(
+            notice_of(
+                r#"{"type":"system","subtype":"model_refusal_fallback","original_model":"claude-fable-5","fallback_model":"claude-haiku-4-5","direction":"sticky","content":"x"}"#
+            ),
+            AgentEvent::Notice {
+                kind: NoticeKind::ModelRerouted,
+                severity: NoticeSeverity::Warning,
+                summary: "Model changed to claude-haiku-4-5".into(),
+                detail: Some(
+                    "claude-fable-5 refused the request; replies now come from claude-haiku-4-5."
+                        .into()
+                ),
+                key: Some("model".into()),
+            }
+        );
+        assert_eq!(
+            notice_of(
+                r#"{"type":"system","subtype":"api_retry","attempt":2,"max_retries":3,"retry_delay_ms":4000,"error_status":529}"#
+            ),
+            AgentEvent::Notice {
+                kind: NoticeKind::Retrying,
+                severity: NoticeSeverity::Warning,
+                summary: "Retrying — attempt 2 of 3".into(),
+                detail: Some("Next attempt in 4s.".into()),
+                key: Some("retry".into()),
+            }
+        );
+        // Manual compaction reads differently and a missing post_tokens
+        // degrades the detail rather than lying.
+        assert_eq!(
+            notice_of(
+                r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":500}}"#
+            ),
+            AgentEvent::Notice {
+                kind: NoticeKind::Compaction,
+                severity: NoticeSeverity::Info,
+                summary: "Context compacted".into(),
+                detail: Some("500 tokens before compaction".into()),
+                key: Some("compaction".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn passthrough_subtypes_carry_capped_provider_prose() {
+        use comet_proto::{NoticeKind, NoticeSeverity};
+
+        // informational: severity from `level`, key from `tool_use_id`.
+        assert_eq!(
+            notice_of(
+                r#"{"type":"system","subtype":"informational","content":"Consider running /doctor.","level":"suggestion","tool_use_id":"tu-1"}"#
+            ),
+            AgentEvent::Notice {
+                kind: NoticeKind::Info,
+                severity: NoticeSeverity::Warning,
+                summary: "Consider running /doctor.".into(),
+                detail: None,
+                key: Some("tu-1".into()),
+            }
+        );
+        // info/notice levels stay quiet-severity.
+        match notice_of(
+            r#"{"type":"system","subtype":"informational","content":"x","level":"notice"}"#,
+        ) {
+            AgentEvent::Notice { severity, .. } => {
+                assert_eq!(severity, NoticeSeverity::Info)
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // notification: severity from `priority`, key from `key`.
+        assert_eq!(
+            notice_of(
+                r#"{"type":"system","subtype":"notification","key":"usage-warning","text":"Half of the weekly limit is used.","priority":"immediate"}"#
+            ),
+            AgentEvent::Notice {
+                kind: NoticeKind::Info,
+                severity: NoticeSeverity::Warning,
+                summary: "Half of the weekly limit is used.".into(),
+                detail: None,
+                key: Some("usage-warning".into()),
+            }
+        );
+    }
+
+    /// The 480-byte detail budget is what keeps unbounded provider prose out
+    /// of a persisted, LAN-replayed doc, and this is its only guard — so the
+    /// input must EXCEED it (600 bytes) and the length must be asserted
+    /// exactly. A shorter input makes `cap_prose` a no-op and the assertion
+    /// vacuous: it would pass just as happily if detail were capped at 160.
+    #[test]
+    fn oversized_provider_prose_is_capped_with_full_text_in_detail() {
+        let long = "x".repeat(600);
+        let raw = format!(
+            r#"{{"type":"system","subtype":"informational","content":"{long}","level":"info"}}"#
+        );
+        match notice_of(&raw) {
+            AgentEvent::Notice {
+                summary, detail, ..
+            } => {
+                assert_eq!(summary.len(), 160 + '…'.len_utf8());
+                assert!(summary.ends_with('…'));
+                let detail = detail.expect("overflow keeps a longer detail");
+                assert_eq!(detail.len(), 480 + '…'.len_utf8());
+                assert!(detail.ends_with('…'));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_limit_allowed_warning_becomes_a_notice_and_rejected_stays_an_error() {
+        use comet_proto::{NoticeKind, NoticeSeverity};
+        // allowed_warning: a notice, not an error.
+        assert_eq!(
+            notice_of(
+                r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour"}}"#
+            ),
+            AgentEvent::Notice {
+                kind: NoticeKind::RateLimit,
+                severity: NoticeSeverity::Warning,
+                summary: "Approaching the Claude 5-hour usage limit".into(),
+                detail: None,
+                key: Some("rateLimit".into()),
+            }
+        );
+        // rejected: deliberately UNCHANGED — it blocks the turn, it is a
+        // failure, and reclassifying it would be a behaviour change this
+        // slice has no reason to make.
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"}}"#,
+        )
+        .unwrap();
+        let events = Normalizer::new().normalize(frame, false);
+        assert!(matches!(&events[0], AgentEvent::Error { .. }), "{events:?}");
+        // allowed: still quiet.
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#,
+        )
+        .unwrap();
+        assert!(Normalizer::new().normalize(frame, false).is_empty());
     }
 }

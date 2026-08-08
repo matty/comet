@@ -1047,9 +1047,18 @@ async fn drive_run(
         // Any stream activity proves the run is alive — keep the session's
         // freshness inside the UI's 45s staleness window (throttled).
         inner.touch_session(&chat_id);
+        // A Notice is the ONE event that can arrive OUTSIDE a turn (an MCP
+        // server dropping, a rate-limit warning, an environment disconnect
+        // while the session sits parked), so it is NOT turn-start. Counting it
+        // as one wedged the session: `idle_since` cleared → the reaper's select
+        // arm (gated on `idle_since.is_some()`) is disabled and the child is
+        // never released, the status flips to Working, and the chip opens a
+        // streaming entry that no `Done` is ever coming to finish. Handled
+        // below by writing it as its own finished entry, still parked.
+        let parked_notice = idle_since.is_some() && matches!(&event, AgentEvent::Notice { .. });
         // First event after parking idle = the next turn beginning (a routed
         // dispatch steered in): the session is Working again.
-        if idle_since.take().is_some() {
+        if !parked_notice && idle_since.take().is_some() {
             inner.set_status(&chat_id, SessionStatus::Working, true);
         }
         // Empty reasoning deltas are PURE heartbeats: redacted thinking and
@@ -1180,6 +1189,33 @@ async fn drive_run(
         let skip_fold = matches!(&event, AgentEvent::SessionStarted { .. }) && !folded.is_empty();
         if !skip_fold {
             fold_event_into_parts(&mut folded, &event);
+        }
+
+        // Between-turns notice: write it NOW as a complete entry and stay
+        // parked. The spec's decision that such a notice is written stands
+        // (holding it until the next turn would lose exactly the MCP-failure
+        // case this exists for), but nothing else will finalize it — no `Done`
+        // is coming while parked, and the normal flush tick would leave a
+        // `streaming` entry spinning in the UI forever. One notice per entry is
+        // the cost: parking already cleared the accumulator, so a repeat can't
+        // collapse into a trailing part across the gap.
+        if parked_notice {
+            if let Err(err) = finish_segment(
+                doc_ref,
+                writer.take(),
+                &entry_id,
+                &device_id,
+                segment_started,
+                &folded,
+                MessageStatus::Complete,
+            ) {
+                tracing::warn!(chat = %chat_id, error = %err, "parked notice segment finish failed");
+            }
+            folded.clear();
+            dirty = false;
+            entry_id = new_id();
+            segment_started = now_ms();
+            continue;
         }
 
         if let AgentEvent::Done { status, .. } = &event {

@@ -11,8 +11,8 @@ use comet_harness::{
     CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, TodoItem,
-    ToolCall, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, ReasoningLevel, RunRequest,
+    SandboxLevel, TodoItem, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 /// The `fake-codex` bin target, built by cargo alongside this test.
@@ -581,4 +581,97 @@ async fn models_returns_curated_catalog() {
     // The trait impl must hand back the associated declaration verbatim —
     // that identity is what lets the registry's lazy descriptor name it.
     assert_eq!(missing.capabilities(), CodexHarness::capabilities());
+}
+
+#[tokio::test]
+async fn claimed_notifications_surface_as_notices() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:notices"), controls).await;
+
+    let notices: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Notice {
+                kind,
+                severity,
+                summary,
+                key,
+                ..
+            } => Some((*kind, *severity, summary.clone(), key.clone())),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        notices.contains(&(
+            NoticeKind::McpStatus,
+            NoticeSeverity::Warning,
+            "MCP server linear failed to start".to_string(),
+            Some("mcp:linear".to_string()),
+        )),
+        "{notices:?}"
+    );
+    assert!(
+        notices.contains(&(
+            NoticeKind::AuthStatus,
+            NoticeSeverity::Info,
+            "Signed in to MCP server linear".to_string(),
+            Some("mcp:linear".to_string()),
+        )),
+        "{notices:?}"
+    );
+    assert!(
+        notices.contains(&(
+            NoticeKind::McpStatus,
+            NoticeSeverity::Warning,
+            "Remote environment disconnected".to_string(),
+            Some("environment".to_string()),
+        )),
+        "{notices:?}"
+    );
+    // Threshold filter: four rolling rate-limit updates produce exactly two
+    // notices — the first 80% crossing and the first 95% crossing.
+    let rate: Vec<&String> = notices
+        .iter()
+        .filter(|(k, ..)| *k == NoticeKind::RateLimit)
+        .map(|(_, _, s, _)| s)
+        .collect();
+    assert_eq!(rate.len(), 2, "{notices:?}");
+    assert_eq!(rate[0], "Codex usage is at 85% of its limit");
+    assert_eq!(rate[1], "Codex usage is at 97% of its limit");
+
+    // "starting" produced nothing: failed + oauth + env + 2 rate = 5 total.
+    assert_eq!(notices.len(), 5, "{notices:?}");
+
+    // End to end, no notice's detail carries a raw provider error string
+    // (user-facing-errors rule 1) — the failed startup shows Comet's own copy
+    // derived from the structured `failureReason` instead.
+    let details: Vec<Option<String>> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Notice { detail, .. } => Some(detail.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !details
+            .iter()
+            .flatten()
+            .any(|d| d.contains("ECONNREFUSED") || d.contains("127.0.0.1")),
+        "{details:?}"
+    );
+    assert!(
+        details.contains(&Some(
+            "Sign in to this server again to reconnect it.".to_string()
+        )),
+        "{details:?}"
+    );
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
 }
