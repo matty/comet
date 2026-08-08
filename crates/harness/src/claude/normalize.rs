@@ -712,9 +712,14 @@ mod tests {
         );
     }
 
+    /// The 480-byte detail budget is what keeps unbounded provider prose out
+    /// of a persisted, LAN-replayed doc, and this is its only guard — so the
+    /// input must EXCEED it (600 bytes) and the length must be asserted
+    /// exactly. A shorter input makes `cap_prose` a no-op and the assertion
+    /// vacuous: it would pass just as happily if detail were capped at 160.
     #[test]
     fn oversized_provider_prose_is_capped_with_full_text_in_detail() {
-        let long = "x".repeat(300);
+        let long = "x".repeat(600);
         let raw = format!(
             r#"{{"type":"system","subtype":"informational","content":"{long}","level":"info"}}"#
         );
@@ -725,7 +730,8 @@ mod tests {
                 assert_eq!(summary.len(), 160 + '…'.len_utf8());
                 assert!(summary.ends_with('…'));
                 let detail = detail.expect("overflow keeps a longer detail");
-                assert!(detail.len() <= 480 + '…'.len_utf8());
+                assert_eq!(detail.len(), 480 + '…'.len_utf8());
+                assert!(detail.ends_with('…'));
             }
             other => panic!("unexpected {other:?}"),
         }

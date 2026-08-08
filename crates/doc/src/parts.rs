@@ -631,6 +631,16 @@ mod tests {
             &notice(NoticeKind::Compaction, "compaction", "Compacted"),
         );
         assert_eq!(parts.len(), 3);
+        // Part count alone would still pass with a leaked counter: the new
+        // chip must read as a first occurrence, not "×2".
+        assert!(
+            matches!(&parts[0], MessagePart::Notice { occurrences: 1, .. }),
+            "{parts:?}"
+        );
+        assert!(
+            matches!(&parts[2], MessagePart::Notice { occurrences: 1, .. }),
+            "{parts:?}"
+        );
     }
 
     /// DECISION (pinned): a notice folding into an empty accumulator produces
