@@ -1,10 +1,12 @@
 //! Frame → [`AgentEvent`] normalization, ported from claude.ts's `normalize`
 //! (init dedupe, subagent filtering, tool decoding, error-code mapping).
 
-use comet_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
+use comet_proto::{
+    AgentEvent, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, TodoItem, ToolCall,
+};
 use serde_json::Value;
 
-use super::wire::{ContentBlock, Frame};
+use super::wire::{ContentBlock, Frame, SystemNoticeFrame};
 
 /// Human-readable text for the CLI's assistant-level error codes. These arrive
 /// as a terse `error` field on an `assistant` frame — usually with NO text
@@ -131,6 +133,57 @@ fn new_message_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// Map one allowlisted `system` notice frame to its notice event. Structured
+/// kinds carry Comet copy; the passthrough kinds (informational,
+/// notification) carry capped provider prose and are claimed by the
+/// passthrough emitters. The structured kinds use a per-kind constant
+/// collapse key.
+fn notice_events(f: &SystemNoticeFrame) -> Vec<AgentEvent> {
+    let notice = match f.subtype.as_str() {
+        "compact_boundary" => {
+            let m = &f.compact_metadata;
+            let summary = if m.trigger == "manual" {
+                "Context compacted".to_string()
+            } else {
+                "Context compacted automatically".to_string()
+            };
+            let detail = match m.post_tokens {
+                Some(post) => format!("{} tokens → {}", m.pre_tokens, post),
+                None => format!("{} tokens before compaction", m.pre_tokens),
+            };
+            Some(AgentEvent::Notice {
+                kind: NoticeKind::Compaction,
+                severity: NoticeSeverity::Info,
+                summary,
+                detail: Some(detail),
+                key: Some("compaction".into()),
+            })
+        }
+        "model_refusal_fallback" => Some(AgentEvent::Notice {
+            kind: NoticeKind::ModelRerouted,
+            severity: NoticeSeverity::Warning,
+            summary: format!("Model changed to {}", f.fallback_model),
+            detail: Some(format!(
+                "{} refused the request; replies now come from {}.",
+                f.original_model, f.fallback_model
+            )),
+            key: Some("model".into()),
+        }),
+        "api_retry" => Some(AgentEvent::Notice {
+            kind: NoticeKind::Retrying,
+            severity: NoticeSeverity::Warning,
+            summary: format!("Retrying — attempt {} of {}", f.attempt, f.max_retries),
+            detail: Some(format!(
+                "Next attempt in {}s.",
+                f.retry_delay_ms.div_ceil(1000)
+            )),
+            key: Some("retry".into()),
+        }),
+        _ => None,
+    };
+    notice.into_iter().collect()
+}
+
 /// Per-run normalization state.
 ///
 /// `saw_init` dedupes `system:init` — the CLI re-emits it every time the model
@@ -182,6 +235,8 @@ impl Normalizer {
                     assistant_message_id: self.assistant_message_id.clone(),
                 }]
             }
+
+            Frame::SystemNotice(f) => notice_events(&f),
 
             // Frames with `parent_tool_use_id` set belong to a SUBAGENT's
             // nested transcript; a background Task runs concurrently with the
@@ -501,5 +556,71 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    fn notice_of(raw: &str) -> AgentEvent {
+        let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
+        let events = Normalizer::new().normalize(frame, false);
+        assert_eq!(events.len(), 1, "{events:?}");
+        events.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn structured_system_subtypes_map_to_notices() {
+        use comet_proto::{NoticeKind, NoticeSeverity};
+
+        assert_eq!(
+            notice_of(
+                r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":68000,"post_tokens":12000}}"#
+            ),
+            AgentEvent::Notice {
+                kind: NoticeKind::Compaction,
+                severity: NoticeSeverity::Info,
+                summary: "Context compacted automatically".into(),
+                detail: Some("68000 tokens → 12000".into()),
+                key: Some("compaction".into()),
+            }
+        );
+        assert_eq!(
+            notice_of(
+                r#"{"type":"system","subtype":"model_refusal_fallback","original_model":"claude-fable-5","fallback_model":"claude-haiku-4-5","direction":"sticky","content":"x"}"#
+            ),
+            AgentEvent::Notice {
+                kind: NoticeKind::ModelRerouted,
+                severity: NoticeSeverity::Warning,
+                summary: "Model changed to claude-haiku-4-5".into(),
+                detail: Some(
+                    "claude-fable-5 refused the request; replies now come from claude-haiku-4-5."
+                        .into()
+                ),
+                key: Some("model".into()),
+            }
+        );
+        assert_eq!(
+            notice_of(
+                r#"{"type":"system","subtype":"api_retry","attempt":2,"max_retries":3,"retry_delay_ms":4000,"error_status":529}"#
+            ),
+            AgentEvent::Notice {
+                kind: NoticeKind::Retrying,
+                severity: NoticeSeverity::Warning,
+                summary: "Retrying — attempt 2 of 3".into(),
+                detail: Some("Next attempt in 4s.".into()),
+                key: Some("retry".into()),
+            }
+        );
+        // Manual compaction reads differently and a missing post_tokens
+        // degrades the detail rather than lying.
+        assert_eq!(
+            notice_of(
+                r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":500}}"#
+            ),
+            AgentEvent::Notice {
+                kind: NoticeKind::Compaction,
+                severity: NoticeSeverity::Info,
+                summary: "Context compacted".into(),
+                detail: Some("500 tokens before compaction".into()),
+                key: Some("compaction".into()),
+            }
+        );
     }
 }
