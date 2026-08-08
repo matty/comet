@@ -11,8 +11,8 @@ use comet_harness::{
     CancellationToken, ClaudeHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, ToolCall, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, RunRequest, SandboxLevel,
+    ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 /// The `fake-claude` bin target, built by cargo alongside this test.
@@ -353,4 +353,108 @@ async fn missing_binary_is_not_installed() {
         .err()
         .expect("spawn fails");
     assert!(matches!(err, HarnessError::NotInstalled(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn notice_frames_surface_as_notice_events() {
+    let (controls, _steer, _token) = controls("A");
+    let events = run_to_end(&harness(), request("scenario:notices"), controls).await;
+
+    let notices: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Notice {
+                kind,
+                severity,
+                summary,
+                detail,
+                key,
+            } => Some((
+                *kind,
+                *severity,
+                summary.clone(),
+                detail.clone(),
+                key.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        notices.contains(&(
+            NoticeKind::Compaction,
+            NoticeSeverity::Info,
+            "Context compacted automatically".to_string(),
+            Some("68000 tokens → 12000".to_string()),
+            Some("compaction".to_string()),
+        )),
+        "{notices:?}"
+    );
+    assert!(
+        notices.contains(&(
+            NoticeKind::ModelRerouted,
+            NoticeSeverity::Warning,
+            "Model changed to claude-haiku-4-5".to_string(),
+            Some(
+                "claude-fable-5 refused the request; replies now come from claude-haiku-4-5."
+                    .to_string()
+            ),
+            Some("model".to_string()),
+        )),
+        "{notices:?}"
+    );
+    // Both retry frames surface — collapse is the doc fold's job, not the
+    // adapter's.
+    let retries: Vec<&String> = notices
+        .iter()
+        .filter(|(k, ..)| *k == NoticeKind::Retrying)
+        .map(|(_, _, s, ..)| s)
+        .collect();
+    assert_eq!(retries.len(), 2, "{notices:?}");
+    assert_eq!(retries[0], "Retrying — attempt 1 of 3");
+    assert_eq!(retries[1], "Retrying — attempt 2 of 3");
+    // Passthrough kinds: severity read from the wire, key carried verbatim.
+    assert!(
+        notices.contains(&(
+            NoticeKind::Info,
+            NoticeSeverity::Warning,
+            "Consider running /doctor to fix your settings.".to_string(),
+            None,
+            None,
+        )),
+        "{notices:?}"
+    );
+    assert!(
+        notices.contains(&(
+            NoticeKind::Info,
+            NoticeSeverity::Info,
+            "You have used half of your weekly limit.".to_string(),
+            None,
+            Some("usage-warning".to_string()),
+        )),
+        "{notices:?}"
+    );
+    assert!(
+        notices.contains(&(
+            NoticeKind::RateLimit,
+            NoticeSeverity::Warning,
+            "Approaching the Claude 5-hour usage limit".to_string(),
+            None,
+            Some("rateLimit".to_string()),
+        )),
+        "{notices:?}"
+    );
+
+    // Exactly the scripted emitters fired — compaction, reroute, retry x2,
+    // informational, notification, rate limit — and the unclaimed future
+    // subtype produced neither a notice nor an error.
+    assert_eq!(notices.len(), 7, "{notices:?}");
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
 }
