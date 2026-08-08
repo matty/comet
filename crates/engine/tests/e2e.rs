@@ -17,8 +17,8 @@ use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
 use comet_harness::mock::MockHarness;
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessCapabilities, HarnessId, Model, ReasoningLevel, RunRequest,
-    SandboxLevel, SessionStatus, SteeringMode, ToolCall,
+    AgentEvent, DoneStatus, HarnessCapabilities, HarnessId, Model, NoticeKind, NoticeSeverity,
+    ReasoningLevel, RunRequest, SandboxLevel, SessionStatus, SteeringMode, ToolCall,
 };
 use comet_sync::DocsStore;
 
@@ -365,6 +365,98 @@ async fn session_status_transitions_idle_working_idle() {
         }
     }
     assert_eq!(seen, vec![SessionStatus::Working, SessionStatus::Idle]);
+}
+
+/// REGRESSION: a notice is the one event that can arrive OUTSIDE a turn, and
+/// it must not be mistaken for turn-start. Counting it as one cleared
+/// `idle_since` — which both flipped the parked session to Working and
+/// disabled the 30-minute reaper's select arm (it is gated on
+/// `idle_since.is_some()`), so the child was never released — and then opened
+/// a `streaming` assistant entry holding just the chip that no `Done` was ever
+/// coming to finish: a chat spinning forever with no terminal state.
+#[tokio::test]
+async fn a_notice_while_parked_leaves_the_session_parked_and_the_entry_finished() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-1".into(),
+                    assistant_message_id: "a-1".into(),
+                },
+                AgentEvent::TextDelta {
+                    text: "first turn".into(),
+                },
+                // Steerable + completed ⇒ the run PARKS here instead of ending.
+                done(DoneStatus::Completed),
+                // …and the provider keeps talking while nobody is asking.
+                AgentEvent::Notice {
+                    kind: NoticeKind::McpStatus,
+                    severity: NoticeSeverity::Warning,
+                    summary: "MCP server linear failed to start".into(),
+                    detail: None,
+                    key: Some("mcp:linear".into()),
+                },
+            ],
+            step_delay: Duration::from_millis(20),
+            // Persistent-session shape: the stream stays open past the park.
+            hang_until_interrupt: true,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-parked-notice",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-1".into(),
+        },
+    );
+
+    let has_notice = |e: &SessionMessageEntry| {
+        e.parts
+            .iter()
+            .any(|p| matches!(p, MessagePart::Notice { .. }))
+    };
+    wait_for(
+        || entries_now(&core).iter().any(has_notice),
+        "the between-turns notice to reach the doc",
+    )
+    .await;
+    // Give any (buggy) status flip or streaming-entry write time to land.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // (a) + (b): the session is still PARKED. Working is the visible half of
+    // the wedge; the reaper gate that would have leaked the child is the same
+    // `idle_since` this status is derived from, and nothing else resets it.
+    assert_eq!(
+        core.sessions.session_status(CHAT).map(|s| s.status),
+        Some(SessionStatus::Idle),
+        "a between-turns notice must not restart the turn"
+    );
+
+    // (c) the notice landed in its own FINISHED entry — no chip left spinning.
+    let all = entries(&core);
+    let notice_entry = all.iter().find(|e| has_notice(e)).expect("notice entry");
+    assert_eq!(notice_entry.role, MessageRole::Assistant);
+    assert_eq!(notice_entry.status, Some(MessageStatus::Complete));
+    assert!(
+        all.iter()
+            .all(|e| e.status != Some(MessageStatus::Streaming)),
+        "no entry may be left streaming, got {all:#?}"
+    );
+    // The parked turn's own entry stayed separate and complete.
+    assert!(all.iter().any(|e| {
+        e.status == Some(MessageStatus::Complete)
+            && e.parts
+                .iter()
+                .any(|p| matches!(p, MessagePart::Text { text, .. } if text == "first turn"))
+    }));
 }
 
 #[tokio::test]
