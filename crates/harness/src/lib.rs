@@ -224,9 +224,9 @@ pub(crate) fn cap_prose(s: &str, max_bytes: usize) -> String {
 /// failures have no name of their own, and they are the ONLY producer of
 /// [`comet_proto::DiagnosticSeverity::Malformed`].
 ///
-/// Unused until Task 3 (run loop) and Task 4 (Codex adapter) wire the
-/// parse-failure sinks that construct `Malformed` diagnostics from it.
-#[allow(dead_code)]
+/// Used by each adapter's parse-failure sink — the frame loop's `Err` arm
+/// when a stdout line fails to decode — to build a `Malformed` diagnostic
+/// without ever naming the offending line.
 pub(crate) const UNPARSEABLE: &str = "unparseable";
 
 /// Build the diagnostic event for a dropped frame. The caller has already
@@ -721,5 +721,23 @@ mod probe_tests {
         let capped = cap_prose(&multi, 161);
         assert!(capped.ends_with('…'));
         assert!(capped.chars().all(|c| c == 'é' || c == '…'));
+    }
+
+    /// `Malformed` is the parse-failure severity (sink 5, the only producer
+    /// anywhere in the slice): the fixed `UNPARSEABLE` sentinel travels as the
+    /// discriminator, never the offending line, and the summary is Comet's
+    /// own copy — distinct from the `Unknown` copy used by every other sink.
+    #[test]
+    fn malformed_diagnostic_carries_the_fixed_sentinel_and_its_own_copy() {
+        let ev = diagnostic(UNPARSEABLE, comet_proto::DiagnosticSeverity::Malformed);
+        assert_eq!(
+            ev,
+            AgentEvent::Diagnostic {
+                discriminator: UNPARSEABLE.into(),
+                severity: comet_proto::DiagnosticSeverity::Malformed,
+                code: None,
+                summary: "The agent sent a message Comet couldn't read.".into(),
+            }
+        );
     }
 }
