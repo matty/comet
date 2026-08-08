@@ -17,8 +17,9 @@ use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
 use comet_harness::mock::MockHarness;
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessCapabilities, HarnessId, Model, NoticeKind, NoticeSeverity,
-    ReasoningLevel, RunRequest, SandboxLevel, SessionStatus, SteeringMode, ToolCall,
+    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessCapabilities, HarnessId, Model, NoticeKind,
+    NoticeSeverity, ReasoningLevel, RunRequest, SandboxLevel, SessionStatus, SteeringMode,
+    ToolCall,
 };
 use comet_sync::DocsStore;
 
@@ -457,6 +458,95 @@ async fn a_notice_while_parked_leaves_the_session_parked_and_the_entry_finished(
                 .iter()
                 .any(|p| matches!(p, MessagePart::Text { text, .. } if text == "first turn"))
     }));
+}
+
+/// 0b.2: a Diagnostic is bookkeeping, not turn content — a persistent Codex
+/// session's unknown notification can arrive while PARKED, and it must not be
+/// mistaken for turn-start (the same wedge the between-turns notice and the
+/// empty heartbeat each hit: `idle_since` cleared → Working forever, reaper
+/// disarmed). It also folds to NO doc part: only the registry hears it.
+#[tokio::test]
+async fn a_diagnostic_while_parked_is_counted_and_leaves_the_session_parked() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-1".into(),
+                    assistant_message_id: "a-1".into(),
+                },
+                AgentEvent::TextDelta {
+                    text: "first turn".into(),
+                },
+                // Steerable + completed ⇒ the run PARKS here…
+                done(DoneStatus::Completed),
+                // …then the provider ships a frame this build never heard of.
+                AgentEvent::Diagnostic {
+                    discriminator: "thread/checkpoint/created".into(),
+                    severity: DiagnosticSeverity::Unknown,
+                    code: None,
+                    summary: "The agent sent a message Comet doesn't recognize.".into(),
+                },
+            ],
+            step_delay: Duration::from_millis(20),
+            hang_until_interrupt: true,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-parked-diagnostic",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-1".into(),
+        },
+    );
+
+    wait_for(
+        || !core.registry.diagnostics().is_empty(),
+        "the diagnostic to reach the registry",
+    )
+    .await;
+    // Give any (buggy) status flip or doc write time to land.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Counted, keyed (harness, discriminator).
+    let report = core.registry.diagnostics();
+    assert_eq!(report.len(), 1);
+    assert_eq!(report[0].harness, HarnessId::Mock);
+    assert_eq!(report[0].entries.len(), 1);
+    assert_eq!(
+        report[0].entries[0].discriminator,
+        "thread/checkpoint/created"
+    );
+    assert_eq!(report[0].entries[0].count, 1);
+
+    // Still PARKED: the diagnostic is not turn-start.
+    assert_eq!(
+        core.sessions.session_status(CHAT).map(|s| s.status),
+        Some(SessionStatus::Idle),
+        "a between-turns diagnostic must not restart the turn"
+    );
+    // And it never became a doc part: every entry holds only text, none is
+    // left streaming.
+    let all = entries(&core);
+    assert!(
+        all.iter().all(|e| e
+            .parts
+            .iter()
+            .all(|p| matches!(p, MessagePart::Text { .. }))),
+        "a diagnostic must never become a doc part: {all:#?}"
+    );
+    assert!(
+        all.iter()
+            .all(|e| e.status != Some(MessageStatus::Streaming)),
+        "no entry may be left streaming, got {all:#?}"
+    );
 }
 
 /// REGRESSION: an EMPTY reasoning delta is a pure heartbeat — persistent

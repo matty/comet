@@ -1061,6 +1061,24 @@ async fn drive_run(
         if matches!(&event, AgentEvent::ReasoningDelta { text } if text.is_empty()) {
             continue;
         }
+        // A Diagnostic is bookkeeping about the protocol, not turn content.
+        // It can arrive OUTSIDE a turn (a persistent session's unknown
+        // notification while parked) and must not be mistaken for turn-start
+        // — the same wedge the between-turns notice and the empty heartbeat
+        // each hit. It folds to no part, so its whole life is: count into
+        // the per-boot registry, journal, move on.
+        if let AgentEvent::Diagnostic {
+            discriminator,
+            severity,
+            ..
+        } = &event
+        {
+            inner
+                .registry
+                .record_diagnostic(harness_id, discriminator, *severity);
+            inner.publish(&chat_id, &event);
+            continue;
+        }
         // A Notice is the ONE event that can arrive OUTSIDE a turn (an MCP
         // server dropping, a rate-limit warning, an environment disconnect
         // while the session sits parked), so it is NOT turn-start. Counting it

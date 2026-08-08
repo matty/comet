@@ -8,7 +8,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde::{Deserialize, Serialize};
 
 use comet_harness::{Harness, HarnessError, mock::MockHarness};
-use comet_proto::{AgentEvent, DoneStatus, HarnessAvailability, HarnessCapabilities, HarnessId};
+use comet_proto::{
+    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessAvailability, HarnessCapabilities,
+    HarnessId, sanitize_discriminator,
+};
 
 /// What `ListHarnesses` reports per harness.
 ///
@@ -42,6 +45,44 @@ fn describe(harness: &dyn Harness) -> HarnessDescriptor {
     }
 }
 
+/// One aggregated diagnostic row: a discriminator this boot has seen, how
+/// often, and when. `severity` is fixed per discriminator by construction
+/// (only the "unparseable" sentinel is Malformed), so the first arrival's
+/// value stands.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessDiagnosticEntry {
+    pub discriminator: String,
+    pub severity: DiagnosticSeverity,
+    pub count: u64,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+}
+
+/// What `ListHarnessDiagnostics` reports per harness. Per-boot, not
+/// persisted: it describes the pairing of THIS Comet build with THIS CLI
+/// version, and is worthless the moment either changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessDiagnostics {
+    pub harness: HarnessId,
+    /// Distinct discriminators, most frequent first (≤ 64).
+    pub entries: Vec<HarnessDiagnosticEntry>,
+    /// Arrivals whose (new) discriminator no longer fit under the cap.
+    #[serde(default)]
+    pub overflow: u64,
+}
+
+/// Bound on distinct discriminators per harness — past it, new names pour
+/// into the overflow bucket so a chatty future protocol cannot grow memory.
+const MAX_DISTINCT_DIAGNOSTICS: usize = 64;
+
+#[derive(Default)]
+struct DiagnosticsBucket {
+    entries: HashMap<String, HarnessDiagnosticEntry>,
+    overflow: u64,
+}
+
 type Factory = Box<dyn Fn() -> Result<Arc<dyn Harness>, HarnessError> + Send + Sync>;
 
 enum Slot {
@@ -58,6 +99,9 @@ pub struct HarnessRegistry {
     /// Probe results, overlaid onto every descriptor. Absent = never probed,
     /// which reports as `Unknown` and leaves the harness selectable.
     availability: Mutex<HashMap<HarnessId, HarnessAvailability>>,
+    /// Per-boot log of unrecognized provider frames, keyed by
+    /// (harness, discriminator). Bounded; counts saturate.
+    diagnostics: Mutex<HashMap<HarnessId, DiagnosticsBucket>>,
 }
 
 impl Default for HarnessRegistry {
@@ -72,6 +116,7 @@ impl HarnessRegistry {
             slots: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
             availability: Mutex::new(HashMap::new()),
+            diagnostics: Mutex::new(HashMap::new()),
         }
     }
 
@@ -130,6 +175,76 @@ impl HarnessRegistry {
     /// Record a probe result. Idempotent; a later probe replaces an earlier one.
     pub fn set_availability(&self, id: HarnessId, availability: HarnessAvailability) {
         self.availability().insert(id, availability);
+    }
+
+    fn diagnostics_lock(&self) -> MutexGuard<'_, HashMap<HarnessId, DiagnosticsBucket>> {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Count one unrecognized frame. Saturating; the 65th distinct
+    /// discriminator (and later new ones) accumulate into the overflow
+    /// bucket. Re-sanitizes defensively — the registry is the last owner
+    /// before an RPC reply and a settings card.
+    ///
+    /// Deliberately not filtered by subagent origin: an unknown frame is
+    /// unknown regardless of which thread produced it, and this count is a
+    /// protocol-drift signal (does this build understand this CLI version),
+    /// not a per-conversation statistic.
+    pub fn record_diagnostic(
+        &self,
+        id: HarnessId,
+        discriminator: &str,
+        severity: DiagnosticSeverity,
+    ) {
+        let discriminator = sanitize_discriminator(discriminator);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut all = self.diagnostics_lock();
+        let bucket = all.entry(id).or_default();
+        if let Some(entry) = bucket.entries.get_mut(&discriminator) {
+            entry.count = entry.count.saturating_add(1);
+            entry.last_seen_ms = now_ms;
+        } else if bucket.entries.len() < MAX_DISTINCT_DIAGNOSTICS {
+            bucket.entries.insert(
+                discriminator.clone(),
+                HarnessDiagnosticEntry {
+                    discriminator,
+                    severity,
+                    count: 1,
+                    first_seen_ms: now_ms,
+                    last_seen_ms: now_ms,
+                },
+            );
+        } else {
+            bucket.overflow = bucket.overflow.saturating_add(1);
+        }
+    }
+
+    /// The per-boot report for `ListHarnessDiagnostics`: only harnesses that
+    /// recorded something, rows most frequent first (name as tiebreak, so the
+    /// order is deterministic).
+    pub fn diagnostics(&self) -> Vec<HarnessDiagnostics> {
+        let all = self.diagnostics_lock();
+        let mut out: Vec<HarnessDiagnostics> = all
+            .iter()
+            .map(|(id, bucket)| {
+                let mut entries: Vec<HarnessDiagnosticEntry> =
+                    bucket.entries.values().cloned().collect();
+                entries.sort_by(|a, b| {
+                    b.count
+                        .cmp(&a.count)
+                        .then_with(|| a.discriminator.cmp(&b.discriminator))
+                });
+                HarnessDiagnostics {
+                    harness: *id,
+                    entries,
+                    overflow: bucket.overflow,
+                }
+            })
+            .collect();
+        out.sort_by_key(|d| format!("{:?}", d.harness));
+        out
     }
 
     /// Catalog for `ListHarnesses` — never forces a lazy resolve.
@@ -509,5 +624,98 @@ mod tests {
         }
         let round: HarnessDescriptor = serde_json::from_value(json).unwrap();
         assert_eq!(round.capabilities, descriptor.capabilities);
+    }
+
+    #[test]
+    fn diagnostics_aggregate_by_discriminator_per_harness() {
+        use comet_proto::DiagnosticSeverity;
+        let registry = HarnessRegistry::new();
+        // Spec verification 1: a thousand arrivals of one discriminator are
+        // one row with count 1000 — aggregation is what makes a
+        // high-frequency unknown frame harmless.
+        for _ in 0..1000 {
+            registry.record_diagnostic(
+                HarnessId::ClaudeCode,
+                "system/somethingNew",
+                DiagnosticSeverity::Unknown,
+            );
+        }
+        registry.record_diagnostic(
+            HarnessId::Codex,
+            "thread/checkpoint/created",
+            DiagnosticSeverity::Unknown,
+        );
+        let report = registry.diagnostics();
+        let claude = report
+            .iter()
+            .find(|d| d.harness == HarnessId::ClaudeCode)
+            .expect("claude bucket");
+        assert_eq!(claude.entries.len(), 1);
+        assert_eq!(claude.entries[0].discriminator, "system/somethingNew");
+        assert_eq!(claude.entries[0].count, 1000);
+        assert_eq!(claude.overflow, 0);
+        assert!(claude.entries[0].last_seen_ms >= claude.entries[0].first_seen_ms);
+        // The other harness's counts stay separate — the key is
+        // (HarnessId, discriminator).
+        let codex = report
+            .iter()
+            .find(|d| d.harness == HarnessId::Codex)
+            .expect("codex bucket");
+        assert_eq!(codex.entries.len(), 1);
+        assert_eq!(codex.entries[0].count, 1);
+    }
+
+    /// Spec verification 4: the 65th DISTINCT discriminator lands in the
+    /// overflow bucket; an existing one still counts normally after the cap.
+    #[test]
+    fn the_sixty_fifth_discriminator_lands_in_the_overflow_bucket() {
+        use comet_proto::DiagnosticSeverity;
+        let registry = HarnessRegistry::new();
+        for i in 0..64 {
+            registry.record_diagnostic(
+                HarnessId::Codex,
+                &format!("method/{i}"),
+                DiagnosticSeverity::Unknown,
+            );
+        }
+        registry.record_diagnostic(HarnessId::Codex, "method/64", DiagnosticSeverity::Unknown);
+        registry.record_diagnostic(HarnessId::Codex, "method/65", DiagnosticSeverity::Unknown);
+        registry.record_diagnostic(HarnessId::Codex, "method/0", DiagnosticSeverity::Unknown);
+        let report = registry.diagnostics();
+        let codex = report
+            .iter()
+            .find(|d| d.harness == HarnessId::Codex)
+            .expect("codex bucket");
+        assert_eq!(codex.entries.len(), 64);
+        assert_eq!(codex.overflow, 2);
+        let m0 = codex
+            .entries
+            .iter()
+            .find(|e| e.discriminator == "method/0")
+            .expect("existing row");
+        assert_eq!(m0.count, 2);
+        // Rows come back most frequent first, so the card's top line is the
+        // loudest discriminator.
+        assert_eq!(codex.entries[0].discriminator, "method/0");
+    }
+
+    /// Defense in depth (spec verification 2): the harness sanitizes at the
+    /// drop site, but the registry is the last owner before an RPC reply and
+    /// a settings card — an unsanitized caller must not get a path through.
+    #[test]
+    fn the_registry_re_sanitizes_discriminators() {
+        use comet_proto::DiagnosticSeverity;
+        let registry = HarnessRegistry::new();
+        registry.record_diagnostic(
+            HarnessId::ClaudeCode,
+            r"C:\dev\secrets.txt",
+            DiagnosticSeverity::Unknown,
+        );
+        let report = registry.diagnostics();
+        let claude = report
+            .iter()
+            .find(|d| d.harness == HarnessId::ClaudeCode)
+            .expect("claude bucket");
+        assert_eq!(claude.entries[0].discriminator, "malformed");
     }
 }
