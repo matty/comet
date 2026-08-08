@@ -210,6 +210,31 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
     }
 }
 
+/// Comet copy for a failed `mcpServer/startupStatus/updated`, derived from the
+/// app server's STRUCTURED `failureReason` — never from its `error` string.
+///
+/// `error` is a raw technical message ("connect ECONNREFUSED 127.0.0.1:3845")
+/// and `.agents/rules/user-facing-errors.md` rule 1 is unconditional: the user
+/// never sees one. It reaches a hover tooltip, the persisted doc and LAN
+/// replay, so it is debug-logged here and dropped. `failureReason` is the
+/// schema's own enum (`McpServerStartupFailureReason`); its only variant today
+/// is `reauthenticationRequired`, which IS actionable. An unrecognized or
+/// absent reason answers `None` — the summary already names the server, and no
+/// detail beats invented detail.
+fn startup_failure_detail(name: &str, params: &Value, error: &str) -> Option<String> {
+    let reason = str_field(params, &["failureReason", "failure_reason"]);
+    if !error.is_empty() || !reason.is_empty() {
+        tracing::debug!(
+            target: "comet_harness::codex",
+            "mcp server {name} failed to start (reason={reason:?}, provider error): {error}"
+        );
+    }
+    match reason.as_str() {
+        "reauthenticationRequired" => Some("Sign in to this server again to reconnect it.".into()),
+        _ => None,
+    }
+}
+
 /// Stateless notification → notice mapping for the three claimed Codex
 /// methods that need no per-session state. `account/rateLimits/updated` goes
 /// through [`rate_limit_notice`] instead — it fires continuously and must be
@@ -226,8 +251,7 @@ pub(crate) fn notice_for(method: &str, params: &Value) -> Option<AgentEvent> {
                     kind: NoticeKind::McpStatus,
                     severity: NoticeSeverity::Warning,
                     summary: format!("MCP server {name} failed to start"),
-                    detail: (!error.is_empty())
-                        .then(|| crate::cap_prose(&error, crate::NOTICE_DETAIL_MAX)),
+                    detail: startup_failure_detail(&name, params, &error),
                     key: Some(format!("mcp:{name}")),
                 }),
                 "ready" => Some(AgentEvent::Notice {
@@ -249,6 +273,12 @@ pub(crate) fn notice_for(method: &str, params: &Value) -> Option<AgentEvent> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let error = str_field(params, &["error"]);
+            if !error.is_empty() {
+                tracing::debug!(
+                    target: "comet_harness::codex",
+                    "mcp oauth login failed for {name} (provider error): {error}"
+                );
+            }
             Some(AgentEvent::Notice {
                 kind: NoticeKind::AuthStatus,
                 severity: NoticeSeverity::Info,
@@ -257,8 +287,11 @@ pub(crate) fn notice_for(method: &str, params: &Value) -> Option<AgentEvent> {
                 } else {
                     format!("Sign-in to MCP server {name} didn't finish")
                 },
-                detail: (!error.is_empty())
-                    .then(|| crate::cap_prose(&error, crate::NOTICE_DETAIL_MAX)),
+                // The app server's `error` is a raw transport/OAuth string
+                // ("connect ECONNREFUSED …") — it stays in tracing, never in
+                // the doc. There is no structured reason field on this
+                // notification, so the summary carries the whole message.
+                detail: None,
                 key: Some(format!("mcp:{name}")),
             })
         }
@@ -439,16 +472,51 @@ mod tests {
     #[test]
     fn mcp_startup_status_maps_terminal_states_only() {
         use comet_proto::{NoticeKind, NoticeSeverity};
+        // The app server's raw `error` NEVER becomes user-facing detail
+        // (user-facing-errors rule 1) — it is debug-logged and dropped.
         assert_eq!(
             notice_for(
                 "mcpServer/startupStatus/updated",
-                &json!({"name": "linear", "status": "failed", "error": "connect ECONNREFUSED"}),
+                &json!({"name": "linear", "status": "failed",
+                        "error": "connect ECONNREFUSED 127.0.0.1:3845"}),
             ),
             Some(AgentEvent::Notice {
                 kind: NoticeKind::McpStatus,
                 severity: NoticeSeverity::Warning,
                 summary: "MCP server linear failed to start".into(),
-                detail: Some("connect ECONNREFUSED".into()),
+                detail: None,
+                key: Some("mcp:linear".into()),
+            })
+        );
+        // The structured `failureReason` IS actionable — Comet's own copy for
+        // the schema's only variant, with the raw error still dropped.
+        assert_eq!(
+            notice_for(
+                "mcpServer/startupStatus/updated",
+                &json!({"name": "linear", "status": "failed",
+                        "failureReason": "reauthenticationRequired",
+                        "error": "401 Unauthorized"}),
+            ),
+            Some(AgentEvent::Notice {
+                kind: NoticeKind::McpStatus,
+                severity: NoticeSeverity::Warning,
+                summary: "MCP server linear failed to start".into(),
+                detail: Some("Sign in to this server again to reconnect it.".into()),
+                key: Some("mcp:linear".into()),
+            })
+        );
+        // A reason this build has never heard of falls back to no detail
+        // rather than echoing the wire value at the user.
+        assert_eq!(
+            notice_for(
+                "mcpServer/startupStatus/updated",
+                &json!({"name": "linear", "status": "failed", "failureReason": "somethingNew"}),
+            ),
+            Some(AgentEvent::Notice {
+                kind: NoticeKind::McpStatus,
+                severity: NoticeSeverity::Warning,
+                summary: "MCP server linear failed to start".into(),
+                detail: None,
                 key: Some("mcp:linear".into()),
             })
         );
@@ -502,6 +570,21 @@ mod tests {
                 summary: "Remote environment disconnected".into(),
                 detail: None,
                 key: Some("environment".into()),
+            })
+        );
+        // A failed sign-in keeps the raw provider error out of the doc too.
+        assert_eq!(
+            notice_for(
+                "mcpServer/oauthLogin/completed",
+                &json!({"name": "linear", "success": false,
+                        "error": "connect ECONNREFUSED 127.0.0.1:3845"}),
+            ),
+            Some(AgentEvent::Notice {
+                kind: NoticeKind::AuthStatus,
+                severity: NoticeSeverity::Info,
+                summary: "Sign-in to MCP server linear didn't finish".into(),
+                detail: None,
+                key: Some("mcp:linear".into()),
             })
         );
         // Unclaimed methods answer None (they stay with the tolerated arm).

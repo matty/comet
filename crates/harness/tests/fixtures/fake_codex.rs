@@ -393,8 +393,10 @@ fn notices(tid: &str) {
     emit(
         r#"{"method":"mcpServer/startupStatus/updated","params":{"name":"linear","status":"starting"}}"#,
     );
+    // Carries BOTH the raw `error` (which must never reach the doc) and the
+    // structured `failureReason` (which becomes Comet's own actionable copy).
     emit(
-        r#"{"method":"mcpServer/startupStatus/updated","params":{"name":"linear","status":"failed","error":"connect ECONNREFUSED 127.0.0.1:3845"}}"#,
+        r#"{"method":"mcpServer/startupStatus/updated","params":{"name":"linear","status":"failed","failureReason":"reauthenticationRequired","error":"connect ECONNREFUSED 127.0.0.1:3845"}}"#,
     );
     emit(
         r#"{"method":"mcpServer/oauthLogin/completed","params":{"name":"linear","success":true}}"#,

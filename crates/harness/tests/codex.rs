@@ -642,6 +642,30 @@ async fn claimed_notifications_surface_as_notices() {
 
     // "starting" produced nothing: failed + oauth + env + 2 rate = 5 total.
     assert_eq!(notices.len(), 5, "{notices:?}");
+
+    // End to end, no notice's detail carries a raw provider error string
+    // (user-facing-errors rule 1) — the failed startup shows Comet's own copy
+    // derived from the structured `failureReason` instead.
+    let details: Vec<Option<String>> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Notice { detail, .. } => Some(detail.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !details
+            .iter()
+            .flatten()
+            .any(|d| d.contains("ECONNREFUSED") || d.contains("127.0.0.1")),
+        "{details:?}"
+    );
+    assert!(
+        details.contains(&Some(
+            "Sign in to this server again to reconnect it.".to_string()
+        )),
+        "{details:?}"
+    );
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
     assert!(matches!(
         events.last(),
