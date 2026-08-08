@@ -539,6 +539,37 @@ pub enum NoticeSeverity {
     Warning,
 }
 
+/// How badly a provider frame missed. `Unknown` = the frame decoded fine but
+/// is on neither the claimed nor the ignored list. `Malformed` = the line or
+/// body never decoded — produced ONLY by the parse-failure sinks; nothing
+/// else may use it. `#[serde(other)]` on `Unknown`: an unrecognized severity
+/// is, literally, unknown, and must not fail the surrounding batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiagnosticSeverity {
+    Malformed,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Sanitize a provider-derived frame discriminator. Allowed alphabet
+/// `[A-Za-z0-9._/-]`; over-long but clean input truncates to 64 bytes
+/// (ASCII-only, so any cut lands on a char boundary); empty input or anything
+/// outside the alphabet becomes the literal `"malformed"`. The input is
+/// provider-controlled and ends up in a journal, an RPC reply and a settings
+/// card — treat it as untrusted. Applied at the harness boundary and again,
+/// defensively, by the engine registry.
+pub fn sanitize_discriminator(raw: &str) -> String {
+    let clean = !raw.is_empty()
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'));
+    if !clean {
+        return "malformed".to_string();
+    }
+    raw[..raw.len().min(64)].to_string()
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors comet's `AgentEvent` tagged enum.
@@ -613,6 +644,25 @@ pub enum AgentEvent {
         /// Collapse key — from the wire where the provider gives us one.
         #[serde(default)]
         key: Option<String>,
+    },
+    /// A provider frame Comet did not recognize (`Unknown`) or could not
+    /// parse (`Malformed`). Counted into the engine's per-boot registry and
+    /// journaled; NEVER a transcript part, and the payload is never carried —
+    /// a frame Comet cannot classify is a frame whose fields it cannot vet.
+    /// The full frame goes to `tracing::warn` at the drop site instead.
+    #[serde(rename_all = "camelCase")]
+    Diagnostic {
+        /// Frame `type` / `system/<subtype>` / `control_request/<subtype>` /
+        /// JSON-RPC method / `item/<itemType>`, via [`sanitize_discriminator`];
+        /// the fixed sentinel `"unparseable"` for parse failures.
+        discriminator: String,
+        severity: DiagnosticSeverity,
+        /// Reserved for structured provider error codes; every current
+        /// producer sends `None`. Spec-specified wire shape.
+        #[serde(default)]
+        code: Option<String>,
+        /// Comet copy, never provider text.
+        summary: String,
     },
     #[serde(rename_all = "camelCase")]
     Done {
@@ -760,5 +810,57 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    #[test]
+    fn diagnostic_event_round_trips_and_unknown_severity_degrades() {
+        let ev = AgentEvent::Diagnostic {
+            discriminator: "system/somethingNew".into(),
+            severity: DiagnosticSeverity::Unknown,
+            code: None,
+            summary: "The agent sent a message Comet doesn't recognize.".into(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+        // A `code` written by a future build decodes; an absent one defaults.
+        let old =
+            r#"{"type":"diagnostic","discriminator":"x","severity":"malformed","summary":"s"}"#;
+        match serde_json::from_str::<AgentEvent>(old).unwrap() {
+            AgentEvent::Diagnostic { code, severity, .. } => {
+                assert_eq!(code, None);
+                assert_eq!(severity, DiagnosticSeverity::Malformed);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // A severity this build has never heard of degrades to Unknown
+        // instead of failing the surrounding batch.
+        assert_eq!(
+            serde_json::from_str::<DiagnosticSeverity>("\"someFutureSeverity\"").unwrap(),
+            DiagnosticSeverity::Unknown
+        );
+        assert_eq!(
+            serde_json::to_string(&DiagnosticSeverity::Malformed).unwrap(),
+            "\"malformed\""
+        );
+    }
+
+    #[test]
+    fn discriminator_sanitizer_rejects_untrusted_shapes() {
+        // Clean identifiers pass through untouched.
+        assert_eq!(sanitize_discriminator("system/status"), "system/status");
+        assert_eq!(
+            sanitize_discriminator("item/webSearch.v2_x-y"),
+            "item/webSearch.v2_x-y"
+        );
+        // A path, a quote, a space, a control character, or nothing at all
+        // becomes the literal "malformed" — the original never travels.
+        assert_eq!(sanitize_discriminator(r"C:\dev\secrets.txt"), "malformed");
+        assert_eq!(sanitize_discriminator("say \"hi\""), "malformed");
+        assert_eq!(sanitize_discriminator("two words"), "malformed");
+        assert_eq!(sanitize_discriminator("a\u{7}b"), "malformed");
+        assert_eq!(sanitize_discriminator(""), "malformed");
+        // Over-long but clean truncates to 64 bytes (ASCII ⇒ char-safe).
+        let long = "a".repeat(80);
+        assert_eq!(sanitize_discriminator(&long), "a".repeat(64));
     }
 }

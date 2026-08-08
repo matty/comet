@@ -259,7 +259,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 });
             }
         }
-        AgentEvent::AssistantMessageCompleted { .. } | AgentEvent::Usage { .. } => {}
+        AgentEvent::AssistantMessageCompleted { .. }
+        | AgentEvent::Usage { .. }
+        | AgentEvent::Diagnostic { .. } => {}
     }
 }
 
@@ -736,5 +738,37 @@ mod tests {
             &parts[0],
             MessagePart::Notice { occurrences: 1, .. }
         ));
+    }
+
+    /// Spec verification 3: a Diagnostic is not transcript material — it folds
+    /// to NO part, so a doc written during a run full of unknown frames is
+    /// byte-identical to one without them.
+    #[test]
+    fn diagnostics_fold_to_no_part() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(&mut parts, &text_delta("hello"));
+        let before = parts.clone();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Diagnostic {
+                discriminator: "thread/checkpoint/created".into(),
+                severity: comet_proto::DiagnosticSeverity::Unknown,
+                code: None,
+                summary: "The agent sent a message Comet doesn't recognize.".into(),
+            },
+        );
+        assert_eq!(parts, before);
+        // Into an empty accumulator too — nothing opens an entry.
+        let mut empty = Vec::new();
+        fold_event_into_parts(
+            &mut empty,
+            &AgentEvent::Diagnostic {
+                discriminator: "unparseable".into(),
+                severity: comet_proto::DiagnosticSeverity::Malformed,
+                code: None,
+                summary: "The agent sent a message Comet couldn't read.".into(),
+            },
+        );
+        assert!(empty.is_empty());
     }
 }
