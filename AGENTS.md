@@ -103,6 +103,14 @@ and no waiting state can last forever — every skeleton needs a reply, a timeou
 retry that gives up into something actionable. Failures split into a short `summary` and an
 actionable `hint`, with the diagnostic detail left in `tracing`.
 
+## Fields a provider may omit
+
+Read `.agents/rules/optional-wire-fields.md` before consuming an `Option` that came off a
+provider's wire. One rule: write the absent case yourself, because a plan's fixtures supply
+the field every time and the `None` path otherwise ships never having been constructed. The
+trap is downstream of decoding — `None` read as a value rather than as "unknown", which
+`None == None` makes look correct at the call site.
+
 ## Shared procedures
 
 Agent-agnostic procedures live in `.agents/`. Read the relevant one before starting that kind
@@ -115,6 +123,7 @@ of task:
 | Commit, push, open a PR | `.agents/workflows/commit-pr.md` |
 | Write UI code in `crates/ui` | `.agents/rules/gpui-ui.md` |
 | Write a surface that can fail or wait | `.agents/rules/user-facing-errors.md` |
+| Consume a field a provider may omit | `.agents/rules/optional-wire-fields.md` |
 
 Claude Code exposes these as the slash commands `/verify`, `/sync-upstream`, and
 `/commit-pr` via thin wrappers in `.claude/skills/`, which read the files above rather than
