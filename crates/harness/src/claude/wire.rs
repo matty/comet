@@ -1,8 +1,9 @@
 //! Claude CLI stream-json wire frames (stdout JSONL + stdin lines).
 //!
-//! Tolerant by construction: every field defaults, unknown frame types map to
-//! [`Frame::Other`], so a newer CLI never breaks parsing — we only read the
-//! fields the normalizer needs (spec: docs/research/harness.md).
+//! Tolerant by construction: every field defaults, and unclaimed frame types
+//! split three ways — [`Frame::Ignored`] (recognized, deliberately dropped)
+//! or [`Frame::Unknown`] (a diagnostic) — so a newer CLI never breaks parsing
+//! and nothing vanishes silently (spec: docs/research/harness.md).
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -19,8 +20,13 @@ pub(crate) enum Frame {
     RateLimit(RateLimitFrame),
     Result(ResultFrame),
     ControlRequest(ControlRequestFrame),
-    /// control_response / control_cancel_request / anything unknown.
-    Other,
+    /// Recognized and deliberately dropped — on [`IGNORED_FRAMES`], with a
+    /// one-word reason naming the owner ("4.2") or the nature ("transient").
+    Ignored(&'static str),
+    /// On neither the claimed nor the ignored list: slice 0b.2's diagnostic.
+    Unknown {
+        discriminator: String,
+    },
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -38,9 +44,9 @@ pub(crate) struct SystemFrame {
 }
 
 /// The `system` subtypes claimed as notices. An explicit allowlist on
-/// purpose: everything else still becomes [`Frame::Other`], which is where
-/// slice 0b.2's diagnostics will read from — a subtype nobody claimed must
-/// surface there, not vanish.
+/// purpose: everything else falls to the Ignored/Unknown split in
+/// [`classify_unclaimed`] — a subtype nobody claimed must surface as a
+/// diagnostic, not vanish.
 pub(crate) const NOTICE_SUBTYPES: &[&str] = &[
     "compact_boundary",
     "model_refusal_fallback",
@@ -48,6 +54,65 @@ pub(crate) const NOTICE_SUBTYPES: &[&str] = &[
     "informational",
     "notification",
 ];
+
+/// Frames Comet recognizes and deliberately drops — the middle tier of the
+/// Claimed / Ignored / Unknown classification. Reasons: a slice number means
+/// that slice claims the entry later and moves it to Claimed (stopping its
+/// count); anything else names why no surface wants it. ★ = confirmed firing
+/// on a real Claude Code 2.1.226 capture (2026-08-08); the rest are named by
+/// sdk.d.ts 0.3.195. Deliberately NOT here, so a diagnostic fires:
+/// local_command_output, model_refusal_no_fallback, mirror_error,
+/// elicitation_complete, files_persisted, plugin_install, worker_shutting_down.
+pub(crate) const IGNORED_FRAMES: &[(&str, &str)] = &[
+    // top-level frame types
+    ("control_response", "reply-channel"),
+    ("control_cancel_request", "control-plumbing"),
+    ("keep_alive", "transport-ping"),
+    ("tool_progress", "liveness"),
+    ("tool_use_summary", "cosmetic"),
+    ("prompt_suggestion", "opt-in"),
+    ("auth_status", "auth-transient"),
+    // system subtypes
+    ("system/status", "transient"),          // ★ one per API request
+    ("system/thinking_tokens", "heartbeat"), // ★ whenever reasoning is on
+    ("system/session_state_changed", "turn-state"),
+    ("system/hook_started", "4.2"), // ★ one per session with hooks
+    ("system/hook_progress", "4.2"),
+    ("system/hook_response", "4.2"), // ★
+    ("system/task_started", "4.2"),
+    ("system/task_progress", "4.2"),
+    ("system/task_updated", "4.2"),
+    ("system/task_notification", "4.2"),
+    ("system/commands_changed", "2.4"),
+    ("system/permission_denied", "phase-1"),
+    // Memory-feature chatter; fires routinely for memory-enabled users. No
+    // planned slice owns a memory surface — the reason names that product
+    // fact, not a deferral; whoever builds one claims this entry.
+    ("system/memory_recall", "memory"),
+];
+
+pub(crate) fn ignored_reason(discriminator: &str) -> Option<&'static str> {
+    IGNORED_FRAMES
+        .iter()
+        .find(|(name, _)| *name == discriminator)
+        .map(|(_, reason)| *reason)
+}
+
+/// Route a frame no claimed arm took: Ignored if allowlisted, else an Unknown
+/// that 0b.2 records. The full frame is warn-logged HERE — the drop site —
+/// and stays local to the host; the discriminator is the only thing that
+/// travels (sanitized again inside `diagnostic()`).
+fn classify_unclaimed(discriminator: String, value: &Value) -> Frame {
+    if let Some(reason) = ignored_reason(&discriminator) {
+        return Frame::Ignored(reason);
+    }
+    tracing::warn!(
+        target: "comet_harness::claude",
+        frame = %value,
+        "unrecognized frame (recorded as a diagnostic)"
+    );
+    Frame::Unknown { discriminator }
+}
 
 /// One tolerant struct for every allowlisted notice subtype — every field
 /// defaults, consistent with this module's "tolerant by construction" header.
@@ -224,7 +289,8 @@ pub(crate) struct ControlRequestBody {
     pub input: Value,
 }
 
-/// Parse one stdout JSONL line. `Err` = not JSON; unknown types = `Other`.
+/// Parse one stdout JSONL line. `Err` = not JSON; unclaimed types classify
+/// via [`classify_unclaimed`].
 pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
     let value: Value = serde_json::from_str(line)?;
     let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
@@ -240,7 +306,10 @@ pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
                 s if NOTICE_SUBTYPES.contains(&s) => {
                     Frame::SystemNotice(serde_json::from_value(value)?)
                 }
-                _ => Frame::Other,
+                s => {
+                    let discriminator = format!("system/{s}");
+                    classify_unclaimed(discriminator, &value)
+                }
             }
         }
         "stream_event" => Frame::StreamEvent(serde_json::from_value(value)?),
@@ -249,7 +318,7 @@ pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
         "rate_limit_event" => Frame::RateLimit(serde_json::from_value(value)?),
         "result" => Frame::Result(serde_json::from_value(value)?),
         "control_request" => Frame::ControlRequest(serde_json::from_value(value)?),
-        _ => Frame::Other,
+        kind => classify_unclaimed(kind.to_owned(), &value),
     };
     Ok(frame)
 }
@@ -347,7 +416,7 @@ mod tests {
         }
         assert!(matches!(
             parse_frame(r#"{"type":"mystery_frame"}"#).expect("parses"),
-            Frame::Other
+            Frame::Unknown { discriminator } if discriminator == "mystery_frame"
         ));
         assert!(parse_frame("not json").is_err());
     }
@@ -409,15 +478,57 @@ mod tests {
             }
             other => panic!("unexpected frame: {other:?}"),
         }
-        // Everything else lands in Other — the 0b.2 interlock: a subtype
-        // nobody claimed must show up there, not vanish inside System.
+        // Everything else splits three ways — the 0b.2 classification: a
+        // subtype nobody claimed is Unknown (a diagnostic)…
         assert!(matches!(
             parse_frame(r#"{"type":"system","subtype":"someFutureSubtype"}"#).unwrap(),
-            Frame::Other
+            Frame::Unknown { discriminator } if discriminator == "system/someFutureSubtype"
         ));
+        // …while a recognized-and-deliberately-dropped one is Ignored, its
+        // reason naming the owner.
         assert!(matches!(
             parse_frame(r#"{"type":"system","subtype":"status","status":"compacting"}"#).unwrap(),
-            Frame::Other
+            Frame::Ignored("transient")
         ));
+    }
+
+    /// The frames a REAL healthy session emits (Claude Code 2.1.226 capture,
+    /// 2026-08-08). One diagnostic from any of these puts a lie on the
+    /// settings card — "hidden when zero" is only honest with this tier.
+    #[test]
+    fn the_ignore_list_covers_every_capture_confirmed_routine_frame() {
+        for (raw, reason) in [
+            (
+                r#"{"type":"system","subtype":"status","status":"requesting"}"#,
+                "transient",
+            ),
+            (
+                r#"{"type":"system","subtype":"thinking_tokens","tokens":42}"#,
+                "heartbeat",
+            ),
+            (
+                r#"{"type":"system","subtype":"hook_started","hook":"SessionStart"}"#,
+                "4.2",
+            ),
+            (
+                r#"{"type":"system","subtype":"hook_response","hook":"SessionStart"}"#,
+                "4.2",
+            ),
+            (
+                r#"{"type":"control_response","response":{}}"#,
+                "reply-channel",
+            ),
+            (r#"{"type":"keep_alive"}"#, "transport-ping"),
+            (r#"{"type":"tool_progress","tool_use_id":"t1"}"#, "liveness"),
+            (
+                r#"{"type":"system","subtype":"memory_recall","content":"x"}"#,
+                "memory",
+            ),
+        ] {
+            match parse_frame(raw).expect("parses") {
+                Frame::Ignored(r) => assert_eq!(r, reason, "{raw}"),
+                other => panic!("{raw} should be Ignored({reason}), got {other:?}"),
+            }
+        }
     }
 }

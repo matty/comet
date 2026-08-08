@@ -2,7 +2,8 @@
 //! (init dedupe, subagent filtering, tool decoding, error-code mapping).
 
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, TodoItem, ToolCall,
+    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, TodoItem,
+    ToolCall,
 };
 use serde_json::Value;
 
@@ -444,8 +445,24 @@ impl Normalizer {
                 vec![usage, done]
             }
 
+            // Recognized, deliberately dropped — the middle tier. Nothing to
+            // emit; the reason names the owner.
+            Frame::Ignored(reason) => {
+                tracing::trace!(target: "comet_harness::claude", reason, "ignored frame");
+                Vec::new()
+            }
+
+            // On neither list: still dropped — now counted. The full frame
+            // was warn-logged at the drop site (parse_frame).
+            Frame::Unknown { discriminator } => {
+                vec![crate::diagnostic(
+                    &discriminator,
+                    DiagnosticSeverity::Unknown,
+                )]
+            }
+
             // Control frames are handled by the run loop, not normalized.
-            Frame::ControlRequest(_) | Frame::Other => Vec::new(),
+            Frame::ControlRequest(_) => Vec::new(),
         }
     }
 }
@@ -768,5 +785,42 @@ mod tests {
         )
         .unwrap();
         assert!(Normalizer::new().normalize(frame, false).is_empty());
+    }
+
+    #[test]
+    fn ignored_frames_are_silent_and_unknown_frames_become_diagnostics() {
+        use comet_proto::DiagnosticSeverity;
+        let normalize = |raw: &str| {
+            let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
+            Normalizer::new().normalize(frame, false)
+        };
+        // Ignored tier: recognized, deliberately dropped — routine on every
+        // healthy session, must produce NOTHING.
+        assert!(
+            normalize(r#"{"type":"system","subtype":"status","status":"requesting"}"#).is_empty()
+        );
+        assert!(
+            normalize(r#"{"type":"system","subtype":"thinking_tokens","tokens":9}"#).is_empty()
+        );
+        assert!(normalize(r#"{"type":"tool_progress","tool_use_id":"t1"}"#).is_empty());
+        // Unknown tier: exactly one diagnostic — discriminator named, severity
+        // Unknown, summary Comet-authored (the payload never travels).
+        let events =
+            normalize(r#"{"type":"system","subtype":"someFutureSubtype","secret":"do-not-carry"}"#);
+        assert_eq!(
+            events,
+            vec![AgentEvent::Diagnostic {
+                discriminator: "system/someFutureSubtype".into(),
+                severity: DiagnosticSeverity::Unknown,
+                code: None,
+                summary: "The agent sent a message Comet doesn't recognize.".into(),
+            }]
+        );
+        // A hostile type string never travels: the sanitizer collapses it.
+        let events = normalize(r#"{"type":"two words"}"#);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::Diagnostic { discriminator, .. } if discriminator == "malformed"
+        ));
     }
 }

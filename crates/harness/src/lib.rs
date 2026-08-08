@@ -220,6 +220,40 @@ pub(crate) fn cap_prose(s: &str, max_bytes: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// The fixed discriminator for a line or body that never decoded — parse
+/// failures have no name of their own, and they are the ONLY producer of
+/// [`comet_proto::DiagnosticSeverity::Malformed`].
+///
+/// Unused until Task 3 (run loop) and Task 4 (Codex adapter) wire the
+/// parse-failure sinks that construct `Malformed` diagnostics from it.
+#[allow(dead_code)]
+pub(crate) const UNPARSEABLE: &str = "unparseable";
+
+/// Build the diagnostic event for a dropped frame. The caller has already
+/// warn-logged the full frame at the drop site — this carries only the
+/// sanitized name and Comet copy, never provider text (redaction is
+/// structural: the payload is absent, not truncated).
+pub(crate) fn diagnostic(
+    discriminator: &str,
+    severity: comet_proto::DiagnosticSeverity,
+) -> AgentEvent {
+    let summary = match severity {
+        comet_proto::DiagnosticSeverity::Unknown => {
+            "The agent sent a message Comet doesn't recognize."
+        }
+        comet_proto::DiagnosticSeverity::Malformed => {
+            "The agent sent a message Comet couldn't read."
+        }
+    }
+    .to_string();
+    AgentEvent::Diagnostic {
+        discriminator: comet_proto::sanitize_discriminator(discriminator),
+        severity,
+        code: None,
+        summary,
+    }
+}
+
 /// Availability for a CLI that never resolved far enough to be probed.
 ///
 /// Kept out of the adapters so both name the same summaries: the picker groups
