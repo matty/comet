@@ -36,7 +36,7 @@ use gpui::{
 };
 
 use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
-use comet_proto::{ServerId, ServerRef, ToolCall};
+use comet_proto::{NoticeSeverity, ServerId, ServerRef, ToolCall};
 
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
@@ -240,6 +240,13 @@ pub enum RowKind {
     },
     ErrorChip {
         message: SharedString,
+    },
+    NoticeChip {
+        summary: SharedString,
+        /// Hover tooltip; already suppressed when it would duplicate `summary`.
+        detail: Option<SharedString>,
+        severity: NoticeSeverity,
+        occurrences: u32,
     },
 }
 
@@ -484,10 +491,40 @@ pub fn rows_for_entry(
                     }
                     // Tools are grouped by the outer arm; nothing reaches here.
                     MessagePart::Tool { .. } => {}
-                    // Persisted but not yet rendered: the NoticeChip row lands
-                    // later in this slice and replaces this arm. Skipping here
-                    // keeps the doc layer landable on its own.
-                    MessagePart::Notice { .. } => {}
+                    MessagePart::Notice {
+                        id: part_id,
+                        severity,
+                        summary,
+                        detail,
+                        occurrences,
+                        ..
+                    } => {
+                        // A detail that restates the summary earns nothing on
+                        // hover (0.2a's duplicate-copy lesson) — drop it here.
+                        let detail: Option<SharedString> = detail
+                            .as_ref()
+                            .filter(|d| d.as_str() != summary.as_str())
+                            .map(|d| SharedString::from(single_line(d)));
+                        let mut fp = summary.as_bytes().to_vec();
+                        if let Some(d) = &detail {
+                            fp.extend_from_slice(d.as_bytes());
+                        }
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            // Occurrences folds into the version: a collapse
+                            // that only bumps the counter must still repaint.
+                            version: (fnv1a(&fp) << 1) ^ u64::from(*occurrences),
+                            turn_start: false,
+                            kind: RowKind::NoticeChip {
+                                summary: SharedString::from(single_line(summary)),
+                                detail,
+                                severity: *severity,
+                                occurrences: *occurrences,
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                        });
+                    }
                 }
             }
         }
@@ -1728,6 +1765,19 @@ impl Transcript {
                 input_chip(header.clone(), *resolved, &theme)
             }
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::NoticeChip {
+                summary,
+                detail,
+                severity,
+                occurrences,
+            } => notice_chip(
+                format!("{}-notice", row.id).into(),
+                summary.clone(),
+                detail.clone(),
+                *severity,
+                *occurrences,
+                &theme,
+            ),
         };
 
         // Hover-revealed timestamp strip (comet chat-view.tsx `Timestamp`):
@@ -2188,6 +2238,131 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
         .into_any_element()
 }
 
+/// The transcript notice chip — a quiet sibling of [`error_chip`] for
+/// provider notices (compaction, model reroute, retry, MCP status). Amber
+/// `warning_muted` for a state to resolve, muted neutrals for information —
+/// never `danger`, these are not failures. Layout constants are identical for
+/// both severities: only paint differs (.agents/rules/gpui-ui.md). No
+/// `opacity()` on the summary text — it is text to read (0.2a's contrast
+/// lesson); the wash/border alphas are paint on color tokens, matching
+/// [`error_chip`]'s idiom. `detail` renders as a hover tooltip; the caller
+/// already suppressed it when it would duplicate the summary.
+fn notice_chip(
+    chip_id: SharedString,
+    summary: SharedString,
+    detail: Option<SharedString>,
+    severity: NoticeSeverity,
+    occurrences: u32,
+    theme: &Theme,
+) -> AnyElement {
+    let warning = severity == NoticeSeverity::Warning;
+    let (border, wash, tile, tint) = if warning {
+        (
+            theme.warning_muted.opacity(0.16),
+            theme.warning_muted.opacity(0.05),
+            theme.warning_muted.opacity(0.12),
+            theme.warning_muted,
+        )
+    } else {
+        (
+            crate::theme::hairline(0.08),
+            crate::theme::ink(0.045),
+            crate::theme::ink(0.09),
+            theme.text_muted,
+        )
+    };
+    let icon_path = if warning {
+        crate::icons::DANGER_TRIANGLE
+    } else {
+        crate::icons::INFO_CIRCLE
+    };
+    let mut row = div()
+        .id(chip_id)
+        .h(px(34.0))
+        .w_full()
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .overflow_hidden()
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(border)
+        .bg(wash)
+        .px(px(8.0))
+        .text_size(px(12.0))
+        .child(
+            div()
+                .flex_none()
+                .size(px(20.0))
+                .rounded(px(6.0))
+                .bg(tile)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    crate::icons::icon(icon_path)
+                        .size(px(12.0))
+                        .text_color(tint),
+                ),
+        )
+        .child(
+            div()
+                .flex_none()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(tint)
+                .child(SharedString::from("Notice")),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .truncate()
+                .text_color(theme.text)
+                .child(summary),
+        );
+    if occurrences > 1 {
+        row = row.child(
+            div()
+                .flex_none()
+                .text_color(theme.text_muted)
+                .child(SharedString::from(format!("×{occurrences}"))),
+        );
+    }
+    if let Some(detail) = detail {
+        row = row.tooltip(move |_, cx| {
+            let detail = detail.clone();
+            cx.new(|_| NoticeDetailTooltip { detail }).into()
+        });
+    }
+    div().py(px(4.0)).w_full().child(row).into_any_element()
+}
+
+/// Hover card for a notice's `detail` line (same frame as the harness-rail
+/// tooltip in `pickers.rs`).
+struct NoticeDetailTooltip {
+    detail: SharedString,
+}
+
+impl gpui::Render for NoticeDetailTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        motion::fade_quick(
+            SharedString::from("notice-detail-tooltip"),
+            div()
+                .max_w(px(360.0))
+                .px(px(8.0))
+                .py(px(6.0))
+                .rounded(px(5.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .bg(theme.surface_raised)
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .child(self.detail.clone()),
+        )
+    }
+}
+
 /// A small glyph standing in for the tool's icon (comet uses an icon set; a
 /// quiet monochrome character keeps the tile without shipping SVGs).
 /// The glyph for a tool call (comet tool-chip.tsx `toolIcon`, Solar set).
@@ -2609,6 +2784,115 @@ mod tests {
             is_error: false,
             resolved: true,
         }
+    }
+
+    fn notice_part(id: &str, summary: &str, detail: Option<&str>, occurrences: u32) -> MessagePart {
+        MessagePart::Notice {
+            id: id.into(),
+            kind: comet_proto::NoticeKind::Retrying,
+            severity: comet_proto::NoticeSeverity::Warning,
+            summary: summary.into(),
+            detail: detail.map(str::to_owned),
+            key: Some("retry".into()),
+            occurrences,
+        }
+    }
+
+    #[test]
+    fn notice_parts_become_notice_chip_rows() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![
+                text_part("t0", "before"),
+                notice_part(
+                    "n1",
+                    "Retrying — attempt 1 of 3",
+                    Some("Next attempt in 2s."),
+                    1,
+                ),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].id.as_ref(), "m1#n1");
+        let RowKind::NoticeChip {
+            summary,
+            detail,
+            severity,
+            occurrences,
+        } = &rows[1].kind
+        else {
+            panic!("expected NoticeChip, got another row kind");
+        };
+        assert_eq!(summary.as_ref(), "Retrying — attempt 1 of 3");
+        assert_eq!(
+            detail.as_ref().map(|d| d.as_ref()),
+            Some("Next attempt in 2s.")
+        );
+        assert_eq!(*severity, comet_proto::NoticeSeverity::Warning);
+        assert_eq!(*occurrences, 1);
+    }
+
+    /// `Row::version` folds in `occurrences`, or a collapse (which changes
+    /// only the counter once the summary settles) would not repaint.
+    #[test]
+    fn notice_row_version_changes_when_occurrences_bumps() {
+        let one = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![notice_part("n0", "Retrying — attempt 3 of 3", None, 2)],
+        );
+        let two = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![notice_part("n0", "Retrying — attempt 3 of 3", None, 3)],
+        );
+        let r1 = rows_for_entry(&one, false, &mut parse);
+        let r2 = rows_for_entry(&two, false, &mut parse);
+        assert_eq!(r1[0].id, r2[0].id);
+        assert_ne!(r1[0].version, r2[0].version);
+    }
+
+    /// A detail that restates the summary is suppressed before it reaches the
+    /// chip (0.2a's duplicate-copy lesson).
+    #[test]
+    fn notice_detail_duplicating_summary_is_suppressed() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![notice_part(
+                "n0",
+                "Context compacted",
+                Some("Context compacted"),
+                1,
+            )],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::NoticeChip { detail, .. } = &rows[0].kind else {
+            panic!("expected NoticeChip");
+        };
+        assert_eq!(*detail, None);
+    }
+
+    /// A notice between two tool calls breaks the tool group, like any
+    /// non-tool part.
+    #[test]
+    fn a_notice_splits_tool_groups() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![
+                tool_part("a", "ls"),
+                notice_part("n0", "Context compacted", None, 1),
+                tool_part("b", "pwd"),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(rows[0].kind, RowKind::ToolGroup { .. }));
+        assert!(matches!(rows[1].kind, RowKind::NoticeChip { .. }));
+        assert!(matches!(rows[2].kind, RowKind::ToolGroup { .. }));
     }
 
     const MD: &str = "# Title\n\npara one\n\n```rust\nlet x = 1;\n```";
