@@ -569,13 +569,20 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .expect("dispatch");
 
     // The mock's scripted reply doubles as the titling model's output.
-    let chat = wait_for("chat title", || {
+    //
+    // Gate on the BRANCH, not the title. The titler renames the worktree branch
+    // (step 5) before it writes the title (step 6), so "title is non-empty"
+    // looks like the safe later signal — but the two are separate doc writes and
+    // the title became visible to a reader first, handing back a snapshot whose
+    // `branch` still held the pre-rename name. Waiting for the field this test
+    // actually asserts on is what makes it deterministic.
+    let chat = wait_for("renamed chat branch", || {
         core.workspace
             .doc()
             .chat(chat_id)
             .ok()
             .flatten()
-            .filter(|c| c.title.as_deref().is_some_and(|t| !t.is_empty()))
+            .filter(|c| c.branch.as_deref() == Some("comet/fix-login-flow"))
     })
     .await;
     assert_eq!(chat.title.as_deref(), Some("Fix Login Flow"));
