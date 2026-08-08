@@ -702,3 +702,67 @@ async fn claimed_notifications_surface_as_notices() {
         })
     ));
 }
+
+#[tokio::test]
+async fn unclaimed_notifications_items_and_requests_surface_as_diagnostics() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:diagnostics"), controls).await;
+
+    let diagnostics: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Diagnostic {
+                discriminator,
+                severity,
+                ..
+            } => Some((discriminator.clone(), *severity)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        diagnostics,
+        vec![
+            // sink 5: a non-JSON line, then a JSON frame with neither
+            // `method` nor `id` — both the Malformed sentinel.
+            ("unparseable".to_string(), DiagnosticSeverity::Malformed),
+            ("unparseable".to_string(), DiagnosticSeverity::Malformed),
+            // sink 2: an unknown notification method, verbatim.
+            (
+                "thread/checkpoint/created".to_string(),
+                DiagnosticSeverity::Unknown
+            ),
+            // sink 4: an unknown item type — started AND completed each count.
+            (
+                "item/contextCompaction".to_string(),
+                DiagnosticSeverity::Unknown
+            ),
+            (
+                "item/contextCompaction".to_string(),
+                DiagnosticSeverity::Unknown
+            ),
+            // an unknown server→client request: answered -32601, then counted.
+            (
+                "some/unknownRequest".to_string(),
+                DiagnosticSeverity::Unknown
+            ),
+        ],
+        "{events:?}"
+    );
+    // Redaction is structural: no provider text on any diagnostic.
+    for e in &events {
+        if let AgentEvent::Diagnostic { summary, .. } = e {
+            assert!(!summary.contains("do-not-carry"), "{summary}");
+        }
+    }
+    // The Ignored tier (thread/settings/updated, remoteControl/status/changed,
+    // thread/status/changed, item/reasoning/summaryPartAdded — all
+    // capture-confirmed routine) produced nothing; the run ends cleanly.
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}

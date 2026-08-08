@@ -133,6 +133,8 @@ fn main() {
         resumed(&tid);
     } else if turn_line.contains("scenario:notices") {
         notices(&tid);
+    } else if turn_line.contains("scenario:diagnostics") {
+        diagnostics(&tid);
     } else {
         fail_turn(&tid, "unknown scenario");
     }
@@ -419,5 +421,36 @@ fn notices(tid: &str) {
         r#"{"method":"thread/environment/disconnected","params":{"environmentId":"env-1","threadId":"th-1"}}"#,
     );
     emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"done"}}"#);
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+}
+
+fn diagnostics(tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    // Sink 5: a non-JSON line, then a JSON frame that is not JSON-RPC.
+    emit("codex: not json at all");
+    emit(r#"{"jsonrpc":"2.0","weird":true}"#);
+    // Ignored tier — all capture-confirmed on a healthy session; the first
+    // two were misclassified as Unknown before the capture caught it.
+    emit(r#"{"method":"thread/settings/updated","params":{"settings":{"model":"gpt-5.6-sol"}}}"#);
+    emit(
+        r#"{"method":"remoteControl/status/changed","params":{"hostname":"box","installationId":"i-1"}}"#,
+    );
+    emit(r#"{"method":"thread/status/changed","params":{"status":"active"}}"#);
+    emit(r#"{"method":"item/reasoning/summaryPartAdded","params":{"itemId":"r1"}}"#);
+    // Sink 2: an unknown notification method.
+    emit(r#"{"method":"thread/checkpoint/created","params":{"secret":"do-not-carry"}}"#);
+    // Sink 4: an unknown item type inside the claimed item lifecycle.
+    emit(r#"{"method":"item/started","params":{"item":{"id":"cc1","type":"contextCompaction"}}}"#);
+    emit(
+        r#"{"method":"item/completed","params":{"item":{"id":"cc1","type":"contextCompaction","status":"completed"}}}"#,
+    );
+    // An unknown server→client REQUEST: the harness answers -32601 (the fake
+    // does not read the reply; one small line sits in the pipe buffer), then
+    // counts it.
+    emit(r#"{"id":99,"method":"some/unknownRequest","params":{}}"#);
+    emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"ok"}}"#);
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
 }
