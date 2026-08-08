@@ -554,6 +554,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
 
     let request = comet_proto::RunRequest {
         prompt: "please fix the login flow".into(),
+        harness: None,
         model: None,
         reasoning: None,
         model_options: serde_json::Map::new(),
@@ -613,6 +614,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .expect("rename");
     let request = comet_proto::RunRequest {
         prompt: "another request".into(),
+        harness: None,
         model: None,
         reasoning: None,
         model_options: serde_json::Map::new(),

@@ -2129,6 +2129,7 @@ mod tests {
     fn registration_request(dir: &std::path::Path) -> comet_proto::RunRequest {
         comet_proto::RunRequest {
             prompt: "register old generation".into(),
+            harness: None,
             model: None,
             reasoning: None,
             model_options: Default::default(),
@@ -2239,6 +2240,7 @@ mod tests {
     fn recording_request(dir: &std::path::Path, prompt: &str) -> comet_proto::RunRequest {
         comet_proto::RunRequest {
             prompt: prompt.into(),
+            harness: None,
             model: None,
             reasoning: None,
             model_options: Default::default(),
@@ -3167,6 +3169,7 @@ mod tests {
                 HarnessId::Mock,
                 comet_proto::RunRequest {
                     prompt: "change it".into(),
+                    harness: None,
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
@@ -3548,6 +3551,7 @@ mod tests {
                 HarnessId::Mock,
                 comet_proto::RunRequest {
                     prompt: "change it".into(),
+                    harness: None,
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
@@ -3896,6 +3900,7 @@ mod tests {
                 HarnessId::Mock,
                 comet_proto::RunRequest {
                     prompt: "change it".into(),
+                    harness: None,
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
@@ -3962,6 +3967,7 @@ mod tests {
                 HarnessId::Mock,
                 comet_proto::RunRequest {
                     prompt: "change it".into(),
+                    harness: None,
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
@@ -4063,6 +4069,7 @@ mod tests {
                 HarnessId::Mock,
                 comet_proto::RunRequest {
                     prompt: "change it".into(),
+                    harness: None,
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
@@ -4336,6 +4343,7 @@ mod tests {
                 HarnessId::Mock,
                 comet_proto::RunRequest {
                     prompt: "change it".into(),
+                    harness: None,
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
@@ -4445,6 +4453,7 @@ mod tests {
                 HarnessId::Mock,
                 comet_proto::RunRequest {
                     prompt: "change it".into(),
+                    harness: None,
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
@@ -4564,6 +4573,7 @@ mod tests {
                 HarnessId::Mock,
                 comet_proto::RunRequest {
                     prompt: "change it".into(),
+                    harness: None,
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),

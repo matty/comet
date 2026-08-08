@@ -970,6 +970,12 @@ pub struct ModelOptionChoice {
 #[serde(rename_all = "camelCase")]
 pub struct RunRequest {
     pub prompt: String,
+    /// The harness picked at send time. It lets the authoritative owner honor
+    /// the selection when claim-on-first-command runs without a complete chat
+    /// row, instead of silently falling back to the engine default. Additive +
+    /// serde-defaulted for persisted-request compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<HarnessId>,
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
     /// Harness-specific option selections (option id -> choice id), JSON round-tripped.
@@ -1017,6 +1023,7 @@ impl RunRequest {
     pub fn for_session(mode: RuntimeMode) -> Self {
         Self {
             prompt: String::new(),
+            harness: None,
             model: None,
             reasoning: None,
             model_options: serde_json::Map::new(),
@@ -1817,6 +1824,28 @@ mod tests {
         let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
         let req: RunRequest = serde_json::from_str(old).unwrap();
         assert_eq!(req.runtime_mode, RuntimeMode::AutoAcceptEdits);
+    }
+
+    #[test]
+    fn run_request_harness_is_optional_and_round_trips_when_selected() {
+        // Persisted requests from before protocol 8 carry no harness. Absence
+        // means the owner must consult the chat row/default; it is not a
+        // synthetic provider selection.
+        let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
+        let old: RunRequest = serde_json::from_str(old).unwrap();
+        assert_eq!(old.harness, None);
+        assert!(serde_json::to_value(&old).unwrap().get("harness").is_none());
+
+        let selected = RunRequest {
+            harness: Some(HarnessId::Cursor),
+            ..old
+        };
+        let wire = serde_json::to_value(&selected).unwrap();
+        assert_eq!(wire.get("harness"), Some(&serde_json::json!("cursor")));
+        assert_eq!(
+            serde_json::from_value::<RunRequest>(wire).unwrap().harness,
+            Some(HarnessId::Cursor)
+        );
     }
 
     #[test]

@@ -964,6 +964,17 @@ impl DocHost {
             .unwrap_or(self.inner.config.default_harness)
     }
 
+    /// Resolve the provider selected for this command. The explicit request
+    /// value rides the command plane and therefore survives a missing chat
+    /// row; older persisted requests fall back to the row and engine default.
+    pub(crate) fn harness_for_request(
+        &self,
+        chat_id: &str,
+        request: &comet_proto::RunRequest,
+    ) -> HarnessId {
+        request.harness.unwrap_or_else(|| self.harness_for(chat_id))
+    }
+
     /// Drain pending commands (host-only): evaluate → mark processed BEFORE execute →
     /// execute → write the outcome as the sole outcome writer.
     pub async fn drain_commands(&self, handle: &Arc<ChatDocHandle>) {
@@ -1073,7 +1084,25 @@ impl DocHost {
                 if let Some(ws) = self.workspace() {
                     ws.claim_chat(chat_id, Some(&request.cwd))?;
                 }
-                let harness = self.harness_for(chat_id);
+                let harness = self.harness_for_request(chat_id, request);
+                // The owner persists what it is about to dispatch so the row
+                // remains truthful even when CreateChat failed or a command-
+                // only client reached the claim fallback.
+                if let Some(ws) = self.workspace()
+                    && ws.chat_config(chat_id).is_none()
+                {
+                    let config = comet_proto::ChatConfig {
+                        harness,
+                        model: request.model.clone(),
+                        reasoning: request.reasoning,
+                        model_options: request.model_options.clone(),
+                        sandbox: request.sandbox,
+                        runtime_mode: request.runtime_mode,
+                    };
+                    if let Err(err) = ws.set_chat_config(chat_id, &config) {
+                        tracing::warn!(chat = %chat_id, error = %err, "run-config backfill failed");
+                    }
+                }
                 sessions
                     .dispatch(chat_id, harness, request.clone(), Some(message_id.clone()))
                     .await?;
@@ -1109,13 +1138,9 @@ impl DocHost {
                         // turn's images; this steer's own refs (if any) already
                         // ride the prompt text.
                         request.attachments = Vec::new();
+                        let harness = self.harness_for_request(chat_id, &request);
                         sessions
-                            .dispatch(
-                                chat_id,
-                                self.harness_for(chat_id),
-                                request,
-                                message_id.clone(),
-                            )
+                            .dispatch(chat_id, harness, request, message_id.clone())
                             .await?;
                         Ok((
                             SessionCommandStatus::Applied,
@@ -1190,9 +1215,8 @@ impl DocHost {
                     tracing::warn!(chat = %chat_id, request = %request_id, error = %err,
                         "orphaned input resolve failed");
                 }
-                sessions
-                    .dispatch(chat_id, self.harness_for(chat_id), request, None)
-                    .await?;
+                let harness = self.harness_for_request(chat_id, &request);
+                sessions.dispatch(chat_id, harness, request, None).await?;
                 Ok((
                     SessionCommandStatus::Applied,
                     Some("answered as new turn".into()),
@@ -1255,6 +1279,7 @@ impl DocHost {
         let runtime_mode = config.as_ref().map(|c| c.runtime_mode).unwrap_or_default();
         Some(comet_proto::RunRequest {
             prompt: prompt.to_string(),
+            harness: config.as_ref().map(|c| c.harness),
             model: config.as_ref().and_then(|c| c.model.clone()),
             reasoning: config.as_ref().and_then(|c| c.reasoning),
             model_options: config

@@ -33,7 +33,12 @@ use serde::{Deserialize, Serialize};
 ///    being produced in the same slice, and that needed no bump, because
 ///    ceasing to SEND a variant every peer already decodes breaks nobody. The
 ///    variant is still decoded, for documents written before the change.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// 8: `RunRequest.harness` became command-plane intent for claim-on-first-
+///    command. The field is additive and old persisted requests safely decode
+///    it as absent, but an older LAN peer would silently ignore a user's
+///    provider choice and execute under its own default. Same safety class as
+///    4: refusing the pairing is more honest than running the wrong provider.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

@@ -79,11 +79,13 @@ pinned TLS transport, and pairing. `comet-engine` owns storage and authoritative
 operations. `comet-client` supervises direct connections, and `comet-ui` is the
 supported remote UX surface.
 
-`comet-proto`'s `PROTOCOL_VERSION` gates LAN pairing with an exact match. The
-bump rule: a new *field* on an existing wire type stays additive and does not
-bump — absent fields must decode to conservative defaults. A new *variant* of
+`comet-proto`'s `PROTOCOL_VERSION` gates LAN pairing with an exact match. A new
+*field* on an existing wire type normally stays additive when absence has a
+genuinely conservative meaning. It still bumps when an older peer silently
+ignoring the field would execute a materially different request — permission
+mode and command-selected harness are the worked examples. A new *variant* of
 an enum that crosses the RPC boundary inside a decoded container (such as
-`MessagePart` inside a `TranscriptFrame`) does bump, because the container
+`MessagePart` inside a `TranscriptFrame`) also bumps, because the container
 decode is all-or-nothing and the receiving side has no tolerant arm for an
 unknown variant. A new RPC *method* needs no bump — an older peer answers
 `UnknownMethod`, which the UI already translates into "restart to update".

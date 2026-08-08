@@ -441,7 +441,7 @@ async fn identity_change_is_terminal_until_explicit_reconnect() {
 }
 
 #[tokio::test]
-async fn incompatible_version_reports_remote_version_and_waits_for_reconnect() {
+async fn protocol_7_peer_is_rejected_before_it_can_ignore_the_harness_choice() {
     let a_id = secure_server('a');
     let b_id = secure_server('b');
     let b_entry = remote(b_id.clone(), "B", 'b');
@@ -458,7 +458,7 @@ async fn incompatible_version_reports_remote_version_and_waits_for_reconnect() {
         Vec::new(),
         Vec::new(),
         Arc::new(Mutex::new(Vec::new())),
-        99,
+        7,
         true,
     );
     let compatible = service(
@@ -477,7 +477,7 @@ async fn incompatible_version_reports_remote_version_and_waits_for_reconnect() {
         .await
         .unwrap();
     let mut snapshot = ServerSnapshot::default();
-    let incompatible_state = RemoteConnectionState::IncompatibleVersion { remote: 99 };
+    let incompatible_state = RemoteConnectionState::IncompatibleVersion { remote: 7 };
 
     wait_for_state(&mut federation, &mut snapshot, &b_id, &incompatible_state).await;
     federation

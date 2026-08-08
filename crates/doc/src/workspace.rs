@@ -268,6 +268,33 @@ impl WorkspaceDoc {
         Ok(())
     }
 
+    /// Claim a chat whose run command reached its owner before the complete
+    /// workspace row. This is deliberately a partial write: fields the claim
+    /// cannot know (title, config, branch, archive, activity, resume metadata)
+    /// are left untouched if a complete create lands between the caller's
+    /// existence check and this write, or arrives later through the owner RPC.
+    pub fn claim_chat(
+        &self,
+        chat_id: &str,
+        device_id: &str,
+        cwd: Option<&str>,
+        space_id: Option<&str>,
+        created_at: DateTime<Utc>,
+    ) -> Result<(), DocError> {
+        let row = self.row("chats", chat_id)?;
+        row.insert("id", chat_id)?;
+        row.insert("deviceId", device_id)?;
+        row.insert("createdAt", created_at.timestamp_millis())?;
+        if let Some(cwd) = cwd {
+            row.insert("cwd", cwd)?;
+        }
+        if let Some(space_id) = space_id {
+            row.insert("spaceId", space_id)?;
+        }
+        self.doc.commit();
+        Ok(())
+    }
+
     /// Synced seen marker (LWW) with a monotonic guard: no oplog write when the
     /// stored stamp is already >= `at` (idempotence backstop — the UI also
     /// guards on "currently unseen" before calling). `false` when no such row.
@@ -839,6 +866,36 @@ mod tests {
             .expect("export b");
         b.doc().import(&a_update).expect("import into b");
         a.doc().import(&b_update).expect("import into a");
+    }
+
+    /// `WorkspaceHost` checks for a row before it resolves the command cwd and
+    /// writes the claim. A concurrent local/LAN `CreateChat` can land in that
+    /// interval. The final claim must update only ownership fields rather than
+    /// erasing the complete row's user-selected metadata.
+    #[test]
+    fn owner_claim_preserves_a_complete_row_that_landed_after_the_precheck() {
+        let owner = WorkspaceDoc::new();
+        let complete = chat("chat-race", "dev-owner");
+
+        owner.upsert_chat(&complete).expect("concurrent create");
+        owner
+            .claim_chat(
+                "chat-race",
+                "dev-owner",
+                Some("C:/src/comet/.worktrees/race"),
+                Some("space-comet"),
+                ts(9_000),
+            )
+            .expect("owner claim");
+
+        let merged = owner.chat("chat-race").unwrap().expect("claimed row");
+        assert_eq!(merged.device_id, "dev-owner");
+        assert_eq!(merged.cwd.as_deref(), Some("C:/src/comet/.worktrees/race"));
+        assert_eq!(merged.space_id.as_deref(), Some("space-comet"));
+        assert_eq!(merged.title, complete.title);
+        assert_eq!(merged.config, complete.config);
+        assert_eq!(merged.branch, complete.branch);
+        assert_eq!(merged.archived, complete.archived);
     }
 
     #[test]
