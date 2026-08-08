@@ -1047,6 +1047,20 @@ async fn drive_run(
         // Any stream activity proves the run is alive — keep the session's
         // freshness inside the UI's 45s staleness window (throttled).
         inner.touch_session(&chat_id);
+        // Empty reasoning deltas are PURE heartbeats: redacted thinking and
+        // tool-input-generation windows stream them with no text, and a
+        // persistent session emits them between turns too. They fold to
+        // nothing, so journaling/publishing them is only noise (hundreds per
+        // long turn observed) — the touch above already did their job.
+        //
+        // Dropped HERE, before any state transition, and not below the
+        // turn-start block: a heartbeat is not turn-start either. Counting one
+        // as a turn wedged a parked session the same way a notice used to (see
+        // the note below) — with the extra sting that `parked_notice` reads
+        // `idle_since`, so a heartbeat clearing it silently disarmed that fix.
+        if matches!(&event, AgentEvent::ReasoningDelta { text } if text.is_empty()) {
+            continue;
+        }
         // A Notice is the ONE event that can arrive OUTSIDE a turn (an MCP
         // server dropping, a rate-limit warning, an environment disconnect
         // while the session sits parked), so it is NOT turn-start. Counting it
@@ -1060,13 +1074,6 @@ async fn drive_run(
         // dispatch steered in): the session is Working again.
         if !parked_notice && idle_since.take().is_some() {
             inner.set_status(&chat_id, SessionStatus::Working, true);
-        }
-        // Empty reasoning deltas are PURE heartbeats: redacted thinking and
-        // tool-input-generation windows stream them with no text. They fold
-        // to nothing, so journaling/publishing them is only noise (hundreds
-        // per long turn observed) — the touch above already did their job.
-        if matches!(&event, AgentEvent::ReasoningDelta { text } if text.is_empty()) {
-            continue;
         }
 
         // Failed-resume fallback: an engine-injected `--resume` naming a session
