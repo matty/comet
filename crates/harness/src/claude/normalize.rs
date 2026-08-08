@@ -179,6 +179,44 @@ fn notice_events(f: &SystemNoticeFrame) -> Vec<AgentEvent> {
             )),
             key: Some("retry".into()),
         }),
+        "informational" => {
+            tracing::debug!(
+                target: "comet_harness::claude",
+                "informational (full text): {}", f.content
+            );
+            // sdk.d.ts documents `level` as the CLI's own render level —
+            // read it rather than inventing a severity.
+            let severity = match f.level.as_str() {
+                "suggestion" | "warning" => NoticeSeverity::Warning,
+                _ => NoticeSeverity::Info,
+            };
+            Some(AgentEvent::Notice {
+                kind: NoticeKind::Info,
+                severity,
+                summary: crate::cap_prose(&f.content, crate::NOTICE_SUMMARY_MAX),
+                detail: (f.content.len() > crate::NOTICE_SUMMARY_MAX)
+                    .then(|| crate::cap_prose(&f.content, crate::NOTICE_DETAIL_MAX)),
+                key: f.tool_use_id.clone(),
+            })
+        }
+        "notification" => {
+            tracing::debug!(
+                target: "comet_harness::claude",
+                "notification (full text): {}", f.text
+            );
+            let severity = match f.priority.as_str() {
+                "high" | "immediate" => NoticeSeverity::Warning,
+                _ => NoticeSeverity::Info,
+            };
+            Some(AgentEvent::Notice {
+                kind: NoticeKind::Info,
+                severity,
+                summary: crate::cap_prose(&f.text, crate::NOTICE_SUMMARY_MAX),
+                detail: (f.text.len() > crate::NOTICE_SUMMARY_MAX)
+                    .then(|| crate::cap_prose(&f.text, crate::NOTICE_DETAIL_MAX)),
+                key: f.key.clone(),
+            })
+        }
         _ => None,
     };
     notice.into_iter().collect()
@@ -310,19 +348,28 @@ impl Normalizer {
                     .collect()
             }
 
-            // A claude.ai plan window was hit. A hard `rejected` blocks the
-            // turn — make it visible; allowed/allowed_warning stay quiet.
+            // A claude.ai plan window. `rejected` blocks the turn and stays an
+            // Error (deliberately unchanged this slice). `allowed_warning` is
+            // the provider telling us the window is nearly spent — a state to
+            // resolve, not a failure: a Warning notice. `allowed` stays quiet.
             Frame::RateLimit(f) => {
-                if f.rate_limit_info.status != "rejected" {
-                    return Vec::new();
-                }
                 let window =
                     rate_window_label(f.rate_limit_info.rate_limit_type.as_deref().unwrap_or(""));
-                vec![AgentEvent::Error {
-                    message: format!(
-                        "Claude {window} limit reached — the turn was blocked. Try again after it resets."
-                    ),
-                }]
+                match f.rate_limit_info.status.as_str() {
+                    "rejected" => vec![AgentEvent::Error {
+                        message: format!(
+                            "Claude {window} limit reached — the turn was blocked. Try again after it resets."
+                        ),
+                    }],
+                    "allowed_warning" => vec![AgentEvent::Notice {
+                        kind: NoticeKind::RateLimit,
+                        severity: NoticeSeverity::Warning,
+                        summary: format!("Approaching the Claude {window} usage limit"),
+                        detail: None,
+                        key: Some("rateLimit".into()),
+                    }],
+                    _ => Vec::new(),
+                }
             }
 
             Frame::Result(f) => {
@@ -622,5 +669,98 @@ mod tests {
                 key: Some("compaction".into()),
             }
         );
+    }
+
+    #[test]
+    fn passthrough_subtypes_carry_capped_provider_prose() {
+        use comet_proto::{NoticeKind, NoticeSeverity};
+
+        // informational: severity from `level`, key from `tool_use_id`.
+        assert_eq!(
+            notice_of(
+                r#"{"type":"system","subtype":"informational","content":"Consider running /doctor.","level":"suggestion","tool_use_id":"tu-1"}"#
+            ),
+            AgentEvent::Notice {
+                kind: NoticeKind::Info,
+                severity: NoticeSeverity::Warning,
+                summary: "Consider running /doctor.".into(),
+                detail: None,
+                key: Some("tu-1".into()),
+            }
+        );
+        // info/notice levels stay quiet-severity.
+        match notice_of(
+            r#"{"type":"system","subtype":"informational","content":"x","level":"notice"}"#,
+        ) {
+            AgentEvent::Notice { severity, .. } => {
+                assert_eq!(severity, NoticeSeverity::Info)
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // notification: severity from `priority`, key from `key`.
+        assert_eq!(
+            notice_of(
+                r#"{"type":"system","subtype":"notification","key":"usage-warning","text":"Half of the weekly limit is used.","priority":"immediate"}"#
+            ),
+            AgentEvent::Notice {
+                kind: NoticeKind::Info,
+                severity: NoticeSeverity::Warning,
+                summary: "Half of the weekly limit is used.".into(),
+                detail: None,
+                key: Some("usage-warning".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn oversized_provider_prose_is_capped_with_full_text_in_detail() {
+        let long = "x".repeat(300);
+        let raw = format!(
+            r#"{{"type":"system","subtype":"informational","content":"{long}","level":"info"}}"#
+        );
+        match notice_of(&raw) {
+            AgentEvent::Notice {
+                summary, detail, ..
+            } => {
+                assert_eq!(summary.len(), 160 + '…'.len_utf8());
+                assert!(summary.ends_with('…'));
+                let detail = detail.expect("overflow keeps a longer detail");
+                assert!(detail.len() <= 480 + '…'.len_utf8());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_limit_allowed_warning_becomes_a_notice_and_rejected_stays_an_error() {
+        use comet_proto::{NoticeKind, NoticeSeverity};
+        // allowed_warning: a notice, not an error.
+        assert_eq!(
+            notice_of(
+                r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour"}}"#
+            ),
+            AgentEvent::Notice {
+                kind: NoticeKind::RateLimit,
+                severity: NoticeSeverity::Warning,
+                summary: "Approaching the Claude 5-hour usage limit".into(),
+                detail: None,
+                key: Some("rateLimit".into()),
+            }
+        );
+        // rejected: deliberately UNCHANGED — it blocks the turn, it is a
+        // failure, and reclassifying it would be a behaviour change this
+        // slice has no reason to make.
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"}}"#,
+        )
+        .unwrap();
+        let events = Normalizer::new().normalize(frame, false);
+        assert!(matches!(&events[0], AgentEvent::Error { .. }), "{events:?}");
+        // allowed: still quiet.
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#,
+        )
+        .unwrap();
+        assert!(Normalizer::new().normalize(frame, false).is_empty());
     }
 }

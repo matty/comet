@@ -199,6 +199,27 @@ pub(crate) fn not_installed_message(stem: &str, override_var: &str) -> String {
     format!("{stem}. {hint}")
 }
 
+/// Byte budget for a notice `summary` built from provider prose.
+pub(crate) const NOTICE_SUMMARY_MAX: usize = 160;
+/// Byte budget for a notice `detail` built from provider prose.
+pub(crate) const NOTICE_DETAIL_MAX: usize = 480;
+
+/// Cap unbounded provider prose at the harness boundary: truncate to
+/// `max_bytes` on a char boundary and append an ellipsis. Irreversible for
+/// anyone reading the doc later, which is the point — the doc is a
+/// user-facing transcript, not a log. Call sites debug-log the full text
+/// BEFORE capping.
+pub(crate) fn cap_prose(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 /// Availability for a CLI that never resolved far enough to be probed.
 ///
 /// Kept out of the adapters so both name the same summaries: the picker groups
@@ -650,5 +671,21 @@ mod probe_tests {
             !hint.contains("searched"),
             "hint must not carry the inventory: {hint}"
         );
+    }
+
+    #[test]
+    fn cap_prose_truncates_on_char_boundaries_with_ellipsis() {
+        // Under the cap: unchanged, no ellipsis.
+        assert_eq!(cap_prose("short", 160), "short");
+        // Over the cap: truncated at a char boundary + ellipsis.
+        let long = "a".repeat(200);
+        let capped = cap_prose(&long, 160);
+        assert_eq!(capped, format!("{}…", "a".repeat(160)));
+        // A multibyte char straddling the cap is not split ("é" is 2 bytes:
+        // 161 bytes of "é" content has no boundary at 160, so it backs off).
+        let multi = "é".repeat(81); // 162 bytes
+        let capped = cap_prose(&multi, 161);
+        assert!(capped.ends_with('…'));
+        assert!(capped.chars().all(|c| c == 'é' || c == '…'));
     }
 }

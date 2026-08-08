@@ -41,8 +41,13 @@ pub(crate) struct SystemFrame {
 /// purpose: everything else still becomes [`Frame::Other`], which is where
 /// slice 0b.2's diagnostics will read from — a subtype nobody claimed must
 /// surface there, not vanish.
-pub(crate) const NOTICE_SUBTYPES: &[&str] =
-    &["compact_boundary", "model_refusal_fallback", "api_retry"];
+pub(crate) const NOTICE_SUBTYPES: &[&str] = &[
+    "compact_boundary",
+    "model_refusal_fallback",
+    "api_retry",
+    "informational",
+    "notification",
+];
 
 /// One tolerant struct for every allowlisted notice subtype — every field
 /// defaults, consistent with this module's "tolerant by construction" header.
@@ -66,6 +71,20 @@ pub(crate) struct SystemNoticeFrame {
     pub max_retries: u64,
     #[serde(default)]
     pub retry_delay_ms: u64,
+    // informational
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub level: String,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    // notification
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub priority: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
