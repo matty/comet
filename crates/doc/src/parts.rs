@@ -600,6 +600,22 @@ mod tests {
         assert_eq!(parts.len(), 2);
     }
 
+    /// A different kind does not collapse, even with the same key — the
+    /// guard is `kind == kind && key == key`, not key alone.
+    #[test]
+    fn different_kind_same_key_notices_do_not_collapse() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeKind::Compaction, "shared", "Compacted"),
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeKind::McpStatus, "shared", "MCP failed"),
+        );
+        assert_eq!(parts.len(), 2);
+    }
+
     /// Only the TRAILING part collapses: a notice recurring after other
     /// content gets its own chip, because its position is the message.
     #[test]
