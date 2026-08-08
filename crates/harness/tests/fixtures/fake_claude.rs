@@ -63,6 +63,8 @@ fn main() {
         error();
     } else if first.contains("scenario:notices") {
         notices();
+    } else if first.contains("scenario:diagnostics") {
+        diagnostics();
     } else {
         emit(
             r#"{"type":"result","subtype":"error_during_execution","errors":["unknown scenario"],"usage":{"input_tokens":0,"output_tokens":0},"session_id":"sess-x"}"#,
@@ -217,5 +219,40 @@ fn notices() {
     );
     emit(
         r#"{"type":"result","subtype":"success","result":"done","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-n"}"#,
+    );
+}
+
+fn diagnostics() {
+    emit(
+        r#"{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-d"}"#,
+    );
+    // Sink 5: a non-JSON stdout line → the "unparseable" Malformed sentinel.
+    emit("claude: warming up (not json)");
+    // Ignored tier — every one of these is routine on a healthy session
+    // (capture-confirmed) and must produce NOTHING.
+    emit(r#"{"type":"system","subtype":"status","status":"requesting","session_id":"sess-d"}"#);
+    emit(r#"{"type":"system","subtype":"thinking_tokens","tokens":123,"session_id":"sess-d"}"#);
+    emit(
+        r#"{"type":"system","subtype":"hook_started","hook":"SessionStart","session_id":"sess-d"}"#,
+    );
+    emit(
+        r#"{"type":"system","subtype":"hook_response","hook":"SessionStart","session_id":"sess-d"}"#,
+    );
+    emit(r#"{"type":"tool_progress","tool_use_id":"t1","progress":0.5,"session_id":"sess-d"}"#);
+    // Unknown tier: an unclaimed system subtype and an unknown top-level type.
+    emit(
+        r#"{"type":"system","subtype":"someFutureSubtype","payload":"do-not-carry","session_id":"sess-d"}"#,
+    );
+    emit(r#"{"type":"mystery_frame","secret":"do-not-carry","session_id":"sess-d"}"#);
+    // Sink 3: an unclaimed control request (counted, not answered — the fake
+    // does not wait for a reply).
+    emit(
+        r#"{"type":"control_request","request_id":"cr-9","request":{"subtype":"request_user_dialog","dialog":{"kind":"someDialog"}}}"#,
+    );
+    emit(
+        r#"{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}}"#,
+    );
+    emit(
+        r#"{"type":"result","subtype":"success","result":"done","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-d"}"#,
     );
 }
