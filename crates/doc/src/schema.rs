@@ -71,6 +71,18 @@ struct DocPartJson {
     resolved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notice_kind: Option<comet_proto::NoticeKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    severity: Option<comet_proto::NoticeSeverity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    occurrences: Option<u32>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -114,6 +126,25 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             message: Some(message.clone()),
             ..Default::default()
         },
+        MessagePart::Notice {
+            id,
+            kind,
+            severity,
+            summary,
+            detail,
+            key,
+            occurrences,
+        } => DocPartJson {
+            id: id.clone(),
+            kind: "notice".into(),
+            notice_kind: Some(*kind),
+            severity: Some(*severity),
+            summary: Some(summary.clone()),
+            detail: detail.clone(),
+            key: key.clone(),
+            occurrences: Some(*occurrences),
+            ..Default::default()
+        },
     })
 }
 
@@ -144,6 +175,18 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
         "error" => MessagePart::Error {
             id: p.id,
             message: p.message.unwrap_or_default(),
+        },
+        "notice" => MessagePart::Notice {
+            id: p.id,
+            // A kind this build has never heard of already degraded to Info
+            // inside NoticeKind's serde; an ABSENT kind (torn write) does the
+            // same here.
+            kind: p.notice_kind.unwrap_or(comet_proto::NoticeKind::Info),
+            severity: p.severity.unwrap_or(comet_proto::NoticeSeverity::Warning),
+            summary: p.summary.unwrap_or_default(),
+            detail: p.detail,
+            key: p.key,
+            occurrences: p.occurrences.unwrap_or(1),
         },
         _ => MessagePart::Text {
             id: p.id,
@@ -558,6 +601,34 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
     }
+    if let Some(notice_kind) = doc_part.notice_kind {
+        map.insert(
+            "noticeKind",
+            serde_json::to_value(notice_kind)?
+                .as_str()
+                .ok_or_else(|| DocError::Schema("noticeKind not a string".into()))?,
+        )?;
+    }
+    if let Some(severity) = doc_part.severity {
+        map.insert(
+            "severity",
+            serde_json::to_value(severity)?
+                .as_str()
+                .ok_or_else(|| DocError::Schema("severity not a string".into()))?,
+        )?;
+    }
+    if let Some(summary) = &doc_part.summary {
+        map.insert("summary", summary.as_str())?;
+    }
+    if let Some(detail) = &doc_part.detail {
+        map.insert("detail", detail.as_str())?;
+    }
+    if let Some(key) = &doc_part.key {
+        map.insert("key", key.as_str())?;
+    }
+    if let Some(occurrences) = doc_part.occurrences {
+        map.insert("occurrences", occurrences as i64)?;
+    }
     Ok(())
 }
 
@@ -614,8 +685,10 @@ fn validate_message_parts(row: &serde_json::Value) -> Result<(), DocError> {
                 }
             }
             "error" if part.message.is_some() => {}
+            "notice" if part.summary.is_some() => {}
             "text" => return Err(invalid("missing text")),
             "error" => return Err(invalid("missing message")),
+            "notice" => return Err(invalid("missing summary")),
             _ => return Err(invalid("unknown part kind")),
         }
     }
@@ -810,6 +883,34 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     }
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
+    }
+    if let Some(notice_kind) = doc_part.notice_kind {
+        map.insert(
+            "noticeKind",
+            serde_json::to_value(notice_kind)?
+                .as_str()
+                .ok_or_else(|| DocError::Schema("noticeKind not a string".into()))?,
+        )?;
+    }
+    if let Some(severity) = doc_part.severity {
+        map.insert(
+            "severity",
+            serde_json::to_value(severity)?
+                .as_str()
+                .ok_or_else(|| DocError::Schema("severity not a string".into()))?,
+        )?;
+    }
+    if let Some(summary) = &doc_part.summary {
+        map.insert("summary", summary.as_str())?;
+    }
+    if let Some(detail) = &doc_part.detail {
+        map.insert("detail", detail.as_str())?;
+    }
+    if let Some(key) = &doc_part.key {
+        map.insert("key", key.as_str())?;
+    }
+    if let Some(occurrences) = doc_part.occurrences {
+        map.insert("occurrences", occurrences as i64)?;
     }
     if let Some(text) = &doc_part.text {
         // Defensive path only — the fold never rewrites earlier text.
@@ -1158,5 +1259,128 @@ mod tests {
         assert_eq!(tail.messages.len(), 2);
         assert_eq!(tail.messages[1].id, "m4");
         assert_eq!(tail.chat_id, "chat-1");
+    }
+
+    fn notice_part(id: &str, summary: &str, occurrences: u32) -> MessagePart {
+        MessagePart::Notice {
+            id: id.into(),
+            kind: comet_proto::NoticeKind::Retrying,
+            severity: comet_proto::NoticeSeverity::Warning,
+            summary: summary.into(),
+            detail: Some("Next attempt in 2s.".into()),
+            key: Some("retry".into()),
+            occurrences,
+        }
+    }
+
+    #[test]
+    fn notice_part_round_trips_through_the_doc() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![notice_part("n0", "Retrying — attempt 1 of 3", 3)],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(
+            entries[0].parts,
+            vec![notice_part("n0", "Retrying — attempt 1 of 3", 3)]
+        );
+        // Strict validation (the pre-migration reader) accepts notice rows.
+        doc.validate_strict().unwrap();
+    }
+
+    /// A notice row written WITHOUT `occurrences` (a build predating collapse,
+    /// or a hand-rolled peer) reads back as 1 — never a decode failure.
+    #[test]
+    fn notice_row_without_occurrences_reads_as_one() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let row = doc
+            .doc()
+            .get_list("messages")
+            .push_container(LoroMap::new())
+            .unwrap();
+        row.insert("id", "m1").unwrap();
+        row.insert("role", "assistant").unwrap();
+        row.insert("createdAt", 1i64).unwrap();
+        row.insert("deviceId", "dev-a").unwrap();
+        let parts = row.insert_container("parts", LoroList::new()).unwrap();
+        let part = parts.push_container(LoroMap::new()).unwrap();
+        part.insert("id", "n0").unwrap();
+        part.insert("kind", "notice").unwrap();
+        part.insert("noticeKind", "compaction").unwrap();
+        part.insert("severity", "info").unwrap();
+        part.insert("summary", "Context compacted automatically")
+            .unwrap();
+        doc.doc().commit();
+
+        let entries = doc.read_entries().unwrap();
+        match &entries[0].parts[0] {
+            MessagePart::Notice {
+                occurrences,
+                kind,
+                severity,
+                ..
+            } => {
+                assert_eq!(*occurrences, 1);
+                assert_eq!(*kind, comet_proto::NoticeKind::Compaction);
+                assert_eq!(*severity, comet_proto::NoticeSeverity::Info);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// An entry written by a build WITHOUT notices must be byte-identical
+    /// after this slice: the new DocPartJson fields are Option +
+    /// skip_serializing_if, so a plain text part's map carries exactly the
+    /// keys it always did.
+    #[test]
+    fn pre_notice_part_maps_carry_no_new_keys() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&user_entry("m1", "hello")).unwrap();
+        let value = doc
+            .doc()
+            .get_list("messages")
+            .get_deep_value()
+            .to_json_value();
+        let part = &value[0]["parts"][0];
+        let keys: Vec<&str> = part
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys.len(), 3, "unexpected keys: {keys:?}");
+        for key in ["id", "kind", "text"] {
+            assert!(keys.contains(&key), "missing {key}: {keys:?}");
+        }
+    }
+
+    /// Strict validation names the missing field for a summary-less notice.
+    #[test]
+    fn strict_validation_rejects_a_notice_without_summary() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let row = doc
+            .doc()
+            .get_list("messages")
+            .push_container(LoroMap::new())
+            .unwrap();
+        row.insert("id", "m1").unwrap();
+        row.insert("role", "assistant").unwrap();
+        row.insert("createdAt", 1i64).unwrap();
+        row.insert("deviceId", "dev-a").unwrap();
+        let parts = row.insert_container("parts", LoroList::new()).unwrap();
+        let part = parts.push_container(LoroMap::new()).unwrap();
+        part.insert("id", "n0").unwrap();
+        part.insert("kind", "notice").unwrap();
+        doc.doc().commit();
+
+        let err = doc.validate_strict().unwrap_err().to_string();
+        assert!(err.contains("missing summary"), "{err}");
     }
 }

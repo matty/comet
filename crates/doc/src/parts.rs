@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use comet_proto::{AgentEvent, ToolCall, UserInputQuestion};
+use comet_proto::{AgentEvent, NoticeKind, NoticeSeverity, ToolCall, UserInputQuestion};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -15,6 +15,12 @@ pub enum MessageStatus {
     Streaming,
     Complete,
     Aborted,
+}
+
+/// Serde default for `MessagePart::Notice::occurrences` — a payload written
+/// before collapse existed represents a single occurrence.
+fn one() -> u32 {
+    1
 }
 
 /// One rendered part of an assistant message.
@@ -47,6 +53,25 @@ pub enum MessagePart {
         id: String,
         message: String,
     },
+    /// A provider notice (compaction, model reroute, retry, MCP status…).
+    /// Positional: "the context was compacted HERE" is the whole message.
+    #[serde(rename_all = "camelCase")]
+    Notice {
+        id: String,
+        /// Stored as `noticeKind` on the wire — `kind` is the part-type tag.
+        #[serde(rename = "noticeKind")]
+        kind: NoticeKind,
+        severity: NoticeSeverity,
+        summary: String,
+        #[serde(default)]
+        detail: Option<String>,
+        /// Collapse key — from the wire where the provider gives us one.
+        #[serde(default)]
+        key: Option<String>,
+        /// 1 for a single occurrence; >1 after collapse.
+        #[serde(default = "one")]
+        occurrences: u32,
+    },
 }
 
 impl MessagePart {
@@ -55,7 +80,8 @@ impl MessagePart {
             MessagePart::Text { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
-            | MessagePart::Error { id, .. } => id,
+            | MessagePart::Error { id, .. }
+            | MessagePart::Notice { id, .. } => id,
         }
     }
 
@@ -67,6 +93,9 @@ impl MessagePart {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
             }
             MessagePart::Error { message, .. } => message.len(),
+            MessagePart::Notice {
+                summary, detail, ..
+            } => summary.len() + detail.as_deref().map_or(0, str::len),
         }
     }
 }
@@ -431,5 +460,49 @@ mod tests {
     #[test]
     fn continuation_ids_are_deterministic() {
         assert_eq!(continuation_id("m1", 1), "m1#c1");
+    }
+
+    #[test]
+    fn notice_part_serde_defaults_occurrences_to_one() {
+        // A payload written before collapse existed (no `occurrences`).
+        let json = r#"{"kind":"notice","id":"n0","noticeKind":"retrying","severity":"warning","summary":"Retrying — attempt 1 of 3"}"#;
+        let part: MessagePart = serde_json::from_str(json).unwrap();
+        match &part {
+            MessagePart::Notice {
+                occurrences,
+                kind,
+                severity,
+                summary,
+                detail,
+                key,
+                ..
+            } => {
+                assert_eq!(*occurrences, 1);
+                assert_eq!(*kind, comet_proto::NoticeKind::Retrying);
+                assert_eq!(*severity, comet_proto::NoticeSeverity::Warning);
+                assert_eq!(summary, "Retrying — attempt 1 of 3");
+                assert_eq!(*detail, None);
+                assert_eq!(*key, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Round trip.
+        let json = serde_json::to_string(&part).unwrap();
+        assert_eq!(serde_json::from_str::<MessagePart>(&json).unwrap(), part);
+    }
+
+    #[test]
+    fn notice_byte_len_counts_summary_and_detail() {
+        let part = MessagePart::Notice {
+            id: "n0".into(),
+            kind: comet_proto::NoticeKind::Info,
+            severity: comet_proto::NoticeSeverity::Info,
+            summary: "abcd".into(),
+            detail: Some("efgh".into()),
+            key: None,
+            occurrences: 1,
+        };
+        assert_eq!(part.byte_len(), 8);
+        assert_eq!(part.id(), "n0");
     }
 }

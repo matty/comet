@@ -484,6 +484,10 @@ pub fn rows_for_entry(
                     }
                     // Tools are grouped by the outer arm; nothing reaches here.
                     MessagePart::Tool { .. } => {}
+                    // Persisted but not yet rendered: the NoticeChip row lands
+                    // later in this slice and replaces this arm. Skipping here
+                    // keeps the doc layer landable on its own.
+                    MessagePart::Notice { .. } => {}
                 }
             }
         }
