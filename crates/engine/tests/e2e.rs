@@ -459,6 +459,96 @@ async fn a_notice_while_parked_leaves_the_session_parked_and_the_entry_finished(
     }));
 }
 
+/// REGRESSION: an EMPTY reasoning delta is a pure heartbeat — persistent
+/// sessions stream them between turns — but the run loop cleared `idle_since`
+/// before the filter that drops them, so a heartbeat wedged a parked session
+/// exactly as a notice used to: Working forever with no `Done` coming, and the
+/// 30-minute reaper's select arm (gated on `idle_since.is_some()`) disabled, so
+/// the child was never released.
+///
+/// The notice that follows is both the delivery marker (the harness emits in
+/// order, so seeing it proves the heartbeat was consumed) and the sharper half
+/// of the assertion: `parked_notice` is itself derived from `idle_since`, so a
+/// heartbeat that clears it silently disarms the fix that keeps a between-turns
+/// notice from restarting the turn.
+#[tokio::test]
+async fn an_empty_reasoning_heartbeat_while_parked_leaves_the_session_parked() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-1".into(),
+                    assistant_message_id: "a-1".into(),
+                },
+                AgentEvent::TextDelta {
+                    text: "first turn".into(),
+                },
+                // Steerable + completed ⇒ the run PARKS here instead of ending.
+                done(DoneStatus::Completed),
+                // The heartbeat under test: no text, so it folds to nothing and
+                // never reaches the doc. Nothing but the status can observe it.
+                AgentEvent::ReasoningDelta {
+                    text: String::new(),
+                },
+                AgentEvent::Notice {
+                    kind: NoticeKind::McpStatus,
+                    severity: NoticeSeverity::Warning,
+                    summary: "MCP server linear failed to start".into(),
+                    detail: None,
+                    key: Some("mcp:linear".into()),
+                },
+            ],
+            step_delay: Duration::from_millis(20),
+            // Persistent-session shape: the stream stays open past the park.
+            hang_until_interrupt: true,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-parked-heartbeat",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-1".into(),
+        },
+    );
+
+    let has_notice = |e: &SessionMessageEntry| {
+        e.parts
+            .iter()
+            .any(|p| matches!(p, MessagePart::Notice { .. }))
+    };
+    wait_for(
+        || entries_now(&core).iter().any(has_notice),
+        "the post-heartbeat notice to reach the doc",
+    )
+    .await;
+    // Give any (buggy) status flip or streaming-entry write time to land.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(
+        core.sessions.session_status(CHAT).map(|s| s.status),
+        Some(SessionStatus::Idle),
+        "an empty reasoning heartbeat must not restart a parked turn"
+    );
+    // …and the notice still took the parked path, which only holds while the
+    // heartbeat left `idle_since` alone.
+    let all = entries(&core);
+    let notice_entry = all.iter().find(|e| has_notice(e)).expect("notice entry");
+    assert_eq!(notice_entry.status, Some(MessageStatus::Complete));
+    assert!(
+        all.iter()
+            .all(|e| e.status != Some(MessageStatus::Streaming)),
+        "no entry may be left streaming, got {all:#?}"
+    );
+}
+
 #[tokio::test]
 async fn interrupt_stamps_streaming_entry_aborted() {
     let dir = tempfile::tempdir().unwrap();
