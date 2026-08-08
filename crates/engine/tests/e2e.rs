@@ -21,6 +21,7 @@ use comet_proto::{
     NoticeSeverity, ReasoningLevel, RunRequest, SandboxLevel, SessionStatus, SteeringMode,
     ToolCall,
 };
+use comet_rpc::RpcService;
 use comet_sync::DocsStore;
 
 const CHAT: &str = "chat-e2e";
@@ -2029,4 +2030,52 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
             .any(|j| matches!(&j.event, AgentEvent::TextDelta { text } if text == "done")),
         "text deltas unaffected"
     );
+}
+
+/// The diagnostics surface is pull-only: `ListHarnessDiagnostics` answers
+/// straight from the registry, like `ListHarnesses` — no push channel, a
+/// few-seconds-stale count is harmless.
+#[tokio::test]
+async fn list_harness_diagnostics_answers_from_the_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![],
+            step_delay: Duration::from_millis(1),
+            hang_until_interrupt: false,
+        }),
+    );
+    core.registry.record_diagnostic(
+        HarnessId::Mock,
+        "thread/checkpoint/created",
+        DiagnosticSeverity::Unknown,
+    );
+    core.registry.record_diagnostic(
+        HarnessId::Mock,
+        "thread/checkpoint/created",
+        DiagnosticSeverity::Unknown,
+    );
+
+    let reply = core
+        .rpc_service()
+        .handle(
+            comet_rpc::methods::LIST_HARNESS_DIAGNOSTICS,
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("method answers");
+    let comet_rpc::RpcReply::Value(value) = reply else {
+        panic!("expected a unary reply");
+    };
+    let report: Vec<comet_engine::registry::HarnessDiagnostics> =
+        serde_json::from_value(value).expect("reply decodes");
+    assert_eq!(report.len(), 1);
+    assert_eq!(report[0].harness, HarnessId::Mock);
+    assert_eq!(
+        report[0].entries[0].discriminator,
+        "thread/checkpoint/created"
+    );
+    assert_eq!(report[0].entries[0].count, 2);
+    assert_eq!(report[0].overflow, 0);
 }

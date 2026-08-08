@@ -970,6 +970,7 @@ impl RpcService for EngineRpc {
         match method {
             methods::SERVER_HELLO => RpcReply::value(self.server_hello()?),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
+            methods::LIST_HARNESS_DIAGNOSTICS => RpcReply::value(&self.registry.diagnostics()),
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
                 let harness = self
