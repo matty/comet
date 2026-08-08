@@ -15,6 +15,7 @@ pub fn remote_method_allowed(method: &str) -> bool {
         methods::SERVER_HELLO
             | methods::LOCAL_DEVICE
             | methods::LIST_HARNESSES
+            | methods::LIST_HARNESS_DIAGNOSTICS
             | methods::LIST_MODELS
             | methods::QUEUE_COMMAND
             | methods::WATCH_DOC_MESSAGES
