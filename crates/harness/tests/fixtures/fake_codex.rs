@@ -131,6 +131,8 @@ fn main() {
         fail(&tid);
     } else if turn_line.contains("scenario:resumed") {
         resumed(&tid);
+    } else if turn_line.contains("scenario:notices") {
+        notices(&tid);
     } else {
         fail_turn(&tid, "unknown scenario");
     }
@@ -379,5 +381,41 @@ fn resumed(tid: &str) {
         r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
     ));
     emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+}
+
+fn notices(tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    // MCP lifecycle: "starting" is transient (no notice); failed is terminal.
+    emit(
+        r#"{"method":"mcpServer/startupStatus/updated","params":{"name":"linear","status":"starting"}}"#,
+    );
+    emit(
+        r#"{"method":"mcpServer/startupStatus/updated","params":{"name":"linear","status":"failed","error":"connect ECONNREFUSED 127.0.0.1:3845"}}"#,
+    );
+    emit(
+        r#"{"method":"mcpServer/oauthLogin/completed","params":{"name":"linear","success":true}}"#,
+    );
+    // Rolling rate-limit updates: only the FIRST 80% and FIRST 95% crossings
+    // may produce notices.
+    emit(
+        r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":50}}}}"#,
+    );
+    emit(
+        r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":85}}}}"#,
+    );
+    emit(
+        r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":90}}}}"#,
+    );
+    emit(
+        r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":97},"secondary":{"usedPercent":12}}}}"#,
+    );
+    emit(
+        r#"{"method":"thread/environment/disconnected","params":{"environmentId":"env-1","threadId":"th-1"}}"#,
+    );
+    emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"done"}}"#);
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
 }
