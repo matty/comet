@@ -508,6 +508,37 @@ pub enum DoneStatus {
     Errored,
 }
 
+/// What a provider notice is about. Providers drive this over the wire, so an
+/// unknown value must not poison the batch: `#[serde(other)]` degrades it to
+/// `Info` — quiet, because we do not know what it is. This IS valid on a
+/// plain externally-tagged unit-variant enum (verified empirically; the serde
+/// book's wording about internally/adjacently tagged enums reads as a
+/// restriction and is not one). Do not rewrite as a hand-written Deserialize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NoticeKind {
+    Compaction,
+    ModelRerouted,
+    Retrying,
+    McpStatus,
+    AuthStatus,
+    RateLimit,
+    #[serde(other)]
+    Info,
+}
+
+/// How loudly a notice paints. Unknown severities degrade LOUD (`Warning`),
+/// the opposite direction from `NoticeKind`: a level we cannot interpret is
+/// more likely to matter than less, and the cost of over-showing is an amber
+/// chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NoticeSeverity {
+    Info,
+    #[serde(other)]
+    Warning,
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors comet's `AgentEvent` tagged enum.
@@ -618,5 +649,59 @@ mod tests {
             serde_json::to_string(&HarnessId::ClaudeCode).unwrap(),
             "\"claude-code\""
         );
+    }
+
+    /// Unknown provider-driven enum values must degrade, not fail: decoding
+    /// is all-or-nothing across a containing vector, so one strict value
+    /// rejects every element. An unknown KIND degrades quiet (`Info` — we do
+    /// not dress up what we cannot name); an unknown SEVERITY degrades loud
+    /// (`Warning` — a level we cannot interpret is more likely to matter).
+    #[test]
+    fn unknown_notice_kind_and_severity_degrade_instead_of_failing() {
+        assert_eq!(
+            serde_json::from_str::<NoticeKind>("\"compaction\"").unwrap(),
+            NoticeKind::Compaction
+        );
+        assert_eq!(
+            serde_json::from_str::<NoticeKind>("\"modelRerouted\"").unwrap(),
+            NoticeKind::ModelRerouted
+        );
+        assert_eq!(
+            serde_json::from_str::<NoticeKind>("\"someFutureKind\"").unwrap(),
+            NoticeKind::Info
+        );
+        assert_eq!(
+            serde_json::from_str::<NoticeSeverity>("\"info\"").unwrap(),
+            NoticeSeverity::Info
+        );
+        assert_eq!(
+            serde_json::from_str::<NoticeSeverity>("\"someFutureSeverity\"").unwrap(),
+            NoticeSeverity::Warning
+        );
+    }
+
+    /// Wire names are camelCase strings and round-trip.
+    #[test]
+    fn notice_enums_round_trip_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&NoticeKind::McpStatus).unwrap(),
+            "\"mcpStatus\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NoticeSeverity::Warning).unwrap(),
+            "\"warning\""
+        );
+        for kind in [
+            NoticeKind::Compaction,
+            NoticeKind::ModelRerouted,
+            NoticeKind::Retrying,
+            NoticeKind::McpStatus,
+            NoticeKind::AuthStatus,
+            NoticeKind::RateLimit,
+            NoticeKind::Info,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(serde_json::from_str::<NoticeKind>(&json).unwrap(), kind);
+        }
     }
 }
