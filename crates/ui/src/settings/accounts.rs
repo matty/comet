@@ -15,6 +15,7 @@ use gpui::{
 };
 use std::time::Duration;
 
+use comet_engine::registry::HarnessDiagnostics;
 use comet_proto::{
     AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
     AgentLoginStatus, HarnessId,
@@ -131,6 +132,46 @@ pub fn provider_accounts(
     accounts
 }
 
+/// The per-provider "Not understood" rollup: total count and the sentence.
+/// `None` when the provider has nothing recorded — the block is HIDDEN at
+/// zero, which the harness-side Ignored tier keeps as the normal state.
+/// `name` is the Agent's display name (never a harness id).
+pub fn diagnostics_rollup(
+    list: &[HarnessDiagnostics],
+    harness: HarnessId,
+    name: &str,
+) -> Option<(u64, String)> {
+    let report = list.iter().find(|d| d.harness == harness)?;
+    let total: u64 = report
+        .entries
+        .iter()
+        .map(|e| e.count)
+        .fold(report.overflow, u64::saturating_add);
+    if total == 0 {
+        return None;
+    }
+    let noun = if total == 1 { "message" } else { "messages" };
+    Some((
+        total,
+        format!("{name} sent {total} {noun} this session that Comet doesn't recognize."),
+    ))
+}
+
+/// Compact relative age for the diagnostics rows. Pure given `now_ms`; a
+/// clock that ran backwards degrades to "just now".
+pub fn format_ago(last_seen_ms: i64, now_ms: i64) -> String {
+    let secs = (now_ms - last_seen_ms).max(0) / 1000;
+    if secs < 10 {
+        "just now".into()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entity
 // ---------------------------------------------------------------------------
@@ -180,6 +221,11 @@ pub struct AccountsPage {
     /// follows the same mouse-down from instantly reopening the menu.
     device_menu_dismissed_at: Option<std::time::Instant>,
     snapshot: Loadable<AgentAccountsSnapshot>,
+    /// Per-boot unrecognized-message counts, fetched alongside the accounts
+    /// list. Empty = zero everywhere OR the fetch failed/was cancelled — the
+    /// block is supplementary and hides either way (an older engine without
+    /// the method simply lacks the feature).
+    diagnostics: Vec<HarnessDiagnostics>,
     /// Account id with an in-flight Switch/Forget.
     busy_account: Option<String>,
     login: Option<LoginFlow>,
@@ -207,6 +253,7 @@ impl AccountsPage {
             device_menu_open: false,
             device_menu_dismissed_at: None,
             snapshot: Loadable::Idle,
+            diagnostics: Vec::new(),
             busy_account: None,
             login: None,
             error: None,
@@ -418,16 +465,30 @@ impl AccountsPage {
         // device switch and every post-action refresh all call it.
         let (request_id, cancelled) = crate::toast::begin(cx, errors::Loading::Accounts);
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let call = std::pin::pin!(engine.client().call(methods::LIST_AGENT_ACCOUNTS, params));
-            let outcome = futures::future::select(call, cancelled).await;
+            // Both RPCs ride the one registered request: the toast covers the
+            // whole wait, and Cancel drops both futures together. `cancelled`
+            // is also the registration's liveness handle, so it stays inside
+            // this task — dropping the task (a newer load replaces it) drops
+            // the receiver, and the registry forgets the entry rather than
+            // leaving a toast for work that is no longer running.
+            //
+            // The diagnostics call is NOT device-qualified: its counts
+            // describe the engine answering it, this boot.
+            let client = engine.client();
+            let accounts_call = client.call(methods::LIST_AGENT_ACCOUNTS, params);
+            let diagnostics_call =
+                client.call(methods::LIST_HARNESS_DIAGNOSTICS, serde_json::Value::Null);
+            let both = std::pin::pin!(futures::future::join(accounts_call, diagnostics_call));
+            let outcome = futures::future::select(both, cancelled).await;
             this.update(cx, |page, cx| {
                 crate::toast::end(cx, request_id);
-                let result = match outcome {
-                    futures::future::Either::Left((result, _)) => result,
+                let (result, diagnostics_result) = match outcome {
+                    futures::future::Either::Left((results, _)) => results,
                     futures::future::Either::Right(_) => {
                         page.snapshot = Loadable::Error(crate::toast::cancelled_message(
                             errors::Loading::Accounts,
                         ));
+                        page.diagnostics = Vec::new();
                         cx.notify();
                         return;
                     }
@@ -441,6 +502,26 @@ impl AccountsPage {
                     },
                     Err(err) => {
                         Loadable::Error(errors::load_failure(errors::Loading::Accounts, &err))
+                    }
+                };
+                // Supplementary: a failure (an older engine's UnknownMethod
+                // included) hides the block rather than erroring a pane the
+                // accounts result already owns. Detail stays in tracing.
+                page.diagnostics = match diagnostics_result {
+                    Ok(value) => serde_json::from_value::<Vec<HarnessDiagnostics>>(value)
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(
+                                error = %err,
+                                "harness diagnostics decode failed (block hidden)"
+                            );
+                            Vec::new()
+                        }),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "harness diagnostics load failed (block hidden)"
+                        );
+                        Vec::new()
                     }
                 };
                 cx.notify();
@@ -752,6 +833,90 @@ impl AccountsPage {
                 )
             })
             .into_any_element()
+    }
+
+    /// The "Not understood" block under a provider card. Hidden entirely at
+    /// zero — with the harness-side Ignored tier in place, zero is the normal
+    /// state, so a non-zero count means the provider shipped something new.
+    /// Muted neutrals, not amber: this is information about protocol drift,
+    /// not a state the user can resolve. Layout constants are plain numbers
+    /// and do not vary by appearance (gpui-ui rules); discriminators are wire
+    /// identifiers already sanitized at the harness boundary.
+    fn render_diagnostics_block(
+        &self,
+        harness: HarnessId,
+        name: &str,
+        theme: &Theme,
+        now_ms: i64,
+    ) -> Option<AnyElement> {
+        let (_total, sentence) = diagnostics_rollup(&self.diagnostics, harness, name)?;
+        let report = self.diagnostics.iter().find(|d| d.harness == harness)?;
+        let mut block = div()
+            .mt(px(8.0))
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface)
+            .px(px(16.0))
+            .py(px(12.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(SharedString::from("Not understood")),
+            )
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(sentence)),
+            );
+        for entry in &report.entries {
+            block = block.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.0))
+                    .text_size(px(12.0))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_color(theme.text)
+                            .child(SharedString::from(entry.discriminator.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(format!("×{}", entry.count))),
+                    )
+                    .child(div().flex_none().text_color(theme.text_muted).child(
+                        SharedString::from(format!(
+                            "last {}",
+                            format_ago(entry.last_seen_ms, now_ms)
+                        )),
+                    )),
+            );
+        }
+        if report.overflow > 0 {
+            block = block.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(format!(
+                        "…and {} more messages",
+                        report.overflow
+                    ))),
+            );
+        }
+        Some(block.into_any_element())
     }
 
     /// One account row (comet settings.agents.tsx `AccountRow`): initial
@@ -1375,6 +1540,12 @@ impl Render for AccountsPage {
                                     .map(|warning| widgets::warning_strip(&theme, warning)),
                             )
                             .child(card)
+                            .children(self.render_diagnostics_block(
+                                harness,
+                                name,
+                                &theme,
+                                now.timestamp_millis(),
+                            ))
                             .into_any_element()
                     })
                     .collect()
@@ -1546,5 +1717,84 @@ mod tests {
         assert_eq!(ids, ["c2", "c1"], "active account leads");
         assert_eq!(provider_accounts(&snapshot, HarnessId::Codex).len(), 1);
         assert!(provider_accounts(&snapshot, HarnessId::Cursor).is_empty());
+    }
+
+    fn diag_report(
+        harness: HarnessId,
+        counts: &[(&str, u64)],
+        overflow: u64,
+    ) -> comet_engine::registry::HarnessDiagnostics {
+        comet_engine::registry::HarnessDiagnostics {
+            harness,
+            entries: counts
+                .iter()
+                .map(|(d, c)| comet_engine::registry::HarnessDiagnosticEntry {
+                    discriminator: (*d).into(),
+                    severity: comet_proto::DiagnosticSeverity::Unknown,
+                    count: *c,
+                    first_seen_ms: 0,
+                    last_seen_ms: 0,
+                })
+                .collect(),
+            overflow,
+        }
+    }
+
+    /// "Hidden when zero" is the honest normal state — the Ignored tier is
+    /// what makes it true. The rollup is the single gate for the block.
+    #[test]
+    fn diagnostics_rollup_hides_at_zero_and_sums_overflow() {
+        // Absent provider → hidden.
+        assert_eq!(diagnostics_rollup(&[], HarnessId::Codex, "Codex"), None);
+        // Present but empty → hidden.
+        assert_eq!(
+            diagnostics_rollup(
+                &[diag_report(HarnessId::Codex, &[], 0)],
+                HarnessId::Codex,
+                "Codex"
+            ),
+            None
+        );
+        // Counts + overflow sum; copy pluralizes and names the Agent — never
+        // the harness id.
+        let list = vec![diag_report(
+            HarnessId::Codex,
+            &[
+                ("thread/checkpoint/created", 4),
+                ("item/webSearch/started", 2),
+            ],
+            3,
+        )];
+        assert_eq!(
+            diagnostics_rollup(&list, HarnessId::Codex, "Codex"),
+            Some((
+                9,
+                "Codex sent 9 messages this session that Comet doesn't recognize.".to_string()
+            ))
+        );
+        // The OTHER provider's card stays hidden.
+        assert_eq!(
+            diagnostics_rollup(&list, HarnessId::ClaudeCode, "Claude Code"),
+            None
+        );
+        // Singular.
+        let one = vec![diag_report(HarnessId::ClaudeCode, &[("unparseable", 1)], 0)];
+        assert_eq!(
+            diagnostics_rollup(&one, HarnessId::ClaudeCode, "Claude Code"),
+            Some((
+                1,
+                "Claude Code sent 1 message this session that Comet doesn't recognize.".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn format_ago_buckets() {
+        assert_eq!(format_ago(1_000, 5_000), "just now");
+        assert_eq!(format_ago(0, 45_000), "45s ago");
+        assert_eq!(format_ago(0, 120_000), "2m ago");
+        assert_eq!(format_ago(0, 7_200_000), "2h ago");
+        // A clock that ran backwards degrades to "just now", never negative.
+        assert_eq!(format_ago(10_000, 5_000), "just now");
     }
 }
