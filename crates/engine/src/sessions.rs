@@ -546,6 +546,14 @@ impl SessionsEngine {
                     .or_else(|| host.request_from_chat_row(&chat_id, &prompt_text))
                     // Last resort: the journal's own cwd (comet's draft config)
                     // — a crash can predate the debounced workspace-row write.
+                    //
+                    // The default mode is the only answer available here, and
+                    // it is the right one. This arm is reached only when the
+                    // chat row is missing, so the chat never had a stored
+                    // config to choose a mode in — and the journal replays
+                    // `AgentEvent`s, which carry no mode to recover one from.
+                    // A row that exists but has no config resolves to the same
+                    // default one branch up.
                     .or_else(|| {
                         let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
                         Some(RunRequest {
