@@ -3,7 +3,10 @@
 //!
 //! Tolerant by construction: both field spellings the app server has shipped
 //! (`delta`/`textDelta`, `exitCode`/`exit_code`, camelCase/snake_case item
-//! types) are accepted, and unknown item types map to nothing.
+//! types) are accepted. Unknown item types no longer map to nothing — an
+//! item type inside an otherwise-claimed notification that Comet does not
+//! understand becomes an Unknown diagnostic (see `map_item`'s `other` arm),
+//! counted and journaled rather than dropped silently.
 
 use comet_proto::{AgentEvent, NoticeKind, NoticeSeverity, TodoItem, ToolCall};
 use serde_json::Value;
@@ -374,8 +377,11 @@ pub(crate) fn rate_limit_notice(
 
 /// Notification methods Comet recognizes and deliberately drops — the middle
 /// tier of the Claimed / Ignored / Unknown classification. Reasons: a slice
-/// number means that slice claims the entry later; anything else names why no
-/// surface wants it. ★ = confirmed firing on a real codex-cli 0.147.0 capture
+/// number (e.g. `"4.2"`, `"2.4"`, `"phase-1"`) names a roadmap slice that
+/// will later claim the entry and move it out of this table; it is a
+/// maintenance obligation, not a fact about the notification, and reading
+/// only this repository will not resolve which slice that is; any other
+/// reason names why no surface wants it. ★ = confirmed firing on a real codex-cli 0.147.0 capture
 /// (2026-08-08); the rest are named by the generated schema (70 methods).
 /// The hook/* and item/autoApprovalReview/* families are exactly the two
 /// members each — the schema has no others, so literal strings, no globs.

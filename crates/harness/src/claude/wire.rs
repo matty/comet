@@ -56,9 +56,12 @@ pub(crate) const NOTICE_SUBTYPES: &[&str] = &[
 ];
 
 /// Frames Comet recognizes and deliberately drops — the middle tier of the
-/// Claimed / Ignored / Unknown classification. Reasons: a slice number means
-/// that slice claims the entry later and moves it to Claimed (stopping its
-/// count); anything else names why no surface wants it. ★ = confirmed firing
+/// Claimed / Ignored / Unknown classification. Reasons: a slice number
+/// (e.g. `"4.2"`, `"2.4"`, `"phase-1"`) names a roadmap slice that will
+/// later claim the entry and move it out of this table to Claimed, stopping
+/// its count — it is a maintenance obligation, not a fact about the frame,
+/// and reading only this repository will not resolve which slice that is;
+/// any other reason names why no surface wants the frame at all. ★ = confirmed firing
 /// on a real Claude Code 2.1.226 capture (2026-08-08); the rest are named by
 /// sdk.d.ts 0.3.195. Deliberately NOT here, so a diagnostic fires:
 /// local_command_output, model_refusal_no_fallback, mirror_error,
@@ -457,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn system_subtypes_split_init_notice_and_other() {
+    fn system_subtypes_split_init_notice_ignored_and_unknown() {
         // init keeps its dedicated SystemFrame (SessionStarted decoding
         // untouched).
         assert!(matches!(

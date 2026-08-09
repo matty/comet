@@ -555,10 +555,22 @@ pub enum DiagnosticSeverity {
 /// Sanitize a provider-derived frame discriminator. Allowed alphabet
 /// `[A-Za-z0-9._/-]`; over-long but clean input truncates to 64 bytes
 /// (ASCII-only, so any cut lands on a char boundary); empty input or anything
-/// outside the alphabet becomes the literal `"malformed"`. The input is
-/// provider-controlled and ends up in a journal, an RPC reply and a settings
-/// card — treat it as untrusted. Applied at the harness boundary and again,
-/// defensively, by the engine registry.
+/// outside the alphabet becomes the literal `"malformed"`.
+///
+/// The guarantee this gives is narrow: the *output* is always a bounded-length
+/// string in an alphabet safe to render and log. It is **not** a path filter,
+/// and it does not reject paths in general — only ones containing a byte
+/// outside the alphabet. A Windows path fails (the backslash isn't allowed)
+/// and becomes `"malformed"`, but a POSIX-style path such as
+/// `/home/matty/.ssh/id_rsa` is composed entirely of allowed bytes and passes
+/// through completely unchanged. Every current caller feeds this type names
+/// and JSON-RPC methods, so that never happens in practice today — but a
+/// future caller passing untrusted free text (anything that might contain a
+/// path, a secret, or other sensitive prose) must sanitize for its own
+/// concerns before calling this; do not rely on this function to do it. The
+/// output ends up in a journal, an RPC reply and a settings card — treat the
+/// *input* as untrusted regardless. Applied at the harness boundary and
+/// again, defensively, by the engine registry.
 pub fn sanitize_discriminator(raw: &str) -> String {
     let clean = !raw.is_empty()
         && raw

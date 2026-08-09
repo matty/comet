@@ -46,9 +46,11 @@ fn describe(harness: &dyn Harness) -> HarnessDescriptor {
 }
 
 /// One aggregated diagnostic row: a discriminator this boot has seen, how
-/// often, and when. `severity` is fixed per discriminator by construction
-/// (only the "unparseable" sentinel is Malformed), so the first arrival's
-/// value stands.
+/// often, and when. `severity` is not enforced to be fixed per discriminator
+/// — nothing stops a provider frame from being typed literally
+/// `"unparseable"`, colliding with the parse-failure sentinel — so treat it
+/// as: whichever severity arrived first for this discriminator is the one
+/// retained; later arrivals with a different severity are silently ignored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HarnessDiagnosticEntry {
@@ -701,7 +703,10 @@ mod tests {
 
     /// Defense in depth (spec verification 2): the harness sanitizes at the
     /// drop site, but the registry is the last owner before an RPC reply and
-    /// a settings card — an unsanitized caller must not get a path through.
+    /// a settings card. A Windows path is rejected because the backslash is
+    /// outside `sanitize_discriminator`'s alphabet — that is the only sense
+    /// in which this is "path" protection. See the POSIX case below for what
+    /// actually happens to a path made only of allowed characters.
     #[test]
     fn the_registry_re_sanitizes_discriminators() {
         use comet_proto::DiagnosticSeverity;
@@ -717,5 +722,30 @@ mod tests {
             .find(|d| d.harness == HarnessId::ClaudeCode)
             .expect("claude bucket");
         assert_eq!(claude.entries[0].discriminator, "malformed");
+    }
+
+    /// Documented, intended behaviour — not an oversight: a POSIX-style path
+    /// is built entirely from `sanitize_discriminator`'s allowed alphabet
+    /// (`[A-Za-z0-9._/-]`), so it survives re-sanitization unchanged and
+    /// would reach an RPC reply and a settings card verbatim. Every current
+    /// caller only ever feeds this type names and JSON-RPC methods, so no
+    /// live sink passes untrusted free text through; a future caller that
+    /// does must sanitize for its own concerns first, per the doc on
+    /// `sanitize_discriminator`.
+    #[test]
+    fn the_registry_passes_a_posix_style_path_through_unchanged() {
+        use comet_proto::DiagnosticSeverity;
+        let registry = HarnessRegistry::new();
+        registry.record_diagnostic(
+            HarnessId::ClaudeCode,
+            "/home/matty/.ssh/id_rsa",
+            DiagnosticSeverity::Unknown,
+        );
+        let report = registry.diagnostics();
+        let claude = report
+            .iter()
+            .find(|d| d.harness == HarnessId::ClaudeCode)
+            .expect("claude bucket");
+        assert_eq!(claude.entries[0].discriminator, "/home/matty/.ssh/id_rsa");
     }
 }

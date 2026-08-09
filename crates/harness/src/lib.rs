@@ -220,13 +220,27 @@ pub(crate) fn cap_prose(s: &str, max_bytes: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-/// The fixed discriminator for a line or body that never decoded — parse
-/// failures have no name of their own, and they are the ONLY producer of
-/// [`comet_proto::DiagnosticSeverity::Malformed`].
+/// The five places a provider frame becomes an `AgentEvent::Diagnostic`
+/// instead of vanishing silently. Numbered here so the "Sink N" comments
+/// scattered at each site resolve against something real — that numbering
+/// has no meaning outside this repository (the planning document it was
+/// drafted against is not shipped), so this doc comment is its only
+/// in-repo definition:
 ///
-/// Used by each adapter's parse-failure sink — the frame loop's `Err` arm
-/// when a stdout line fails to decode — to build a `Malformed` diagnostic
-/// without ever naming the offending line.
+/// 1. Claude, two call sites feeding one arm: an unclaimed top-level frame
+///    `type`, or an unclaimed `system/<subtype>` — both classified by
+///    `claude::wire::classify_unclaimed` into `Frame::Unknown`, emitted as
+///    one diagnostic in `claude::normalize`.
+/// 2. Codex: the notification catch-all — a JSON-RPC method on neither the
+///    claimed nor the `codex::normalize::IGNORED_NOTIFICATIONS` list.
+/// 3. Claude: an unclaimed inbound `control_request` subtype, handled (by
+///    not answering it) in `claude::mod::handle_control_request`.
+/// 4. Codex: an unclaimed item `type` inside an otherwise-claimed
+///    notification, in `codex::normalize::map_item`.
+/// 5. Parse failures on both sides — a stdout line that never decoded at
+///    all. Always [`comet_proto::DiagnosticSeverity::Malformed`], always
+///    this fixed sentinel; the raw line stays in `tracing` and never
+///    travels with the event.
 pub(crate) const UNPARSEABLE: &str = "unparseable";
 
 /// Build the diagnostic event for a dropped frame. The caller has already

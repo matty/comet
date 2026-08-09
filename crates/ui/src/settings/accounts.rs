@@ -6,7 +6,11 @@
 //!
 //! The accounts RPC surface is being implemented engine-side in parallel —
 //! every call here surfaces failures as inline UI states rather than assuming
-//! the methods exist.
+//! the methods exist. One deliberate exception: the harness-diagnostics call
+//! (see the "Not understood" block below) is supplementary to the accounts
+//! result the pane already owns, so any failure — decode error, RPC error,
+//! or an older engine replying `UnknownMethod` because it predates this
+//! surface — hides the block and logs instead of erroring the pane.
 
 use chrono::{DateTime, Utc};
 use gpui::{
