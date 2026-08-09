@@ -44,7 +44,7 @@ use tokio::sync::mpsc;
 
 use comet_proto::{
     AgentEvent, DiagnosticSeverity, DoneStatus, HarnessAvailability, HarnessCapabilities,
-    HarnessId, Model, RunRequest, SteeringMode, UserInputAnswer, UserInputQuestion,
+    HarnessId, Model, RunRequest, RuntimeMode, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
@@ -158,6 +158,10 @@ impl CodexHarness {
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: REASONING_LEVELS.to_vec(),
+            // Undeclared: nothing maps a runtime mode onto codex's approval
+            // policy yet, and declaring a mode the adapter does not honor
+            // would offer a promise the run cannot keep.
+            runtime_modes: Vec::new(),
         }
     }
 
@@ -237,11 +241,16 @@ impl Harness for CodexHarness {
                 "codex sandbox escalated to danger-full-access: linked worktree on a \
                  slash-named branch trips codex's worktree-mount derivation"
             );
-            // `runtime_mode` deliberately stays untouched: nothing reads it
-            // yet, so this leaves the request's mode/sandbox pair
-            // disagreeing. Once an adapter starts reading `runtime_mode`,
-            // reconcile the two here instead of letting this escalation
-            // silently drift out of sync with it.
+            // `runtime_mode` is read further down (the approval branch that
+            // checks for `RuntimeMode::FullAccess`), so this escalation
+            // matters to more than the sandbox: it raises only `sandbox`
+            // and leaves `runtime_mode` as the caller set it. On a
+            // full-access request the pair stays coherent by coincidence;
+            // on any other mode it does not — the request now runs with a
+            // danger-full-access sandbox under a mode that did not ask for
+            // one. Whoever next derives Codex's approval policy from
+            // `runtime_mode` has to decide whether escalating the sandbox
+            // here should escalate the mode too.
             request.sandbox = comet_proto::SandboxLevel::DangerFullAccess;
         }
         let mut cmd = Command::new(&exe);
@@ -417,7 +426,7 @@ async fn run_session(session: Session) {
 
     // ---- wire params ------------------------------------------------------
     // Parity with the Claude adapter, which auto-approves every `can_use_tool`
-    // regardless of `auto_approve` (comet sessions run unattended; the sandbox
+    // regardless of `runtime_mode` (comet sessions run unattended; the sandbox
     // is the guardrail): never surface wire approvals. "on-request" turned
     // every command into a yes/no question (user report: "asking me for
     // approval at every step"). The approval-as-input plumbing below stays for
@@ -833,7 +842,7 @@ async fn run_session(session: Session) {
                         id,
                         &method,
                         &params,
-                        request.auto_approve,
+                        request.runtime_mode == RuntimeMode::FullAccess,
                         &request_input,
                     ) && !send(&event_tx, ev).await
                     {
@@ -1057,15 +1066,15 @@ type RequestInputFn = Box<
 
 /// Serve one server→client request. Approval requests round-trip through
 /// `request_input` as a synthesized yes/no question (in a subtask so the
-/// message loop keeps flowing); with `auto_approve` they're accepted outright
-/// (belt to the wire-level `approvalPolicy: "never"`). Anything else is
-/// rejected as unsupported so the server never wedges awaiting a reply.
+/// message loop keeps flowing); a run that may proceed without asking accepts
+/// them outright (belt to the wire-level `approvalPolicy: "never"`). Anything
+/// else is rejected as unsupported so the server never wedges awaiting a reply.
 fn handle_server_request(
     client: &RpcClient,
     id: Value,
     method: &str,
     params: &Value,
-    auto_approve: bool,
+    accept_without_asking: bool,
     request_input: &Arc<RequestInputFn>,
 ) -> Option<AgentEvent> {
     let is_approval = matches!(
@@ -1074,8 +1083,9 @@ fn handle_server_request(
     );
     if !is_approval {
         // Answer FIRST — the server must never wedge awaiting a reply — then
-        // count. The -32601 reply is byte-for-byte what shipped before this
-        // slice; counting rides the return path, nothing more.
+        // count. The -32601 reply is the same one this adapter has always
+        // sent for an unsupported method; counting rides the return path,
+        // nothing more.
         client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
         tracing::warn!(
             target: "comet_harness::codex",
@@ -1085,7 +1095,7 @@ fn handle_server_request(
         );
         return Some(crate::diagnostic(method, DiagnosticSeverity::Unknown));
     }
-    if auto_approve {
+    if accept_without_asking {
         client.respond(&id, json!({ "decision": "accept" }));
         return None;
     }

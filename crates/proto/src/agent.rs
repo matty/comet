@@ -114,6 +114,11 @@ pub struct HarnessCapabilities {
     pub steering_mode: SteeringMode,
     /// The effort ladder offered in the traits picker.
     pub reasoning_levels: Vec<ReasoningLevel>,
+    /// The runtime modes this harness honors, in the order they should be
+    /// offered. An empty list means the harness has not declared any — read it
+    /// as unknown, never as "supports nothing", or a harness that predates the
+    /// field is presented as offering no way to run at all.
+    pub runtime_modes: Vec<RuntimeMode>,
 }
 
 /// Whether a harness's CLI is usable on this device, as of the last probe.
@@ -397,6 +402,23 @@ mod capability_tests {
         let decoded: HarnessCapabilities = serde_json::from_str("{}").unwrap();
         assert_eq!(decoded, HarnessCapabilities::default());
     }
+
+    /// An undeclared mode list is the absent case a consumer has to write
+    /// itself: it means the harness has not said, not that it supports
+    /// nothing. Decoding must produce it rather than failing the batch.
+    #[test]
+    fn absent_runtime_modes_decode_to_an_empty_list() {
+        let caps: HarnessCapabilities = serde_json::from_str("{}").unwrap();
+        assert!(caps.runtime_modes.is_empty());
+
+        let partial: HarnessCapabilities =
+            serde_json::from_str(r#"{"runtimeModes":["approval-required","full-access"]}"#)
+                .unwrap();
+        assert_eq!(
+            partial.runtime_modes,
+            vec![RuntimeMode::ApprovalRequired, RuntimeMode::FullAccess]
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -454,8 +476,6 @@ pub struct RunRequest {
     /// sandbox, a pairing no mode expresses, and that request is built by
     /// hand rather than through [`RunRequest::for_session`].
     pub sandbox: SandboxLevel,
-    #[serde(default)]
-    pub auto_approve: bool,
     /// Harness-native session id to resume, if any.
     pub resume: Option<String>,
     /// Absolute paths of image attachments already staged on the run device
@@ -489,7 +509,6 @@ impl RunRequest {
             cwd: String::new(),
             runtime_mode: mode,
             sandbox: mode.sandbox(),
-            auto_approve: false,
             resume: None,
             attachments: Vec::new(),
         }
@@ -852,11 +871,33 @@ mod tests {
 
     #[test]
     fn for_session_default_reproduces_the_previous_hardcode() {
-        // The behavioral claim of this slice, in one assertion: the derived
-        // sandbox equals the literal every user-session site used to write.
+        // The behavioral claim of the runtime-mode work, in one assertion: the
+        // derived sandbox equals the literal every user-session site used to
+        // write, and the default mode is the never-bypass one.
         let req = RunRequest::for_session(RuntimeMode::default());
         assert_eq!(req.sandbox, SandboxLevel::WorkspaceWrite);
-        assert!(!req.auto_approve);
+        assert_eq!(req.runtime_mode, RuntimeMode::AutoAcceptEdits);
+    }
+
+    /// A peer built before the runtime mode replaced the auto-approve flag
+    /// still sends `autoApprove`. It must decode, ignored — the field it stood
+    /// in for is now the mode.
+    ///
+    /// Such a payload loses its never-ask intent: `true` degrades to the
+    /// default mode rather than to `FullAccess`. That is the safe direction and
+    /// the reason this is a plain ignore rather than a translation. Requests
+    /// carrying `true` did reach the wire — the queued run commands in the doc
+    /// command log are the durable, synced path — so this is a real degradation
+    /// for a pre-upgrade peer, not a hypothetical one.
+    #[test]
+    fn a_payload_still_sending_auto_approve_decodes() {
+        let decoded: RunRequest = serde_json::from_str(
+            r#"{"prompt":"hi","model":null,"reasoning":null,"cwd":"/tmp",
+                "sandbox":"workspace-write","autoApprove":true,"resume":null}"#,
+        )
+        .expect("an older peer's payload must still decode");
+        assert_eq!(decoded.runtime_mode, RuntimeMode::AutoAcceptEdits);
+        assert_eq!(decoded.sandbox, SandboxLevel::WorkspaceWrite);
     }
 
     #[test]

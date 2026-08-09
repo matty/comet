@@ -36,7 +36,6 @@ fn run_request(prompt: &str) -> RunRequest {
         cwd: "/tmp".into(),
         runtime_mode: RuntimeMode::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
-        auto_approve: true,
         attachments: Vec::new(),
         resume: None,
     }
@@ -100,6 +99,7 @@ impl Harness for ScriptedHarness {
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![ReasoningLevel::Medium],
+            runtime_modes: Vec::new(),
         }
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
@@ -1716,6 +1716,7 @@ impl Harness for CapturingHarness {
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![ReasoningLevel::Medium],
+            runtime_modes: Vec::new(),
         }
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
@@ -1908,7 +1909,6 @@ async fn real_claude_sees_uploaded_image_inline() {
         cwd: cwd.to_string_lossy().to_string(),
         runtime_mode: RuntimeMode::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
-        auto_approve: false,
         attachments: vec![path],
         resume: None,
     };

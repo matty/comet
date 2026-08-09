@@ -43,7 +43,6 @@ fn run_request(prompt: &str, cwd: &str) -> RunRequest {
         cwd: cwd.into(),
         runtime_mode: RuntimeMode::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
-        auto_approve: true,
         attachments: Vec::new(),
         resume: None,
     }
@@ -73,6 +72,7 @@ impl Harness for RecordingHarness {
             supports_steering: false,
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: vec![ReasoningLevel::Medium],
+            runtime_modes: Vec::new(),
         }
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
@@ -437,6 +437,7 @@ impl Harness for PersistentHarness {
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![ReasoningLevel::Medium],
+            runtime_modes: Vec::new(),
         }
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
@@ -787,7 +788,6 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
         cwd: cwd.clone(),
         runtime_mode: RuntimeMode::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
-        auto_approve: false,
         attachments: Vec::new(),
         resume: None,
     };

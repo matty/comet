@@ -32,9 +32,12 @@ fn request(prompt: &str) -> RunRequest {
         reasoning: Some(ReasoningLevel::Ultra),
         model_options: serde_json::Map::new(),
         cwd: String::new(),
-        runtime_mode: RuntimeMode::default(),
+        // Deliberately mismatched, unlike the Claude fixture: the Codex
+        // adapter reads `sandbox` directly (Claude does not), so exercising
+        // `FullAccess` against a `WorkspaceWrite` sandbox is a real,
+        // distinct case here, not fixture drift.
+        runtime_mode: RuntimeMode::FullAccess,
         sandbox: SandboxLevel::WorkspaceWrite,
-        auto_approve: true,
         attachments: Vec::new(),
         resume: None,
     }
@@ -398,7 +401,11 @@ async fn approvals_round_trip_as_input_requests() {
         interrupt: token.clone(),
     };
     let mut req = request("scenario:approve");
-    req.auto_approve = false;
+    // Any mode but `FullAccess` sends an approval through the input bridge.
+    // `ApprovalRequired` states that without asserting anything about what
+    // auto-accept-edits should do with a file change once the adapter derives
+    // its approval policy from the mode.
+    req.runtime_mode = RuntimeMode::ApprovalRequired;
     let events = run_to_end(&harness(), req, controls).await;
 
     let asked = asked.lock().unwrap();
@@ -432,7 +439,7 @@ async fn approvals_round_trip_as_input_requests() {
 async fn approval_no_answer_becomes_decline() {
     let (controls, _steer, _token) = controls("No");
     let mut req = request("scenario:decline");
-    req.auto_approve = false;
+    req.runtime_mode = RuntimeMode::ApprovalRequired;
     let events = run_to_end(&harness(), req, controls).await;
 
     // The fake only completes the turn after seeing the decline decision.

@@ -46,7 +46,43 @@ fn last_content(line: &str) -> String {
     }
 }
 
+/// The values the installed Claude Code 2.1.226 accepts for
+/// `--permission-mode`: the six choices its own `--help` advertises, plus the
+/// unadvertised `default` alias comet keeps for older CLIs (see
+/// `crates/harness/src/claude/mod.rs`). Every other argument is ignored —
+/// this fixture checks only that the one flag the adapter derives from
+/// `RunRequest.runtime_mode` is a value a real `claude` binary would accept,
+/// so every scenario that spawns this binary gets that check for free
+/// instead of no scenario checking it at all.
+const VALID_PERMISSION_MODES: &[&str] = &[
+    "acceptEdits",
+    "auto",
+    "bypassPermissions",
+    "manual",
+    "dontAsk",
+    "plan",
+    "default",
+];
+
+fn check_permission_mode() {
+    let args: Vec<String> = std::env::args().collect();
+    let Some(pos) = args.iter().position(|a| a == "--permission-mode") else {
+        return;
+    };
+    let Some(value) = args.get(pos + 1) else {
+        return;
+    };
+    if !VALID_PERMISSION_MODES.contains(&value.as_str()) {
+        eprintln!(
+            "fake-claude: --permission-mode {value:?} is not a value the real CLI accepts \
+             (expected one of {VALID_PERMISSION_MODES:?})"
+        );
+        exit(1);
+    }
+}
+
 fn main() {
+    check_permission_mode();
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
     let first = read_line(&mut stdin);
