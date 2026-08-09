@@ -195,6 +195,38 @@ pub struct ToolItem {
     pub resolved: bool,
 }
 
+/// The approval card's paint discriminator — the ONLY thing that may vary by
+/// decision (`.agents/rules/gpui-ui.md`: layout constants never depend on
+/// which color is painted). Carries the decision KIND, not the decision
+/// itself, because `Allow` and `AllowForSession` are both the user saying
+/// yes and paint identically; only `approval_card`'s match arm needs to know
+/// which of the four looks to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalPaint {
+    /// No decision recorded yet.
+    Open,
+    /// `Allow` or `AllowForSession`.
+    Allowed,
+    /// A choice the user made, not a failure — never painted `danger`/red.
+    Denied,
+    /// Host-stamped because the run ended with this still open.
+    Expired,
+}
+
+impl ApprovalPaint {
+    fn of(decision: Option<&comet_proto::ApprovalDecision>) -> Self {
+        use comet_proto::ApprovalDecision;
+        match decision {
+            None => ApprovalPaint::Open,
+            Some(ApprovalDecision::Allow) | Some(ApprovalDecision::AllowForSession) => {
+                ApprovalPaint::Allowed
+            }
+            Some(ApprovalDecision::Deny { .. }) => ApprovalPaint::Denied,
+            Some(ApprovalDecision::Expired) => ApprovalPaint::Expired,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum RowKind {
     User {
@@ -249,9 +281,9 @@ pub enum RowKind {
         detail: SharedString,
         /// The terminal caption, once decided. `None` while open.
         state: Option<SharedString>,
-        /// Paint-only: the host stamped `Expired` because the run ended with
-        /// this still open. Changes colour, never layout.
-        expired: bool,
+        /// Paint-only discriminator for the decision (or its absence).
+        /// Changes colour and icon, never layout.
+        paint: ApprovalPaint,
     },
     ErrorChip {
         message: SharedString,
@@ -516,8 +548,7 @@ pub fn rows_for_entry(
                         let state = decision.as_ref().map(|d| {
                             SharedString::from(comet_proto::view::approval_decision_label(d))
                         });
-                        let expired =
-                            matches!(decision, Some(comet_proto::ApprovalDecision::Expired));
+                        let paint = ApprovalPaint::of(decision.as_ref());
                         let mut fp = detail.as_bytes().to_vec();
                         fp.extend_from_slice(label.as_bytes());
                         if let Some(state) = &state {
@@ -534,7 +565,7 @@ pub fn rows_for_entry(
                                 label,
                                 detail: detail.into(),
                                 state,
-                                expired,
+                                paint,
                             },
                             entry_id: entry_id.clone(),
                             timestamp: None,
@@ -1817,8 +1848,8 @@ impl Transcript {
                 label,
                 detail,
                 state,
-                expired,
-            } => approval_card(label, detail.clone(), state.clone(), *expired, &theme),
+                paint,
+            } => approval_card(label, detail.clone(), state.clone(), *paint, &theme),
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::NoticeChip {
                 summary,
@@ -2396,10 +2427,17 @@ fn notice_chip(
 ///
 /// Two lines, **56px in every kind and every state**: layout never varies with
 /// the decision, so an approval resolving cannot reflow the transcript under
-/// the user's scroll position (`.agents/rules/gpui-ui.md`). Open reads in
-/// neutral tones — this is a state to resolve, not a failure, so `danger` is
-/// wrong for it; `Expired` reads amber (`warning_muted`) and its caption
-/// carries the reason, because it is the one state the user did not choose.
+/// the user's scroll position (`.agents/rules/gpui-ui.md`). Height, padding,
+/// icon size and tile size are the SAME literals in every arm below — only
+/// the `match` on [`ApprovalPaint`] may vary between them.
+///
+/// Open and `Denied` both read in neutral tones — a denial is a choice the
+/// user made, not a failure, so `danger`/red is wrong for it
+/// (`.agents/rules/user-facing-errors.md`); `Allowed` reads `success_muted`,
+/// `Expired` reads amber (`warning_muted`) because it is the one state the
+/// user did not choose. Icon plus tint/caption-color is what has to carry the
+/// distinction on its own — this project has shipped a card that painted
+/// every decision identically twice before.
 ///
 /// Passive by construction, like [`input_chip`]: the decision controls live in
 /// the composer, so there is no control here to disable when the approval is
@@ -2408,23 +2446,45 @@ fn approval_card(
     label: &'static str,
     detail: SharedString,
     state: Option<SharedString>,
-    expired: bool,
+    paint: ApprovalPaint,
     theme: &Theme,
 ) -> AnyElement {
-    let (border, wash, tile, tint) = if expired {
-        (
-            theme.warning_muted.opacity(0.16),
-            theme.warning_muted.opacity(0.05),
-            theme.warning_muted.opacity(0.12),
-            theme.warning_muted,
-        )
-    } else {
-        (
+    let (border, wash, tile, tint, icon_path, caption_color) = match paint {
+        ApprovalPaint::Allowed => (
+            theme.success_muted.opacity(0.16),
+            theme.success_muted.opacity(0.05),
+            theme.success_muted.opacity(0.12),
+            theme.success_muted,
+            crate::icons::CHECK,
+            theme.text_muted,
+        ),
+        ApprovalPaint::Denied => (
             crate::theme::hairline(0.08),
             crate::theme::ink(0.045),
             crate::theme::ink(0.09),
             theme.text_muted,
-        )
+            crate::icons::CLOSE_CIRCLE,
+            // The one caption that departs from the muted tone every other
+            // state uses — a refusal has to read differently from an
+            // approval at a glance, not just carry a different word.
+            theme.text,
+        ),
+        ApprovalPaint::Expired => (
+            theme.warning_muted.opacity(0.16),
+            theme.warning_muted.opacity(0.05),
+            theme.warning_muted.opacity(0.12),
+            theme.warning_muted,
+            crate::icons::KEY_MINIMALISTIC,
+            theme.text_muted,
+        ),
+        ApprovalPaint::Open => (
+            crate::theme::hairline(0.08),
+            crate::theme::ink(0.045),
+            crate::theme::ink(0.09),
+            theme.text_muted,
+            crate::icons::KEY_MINIMALISTIC,
+            theme.text_muted,
+        ),
     };
     div()
         .py(px(4.0))
@@ -2460,7 +2520,7 @@ fn approval_card(
                                 .items_center()
                                 .justify_center()
                                 .child(
-                                    crate::icons::icon(crate::icons::KEY_MINIMALISTIC)
+                                    crate::icons::icon(icon_path)
                                         .size(px(12.0))
                                         .text_color(tint),
                                 ),
@@ -2478,7 +2538,7 @@ fn approval_card(
                                 .flex_none()
                                 .min_w_0()
                                 .truncate()
-                                .text_color(theme.text_muted)
+                                .text_color(caption_color)
                                 .child(state)
                         })),
                 )
@@ -3037,7 +3097,7 @@ mod tests {
             label,
             detail,
             state,
-            expired,
+            paint,
         } = &rows[1].kind
         else {
             panic!("expected ApprovalCard, got another row kind");
@@ -3045,7 +3105,7 @@ mod tests {
         assert_eq!(*label, "Run a command");
         assert_eq!(detail.as_ref(), "cargo test --workspace");
         assert_eq!(*state, None, "an open approval has no terminal caption");
-        assert!(!*expired);
+        assert_eq!(*paint, ApprovalPaint::Open);
     }
 
     #[test]
@@ -3059,14 +3119,14 @@ mod tests {
             )],
         );
         let rows = rows_for_entry(&entry, false, &mut parse);
-        let RowKind::ApprovalCard { state, expired, .. } = &rows[0].kind else {
+        let RowKind::ApprovalCard { state, paint, .. } = &rows[0].kind else {
             panic!("expected ApprovalCard");
         };
         assert_eq!(
             state.as_ref().map(|s| s.as_ref()),
             Some("Allowed for this session")
         );
-        assert!(!*expired);
+        assert_eq!(*paint, ApprovalPaint::Allowed);
     }
 
     /// `Expired` paints differently (amber, a state to resolve) but must NOT
@@ -3085,18 +3145,86 @@ mod tests {
         let rows = rows_for_entry(&entry, false, &mut parse);
         let RowKind::ApprovalCard {
             state,
-            expired,
+            paint,
             label,
             detail,
         } = &rows[0].kind
         else {
             panic!("expected ApprovalCard");
         };
-        assert!(*expired);
+        assert_eq!(*paint, ApprovalPaint::Expired);
         assert!(state.as_ref().is_some_and(|s| s.contains("run ended")));
         // Identical to the open row's content fields: only paint may differ.
         assert_eq!(*label, "Run a command");
         assert_eq!(detail.as_ref(), "cargo test --workspace");
+    }
+
+    /// The whole point of splitting the paint discriminator out of `expired`:
+    /// a decision must change how the card LOOKS (Allowed/Denied/Expired/Open
+    /// all pairwise distinct) without changing anything layout-bearing — the
+    /// 56px card must not reflow under the user's scroll position when a
+    /// decision lands.
+    #[test]
+    fn the_paint_discriminator_differs_by_decision_while_layout_fields_do_not() {
+        let row_for = |decision: Option<comet_proto::ApprovalDecision>| {
+            let entry = assistant(
+                "m1",
+                MessageStatus::Complete,
+                vec![approval_part("ap-r1", decision)],
+            );
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            let RowKind::ApprovalCard {
+                label,
+                detail,
+                paint,
+                ..
+            } = rows[0].kind.clone()
+            else {
+                panic!("expected ApprovalCard");
+            };
+            (label, detail, paint)
+        };
+
+        let (open_label, open_detail, open_paint) = row_for(None);
+        let (allow_label, allow_detail, allow_paint) =
+            row_for(Some(comet_proto::ApprovalDecision::Allow));
+        let (session_label, session_detail, session_paint) =
+            row_for(Some(comet_proto::ApprovalDecision::AllowForSession));
+        let (deny_label, deny_detail, deny_paint) =
+            row_for(Some(comet_proto::ApprovalDecision::Deny {
+                message: "no".into(),
+            }));
+        let (expired_label, expired_detail, expired_paint) =
+            row_for(Some(comet_proto::ApprovalDecision::Expired));
+
+        // Layout-bearing content (what `approval_card` sizes/lays out around)
+        // never varies with the decision — only the request does.
+        for (label, detail) in [
+            (open_label, &open_detail),
+            (allow_label, &allow_detail),
+            (session_label, &session_detail),
+            (deny_label, &deny_detail),
+            (expired_label, &expired_detail),
+        ] {
+            assert_eq!(label, "Run a command");
+            assert_eq!(detail.as_ref(), "cargo test --workspace");
+        }
+
+        // Allow and AllowForSession are the SAME paint (both "the user said
+        // yes") — that is deliberate, not the bug. Everything else must be
+        // pairwise distinct, or a refusal is indistinguishable from an
+        // approval on a scrolled-back transcript (the defect this guards).
+        assert_eq!(allow_paint, session_paint);
+        let distinct = [open_paint, allow_paint, deny_paint, expired_paint];
+        for i in 0..distinct.len() {
+            for j in (i + 1)..distinct.len() {
+                assert_ne!(
+                    distinct[i], distinct[j],
+                    "paint must differ across {:?} vs {:?}",
+                    distinct[i], distinct[j]
+                );
+            }
+        }
     }
 
     /// The decision changes the row's CONTENT, so it has to change the row's
