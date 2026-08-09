@@ -241,11 +241,16 @@ impl Harness for CodexHarness {
                 "codex sandbox escalated to danger-full-access: linked worktree on a \
                  slash-named branch trips codex's worktree-mount derivation"
             );
-            // `runtime_mode` deliberately stays untouched: nothing reads it
-            // yet, so this leaves the request's mode/sandbox pair
-            // disagreeing. Once an adapter starts reading `runtime_mode`,
-            // reconcile the two here instead of letting this escalation
-            // silently drift out of sync with it.
+            // `runtime_mode` is read further down (the approval branch that
+            // checks for `RuntimeMode::FullAccess`), so this escalation
+            // matters to more than the sandbox: it raises only `sandbox`
+            // and leaves `runtime_mode` as the caller set it. On a
+            // full-access request the pair stays coherent by coincidence;
+            // on any other mode it does not — the request now runs with a
+            // danger-full-access sandbox under a mode that did not ask for
+            // one. Whoever next derives Codex's approval policy from
+            // `runtime_mode` has to decide whether escalating the sandbox
+            // here should escalate the mode too.
             request.sandbox = comet_proto::SandboxLevel::DangerFullAccess;
         }
         let mut cmd = Command::new(&exe);
@@ -1078,8 +1083,9 @@ fn handle_server_request(
     );
     if !is_approval {
         // Answer FIRST — the server must never wedge awaiting a reply — then
-        // count. The -32601 reply is byte-for-byte what shipped before this
-        // slice; counting rides the return path, nothing more.
+        // count. The -32601 reply is the same one this adapter has always
+        // sent for an unsupported method; counting rides the return path,
+        // nothing more.
         client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
         tracing::warn!(
             target: "comet_harness::codex",

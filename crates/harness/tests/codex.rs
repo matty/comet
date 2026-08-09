@@ -32,6 +32,10 @@ fn request(prompt: &str) -> RunRequest {
         reasoning: Some(ReasoningLevel::Ultra),
         model_options: serde_json::Map::new(),
         cwd: String::new(),
+        // Deliberately mismatched, unlike the Claude fixture: the Codex
+        // adapter reads `sandbox` directly (Claude does not), so exercising
+        // `FullAccess` against a `WorkspaceWrite` sandbox is a real,
+        // distinct case here, not fixture drift.
         runtime_mode: RuntimeMode::FullAccess,
         sandbox: SandboxLevel::WorkspaceWrite,
         attachments: Vec::new(),

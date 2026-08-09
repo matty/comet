@@ -196,6 +196,10 @@ impl ClaudeHarness {
         // `default` is the CLI's unadvertised alias for the mode it now lists
         // as `manual`; both ask before each tool call. Keep `default` — it is
         // accepted by every CLI version comet resolves, and `manual` is not.
+        // Captured against the installed Claude Code 2.1.226: `--permission-mode
+        // --help` advertises exactly `acceptEdits`, `auto`, `bypassPermissions`,
+        // `manual`, `dontAsk`, `plan`, and that binary also accepts the
+        // unadvertised `default` (`--permission-mode bogus` exits 1 instead).
         let (permission_mode, skip_permissions) = match request.runtime_mode {
             RuntimeMode::ApprovalRequired => ("default", false),
             RuntimeMode::AutoAcceptEdits => ("acceptEdits", false),
