@@ -11,9 +11,10 @@
 //! - Notifications map to [`AgentEvent`]s: agentMessage/reasoning deltas (both
 //!   `delta`/`textDelta` spellings), item lifecycles → typed ToolCall/ToolResult,
 //!   `thread/tokenUsage/updated` → Usage, turn/completed|failed|aborted → Done.
-//! - Approvals: the wire policy is always `"never"` — parity with the Claude
-//!   adapter's auto-approve-everything (unattended runs; the sandbox is the
-//!   guardrail). Stray `item/commandExecution/requestApproval` +
+//! - Approvals: the wire policy is pinned to `"never"` for now, not
+//!   permanently — see [`CodexHarness::run`] for what pinning it still costs
+//!   and what deriving it from `runtime_mode` would fix. Stray
+//!   `item/commandExecution/requestApproval` +
 //!   `item/fileChange/requestApproval` still round-trip through
 //!   [`RunControls::request_input`] as a synthesized yes/no question.
 //! - Steering: `turn/steer { expectedTurnId }` into the live turn; a rejected
@@ -165,7 +166,10 @@ impl CodexHarness {
             // both mean "no approval prompt", which is what a `"never"` policy
             // delivers. The asking modes belong to the change that derives the
             // policy from the mode — declaring one the adapter cannot keep
-            // would offer a promise the run breaks.
+            // would offer a promise the run breaks. One declared promise is
+            // still conditional: the linked-worktree sandbox workaround below
+            // can silently raise `AutoAcceptEdits`'s workspace-write sandbox
+            // to danger-full-access.
             runtime_modes: vec![RuntimeMode::AutoAcceptEdits, RuntimeMode::FullAccess],
         }
     }
@@ -236,8 +240,7 @@ impl Harness for CodexHarness {
         // every command before it starts; `wing-x` is fine; explicit
         // writableRoots don't suppress the broken derivation; full access
         // works). Escalate that exact shape instead of shipping a session
-        // where nothing can run — parity note: the Claude adapter effectively
-        // grants full access anyway (auto-approved can_use_tool).
+        // where nothing can run.
         if request.sandbox == comet_proto::SandboxLevel::WorkspaceWrite
             && worktree_on_slashed_branch(&request.cwd)
         {

@@ -230,7 +230,9 @@ fn happy(turn_line: &str, thread_line: &str, tid: &str) {
 
 fn auto_reviewer(thread_line: &str, tid: &str) {
     // `Auto` is the only runtime mode that hands approval review to the
-    // provider; every other scenario pins "user" via `happy`'s assertions.
+    // provider. `happy` is the only other scenario whose thread-line
+    // assertions inspect `approvalsReviewer` (pinned to "user"); the rest
+    // check the thread line only for `approvalPolicy`.
     if !thread_line.contains(r#""approvalsReviewer":"auto_review""#) {
         fail_turn(
             tid,

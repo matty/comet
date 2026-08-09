@@ -306,6 +306,36 @@ async fn auto_mode_sends_the_provider_as_the_approvals_reviewer() {
     );
 }
 
+/// `AutoAcceptEdits` is declared in [`CodexHarness::capabilities`] but no
+/// other test ever sets it. It maps to the same `"user"` reviewer `happy`'s
+/// thread-line assertions already pin for `FullAccess`
+/// (`fixtures/fake_codex.rs:167`), so reusing `happy` — with the same `cwd`
+/// and `serviceTier` the assertions require — is enough to prove the mapping
+/// reaches the wire without a dedicated scenario.
+#[tokio::test]
+async fn auto_accept_edits_reaches_the_wire_as_user() {
+    let (controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:happy");
+    req.runtime_mode = RuntimeMode::AutoAcceptEdits;
+    req.cwd = "/tmp".into();
+    req.model_options.insert(
+        "serviceTier".into(),
+        serde_json::Value::String("fast".into()),
+    );
+    let events = run_to_end(&harness(), req, controls).await;
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+}
+
 #[tokio::test]
 async fn steering_uses_turn_steer_with_expected_turn_id() {
     let (controls, steer, _token) = controls("Yes");

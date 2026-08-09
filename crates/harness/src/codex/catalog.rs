@@ -77,8 +77,8 @@ pub(crate) fn sandbox_policy_value(sandbox: SandboxLevel) -> serde_json::Value {
 ///
 /// Sending this is currently inert — the wire approval policy is pinned to
 /// `"never"`, so no approval is ever raised for a reviewer to answer. It is
-/// sent anyway so the thread carries the mode's full intent, and so the slice
-/// that unpins the policy changes one literal rather than three.
+/// sent anyway so the thread carries the mode's full intent, and so the
+/// change that unpins the policy changes one literal rather than three.
 pub(crate) fn approvals_reviewer(mode: RuntimeMode) -> &'static str {
     match mode {
         RuntimeMode::Auto => "auto_review",
