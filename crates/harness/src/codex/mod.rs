@@ -11,9 +11,10 @@
 //! - Notifications map to [`AgentEvent`]s: agentMessage/reasoning deltas (both
 //!   `delta`/`textDelta` spellings), item lifecycles → typed ToolCall/ToolResult,
 //!   `thread/tokenUsage/updated` → Usage, turn/completed|failed|aborted → Done.
-//! - Approvals: the wire policy is always `"never"` — parity with the Claude
-//!   adapter's auto-approve-everything (unattended runs; the sandbox is the
-//!   guardrail). Stray `item/commandExecution/requestApproval` +
+//! - Approvals: the wire policy is pinned to `"never"` for now, not
+//!   permanently — see [`CodexHarness::run`] for what pinning it still costs
+//!   and what deriving it from `runtime_mode` would fix. Stray
+//!   `item/commandExecution/requestApproval` +
 //!   `item/fileChange/requestApproval` still round-trip through
 //!   [`RunControls::request_input`] as a synthesized yes/no question.
 //! - Steering: `turn/steer { expectedTurnId }` into the live turn; a rejected
@@ -48,7 +49,10 @@ use comet_proto::{
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
-use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
+use catalog::{
+    REASONING_LEVELS, approvals_reviewer, sandbox_mode, sandbox_policy_value, static_models,
+    to_effort,
+};
 use normalize::{
     Phase, RateLimitThresholds, delta_text, ignored_notification_reason, item_id, item_type,
     map_item, notice_for, rate_limit_notice, turn_error_message, turn_id, usage_event,
@@ -158,10 +162,15 @@ impl CodexHarness {
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: REASONING_LEVELS.to_vec(),
-            // Undeclared: nothing maps a runtime mode onto codex's approval
-            // policy yet, and declaring a mode the adapter does not honor
-            // would offer a promise the run cannot keep.
-            runtime_modes: Vec::new(),
+            // Only the modes the pinned wire approval policy actually honors:
+            // both mean "no approval prompt", which is what a `"never"` policy
+            // delivers. The asking modes belong to the change that derives the
+            // policy from the mode — declaring one the adapter cannot keep
+            // would offer a promise the run breaks. One declared promise is
+            // still conditional: the linked-worktree sandbox workaround below
+            // can silently raise `AutoAcceptEdits`'s workspace-write sandbox
+            // to danger-full-access.
+            runtime_modes: vec![RuntimeMode::AutoAcceptEdits, RuntimeMode::FullAccess],
         }
     }
 
@@ -231,8 +240,7 @@ impl Harness for CodexHarness {
         // every command before it starts; `wing-x` is fine; explicit
         // writableRoots don't suppress the broken derivation; full access
         // works). Escalate that exact shape instead of shipping a session
-        // where nothing can run — parity note: the Claude adapter effectively
-        // grants full access anyway (auto-approved can_use_tool).
+        // where nothing can run.
         if request.sandbox == comet_proto::SandboxLevel::WorkspaceWrite
             && worktree_on_slashed_branch(&request.cwd)
         {
@@ -241,16 +249,18 @@ impl Harness for CodexHarness {
                 "codex sandbox escalated to danger-full-access: linked worktree on a \
                  slash-named branch trips codex's worktree-mount derivation"
             );
-            // `runtime_mode` is read further down (the approval branch that
-            // checks for `RuntimeMode::FullAccess`), so this escalation
-            // matters to more than the sandbox: it raises only `sandbox`
-            // and leaves `runtime_mode` as the caller set it. On a
-            // full-access request the pair stays coherent by coincidence;
-            // on any other mode it does not — the request now runs with a
-            // danger-full-access sandbox under a mode that did not ask for
-            // one. Whoever next derives Codex's approval policy from
-            // `runtime_mode` has to decide whether escalating the sandbox
-            // here should escalate the mode too.
+            // `runtime_mode` is read further down — by `approvals_reviewer`
+            // on `thread/start`, and by the `RuntimeMode::FullAccess` check
+            // below — so this escalation matters to more than the sandbox.
+            // It raises only `sandbox` and deliberately leaves `runtime_mode`
+            // as the caller set it, so the reviewer keeps reflecting what the
+            // caller asked for rather than what this CLI-bug workaround
+            // forced. On a full-access request the pair stays coherent by
+            // coincidence; on any other mode it does not — the request now
+            // runs with a danger-full-access sandbox under a mode that did
+            // not ask for one. Whoever next derives Codex's approval *policy*
+            // from `runtime_mode` still has to decide whether escalating the
+            // sandbox here should escalate the policy too.
             request.sandbox = comet_proto::SandboxLevel::DangerFullAccess;
         }
         let mut cmd = Command::new(&exe);
@@ -425,12 +435,16 @@ async fn run_session(session: Session) {
     let request_input = Arc::new(request_input);
 
     // ---- wire params ------------------------------------------------------
-    // Parity with the Claude adapter, which auto-approves every `can_use_tool`
-    // regardless of `runtime_mode` (comet sessions run unattended; the sandbox
-    // is the guardrail): never surface wire approvals. "on-request" turned
-    // every command into a yes/no question (user report: "asking me for
-    // approval at every step"). The approval-as-input plumbing below stays for
-    // stray requests and a future explicit permission-mode setting.
+    // Pinned rather than derived from `runtime_mode`: an approval Codex raises
+    // today has nowhere honest to go, so it round-trips through the
+    // synthesized yes/no input question and surfaces to the user as a generic
+    // prompt — "on-request" turned every command into exactly that (user
+    // report: "asking me for approval at every step"). `"never"` removes the
+    // prompt entirely; the approval-as-input plumbing below stays for stray
+    // requests. `FullAccess` and `Auto` already mean what `"never"` says, but
+    // `ApprovalRequired` and `AutoAcceptEdits` do not — deriving the policy
+    // from `runtime_mode` instead of pinning it is what makes those two modes
+    // honest.
     let approval_policy = "never";
     let effort = to_effort(request.reasoning);
     // Service tier rides thread-start and every turn (mirrors the Codex IDE
@@ -447,6 +461,10 @@ async fn run_session(session: Session) {
         p.insert("cwd".into(), Value::String(request.cwd.clone()));
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
+        p.insert(
+            "approvalsReviewer".into(),
+            approvals_reviewer(request.runtime_mode).into(),
+        );
         if let Some(model) = &request.model {
             p.insert("model".into(), Value::String(model.clone()));
         }

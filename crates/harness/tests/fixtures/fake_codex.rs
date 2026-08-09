@@ -119,6 +119,8 @@ fn main() {
         steer_race(&mut stdin, &tid);
     } else if turn_line.contains("scenario:steer") {
         steer(&mut stdin, &tid);
+    } else if turn_line.contains("scenario:auto-reviewer") {
+        auto_reviewer(&thread_line, &tid);
     } else if turn_line.contains("scenario:approve") {
         approve(&mut stdin, &turn_line, &thread_line, &tid);
     } else if turn_line.contains("scenario:decline") {
@@ -162,6 +164,7 @@ fn happy(turn_line: &str, thread_line: &str, tid: &str) {
         r#""sandbox":"workspace-write""#,
         r#""cwd":"/tmp""#,
         r#""serviceTier":"fast""#,
+        r#""approvalsReviewer":"user""#,
     ] {
         if !thread_line.contains(want) {
             fail_turn(tid, &format!("thread param missing: {want}"));
@@ -222,6 +225,25 @@ fn happy(turn_line: &str, thread_line: &str, tid: &str) {
     emit(
         r#"{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"last":{"inputTokens":42,"outputTokens":7}}}}"#,
     );
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+}
+
+fn auto_reviewer(thread_line: &str, tid: &str) {
+    // `Auto` is the only runtime mode that hands approval review to the
+    // provider. `happy` is the only other scenario whose thread-line
+    // assertions inspect `approvalsReviewer` (pinned to "user"); the rest
+    // check the thread line only for `approvalPolicy`.
+    if !thread_line.contains(r#""approvalsReviewer":"auto_review""#) {
+        fail_turn(
+            tid,
+            "thread param missing: \"approvalsReviewer\":\"auto_review\"",
+        );
+        return;
+    }
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
 }
 

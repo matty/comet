@@ -40,9 +40,12 @@
 ## Codex app-server protocol
 - Handshake: initialize {clientInfo, capabilities{experimentalApi, optOutNotificationMethods}} ->
   initialized notification. Overload = JSON-RPC error -32001.
-- thread/start {model?, cwd, approvalPolicy, sandbox} -> thread.id; thread/resume {threadId}
-  (fallback to thread/start if rollout missing).
-- turn/start {threadId, input:[{type:"text",text}], model?, effort?, sandboxPolicy, approvalPolicy};
+- thread/start {cwd, approvalPolicy, sandbox, approvalsReviewer, model?, serviceTier?} -> thread.id;
+  thread/resume sends the SAME params plus {threadId} (fallback to thread/start if rollout
+  missing). approvalsReviewer verified accepted+echoed on both, codex-cli 0.147.0 — the echo
+  rides the RPC result inline, NOT a thread/settings/updated notification.
+- turn/start {threadId, input:[{type:"text",text}], sandboxPolicy, approvalPolicy, summary:"auto",
+  model?, effort?, serviceTier?};
   turn/steer {threadId, expectedTurnId, input}; turn/interrupt {threadId, turnId}.
 - Notifications: turn/started|completed{usage}|failed|aborted; item/started|completed
   (item.type: agent_message, reasoning, command_execution, file_change, mcp_tool_call, web_search,
