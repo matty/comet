@@ -22,8 +22,7 @@ use gpui::{
 
 use comet_engine::registry::HarnessDescriptor;
 use comet_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, RuntimeMode,
-    SandboxLevel, ServerRef,
+    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, RuntimeMode, ServerRef,
 };
 use comet_rpc::methods;
 
@@ -65,6 +64,7 @@ pub struct DraftConfig {
     pub reasoning: Option<ReasoningLevel>,
     /// option id → choice id (only non-defaults are meaningful).
     pub model_options: serde_json::Map<String, serde_json::Value>,
+    pub runtime_mode: RuntimeMode,
     /// The picked ref (base branch in NewWorktree mode; a worktree's branch
     /// when reusing one). `None` = the repo's current branch.
     pub branch: Option<String>,
@@ -109,6 +109,7 @@ pub struct ResolvedRunConfig {
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
     pub model_options: serde_json::Map<String, serde_json::Value>,
+    pub runtime_mode: RuntimeMode,
 }
 
 impl ResolvedRunConfig {
@@ -119,9 +120,8 @@ impl ResolvedRunConfig {
             model: self.model.clone(),
             reasoning: self.reasoning,
             model_options: self.model_options.clone(),
-            sandbox: SandboxLevel::WorkspaceWrite,
-            // Placeholder until the picker exposes a runtime mode control.
-            runtime_mode: RuntimeMode::default(),
+            sandbox: self.runtime_mode.sandbox(),
+            runtime_mode: self.runtime_mode,
         })
     }
 }
@@ -581,6 +581,20 @@ impl Pickers {
         }
     }
 
+    /// The chat's persisted mode for an existing chat, the draft's for the
+    /// new-chat canvas.
+    fn effective_runtime_mode(&self, cx: &App) -> RuntimeMode {
+        match self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|c| c.config.as_ref())
+        {
+            Some(config) => config.runtime_mode,
+            None => self.config.runtime_mode,
+        }
+    }
+
     /// The fully-resolved config the composer threads into the Run request and
     /// `Mutate createChat`: concrete model + reasoning whenever the catalog is
     /// loaded (no "engine picks a default" passthrough).
@@ -594,6 +608,7 @@ impl Pickers {
                 .or_else(|| self.effective_model_id(cx).map(str::to_string)),
             reasoning: self.effective_reasoning(cx),
             model_options: self.explicit_options(cx),
+            runtime_mode: self.effective_runtime_mode(cx),
         }
     }
 
@@ -3089,7 +3104,7 @@ impl Render for Pickers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+    use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice, SandboxLevel};
 
     #[test]
     fn traits_summary_formats_non_defaults() {
@@ -3213,6 +3228,30 @@ mod tests {
         assert_eq!(config.harness, HarnessId::ClaudeCode);
         assert_eq!(config.model.as_deref(), Some("opus"));
         assert_eq!(config.sandbox, SandboxLevel::WorkspaceWrite);
+    }
+
+    #[test]
+    fn chat_config_carries_the_resolved_runtime_mode() {
+        let resolved = ResolvedRunConfig {
+            harness: Some(HarnessId::ClaudeCode),
+            model: Some("claude-fable-5".into()),
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            runtime_mode: RuntimeMode::ApprovalRequired,
+        };
+        let config = resolved.chat_config().expect("harness is set");
+        assert_eq!(config.runtime_mode, RuntimeMode::ApprovalRequired);
+        // The row's sandbox follows the mode, so a later reader of the row
+        // cannot see the two disagree.
+        assert_eq!(config.sandbox, SandboxLevel::ReadOnly);
+    }
+
+    #[test]
+    fn resolved_run_config_defaults_the_runtime_mode() {
+        assert_eq!(
+            ResolvedRunConfig::default().runtime_mode,
+            RuntimeMode::AutoAcceptEdits
+        );
     }
 
     #[test]
