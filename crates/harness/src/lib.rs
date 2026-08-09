@@ -220,6 +220,54 @@ pub(crate) fn cap_prose(s: &str, max_bytes: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// The five places a provider frame becomes an `AgentEvent::Diagnostic`
+/// instead of vanishing silently. Numbered here so the "Sink N" comments
+/// scattered at each site resolve against something real — that numbering
+/// has no meaning outside this repository (the planning document it was
+/// drafted against is not shipped), so this doc comment is its only
+/// in-repo definition:
+///
+/// 1. Claude, two call sites feeding one arm: an unclaimed top-level frame
+///    `type`, or an unclaimed `system/<subtype>` — both classified by
+///    `claude::wire::classify_unclaimed` into `Frame::Unknown`, emitted as
+///    one diagnostic in `claude::normalize`.
+/// 2. Codex: the notification catch-all — a JSON-RPC method on neither the
+///    claimed nor the `codex::normalize::IGNORED_NOTIFICATIONS` list.
+/// 3. Claude: an unclaimed inbound `control_request` subtype, handled (by
+///    not answering it) in `claude::mod::handle_control_request`.
+/// 4. Codex: an unclaimed item `type` inside an otherwise-claimed
+///    notification, in `codex::normalize::map_item`.
+/// 5. Parse failures on both sides — a stdout line that never decoded at
+///    all. Always [`comet_proto::DiagnosticSeverity::Malformed`], always
+///    this fixed sentinel; the raw line stays in `tracing` and never
+///    travels with the event.
+pub(crate) const UNPARSEABLE: &str = "unparseable";
+
+/// Build the diagnostic event for a dropped frame. The caller has already
+/// warn-logged the full frame at the drop site — this carries only the
+/// sanitized name and Comet copy, never provider text (redaction is
+/// structural: the payload is absent, not truncated).
+pub(crate) fn diagnostic(
+    discriminator: &str,
+    severity: comet_proto::DiagnosticSeverity,
+) -> AgentEvent {
+    let summary = match severity {
+        comet_proto::DiagnosticSeverity::Unknown => {
+            "The agent sent a message Comet doesn't recognize."
+        }
+        comet_proto::DiagnosticSeverity::Malformed => {
+            "The agent sent a message Comet couldn't read."
+        }
+    }
+    .to_string();
+    AgentEvent::Diagnostic {
+        discriminator: comet_proto::sanitize_discriminator(discriminator),
+        severity,
+        code: None,
+        summary,
+    }
+}
+
 /// Availability for a CLI that never resolved far enough to be probed.
 ///
 /// Kept out of the adapters so both name the same summaries: the picker groups
@@ -687,5 +735,23 @@ mod probe_tests {
         let capped = cap_prose(&multi, 161);
         assert!(capped.ends_with('…'));
         assert!(capped.chars().all(|c| c == 'é' || c == '…'));
+    }
+
+    /// `Malformed` is the parse-failure severity (sink 5, the only producer
+    /// anywhere in the slice): the fixed `UNPARSEABLE` sentinel travels as the
+    /// discriminator, never the offending line, and the summary is Comet's
+    /// own copy — distinct from the `Unknown` copy used by every other sink.
+    #[test]
+    fn malformed_diagnostic_carries_the_fixed_sentinel_and_its_own_copy() {
+        let ev = diagnostic(UNPARSEABLE, comet_proto::DiagnosticSeverity::Malformed);
+        assert_eq!(
+            ev,
+            AgentEvent::Diagnostic {
+                discriminator: UNPARSEABLE.into(),
+                severity: comet_proto::DiagnosticSeverity::Malformed,
+                code: None,
+                summary: "The agent sent a message Comet couldn't read.".into(),
+            }
+        );
     }
 }

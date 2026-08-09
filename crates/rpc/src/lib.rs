@@ -39,6 +39,7 @@ pub use tls::{
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
     pub const LIST_HARNESSES: &str = "ListHarnesses";
+    pub const LIST_HARNESS_DIAGNOSTICS: &str = "ListHarnessDiagnostics";
     pub const LIST_MODELS: &str = "ListModels";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";

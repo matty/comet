@@ -3,7 +3,10 @@
 //!
 //! Tolerant by construction: both field spellings the app server has shipped
 //! (`delta`/`textDelta`, `exitCode`/`exit_code`, camelCase/snake_case item
-//! types) are accepted, and unknown item types map to nothing.
+//! types) are accepted. Unknown item types no longer map to nothing — an
+//! item type inside an otherwise-claimed notification that Comet does not
+//! understand becomes an Unknown diagnostic (see `map_item`'s `other` arm),
+//! counted and journaled rather than dropped silently.
 
 use comet_proto::{AgentEvent, NoticeKind, NoticeSeverity, TodoItem, ToolCall};
 use serde_json::Value;
@@ -205,8 +208,33 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
         "error" => vec![AgentEvent::Error {
             message: str_field(item, &["message"]),
         }],
-        // userMessage / reasoning / agentMessage flow through delta channels.
-        _ => Vec::new(),
+        // userMessage / reasoning flow through delta channels (agentMessage
+        // is routed by the session loop before map_item is reached, but both
+        // spellings are named here so a refactor can't misread them as
+        // unknown).
+        "userMessage" | "user_message" | "reasoning" | "agentMessage" | "agent_message" => {
+            Vec::new()
+        }
+        other => {
+            // Sink 4: an item type inside a CLAIMED notification that Comet
+            // does not understand. `item/<type>` keeps it distinguishable
+            // from a method. Fires on started AND completed, so one unknown
+            // item counts twice — a frequency signal, not an item count.
+            tracing::warn!(
+                target: "comet_harness::codex",
+                item = %item,
+                "unrecognized item type (recorded as a diagnostic)"
+            );
+            let discriminator = if other.is_empty() {
+                "item/untyped".to_string()
+            } else {
+                format!("item/{other}")
+            };
+            vec![crate::diagnostic(
+                &discriminator,
+                comet_proto::DiagnosticSeverity::Unknown,
+            )]
+        }
     }
 }
 
@@ -345,6 +373,61 @@ pub(crate) fn rate_limit_notice(
         detail: None,
         key: Some("rateLimit".into()),
     })
+}
+
+/// Notification methods Comet recognizes and deliberately drops — the middle
+/// tier of the Claimed / Ignored / Unknown classification. Reasons: a slice
+/// number (e.g. `"4.2"`, `"2.4"`, `"phase-1"`) names a roadmap slice that
+/// will later claim the entry and move it out of this table; it is a
+/// maintenance obligation, not a fact about the notification, and reading
+/// only this repository will not resolve which slice that is; any other
+/// reason names why no surface wants it. ★ = confirmed firing on a real codex-cli 0.147.0 capture
+/// (2026-08-08); the rest are named by the generated schema (70 methods).
+/// The hook/* and item/autoApprovalReview/* families are exactly the two
+/// members each — the schema has no others, so literal strings, no globs.
+/// Deliberately NOT here (notice-material or genuinely unused, so a
+/// diagnostic is the honest signal): warning, guardianWarning,
+/// deprecationNotice, configWarning, model/rerouted, model/verification,
+/// turn/moderationMetadata, the thread archive/delete/goal/realtime families,
+/// fs/changed, windowsSandbox/setupCompleted, windows/worldWritableWarning
+/// (neither fired even when the Windows sandbox failed).
+pub(crate) const IGNORED_NOTIFICATIONS: &[(&str, &str)] = &[
+    // owned by a later slice
+    ("skills/changed", "2.4"),
+    ("turn/plan/updated", "4.2"),
+    ("item/plan/delta", "4.2"),
+    ("hook/started", "4.2"),
+    ("hook/completed", "4.2"),
+    ("item/autoApprovalReview/started", "phase-1"),
+    ("item/autoApprovalReview/completed", "phase-1"),
+    // no user-relevant state
+    ("account/updated", "transient"),
+    ("thread/status/changed", "transient"), // ★ 2 per session
+    ("thread/environment/connected", "baseline"),
+    ("thread/started", "redundant"),              // ★ 1 per session
+    ("thread/settings/updated", "settings-echo"), // ★ 1 per session
+    ("remoteControl/status/changed", "remote-status"), // ★ 1 per session
+    ("thread/name/updated", "redundant"),
+    ("serverRequest/resolved", "bookkeeping"),
+    ("process/exited", "bookkeeping"),
+    // high-volume streams comet does not render yet
+    ("item/commandExecution/outputDelta", "unrendered"), // ★
+    ("command/exec/outputDelta", "unrendered"),
+    ("process/outputDelta", "unrendered"),
+    ("item/fileChange/patchUpdated", "unrendered"),
+    ("turn/diff/updated", "unrendered"),
+    ("item/mcpToolCall/progress", "progress"),
+    ("item/reasoning/summaryPartAdded", "boundary"), // ★
+    // schema-deprecated
+    ("item/fileChange/outputDelta", "deprecated"),
+    ("thread/compacted", "deprecated"),
+];
+
+pub(crate) fn ignored_notification_reason(method: &str) -> Option<&'static str> {
+    IGNORED_NOTIFICATIONS
+        .iter()
+        .find(|(name, _)| *name == method)
+        .map(|(_, reason)| *reason)
 }
 
 #[cfg(test)]
@@ -636,5 +719,70 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn the_notification_ignore_list_names_the_capture_confirmed_methods() {
+        // codex-cli 0.147.0 capture (2026-08-08): these fire on a healthy
+        // session; one diagnostic from any of them lies on the settings card.
+        for method in [
+            "thread/started",
+            "thread/settings/updated",
+            "remoteControl/status/changed",
+            "thread/status/changed",
+            "item/reasoning/summaryPartAdded",
+            "item/commandExecution/outputDelta",
+        ] {
+            assert!(
+                ignored_notification_reason(method).is_some(),
+                "{method} fires on a healthy session and must be Ignored"
+            );
+        }
+        // Notice-material or genuinely unused methods stay Unknown on
+        // purpose — a diagnostic is the honest signal until a slice claims
+        // them.
+        for method in [
+            "deprecationNotice",
+            "model/rerouted",
+            "warning",
+            "guardianWarning",
+        ] {
+            assert!(ignored_notification_reason(method).is_none(), "{method}");
+        }
+    }
+
+    #[test]
+    fn unknown_item_types_map_to_an_item_diagnostic() {
+        use comet_proto::DiagnosticSeverity;
+        // Sink 4: decoded fine, item type not understood → Unknown (never
+        // Malformed — that stays reserved for parse failures).
+        let events = map_item(
+            Phase::Started,
+            &json!({"type": "contextCompaction", "id": "cc1", "secret": "do-not-carry"}),
+        );
+        assert_eq!(
+            events,
+            vec![AgentEvent::Diagnostic {
+                discriminator: "item/contextCompaction".into(),
+                severity: DiagnosticSeverity::Unknown,
+                code: None,
+                summary: "The agent sent a message Comet doesn't recognize.".into(),
+            }]
+        );
+        // The delta-channel types are claimed elsewhere, not unknown.
+        assert!(map_item(Phase::Started, &json!({"type": "reasoning", "id": "r1"})).is_empty());
+        assert!(
+            map_item(
+                Phase::Completed,
+                &json!({"type": "userMessage", "id": "u1"})
+            )
+            .is_empty()
+        );
+        // An untyped item still gets a stable, sanitizer-safe name.
+        let events = map_item(Phase::Started, &json!({"id": "x"}));
+        assert!(matches!(
+            &events[0],
+            AgentEvent::Diagnostic { discriminator, .. } if discriminator == "item/untyped"
+        ));
     }
 }

@@ -11,8 +11,8 @@ use comet_harness::{
     CancellationToken, ClaudeHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, RunRequest, SandboxLevel,
-    ToolCall, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, RunRequest,
+    SandboxLevel, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 /// The `fake-claude` bin target, built by cargo alongside this test.
@@ -445,11 +445,85 @@ async fn notice_frames_surface_as_notice_events() {
         "{notices:?}"
     );
 
+    // The unclaimed someFutureSubtype now surfaces as a diagnostic — 0b.2's
+    // interlock with 0b.1's parse_frame allowlist — rather than vanishing.
+    let diagnostics: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Diagnostic {
+                discriminator,
+                severity,
+                ..
+            } => Some((discriminator.as_str(), *severity)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        diagnostics,
+        vec![("system/someFutureSubtype", DiagnosticSeverity::Unknown)]
+    );
+
     // Exactly the scripted emitters fired — compaction, reroute, retry x2,
     // informational, notification, rate limit — and the unclaimed future
     // subtype produced neither a notice nor an error.
     assert_eq!(notices.len(), 7, "{notices:?}");
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn unclaimed_frames_surface_as_diagnostics_and_ignored_frames_stay_silent() {
+    let (controls, _steer, _token) = controls("A");
+    let events = run_to_end(&harness(), request("scenario:diagnostics"), controls).await;
+
+    let diagnostics: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Diagnostic {
+                discriminator,
+                severity,
+                ..
+            } => Some((discriminator.clone(), *severity)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        diagnostics,
+        vec![
+            ("unparseable".to_string(), DiagnosticSeverity::Malformed),
+            (
+                "system/someFutureSubtype".to_string(),
+                DiagnosticSeverity::Unknown
+            ),
+            ("mystery_frame".to_string(), DiagnosticSeverity::Unknown),
+            (
+                "control_request/request_user_dialog".to_string(),
+                DiagnosticSeverity::Unknown
+            ),
+        ],
+        "{events:?}"
+    );
+    // Redaction is structural: no provider text travels on any diagnostic.
+    for e in &events {
+        if let AgentEvent::Diagnostic { summary, .. } = e {
+            assert!(!summary.contains("do-not-carry"), "{summary}");
+        }
+    }
+    // The Ignored tier (status, thinking_tokens, the hook pair,
+    // tool_progress — all capture-confirmed routine) produced nothing, no
+    // Error fired, and the run still ends cleanly.
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta { text } if text == "ok"))
+    );
     assert!(matches!(
         events.last(),
         Some(AgentEvent::Done {

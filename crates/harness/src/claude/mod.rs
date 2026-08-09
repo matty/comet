@@ -30,8 +30,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessAvailability, HarnessCapabilities, HarnessId, Model,
-    ReasoningLevel, RunRequest, SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessAvailability, HarnessCapabilities,
+    HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
@@ -478,12 +478,30 @@ async fn run_session(session: Session) {
                     let frame = match wire::parse_frame(line) {
                         Ok(frame) => frame,
                         Err(e) => {
-                            tracing::debug!(target: "comet_harness::claude", "unparseable frame (skipped): {e}");
+                            // Sink 5 — the only producer of `Malformed`. The
+                            // raw line stays HERE, in tracing; the event
+                            // carries only the fixed sentinel.
+                            tracing::warn!(
+                                target: "comet_harness::claude",
+                                line,
+                                "unparseable frame (recorded as a diagnostic): {e}"
+                            );
+                            let ev = crate::diagnostic(
+                                crate::UNPARSEABLE,
+                                DiagnosticSeverity::Malformed,
+                            );
+                            if event_tx.send(Ok(ev)).await.is_err() {
+                                break 'main;
+                            }
                             continue;
                         }
                     };
                     if let Frame::ControlRequest(req) = frame {
-                        handle_control_request(req, &request_input, &stdin_tx);
+                        if let Some(ev) = handle_control_request(req, &request_input, &stdin_tx)
+                            && event_tx.send(Ok(ev)).await.is_err()
+                        {
+                            break 'main;
+                        }
                         continue;
                     }
                     for ev in norm.normalize(frame, interrupted) {
@@ -615,18 +633,34 @@ fn handle_control_request(
     req: ControlRequestFrame,
     request_input: &Arc<RequestInputFn>,
     stdin_tx: &mpsc::UnboundedSender<StdinMsg>,
-) {
+) -> Option<AgentEvent> {
     if req.request.subtype != "can_use_tool" {
-        tracing::debug!(
+        // Sink 3: an unclaimed inbound control request — counted, and
+        // deliberately NOT answered. The SDK's `request_user_dialog` contract
+        // says hosts should reply `{behavior:"cancelled"}` to dialog kinds
+        // they don't recognize; adopting that is a behaviour change deferred
+        // to whichever slice first claims a control-request subtype. ~53
+        // subtypes exist in the SDK's inbound union and the capture saw none
+        // fire, so their frequency is unknown, not zero.
+        tracing::warn!(
             target: "comet_harness::claude",
-            "unhandled control_request subtype: {}", req.request.subtype
+            request = %serde_json::json!({
+                "request_id": req.request_id,
+                "subtype": req.request.subtype,
+                "tool_name": req.request.tool_name,
+                "input": req.request.input,
+            }),
+            "unclaimed control_request (recorded as a diagnostic)"
         );
-        return;
+        return Some(crate::diagnostic(
+            &format!("control_request/{}", req.request.subtype),
+            DiagnosticSeverity::Unknown,
+        ));
     }
     if req.request.tool_name != "AskUserQuestion" {
         let line = control_response_line(&req.request_id, allow_response(req.request.input));
         let _ = stdin_tx.send(StdinMsg::Line(line));
-        return;
+        return None;
     }
     let request_input = Arc::clone(request_input);
     let stdin_tx = stdin_tx.clone();
@@ -648,6 +682,7 @@ fn handle_control_request(
         let line = control_response_line(&request_id, allow_response(updated));
         let _ = stdin_tx.send(StdinMsg::Line(line));
     });
+    None
 }
 
 /// Parse Claude's `AskUserQuestion` tool input into [`UserInputQuestion`]s
@@ -760,5 +795,74 @@ mod tests {
         assert_eq!(updated["answers"]["Pick one"], json!("B"));
         // Original input is preserved alongside the answers.
         assert!(updated["questions"].is_array());
+    }
+}
+
+#[cfg(test)]
+mod control_request_tests {
+    use super::*;
+    use wire::ControlRequestBody;
+
+    fn frame(subtype: &str, tool_name: &str) -> ControlRequestFrame {
+        ControlRequestFrame {
+            request_id: "cr-1".into(),
+            request: ControlRequestBody {
+                subtype: subtype.into(),
+                tool_name: tool_name.into(),
+                input: serde_json::json!({"x": 1}),
+            },
+        }
+    }
+
+    fn bridge() -> (
+        Arc<RequestInputFn>,
+        mpsc::UnboundedSender<StdinMsg>,
+        mpsc::UnboundedReceiver<StdinMsg>,
+    ) {
+        let request_input: Arc<RequestInputFn> = Arc::new(Box::new(|_| {
+            let (_tx, rx) = tokio::sync::oneshot::channel();
+            rx
+        }));
+        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel();
+        (request_input, stdin_tx, stdin_rx)
+    }
+
+    /// Sink 3: an unclaimed subtype is counted (Unknown, control_request/-
+    /// prefixed) and — deliberately — not answered. The SDK's
+    /// request_user_dialog contract says hosts must reply
+    /// {behavior:"cancelled"}; replying is a behaviour change to a frame the
+    /// capture never saw fire, deferred to whichever slice first claims a
+    /// control-request subtype.
+    #[test]
+    fn an_unclaimed_control_request_becomes_a_diagnostic_and_no_reply() {
+        use comet_proto::DiagnosticSeverity;
+        let (request_input, stdin_tx, mut stdin_rx) = bridge();
+        let ev =
+            handle_control_request(frame("request_user_dialog", ""), &request_input, &stdin_tx);
+        assert_eq!(
+            ev,
+            Some(AgentEvent::Diagnostic {
+                discriminator: "control_request/request_user_dialog".into(),
+                severity: DiagnosticSeverity::Unknown,
+                code: None,
+                summary: "The agent sent a message Comet doesn't recognize.".into(),
+            })
+        );
+        assert!(stdin_rx.try_recv().is_err(), "no reply is written today");
+    }
+
+    /// The claimed path is byte-for-byte what it was: the auto-approve reply
+    /// still goes out, and nothing is counted. Counting must never replace
+    /// answering.
+    #[test]
+    fn can_use_tool_still_answers_allow_and_counts_nothing() {
+        let (request_input, stdin_tx, mut stdin_rx) = bridge();
+        let ev = handle_control_request(frame("can_use_tool", "Bash"), &request_input, &stdin_tx);
+        assert_eq!(ev, None);
+        let StdinMsg::Line(line) = stdin_rx.try_recv().expect("an allow reply was written") else {
+            panic!("expected a stdin line");
+        };
+        assert!(line.contains(r#""behavior":"allow""#), "{line}");
+        assert!(line.contains("cr-1"), "{line}");
     }
 }

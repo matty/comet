@@ -723,6 +723,7 @@ fn operational_surface_is_explicitly_allowed() {
         methods::SERVER_HELLO,
         methods::LOCAL_DEVICE,
         methods::LIST_HARNESSES,
+        methods::LIST_HARNESS_DIAGNOSTICS,
         methods::LIST_MODELS,
         methods::QUEUE_COMMAND,
         methods::WATCH_DOC_MESSAGES,

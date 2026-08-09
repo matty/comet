@@ -1061,14 +1061,41 @@ async fn drive_run(
         if matches!(&event, AgentEvent::ReasoningDelta { text } if text.is_empty()) {
             continue;
         }
-        // A Notice is the ONE event that can arrive OUTSIDE a turn (an MCP
-        // server dropping, a rate-limit warning, an environment disconnect
-        // while the session sits parked), so it is NOT turn-start. Counting it
-        // as one wedged the session: `idle_since` cleared → the reaper's select
-        // arm (gated on `idle_since.is_some()`) is disabled and the child is
-        // never released, the status flips to Working, and the chip opens a
-        // streaming entry that no `Done` is ever coming to finish. Handled
-        // below by writing it as its own finished entry, still parked.
+        // A Diagnostic is bookkeeping about the protocol, not turn content.
+        // It can arrive OUTSIDE a turn (a persistent session's unknown
+        // notification while parked) and must not be mistaken for turn-start
+        // — the same wedge the between-turns notice and the empty heartbeat
+        // each hit. It folds to no part, so its whole life is: count into
+        // the per-boot registry, journal, move on.
+        if let AgentEvent::Diagnostic {
+            discriminator,
+            severity,
+            ..
+        } = &event
+        {
+            inner
+                .registry
+                .record_diagnostic(harness_id, discriminator, *severity);
+            inner.publish(&chat_id, &event);
+            continue;
+        }
+        // Notice is not the only event class that can arrive OUTSIDE a turn —
+        // the empty-heartbeat ReasoningDelta and the Diagnostic handled just
+        // above both can too, each disposed of before reaching here for
+        // exactly this reason. A Notice (an MCP server dropping, a
+        // rate-limit warning, an environment disconnect while the session
+        // sits parked) is NOT turn-start either. Counting it as one wedged
+        // the session: `idle_since` cleared → the reaper's select arm (gated
+        // on `idle_since.is_some()`) is disabled and the child is never
+        // released, the status flips to Working, and the chip opens a
+        // streaming entry that no `Done` is ever coming to finish. This
+        // comment is scar tissue from two prior regressions in this exact
+        // loop — a between-turns notice, and (later) an empty reasoning
+        // heartbeat, each of which flipped a parked session to Working
+        // forever and disarmed the idle reaper. Treat "can arrive outside a
+        // turn" as the default question for any new event class, not the
+        // exception. Handled below by writing it as its own finished entry,
+        // still parked.
         let parked_notice = idle_since.is_some() && matches!(&event, AgentEvent::Notice { .. });
         // First event after parking idle = the next turn beginning (a routed
         // dispatch steered in): the session is Working again.

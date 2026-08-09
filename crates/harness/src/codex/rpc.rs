@@ -36,6 +36,10 @@ pub(crate) enum Incoming {
     },
     /// stdout EOF: the app server exited. All pending requests fail.
     Eof,
+    /// A stdout line that was not a JSON-RPC message: non-JSON, or JSON with
+    /// neither `method` nor `id`. Sink 5 — the session loop records it. The
+    /// raw line stays in tracing at the drop site.
+    Malformed,
 }
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
@@ -143,7 +147,14 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
             continue;
         }
         let Ok(msg) = serde_json::from_str::<Value>(line) else {
-            tracing::debug!(target: "comet_harness::codex", "non-JSON stdout line (skipped)");
+            tracing::warn!(
+                target: "comet_harness::codex",
+                line,
+                "non-JSON stdout line (recorded as a diagnostic)"
+            );
+            if tx.send(Incoming::Malformed).await.is_err() {
+                return;
+            }
             continue;
         };
         let method = msg.get("method").and_then(Value::as_str);
@@ -186,7 +197,16 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
                     return;
                 }
             }
-            (None, None) => {}
+            (None, None) => {
+                tracing::warn!(
+                    target: "comet_harness::codex",
+                    frame = %msg,
+                    "not a JSON-RPC message (recorded as a diagnostic)"
+                );
+                if tx.send(Incoming::Malformed).await.is_err() {
+                    return;
+                }
+            }
         }
     }
     // EOF/read error: fail every awaiting request, then signal the loop.

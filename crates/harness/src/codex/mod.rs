@@ -43,15 +43,15 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessAvailability, HarnessCapabilities, HarnessId, Model, RunRequest,
-    SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessAvailability, HarnessCapabilities,
+    HarnessId, Model, RunRequest, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
-    Phase, RateLimitThresholds, delta_text, item_id, item_type, map_item, notice_for,
-    rate_limit_notice, turn_error_message, turn_id, usage_event,
+    Phase, RateLimitThresholds, delta_text, ignored_notification_reason, item_id, item_type,
+    map_item, notice_for, rate_limit_notice, turn_error_message, turn_id, usage_event,
 };
 use rpc::{Incoming, RpcClient};
 
@@ -802,21 +802,46 @@ async fn run_session(session: Session) {
                         }
                     }
 
-                    // thread/status, account/updated, skills/changed, … —
-                    // unknown notification methods are tolerated by design
-                    // (slice 0b.2 turns this arm into diagnostics).
-                    _ => {}
+                    // Recognized, deliberately dropped — the Ignored tier
+                    // (thread/status, settings echo, output deltas, …).
+                    m if ignored_notification_reason(m).is_some() => {}
+
+                    // Sink 2: on neither list — still dropped, now counted.
+                    _ => {
+                        tracing::warn!(
+                            target: "comet_harness::codex",
+                            %method,
+                            params = %params,
+                            "unrecognized notification (recorded as a diagnostic)"
+                        );
+                        let ev = crate::diagnostic(&method, DiagnosticSeverity::Unknown);
+                        if !send(&event_tx, ev).await {
+                            break 'main;
+                        }
+                    }
                 },
 
                 Some(Incoming::Request { id, method, params }) => {
-                    handle_server_request(
+                    if let Some(ev) = handle_server_request(
                         &client,
                         id,
                         &method,
                         &params,
                         request.auto_approve,
                         &request_input,
-                    );
+                    ) && !send(&event_tx, ev).await
+                    {
+                        break 'main;
+                    }
+                }
+
+                Some(Incoming::Malformed) => {
+                    // Sink 5 (Codex side): the reader already warn-logged the
+                    // raw line; only the sentinel travels.
+                    let ev = crate::diagnostic(crate::UNPARSEABLE, DiagnosticSeverity::Malformed);
+                    if !send(&event_tx, ev).await {
+                        break 'main;
+                    }
                 }
 
                 // stdout EOF or reader gone: the app server exited.
@@ -1036,22 +1061,27 @@ fn handle_server_request(
     params: &Value,
     auto_approve: bool,
     request_input: &Arc<RequestInputFn>,
-) {
+) -> Option<AgentEvent> {
     let is_approval = matches!(
         method,
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
     );
     if !is_approval {
-        tracing::debug!(
-            target: "comet_harness::codex",
-            "unhandled server request: {method}"
-        );
+        // Answer FIRST — the server must never wedge awaiting a reply — then
+        // count. The -32601 reply is byte-for-byte what shipped before this
+        // slice; counting rides the return path, nothing more.
         client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
-        return;
+        tracing::warn!(
+            target: "comet_harness::codex",
+            %method,
+            params = %params,
+            "unrecognized server request (recorded as a diagnostic)"
+        );
+        return Some(crate::diagnostic(method, DiagnosticSeverity::Unknown));
     }
     if auto_approve {
         client.respond(&id, json!({ "decision": "accept" }));
-        return;
+        return None;
     }
 
     let question = approval_question(method, params);
@@ -1076,6 +1106,7 @@ fn handle_server_request(
             json!({ "decision": if accept { "accept" } else { "decline" } }),
         );
     });
+    None
 }
 
 /// Synthesize the yes/no question an approval request surfaces to the user.
