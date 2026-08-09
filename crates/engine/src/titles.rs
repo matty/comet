@@ -201,7 +201,6 @@ fn title_request(model: Option<String>, cwd: &str, prompt: String) -> RunRequest
         cwd: cwd.to_string(),
         runtime_mode: RuntimeMode::FullAccess,
         sandbox: SandboxLevel::ReadOnly,
-        auto_approve: true,
         attachments: Vec::new(),
         resume: None,
     }

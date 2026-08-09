@@ -199,7 +199,7 @@ async fn main() {
                     "reasoning": null,
                     "cwd": "/tmp",
                     "sandbox": "workspace-write",
-                    "autoApprove": true,
+                    "runtimeMode": "full-access",
                     "resume": null,
                 },
             },

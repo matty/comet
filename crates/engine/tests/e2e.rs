@@ -36,7 +36,6 @@ fn run_request(prompt: &str) -> RunRequest {
         cwd: "/tmp".into(),
         runtime_mode: RuntimeMode::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
-        auto_approve: true,
         attachments: Vec::new(),
         resume: None,
     }
@@ -1908,7 +1907,6 @@ async fn real_claude_sees_uploaded_image_inline() {
         cwd: cwd.to_string_lossy().to_string(),
         runtime_mode: RuntimeMode::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
-        auto_approve: false,
         attachments: vec![path],
         resume: None,
     };

@@ -560,7 +560,6 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         cwd: worktree.path.clone(),
         runtime_mode: comet_proto::RuntimeMode::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
-        auto_approve: true,
         attachments: Vec::new(),
         resume: None,
     };
@@ -620,7 +619,6 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         cwd: worktree.path.clone(),
         runtime_mode: comet_proto::RuntimeMode::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
-        auto_approve: true,
         attachments: Vec::new(),
         resume: None,
     };

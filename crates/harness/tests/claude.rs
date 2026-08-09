@@ -33,7 +33,6 @@ fn request(prompt: &str) -> RunRequest {
         cwd: String::new(),
         runtime_mode: RuntimeMode::default(),
         sandbox: SandboxLevel::DangerFullAccess,
-        auto_approve: true,
         attachments: Vec::new(),
         resume: None,
     }

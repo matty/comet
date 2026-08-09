@@ -44,7 +44,7 @@ use tokio::sync::mpsc;
 
 use comet_proto::{
     AgentEvent, DiagnosticSeverity, DoneStatus, HarnessAvailability, HarnessCapabilities,
-    HarnessId, Model, RunRequest, SteeringMode, UserInputAnswer, UserInputQuestion,
+    HarnessId, Model, RunRequest, RuntimeMode, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
@@ -417,7 +417,7 @@ async fn run_session(session: Session) {
 
     // ---- wire params ------------------------------------------------------
     // Parity with the Claude adapter, which auto-approves every `can_use_tool`
-    // regardless of `auto_approve` (comet sessions run unattended; the sandbox
+    // regardless of `runtime_mode` (comet sessions run unattended; the sandbox
     // is the guardrail): never surface wire approvals. "on-request" turned
     // every command into a yes/no question (user report: "asking me for
     // approval at every step"). The approval-as-input plumbing below stays for
@@ -833,7 +833,7 @@ async fn run_session(session: Session) {
                         id,
                         &method,
                         &params,
-                        request.auto_approve,
+                        request.runtime_mode == RuntimeMode::FullAccess,
                         &request_input,
                     ) && !send(&event_tx, ev).await
                     {
@@ -1057,15 +1057,15 @@ type RequestInputFn = Box<
 
 /// Serve one server→client request. Approval requests round-trip through
 /// `request_input` as a synthesized yes/no question (in a subtask so the
-/// message loop keeps flowing); with `auto_approve` they're accepted outright
-/// (belt to the wire-level `approvalPolicy: "never"`). Anything else is
-/// rejected as unsupported so the server never wedges awaiting a reply.
+/// message loop keeps flowing); a run that may proceed without asking accepts
+/// them outright (belt to the wire-level `approvalPolicy: "never"`). Anything
+/// else is rejected as unsupported so the server never wedges awaiting a reply.
 fn handle_server_request(
     client: &RpcClient,
     id: Value,
     method: &str,
     params: &Value,
-    auto_approve: bool,
+    accept_without_asking: bool,
     request_input: &Arc<RequestInputFn>,
 ) -> Option<AgentEvent> {
     let is_approval = matches!(
@@ -1085,7 +1085,7 @@ fn handle_server_request(
         );
         return Some(crate::diagnostic(method, DiagnosticSeverity::Unknown));
     }
-    if auto_approve {
+    if accept_without_asking {
         client.respond(&id, json!({ "decision": "accept" }));
         return None;
     }

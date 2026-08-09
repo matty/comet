@@ -454,8 +454,6 @@ pub struct RunRequest {
     /// sandbox, a pairing no mode expresses, and that request is built by
     /// hand rather than through [`RunRequest::for_session`].
     pub sandbox: SandboxLevel,
-    #[serde(default)]
-    pub auto_approve: bool,
     /// Harness-native session id to resume, if any.
     pub resume: Option<String>,
     /// Absolute paths of image attachments already staged on the run device
@@ -489,7 +487,6 @@ impl RunRequest {
             cwd: String::new(),
             runtime_mode: mode,
             sandbox: mode.sandbox(),
-            auto_approve: false,
             resume: None,
             attachments: Vec::new(),
         }
@@ -852,11 +849,27 @@ mod tests {
 
     #[test]
     fn for_session_default_reproduces_the_previous_hardcode() {
-        // The behavioral claim of this slice, in one assertion: the derived
-        // sandbox equals the literal every user-session site used to write.
+        // The behavioral claim of the runtime-mode work, in one assertion: the
+        // derived sandbox equals the literal every user-session site used to
+        // write, and the default mode is the never-bypass one.
         let req = RunRequest::for_session(RuntimeMode::default());
         assert_eq!(req.sandbox, SandboxLevel::WorkspaceWrite);
-        assert!(!req.auto_approve);
+        assert_eq!(req.runtime_mode, RuntimeMode::AutoAcceptEdits);
+    }
+
+    /// A peer built before the runtime mode replaced the auto-approve flag
+    /// still sends `autoApprove`. It must decode, ignored: the field it stood
+    /// in for is now the mode, and every request that carried it `true` was
+    /// engine-internal and never crossed the wire.
+    #[test]
+    fn a_payload_still_sending_auto_approve_decodes() {
+        let decoded: RunRequest = serde_json::from_str(
+            r#"{"prompt":"hi","model":null,"reasoning":null,"cwd":"/tmp",
+                "sandbox":"workspace-write","autoApprove":true,"resume":null}"#,
+        )
+        .expect("an older peer's payload must still decode");
+        assert_eq!(decoded.runtime_mode, RuntimeMode::AutoAcceptEdits);
+        assert_eq!(decoded.sandbox, SandboxLevel::WorkspaceWrite);
     }
 
     #[test]
