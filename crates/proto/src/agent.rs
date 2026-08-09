@@ -36,6 +36,39 @@ pub enum SandboxLevel {
     DangerFullAccess,
 }
 
+/// How much a run may do without asking.
+///
+/// The sandbox is not a separate user choice: each mode names the one it
+/// implies, so a caller cannot pair a permissive mode with a restrictive
+/// sandbox by accident. See [`RunRequest::for_session`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeMode {
+    /// Every tool call is asked about first.
+    ApprovalRequired,
+    /// Edits inside the workspace proceed; the sandbox is the boundary.
+    ///
+    /// The default because it is what every chat has already been running:
+    /// a workspace-write sandbox with nothing able to block on a question.
+    #[default]
+    AutoAcceptEdits,
+    /// As above, with the provider reviewing its own calls where it can.
+    Auto,
+    /// No sandbox and no approvals.
+    FullAccess,
+}
+
+impl RuntimeMode {
+    /// The sandbox this mode implies.
+    pub fn sandbox(self) -> SandboxLevel {
+        match self {
+            RuntimeMode::ApprovalRequired => SandboxLevel::ReadOnly,
+            RuntimeMode::AutoAcceptEdits | RuntimeMode::Auto => SandboxLevel::WorkspaceWrite,
+            RuntimeMode::FullAccess => SandboxLevel::DangerFullAccess,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SteeringMode {
@@ -874,5 +907,58 @@ mod tests {
         // Over-long but clean truncates to 64 bytes (ASCII ⇒ char-safe).
         let long = "a".repeat(80);
         assert_eq!(sanitize_discriminator(&long), "a".repeat(64));
+    }
+
+    #[test]
+    fn runtime_mode_derives_the_sandbox_for_every_variant() {
+        assert_eq!(
+            RuntimeMode::ApprovalRequired.sandbox(),
+            SandboxLevel::ReadOnly
+        );
+        assert_eq!(
+            RuntimeMode::AutoAcceptEdits.sandbox(),
+            SandboxLevel::WorkspaceWrite
+        );
+        assert_eq!(RuntimeMode::Auto.sandbox(), SandboxLevel::WorkspaceWrite);
+        assert_eq!(
+            RuntimeMode::FullAccess.sandbox(),
+            SandboxLevel::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn runtime_mode_defaults_to_auto_accept_edits() {
+        // The mode that reproduces how every existing chat has been running:
+        // a workspace-write sandbox, and no approval a user could not answer.
+        assert_eq!(RuntimeMode::default(), RuntimeMode::AutoAcceptEdits);
+        assert_eq!(
+            RuntimeMode::default().sandbox(),
+            SandboxLevel::WorkspaceWrite
+        );
+    }
+
+    #[test]
+    fn runtime_mode_uses_kebab_case() {
+        assert_eq!(
+            serde_json::to_string(&RuntimeMode::ApprovalRequired).unwrap(),
+            "\"approval-required\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RuntimeMode::AutoAcceptEdits).unwrap(),
+            "\"auto-accept-edits\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RuntimeMode::FullAccess).unwrap(),
+            "\"full-access\""
+        );
+        for mode in [
+            RuntimeMode::ApprovalRequired,
+            RuntimeMode::AutoAcceptEdits,
+            RuntimeMode::Auto,
+            RuntimeMode::FullAccess,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(serde_json::from_str::<RuntimeMode>(&json).unwrap(), mode);
+        }
     }
 }
