@@ -310,6 +310,70 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
     }
 }
 
+/// Per-kind approval card label + one-line detail — the sibling of
+/// [`tool_chip_content`], and subject to the same limit the doc's privacy
+/// policy imposes: a file change carries COUNTS, never the patch, because
+/// `render_parts` strips heavy tool inputs before anything enters the doc.
+///
+/// The label is Comet's own vocabulary, never provider prose. `Unknown`'s
+/// `summary` is the one string that passes through, and `ApprovalRequest`'s
+/// own doc comment is what guarantees it: the adapter that builds it writes
+/// Comet copy naming the action.
+pub fn approval_chip_content(approval: &crate::ApprovalRequest) -> (&'static str, String) {
+    let (label, detail) = approval_chip_content_raw(approval);
+    (label, single_line(&detail))
+}
+
+fn approval_chip_content_raw(approval: &crate::ApprovalRequest) -> (&'static str, String) {
+    use crate::{ApprovalRequest, FileOperation};
+    match approval {
+        ApprovalRequest::Command { command, cwd } => (
+            "Run a command",
+            match cwd {
+                // The absent case is written here rather than inferred: no
+                // working directory reported is not the same as one reported
+                // empty, and neither may render as a location.
+                Some(cwd) if !cwd.is_empty() => format!("{command} · in {cwd}"),
+                _ => command.clone(),
+            },
+        ),
+        ApprovalRequest::FileChange {
+            path,
+            operation,
+            added_lines,
+            removed_lines,
+        } => (
+            match operation {
+                FileOperation::Create => "Create a file",
+                FileOperation::Modify => "Edit a file",
+                FileOperation::Delete => "Delete a file",
+                // An operation a later provider introduces. Name the file and
+                // stop: claiming "Edit" for something that might be a rename
+                // is worse than being vague about the verb.
+                FileOperation::Unknown => "Change a file",
+            },
+            format!("{path} · +{added_lines} −{removed_lines}"),
+        ),
+        ApprovalRequest::FileRead { path } => ("Read a file", path.clone()),
+        ApprovalRequest::Mcp { server, tool } => ("Use an MCP tool", format!("{server} · {tool}")),
+        ApprovalRequest::Unknown { summary } => ("Permission needed", summary.clone()),
+    }
+}
+
+/// The caption on a decided approval card.
+pub fn approval_decision_label(decision: &crate::ApprovalDecision) -> &'static str {
+    use crate::ApprovalDecision;
+    match decision {
+        ApprovalDecision::Allow => "Allowed",
+        ApprovalDecision::AllowForSession => "Allowed for this session",
+        ApprovalDecision::Deny { .. } => "Denied",
+        // Host-stamped when the run ended with this still open. The only
+        // decision the user did not make, so it is the only one that has to
+        // say why it is there.
+        ApprovalDecision::Expired => "Expired — the run ended first",
+    }
+}
+
 /// The ToolGroup summary line — "Ran 3 commands · edited 2 files".
 ///
 /// Takes `(call, is_error)` pairs so each viewport can keep its own row model;
@@ -543,5 +607,118 @@ mod checkout_tests {
             checkout_label(CheckoutKind::NewWorktree, Some(&plain("main"))),
             "New worktree"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_copy_names_the_action_for_every_kind() {
+        use crate::{ApprovalRequest, FileOperation};
+        let (label, detail) = approval_chip_content(&ApprovalRequest::Command {
+            command: "cargo test\n--workspace".into(),
+            cwd: Some("/repo".into()),
+        });
+        assert_eq!(label, "Run a command");
+        assert_eq!(detail, "cargo test --workspace · in /repo");
+
+        let (label, detail) = approval_chip_content(&ApprovalRequest::FileChange {
+            path: "src/main.rs".into(),
+            operation: FileOperation::Modify,
+            added_lines: 12,
+            removed_lines: 3,
+        });
+        assert_eq!(label, "Edit a file");
+        assert_eq!(detail, "src/main.rs · +12 −3");
+
+        let (label, detail) = approval_chip_content(&ApprovalRequest::FileRead {
+            path: "/etc/hosts".into(),
+        });
+        assert_eq!(label, "Read a file");
+        assert_eq!(detail, "/etc/hosts");
+
+        let (label, detail) = approval_chip_content(&ApprovalRequest::Mcp {
+            server: "linear".into(),
+            tool: "create_issue".into(),
+        });
+        assert_eq!(label, "Use an MCP tool");
+        assert_eq!(detail, "linear · create_issue");
+
+        let (label, detail) = approval_chip_content(&ApprovalRequest::Unknown {
+            summary: "an action Comet does not model".into(),
+        });
+        assert_eq!(label, "Permission needed");
+        assert_eq!(detail, "an action Comet does not model");
+    }
+
+    /// The absent case, written by hand (`.agents/rules/optional-wire-fields.md`):
+    /// a provider that reports no working directory must not render as one
+    /// reporting an empty string.
+    #[test]
+    fn a_command_without_a_cwd_shows_no_location_clause() {
+        use crate::ApprovalRequest;
+        let (_, detail) = approval_chip_content(&ApprovalRequest::Command {
+            command: "ls".into(),
+            cwd: None,
+        });
+        assert_eq!(detail, "ls");
+        let (_, empty) = approval_chip_content(&ApprovalRequest::Command {
+            command: "ls".into(),
+            cwd: Some(String::new()),
+        });
+        assert_eq!(empty, "ls", "an empty cwd is not a location either");
+    }
+
+    /// A file operation a later provider introduces decodes as `Unknown`
+    /// (`FileOperation`'s `#[serde(other)]`). The card must name the file and
+    /// stop short of claiming WHICH change it is.
+    #[test]
+    fn an_unknown_file_operation_does_not_claim_a_verb() {
+        use crate::{ApprovalRequest, FileOperation};
+        let (label, _) = approval_chip_content(&ApprovalRequest::FileChange {
+            path: "a.rs".into(),
+            operation: FileOperation::Unknown,
+            added_lines: 0,
+            removed_lines: 0,
+        });
+        assert_eq!(label, "Change a file");
+        assert!(!label.contains("Edit") && !label.contains("Delete"));
+    }
+
+    /// `Expired` is the only decision the user did not choose, so it is the
+    /// only one that has to explain itself.
+    #[test]
+    fn decision_labels_explain_only_the_one_the_user_did_not_choose() {
+        use crate::ApprovalDecision;
+        assert_eq!(approval_decision_label(&ApprovalDecision::Allow), "Allowed");
+        assert_eq!(
+            approval_decision_label(&ApprovalDecision::AllowForSession),
+            "Allowed for this session"
+        );
+        assert_eq!(
+            approval_decision_label(&ApprovalDecision::Deny {
+                message: "not that path".into()
+            }),
+            "Denied"
+        );
+        let expired = approval_decision_label(&ApprovalDecision::Expired);
+        assert!(
+            expired.contains("run ended"),
+            "the user never chose this one; the label has to say why: {expired}"
+        );
+    }
+
+    /// Provider prose must not reach the card through the detail line, and a
+    /// multi-line command must not reach a single-line row (gpui breaks on a
+    /// literal newline before its ellipsis logic — `single_line`'s reason).
+    #[test]
+    fn approval_detail_is_always_one_line() {
+        use crate::ApprovalRequest;
+        let (_, detail) = approval_chip_content(&ApprovalRequest::Unknown {
+            summary: "line one\n\nline two".into(),
+        });
+        assert!(!detail.contains('\n'), "{detail}");
     }
 }
