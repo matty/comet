@@ -3784,11 +3784,17 @@ impl Composer {
 
         // Draft swap on chat navigation — the input entity itself survives.
         if key != self.current_key {
-            let old_text = self.input.read(cx).text().to_string();
-            if old_text.is_empty() {
-                self.drafts.remove(&self.current_key);
-            } else {
-                self.drafts.insert(self.current_key.clone(), old_text);
+            // While a blocking surface owns the input its text is a deny note
+            // or a wizard answer, NOT a draft — and the real draft was already
+            // parked when that surface armed. Stashing the note over it here
+            // would lose the draft to a navigation the user made mid-decision.
+            if !(self.approval.is_some() || self.wizard.is_some()) {
+                let old_text = self.input.read(cx).text().to_string();
+                if old_text.is_empty() {
+                    self.drafts.remove(&self.current_key);
+                } else {
+                    self.drafts.insert(self.current_key.clone(), old_text);
+                }
             }
             let draft = self.drafts.get(&key).cloned().unwrap_or_default();
             self.current_key = key;
@@ -3826,19 +3832,29 @@ impl Composer {
                 // must not survive the handoff (see `on_input_edited`'s
                 // wizard/approval guard above).
                 self.reset_mention(None, cx);
+                self.park_draft_for_note(cx);
+            } else {
+                // Re-assert on every later state change: the wizard's own arm
+                // below can reclaim the placeholder when both are pending.
+                self.input.update(cx, |input, cx| {
+                    input.set_placeholder("Add a note for the agent (optional)", cx)
+                });
             }
-            self.input.update(cx, |input, cx| {
-                input.set_placeholder("Add a note for the agent (optional)", cx)
-            });
         } else if had_approval {
             // The row just retired with no local click behind it — Expired,
             // a paired device's decision, or a superseding assistant entry.
-            // `respond_approval` already restores the default placeholder for
-            // the local-click path, so this arm only fires for the other
-            // three. If a wizard question is also pending, its own arm below
-            // reclaims the placeholder immediately after.
-            self.input
-                .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
+            // `respond_approval` already hands the input back for the
+            // local-click path, so this arm only fires for the other three.
+            if pending.is_none() {
+                self.release_borrowed_input(cx);
+            } else {
+                // A question is pending, so the wizard's arm below borrows the
+                // input on this same pass. Handing the draft back here would
+                // put it in that panel's free-text field instead of the
+                // composer; it stays parked until the wizard releases.
+                self.input
+                    .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
+            }
         }
 
         // Question panel lifecycle (wizard state cached per request id).
@@ -4428,10 +4444,7 @@ impl Composer {
             return;
         };
         self.answered_approvals.insert(request_id.clone());
-        self.input.update(cx, |input, cx| {
-            input.set_text("", cx);
-            input.set_placeholder("Do anything…", cx);
-        });
+        self.release_borrowed_input(cx);
         let Some(engine) = self.state.read(cx).selected_client() else {
             return;
         };
@@ -4452,10 +4465,18 @@ impl Composer {
             Ok(value) => serde_json::json!({ "chatId": chat_id, "command": value }),
             Err(_) => return,
         };
+        // The composer entity is shared across chats and outlives this task, so
+        // both continuations below have to prove they still own the chat the
+        // decision came from. Without it, a navigation during the round trip
+        // paints the failure banner on whatever chat the user landed on.
+        let owner = self.current_key.clone();
         self.send_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
+                    if composer.current_key != owner {
+                        return;
+                    }
                     composer.failure = Some(crate::errors::approval_failure(&err).into());
                     // The decision never left this device — put the row back.
                     // Unconditional, unlike `restore_approval_row`'s own
@@ -4479,6 +4500,9 @@ impl Composer {
             // explanation, and this code cannot tell them apart.
             cx.background_executor().timer(Duration::from_secs(2)).await;
             this.update(cx, |composer, cx| {
+                if composer.current_key != owner {
+                    return;
+                }
                 composer.restore_approval_row(&request_id, cx);
             })
             .ok();
@@ -4501,11 +4525,45 @@ impl Composer {
         let transcript = self.state.read(cx).transcript.clone();
         if crate::approvals::approval_still_unanswered(&transcript, request_id) {
             self.approval = crate::approvals::pending_approval(&transcript);
-            self.input.update(cx, |input, cx| {
-                input.set_placeholder("Add a note for the agent (optional)", cx)
-            });
+            // Re-arming borrows the input again, so the draft handed back when
+            // the decision was sent has to be parked a second time — otherwise
+            // it reappears as the deny note under the restored row.
+            self.park_draft_for_note(cx);
             cx.notify();
         }
+    }
+
+    /// Park the draft before a blocking surface borrows the shared input, and
+    /// hand that surface an empty field.
+    ///
+    /// One `ComposerInput` entity serves three roles — prompt, wizard answer,
+    /// deny note — so arming a blocking surface has to put whatever the user
+    /// was already typing somewhere. Without this an in-flight prompt became
+    /// the visible deny note and Allow wiped it with no recovery. The parking
+    /// spot is the same per-chat `drafts` map navigation uses, so a draft
+    /// displaced by an approval and one displaced by a chat switch survive the
+    /// same way.
+    fn park_draft_for_note(&mut self, cx: &mut Context<Self>) {
+        let draft = self.input.read(cx).text().to_string();
+        if draft.is_empty() {
+            self.drafts.remove(&self.current_key);
+        } else {
+            self.drafts.insert(self.current_key.clone(), draft);
+        }
+        self.input.update(cx, |input, cx| {
+            input.set_text("", cx);
+            input.set_placeholder("Add a note for the agent (optional)", cx);
+        });
+    }
+
+    /// Hand the shared input back to the composer: the default placeholder,
+    /// and the draft [`Self::park_draft_for_note`] displaced.
+    fn release_borrowed_input(&mut self, cx: &mut Context<Self>) {
+        let draft = self.drafts.remove(&self.current_key).unwrap_or_default();
+        self.input.update(cx, |input, cx| {
+            input.set_text(draft, cx);
+            input.set_placeholder("Do anything…", cx);
+        });
     }
 
     fn on_wizard_key(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
