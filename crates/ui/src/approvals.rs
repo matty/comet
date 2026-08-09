@@ -28,6 +28,17 @@ use gpui::SharedString;
 /// work (a build, a test run, a large search all legitimately exceed it,
 /// which is why the state is informational and offers Stop rather than
 /// acting on its own), NOT a value tuned to that single observation.
+///
+/// This 60s is deliberately GREATER than `SESSION_STALE_MS` (45s,
+/// `crates/proto/src/view.rs`) — the blocked strip only renders under
+/// `Indicator::Working`/`AwaitingInput`, and the stale gate turns both to
+/// `None` past 45s. The line is reachable at all only because `drive_run`'s
+/// 15s liveness heartbeat calls `touch_session` unconditionally while the
+/// harness stream is open (`crates/engine/src/sessions.rs`, the
+/// `live_heartbeat` tick), keeping the session fresh independent of whether
+/// the tool call itself is producing events. Make that heartbeat conditional
+/// on stream activity — a plausible future optimisation — and this line
+/// silently becomes unreachable, which is exactly the state it exists to name.
 pub const HUNG_TOOL_AFTER_SECS: i64 = 60;
 
 /// The unresolved approval the decision row should serve: an approval part
@@ -407,6 +418,22 @@ mod tests {
         assert!(matches!(blocked_on(&t), Some(BlockedOn::Approval { .. })));
     }
 
+    /// Same rule as above, parts in the OPPOSITE order. `blocked_on` checks
+    /// `pending_approval` (which scans the WHOLE entry) before it falls back
+    /// to a reverse scan for an unresolved tool part — an implementation that
+    /// picked whichever part came last (or first) in the vec, rather than
+    /// genuinely preferring the approval, would pass the `[tool, approval]`
+    /// fixture above by accident and only fail here.
+    #[test]
+    fn an_open_approval_outranks_an_unresolved_tool_call_in_either_part_order() {
+        let t = vec![assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![approval_part("r1", None), tool_part("t1", false)],
+        )];
+        assert!(matches!(blocked_on(&t), Some(BlockedOn::Approval { .. })));
+    }
+
     #[test]
     fn an_unresolved_tool_call_is_the_blocked_state_when_nothing_is_pending() {
         let t = vec![assistant(
@@ -433,6 +460,22 @@ mod tests {
             vec![tool_part("t1", true)],
         )];
         assert!(blocked_on(&t).is_none());
+    }
+
+    /// The `None` path a `.find` over an absent assistant entry takes — an
+    /// empty transcript (no messages sent yet) and a transcript that only has
+    /// a user entry (nothing has been answered by the assistant at all). Both
+    /// have to fall out of `blocked_on`'s leading `?` cleanly rather than
+    /// panicking on a `.rev().find()` that never matches
+    /// (`.agents/rules/optional-wire-fields.md`: write the absent case
+    /// yourself, or it ships never having been constructed).
+    #[test]
+    fn blocked_on_is_none_with_no_assistant_entry() {
+        assert!(blocked_on(&[]).is_none(), "an empty transcript");
+        assert!(
+            blocked_on(&[user("u1")]).is_none(),
+            "a user-only transcript, before any assistant reply"
+        );
     }
 
     /// An approval reports the moment it appears — a wait for a person is
