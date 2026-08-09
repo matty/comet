@@ -64,6 +64,8 @@ pub struct DraftConfig {
     pub reasoning: Option<ReasoningLevel>,
     /// option id → choice id (only non-defaults are meaningful).
     pub model_options: serde_json::Map<String, serde_json::Value>,
+    /// The new-chat canvas's pick. Nothing writes this yet — it only ever
+    /// takes its `Default` — until the composer grows a picker for it.
     pub runtime_mode: RuntimeMode,
     /// The picked ref (base branch in NewWorktree mode; a worktree's branch
     /// when reusing one). `None` = the repo's current branch.

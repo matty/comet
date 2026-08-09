@@ -177,6 +177,14 @@ impl SessionsEngine {
     }
 
     /// The last request dispatched for a chat (steer→new-turn fallback).
+    ///
+    /// This carries the mode (and sandbox) of the *previous* turn, not the
+    /// chat row's current one — it is stamped at dispatch and never touched
+    /// again. That's a no-op today because the mode is fixed for a chat's
+    /// lifetime, but once a mode can change mid-chat the two can diverge: a
+    /// steer or a resumed-input answer taking this fallback would still run
+    /// under the old mode until the next composer send re-derives the
+    /// request from the row.
     pub fn last_request(&self, chat_id: &str) -> Option<RunRequest> {
         lock(&self.inner.last_requests).get(chat_id).cloned()
     }

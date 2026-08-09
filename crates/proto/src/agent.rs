@@ -441,6 +441,11 @@ pub struct RunRequest {
     /// getting.
     #[serde(default)]
     pub runtime_mode: RuntimeMode,
+    /// An adapter that needs the sandbox must read this field, not
+    /// `runtime_mode.sandbox()`. The two agree for every user session, but
+    /// not in general: chat titling pairs a never-ask mode with a read-only
+    /// sandbox, a pairing no mode expresses, and that request is built by
+    /// hand rather than through [`RunRequest::for_session`].
     pub sandbox: SandboxLevel,
     #[serde(default)]
     pub auto_approve: bool,
@@ -1029,6 +1034,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&RuntimeMode::AutoAcceptEdits).unwrap(),
             "\"auto-accept-edits\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RuntimeMode::Auto).unwrap(),
+            "\"auto\""
         );
         assert_eq!(
             serde_json::to_string(&RuntimeMode::FullAccess).unwrap(),

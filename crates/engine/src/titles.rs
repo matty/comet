@@ -185,11 +185,13 @@ impl TitleGenerator {
 
 /// The request that names a chat.
 ///
-/// Read-only, and set so nothing can ask it a question: this runs with no
-/// surface on which an answer could be given, so an approval would hang it
-/// forever. That pairing — never asked, and unable to write — is not one of
-/// the runtime modes, which is why this is built by hand instead of through
-/// [`RunRequest::for_session`].
+/// Set so nothing can ask it a question: this runs with no surface on which
+/// an answer could be given, so an approval would hang it forever. The
+/// read-only sandbox is enforced by whichever adapters honor `request.sandbox`
+/// (Codex today; the Claude harness does not read it at all) — it is not a
+/// guarantee this request itself makes. That pairing of a never-ask mode with
+/// a read-only sandbox is not one the runtime modes express, which is why
+/// this is built by hand instead of through [`RunRequest::for_session`].
 fn title_request(model: Option<String>, cwd: &str, prompt: String) -> RunRequest {
     RunRequest {
         prompt,

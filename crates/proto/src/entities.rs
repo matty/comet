@@ -80,6 +80,11 @@ pub struct ChatConfig {
     pub reasoning: Option<ReasoningLevel>,
     #[serde(default)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
+    /// Written for compatibility with peers that do not know
+    /// `runtime_mode` yet; the engine's own read path ignores it and derives
+    /// the sandbox from the mode below instead. Keep writing it — it is not
+    /// live state on this build, but it is the only sandbox an older peer
+    /// can see.
     pub sandbox: SandboxLevel,
     /// The chat's permission mode. Absent on the wire means a chat created
     /// before the field existed; it resolves to the default.
