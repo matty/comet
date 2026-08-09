@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use comet_proto::{RunRequest, UserInputAnswer};
+use comet_proto::{ApprovalDecision, RunRequest, UserInputAnswer};
 
 use crate::constants::COMMAND_DEFAULT_TTL_MS;
 
@@ -21,6 +21,7 @@ pub enum SessionCommandKind {
     Steer,
     Interrupt,
     RespondInput,
+    RespondApproval,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +55,11 @@ pub enum SessionCommandPayload {
         request_id: String,
         answers: Vec<UserInputAnswer>,
     },
+    #[serde(rename_all = "camelCase")]
+    RespondApproval {
+        request_id: String,
+        decision: ApprovalDecision,
+    },
 }
 
 impl SessionCommandPayload {
@@ -63,6 +69,7 @@ impl SessionCommandPayload {
             SessionCommandPayload::Steer { .. } => SessionCommandKind::Steer,
             SessionCommandPayload::Interrupt {} => SessionCommandKind::Interrupt,
             SessionCommandPayload::RespondInput { .. } => SessionCommandKind::RespondInput,
+            SessionCommandPayload::RespondApproval { .. } => SessionCommandKind::RespondApproval,
         }
     }
 }
@@ -289,6 +296,45 @@ mod tests {
         let cx1 = cx(&entries, &NEVER, &NEVER, 3_000, None);
         assert_eq!(evaluate_command(&r1, &cx1), CommandDisposition::Execute);
         assert_eq!(evaluate_command(&r2, &cx1), CommandDisposition::Execute);
+    }
+
+    #[test]
+    fn respond_approval_reports_its_kind() {
+        let e = entry(
+            "c1",
+            SessionCommandPayload::RespondApproval {
+                request_id: "r1".into(),
+                decision: ApprovalDecision::Allow,
+            },
+            1_000,
+        );
+        assert_eq!(e.kind(), SessionCommandKind::RespondApproval);
+    }
+
+    #[test]
+    fn respond_approval_is_never_superseded_by_a_newer_one() {
+        // Supersession is for steer/interrupt only. Two approvals in flight
+        // answer two different request ids; dropping the older would strand it.
+        let older = entry(
+            "c1",
+            SessionCommandPayload::RespondApproval {
+                request_id: "r1".into(),
+                decision: ApprovalDecision::Allow,
+            },
+            1_000,
+        );
+        let newer = entry(
+            "c2",
+            SessionCommandPayload::RespondApproval {
+                request_id: "r2".into(),
+                decision: ApprovalDecision::Allow,
+            },
+            2_000,
+        );
+        let entries = vec![older.clone(), newer.clone()];
+        let cx1 = cx(&entries, &NEVER, &NEVER, 3_000, None);
+        assert_eq!(evaluate_command(&older, &cx1), CommandDisposition::Execute);
+        assert_eq!(evaluate_command(&newer, &cx1), CommandDisposition::Execute);
     }
 
     #[test]

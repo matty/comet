@@ -1519,6 +1519,52 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_command_kind_is_skipped_and_the_rest_still_drain() {
+        // What an older peer does with a command kind it has never heard of.
+        // This is what makes shipping a new kind safe without a protocol bump,
+        // and it has to go through `read_commands` — that is where the
+        // skip-not-fail policy lives.
+        use crate::commands::SessionCommandPayload;
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let queue = |id: &str| SessionCommandEntry {
+            id: id.into(),
+            payload: SessionCommandPayload::Steer {
+                prompt: "focus".into(),
+                message_id: None,
+            },
+            issued_by: "dev-a".into(),
+            issued_at: 1,
+            based_on: None,
+            expires_at: None,
+            status: SessionCommandStatus::Pending,
+            resolution: None,
+        };
+        doc.queue_command(&queue("c1")).unwrap();
+        doc.queue_command(&queue("c2")).unwrap();
+
+        // Rewrite the second row's payload as a kind this build cannot know.
+        let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) =
+            doc.doc().get_list("commands").get(1)
+        else {
+            panic!("command row missing");
+        };
+        row.insert(
+            "payload",
+            loro_value_from_json(&serde_json::json!({"kind": "somethingLater"})),
+        )
+        .unwrap();
+        doc.doc().commit();
+
+        let commands = doc.read_commands().unwrap();
+        assert_eq!(
+            commands.len(),
+            1,
+            "the undecodable row is skipped, not fatal"
+        );
+        assert_eq!(commands[0].id, "c1");
+    }
+
+    #[test]
     fn tail_materializes_last_n_joined() {
         let doc = SessionDoc::init("chat-1").unwrap();
         for i in 0..5 {

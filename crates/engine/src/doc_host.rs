@@ -27,7 +27,7 @@ use comet_doc::{
     SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
     join_continuation_entries,
 };
-use comet_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
+use comet_proto::{ApprovalDecision, HarnessId, UserInputAnswer, UserInputQuestion};
 use comet_sync::DocsStore;
 
 use crate::sessions::{SessionsEngine, SteerOutcome};
@@ -655,6 +655,36 @@ impl DocHost {
                 Ok((
                     SessionCommandStatus::Applied,
                     Some("answered as new turn".into()),
+                ))
+            }
+            SessionCommandPayload::RespondApproval {
+                request_id,
+                decision,
+            } => {
+                // `Expired` is stamped by the host when a run ends; it is not a
+                // choice a client may make. Accepting it off the wire would let
+                // any paired device mark a live approval expired, which every
+                // peer would then render as answered and disabled.
+                if matches!(decision, ApprovalDecision::Expired) {
+                    return Ok((
+                        SessionCommandStatus::Rejected,
+                        Some("Expired isn't a decision that can be sent.".into()),
+                    ));
+                }
+                if sessions.respond_approval(chat_id, request_id, decision.clone())? {
+                    return Ok((SessionCommandStatus::Applied, None));
+                }
+                // No live resolver, and no fallback is possible: the decision
+                // answers a request id owned by a process that has exited.
+                // Refuse with a reason rather than dropping it silently.
+                tracing::debug!(
+                    chat = %chat_id,
+                    request = %request_id,
+                    "respond-approval had no live resolver"
+                );
+                Ok((
+                    SessionCommandStatus::Rejected,
+                    Some("This approval is no longer waiting for an answer.".into()),
                 ))
             }
         }

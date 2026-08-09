@@ -487,6 +487,31 @@ impl SessionsEngine {
         Ok(true)
     }
 
+    /// Resolve a pending approval. Returns `false` when no such request is
+    /// pending — an unknown id, or a run that already settled.
+    pub fn respond_approval(
+        &self,
+        chat_id: &str,
+        request_id: &str,
+        decision: ApprovalDecision,
+    ) -> Result<bool, EngineError> {
+        let target = lock(&self.inner.runs)
+            .get(chat_id)
+            .map(|h| (h.pending_approvals.clone(), h.engine_tx.clone()));
+        let Some((pending, engine_tx)) = target else {
+            return Ok(false);
+        };
+        let Some(resolver) = lock(&pending).remove(request_id) else {
+            return Ok(false);
+        };
+        let _ = resolver.send(decision.clone());
+        let _ = engine_tx.send(AgentEvent::ApprovalResolved {
+            request_id: request_id.to_string(),
+            decision,
+        });
+        Ok(true)
+    }
+
     /// Boot recovery: for every journal whose last event is not `Done` (a run died
     /// mid-stream), stamp this device's abandoned `streaming` doc entries `aborted`
     /// with a VISIBLE "Run interrupted by engine restart" error part, close the
