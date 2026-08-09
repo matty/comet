@@ -153,9 +153,16 @@ pub fn blocked_on(transcript: &[SessionMessageEntry]) -> Option<BlockedOn> {
 pub struct BlockedLine {
     pub text: SharedString,
     pub elapsed_secs: i64,
-    /// Whether to offer Stop. False for an approval — Deny is its escape
-    /// hatch, and offering both would ask the user to choose between two ways
-    /// of ending the same wait.
+    /// Whether to offer Stop. True for both waits, and the reason differs
+    /// between them: on a hung call Stop is the only exit, while on an approval
+    /// Deny ends the APPROVAL and Stop ends the TURN. Those are different
+    /// exits, not two ways of saying the same thing — denying leaves the agent
+    /// running and free to try something else.
+    ///
+    /// Suppressing it here made a pending approval the one live run in the app
+    /// that could not be interrupted: the decision row replaces the composer,
+    /// so the send button's own Stop is off screen for exactly as long as the
+    /// wait lasts.
     pub stoppable: bool,
 }
 
@@ -196,7 +203,7 @@ pub fn blocked_line(
         BlockedOn::Approval { .. } => Some(BlockedLine {
             text: "Waiting for approval".into(),
             elapsed_secs,
-            stoppable: false,
+            stoppable: true,
         }),
         BlockedOn::Tool { label, detail, .. } => {
             if elapsed_secs < HUNG_TOOL_AFTER_SECS {
@@ -489,7 +496,12 @@ mod tests {
         let line = blocked_line(&mut stamp, approval, t0).expect("approvals report immediately");
         assert_eq!(line.elapsed_secs, 0);
         assert!(line.text.contains("Waiting for approval"), "{}", line.text);
-        assert!(!line.stoppable, "Deny is the escape hatch, not Stop");
+        assert!(
+            line.stoppable,
+            "Deny ends the approval; Stop ends the turn. The decision row \
+             replaces the composer, so this line carries the only Stop on \
+             screen while the wait lasts."
+        );
 
         let mut stamp = None;
         let tool = || {
@@ -558,7 +570,7 @@ mod tests {
         let mut stamp = None;
         let line = blocked_line(&mut stamp, blocked_on(&t), Instant::now())
             .expect("an open approval is a blocked turn regardless of indicator");
-        assert!(!line.stoppable);
+        assert!(line.stoppable);
         assert!(line.text.contains("Waiting for approval"));
     }
 }
