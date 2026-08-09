@@ -5,8 +5,8 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessCapabilities, HarnessId, Model, ReasoningLevel, RunRequest,
-    SteeringMode, UserInputQuestion,
+    AgentEvent, ApprovalDecision, ApprovalRequest, DoneStatus, FileOperation, HarnessCapabilities,
+    HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls};
@@ -145,6 +145,61 @@ impl Harness for MockHarness {
                             picked.join("**, **")
                         }
                     ),
+                });
+                let _ = tx.send(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                });
+            });
+            let stream = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (Ok(event), rx))
+            });
+            return Ok(stream.boxed());
+        }
+
+        // Dev/testing knob: `COMET_MOCK_APPROVAL=1` swaps in a run that asks
+        // permission mid-stream via `controls.request_approval` (the host mints
+        // the request id, emits `ApprovalRequested`, and resolves it from the
+        // queued respond-approval command) — the only data-side way to put an
+        // approval card on screen.
+        let approval_mode = std::env::var("COMET_MOCK_APPROVAL")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        if approval_mode {
+            let request_approval = controls.request_approval;
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+            tokio::spawn(async move {
+                let pause = if delay_ms == 0 {
+                    std::time::Duration::from_millis(50)
+                } else {
+                    delay
+                };
+                tokio::time::sleep(pause).await;
+                let _ = tx.send(AgentEvent::TextDelta {
+                    text: "I need to edit the reconciliation module before I continue.\n\n".into(),
+                });
+                tokio::time::sleep(pause).await;
+                let decision = request_approval(ApprovalRequest::FileChange {
+                    path: "src/reconcile.rs".into(),
+                    operation: FileOperation::Modify,
+                    added_lines: 24,
+                    removed_lines: 6,
+                })
+                .await;
+                tokio::time::sleep(pause).await;
+                let closing = match decision {
+                    Ok(ApprovalDecision::Allow) | Ok(ApprovalDecision::AllowForSession) => {
+                        "Applied the edit."
+                    }
+                    Ok(ApprovalDecision::Deny { .. }) => "Left the file untouched.",
+                    // The run outlived its decision channel: expired, or the
+                    // resolver was dropped with the run.
+                    Ok(ApprovalDecision::Expired) | Err(_) => "Stopped without the edit.",
+                };
+                let _ = tx.send(AgentEvent::TextDelta {
+                    text: closing.into(),
                 });
                 let _ = tx.send(AgentEvent::Done {
                     status: DoneStatus::Completed,
