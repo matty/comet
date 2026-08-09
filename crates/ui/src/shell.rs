@@ -1105,6 +1105,13 @@ impl Shell {
             }
             self.right_tween = None;
             self.terminal_tween = None;
+            // The blocked-turn clock is keyed only on the approval/tool id, not
+            // on the chat it belongs to — a stamp surviving the switch would be
+            // the clock's only OVER-report path (a same-keyed wait on the new
+            // chat inheriting a start time from the old one) in a design that
+            // otherwise only ever under-reports. Theoretical today (approval
+            // ids are UUIDs; tool keys are provider call ids), but free to close.
+            self.blocked_stamp = None;
             let panels = self.panels.get(&self.panel_key(cx));
             if let Some(panel) = self.terminal.clone() {
                 panel.update(cx, |panel, cx| panel.set_open(panels.terminal_open, cx));
