@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 /// receiver has no tolerant arm. A new RPC method needs no bump — an older
 /// peer answers `UnknownMethod`.
 ///
-/// 2: `MessagePart::Notice` (slice 0b.1).
-pub const PROTOCOL_VERSION: u32 = 2;
+/// 2: `MessagePart::Notice`.
+/// 3: `MessagePart::Approval`.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

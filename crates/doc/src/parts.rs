@@ -5,7 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use comet_proto::{AgentEvent, NoticeKind, NoticeSeverity, ToolCall, UserInputQuestion};
+use comet_proto::{
+    AgentEvent, ApprovalDecision, ApprovalRequest, NoticeKind, NoticeSeverity, ToolCall,
+    UserInputQuestion,
+};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -49,6 +52,17 @@ pub enum MessagePart {
         #[serde(default)]
         resolved: bool,
     },
+    /// An approval the provider is blocked on. `decision: None` is the open
+    /// state; the host is the sole writer of the resolved state, including the
+    /// `Expired` it stamps when a pending approval's run ends.
+    #[serde(rename_all = "camelCase")]
+    Approval {
+        id: String,
+        request_id: String,
+        approval: ApprovalRequest,
+        #[serde(default)]
+        decision: Option<ApprovalDecision>,
+    },
     Error {
         id: String,
         message: String,
@@ -80,6 +94,7 @@ impl MessagePart {
             MessagePart::Text { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
+            | MessagePart::Approval { id, .. }
             | MessagePart::Error { id, .. }
             | MessagePart::Notice { id, .. } => id,
         }
@@ -91,6 +106,9 @@ impl MessagePart {
             MessagePart::Tool { call, .. } => serde_json::to_vec(call).map_or(0, |v| v.len()),
             MessagePart::Input { questions, .. } => {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
+            }
+            MessagePart::Approval { approval, .. } => {
+                serde_json::to_vec(approval).map_or(0, |v| v.len())
             }
             MessagePart::Error { message, .. } => message.len(),
             MessagePart::Notice {
@@ -112,6 +130,7 @@ impl MessagePart {
 /// - `ToolCall` appends, or refreshes in place when the id already exists (SDK retry idempotence).
 /// - `ToolResult` marks the matching tool part resolved / errored in place.
 /// - `InputRequested` appends an input part; `InputResolved` marks it resolved.
+/// - `ApprovalRequested` appends an approval part; `ApprovalResolved` stamps its decision.
 /// - `Error` and `Done{error}` become visible error parts.
 pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
     match event {
@@ -191,6 +210,36 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 }
             }
         }
+        AgentEvent::ApprovalRequested {
+            request_id,
+            approval,
+        } => {
+            let id = format!("ap-{request_id}");
+            if !out.iter().any(|p| p.id() == id) {
+                out.push(MessagePart::Approval {
+                    id,
+                    request_id: request_id.clone(),
+                    approval: approval.clone(),
+                    decision: None,
+                });
+            }
+        }
+        AgentEvent::ApprovalResolved {
+            request_id,
+            decision,
+        } => {
+            for p in out.iter_mut() {
+                if let MessagePart::Approval {
+                    request_id: rid,
+                    decision: slot,
+                    ..
+                } = p
+                    && rid == request_id
+                {
+                    *slot = Some(decision.clone());
+                }
+            }
+        }
         AgentEvent::Error { message } => {
             let id = format!("e{}", out.len());
             out.push(MessagePart::Error {
@@ -261,9 +310,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         }
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
-        | AgentEvent::Diagnostic { .. }
-        | AgentEvent::ApprovalRequested { .. }
-        | AgentEvent::ApprovalResolved { .. } => {}
+        | AgentEvent::Diagnostic { .. } => {}
     }
 }
 
@@ -369,6 +416,85 @@ mod tests {
 
     fn text_delta(s: &str) -> AgentEvent {
         AgentEvent::TextDelta { text: s.into() }
+    }
+
+    #[test]
+    fn approval_requested_appends_an_open_part() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ApprovalRequested {
+                request_id: "r1".into(),
+                approval: ApprovalRequest::FileRead {
+                    path: "a.rs".into(),
+                },
+            },
+        );
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Approval { id, request_id, decision: None, .. }
+                if id == "ap-r1" && request_id == "r1"
+        ));
+    }
+
+    #[test]
+    fn approval_requested_is_idempotent_on_the_same_id() {
+        let mut parts = Vec::new();
+        let ev = AgentEvent::ApprovalRequested {
+            request_id: "r1".into(),
+            approval: ApprovalRequest::FileRead {
+                path: "a.rs".into(),
+            },
+        };
+        fold_event_into_parts(&mut parts, &ev);
+        fold_event_into_parts(&mut parts, &ev);
+        assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
+    fn approval_resolved_stamps_the_matching_part() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ApprovalRequested {
+                request_id: "r1".into(),
+                approval: ApprovalRequest::FileRead {
+                    path: "a.rs".into(),
+                },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ApprovalResolved {
+                request_id: "r1".into(),
+                decision: ApprovalDecision::Deny {
+                    message: "no".into(),
+                },
+            },
+        );
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Approval {
+                decision: Some(ApprovalDecision::Deny { message }),
+                ..
+            } if message == "no"
+        ));
+    }
+
+    #[test]
+    fn approval_resolved_for_an_unknown_id_changes_nothing() {
+        // The absent case: a decision arriving for a part this accumulator
+        // never saw must not fabricate one.
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ApprovalResolved {
+                request_id: "ghost".into(),
+                decision: ApprovalDecision::Allow,
+            },
+        );
+        assert!(parts.is_empty());
     }
 
     #[test]

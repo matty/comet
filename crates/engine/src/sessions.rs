@@ -830,6 +830,12 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 is_error: *is_error,
                 resolved: *resolved,
             },
+            // Approvals carry no heavy field by construction: a file change is
+            // path + operation + counts, never the patch. Passed through whole
+            // — the catch-all below would do the same, but a kind that DOES
+            // carry something heavy has to make that decision here rather than
+            // inherit it silently.
+            MessagePart::Approval { .. } => part.clone(),
             other => other.clone(),
         })
         .collect()
@@ -1347,6 +1353,24 @@ mod tests {
     fn engine(dir: &std::path::Path) -> SessionsEngine {
         let journal = Arc::new(RunJournal::open(dir).expect("journal opens"));
         SessionsEngine::new("dev-a".into(), journal, Arc::new(HarnessRegistry::new()))
+    }
+
+    #[test]
+    fn render_parts_passes_an_approval_through_unchanged() {
+        // The privacy policy strips heavy tool inputs; an approval has none to
+        // strip, and this pins that rather than leaving it to a catch-all.
+        let part = MessagePart::Approval {
+            id: "ap-r1".into(),
+            request_id: "r1".into(),
+            approval: comet_proto::ApprovalRequest::FileChange {
+                path: "src/main.rs".into(),
+                operation: comet_proto::FileOperation::Modify,
+                added_lines: 12,
+                removed_lines: 3,
+            },
+            decision: None,
+        };
+        assert_eq!(render_parts(std::slice::from_ref(&part)), vec![part]);
     }
 
     fn session_started(cwd: &str, runtime_mode: RuntimeMode) -> AgentEvent {
