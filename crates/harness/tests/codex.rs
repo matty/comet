@@ -285,6 +285,27 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     );
 }
 
+/// `Auto` is the only mode that hands approval review to the provider, so it
+/// is the only one whose reviewer value the other scenarios cannot pin.
+#[tokio::test]
+async fn auto_mode_sends_the_provider_as_the_approvals_reviewer() {
+    let (controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:auto-reviewer");
+    req.runtime_mode = RuntimeMode::Auto;
+    let events = run_to_end(&harness(), req, controls).await;
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+}
+
 #[tokio::test]
 async fn steering_uses_turn_steer_with_expected_turn_id() {
     let (controls, steer, _token) = controls("Yes");
