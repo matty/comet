@@ -38,9 +38,16 @@ pub enum SandboxLevel {
 
 /// How much a run may do without asking.
 ///
-/// The sandbox is not a separate user choice: each mode names the one it
-/// implies, so a caller cannot pair a permissive mode with a restrictive
-/// sandbox by accident. See [`RunRequest::for_session`].
+/// For a user session the sandbox is not a separate choice: each mode names
+/// the one it implies, and [`RunRequest::for_session`] applies it, so those
+/// call sites cannot pair a permissive mode with a restrictive sandbox by
+/// accident.
+///
+/// That is a property of the constructor, not of the type. `RunRequest`
+/// carries the two separately on purpose, because chat titling needs a
+/// never-ask mode with a read-only sandbox — a pairing no mode expresses.
+/// Anything reading a request's sandbox must read the field, not
+/// `runtime_mode.sandbox()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeMode {
