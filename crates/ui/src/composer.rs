@@ -3162,6 +3162,16 @@ pub struct Composer {
     /// Requests already answered locally (suppresses the panel until the doc
     /// frame marks them resolved).
     answered_requests: HashSet<String>,
+    /// The approval the decision row is serving. Unlike [`Self::wizard`] this
+    /// is NOT latched: it is recomputed from the transcript on every state
+    /// change and released the instant any decision — including the host's
+    /// `Expired` — reaches the doc. An approval answers a JSON-RPC id owned by
+    /// a process that may have exited; latching it past that would leave an
+    /// Allow button that does nothing, silently.
+    approval: Option<(String, comet_proto::ApprovalRequest)>,
+    /// Approvals answered locally, suppressing the row until the doc frame
+    /// carries the decision back.
+    answered_approvals: HashSet<String>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
@@ -3248,6 +3258,8 @@ impl Composer {
             wizard: None,
             wizard_focus: cx.focus_handle(),
             answered_requests: HashSet::new(),
+            approval: None,
+            answered_approvals: HashSet::new(),
             advance_task: None,
             send_task: None,
             expanded_mode: false,
@@ -3761,11 +3773,12 @@ impl Composer {
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
-        let (key, pending) = {
+        let (key, pending, approval) = {
             let s = self.state.read(cx);
             (
                 s.selected_chat.clone(),
                 pending_input_request(&s.transcript),
+                crate::approvals::pending_approval(&s.transcript),
             )
         };
 
@@ -3781,6 +3794,8 @@ impl Composer {
             self.current_key = key;
             self.failure = None;
             self.wizard = None;
+            self.approval = None;
+            self.answered_approvals.clear();
             // Attachments stay stashed under their chat key (the map swap IS
             // the navigation); only the transient chrome resets.
             self.preview = None;
@@ -3795,6 +3810,17 @@ impl Composer {
             self.last_rendered_height = 0.0;
             self.route_snap_until = Some(Instant::now() + Duration::from_millis(ROUTE_SNAP_MS));
             self.input.update(cx, |input, cx| input.set_text(draft, cx));
+        }
+
+        // No latch, deliberately (see the field's doc comment). `pending_approval`
+        // already returns None for any decided approval, so a decision landing
+        // anywhere — this device, a paired one, or the host's `Expired` stamp —
+        // retires the row on the next state change.
+        self.approval = approval.filter(|(id, _)| !self.answered_approvals.contains(id));
+        if self.approval.is_some() {
+            self.input.update(cx, |input, cx| {
+                input.set_placeholder("Add a note for the agent (optional)", cx)
+            });
         }
 
         // Question panel lifecycle (wizard state cached per request id).
@@ -3860,6 +3886,11 @@ impl Composer {
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
+        if self.approval.is_some() {
+            // The decision row replaces the composer; Enter in the deny-note
+            // field must not send a prompt into a turn that is blocked.
+            return;
+        }
         if self.wizard.is_some() {
             // Enter inside the panel's free-text input submits the page.
             let typed = self.input.read(cx).text().trim().to_string();
@@ -4214,7 +4245,7 @@ impl Composer {
         }));
     }
 
-    fn interrupt(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn interrupt(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).selected_client() else {
             return;
         };
@@ -4357,6 +4388,80 @@ impl Composer {
                 let still_pending = pending_input_request(&transcript)
                     .is_some_and(|(pending_id, _)| pending_id == request_id);
                 if still_pending && composer.answered_requests.remove(&request_id) {
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Queue a decision and retire the row.
+    ///
+    /// `RespondApproval` is a doc command on the existing `QUEUE_COMMAND` RPC
+    /// (`crates/doc/src/commands.rs`), not a new RPC method — so a paired LAN
+    /// client answers approvals with no allowlist work, by construction.
+    fn respond_approval(
+        &mut self,
+        decision: comet_proto::ApprovalDecision,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((request_id, _)) = self.approval.take() else {
+            return;
+        };
+        self.answered_approvals.insert(request_id.clone());
+        self.input.update(cx, |input, cx| {
+            input.set_text("", cx);
+            input.set_placeholder("Do anything…", cx);
+        });
+        let Some(engine) = self.state.read(cx).selected_client() else {
+            return;
+        };
+        let Some(chat_id) = self
+            .state
+            .read(cx)
+            .selected_chat
+            .clone()
+            .map(|id| id.local_id)
+        else {
+            return;
+        };
+        let command = SessionCommandPayload::RespondApproval {
+            request_id: request_id.clone(),
+            decision,
+        };
+        let params = match serde_json::to_value(&command) {
+            Ok(value) => serde_json::json!({ "chatId": chat_id, "command": value }),
+            Err(_) => return,
+        };
+        self.send_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
+            if let Err(err) = result {
+                this.update(cx, |composer, cx| {
+                    composer.failure = Some(crate::errors::approval_failure(&err).into());
+                    // The decision never left this device — put the row back.
+                    composer.answered_approvals.remove(&request_id);
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
+            // The command queued, but the host may still REJECT it — a run that
+            // ended between the render and the click has no resolver left
+            // (`crates/engine/src/doc_host.rs`: "This approval is no longer
+            // waiting for an answer"), and the UI does not observe command
+            // status. If the same request is still pending once the host has
+            // had ample time, the decision demonstrably didn't take: un-hide
+            // the row rather than leaving a blocked turn with nothing on
+            // screen to answer it. No failure text — a slow host is the other
+            // explanation, and this code cannot tell them apart.
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            this.update(cx, |composer, cx| {
+                let transcript = composer.state.read(cx).transcript.clone();
+                let still_pending = crate::approvals::pending_approval(&transcript)
+                    .is_some_and(|(pending_id, _)| pending_id == request_id)
+                    && crate::approvals::approval_decision(&transcript, &request_id).is_none();
+                if still_pending && composer.answered_approvals.remove(&request_id) {
                     cx.notify();
                 }
             })
@@ -4602,6 +4707,161 @@ impl Composer {
             .into_any_element()
     }
 
+    /// The approval decision row, rendered in place of the composer — the same
+    /// floating-pill chrome as [`Self::render_wizard`], so a turn blocked on a
+    /// decision and a turn blocked on a question read as the same kind of
+    /// moment. Replacing the composer IS the send block: there is no flag a
+    /// later call site can forget to check.
+    ///
+    /// The shared input becomes the deny note, mirroring the wizard's
+    /// free-text override — it is what lets a refusal say "not that path"
+    /// instead of only "no". Allow ignores it.
+    fn render_approval(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = Theme::of(cx).clone();
+        let Some((_, approval)) = self.approval.clone() else {
+            return gpui::Empty.into_any_element();
+        };
+        let (label, detail) = comet_proto::view::approval_chip_content(&approval);
+        let note = self.input.read(cx).text().trim().to_string();
+
+        // One button shape for all three decisions: only the tint differs, so
+        // the row's height cannot vary with which decision is emphasised.
+        let button = |id: &'static str,
+                      text: &'static str,
+                      strong: bool,
+                      theme: &Theme,
+                      cx: &mut Context<Self>,
+                      decision: comet_proto::ApprovalDecision| {
+            div()
+                .id(id)
+                .h(px(30.0))
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(if strong {
+                    crate::theme::hairline(0.16)
+                } else {
+                    crate::theme::hairline(0.08)
+                })
+                .bg(motion::hover_blend(
+                    &format!("approval-{id}"),
+                    crate::theme::ink(if strong { 0.09 } else { 0.025 }),
+                    crate::theme::ink(if strong { 0.14 } else { 0.06 }),
+                ))
+                .on_hover(motion::hover_listener(format!("approval-{id}")))
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(if strong { theme.text } else { theme.text_muted })
+                .child(SharedString::from(text))
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.respond_approval(decision.clone(), cx)),
+                )
+        };
+
+        div()
+            .id("approval-panel")
+            .rounded(px(26.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.input_bg)
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(px(16.0))
+                    .pt(px(16.0))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted.opacity(0.6))
+                            .child(SharedString::from(crate::popover::tracked_upper(
+                                "Approval needed",
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .mt(px(6.0))
+                            .text_size(px(15.0))
+                            .line_height(px(20.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(SharedString::from(label)),
+                    )
+                    .child(
+                        div()
+                            .mt(px(4.0))
+                            .w_full()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.5))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(detail)),
+                    )
+                    .child(
+                        div()
+                            .mt(px(12.0))
+                            .border_t_1()
+                            .border_color(crate::theme::hairline(0.06))
+                            .pt(px(12.0))
+                            .pb(px(4.0))
+                            .px(px(4.0))
+                            .child(self.input.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .px(px(12.0))
+                    .pb(px(12.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(button(
+                        "approval-deny",
+                        "Deny",
+                        false,
+                        &theme,
+                        cx,
+                        comet_proto::ApprovalDecision::Deny {
+                            message: if note.is_empty() {
+                                // Comet copy, not an empty string: the message
+                                // goes back to the model, and "" tells it
+                                // nothing about what to do instead.
+                                "The user declined this action.".to_string()
+                            } else {
+                                note.clone()
+                            },
+                        },
+                    ))
+                    .child(div().flex_1())
+                    .child(button(
+                        "approval-allow-session",
+                        "Allow for this session",
+                        false,
+                        &theme,
+                        cx,
+                        comet_proto::ApprovalDecision::AllowForSession,
+                    ))
+                    .child(button(
+                        "approval-allow",
+                        "Allow",
+                        true,
+                        &theme,
+                        cx,
+                        comet_proto::ApprovalDecision::Allow,
+                    )),
+            )
+            .into_any_element()
+    }
+
     fn render_send_button(
         &mut self,
         mode: SendButtonMode,
@@ -4832,6 +5092,17 @@ impl Render for Composer {
                         .child(div().min_w_0().child(message)),
                 )
             });
+
+        // An approval outranks a question when both are somehow pending: the
+        // approval has an expiry the user did not choose, and the question does
+        // not — it stays answerable after its run dies.
+        if self.approval.is_some() {
+            let approval = self.render_approval(cx);
+            return container.child(motion::fade_quick(
+                "composer-approval",
+                div().child(approval),
+            ));
+        }
 
         if wizard_active {
             let wizard = self.render_wizard(cx);
