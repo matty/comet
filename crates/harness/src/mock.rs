@@ -191,11 +191,13 @@ impl Harness for MockHarness {
             return Ok(stream.boxed());
         }
 
-        // Dev/testing knob: `COMET_MOCK_APPROVAL=1` swaps in a run that asks
-        // permission mid-stream via `controls.request_approval` (the host mints
-        // the request id, emits `ApprovalRequested`, and resolves it from the
-        // queued respond-approval command) — the only data-side way to put an
-        // approval card on screen.
+        // Dev/testing knob: `COMET_MOCK_APPROVAL=<kind>` swaps in a run that
+        // asks permission mid-stream via `controls.request_approval` (the host
+        // mints the request id, emits `ApprovalRequested`, and resolves it from
+        // the queued respond-approval command) — the only data-side way to put
+        // an approval card on screen. `<kind>` selects the shape (`command`,
+        // `file-change`, `file-read`, `mcp`, `unknown`); `1` keeps meaning the
+        // file-change run — see `mock_approval` below.
         let approval = std::env::var("COMET_MOCK_APPROVAL")
             .ok()
             .and_then(|v| mock_approval(&v));
@@ -241,9 +243,9 @@ impl Harness for MockHarness {
         }
 
         // Dev/testing knob: `COMET_MOCK_HANG=1` emits a tool call and then
-        // NOTHING — no result, no Done. The blocked-turn state's hung-call arm
-        // (`DEBT.md` D5) has no other data-side producer: every fake in this
-        // repo answers, which is exactly why D5 was only ever observed live.
+        // NOTHING — no result, no Done. A tool call that never returns has no
+        // other data-side producer: every fake in this repo answers, which is
+        // why the state has only ever been seen against a live provider.
         let hang_mode = std::env::var("COMET_MOCK_HANG")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
@@ -494,11 +496,11 @@ mod tests {
         assert!(mock_approval("0").is_none());
     }
 
-    /// The hang-call knob has no test on the stream (it never terminates by
-    /// design); what IS testable is that the two knobs are independent, so a
-    /// hang run does not also ask for an approval.
+    /// The hang knob's value must not accidentally become an "off" value for
+    /// the approval knob: an unrecognized value falls into the fallback arm,
+    /// not the `None` arm.
     #[test]
-    fn the_hang_knob_is_not_an_approval_value() {
+    fn an_unrecognized_value_falls_back_to_the_file_change_run() {
         assert!(
             mock_approval("hang").is_some(),
             "unrecognized values fall back"
