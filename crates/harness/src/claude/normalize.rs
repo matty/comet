@@ -2,8 +2,8 @@
 //! (init dedupe, subagent filtering, tool decoding, error-code mapping).
 
 use comet_proto::{
-    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, TodoItem,
-    ToolCall,
+    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, RuntimeMode,
+    TodoItem, ToolCall,
 };
 use serde_json::Value;
 
@@ -237,14 +237,18 @@ pub(crate) struct Normalizer {
     assistant_message_id: String,
     /// Last session id seen (init or result) — used for synthetic Dones.
     pub session_id: Option<String>,
+    /// Echoed into `SessionStarted` so the journal records what the run was
+    /// launched under. Nothing here acts on it.
+    runtime_mode: RuntimeMode,
 }
 
 impl Normalizer {
-    pub fn new() -> Self {
+    pub fn new(runtime_mode: RuntimeMode) -> Self {
         Self {
             saw_init: false,
             assistant_message_id: new_message_id(),
             session_id: None,
+            runtime_mode,
         }
     }
 
@@ -272,6 +276,7 @@ impl Normalizer {
                     cwd: f.cwd,
                     session_id: f.session_id,
                     assistant_message_id: self.assistant_message_id.clone(),
+                    runtime_mode: self.runtime_mode,
                 }]
             }
 
@@ -519,7 +524,7 @@ mod tests {
 
     fn result_done(raw: &str) -> AgentEvent {
         let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
-        let events = Normalizer::new().normalize(frame, false);
+        let events = Normalizer::new(RuntimeMode::default()).normalize(frame, false);
         assert_eq!(events.len(), 2, "usage + done");
         events.into_iter().nth(1).expect("done event")
     }
@@ -528,7 +533,7 @@ mod tests {
     fn stream_deltas_map_to_text_reasoning_and_heartbeats() {
         let normalize = |raw: &str| {
             let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
-            Normalizer::new().normalize(frame, false)
+            Normalizer::new(RuntimeMode::default()).normalize(frame, false)
         };
         // Real thinking text streams as a reasoning delta.
         let ev = normalize(
@@ -624,7 +629,7 @@ mod tests {
 
     fn notice_of(raw: &str) -> AgentEvent {
         let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
-        let events = Normalizer::new().normalize(frame, false);
+        let events = Normalizer::new(RuntimeMode::default()).normalize(frame, false);
         assert_eq!(events.len(), 1, "{events:?}");
         events.into_iter().next().unwrap()
     }
@@ -777,14 +782,18 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"}}"#,
         )
         .unwrap();
-        let events = Normalizer::new().normalize(frame, false);
+        let events = Normalizer::new(RuntimeMode::default()).normalize(frame, false);
         assert!(matches!(&events[0], AgentEvent::Error { .. }), "{events:?}");
         // allowed: still quiet.
         let frame = crate::claude::wire::parse_frame(
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#,
         )
         .unwrap();
-        assert!(Normalizer::new().normalize(frame, false).is_empty());
+        assert!(
+            Normalizer::new(RuntimeMode::default())
+                .normalize(frame, false)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -792,7 +801,7 @@ mod tests {
         use comet_proto::DiagnosticSeverity;
         let normalize = |raw: &str| {
             let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
-            Normalizer::new().normalize(frame, false)
+            Normalizer::new(RuntimeMode::default()).normalize(frame, false)
         };
         // Ignored tier: recognized, deliberately dropped — routine on every
         // healthy session, must produce NOTHING.

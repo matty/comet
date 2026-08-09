@@ -480,7 +480,7 @@ impl SessionsEngine {
             // exist in the journal (the debounced workspace-row write may
             // never have landed) — remember it so the revived run resumes the
             // same harness conversation (comet recoverDraft, sessions.ts:538).
-            if let Some((session_id, cwd)) = self.inner.journal_harness_session(&chat_id) {
+            if let Some((session_id, cwd, _)) = self.inner.journal_harness_session(&chat_id) {
                 self.inner
                     .remember_harness_session(&chat_id, &session_id, &cwd);
             }
@@ -544,21 +544,19 @@ impl SessionsEngine {
                 let request = sessions
                     .last_request(&chat_id)
                     .or_else(|| host.request_from_chat_row(&chat_id, &prompt_text))
-                    // Last resort: the journal's own cwd (comet's draft config)
-                    // — a crash can predate the debounced workspace-row write.
-                    //
-                    // The default mode is the only answer available here, and
-                    // it is the right one. This arm is reached only when the
-                    // chat row is missing, so the chat never had a stored
-                    // config to choose a mode in — and the journal replays
-                    // `AgentEvent`s, which carry no mode to recover one from.
-                    // A row that exists but has no config resolves to the same
-                    // default one branch up.
+                    // Last resort: the journal's own cwd and mode (comet's
+                    // draft config) — a crash can predate the debounced
+                    // workspace-row write, and the chat a new run belongs to
+                    // takes its mode from the composer draft rather than from
+                    // a stored row. Resuming under the default instead of the
+                    // recorded mode would write where the user asked to be
+                    // asked.
                     .or_else(|| {
-                        let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
+                        let (_, cwd, runtime_mode) =
+                            sessions.inner.journal_harness_session(&chat_id)?;
                         Some(RunRequest {
                             cwd,
-                            ..RunRequest::for_session(RuntimeMode::default())
+                            ..RunRequest::for_session(runtime_mode)
                         })
                     });
                 let Some(mut request) = request else {
@@ -758,16 +756,17 @@ impl Inner {
             return (!session_id.is_empty() && cwd_ok(session_cwd.as_deref().unwrap_or("")))
                 .then_some(session_id);
         }
-        let (session_id, session_cwd) = self.journal_harness_session(chat_id)?;
+        let (session_id, session_cwd, _) = self.journal_harness_session(chat_id)?;
         // Cache the journal hit (memory + row) so later dispatches skip the scan.
         self.remember_harness_session(chat_id, &session_id, &session_cwd);
         cwd_ok(&session_cwd).then_some(session_id)
     }
 
     /// The last harness session id named anywhere in the chat's journal, with
-    /// the cwd of the `SessionStarted` that governs it. `Done.session_id`
-    /// inherits the cwd of the most recent `SessionStarted` (same run).
-    fn journal_harness_session(&self, chat_id: &str) -> Option<(String, String)> {
+    /// the cwd and runtime mode of the `SessionStarted` that governs it.
+    /// `Done.session_id` inherits both from the most recent `SessionStarted`
+    /// (same run).
+    fn journal_harness_session(&self, chat_id: &str) -> Option<(String, String, RuntimeMode)> {
         let events = match self.journal.replay(chat_id, 0) {
             Ok(events) => events,
             Err(err) => {
@@ -776,22 +775,27 @@ impl Inner {
             }
         };
         let mut current_cwd = String::new();
-        let mut found: Option<(String, String)> = None;
+        let mut current_mode = RuntimeMode::default();
+        let mut found: Option<(String, String, RuntimeMode)> = None;
         for (_, event) in events {
             match event {
                 AgentEvent::SessionStarted {
-                    session_id, cwd, ..
+                    session_id,
+                    cwd,
+                    runtime_mode,
+                    ..
                 } => {
                     current_cwd = cwd;
+                    current_mode = runtime_mode;
                     if !session_id.is_empty() {
-                        found = Some((session_id, current_cwd.clone()));
+                        found = Some((session_id, current_cwd.clone(), current_mode));
                     }
                 }
                 AgentEvent::Done {
                     session_id: Some(session_id),
                     ..
                 } if !session_id.is_empty() => {
-                    found = Some((session_id, current_cwd.clone()));
+                    found = Some((session_id, current_cwd.clone(), current_mode));
                 }
                 _ => {}
             }
@@ -1334,4 +1338,78 @@ async fn drive_run(
 
     inner.remove_run(&chat_id, &run_id);
     inner.set_status(&chat_id, final_status, false);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine(dir: &std::path::Path) -> SessionsEngine {
+        let journal = Arc::new(RunJournal::open(dir).expect("journal opens"));
+        SessionsEngine::new("dev-a".into(), journal, Arc::new(HarnessRegistry::new()))
+    }
+
+    fn session_started(cwd: &str, runtime_mode: RuntimeMode) -> AgentEvent {
+        AgentEvent::SessionStarted {
+            harness: HarnessId::Mock,
+            model: "m".into(),
+            tools: Vec::new(),
+            cwd: cwd.into(),
+            session_id: "harness-session-1".into(),
+            assistant_message_id: "a1".into(),
+            runtime_mode,
+        }
+    }
+
+    #[test]
+    fn journal_recovery_carries_the_mode_the_run_was_launched_under() {
+        // The journal is the only durable record of a run whose chat row never
+        // landed, and such a chat takes its mode from the composer draft — so
+        // resuming under the default would drop a mode the user chose.
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = engine(dir.path());
+        sessions
+            .inner
+            .journal
+            .append(
+                "chat-1",
+                &session_started("/tmp/repo", RuntimeMode::ApprovalRequired),
+            )
+            .expect("append");
+
+        let (session_id, cwd, mode) = sessions
+            .inner
+            .journal_harness_session("chat-1")
+            .expect("journal names a session");
+        assert_eq!(session_id, "harness-session-1");
+        assert_eq!(cwd, "/tmp/repo");
+        assert_eq!(mode, RuntimeMode::ApprovalRequired);
+    }
+
+    #[test]
+    fn a_journal_written_before_the_mode_existed_recovers_the_default() {
+        // Absent on the wire is not "unknown": those runs ran under the default.
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = engine(dir.path());
+        let old = serde_json::json!({
+            "type": "sessionStarted",
+            "harness": "mock",
+            "model": "m",
+            "cwd": "/tmp/repo",
+            "sessionId": "harness-session-1",
+            "assistantMessageId": "a1"
+        });
+        let event: AgentEvent = serde_json::from_value(old).expect("old wire decodes");
+        sessions
+            .inner
+            .journal
+            .append("chat-1", &event)
+            .expect("append");
+
+        let (_, _, mode) = sessions
+            .inner
+            .journal_harness_session("chat-1")
+            .expect("journal names a session");
+        assert_eq!(mode, RuntimeMode::AutoAcceptEdits);
+    }
 }

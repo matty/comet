@@ -104,6 +104,7 @@ impl Harness for RecordingHarness {
                         cwd: request.cwd.clone(),
                         session_id: self.session_id.clone(),
                         assistant_message_id: "a-1".into(),
+                        runtime_mode: comet_proto::RuntimeMode::default(),
                     }),
                     Ok(AgentEvent::TextDelta {
                         text: format!("ack: {}", request.prompt),
@@ -362,6 +363,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
                     cwd: "/tmp".into(),
                     session_id: "hs-crash".into(),
                     assistant_message_id: "msg-assistant-1".into(),
+                    runtime_mode: comet_proto::RuntimeMode::default(),
                 },
             )
             .unwrap();
@@ -469,6 +471,7 @@ impl Harness for PersistentHarness {
                 cwd: "/tmp".into(),
                 session_id: "hs-persist".into(),
                 assistant_message_id: "a-1".into(),
+                runtime_mode: comet_proto::RuntimeMode::default(),
             }];
             for ev in first.into_iter().chain(turn(1, "first")) {
                 if tx.send(Ok(ev)).await.is_err() {
@@ -606,6 +609,7 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
                     cwd: "/tmp".into(),
                     session_id: "hs-crash".into(),
                     assistant_message_id: "msg-assistant-1".into(),
+                    runtime_mode: comet_proto::RuntimeMode::default(),
                 },
             )
             .unwrap();

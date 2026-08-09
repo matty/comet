@@ -405,6 +405,7 @@ mod tests {
                 cwd: "/".into(),
                 session_id: "s".into(),
                 assistant_message_id: "a".into(),
+                runtime_mode: comet_proto::RuntimeMode::default(),
             },
         );
         assert!(parts.is_empty());

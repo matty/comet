@@ -554,6 +554,7 @@ async fn run_session(session: Session) {
             cwd: request.cwd.clone(),
             session_id: thread_id.clone(),
             assistant_message_id: assistant_message_id.clone(),
+            runtime_mode: request.runtime_mode,
         },
     )
     .await

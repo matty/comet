@@ -60,6 +60,7 @@ fn mock_script() -> Vec<AgentEvent> {
             cwd: "/tmp".into(),
             session_id: "hs-1".into(),
             assistant_message_id: "a-1".into(),
+            runtime_mode: comet_proto::RuntimeMode::default(),
         },
         AgentEvent::TextDelta { text: "Hel".into() },
         AgentEvent::TextDelta { text: "lo".into() },
@@ -391,6 +392,7 @@ async fn a_notice_while_parked_leaves_the_session_parked_and_the_entry_finished(
                     cwd: "/tmp".into(),
                     session_id: "hs-1".into(),
                     assistant_message_id: "a-1".into(),
+                    runtime_mode: comet_proto::RuntimeMode::default(),
                 },
                 AgentEvent::TextDelta {
                     text: "first turn".into(),
@@ -481,6 +483,7 @@ async fn a_diagnostic_while_parked_is_counted_and_leaves_the_session_parked() {
                     cwd: "/tmp".into(),
                     session_id: "hs-1".into(),
                     assistant_message_id: "a-1".into(),
+                    runtime_mode: comet_proto::RuntimeMode::default(),
                 },
                 AgentEvent::TextDelta {
                     text: "first turn".into(),
@@ -577,6 +580,7 @@ async fn an_empty_reasoning_heartbeat_while_parked_leaves_the_session_parked() {
                     cwd: "/tmp".into(),
                     session_id: "hs-1".into(),
                     assistant_message_id: "a-1".into(),
+                    runtime_mode: comet_proto::RuntimeMode::default(),
                 },
                 AgentEvent::TextDelta {
                     text: "first turn".into(),
@@ -1974,6 +1978,7 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
         cwd: "/tmp".into(),
         session_id: "hs-hb".into(),
         assistant_message_id: "a-hb".into(),
+        runtime_mode: comet_proto::RuntimeMode::default(),
     }];
     // A long "silent" stretch: redacted thinking / input_json_delta windows
     // stream as empty reasoning deltas.

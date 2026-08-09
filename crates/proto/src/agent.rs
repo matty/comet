@@ -679,6 +679,17 @@ pub enum AgentEvent {
         /// Harness-native session id (used for resume).
         session_id: String,
         assistant_message_id: String,
+        /// The mode the run was launched under.
+        ///
+        /// Recorded so a resume can honor it. The journal is the only durable
+        /// record of a run whose chat row never landed — a crash can outrun
+        /// the debounced workspace write — and without this a resumed run
+        /// would silently fall back to the default, which for a chat launched
+        /// under a stricter mode means writing where the user asked to be
+        /// asked. Absent on the wire means a run recorded before it was
+        /// carried; those ran under the default.
+        #[serde(default)]
+        runtime_mode: RuntimeMode,
     },
     TextDelta {
         text: String,
