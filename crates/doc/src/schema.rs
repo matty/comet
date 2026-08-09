@@ -573,6 +573,62 @@ impl SessionDoc {
         Ok(false)
     }
 
+    /// Stamp every OPEN approval in one entry `Expired`, returning how many.
+    ///
+    /// Host-stamped rather than decided per client, so replay and every LAN
+    /// peer agree on the terminal state instead of each reader deciding
+    /// locally whether a card is still live. An approval that already carries
+    /// a decision keeps it.
+    ///
+    /// Scans every part rather than stopping at the first, unlike
+    /// `resolve_input`: an entry can hold more than one open approval, and all
+    /// of them died with the run.
+    pub fn expire_open_approvals(&self, entry_id: &str) -> Result<usize, DocError> {
+        let expired = serde_json::to_value(comet_proto::ApprovalDecision::Expired)?;
+        let messages = self.doc.get_list("messages");
+        let mut stamped = 0usize;
+        for i in 0..messages.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
+                messages.get(i)
+            else {
+                continue;
+            };
+            let id_matches = matches!(
+                entry.get("id"),
+                Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == entry_id
+            );
+            if !id_matches {
+                continue;
+            }
+            let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) =
+                entry.get("parts")
+            else {
+                continue;
+            };
+            for j in 0..parts.len() {
+                let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) =
+                    parts.get(j)
+                else {
+                    continue;
+                };
+                let is_approval = matches!(
+                    part.get("kind"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == "approval"
+                );
+                // Absent IS open: both writers insert `decision` only when
+                // `Some`, so a stored null never occurs.
+                if is_approval && part.get("decision").is_none() {
+                    part.insert("decision", loro_value_from_json(&expired))?;
+                    stamped += 1;
+                }
+            }
+        }
+        if stamped > 0 {
+            self.doc.commit();
+        }
+        Ok(stamped)
+    }
+
     /// Export a snapshot (persistence) — `ExportMode::Snapshot`.
     pub fn export_snapshot(&self) -> Result<Vec<u8>, DocError> {
         self.doc
@@ -1516,6 +1572,74 @@ mod tests {
 
         let err = doc.validate_strict().unwrap_err().to_string();
         assert!(err.contains("kind does not match payload"));
+    }
+
+    #[test]
+    fn expire_open_approvals_stamps_only_the_open_ones() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![
+                MessagePart::Approval {
+                    id: "ap-r1".into(),
+                    request_id: "r1".into(),
+                    approval: ApprovalRequest::FileRead {
+                        path: "a.rs".into(),
+                    },
+                    decision: None,
+                },
+                MessagePart::Approval {
+                    id: "ap-r2".into(),
+                    request_id: "r2".into(),
+                    approval: ApprovalRequest::FileRead {
+                        path: "b.rs".into(),
+                    },
+                    decision: Some(ApprovalDecision::Allow),
+                },
+            ],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        })
+        .unwrap();
+        assert_eq!(doc.expire_open_approvals("m1").unwrap(), 1);
+        let parts = doc.read_entries().unwrap()[0].parts.clone();
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Approval {
+                decision: Some(ApprovalDecision::Expired),
+                ..
+            }
+        ));
+        // An answered approval keeps its answer — expiry is not a reset.
+        assert!(matches!(
+            &parts[1],
+            MessagePart::Approval {
+                decision: Some(ApprovalDecision::Allow),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn expire_open_approvals_is_a_no_op_on_an_entry_without_any() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "no approvals here".into(),
+            }],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        })
+        .unwrap();
+        assert_eq!(doc.expire_open_approvals("m1").unwrap(), 0);
     }
 
     #[test]

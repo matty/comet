@@ -1361,8 +1361,15 @@ async fn drive_run(
             // unresolved question must not outlive the run that asked it
             // (its resolver died with the run; an answer could never land).
             for part in folded.iter_mut() {
-                if let MessagePart::Input { resolved, .. } = part {
-                    *resolved = true;
+                match part {
+                    MessagePart::Input { resolved, .. } => *resolved = true,
+                    // Same rule for approvals, and the same reason. Expired is
+                    // the terminal state; one already answered keeps its
+                    // answer.
+                    MessagePart::Approval { decision, .. } if decision.is_none() => {
+                        *decision = Some(ApprovalDecision::Expired);
+                    }
+                    _ => {}
                 }
             }
             // A Done landing on a PARKED session with nothing streamed (the

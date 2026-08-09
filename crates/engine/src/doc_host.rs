@@ -170,6 +170,16 @@ impl ChatDocHandle {
                 if let Err(err) = self.doc.append_error_part(&entry.id, &part_id, note) {
                     tracing::warn!(chat = %self.chat_id, error = %err, "recovery note append failed");
                 }
+                // The crash path: the process died while blocked on an
+                // approval, so the run loop never reached its terminal
+                // stamp and this entry is the only record left.
+                match self.doc.expire_open_approvals(&entry.id) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(chat = %self.chat_id, entry = %entry.id,
+                        expired = n, "expired approvals left open by a dead run"),
+                    Err(err) => tracing::warn!(chat = %self.chat_id, entry = %entry.id,
+                        error = %err, "expiring open approvals failed"),
+                }
                 stamped.push((entry.id.clone(), entry.created_at));
             }
         }
