@@ -261,7 +261,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         }
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
-        | AgentEvent::Diagnostic { .. } => {}
+        | AgentEvent::Diagnostic { .. }
+        | AgentEvent::ApprovalRequested { .. }
+        | AgentEvent::ApprovalResolved { .. } => {}
     }
 }
 
