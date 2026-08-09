@@ -161,10 +161,12 @@ impl CodexHarness {
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: REASONING_LEVELS.to_vec(),
-            // Undeclared: nothing maps a runtime mode onto codex's approval
-            // policy yet, and declaring a mode the adapter does not honor
-            // would offer a promise the run cannot keep.
-            runtime_modes: Vec::new(),
+            // Only the modes the pinned wire approval policy actually honors:
+            // both mean "no approval prompt", which is what a `"never"` policy
+            // delivers. The asking modes belong to the change that derives the
+            // policy from the mode — declaring one the adapter cannot keep
+            // would offer a promise the run breaks.
+            runtime_modes: vec![RuntimeMode::AutoAcceptEdits, RuntimeMode::FullAccess],
         }
     }
 

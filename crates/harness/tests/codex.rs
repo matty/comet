@@ -795,3 +795,16 @@ async fn unclaimed_notifications_items_and_requests_surface_as_diagnostics() {
         })
     ));
 }
+
+#[test]
+/// Codex declares only the modes the pinned approval policy lets it keep:
+/// both promise no approval prompt, and neither gets one. The asking modes
+/// are declared by the slice that unpins the policy — declaring them sooner
+/// would offer a promise the run cannot keep.
+fn declared_runtime_modes_are_the_ones_the_pinned_policy_honors() {
+    let caps = CodexHarness::capabilities();
+    assert_eq!(
+        caps.runtime_modes,
+        vec![RuntimeMode::AutoAcceptEdits, RuntimeMode::FullAccess]
+    );
+}
