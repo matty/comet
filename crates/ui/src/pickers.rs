@@ -22,7 +22,7 @@ use gpui::{
 
 use comet_engine::registry::HarnessDescriptor;
 use comet_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel, ServerRef,
+    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, RuntimeMode, ServerRef,
 };
 use comet_rpc::methods;
 
@@ -64,6 +64,9 @@ pub struct DraftConfig {
     pub reasoning: Option<ReasoningLevel>,
     /// option id → choice id (only non-defaults are meaningful).
     pub model_options: serde_json::Map<String, serde_json::Value>,
+    /// The new-chat canvas's pick. Nothing writes this yet — it only ever
+    /// takes its `Default` — until the composer grows a picker for it.
+    pub runtime_mode: RuntimeMode,
     /// The picked ref (base branch in NewWorktree mode; a worktree's branch
     /// when reusing one). `None` = the repo's current branch.
     pub branch: Option<String>,
@@ -108,6 +111,7 @@ pub struct ResolvedRunConfig {
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
     pub model_options: serde_json::Map<String, serde_json::Value>,
+    pub runtime_mode: RuntimeMode,
 }
 
 impl ResolvedRunConfig {
@@ -118,7 +122,8 @@ impl ResolvedRunConfig {
             model: self.model.clone(),
             reasoning: self.reasoning,
             model_options: self.model_options.clone(),
-            sandbox: SandboxLevel::WorkspaceWrite,
+            sandbox: self.runtime_mode.sandbox(),
+            runtime_mode: self.runtime_mode,
         })
     }
 }
@@ -160,6 +165,25 @@ pub fn clamp_reasoning(
         Some(level) if ladder.contains(&level) => Some(level),
         _ => default_reasoning(ladder),
     }
+}
+
+/// Applies a picker's field change to a chat config that is about to be
+/// persisted: preserve the row's own runtime mode across the change (the
+/// caller's `config` may already carry the draft's default, not the row's),
+/// then re-derive `sandbox` from whatever mode `change` leaves behind. Doing
+/// the derivation last is what keeps the two fields from disagreeing — a
+/// closure that sets `runtime_mode` must not leave `sandbox` pointing at the
+/// mode that used to be there.
+fn apply_owned_fields(
+    config: &mut ChatConfig,
+    existing: Option<&ChatConfig>,
+    change: impl FnOnce(&mut ChatConfig),
+) {
+    if let Some(existing) = existing {
+        config.runtime_mode = existing.runtime_mode;
+    }
+    change(config);
+    config.sandbox = config.runtime_mode.sandbox();
 }
 
 // ---------------------------------------------------------------------------
@@ -578,6 +602,20 @@ impl Pickers {
         }
     }
 
+    /// The chat's persisted mode for an existing chat, the draft's for the
+    /// new-chat canvas.
+    fn effective_runtime_mode(&self, cx: &App) -> RuntimeMode {
+        match self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|c| c.config.as_ref())
+        {
+            Some(config) => config.runtime_mode,
+            None => self.config.runtime_mode,
+        }
+    }
+
     /// The fully-resolved config the composer threads into the Run request and
     /// `Mutate createChat`: concrete model + reasoning whenever the catalog is
     /// loaded (no "engine picks a default" passthrough).
@@ -591,6 +629,7 @@ impl Pickers {
                 .or_else(|| self.effective_model_id(cx).map(str::to_string)),
             reasoning: self.effective_reasoning(cx),
             model_options: self.explicit_options(cx),
+            runtime_mode: self.effective_runtime_mode(cx),
         }
     }
 
@@ -1381,16 +1420,13 @@ impl Pickers {
         let Some(mut config) = resolved.chat_config() else {
             return; // harness unknown (catalog + chat row both missing) — nothing safe to write
         };
-        // Preserve fields the pickers don't own.
-        if let Some(existing) = self
+        let existing = self
             .state
             .read(cx)
             .selected_chat_row()
             .and_then(|c| c.config.as_ref())
-        {
-            config.sandbox = existing.sandbox;
-        }
-        change(&mut config);
+            .cloned();
+        apply_owned_fields(&mut config, existing.as_ref(), change);
         // Reasoning must stay concrete for whatever model the row now names —
         // same ladder resolution as [`Self::trait_ladder`] (model levels, else
         // the harness's advertised ladder).
@@ -3086,7 +3122,7 @@ impl Render for Pickers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+    use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice, SandboxLevel};
 
     #[test]
     fn traits_summary_formats_non_defaults() {
@@ -3210,6 +3246,68 @@ mod tests {
         assert_eq!(config.harness, HarnessId::ClaudeCode);
         assert_eq!(config.model.as_deref(), Some("opus"));
         assert_eq!(config.sandbox, SandboxLevel::WorkspaceWrite);
+    }
+
+    #[test]
+    fn chat_config_carries_the_resolved_runtime_mode() {
+        let resolved = ResolvedRunConfig {
+            harness: Some(HarnessId::ClaudeCode),
+            model: Some("claude-fable-5".into()),
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            runtime_mode: RuntimeMode::ApprovalRequired,
+        };
+        let config = resolved.chat_config().expect("harness is set");
+        assert_eq!(config.runtime_mode, RuntimeMode::ApprovalRequired);
+        // The row's sandbox follows the mode, so a later reader of the row
+        // cannot see the two disagree.
+        assert_eq!(config.sandbox, SandboxLevel::ReadOnly);
+    }
+
+    #[test]
+    fn apply_owned_fields_preserves_row_mode_and_rederives_sandbox() {
+        // The row already has a non-default mode persisted.
+        let existing = ChatConfig {
+            harness: HarnessId::ClaudeCode,
+            model: Some("opus".into()),
+            reasoning: Some(ReasoningLevel::High),
+            model_options: serde_json::Map::new(),
+            sandbox: SandboxLevel::ReadOnly,
+            runtime_mode: RuntimeMode::ApprovalRequired,
+        };
+        // `resolved.chat_config()` built this from the draft's default mode
+        // (e.g. the row's config was read before the change landed), so it
+        // disagrees with the row before the picker's own logic runs.
+        let mut config = ChatConfig {
+            runtime_mode: RuntimeMode::AutoAcceptEdits,
+            sandbox: RuntimeMode::AutoAcceptEdits.sandbox(),
+            ..existing.clone()
+        };
+
+        // The picker only changes the model — it never touches the mode.
+        apply_owned_fields(&mut config, Some(&existing), |c| {
+            c.model = Some("sonnet".into());
+        });
+
+        assert_eq!(config.model.as_deref(), Some("sonnet"));
+        assert_eq!(
+            config.runtime_mode,
+            RuntimeMode::ApprovalRequired,
+            "the row's mode must survive an unrelated field change"
+        );
+        assert_eq!(
+            config.sandbox,
+            config.runtime_mode.sandbox(),
+            "sandbox must never disagree with the mode it was derived from"
+        );
+    }
+
+    #[test]
+    fn resolved_run_config_defaults_the_runtime_mode() {
+        assert_eq!(
+            ResolvedRunConfig::default().runtime_mode,
+            RuntimeMode::AutoAcceptEdits
+        );
     }
 
     #[test]

@@ -36,6 +36,46 @@ pub enum SandboxLevel {
     DangerFullAccess,
 }
 
+/// How much a run may do without asking.
+///
+/// For a user session the sandbox is not a separate choice: each mode names
+/// the one it implies, and [`RunRequest::for_session`] applies it, so those
+/// call sites cannot pair a permissive mode with a restrictive sandbox by
+/// accident.
+///
+/// That is a property of the constructor, not of the type. `RunRequest`
+/// carries the two separately on purpose, because chat titling needs a
+/// never-ask mode with a read-only sandbox — a pairing no mode expresses.
+/// Anything reading a request's sandbox must read the field, not
+/// `runtime_mode.sandbox()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeMode {
+    /// Every tool call is asked about first.
+    ApprovalRequired,
+    /// Edits inside the workspace proceed; the sandbox is the boundary.
+    ///
+    /// The default because it is what every chat has already been running:
+    /// a workspace-write sandbox with nothing able to block on a question.
+    #[default]
+    AutoAcceptEdits,
+    /// As above, with the provider reviewing its own calls where it can.
+    Auto,
+    /// No sandbox and no approvals.
+    FullAccess,
+}
+
+impl RuntimeMode {
+    /// The sandbox this mode implies.
+    pub fn sandbox(self) -> SandboxLevel {
+        match self {
+            RuntimeMode::ApprovalRequired => SandboxLevel::ReadOnly,
+            RuntimeMode::AutoAcceptEdits | RuntimeMode::Auto => SandboxLevel::WorkspaceWrite,
+            RuntimeMode::FullAccess => SandboxLevel::DangerFullAccess,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SteeringMode {
@@ -400,6 +440,19 @@ pub struct RunRequest {
     #[serde(default)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub cwd: String,
+    /// How much this run may do without asking. The sandbox below is derived
+    /// from it for every user session — see [`RunRequest::for_session`].
+    ///
+    /// Absent on the wire means a request written before the field existed;
+    /// it resolves to the default, which is the mode those runs were already
+    /// getting.
+    #[serde(default)]
+    pub runtime_mode: RuntimeMode,
+    /// An adapter that needs the sandbox must read this field, not
+    /// `runtime_mode.sandbox()`. The two agree for every user session, but
+    /// not in general: chat titling pairs a never-ask mode with a read-only
+    /// sandbox, a pairing no mode expresses, and that request is built by
+    /// hand rather than through [`RunRequest::for_session`].
     pub sandbox: SandboxLevel,
     #[serde(default)]
     pub auto_approve: bool,
@@ -413,6 +466,34 @@ pub struct RunRequest {
     /// content blocks. Additive + serde-defaulted for wire compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
+}
+
+impl RunRequest {
+    /// A user-session run, with the sandbox derived from `mode`.
+    ///
+    /// Use it with struct-update syntax so no call site names a sandbox:
+    ///
+    /// ```ignore
+    /// RunRequest { prompt, cwd, ..RunRequest::for_session(mode) }
+    /// ```
+    ///
+    /// Chat titling is the one caller that does not use this: it needs a
+    /// read-only sandbox with nothing able to ask it a question, a pairing no
+    /// mode expresses, and it has no surface on which an answer could be given.
+    pub fn for_session(mode: RuntimeMode) -> Self {
+        Self {
+            prompt: String::new(),
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            cwd: String::new(),
+            runtime_mode: mode,
+            sandbox: mode.sandbox(),
+            auto_approve: false,
+            resume: None,
+            attachments: Vec::new(),
+        }
+    }
 }
 
 /// A decoded tool invocation, reduced to the fields each kind renders.
@@ -598,6 +679,17 @@ pub enum AgentEvent {
         /// Harness-native session id (used for resume).
         session_id: String,
         assistant_message_id: String,
+        /// The mode the run was launched under.
+        ///
+        /// Recorded so a resume can honor it. The journal is the only durable
+        /// record of a run whose chat row never landed — a crash can outrun
+        /// the debounced workspace write — and without this a resumed run
+        /// would silently fall back to the default, which for a chat launched
+        /// under a stricter mode means writing where the user asked to be
+        /// asked. Absent on the wire means a run recorded before it was
+        /// carried; those ran under the default.
+        #[serde(default)]
+        runtime_mode: RuntimeMode,
     },
     TextDelta {
         text: String,
@@ -718,6 +810,53 @@ mod tests {
         let round: RunRequest =
             serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
         assert_eq!(round.attachments, vec!["/tmp/a.png".to_string()]);
+    }
+
+    #[test]
+    fn run_request_runtime_mode_defaults_when_absent() {
+        // A chat created before this field existed: absent is not "unknown", it
+        // is the mode that reproduces how the chat has been running.
+        let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
+        let req: RunRequest = serde_json::from_str(old).unwrap();
+        assert_eq!(req.runtime_mode, RuntimeMode::AutoAcceptEdits);
+    }
+
+    #[test]
+    fn run_request_runtime_mode_round_trips_on_the_wire() {
+        let req = RunRequest {
+            prompt: "p".into(),
+            cwd: ".".into(),
+            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json.get("runtimeMode").unwrap(), "approval-required");
+        let round: RunRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(round.runtime_mode, RuntimeMode::ApprovalRequired);
+    }
+
+    #[test]
+    fn for_session_pairs_the_sandbox_with_the_mode() {
+        // The whole point of the constructor: a user-session call site cannot
+        // name a sandbox that disagrees with its mode.
+        for mode in [
+            RuntimeMode::ApprovalRequired,
+            RuntimeMode::AutoAcceptEdits,
+            RuntimeMode::Auto,
+            RuntimeMode::FullAccess,
+        ] {
+            let req = RunRequest::for_session(mode);
+            assert_eq!(req.runtime_mode, mode);
+            assert_eq!(req.sandbox, mode.sandbox());
+        }
+    }
+
+    #[test]
+    fn for_session_default_reproduces_the_previous_hardcode() {
+        // The behavioral claim of this slice, in one assertion: the derived
+        // sandbox equals the literal every user-session site used to write.
+        let req = RunRequest::for_session(RuntimeMode::default());
+        assert_eq!(req.sandbox, SandboxLevel::WorkspaceWrite);
+        assert!(!req.auto_approve);
     }
 
     #[test]
@@ -874,5 +1013,62 @@ mod tests {
         // Over-long but clean truncates to 64 bytes (ASCII ⇒ char-safe).
         let long = "a".repeat(80);
         assert_eq!(sanitize_discriminator(&long), "a".repeat(64));
+    }
+
+    #[test]
+    fn runtime_mode_derives_the_sandbox_for_every_variant() {
+        assert_eq!(
+            RuntimeMode::ApprovalRequired.sandbox(),
+            SandboxLevel::ReadOnly
+        );
+        assert_eq!(
+            RuntimeMode::AutoAcceptEdits.sandbox(),
+            SandboxLevel::WorkspaceWrite
+        );
+        assert_eq!(RuntimeMode::Auto.sandbox(), SandboxLevel::WorkspaceWrite);
+        assert_eq!(
+            RuntimeMode::FullAccess.sandbox(),
+            SandboxLevel::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn runtime_mode_defaults_to_auto_accept_edits() {
+        // The mode that reproduces how every existing chat has been running:
+        // a workspace-write sandbox, and no approval a user could not answer.
+        assert_eq!(RuntimeMode::default(), RuntimeMode::AutoAcceptEdits);
+        assert_eq!(
+            RuntimeMode::default().sandbox(),
+            SandboxLevel::WorkspaceWrite
+        );
+    }
+
+    #[test]
+    fn runtime_mode_uses_kebab_case() {
+        assert_eq!(
+            serde_json::to_string(&RuntimeMode::ApprovalRequired).unwrap(),
+            "\"approval-required\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RuntimeMode::AutoAcceptEdits).unwrap(),
+            "\"auto-accept-edits\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RuntimeMode::Auto).unwrap(),
+            "\"auto\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RuntimeMode::FullAccess).unwrap(),
+            "\"full-access\""
+        );
+        for mode in [
+            RuntimeMode::ApprovalRequired,
+            RuntimeMode::AutoAcceptEdits,
+            RuntimeMode::Auto,
+            RuntimeMode::FullAccess,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(serde_json::from_str::<RuntimeMode>(&json).unwrap(), mode);
+        }
     }
 }

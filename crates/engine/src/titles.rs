@@ -22,8 +22,8 @@ use futures::StreamExt;
 
 use comet_harness::{CancellationToken, RunControls, SteerMessage};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, RuntimeMode,
+    SandboxLevel, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::EngineError;
@@ -162,17 +162,7 @@ impl TitleGenerator {
              for a coding session that begins with this request:\n\n{prompt}"
         );
         for attempt in 0..=RETRY_DELAYS_MS.len() {
-            let request = RunRequest {
-                prompt: title_prompt.clone(),
-                model: cheap.clone(),
-                reasoning: Some(ReasoningLevel::Minimal),
-                model_options: serde_json::Map::new(),
-                cwd: cwd.to_string(),
-                sandbox: SandboxLevel::ReadOnly,
-                auto_approve: true,
-                attachments: Vec::new(),
-                resume: None,
-            };
+            let request = title_request(cheap.clone(), cwd, title_prompt.clone());
             match collect_text(harness.as_ref(), request).await {
                 Ok(raw) => {
                     let candidate = clean_title(&raw);
@@ -190,6 +180,30 @@ impl TitleGenerator {
             }
         }
         None
+    }
+}
+
+/// The request that names a chat.
+///
+/// Set so nothing can ask it a question: this runs with no surface on which
+/// an answer could be given, so an approval would hang it forever. The
+/// read-only sandbox is enforced by whichever adapters honor `request.sandbox`
+/// (Codex today; the Claude harness does not read it at all) — it is not a
+/// guarantee this request itself makes. That pairing of a never-ask mode with
+/// a read-only sandbox is not one the runtime modes express, which is why
+/// this is built by hand instead of through [`RunRequest::for_session`].
+fn title_request(model: Option<String>, cwd: &str, prompt: String) -> RunRequest {
+    RunRequest {
+        prompt,
+        model,
+        reasoning: Some(ReasoningLevel::Minimal),
+        model_options: serde_json::Map::new(),
+        cwd: cwd.to_string(),
+        runtime_mode: RuntimeMode::FullAccess,
+        sandbox: SandboxLevel::ReadOnly,
+        auto_approve: true,
+        attachments: Vec::new(),
+        resume: None,
     }
 }
 
@@ -293,5 +307,20 @@ mod tests {
         assert_eq!(clean_title("\"Fix Login Flow\"\nextra"), "Fix Login Flow");
         assert_eq!(clean_title("# Add Dark Mode  "), "Add Dark Mode");
         assert_eq!(clean_title("   "), "");
+    }
+
+    #[test]
+    fn titling_runs_read_only_and_never_asks() {
+        // Titling has no surface on which an approval could be answered, so it
+        // must never be able to receive one — and it has no business writing.
+        // No RuntimeMode pairs those two, which is why this site builds its own
+        // request instead of going through the session constructor.
+        let request = title_request(
+            Some("cheap-model".into()),
+            "/tmp/repo",
+            "name this chat".into(),
+        );
+        assert_eq!(request.sandbox, SandboxLevel::ReadOnly);
+        assert_eq!(request.runtime_mode, RuntimeMode::FullAccess);
     }
 }

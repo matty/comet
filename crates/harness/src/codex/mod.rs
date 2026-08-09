@@ -237,6 +237,11 @@ impl Harness for CodexHarness {
                 "codex sandbox escalated to danger-full-access: linked worktree on a \
                  slash-named branch trips codex's worktree-mount derivation"
             );
+            // `runtime_mode` deliberately stays untouched: nothing reads it
+            // yet, so this leaves the request's mode/sandbox pair
+            // disagreeing. Once an adapter starts reading `runtime_mode`,
+            // reconcile the two here instead of letting this escalation
+            // silently drift out of sync with it.
             request.sandbox = comet_proto::SandboxLevel::DangerFullAccess;
         }
         let mut cmd = Command::new(&exe);
@@ -549,6 +554,7 @@ async fn run_session(session: Session) {
             cwd: request.cwd.clone(),
             session_id: thread_id.clone(),
             assistant_message_id: assistant_message_id.clone(),
+            runtime_mode: request.runtime_mode,
         },
     )
     .await

@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{HarnessId, ReasoningLevel, SandboxLevel};
+use crate::{HarnessId, ReasoningLevel, RuntimeMode, SandboxLevel};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -80,7 +80,16 @@ pub struct ChatConfig {
     pub reasoning: Option<ReasoningLevel>,
     #[serde(default)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
+    /// Written for compatibility with peers that do not know
+    /// `runtime_mode` yet; the engine's own read path ignores it and derives
+    /// the sandbox from the mode below instead. Keep writing it — it is not
+    /// live state on this build, but it is the only sandbox an older peer
+    /// can see.
     pub sandbox: SandboxLevel,
+    /// The chat's permission mode. Absent on the wire means a chat created
+    /// before the field existed; it resolves to the default.
+    #[serde(default)]
+    pub runtime_mode: RuntimeMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -395,4 +404,35 @@ pub enum TerminalEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signal: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_config_runtime_mode_defaults_when_absent() {
+        // A chat row written before this field existed must still decode. The
+        // blast radius is the reason: chat rows decode as a vector, so one
+        // strict field rejects every chat in the workspace, not just this one.
+        let old = r#"{"harness":"claude-code","model":null,"reasoning":null,"sandbox":"workspace-write"}"#;
+        let config: ChatConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(config.runtime_mode, RuntimeMode::AutoAcceptEdits);
+    }
+
+    #[test]
+    fn chat_config_runtime_mode_round_trips() {
+        let config = ChatConfig {
+            harness: HarnessId::ClaudeCode,
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            sandbox: SandboxLevel::ReadOnly,
+            runtime_mode: RuntimeMode::ApprovalRequired,
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json.get("runtimeMode").unwrap(), "approval-required");
+        let round: ChatConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(round, config);
+    }
 }

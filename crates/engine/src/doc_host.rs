@@ -662,8 +662,10 @@ impl DocHost {
 
     /// A steer-turned-run with no in-process `last_request` (engine restarted
     /// since the last turn): rebuild the run config from the chat's workspace
-    /// row — cwd from the row, model/reasoning/options/sandbox from its config
-    /// (composer defaults otherwise). `None` without a workspace host or row.
+    /// row — cwd from the row, model/reasoning/options from its config
+    /// (composer defaults otherwise), and the runtime mode from its config,
+    /// with the sandbox derived from that mode rather than stored separately.
+    /// `None` without a workspace host or row.
     // (Also the RespondInput dead-run fallback's config source.)
     pub(crate) fn request_from_chat_row(
         &self,
@@ -679,6 +681,7 @@ impl DocHost {
             }
         };
         let config = chat.config;
+        let runtime_mode = config.as_ref().map(|c| c.runtime_mode).unwrap_or_default();
         Some(comet_proto::RunRequest {
             prompt: prompt.to_string(),
             model: config.as_ref().and_then(|c| c.model.clone()),
@@ -688,13 +691,7 @@ impl DocHost {
                 .map(|c| c.model_options.clone())
                 .unwrap_or_default(),
             cwd: chat.cwd.unwrap_or_default(),
-            sandbox: config
-                .as_ref()
-                .map(|c| c.sandbox)
-                .unwrap_or(comet_proto::SandboxLevel::WorkspaceWrite),
-            auto_approve: false,
-            attachments: Vec::new(),
-            resume: None,
+            ..comet_proto::RunRequest::for_session(runtime_mode)
         })
     }
 
@@ -780,5 +777,139 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                 host.evict_over_budget();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use comet_proto::{ChatConfig, HarnessId, RuntimeMode, SandboxLevel};
+
+    // These tests only exercise the workspace-row read, never a dispatch, so
+    // the stock mock harness (empty script) is enough to satisfy assembly.
+    fn registry() -> Arc<crate::registry::HarnessRegistry> {
+        let registry = crate::registry::HarnessRegistry::new();
+        registry.register(Arc::new(comet_harness::mock::MockHarness {
+            script: vec![],
+        }));
+        Arc::new(registry)
+    }
+
+    /// Assemble an engine core over a tempdir (offline, fixed device id) — the
+    /// same pattern `crates/engine/tests/workspace_sync.rs` uses for its own
+    /// fixture, copied here because `request_from_chat_row` is crate-private.
+    fn assemble_core(dir: &std::path::Path, device_id: &str) -> crate::EngineCore {
+        std::fs::create_dir_all(dir).expect("create data dir");
+        std::fs::write(dir.join("device-id"), device_id).expect("write device id");
+        crate::EngineCore::assemble(dir, registry(), HarnessId::Mock, None)
+            .expect("engine core assembles")
+    }
+
+    #[tokio::test]
+    async fn stored_runtime_mode_reaches_the_next_run_request() {
+        // The chat row is what a run reads when it has no remembered request:
+        // resume, and the dead-run fallback. The mode a user chose has to
+        // survive that read, and the sandbox has to follow the mode rather
+        // than stay at whatever the row was created with.
+        let dir = tempfile::tempdir().unwrap();
+        let core = assemble_core(dir.path(), "dev-a");
+
+        core.workspace
+            .create_space("space-1", "dev-a", "/tmp/cfg", None, false)
+            .expect("create space");
+        core.workspace
+            .create_chat(
+                "chat-1",
+                "space-1",
+                Some(ChatConfig {
+                    harness: HarnessId::ClaudeCode,
+                    model: None,
+                    reasoning: None,
+                    model_options: Default::default(),
+                    sandbox: SandboxLevel::WorkspaceWrite,
+                    runtime_mode: RuntimeMode::ApprovalRequired,
+                }),
+                None,
+            )
+            .expect("create chat");
+
+        let request = core
+            .doc_host
+            .request_from_chat_row("chat-1", "hello")
+            .expect("chat row exists");
+        assert_eq!(request.runtime_mode, RuntimeMode::ApprovalRequired);
+        assert_eq!(request.sandbox, SandboxLevel::ReadOnly);
+    }
+
+    #[tokio::test]
+    async fn a_chat_row_without_a_config_gets_the_default_mode() {
+        // Every chat that predates this field. Absent is not "unknown" — it
+        // is the mode those chats were already running under.
+        let dir = tempfile::tempdir().unwrap();
+        let core = assemble_core(dir.path(), "dev-a");
+
+        core.workspace
+            .create_space("space-1", "dev-a", "/tmp/cfg", None, false)
+            .expect("create space");
+        core.workspace
+            .create_chat("chat-1", "space-1", None, None)
+            .expect("create chat");
+
+        let request = core
+            .doc_host
+            .request_from_chat_row("chat-1", "hello")
+            .expect("chat row exists");
+        assert_eq!(request.runtime_mode, RuntimeMode::AutoAcceptEdits);
+        assert_eq!(request.sandbox, SandboxLevel::WorkspaceWrite);
+    }
+
+    #[tokio::test]
+    async fn a_runtime_mode_change_through_set_chat_config_reaches_the_next_run_request() {
+        // The mutate path (comet's setChatConfig RPC), not just create-time
+        // config — a user flipping the mode on an existing chat must have it
+        // honoured too.
+        let dir = tempfile::tempdir().unwrap();
+        let core = assemble_core(dir.path(), "dev-a");
+
+        core.workspace
+            .create_space("space-1", "dev-a", "/tmp/cfg", None, false)
+            .expect("create space");
+        core.workspace
+            .create_chat(
+                "chat-1",
+                "space-1",
+                Some(ChatConfig {
+                    harness: HarnessId::ClaudeCode,
+                    model: None,
+                    reasoning: None,
+                    model_options: Default::default(),
+                    sandbox: SandboxLevel::WorkspaceWrite,
+                    runtime_mode: RuntimeMode::AutoAcceptEdits,
+                }),
+                None,
+            )
+            .expect("create chat");
+        let updated = core
+            .workspace
+            .set_chat_config(
+                "chat-1",
+                &ChatConfig {
+                    harness: HarnessId::ClaudeCode,
+                    model: None,
+                    reasoning: None,
+                    model_options: Default::default(),
+                    sandbox: SandboxLevel::WorkspaceWrite,
+                    runtime_mode: RuntimeMode::FullAccess,
+                },
+            )
+            .expect("update chat config");
+        assert!(updated, "chat row must exist to update");
+
+        let request = core
+            .doc_host
+            .request_from_chat_row("chat-1", "hello")
+            .expect("chat row exists");
+        assert_eq!(request.runtime_mode, RuntimeMode::FullAccess);
+        assert_eq!(request.sandbox, SandboxLevel::DangerFullAccess);
     }
 }

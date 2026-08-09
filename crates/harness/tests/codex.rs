@@ -12,7 +12,7 @@ use comet_harness::{
 };
 use comet_proto::{
     AgentEvent, DiagnosticSeverity, DoneStatus, HarnessId, NoticeKind, NoticeSeverity,
-    ReasoningLevel, RunRequest, SandboxLevel, TodoItem, ToolCall, UserInputAnswer,
+    ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel, TodoItem, ToolCall, UserInputAnswer,
     UserInputQuestion,
 };
 
@@ -32,6 +32,7 @@ fn request(prompt: &str) -> RunRequest {
         reasoning: Some(ReasoningLevel::Ultra),
         model_options: serde_json::Map::new(),
         cwd: String::new(),
+        runtime_mode: RuntimeMode::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),

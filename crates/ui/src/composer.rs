@@ -25,9 +25,7 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use comet_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
-use comet_proto::{
-    FileSearchMatch, RunRequest, SandboxLevel, ServerRef, UserInputAnswer, UserInputQuestion,
-};
+use comet_proto::{FileSearchMatch, RunRequest, ServerRef, UserInputAnswer, UserInputQuestion};
 use comet_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
@@ -4166,10 +4164,8 @@ impl Composer {
                             reasoning: resolved.reasoning,
                             model_options: resolved.model_options.clone(),
                             cwd,
-                            sandbox: SandboxLevel::WorkspaceWrite,
-                            auto_approve: false,
-                            resume: None,
                             attachments: attachment_paths,
+                            ..RunRequest::for_session(resolved.runtime_mode)
                         },
                         message_id: message_id.clone(),
                     }

@@ -31,7 +31,8 @@ use tokio::sync::mpsc;
 
 use comet_proto::{
     AgentEvent, DiagnosticSeverity, DoneStatus, HarnessAvailability, HarnessCapabilities,
-    HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, UserInputAnswer, UserInputQuestion,
+    HarnessId, Model, ReasoningLevel, RunRequest, RuntimeMode, SteeringMode, UserInputAnswer,
+    UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
@@ -309,6 +310,7 @@ impl Harness for ClaudeHarness {
             event_tx,
             controls,
             reasoning: request.reasoning,
+            runtime_mode: request.runtime_mode,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             stderr_tail,
@@ -432,6 +434,9 @@ struct Session {
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
     reasoning: Option<ReasoningLevel>,
+    /// Carried only so `SessionStarted` can record what the run was launched
+    /// under; the CLI arguments are built from the request before this point.
+    runtime_mode: RuntimeMode,
     interrupt_grace: Duration,
     kill_grace: Duration,
     /// Rolling stderr tail for the crash message on an unexpected exit.
@@ -448,6 +453,7 @@ async fn run_session(session: Session) {
         event_tx,
         controls,
         reasoning,
+        runtime_mode,
         interrupt_grace,
         kill_grace,
         stderr_tail,
@@ -459,7 +465,7 @@ async fn run_session(session: Session) {
     } = controls;
     let request_input = Arc::new(request_input);
 
-    let mut norm = Normalizer::new();
+    let mut norm = Normalizer::new(runtime_mode);
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
