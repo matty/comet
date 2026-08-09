@@ -7,7 +7,9 @@
 //! short-lived `codex app-server` + `model/list` pagination can later be
 //! spliced in (same call t3code's Codex provider makes).
 
-use comet_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel, SandboxLevel};
+use comet_proto::{
+    Model, ModelOption, ModelOptionChoice, ReasoningLevel, RuntimeMode, SandboxLevel,
+};
 
 /// The unified reasoning ladder Codex accepts (`minimal` is offered but clamped
 /// on the wire — see [`to_effort`]).
@@ -66,6 +68,24 @@ pub(crate) fn sandbox_policy_value(sandbox: SandboxLevel) -> serde_json::Value {
         policy.insert("networkAccess".into(), true.into());
     }
     serde_json::Value::Object(policy)
+}
+
+/// `thread/start`'s `approvalsReviewer`: who answers an approval when one is
+/// raised. Only `Auto` delegates that to the provider; the others keep the
+/// user in the role, which is also the app-server's default when the key is
+/// absent.
+///
+/// Sending this is currently inert — the wire approval policy is pinned to
+/// `"never"`, so no approval is ever raised for a reviewer to answer. It is
+/// sent anyway so the thread carries the mode's full intent, and so the slice
+/// that unpins the policy changes one literal rather than three.
+pub(crate) fn approvals_reviewer(mode: RuntimeMode) -> &'static str {
+    match mode {
+        RuntimeMode::Auto => "auto_review",
+        RuntimeMode::ApprovalRequired | RuntimeMode::AutoAcceptEdits | RuntimeMode::FullAccess => {
+            "user"
+        }
+    }
 }
 
 const ULTRA_LADDER: &[ReasoningLevel] = &[
@@ -211,6 +231,21 @@ mod tests {
         for m in &models {
             let tier = m.options.iter().find(|o| o.id == "serviceTier");
             assert!(tier.is_some(), "{} missing serviceTier", m.id);
+        }
+    }
+
+    /// Every mode maps to a reviewer the app-server's schema accepts. `Auto` is
+    /// the only mode that hands review to the provider; the rest keep the human
+    /// in the role, which is also the server's own default.
+    #[test]
+    fn every_runtime_mode_maps_to_a_schema_reviewer() {
+        for (mode, want) in [
+            (RuntimeMode::ApprovalRequired, "user"),
+            (RuntimeMode::AutoAcceptEdits, "user"),
+            (RuntimeMode::Auto, "auto_review"),
+            (RuntimeMode::FullAccess, "user"),
+        ] {
+            assert_eq!(approvals_reviewer(mode), want, "{mode:?}");
         }
     }
 }
