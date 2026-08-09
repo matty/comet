@@ -491,6 +491,9 @@ pub fn rows_for_entry(
                     }
                     // Tools are grouped by the outer arm; nothing reaches here.
                     MessagePart::Tool { .. } => {}
+                    // No card yet: the approval surface is built with the
+                    // composer decision row, not here.
+                    MessagePart::Approval { .. } => {}
                     MessagePart::Notice {
                         id: part_id,
                         severity,

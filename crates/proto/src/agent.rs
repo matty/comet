@@ -575,6 +575,65 @@ pub enum ToolCall {
     },
 }
 
+/// What a provider is asking permission to do, reduced to the fields a
+/// decision card renders — the same reduction [`ToolCall`] applies.
+///
+/// A file change carries counts, never the patch: the render-parts policy
+/// strips heavy tool inputs before anything enters the doc, and an approval is
+/// subject to the same limit. A richer preview has to be read from the
+/// host-resident diff sidecar rather than carried here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ApprovalRequest {
+    Command {
+        command: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    FileChange {
+        path: String,
+        operation: FileOperation,
+        added_lines: u32,
+        removed_lines: u32,
+    },
+    FileRead {
+        path: String,
+    },
+    Mcp {
+        server: String,
+        tool: String,
+    },
+    /// A provider asked for something Comet does not model. `summary` is Comet
+    /// copy naming the action, never provider prose.
+    Unknown {
+        summary: String,
+    },
+}
+
+/// Unit variants only, so `#[serde(other)]` applies: an operation a later
+/// provider introduces decodes as `Unknown` instead of failing the whole part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FileOperation {
+    Create,
+    Modify,
+    Delete,
+    #[serde(other)]
+    Unknown,
+}
+
+/// The answer to an approval. `Expired` is host-stamped when a pending
+/// approval's run ends and is never a decision a client may send.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "camelCase")]
+pub enum ApprovalDecision {
+    Allow,
+    AllowForSession,
+    Deny { message: String },
+    Expired,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TodoItem {
@@ -748,6 +807,20 @@ pub enum AgentEvent {
     InputResolved {
         request_id: String,
     },
+    /// The host's approval bridge minted this id and parked a resolver before
+    /// emitting. An adapter must not emit its own copy — the run pipeline
+    /// drops one, because a card under an id no resolver knows is
+    /// unanswerable.
+    #[serde(rename_all = "camelCase")]
+    ApprovalRequested {
+        request_id: String,
+        approval: ApprovalRequest,
+    },
+    #[serde(rename_all = "camelCase")]
+    ApprovalResolved {
+        request_id: String,
+        decision: ApprovalDecision,
+    },
     #[serde(rename_all = "camelCase")]
     Steered {
         assistant_message_id: Option<String>,
@@ -810,6 +883,110 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    #[test]
+    fn approval_request_round_trips_each_kind() {
+        let cases = vec![
+            ApprovalRequest::Command {
+                command: "cargo test".into(),
+                cwd: Some("/repo".into()),
+            },
+            ApprovalRequest::FileChange {
+                path: "src/main.rs".into(),
+                operation: FileOperation::Modify,
+                added_lines: 12,
+                removed_lines: 3,
+            },
+            ApprovalRequest::FileRead {
+                path: "/etc/hosts".into(),
+            },
+            ApprovalRequest::Mcp {
+                server: "linear".into(),
+                tool: "create_issue".into(),
+            },
+            ApprovalRequest::Unknown {
+                summary: "an action Comet does not model".into(),
+            },
+        ];
+        for case in cases {
+            let json = serde_json::to_value(&case).unwrap();
+            assert_eq!(
+                serde_json::from_value::<ApprovalRequest>(json).unwrap(),
+                case
+            );
+        }
+    }
+
+    #[test]
+    fn command_approval_without_a_cwd_round_trips() {
+        // The absent case, written by hand: a provider reporting no working
+        // directory must not be indistinguishable from one reporting "".
+        let case = ApprovalRequest::Command {
+            command: "ls".into(),
+            cwd: None,
+        };
+        let json = serde_json::to_value(&case).unwrap();
+        assert!(json.get("cwd").is_none(), "absent cwd must not serialize");
+        assert_eq!(
+            serde_json::from_value::<ApprovalRequest>(json).unwrap(),
+            case
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_file_operation_decodes_as_unknown() {
+        let json = serde_json::json!({
+            "kind": "fileChange",
+            "path": "a.rs",
+            "operation": "rename",
+            "addedLines": 0,
+            "removedLines": 0
+        });
+        assert!(matches!(
+            serde_json::from_value::<ApprovalRequest>(json).unwrap(),
+            ApprovalRequest::FileChange {
+                operation: FileOperation::Unknown,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn approval_decision_round_trips() {
+        for case in [
+            ApprovalDecision::Allow,
+            ApprovalDecision::AllowForSession,
+            ApprovalDecision::Deny {
+                message: "not this path".into(),
+            },
+            ApprovalDecision::Expired,
+        ] {
+            let json = serde_json::to_value(&case).unwrap();
+            assert_eq!(
+                serde_json::from_value::<ApprovalDecision>(json).unwrap(),
+                case
+            );
+        }
+    }
+
+    #[test]
+    fn approval_events_round_trip() {
+        let ev = AgentEvent::ApprovalRequested {
+            request_id: "r1".into(),
+            approval: ApprovalRequest::FileRead {
+                path: "a.rs".into(),
+            },
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(serde_json::from_value::<AgentEvent>(json).unwrap(), ev);
+
+        let ev = AgentEvent::ApprovalResolved {
+            request_id: "r1".into(),
+            decision: ApprovalDecision::Allow,
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(serde_json::from_value::<AgentEvent>(json).unwrap(), ev);
     }
 
     #[test]

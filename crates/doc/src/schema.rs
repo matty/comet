@@ -72,6 +72,11 @@ struct DocPartJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    approval: Option<serde_json::Value>,
+    /// Absent IS the open state — not a torn write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decision: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     notice_kind: Option<comet_proto::NoticeKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     severity: Option<comet_proto::NoticeSeverity>,
@@ -118,6 +123,21 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             kind: "input".into(),
             questions: Some(serde_json::to_value(questions)?),
             resolved: Some(*resolved),
+            ..Default::default()
+        },
+        MessagePart::Approval {
+            id: _,
+            request_id,
+            approval,
+            decision,
+        } => DocPartJson {
+            // The request id IS the persisted part id, matching the input
+            // part: the live fold's display prefix does not survive the write,
+            // and every doc-side mutation matches on this.
+            id: request_id.clone(),
+            kind: "approval".into(),
+            approval: Some(serde_json::to_value(approval)?),
+            decision: decision.as_ref().map(serde_json::to_value).transpose()?,
             ..Default::default()
         },
         MessagePart::Error { id, message } => DocPartJson {
@@ -171,6 +191,20 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                 .and_then(|q| serde_json::from_value(q).ok())
                 .unwrap_or_default(),
             resolved: p.resolved.unwrap_or(false),
+        },
+        "approval" => match p.approval.and_then(|a| serde_json::from_value(a).ok()) {
+            Some(approval) => MessagePart::Approval {
+                id: p.id.clone(),
+                request_id: p.id,
+                approval,
+                // An absent decision is the OPEN state, not a torn write — it
+                // is what an unanswered approval looks like on disk.
+                decision: p.decision.and_then(|d| serde_json::from_value(d).ok()),
+            },
+            None => MessagePart::Text {
+                id: p.id,
+                text: String::new(),
+            },
         },
         "error" => MessagePart::Error {
             id: p.id,
@@ -539,6 +573,62 @@ impl SessionDoc {
         Ok(false)
     }
 
+    /// Stamp every OPEN approval in one entry `Expired`, returning how many.
+    ///
+    /// Host-stamped rather than decided per client, so replay and every LAN
+    /// peer agree on the terminal state instead of each reader deciding
+    /// locally whether a card is still live. An approval that already carries
+    /// a decision keeps it.
+    ///
+    /// Scans every part rather than stopping at the first, unlike
+    /// `resolve_input`: an entry can hold more than one open approval, and all
+    /// of them died with the run.
+    pub fn expire_open_approvals(&self, entry_id: &str) -> Result<usize, DocError> {
+        let expired = serde_json::to_value(comet_proto::ApprovalDecision::Expired)?;
+        let messages = self.doc.get_list("messages");
+        let mut stamped = 0usize;
+        for i in 0..messages.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
+                messages.get(i)
+            else {
+                continue;
+            };
+            let id_matches = matches!(
+                entry.get("id"),
+                Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == entry_id
+            );
+            if !id_matches {
+                continue;
+            }
+            let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) =
+                entry.get("parts")
+            else {
+                continue;
+            };
+            for j in 0..parts.len() {
+                let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) =
+                    parts.get(j)
+                else {
+                    continue;
+                };
+                let is_approval = matches!(
+                    part.get("kind"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == "approval"
+                );
+                // Absent IS open: both writers insert `decision` only when
+                // `Some`, so a stored null never occurs.
+                if is_approval && part.get("decision").is_none() {
+                    part.insert("decision", loro_value_from_json(&expired))?;
+                    stamped += 1;
+                }
+            }
+        }
+        if stamped > 0 {
+            self.doc.commit();
+        }
+        Ok(stamped)
+    }
+
     /// Export a snapshot (persistence) — `ExportMode::Snapshot`.
     pub fn export_snapshot(&self) -> Result<Vec<u8>, DocError> {
         self.doc
@@ -597,6 +687,12 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     }
     if let Some(resolved) = doc_part.resolved {
         map.insert("resolved", resolved)?;
+    }
+    if let Some(approval) = &doc_part.approval {
+        map.insert("approval", loro_value_from_json(approval))?;
+    }
+    if let Some(decision) = &doc_part.decision {
+        map.insert("decision", loro_value_from_json(decision))?;
     }
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
@@ -682,6 +778,19 @@ fn validate_message_parts(row: &serde_json::Value) -> Result<(), DocError> {
                     .map_err(|err| invalid(&format!("invalid questions: {err}")))?;
                 if part.resolved.is_none() {
                     return Err(invalid("missing resolved"));
+                }
+            }
+            "approval" => {
+                let approval = part.approval.ok_or_else(|| invalid("missing approval"))?;
+                serde_json::from_value::<comet_proto::ApprovalRequest>(approval)
+                    .map_err(|err| invalid(&format!("invalid approval: {err}")))?;
+                // A corrupt decision would pass silently otherwise:
+                // `from_doc_part` degrades an undecodable one to None, so a
+                // DENIED approval would read back as still open. No presence
+                // check — absent is this kind's open state.
+                if let Some(decision) = part.decision {
+                    serde_json::from_value::<comet_proto::ApprovalDecision>(decision)
+                        .map_err(|err| invalid(&format!("invalid decision: {err}")))?;
                 }
             }
             "error" if part.message.is_some() => {}
@@ -881,6 +990,12 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     if let Some(resolved) = doc_part.resolved {
         map.insert("resolved", resolved)?;
     }
+    if let Some(approval) = &doc_part.approval {
+        map.insert("approval", loro_value_from_json(approval))?;
+    }
+    if let Some(decision) = &doc_part.decision {
+        map.insert("decision", loro_value_from_json(decision))?;
+    }
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
     }
@@ -906,9 +1021,11 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     // NULLABLE notice fields: set-or-clear, not insert-only. Audit of the
     // rest: `noticeKind`/`severity`/`summary`/`occurrences` are always `Some`
     // for a notice, `call`/`questions` always `Some` for their kind,
-    // `resolved` always `Some` for an input, and `isError` only ever goes
-    // absent → present (tool resolution is monotonic). `detail` and `key` are
-    // the only two an in-place refresh can legitimately clear.
+    // `approval` always `Some` for an approval, `resolved` always `Some` for
+    // an input, and `isError`/`decision` only ever go absent → present (tool
+    // resolution and approval resolution are both monotonic — an approval
+    // that has been answered or expired never returns to open). `detail` and
+    // `key` are the only two an in-place refresh can legitimately clear.
     set_or_clear(map, "detail", doc_part.detail.as_deref())?;
     set_or_clear(map, "key", doc_part.key.as_deref())?;
     if let Some(occurrences) = doc_part.occurrences {
@@ -985,7 +1102,7 @@ pub fn materialize_tail(
 mod tests {
     use super::*;
     use crate::parts::fold_event_into_parts;
-    use comet_proto::{AgentEvent, ToolCall};
+    use comet_proto::{AgentEvent, ApprovalDecision, ApprovalRequest, ToolCall};
 
     fn user_entry(id: &str, text: &str) -> SessionMessageEntry {
         SessionMessageEntry {
@@ -1089,6 +1206,106 @@ mod tests {
         let eb = b.read_entries().unwrap();
         assert_eq!(ea, eb);
         assert_eq!(ea.len(), 2); // one insert from each peer, converged in the same order
+    }
+
+    #[test]
+    fn an_open_approval_part_round_trips_through_the_doc() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Approval {
+                // The live fold's prefixed id; the write normalizes it away.
+                id: "ap-r1".into(),
+                request_id: "r1".into(),
+                approval: ApprovalRequest::Command {
+                    command: "cargo test".into(),
+                    cwd: None,
+                },
+                decision: None,
+            }],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        })
+        .unwrap();
+        let parts = doc.read_entries().unwrap()[0].parts.clone();
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Approval { id, request_id, decision: None, .. }
+                if id == "r1" && request_id == "r1"
+        ));
+        doc.validate_strict().unwrap();
+    }
+
+    #[test]
+    fn a_resolved_approval_part_keeps_its_decision_through_the_doc() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Approval {
+                id: "ap-r1".into(),
+                request_id: "r1".into(),
+                approval: ApprovalRequest::FileRead {
+                    path: "a.rs".into(),
+                },
+                decision: Some(ApprovalDecision::Deny {
+                    message: "not that file".into(),
+                }),
+            }],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+        assert!(matches!(
+            &doc.read_entries().unwrap()[0].parts[0],
+            MessagePart::Approval {
+                decision: Some(ApprovalDecision::Deny { message }),
+                ..
+            } if message == "not that file"
+        ));
+    }
+
+    #[test]
+    fn a_decision_stamped_mid_stream_reaches_the_doc() {
+        // The live path: the decision lands as a field update on an ALREADY
+        // WRITTEN part, which is `update_part_fields`, not `push_part`.
+        // Without that writer the stamp exists only in the in-memory
+        // accumulator and no push-driven test would notice.
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a1", "dev-a", 5).unwrap();
+
+        let mut folded = Vec::new();
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::ApprovalRequested {
+                request_id: "r1".into(),
+                approval: ApprovalRequest::FileRead {
+                    path: "a.rs".into(),
+                },
+            },
+        );
+        writer.sync(&folded).unwrap();
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::ApprovalResolved {
+                request_id: "r1".into(),
+                decision: ApprovalDecision::Allow,
+            },
+        );
+        writer.finish(&folded, MessageStatus::Complete).unwrap();
+
+        assert!(matches!(
+            &doc.read_entries().unwrap()[0].parts[0],
+            MessagePart::Approval {
+                decision: Some(ApprovalDecision::Allow),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1355,6 +1572,120 @@ mod tests {
 
         let err = doc.validate_strict().unwrap_err().to_string();
         assert!(err.contains("kind does not match payload"));
+    }
+
+    #[test]
+    fn expire_open_approvals_stamps_only_the_open_ones() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![
+                MessagePart::Approval {
+                    id: "ap-r1".into(),
+                    request_id: "r1".into(),
+                    approval: ApprovalRequest::FileRead {
+                        path: "a.rs".into(),
+                    },
+                    decision: None,
+                },
+                MessagePart::Approval {
+                    id: "ap-r2".into(),
+                    request_id: "r2".into(),
+                    approval: ApprovalRequest::FileRead {
+                        path: "b.rs".into(),
+                    },
+                    decision: Some(ApprovalDecision::Allow),
+                },
+            ],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        })
+        .unwrap();
+        assert_eq!(doc.expire_open_approvals("m1").unwrap(), 1);
+        let parts = doc.read_entries().unwrap()[0].parts.clone();
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Approval {
+                decision: Some(ApprovalDecision::Expired),
+                ..
+            }
+        ));
+        // An answered approval keeps its answer — expiry is not a reset.
+        assert!(matches!(
+            &parts[1],
+            MessagePart::Approval {
+                decision: Some(ApprovalDecision::Allow),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn expire_open_approvals_is_a_no_op_on_an_entry_without_any() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "no approvals here".into(),
+            }],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        })
+        .unwrap();
+        assert_eq!(doc.expire_open_approvals("m1").unwrap(), 0);
+    }
+
+    #[test]
+    fn an_unknown_command_kind_is_skipped_and_the_rest_still_drain() {
+        // What an older peer does with a command kind it has never heard of.
+        // This is what makes shipping a new kind safe without a protocol bump,
+        // and it has to go through `read_commands` — that is where the
+        // skip-not-fail policy lives.
+        use crate::commands::SessionCommandPayload;
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let queue = |id: &str| SessionCommandEntry {
+            id: id.into(),
+            payload: SessionCommandPayload::Steer {
+                prompt: "focus".into(),
+                message_id: None,
+            },
+            issued_by: "dev-a".into(),
+            issued_at: 1,
+            based_on: None,
+            expires_at: None,
+            status: SessionCommandStatus::Pending,
+            resolution: None,
+        };
+        doc.queue_command(&queue("c1")).unwrap();
+        doc.queue_command(&queue("c2")).unwrap();
+
+        // Rewrite the second row's payload as a kind this build cannot know.
+        let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) =
+            doc.doc().get_list("commands").get(1)
+        else {
+            panic!("command row missing");
+        };
+        row.insert(
+            "payload",
+            loro_value_from_json(&serde_json::json!({"kind": "somethingLater"})),
+        )
+        .unwrap();
+        doc.doc().commit();
+
+        let commands = doc.read_commands().unwrap();
+        assert_eq!(
+            commands.len(),
+            1,
+            "the undecodable row is skipped, not fatal"
+        );
+        assert_eq!(commands[0].id, "c1");
     }
 
     #[test]

@@ -14,8 +14,8 @@ use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
 
 use comet_proto::{
-    AgentEvent, HarnessAvailability, HarnessCapabilities, HarnessId, Model, RunRequest,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, ApprovalDecision, ApprovalRequest, HarnessAvailability, HarnessCapabilities,
+    HarnessId, Model, RunRequest, UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -44,6 +44,12 @@ pub struct RunControls {
     pub request_input: Box<
         dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync,
     >,
+    /// The run asks permission and awaits a decision (blocks the agent). The
+    /// host mints the request id and owns the lifecycle: an adapter that
+    /// emitted its own request event would put a card in the doc under an id
+    /// no resolver knows, and answering it would never unblock the run.
+    pub request_approval:
+        Box<dyn Fn(ApprovalRequest) -> oneshot::Receiver<ApprovalDecision> + Send + Sync>,
     /// Steer prompts consumed at step/turn boundaries.
     pub steering: mpsc::Receiver<SteerMessage>,
     /// Cancel to interrupt the live run: the harness sends its protocol-level

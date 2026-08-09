@@ -22,8 +22,8 @@ use futures::StreamExt;
 
 use comet_harness::{CancellationToken, RunControls, SteerMessage};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, RuntimeMode,
-    SandboxLevel, UserInputAnswer, UserInputQuestion,
+    AgentEvent, ApprovalDecision, ApprovalRequest, DoneStatus, HarnessId, Model, ReasoningLevel,
+    RunRequest, RuntimeMode, SandboxLevel, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::EngineError;
@@ -244,6 +244,13 @@ async fn collect_text(
         request_input: Box::new(|_questions: Vec<UserInputQuestion>| {
             let (tx, rx) = tokio::sync::oneshot::channel::<Vec<UserInputAnswer>>();
             let _ = tx.send(Vec::new());
+            rx
+        }),
+        // Titling runs never-ask with a read-only sandbox, so nothing here can
+        // answer: the dropped sender resolves the receiver to an error, which
+        // a run must treat as not approved.
+        request_approval: Box::new(|_approval: ApprovalRequest| {
+            let (_tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
             rx
         }),
         steering: steer_rx,

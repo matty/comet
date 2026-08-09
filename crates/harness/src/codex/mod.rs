@@ -429,6 +429,10 @@ async fn run_session(session: Session) {
     } = session;
     let RunControls {
         request_input,
+        // Codex pins its approval policy at `never`, so the server issues no
+        // approval request for this to answer; unpinning it is what claims
+        // this field.
+        request_approval: _request_approval,
         mut steering,
         interrupt,
     } = controls;

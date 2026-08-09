@@ -17,9 +17,9 @@ use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
 use comet_harness::mock::MockHarness;
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
-    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessCapabilities, HarnessId, Model, NoticeKind,
-    NoticeSeverity, ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel, SessionStatus,
-    SteeringMode, ToolCall,
+    AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus, FileOperation,
+    HarnessCapabilities, HarnessId, Model, NoticeKind, NoticeSeverity, ReasoningLevel, RunRequest,
+    RuntimeMode, SandboxLevel, SessionStatus, SteeringMode, ToolCall,
 };
 use comet_rpc::RpcService;
 use comet_sync::DocsStore;
@@ -2085,4 +2085,452 @@ async fn list_harness_diagnostics_answers_from_the_registry() {
     );
     assert_eq!(report[0].entries[0].count, 2);
     assert_eq!(report[0].overflow, 0);
+}
+// ---------------------------------------------------------------------------
+// Approvals: request → doc part → decision → harness, plus every terminal path.
+// ---------------------------------------------------------------------------
+
+/// A harness that asks permission once and reports the answer it got, so the
+/// closing text is proof the decision crossed the oneshot rather than merely
+/// having been stamped into the doc.
+struct ApprovingHarness;
+
+#[async_trait]
+impl Harness for ApprovingHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Approving"
+    }
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities::default()
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let request_approval = controls.request_approval;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tokio::spawn(async move {
+            let decision = request_approval(ApprovalRequest::FileChange {
+                path: "src/reconcile.rs".into(),
+                operation: FileOperation::Modify,
+                added_lines: 24,
+                removed_lines: 6,
+            })
+            .await;
+            let closing = match decision {
+                Ok(ApprovalDecision::Allow) | Ok(ApprovalDecision::AllowForSession) => {
+                    "applied the edit"
+                }
+                Ok(ApprovalDecision::Deny { .. }) => "left the file untouched",
+                Ok(ApprovalDecision::Expired) | Err(_) => "stopped without the edit",
+            };
+            let _ = tx.send(AgentEvent::TextDelta {
+                text: closing.into(),
+            });
+            let _ = tx.send(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            });
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (Ok(event), rx))
+        })
+        .boxed())
+    }
+}
+
+/// Drive a run to a pending approval and hand back the request id off the doc.
+async fn drive_to_open_approval(
+    core: &EngineCore,
+    handle: &comet_engine::ChatDocHandle,
+    cmd: &str,
+) -> String {
+    queue_as_viewer(
+        handle.doc(),
+        cmd,
+        SessionCommandPayload::Run {
+            request: run_request("edit it"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || {
+            core.sessions.session_status(CHAT).map(|s| s.status)
+                == Some(SessionStatus::AwaitingInput)
+        },
+        "awaiting approval",
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(core).iter().any(|e| {
+                e.parts
+                    .iter()
+                    .any(|p| matches!(p, MessagePart::Approval { decision: None, .. }))
+            })
+        },
+        "open approval part in doc",
+    )
+    .await;
+    entries_now(core)
+        .iter()
+        .find_map(|e| {
+            e.parts.iter().find_map(|p| match p {
+                MessagePart::Approval { request_id, .. } => Some(request_id.clone()),
+                _ => None,
+            })
+        })
+        .expect("approval part carries a request id")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_round_trips_from_request_to_decision() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ApprovingHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let request_id = drive_to_open_approval(&core, &handle, "cmd-run-approve").await;
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-approve-1",
+        SessionCommandPayload::RespondApproval {
+            request_id,
+            decision: ApprovalDecision::Allow,
+        },
+    );
+
+    // Only reachable if the decision crossed the oneshot into the harness: a
+    // bridge that stamped the doc and never answered would hang here.
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.parts.iter().any(
+                    |p| matches!(p, MessagePart::Text { text, .. } if text == "applied the edit"),
+                )
+            })
+        },
+        "approved turn to report the decision",
+    )
+    .await;
+    assert_eq!(
+        command_status(&core, "cmd-approve-1"),
+        Some((SessionCommandStatus::Applied, None))
+    );
+    assert!(entries_now(&core).iter().any(|e| {
+        e.parts.iter().any(|p| {
+            matches!(
+                p,
+                MessagePart::Approval {
+                    decision: Some(ApprovalDecision::Allow),
+                    ..
+                }
+            )
+        })
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_denied_approval_reaches_the_harness_with_its_message() {
+    // The arm a fixture that silently approves would never exercise.
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ApprovingHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let request_id = drive_to_open_approval(&core, &handle, "cmd-run-deny").await;
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-deny-1",
+        SessionCommandPayload::RespondApproval {
+            request_id,
+            decision: ApprovalDecision::Deny {
+                message: "not that file".into(),
+            },
+        },
+    );
+
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.parts.iter().any(|p| {
+                    matches!(p, MessagePart::Text { text, .. } if text == "left the file untouched")
+                })
+            })
+        },
+        "denied turn to report the decision",
+    )
+    .await;
+    assert!(entries_now(&core).iter().any(|e| {
+        e.parts.iter().any(|p| {
+            matches!(
+                p,
+                MessagePart::Approval {
+                    decision: Some(ApprovalDecision::Deny { message }),
+                    ..
+                } if message == "not that file"
+            )
+        })
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_response_to_an_unknown_approval_is_rejected_with_a_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ApprovingHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let _request_id = drive_to_open_approval(&core, &handle, "cmd-run-bogus").await;
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-approve-bogus",
+        SessionCommandPayload::RespondApproval {
+            request_id: "not-a-real-id".into(),
+            decision: ApprovalDecision::Allow,
+        },
+    );
+
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "cmd-approve-bogus"),
+                Some((SessionCommandStatus::Rejected, Some(_)))
+            )
+        },
+        "bogus approval to be rejected",
+    )
+    .await;
+    let (_, resolution) = command_status(&core, "cmd-approve-bogus").unwrap();
+    assert_eq!(
+        resolution.unwrap(),
+        "This approval is no longer waiting for an answer."
+    );
+    // The real approval is untouched and still answerable.
+    assert!(entries_now(&core).iter().any(|e| {
+        e.parts
+            .iter()
+            .any(|p| matches!(p, MessagePart::Approval { decision: None, .. }))
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_supplied_expired_approval_is_rejected() {
+    // `Expired` is host-stamped, never client-sent: accepting it off the wire
+    // would let any paired device mark a live approval dead.
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ApprovingHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let request_id = drive_to_open_approval(&core, &handle, "cmd-run-expired").await;
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-expire-1",
+        SessionCommandPayload::RespondApproval {
+            request_id: request_id.clone(),
+            decision: ApprovalDecision::Expired,
+        },
+    );
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "cmd-expire-1"),
+                Some((SessionCommandStatus::Rejected, Some(_)))
+            )
+        },
+        "client-sent Expired to be rejected",
+    )
+    .await;
+    let (_, resolution) = command_status(&core, "cmd-expire-1").unwrap();
+    assert_eq!(
+        resolution.unwrap(),
+        "Expired isn't a decision that can be sent."
+    );
+
+    // A wrong decision must never brick the approval: the real one still lands.
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-expire-2",
+        SessionCommandPayload::RespondApproval {
+            request_id,
+            decision: ApprovalDecision::Allow,
+        },
+    );
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.parts.iter().any(
+                    |p| matches!(p, MessagePart::Text { text, .. } if text == "applied the edit"),
+                )
+            })
+        },
+        "the correct decision to still land",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_pending_when_the_run_is_interrupted_becomes_expired() {
+    // The common way a run ends with an approval open: the user stops it. The
+    // part must reach a terminal state in this process, with no restart — the
+    // recovery sweep only ever sees entries a crash left `streaming`.
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ApprovingHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let request_id = drive_to_open_approval(&core, &handle, "cmd-run-interrupt").await;
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-interrupt-1",
+        SessionCommandPayload::Interrupt {},
+    );
+
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        MessagePart::Approval {
+                            request_id: rid,
+                            decision: Some(ApprovalDecision::Expired),
+                            ..
+                        } if *rid == request_id
+                    )
+                })
+            })
+        },
+        "interrupted approval to be stamped expired",
+    )
+    .await;
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_pending_when_the_process_dies_becomes_expired() {
+    // The path an interrupt CANNOT reach: the process is killed while a run is
+    // blocked on an approval, so the run loop never runs its terminal stamp.
+    // A graceful shutdown+restart would prove nothing here — `shutdown()`
+    // interrupts every live run, so the FIRST process would stamp Expired
+    // through the Done arm and recovery would find nothing stale. This
+    // manufactures the on-disk state a kill leaves behind instead.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Pin the device id so the manufactured streaming entry counts as OURS —
+    // `mark_abandoned_streams` only sweeps entries this device wrote.
+    std::fs::write(dir.join("device-id"), "dev-crash").unwrap();
+
+    {
+        let store = DocsStore::open(dir.join("local-store")).unwrap();
+        let doc = SessionDoc::init(CHAT).unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "msg-user-1".into(),
+            role: MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "edit it".into(),
+            }],
+            created_at: 1,
+            device_id: "dev-crash".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "msg-assistant-1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Approval {
+                id: "ap-r-crash".into(),
+                request_id: "r-crash".into(),
+                approval: ApprovalRequest::FileChange {
+                    path: "src/reconcile.rs".into(),
+                    operation: FileOperation::Modify,
+                    added_lines: 24,
+                    removed_lines: 6,
+                },
+                decision: None,
+            }],
+            created_at: 2,
+            device_id: "dev-crash".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        })
+        .unwrap();
+        store
+            .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
+            .unwrap();
+
+        // A journal whose last event is not `Done`: the run died mid-stream.
+        let journal = RunJournal::open(dir.join("local-store/journals")).unwrap();
+        journal
+            .append(
+                CHAT,
+                &AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-crash".into(),
+                    assistant_message_id: "msg-assistant-1".into(),
+                    runtime_mode: RuntimeMode::default(),
+                },
+            )
+            .unwrap();
+    }
+
+    let core = assemble(&dir, Arc::new(ApprovingHarness));
+    assert_eq!(core.device_id, "dev-crash");
+
+    // Asserted BY REQUEST ID, never by "no open approval exists": boot recovery
+    // may revive the crashed turn, and a revived run legitimately opens a NEW
+    // approval beside this one.
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        MessagePart::Approval {
+                            request_id: rid,
+                            decision: Some(ApprovalDecision::Expired),
+                            ..
+                        } if rid == "r-crash"
+                    )
+                })
+            })
+        },
+        "orphaned approval to be stamped expired",
+    )
+    .await;
+
+    // And a decision arriving afterwards is refused rather than resurrecting it.
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-late-approve",
+        SessionCommandPayload::RespondApproval {
+            request_id: "r-crash".into(),
+            decision: ApprovalDecision::Allow,
+        },
+    );
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "cmd-late-approve"),
+                Some((SessionCommandStatus::Rejected, Some(_)))
+            )
+        },
+        "late approval response to be refused",
+    )
+    .await;
+    let (_, resolution) = command_status(&core, "cmd-late-approve").unwrap();
+    assert_eq!(
+        resolution.unwrap(),
+        "This approval is no longer waiting for an answer."
+    );
 }
