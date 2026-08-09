@@ -18,8 +18,8 @@ use comet_harness::mock::MockHarness;
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
     AgentEvent, DiagnosticSeverity, DoneStatus, HarnessCapabilities, HarnessId, Model, NoticeKind,
-    NoticeSeverity, ReasoningLevel, RunRequest, SandboxLevel, SessionStatus, SteeringMode,
-    ToolCall,
+    NoticeSeverity, ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel, SessionStatus,
+    SteeringMode, ToolCall,
 };
 use comet_rpc::RpcService;
 use comet_sync::DocsStore;
@@ -34,6 +34,7 @@ fn run_request(prompt: &str) -> RunRequest {
         reasoning: None,
         model_options: Default::default(),
         cwd: "/tmp".into(),
+        runtime_mode: RuntimeMode::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
@@ -1901,6 +1902,7 @@ async fn real_claude_sees_uploaded_image_inline() {
         reasoning: None,
         model_options: Default::default(),
         cwd: cwd.to_string_lossy().to_string(),
+        runtime_mode: RuntimeMode::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: false,
         attachments: vec![path],

@@ -688,6 +688,7 @@ impl DocHost {
                 .map(|c| c.model_options.clone())
                 .unwrap_or_default(),
             cwd: chat.cwd.unwrap_or_default(),
+            runtime_mode: comet_proto::RuntimeMode::default(),
             sandbox: config
                 .as_ref()
                 .map(|c| c.sandbox)

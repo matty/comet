@@ -26,7 +26,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use comet_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use comet_proto::{
-    FileSearchMatch, RunRequest, SandboxLevel, ServerRef, UserInputAnswer, UserInputQuestion,
+    FileSearchMatch, RunRequest, RuntimeMode, SandboxLevel, ServerRef, UserInputAnswer,
+    UserInputQuestion,
 };
 use comet_rpc::{RpcError, methods};
 
@@ -4166,6 +4167,7 @@ impl Composer {
                             reasoning: resolved.reasoning,
                             model_options: resolved.model_options.clone(),
                             cwd,
+                            runtime_mode: RuntimeMode::default(),
                             sandbox: SandboxLevel::WorkspaceWrite,
                             auto_approve: false,
                             resume: None,

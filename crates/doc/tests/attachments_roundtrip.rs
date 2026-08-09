@@ -12,6 +12,7 @@ fn run_request_attachments_survive_command_round_trip() {
         reasoning: None,
         model_options: Default::default(),
         cwd: "/tmp".into(),
+        runtime_mode: comet_proto::RuntimeMode::default(),
         sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: vec!["/tmp/a.png".into()],

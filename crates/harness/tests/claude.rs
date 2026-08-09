@@ -12,7 +12,7 @@ use comet_harness::{
 };
 use comet_proto::{
     AgentEvent, DiagnosticSeverity, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, RunRequest,
-    SandboxLevel, ToolCall, UserInputAnswer, UserInputQuestion,
+    RuntimeMode, SandboxLevel, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 /// The `fake-claude` bin target, built by cargo alongside this test.
@@ -31,6 +31,7 @@ fn request(prompt: &str) -> RunRequest {
         reasoning: None,
         model_options: serde_json::Map::new(),
         cwd: String::new(),
+        runtime_mode: RuntimeMode::default(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
         attachments: Vec::new(),

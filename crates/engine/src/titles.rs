@@ -22,8 +22,8 @@ use futures::StreamExt;
 
 use comet_harness::{CancellationToken, RunControls, SteerMessage};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, RuntimeMode,
+    SandboxLevel, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::EngineError;
@@ -168,6 +168,7 @@ impl TitleGenerator {
                 reasoning: Some(ReasoningLevel::Minimal),
                 model_options: serde_json::Map::new(),
                 cwd: cwd.to_string(),
+                runtime_mode: RuntimeMode::FullAccess,
                 sandbox: SandboxLevel::ReadOnly,
                 auto_approve: true,
                 attachments: Vec::new(),

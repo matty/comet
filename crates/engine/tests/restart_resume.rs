@@ -26,7 +26,7 @@ use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
     AgentEvent, DoneStatus, HarnessCapabilities, HarnessId, Model, ReasoningLevel, RunRequest,
-    SandboxLevel, SteeringMode,
+    RuntimeMode, SandboxLevel, SteeringMode,
 };
 use comet_sync::DocsStore;
 
@@ -41,6 +41,7 @@ fn run_request(prompt: &str, cwd: &str) -> RunRequest {
         reasoning: None,
         model_options: Default::default(),
         cwd: cwd.into(),
+        runtime_mode: RuntimeMode::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
@@ -780,6 +781,7 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
         reasoning: None,
         model_options: Default::default(),
         cwd: cwd.clone(),
+        runtime_mode: RuntimeMode::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: false,
         attachments: Vec::new(),

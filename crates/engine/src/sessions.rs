@@ -30,8 +30,8 @@ use comet_doc::{
 };
 use comet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, RunRequest, RuntimeMode, Session, SessionStatus,
+    UserInputAnswer, UserInputQuestion,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
@@ -546,6 +546,7 @@ impl SessionsEngine {
                             reasoning: None,
                             model_options: Default::default(),
                             cwd,
+                            runtime_mode: RuntimeMode::default(),
                             sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
                             auto_approve: false,
                             attachments: Vec::new(),

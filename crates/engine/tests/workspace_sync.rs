@@ -14,7 +14,7 @@ use comet_engine::{EngineCore, HarnessRegistry};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
     AgentEvent, ChatConfig, DoneStatus, HarnessCapabilities, HarnessId, Model, RunRequest,
-    SandboxLevel, SessionStatus,
+    RuntimeMode, SandboxLevel, SessionStatus,
 };
 use comet_rpc::methods;
 
@@ -146,6 +146,7 @@ fn run_request(prompt: &str) -> RunRequest {
         reasoning: None,
         model_options: Default::default(),
         cwd: "/tmp".into(),
+        runtime_mode: RuntimeMode::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
