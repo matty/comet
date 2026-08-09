@@ -132,6 +132,14 @@ pub fn provider_accounts(
     accounts
 }
 
+/// "message" or "messages" for `n`. Shared by the rollup sentence and the
+/// overflow line so the two cannot drift into disagreeing grammar — the
+/// overflow line reaches exactly 1 on the first arrival of a 65th distinct
+/// discriminator, so the singular is reachable, not theoretical.
+fn message_noun(n: u64) -> &'static str {
+    if n == 1 { "message" } else { "messages" }
+}
+
 /// The per-provider "Not understood" rollup: total count and the sentence.
 /// `None` when the provider has nothing recorded — the block is HIDDEN at
 /// zero, which the harness-side Ignored tier keeps as the normal state.
@@ -150,7 +158,7 @@ pub fn diagnostics_rollup(
     if total == 0 {
         return None;
     }
-    let noun = if total == 1 { "message" } else { "messages" };
+    let noun = message_noun(total);
     Some((
         total,
         format!("{name} sent {total} {noun} this session that Comet doesn't recognize."),
@@ -911,8 +919,9 @@ impl AccountsPage {
                     .text_size(px(12.0))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(format!(
-                        "…and {} more messages",
-                        report.overflow
+                        "…and {} more {}",
+                        report.overflow,
+                        message_noun(report.overflow)
                     ))),
             );
         }
@@ -1788,6 +1797,36 @@ mod tests {
         );
     }
 
+    /// Overflow with no entries at all: the discriminator cap was hit, so the
+    /// block shows the sentence over zero rows plus the overflow line. The
+    /// most unusual render the block can produce, and the only shape where
+    /// the count comes entirely from the overflow bucket.
+    #[test]
+    fn diagnostics_rollup_counts_overflow_with_no_entries() {
+        let only_overflow = vec![diag_report(HarnessId::Codex, &[], 5)];
+        assert_eq!(
+            diagnostics_rollup(&only_overflow, HarnessId::Codex, "Codex"),
+            Some((
+                5,
+                "Codex sent 5 messages this session that Comet doesn't recognize.".to_string()
+            ))
+        );
+        // Exactly one overflowed message — the 65th distinct discriminator's
+        // first arrival. Both the sentence and the overflow line must say
+        // "message", which is why the choice is one shared function.
+        let single = vec![diag_report(HarnessId::ClaudeCode, &[], 1)];
+        assert_eq!(
+            diagnostics_rollup(&single, HarnessId::ClaudeCode, "Claude Code"),
+            Some((
+                1,
+                "Claude Code sent 1 message this session that Comet doesn't recognize.".to_string()
+            ))
+        );
+        assert_eq!(message_noun(0), "messages");
+        assert_eq!(message_noun(1), "message");
+        assert_eq!(message_noun(2), "messages");
+    }
+
     #[test]
     fn format_ago_buckets() {
         assert_eq!(format_ago(1_000, 5_000), "just now");
@@ -1796,5 +1835,24 @@ mod tests {
         assert_eq!(format_ago(0, 7_200_000), "2h ago");
         // A clock that ran backwards degrades to "just now", never negative.
         assert_eq!(format_ago(10_000, 5_000), "just now");
+    }
+
+    /// Each bucket edge from both sides — an off-by-one in `format_ago` can
+    /// only live here, and nowhere the coarse cases above would catch it.
+    #[test]
+    fn format_ago_bucket_edges() {
+        // "just now" holds up to but not including 10s.
+        assert_eq!(format_ago(0, 9_999), "just now");
+        assert_eq!(format_ago(0, 10_000), "10s ago");
+        // Seconds hold up to but not including a minute.
+        assert_eq!(format_ago(0, 59_000), "59s ago");
+        assert_eq!(format_ago(0, 60_000), "1m ago");
+        // Minutes hold up to but not including an hour.
+        assert_eq!(format_ago(0, 3_599_000), "59m ago");
+        assert_eq!(format_ago(0, 3_600_000), "1h ago");
+        // There is deliberately no day bucket: these counts are per-boot, so
+        // hours stay readable and an ageing session reads "31h ago" rather
+        // than needing a calendar. Pinned so it stays a decision.
+        assert_eq!(format_ago(0, 111_600_000), "31h ago");
     }
 }
