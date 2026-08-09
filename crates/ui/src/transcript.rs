@@ -238,6 +238,21 @@ pub enum RowKind {
         header: SharedString,
         resolved: bool,
     },
+    /// An approval the provider is blocked on. Like `InputChip` this is
+    /// PASSIVE — the decision controls live in the composer — but it is a card
+    /// rather than a chip because the thing being asked (a command, a path and
+    /// its counts) does not survive sharing one 34px line with a label.
+    ApprovalCard {
+        /// Comet's name for the action ("Run a command", "Edit a file").
+        label: &'static str,
+        /// The one-line body: the command, the path + counts, the server/tool.
+        detail: SharedString,
+        /// The terminal caption, once decided. `None` while open.
+        state: Option<SharedString>,
+        /// Paint-only: the host stamped `Expired` because the run ended with
+        /// this still open. Changes colour, never layout.
+        expired: bool,
+    },
     ErrorChip {
         message: SharedString,
     },
@@ -491,9 +506,40 @@ pub fn rows_for_entry(
                     }
                     // Tools are grouped by the outer arm; nothing reaches here.
                     MessagePart::Tool { .. } => {}
-                    // No card yet: the approval surface is built with the
-                    // composer decision row, not here.
-                    MessagePart::Approval { .. } => {}
+                    MessagePart::Approval {
+                        id: part_id,
+                        approval,
+                        decision,
+                        ..
+                    } => {
+                        let (label, detail) = comet_proto::view::approval_chip_content(approval);
+                        let state = decision.as_ref().map(|d| {
+                            SharedString::from(comet_proto::view::approval_decision_label(d))
+                        });
+                        let expired =
+                            matches!(decision, Some(comet_proto::ApprovalDecision::Expired));
+                        let mut fp = detail.as_bytes().to_vec();
+                        fp.extend_from_slice(label.as_bytes());
+                        if let Some(state) = &state {
+                            fp.extend_from_slice(state.as_bytes());
+                        }
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            // The decision folds into the version: a card that
+                            // resolves must repaint even though nothing else in
+                            // the entry changed.
+                            version: fnv1a(&fp),
+                            turn_start: false,
+                            kind: RowKind::ApprovalCard {
+                                label,
+                                detail: detail.into(),
+                                state,
+                                expired,
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                        });
+                    }
                     MessagePart::Notice {
                         id: part_id,
                         severity,
@@ -1767,6 +1813,12 @@ impl Transcript {
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
             }
+            RowKind::ApprovalCard {
+                label,
+                detail,
+                state,
+                expired,
+            } => approval_card(label, detail.clone(), state.clone(), *expired, &theme),
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::NoticeChip {
                 summary,
@@ -2340,6 +2392,108 @@ fn notice_chip(
     div().py(px(4.0)).w_full().child(row).into_any_element()
 }
 
+/// The transcript's approval card — what the provider asked permission to do.
+///
+/// Two lines, **56px in every kind and every state**: layout never varies with
+/// the decision, so an approval resolving cannot reflow the transcript under
+/// the user's scroll position (`.agents/rules/gpui-ui.md`). Open reads in
+/// neutral tones — this is a state to resolve, not a failure, so `danger` is
+/// wrong for it; `Expired` reads amber (`warning_muted`) and its caption
+/// carries the reason, because it is the one state the user did not choose.
+///
+/// Passive by construction, like [`input_chip`]: the decision controls live in
+/// the composer, so there is no control here to disable when the approval is
+/// no longer answerable.
+fn approval_card(
+    label: &'static str,
+    detail: SharedString,
+    state: Option<SharedString>,
+    expired: bool,
+    theme: &Theme,
+) -> AnyElement {
+    let (border, wash, tile, tint) = if expired {
+        (
+            theme.warning_muted.opacity(0.16),
+            theme.warning_muted.opacity(0.05),
+            theme.warning_muted.opacity(0.12),
+            theme.warning_muted,
+        )
+    } else {
+        (
+            crate::theme::hairline(0.08),
+            crate::theme::ink(0.045),
+            crate::theme::ink(0.09),
+            theme.text_muted,
+        )
+    };
+    div()
+        .py(px(4.0))
+        .w_full()
+        .child(
+            div()
+                .h(px(56.0))
+                .w_full()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .gap(px(4.0))
+                .overflow_hidden()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(border)
+                .bg(wash)
+                .px(px(8.0))
+                .text_size(px(12.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(20.0))
+                                .rounded(px(6.0))
+                                .bg(tile)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    crate::icons::icon(crate::icons::KEY_MINIMALISTIC)
+                                        .size(px(12.0))
+                                        .text_color(tint),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(tint)
+                                .child(SharedString::from(label)),
+                        )
+                        .child(div().flex_1())
+                        .children(state.map(|state| {
+                            div()
+                                .flex_none()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme.text_muted)
+                                .child(state)
+                        })),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .w_full()
+                        .truncate()
+                        .text_color(theme.text)
+                        .child(detail),
+                ),
+        )
+        .into_any_element()
+}
+
 /// Hover card for a notice's `detail` line (same frame as the harness-rail
 /// tooltip in `pickers.rs`).
 struct NoticeDetailTooltip {
@@ -2855,6 +3009,139 @@ mod tests {
         let r2 = rows_for_entry(&two, false, &mut parse);
         assert_eq!(r1[0].id, r2[0].id);
         assert_ne!(r1[0].version, r2[0].version);
+    }
+
+    fn approval_part(id: &str, decision: Option<comet_proto::ApprovalDecision>) -> MessagePart {
+        MessagePart::Approval {
+            id: id.into(),
+            request_id: "r1".into(),
+            approval: comet_proto::ApprovalRequest::Command {
+                command: "cargo test --workspace".into(),
+                cwd: None,
+            },
+            decision,
+        }
+    }
+
+    #[test]
+    fn an_open_approval_becomes_a_card_row() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![text_part("t0", "before"), approval_part("ap-r1", None)],
+        );
+        let rows = rows_for_entry(&entry, true, &mut parse);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].id.as_ref(), "m1#ap-r1");
+        let RowKind::ApprovalCard {
+            label,
+            detail,
+            state,
+            expired,
+        } = &rows[1].kind
+        else {
+            panic!("expected ApprovalCard, got another row kind");
+        };
+        assert_eq!(*label, "Run a command");
+        assert_eq!(detail.as_ref(), "cargo test --workspace");
+        assert_eq!(*state, None, "an open approval has no terminal caption");
+        assert!(!*expired);
+    }
+
+    #[test]
+    fn a_decided_approval_carries_its_caption() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![approval_part(
+                "ap-r1",
+                Some(comet_proto::ApprovalDecision::AllowForSession),
+            )],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::ApprovalCard { state, expired, .. } = &rows[0].kind else {
+            panic!("expected ApprovalCard");
+        };
+        assert_eq!(
+            state.as_ref().map(|s| s.as_ref()),
+            Some("Allowed for this session")
+        );
+        assert!(!*expired);
+    }
+
+    /// `Expired` paints differently (amber, a state to resolve) but must NOT
+    /// lay out differently — a decision arriving cannot be allowed to reflow
+    /// the transcript under the user's scroll position.
+    #[test]
+    fn an_expired_approval_is_flagged_for_paint_only() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Aborted,
+            vec![approval_part(
+                "ap-r1",
+                Some(comet_proto::ApprovalDecision::Expired),
+            )],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::ApprovalCard {
+            state,
+            expired,
+            label,
+            detail,
+        } = &rows[0].kind
+        else {
+            panic!("expected ApprovalCard");
+        };
+        assert!(*expired);
+        assert!(state.as_ref().is_some_and(|s| s.contains("run ended")));
+        // Identical to the open row's content fields: only paint may differ.
+        assert_eq!(*label, "Run a command");
+        assert_eq!(detail.as_ref(), "cargo test --workspace");
+    }
+
+    /// The decision changes the row's CONTENT, so it has to change the row's
+    /// version — a diff key that ignored it would leave a decided approval
+    /// painted as open until something else in the entry changed.
+    #[test]
+    fn the_row_version_changes_when_the_decision_lands() {
+        let open = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![approval_part("ap-r1", None)],
+        );
+        let decided = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![approval_part(
+                "ap-r1",
+                Some(comet_proto::ApprovalDecision::Allow),
+            )],
+        );
+        let a = rows_for_entry(&open, true, &mut parse);
+        let b = rows_for_entry(&decided, true, &mut parse);
+        assert_eq!(a[0].id, b[0].id);
+        assert_ne!(a[0].version, b[0].version);
+    }
+
+    /// An approval between two tool calls breaks the group, like any non-tool
+    /// part — the approval is ABOUT the call that follows it, so folding them
+    /// into one group would put the card after the action it gates.
+    #[test]
+    fn an_approval_splits_tool_groups() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![
+                tool_part("a", "ls"),
+                approval_part("ap-r1", None),
+                tool_part("b", "pwd"),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(rows[0].kind, RowKind::ToolGroup { .. }));
+        assert!(matches!(rows[1].kind, RowKind::ApprovalCard { .. }));
+        assert!(matches!(rows[2].kind, RowKind::ToolGroup { .. }));
     }
 
     /// A detail that restates the summary is suppressed before it reaches the
