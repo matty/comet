@@ -187,14 +187,18 @@ impl ClaudeHarness {
         if let Some(effort) = to_effort(request.reasoning, request.model.as_deref()) {
             cmd.args(["--effort", effort]);
         }
-        if request.auto_approve {
-            cmd.args([
-                "--permission-mode",
-                "bypassPermissions",
-                "--dangerously-skip-permissions",
-            ]);
-        } else {
-            cmd.args(["--permission-mode", "default"]);
+        // `default` is the CLI's unadvertised alias for the mode it now lists
+        // as `manual`; both ask before each tool call. Keep `default` — it is
+        // accepted by every CLI version comet resolves, and `manual` is not.
+        let (permission_mode, skip_permissions) = match request.runtime_mode {
+            RuntimeMode::ApprovalRequired => ("default", false),
+            RuntimeMode::AutoAcceptEdits => ("acceptEdits", false),
+            RuntimeMode::Auto => ("auto", false),
+            RuntimeMode::FullAccess => ("bypassPermissions", true),
+        };
+        cmd.args(["--permission-mode", permission_mode]);
+        if skip_permissions {
+            cmd.arg("--dangerously-skip-permissions");
         }
         if let Some(resume) = &request.resume {
             cmd.arg(format!("--resume={resume}"));
@@ -870,5 +874,96 @@ mod control_request_tests {
         };
         assert!(line.contains(r#""behavior":"allow""#), "{line}");
         assert!(line.contains("cr-1"), "{line}");
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+    use comet_proto::{RuntimeMode, SandboxLevel};
+
+    /// The argument list `build_command` would spawn, for a run in `mode`.
+    fn args_for(mode: RuntimeMode) -> Vec<String> {
+        let request = RunRequest {
+            prompt: "hi".into(),
+            ..RunRequest::for_session(mode)
+        };
+        args_of(&request)
+    }
+
+    fn args_of(request: &RunRequest) -> Vec<String> {
+        ClaudeHarness::new()
+            .build_command(&PathBuf::from("claude"), request)
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The value following `flag`, or `None` if the flag is absent.
+    fn value_of<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|at| args.get(at + 1))
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn permission_mode_follows_the_runtime_mode() {
+        for (mode, expected) in [
+            (RuntimeMode::ApprovalRequired, "default"),
+            (RuntimeMode::AutoAcceptEdits, "acceptEdits"),
+            (RuntimeMode::Auto, "auto"),
+            (RuntimeMode::FullAccess, "bypassPermissions"),
+        ] {
+            let args = args_for(mode);
+            assert_eq!(
+                value_of(&args, "--permission-mode"),
+                Some(expected),
+                "{mode:?} produced {args:?}"
+            );
+        }
+    }
+
+    /// The bypass flag is the one argument that must not spread: it is what
+    /// removes every guardrail, and only the mode that names that is allowed
+    /// to carry it.
+    #[test]
+    fn only_full_access_skips_permissions() {
+        for mode in [
+            RuntimeMode::ApprovalRequired,
+            RuntimeMode::AutoAcceptEdits,
+            RuntimeMode::Auto,
+        ] {
+            let args = args_for(mode);
+            assert!(
+                !args.iter().any(|a| a == "--dangerously-skip-permissions"),
+                "{mode:?} must not skip permissions: {args:?}"
+            );
+        }
+        assert!(
+            args_for(RuntimeMode::FullAccess)
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions")
+        );
+    }
+
+    /// Chat titling pairs a never-ask mode with a read-only sandbox. Claude
+    /// reads the mode and not the sandbox, so that request must still produce
+    /// the bypass pair — a run that stopped to ask would hang, since titling
+    /// has no surface on which an answer could be given.
+    #[test]
+    fn a_read_only_sandbox_does_not_change_the_permission_mode() {
+        let request = RunRequest {
+            prompt: "name this chat".into(),
+            sandbox: SandboxLevel::ReadOnly,
+            ..RunRequest::for_session(RuntimeMode::FullAccess)
+        };
+        let args = args_of(&request);
+        assert_eq!(
+            value_of(&args, "--permission-mode"),
+            Some("bypassPermissions")
+        );
+        assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
     }
 }
