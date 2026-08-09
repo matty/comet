@@ -30,8 +30,8 @@ use comet_doc::{
 };
 use comet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, RuntimeMode, Session, SessionStatus,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, ApprovalDecision, ApprovalRequest, DoneStatus, HarnessId, RunRequest, RuntimeMode,
+    Session, SessionStatus, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
@@ -56,6 +56,7 @@ pub enum SteerOutcome {
 }
 
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
+type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>;
 
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
@@ -78,6 +79,7 @@ struct RunHandle {
     cancel: watch::Sender<bool>,
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
     pending_inputs: PendingInputs,
+    pending_approvals: PendingApprovals,
 }
 
 struct Inner {
@@ -317,9 +319,29 @@ impl SessionsEngine {
                 rx
             })
         };
+        let pending_approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+
+        // Approval bridge: same shape as the input bridge above — mint the id,
+        // park the resolver, then emit. Parking before emitting is what makes
+        // a legitimate id always resolvable by the time the event is seen.
+        let request_approval = {
+            let pending = pending_approvals.clone();
+            let engine_tx = engine_tx.clone();
+            Box::new(move |approval: ApprovalRequest| {
+                let (tx, rx) = oneshot::channel();
+                let request_id = new_id();
+                lock(&pending).insert(request_id.clone(), tx);
+                let _ = engine_tx.send(AgentEvent::ApprovalRequested {
+                    request_id,
+                    approval,
+                });
+                rx
+            })
+        };
         let interrupt_token = CancellationToken::new();
         let controls = RunControls {
             request_input,
+            request_approval,
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
         };
@@ -334,6 +356,7 @@ impl SessionsEngine {
                 cancel: cancel_tx,
                 engine_tx,
                 pending_inputs,
+                pending_approvals,
             },
         );
         self.set_status(chat_id, SessionStatus::Working, true);
@@ -408,17 +431,23 @@ impl SessionsEngine {
                 h.interrupt_token.clone(),
                 h.cancel.clone(),
                 h.pending_inputs.clone(),
+                h.pending_approvals.clone(),
             )
         });
-        let Some((run_id, token, cancel, pending)) = target else {
+        let Some((run_id, token, cancel, pending_inputs, pending_approvals)) = target else {
             return Ok(false);
         };
         // Unpark any blocked question FIRST (mirrors comet: harness teardown can await a
         // parked question callback — a run stuck on a question would deadlock the stop).
-        let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
+        let parked: Vec<_> = lock(&pending_inputs).drain().map(|(_, tx)| tx).collect();
         for tx in parked {
             let _ = tx.send(Vec::new());
         }
+        // Same reason for a parked approval. Dropping the senders resolves the
+        // receivers to an error, which a run must treat as not approved — the
+        // same signal every non-answering caller of this bridge produces.
+        let parked: Vec<_> = lock(&pending_approvals).drain().map(|(_, tx)| tx).collect();
+        drop(parked);
         // Harness-level interrupt (protocol + child teardown) …
         token.cancel();
         // … plus the engine-side grace deadline in the run task, so a harness that
@@ -1230,6 +1259,32 @@ async fn drive_run(
                 inner.set_status(&chat_id, SessionStatus::AwaitingInput, false);
             }
             AgentEvent::InputResolved { .. } => {
+                inner.set_status(&chat_id, SessionStatus::Working, false);
+            }
+            AgentEvent::ApprovalRequested { request_id, .. } => {
+                // Same authority rule as input requests: the host mints the id
+                // and parks the resolver before emitting, so a legitimate id
+                // is always pending here. An adapter emitting its own copy
+                // would fold an unanswerable card into the doc.
+                let pending = lock(&inner.runs)
+                    .get(&chat_id)
+                    .map(|h| h.pending_approvals.clone());
+                let known = pending.is_some_and(|p| lock(&p).contains_key(request_id));
+                if !known {
+                    tracing::warn!(
+                        chat = %chat_id,
+                        request = %request_id,
+                        "dropping harness-emitted ApprovalRequested (unknown id; \
+                         the engine approval bridge owns this lifecycle)"
+                    );
+                    continue;
+                }
+                // Reusing AwaitingInput rather than adding a variant: it
+                // crosses RPC inside Session, and every consumer encodes
+                // "blocked on the user", which is true of both.
+                inner.set_status(&chat_id, SessionStatus::AwaitingInput, false);
+            }
+            AgentEvent::ApprovalResolved { .. } => {
                 inner.set_status(&chat_id, SessionStatus::Working, false);
             }
             _ => {}

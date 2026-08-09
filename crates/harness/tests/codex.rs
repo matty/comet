@@ -62,6 +62,14 @@ fn controls(
             let _ = tx.send(answers);
             rx
         }),
+        // No decision source in this fixture: the dropped sender resolves the
+        // receiver to an error, which a run must treat as not approved. Never
+        // default a fixture to Allow — that is how a permission defect ships
+        // looking correct.
+        request_approval: Box::new(|_approval: comet_proto::ApprovalRequest| {
+            let (_tx, rx) = oneshot::channel::<comet_proto::ApprovalDecision>();
+            rx
+        }),
         steering: steer_rx,
         interrupt: token.clone(),
     };
@@ -446,6 +454,14 @@ async fn approvals_round_trip_as_input_requests() {
                 })
                 .collect();
             let _ = tx.send(answers);
+            rx
+        }),
+        // No decision source in this fixture: the dropped sender resolves the
+        // receiver to an error, which a run must treat as not approved. Never
+        // default a fixture to Allow — that is how a permission defect ships
+        // looking correct.
+        request_approval: Box::new(|_approval: comet_proto::ApprovalRequest| {
+            let (_tx, rx) = oneshot::channel::<comet_proto::ApprovalDecision>();
             rx
         }),
         steering: steer_rx,

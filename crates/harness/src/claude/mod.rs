@@ -474,6 +474,9 @@ async fn run_session(session: Session) {
     } = session;
     let RunControls {
         request_input,
+        // Claude's approvals arrive over the control channel and are not
+        // claimed here yet; this adapter still auto-allows every tool call.
+        request_approval: _request_approval,
         mut steering,
         interrupt,
     } = controls;
