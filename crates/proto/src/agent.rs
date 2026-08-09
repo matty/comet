@@ -880,9 +880,15 @@ mod tests {
     }
 
     /// A peer built before the runtime mode replaced the auto-approve flag
-    /// still sends `autoApprove`. It must decode, ignored: the field it stood
-    /// in for is now the mode, and every request that carried it `true` was
-    /// engine-internal and never crossed the wire.
+    /// still sends `autoApprove`. It must decode, ignored — the field it stood
+    /// in for is now the mode.
+    ///
+    /// Such a payload loses its never-ask intent: `true` degrades to the
+    /// default mode rather than to `FullAccess`. That is the safe direction and
+    /// the reason this is a plain ignore rather than a translation. Requests
+    /// carrying `true` did reach the wire — the queued run commands in the doc
+    /// command log are the durable, synced path — so this is a real degradation
+    /// for a pre-upgrade peer, not a hypothetical one.
     #[test]
     fn a_payload_still_sending_auto_approve_decodes() {
         let decoded: RunRequest = serde_json::from_str(

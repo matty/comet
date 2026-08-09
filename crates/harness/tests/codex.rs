@@ -401,7 +401,11 @@ async fn approvals_round_trip_as_input_requests() {
         interrupt: token.clone(),
     };
     let mut req = request("scenario:approve");
-    req.runtime_mode = RuntimeMode::AutoAcceptEdits;
+    // Any mode but `FullAccess` sends an approval through the input bridge.
+    // `ApprovalRequired` states that without asserting anything about what
+    // auto-accept-edits should do with a file change once the adapter derives
+    // its approval policy from the mode.
+    req.runtime_mode = RuntimeMode::ApprovalRequired;
     let events = run_to_end(&harness(), req, controls).await;
 
     let asked = asked.lock().unwrap();
@@ -435,7 +439,7 @@ async fn approvals_round_trip_as_input_requests() {
 async fn approval_no_answer_becomes_decline() {
     let (controls, _steer, _token) = controls("No");
     let mut req = request("scenario:decline");
-    req.runtime_mode = RuntimeMode::AutoAcceptEdits;
+    req.runtime_mode = RuntimeMode::ApprovalRequired;
     let events = run_to_end(&harness(), req, controls).await;
 
     // The fake only completes the turn after seeing the decline decision.
