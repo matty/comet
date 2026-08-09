@@ -3496,7 +3496,7 @@ impl Composer {
     }
 
     fn on_input_edited(&mut self, cx: &mut Context<Self>) {
-        if self.wizard.is_some() {
+        if self.wizard.is_some() || self.approval.is_some() {
             if self.mention.token.is_some() || self.mention_task.is_some() {
                 self.reset_mention(None, cx);
             }
@@ -3819,6 +3819,14 @@ impl Composer {
         let had_approval = self.approval.is_some();
         self.approval = approval.filter(|(id, _)| !self.answered_approvals.contains(id));
         if self.approval.is_some() {
+            if !had_approval {
+                // Newly armed: the input is about to become a deny-note
+                // field, not the mention-aware composer input. Any
+                // in-flight mention search/popup from the previous mode
+                // must not survive the handoff (see `on_input_edited`'s
+                // wizard/approval guard above).
+                self.reset_mention(None, cx);
+            }
             self.input.update(cx, |input, cx| {
                 input.set_placeholder("Add a note for the agent (optional)", cx)
             });
@@ -4450,7 +4458,12 @@ impl Composer {
                 this.update(cx, |composer, cx| {
                     composer.failure = Some(crate::errors::approval_failure(&err).into());
                     // The decision never left this device — put the row back.
+                    // Unconditional, unlike `restore_approval_row`'s own
+                    // notify: if the approval resolved externally during the
+                    // round trip, that call takes its silent branch and the
+                    // failure text above would otherwise paint with no repaint.
                     composer.restore_approval_row(&request_id, cx);
+                    cx.notify();
                 })
                 .ok();
                 return;
@@ -4746,7 +4759,10 @@ impl Composer {
         let Some((_, approval)) = self.approval.clone() else {
             return gpui::Empty.into_any_element();
         };
-        let (label, detail) = comet_proto::view::approval_chip_content(&approval);
+        // The detail (command text, file path, …) is not repeated here — the
+        // 56px transcript card directly above already carries it, and this
+        // row would otherwise print the same sentence twice (see task-7).
+        let (label, _detail) = comet_proto::view::approval_chip_content(&approval);
         let note = self.input.read(cx).text().trim().to_string();
 
         // One button shape for all three decisions: only the tint differs, so
@@ -4807,28 +4823,7 @@ impl Composer {
                             .text_size(px(10.5))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted.opacity(0.6))
-                            .child(SharedString::from(crate::popover::tracked_upper(
-                                "Approval needed",
-                            ))),
-                    )
-                    .child(
-                        div()
-                            .mt(px(6.0))
-                            .text_size(px(15.0))
-                            .line_height(px(20.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child(SharedString::from(label)),
-                    )
-                    .child(
-                        div()
-                            .mt(px(4.0))
-                            .w_full()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(12.5))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from(detail)),
+                            .child(SharedString::from(crate::popover::tracked_upper(label))),
                     )
                     .child(
                         div()
