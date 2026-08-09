@@ -3162,6 +3162,16 @@ pub struct Composer {
     /// Requests already answered locally (suppresses the panel until the doc
     /// frame marks them resolved).
     answered_requests: HashSet<String>,
+    /// The approval the decision row is serving. Unlike [`Self::wizard`] this
+    /// is NOT latched: it is recomputed from the transcript on every state
+    /// change and released the instant any decision — including the host's
+    /// `Expired` — reaches the doc. An approval answers a JSON-RPC id owned by
+    /// a process that may have exited; latching it past that would leave an
+    /// Allow button that does nothing, silently.
+    approval: Option<(String, comet_proto::ApprovalRequest)>,
+    /// Approvals answered locally, suppressing the row until the doc frame
+    /// carries the decision back.
+    answered_approvals: HashSet<String>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
@@ -3248,6 +3258,8 @@ impl Composer {
             wizard: None,
             wizard_focus: cx.focus_handle(),
             answered_requests: HashSet::new(),
+            approval: None,
+            answered_approvals: HashSet::new(),
             advance_task: None,
             send_task: None,
             expanded_mode: false,
@@ -3484,7 +3496,7 @@ impl Composer {
     }
 
     fn on_input_edited(&mut self, cx: &mut Context<Self>) {
-        if self.wizard.is_some() {
+        if self.wizard.is_some() || self.approval.is_some() {
             if self.mention.token.is_some() || self.mention_task.is_some() {
                 self.reset_mention(None, cx);
             }
@@ -3761,26 +3773,35 @@ impl Composer {
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
-        let (key, pending) = {
+        let (key, pending, approval) = {
             let s = self.state.read(cx);
             (
                 s.selected_chat.clone(),
                 pending_input_request(&s.transcript),
+                crate::approvals::pending_approval(&s.transcript),
             )
         };
 
         // Draft swap on chat navigation — the input entity itself survives.
         if key != self.current_key {
-            let old_text = self.input.read(cx).text().to_string();
-            if old_text.is_empty() {
-                self.drafts.remove(&self.current_key);
-            } else {
-                self.drafts.insert(self.current_key.clone(), old_text);
+            // While a blocking surface owns the input its text is a deny note
+            // or a wizard answer, NOT a draft — and the real draft was already
+            // parked when that surface armed. Stashing the note over it here
+            // would lose the draft to a navigation the user made mid-decision.
+            if !(self.approval.is_some() || self.wizard.is_some()) {
+                let old_text = self.input.read(cx).text().to_string();
+                if old_text.is_empty() {
+                    self.drafts.remove(&self.current_key);
+                } else {
+                    self.drafts.insert(self.current_key.clone(), old_text);
+                }
             }
             let draft = self.drafts.get(&key).cloned().unwrap_or_default();
             self.current_key = key;
             self.failure = None;
             self.wizard = None;
+            self.approval = None;
+            self.answered_approvals.clear();
             // Attachments stay stashed under their chat key (the map swap IS
             // the navigation); only the transient chrome resets.
             self.preview = None;
@@ -3795,6 +3816,45 @@ impl Composer {
             self.last_rendered_height = 0.0;
             self.route_snap_until = Some(Instant::now() + Duration::from_millis(ROUTE_SNAP_MS));
             self.input.update(cx, |input, cx| input.set_text(draft, cx));
+        }
+
+        // No latch, deliberately (see the field's doc comment). `pending_approval`
+        // already returns None for any decided approval, so a decision landing
+        // anywhere — this device, a paired one, or the host's `Expired` stamp —
+        // retires the row on the next state change.
+        let had_approval = self.approval.is_some();
+        self.approval = approval.filter(|(id, _)| !self.answered_approvals.contains(id));
+        if self.approval.is_some() {
+            if !had_approval {
+                // Newly armed: the input is about to become a deny-note
+                // field, not the mention-aware composer input. Any
+                // in-flight mention search/popup from the previous mode
+                // must not survive the handoff (see `on_input_edited`'s
+                // wizard/approval guard above).
+                self.reset_mention(None, cx);
+                self.park_draft_for_note(cx);
+            } else {
+                // Re-assert on every later state change: the wizard's own arm
+                // below can reclaim the placeholder when both are pending.
+                self.input.update(cx, |input, cx| {
+                    input.set_placeholder("Add a note for the agent (optional)", cx)
+                });
+            }
+        } else if had_approval {
+            // The row just retired with no local click behind it — Expired,
+            // a paired device's decision, or a superseding assistant entry.
+            // `respond_approval` already hands the input back for the
+            // local-click path, so this arm only fires for the other three.
+            if pending.is_none() {
+                self.release_borrowed_input(cx);
+            } else {
+                // A question is pending, so the wizard's arm below borrows the
+                // input on this same pass. Handing the draft back here would
+                // put it in that panel's free-text field instead of the
+                // composer; it stays parked until the wizard releases.
+                self.input
+                    .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
+            }
         }
 
         // Question panel lifecycle (wizard state cached per request id).
@@ -3860,6 +3920,11 @@ impl Composer {
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
+        if self.approval.is_some() {
+            // The decision row replaces the composer; Enter in the deny-note
+            // field must not send a prompt into a turn that is blocked.
+            return;
+        }
         if self.wizard.is_some() {
             // Enter inside the panel's free-text input submits the page.
             let typed = self.input.read(cx).text().trim().to_string();
@@ -4214,7 +4279,7 @@ impl Composer {
         }));
     }
 
-    fn interrupt(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn interrupt(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).selected_client() else {
             return;
         };
@@ -4363,6 +4428,142 @@ impl Composer {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Queue a decision and retire the row.
+    ///
+    /// `RespondApproval` is a doc command on the existing `QUEUE_COMMAND` RPC
+    /// (`crates/doc/src/commands.rs`), not a new RPC method — so a paired LAN
+    /// client answers approvals with no allowlist work, by construction.
+    fn respond_approval(
+        &mut self,
+        decision: comet_proto::ApprovalDecision,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((request_id, _)) = self.approval.take() else {
+            return;
+        };
+        self.answered_approvals.insert(request_id.clone());
+        self.release_borrowed_input(cx);
+        let Some(engine) = self.state.read(cx).selected_client() else {
+            return;
+        };
+        let Some(chat_id) = self
+            .state
+            .read(cx)
+            .selected_chat
+            .clone()
+            .map(|id| id.local_id)
+        else {
+            return;
+        };
+        let command = SessionCommandPayload::RespondApproval {
+            request_id: request_id.clone(),
+            decision,
+        };
+        let params = match serde_json::to_value(&command) {
+            Ok(value) => serde_json::json!({ "chatId": chat_id, "command": value }),
+            Err(_) => return,
+        };
+        // The composer entity is shared across chats and outlives this task, so
+        // both continuations below have to prove they still own the chat the
+        // decision came from. Without it, a navigation during the round trip
+        // paints the failure banner on whatever chat the user landed on.
+        let owner = self.current_key.clone();
+        self.send_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
+            if let Err(err) = result {
+                this.update(cx, |composer, cx| {
+                    if composer.current_key != owner {
+                        return;
+                    }
+                    composer.failure = Some(crate::errors::approval_failure(&err).into());
+                    // The decision never left this device — put the row back.
+                    // Unconditional, unlike `restore_approval_row`'s own
+                    // notify: if the approval resolved externally during the
+                    // round trip, that call takes its silent branch and the
+                    // failure text above would otherwise paint with no repaint.
+                    composer.restore_approval_row(&request_id, cx);
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
+            // The command queued, but the host may still REJECT it — a run that
+            // ended between the render and the click has no resolver left
+            // (`crates/engine/src/doc_host.rs`: "This approval is no longer
+            // waiting for an answer"), and the UI does not observe command
+            // status. If the same request is still pending once the host has
+            // had ample time, the decision demonstrably didn't take: un-hide
+            // the row rather than leaving a blocked turn with nothing on
+            // screen to answer it. No failure text — a slow host is the other
+            // explanation, and this code cannot tell them apart.
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            this.update(cx, |composer, cx| {
+                if composer.current_key != owner {
+                    return;
+                }
+                composer.restore_approval_row(&request_id, cx);
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Put the decision row back after a queued decision demonstrably didn't
+    /// take — a send that failed outright, or one the 2s safety net finds
+    /// still open.
+    ///
+    /// This recomputes `self.approval` from the transcript itself rather than
+    /// only clearing the local suppression: `on_state_changed` runs off the
+    /// state entity's own notify (`cx.observe(&state, …)`), which this task
+    /// has no reason to have triggered, so leaving the recompute to it could
+    /// strand the composer unblocked with the row gone — exactly what the
+    /// safety net exists to prevent.
+    fn restore_approval_row(&mut self, request_id: &str, cx: &mut Context<Self>) {
+        self.answered_approvals.remove(request_id);
+        let transcript = self.state.read(cx).transcript.clone();
+        if crate::approvals::approval_still_unanswered(&transcript, request_id) {
+            self.approval = crate::approvals::pending_approval(&transcript);
+            // Re-arming borrows the input again, so the draft handed back when
+            // the decision was sent has to be parked a second time — otherwise
+            // it reappears as the deny note under the restored row.
+            self.park_draft_for_note(cx);
+            cx.notify();
+        }
+    }
+
+    /// Park the draft before a blocking surface borrows the shared input, and
+    /// hand that surface an empty field.
+    ///
+    /// One `ComposerInput` entity serves three roles — prompt, wizard answer,
+    /// deny note — so arming a blocking surface has to put whatever the user
+    /// was already typing somewhere. Without this an in-flight prompt became
+    /// the visible deny note and Allow wiped it with no recovery. The parking
+    /// spot is the same per-chat `drafts` map navigation uses, so a draft
+    /// displaced by an approval and one displaced by a chat switch survive the
+    /// same way.
+    fn park_draft_for_note(&mut self, cx: &mut Context<Self>) {
+        let draft = self.input.read(cx).text().to_string();
+        if draft.is_empty() {
+            self.drafts.remove(&self.current_key);
+        } else {
+            self.drafts.insert(self.current_key.clone(), draft);
+        }
+        self.input.update(cx, |input, cx| {
+            input.set_text("", cx);
+            input.set_placeholder("Add a note for the agent (optional)", cx);
+        });
+    }
+
+    /// Hand the shared input back to the composer: the default placeholder,
+    /// and the draft [`Self::park_draft_for_note`] displaced.
+    fn release_borrowed_input(&mut self, cx: &mut Context<Self>) {
+        let draft = self.drafts.remove(&self.current_key).unwrap_or_default();
+        self.input.update(cx, |input, cx| {
+            input.set_text(draft, cx);
+            input.set_placeholder("Do anything…", cx);
+        });
     }
 
     fn on_wizard_key(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
@@ -4602,6 +4803,143 @@ impl Composer {
             .into_any_element()
     }
 
+    /// The approval decision row, rendered in place of the composer — the same
+    /// floating-pill chrome as [`Self::render_wizard`], so a turn blocked on a
+    /// decision and a turn blocked on a question read as the same kind of
+    /// moment. Replacing the composer IS the send block: there is no flag a
+    /// later call site can forget to check.
+    ///
+    /// The shared input becomes the deny note, mirroring the wizard's
+    /// free-text override — it is what lets a refusal say "not that path"
+    /// instead of only "no". Allow ignores it.
+    fn render_approval(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = Theme::of(cx).clone();
+        let Some((_, approval)) = self.approval.clone() else {
+            return gpui::Empty.into_any_element();
+        };
+        // The detail (command text, file path, …) is not repeated here — the
+        // 56px transcript card directly above already carries it, and this
+        // row would otherwise print the same sentence twice (see task-7).
+        let (label, _detail) = comet_proto::view::approval_chip_content(&approval);
+        let note = self.input.read(cx).text().trim().to_string();
+
+        // One button shape for all three decisions: only the tint differs, so
+        // the row's height cannot vary with which decision is emphasised.
+        let button = |id: &'static str,
+                      text: &'static str,
+                      strong: bool,
+                      theme: &Theme,
+                      cx: &mut Context<Self>,
+                      decision: comet_proto::ApprovalDecision| {
+            div()
+                .id(id)
+                .h(px(30.0))
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(if strong {
+                    crate::theme::hairline(0.16)
+                } else {
+                    crate::theme::hairline(0.08)
+                })
+                .bg(motion::hover_blend(
+                    &format!("approval-{id}"),
+                    crate::theme::ink(if strong { 0.09 } else { 0.025 }),
+                    crate::theme::ink(if strong { 0.14 } else { 0.06 }),
+                ))
+                .on_hover(motion::hover_listener(format!("approval-{id}")))
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(if strong { theme.text } else { theme.text_muted })
+                .child(SharedString::from(text))
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.respond_approval(decision.clone(), cx)),
+                )
+        };
+
+        div()
+            .id("approval-panel")
+            .rounded(px(26.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.input_bg)
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(px(16.0))
+                    .pt(px(16.0))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted.opacity(0.6))
+                            .child(SharedString::from(crate::popover::tracked_upper(label))),
+                    )
+                    .child(
+                        div()
+                            .mt(px(12.0))
+                            .border_t_1()
+                            .border_color(crate::theme::hairline(0.06))
+                            .pt(px(12.0))
+                            .pb(px(4.0))
+                            .px(px(4.0))
+                            .child(self.input.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .px(px(12.0))
+                    .pb(px(12.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(button(
+                        "approval-deny",
+                        "Deny",
+                        false,
+                        &theme,
+                        cx,
+                        comet_proto::ApprovalDecision::Deny {
+                            message: if note.is_empty() {
+                                // Comet copy, not an empty string: the message
+                                // goes back to the model, and "" tells it
+                                // nothing about what to do instead.
+                                "The user declined this action.".to_string()
+                            } else {
+                                note.clone()
+                            },
+                        },
+                    ))
+                    .child(div().flex_1())
+                    .child(button(
+                        "approval-allow-session",
+                        "Allow for this session",
+                        false,
+                        &theme,
+                        cx,
+                        comet_proto::ApprovalDecision::AllowForSession,
+                    ))
+                    .child(button(
+                        "approval-allow",
+                        "Allow",
+                        true,
+                        &theme,
+                        cx,
+                        comet_proto::ApprovalDecision::Allow,
+                    )),
+            )
+            .into_any_element()
+    }
+
     fn render_send_button(
         &mut self,
         mode: SendButtonMode,
@@ -4832,6 +5170,17 @@ impl Render for Composer {
                         .child(div().min_w_0().child(message)),
                 )
             });
+
+        // An approval outranks a question when both are somehow pending: the
+        // approval has an expiry the user did not choose, and the question does
+        // not — it stays answerable after its run dies.
+        if self.approval.is_some() {
+            let approval = self.render_approval(cx);
+            return container.child(motion::fade_quick(
+                "composer-approval",
+                div().child(approval),
+            ));
+        }
 
         if wizard_active {
             let wizard = self.render_wizard(cx);

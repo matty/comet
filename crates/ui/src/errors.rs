@@ -123,6 +123,25 @@ pub fn session_move_failure(err: &RpcError) -> String {
     }
 }
 
+/// A decision on an approval that did not reach the engine.
+///
+/// A mutation, like [`switch_failure`], but with a different remedy: the
+/// affordance is still on screen, so "try again" needs no words — what the
+/// copy has to do is distinguish a transient failure (press it again) from a
+/// version mismatch (pressing it again cannot help).
+pub fn approval_failure(err: &RpcError) -> String {
+    tracing::warn!(error = %err, "approval decision failed to queue");
+    match err {
+        RpcError::Closed | RpcError::Transport(_) => {
+            "Couldn't send your decision — Comet's engine isn't responding.".to_string()
+        }
+        RpcError::UnknownMethod(_) | RpcError::BadParams(_) => {
+            "Couldn't send your decision — this copy of Comet doesn't match its engine. Restart Comet, and update the paired machine if you're connected to one.".to_string()
+        }
+        RpcError::Failed(_) => "Couldn't send your decision.".to_string(),
+    }
+}
+
 /// A reply that arrived but would not decode.
 ///
 /// Same cause as [`RpcError::BadParams`] — this build and the engine disagree
@@ -213,5 +232,33 @@ mod tests {
             !transient.contains("Restart Comet"),
             "a transient failure should not send the user to a restart: {transient}"
         );
+    }
+
+    /// A queued decision that failed must not put `RpcError`'s Display on
+    /// screen — this is rule 1, and the composer's existing `format!("{err}")`
+    /// sites are known debt, not a pattern to extend.
+    #[test]
+    fn a_failed_decision_never_leaks_the_error() {
+        let poison = "bad params: missing field `decision` at line 1 column 12";
+        for err in [
+            RpcError::Closed,
+            RpcError::Transport(poison.into()),
+            RpcError::UnknownMethod(poison.into()),
+            RpcError::BadParams(poison.into()),
+            RpcError::Failed(poison.into()),
+        ] {
+            let shown = approval_failure(&err);
+            assert!(
+                !shown.contains("missing field") && !shown.contains("column"),
+                "{shown}"
+            );
+            assert!(
+                shown.contains("decision"),
+                "the copy names what failed: {shown}"
+            );
+        }
+        // A mismatch is not fixed by pressing the button again.
+        assert!(approval_failure(&RpcError::BadParams("x".into())).contains("Restart Comet"));
+        assert!(!approval_failure(&RpcError::Closed).contains("Restart Comet"));
     }
 }

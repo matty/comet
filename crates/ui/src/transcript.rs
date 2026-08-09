@@ -195,6 +195,38 @@ pub struct ToolItem {
     pub resolved: bool,
 }
 
+/// The approval card's paint discriminator — the ONLY thing that may vary by
+/// decision (`.agents/rules/gpui-ui.md`: layout constants never depend on
+/// which color is painted). Carries the decision KIND, not the decision
+/// itself, because `Allow` and `AllowForSession` are both the user saying
+/// yes and paint identically; only `approval_card`'s match arm needs to know
+/// which of the four looks to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalPaint {
+    /// No decision recorded yet.
+    Open,
+    /// `Allow` or `AllowForSession`.
+    Allowed,
+    /// A choice the user made, not a failure — never painted `danger`/red.
+    Denied,
+    /// Host-stamped because the run ended with this still open.
+    Expired,
+}
+
+impl ApprovalPaint {
+    fn of(decision: Option<&comet_proto::ApprovalDecision>) -> Self {
+        use comet_proto::ApprovalDecision;
+        match decision {
+            None => ApprovalPaint::Open,
+            Some(ApprovalDecision::Allow) | Some(ApprovalDecision::AllowForSession) => {
+                ApprovalPaint::Allowed
+            }
+            Some(ApprovalDecision::Deny { .. }) => ApprovalPaint::Denied,
+            Some(ApprovalDecision::Expired) => ApprovalPaint::Expired,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum RowKind {
     User {
@@ -237,6 +269,21 @@ pub enum RowKind {
         /// answer as a resumed turn).
         header: SharedString,
         resolved: bool,
+    },
+    /// An approval the provider is blocked on. Like `InputChip` this is
+    /// PASSIVE — the decision controls live in the composer — but it is a card
+    /// rather than a chip because the thing being asked (a command, a path and
+    /// its counts) does not survive sharing one 34px line with a label.
+    ApprovalCard {
+        /// Comet's name for the action ("Run a command", "Edit a file").
+        label: &'static str,
+        /// The one-line body: the command, the path + counts, the server/tool.
+        detail: SharedString,
+        /// The terminal caption, once decided. `None` while open.
+        state: Option<SharedString>,
+        /// Paint-only discriminator for the decision (or its absence).
+        /// Changes colour and icon, never layout.
+        paint: ApprovalPaint,
     },
     ErrorChip {
         message: SharedString,
@@ -491,9 +538,39 @@ pub fn rows_for_entry(
                     }
                     // Tools are grouped by the outer arm; nothing reaches here.
                     MessagePart::Tool { .. } => {}
-                    // No card yet: the approval surface is built with the
-                    // composer decision row, not here.
-                    MessagePart::Approval { .. } => {}
+                    MessagePart::Approval {
+                        id: part_id,
+                        approval,
+                        decision,
+                        ..
+                    } => {
+                        let (label, detail) = comet_proto::view::approval_chip_content(approval);
+                        let state = decision.as_ref().map(|d| {
+                            SharedString::from(comet_proto::view::approval_decision_label(d))
+                        });
+                        let paint = ApprovalPaint::of(decision.as_ref());
+                        let mut fp = detail.as_bytes().to_vec();
+                        fp.extend_from_slice(label.as_bytes());
+                        if let Some(state) = &state {
+                            fp.extend_from_slice(state.as_bytes());
+                        }
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            // The decision folds into the version: a card that
+                            // resolves must repaint even though nothing else in
+                            // the entry changed.
+                            version: fnv1a(&fp),
+                            turn_start: false,
+                            kind: RowKind::ApprovalCard {
+                                label,
+                                detail: detail.into(),
+                                state,
+                                paint,
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                        });
+                    }
                     MessagePart::Notice {
                         id: part_id,
                         severity,
@@ -1767,6 +1844,12 @@ impl Transcript {
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
             }
+            RowKind::ApprovalCard {
+                label,
+                detail,
+                state,
+                paint,
+            } => approval_card(label, detail.clone(), state.clone(), *paint, &theme),
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::NoticeChip {
                 summary,
@@ -2340,6 +2423,137 @@ fn notice_chip(
     div().py(px(4.0)).w_full().child(row).into_any_element()
 }
 
+/// The transcript's approval card — what the provider asked permission to do.
+///
+/// Two lines, **56px in every kind and every state**: layout never varies with
+/// the decision, so an approval resolving cannot reflow the transcript under
+/// the user's scroll position (`.agents/rules/gpui-ui.md`). Height, padding,
+/// icon size and tile size are the SAME literals in every arm below — only
+/// the `match` on [`ApprovalPaint`] may vary between them.
+///
+/// Open and `Denied` both read in neutral tones — a denial is a choice the
+/// user made, not a failure, so `danger`/red is wrong for it
+/// (`.agents/rules/user-facing-errors.md`); `Allowed` reads `success_muted`,
+/// `Expired` reads amber (`warning_muted`) because it is the one state the
+/// user did not choose. Icon plus tint/caption-color is what has to carry the
+/// distinction on its own — this project has shipped a card that painted
+/// every decision identically twice before.
+///
+/// Passive by construction, like [`input_chip`]: the decision controls live in
+/// the composer, so there is no control here to disable when the approval is
+/// no longer answerable.
+fn approval_card(
+    label: &'static str,
+    detail: SharedString,
+    state: Option<SharedString>,
+    paint: ApprovalPaint,
+    theme: &Theme,
+) -> AnyElement {
+    let (border, wash, tile, tint, icon_path, caption_color) = match paint {
+        ApprovalPaint::Allowed => (
+            theme.success_muted.opacity(0.16),
+            theme.success_muted.opacity(0.05),
+            theme.success_muted.opacity(0.12),
+            theme.success_muted,
+            crate::icons::CHECK,
+            theme.text_muted,
+        ),
+        ApprovalPaint::Denied => (
+            crate::theme::hairline(0.08),
+            crate::theme::ink(0.045),
+            crate::theme::ink(0.09),
+            theme.text_muted,
+            crate::icons::CLOSE_CIRCLE,
+            // The one caption that departs from the muted tone every other
+            // state uses — a refusal has to read differently from an
+            // approval at a glance, not just carry a different word.
+            theme.text,
+        ),
+        ApprovalPaint::Expired => (
+            theme.warning_muted.opacity(0.16),
+            theme.warning_muted.opacity(0.05),
+            theme.warning_muted.opacity(0.12),
+            theme.warning_muted,
+            crate::icons::KEY_MINIMALISTIC,
+            theme.text_muted,
+        ),
+        ApprovalPaint::Open => (
+            crate::theme::hairline(0.08),
+            crate::theme::ink(0.045),
+            crate::theme::ink(0.09),
+            theme.text_muted,
+            crate::icons::KEY_MINIMALISTIC,
+            theme.text_muted,
+        ),
+    };
+    div()
+        .py(px(4.0))
+        .w_full()
+        .child(
+            div()
+                .h(px(56.0))
+                .w_full()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .gap(px(4.0))
+                .overflow_hidden()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(border)
+                .bg(wash)
+                .px(px(8.0))
+                .text_size(px(12.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(20.0))
+                                .rounded(px(6.0))
+                                .bg(tile)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    crate::icons::icon(icon_path)
+                                        .size(px(12.0))
+                                        .text_color(tint),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(tint)
+                                .child(SharedString::from(label)),
+                        )
+                        .child(div().flex_1())
+                        .children(state.map(|state| {
+                            div()
+                                .flex_none()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(caption_color)
+                                .child(state)
+                        })),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .w_full()
+                        .truncate()
+                        .text_color(theme.text)
+                        .child(detail),
+                ),
+        )
+        .into_any_element()
+}
+
 /// Hover card for a notice's `detail` line (same frame as the harness-rail
 /// tooltip in `pickers.rs`).
 struct NoticeDetailTooltip {
@@ -2855,6 +3069,207 @@ mod tests {
         let r2 = rows_for_entry(&two, false, &mut parse);
         assert_eq!(r1[0].id, r2[0].id);
         assert_ne!(r1[0].version, r2[0].version);
+    }
+
+    fn approval_part(id: &str, decision: Option<comet_proto::ApprovalDecision>) -> MessagePart {
+        MessagePart::Approval {
+            id: id.into(),
+            request_id: "r1".into(),
+            approval: comet_proto::ApprovalRequest::Command {
+                command: "cargo test --workspace".into(),
+                cwd: None,
+            },
+            decision,
+        }
+    }
+
+    #[test]
+    fn an_open_approval_becomes_a_card_row() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![text_part("t0", "before"), approval_part("ap-r1", None)],
+        );
+        let rows = rows_for_entry(&entry, true, &mut parse);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].id.as_ref(), "m1#ap-r1");
+        let RowKind::ApprovalCard {
+            label,
+            detail,
+            state,
+            paint,
+        } = &rows[1].kind
+        else {
+            panic!("expected ApprovalCard, got another row kind");
+        };
+        assert_eq!(*label, "Run a command");
+        assert_eq!(detail.as_ref(), "cargo test --workspace");
+        assert_eq!(*state, None, "an open approval has no terminal caption");
+        assert_eq!(*paint, ApprovalPaint::Open);
+    }
+
+    #[test]
+    fn a_decided_approval_carries_its_caption() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![approval_part(
+                "ap-r1",
+                Some(comet_proto::ApprovalDecision::AllowForSession),
+            )],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::ApprovalCard { state, paint, .. } = &rows[0].kind else {
+            panic!("expected ApprovalCard");
+        };
+        assert_eq!(
+            state.as_ref().map(|s| s.as_ref()),
+            Some("Allowed for this session")
+        );
+        assert_eq!(*paint, ApprovalPaint::Allowed);
+    }
+
+    /// `Expired` paints differently (amber, a state to resolve) but must NOT
+    /// lay out differently — a decision arriving cannot be allowed to reflow
+    /// the transcript under the user's scroll position.
+    #[test]
+    fn an_expired_approval_is_flagged_for_paint_only() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Aborted,
+            vec![approval_part(
+                "ap-r1",
+                Some(comet_proto::ApprovalDecision::Expired),
+            )],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::ApprovalCard {
+            state,
+            paint,
+            label,
+            detail,
+        } = &rows[0].kind
+        else {
+            panic!("expected ApprovalCard");
+        };
+        assert_eq!(*paint, ApprovalPaint::Expired);
+        assert!(state.as_ref().is_some_and(|s| s.contains("run ended")));
+        // Identical to the open row's content fields: only paint may differ.
+        assert_eq!(*label, "Run a command");
+        assert_eq!(detail.as_ref(), "cargo test --workspace");
+    }
+
+    /// The whole point of splitting the paint discriminator out of `expired`:
+    /// a decision must change how the card LOOKS (Allowed/Denied/Expired/Open
+    /// all pairwise distinct) without changing anything layout-bearing — the
+    /// 56px card must not reflow under the user's scroll position when a
+    /// decision lands.
+    #[test]
+    fn the_paint_discriminator_differs_by_decision_while_layout_fields_do_not() {
+        let row_for = |decision: Option<comet_proto::ApprovalDecision>| {
+            let entry = assistant(
+                "m1",
+                MessageStatus::Complete,
+                vec![approval_part("ap-r1", decision)],
+            );
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            let RowKind::ApprovalCard {
+                label,
+                detail,
+                paint,
+                ..
+            } = rows[0].kind.clone()
+            else {
+                panic!("expected ApprovalCard");
+            };
+            (label, detail, paint)
+        };
+
+        let (open_label, open_detail, open_paint) = row_for(None);
+        let (allow_label, allow_detail, allow_paint) =
+            row_for(Some(comet_proto::ApprovalDecision::Allow));
+        let (session_label, session_detail, session_paint) =
+            row_for(Some(comet_proto::ApprovalDecision::AllowForSession));
+        let (deny_label, deny_detail, deny_paint) =
+            row_for(Some(comet_proto::ApprovalDecision::Deny {
+                message: "no".into(),
+            }));
+        let (expired_label, expired_detail, expired_paint) =
+            row_for(Some(comet_proto::ApprovalDecision::Expired));
+
+        // Layout-bearing content (what `approval_card` sizes/lays out around)
+        // never varies with the decision — only the request does.
+        for (label, detail) in [
+            (open_label, &open_detail),
+            (allow_label, &allow_detail),
+            (session_label, &session_detail),
+            (deny_label, &deny_detail),
+            (expired_label, &expired_detail),
+        ] {
+            assert_eq!(label, "Run a command");
+            assert_eq!(detail.as_ref(), "cargo test --workspace");
+        }
+
+        // Allow and AllowForSession are the SAME paint (both "the user said
+        // yes") — that is deliberate, not the bug. Everything else must be
+        // pairwise distinct, or a refusal is indistinguishable from an
+        // approval on a scrolled-back transcript (the defect this guards).
+        assert_eq!(allow_paint, session_paint);
+        let distinct = [open_paint, allow_paint, deny_paint, expired_paint];
+        for i in 0..distinct.len() {
+            for j in (i + 1)..distinct.len() {
+                assert_ne!(
+                    distinct[i], distinct[j],
+                    "paint must differ across {:?} vs {:?}",
+                    distinct[i], distinct[j]
+                );
+            }
+        }
+    }
+
+    /// The decision changes the row's CONTENT, so it has to change the row's
+    /// version — a diff key that ignored it would leave a decided approval
+    /// painted as open until something else in the entry changed.
+    #[test]
+    fn the_row_version_changes_when_the_decision_lands() {
+        let open = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![approval_part("ap-r1", None)],
+        );
+        let decided = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![approval_part(
+                "ap-r1",
+                Some(comet_proto::ApprovalDecision::Allow),
+            )],
+        );
+        let a = rows_for_entry(&open, true, &mut parse);
+        let b = rows_for_entry(&decided, true, &mut parse);
+        assert_eq!(a[0].id, b[0].id);
+        assert_ne!(a[0].version, b[0].version);
+    }
+
+    /// An approval between two tool calls breaks the group, like any non-tool
+    /// part — the approval is ABOUT the call that follows it, so folding them
+    /// into one group would put the card after the action it gates.
+    #[test]
+    fn an_approval_splits_tool_groups() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![
+                tool_part("a", "ls"),
+                approval_part("ap-r1", None),
+                tool_part("b", "pwd"),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(rows[0].kind, RowKind::ToolGroup { .. }));
+        assert!(matches!(rows[1].kind, RowKind::ApprovalCard { .. }));
+        assert!(matches!(rows[2].kind, RowKind::ToolGroup { .. }));
     }
 
     /// A detail that restates the summary is suppressed before it reaches the

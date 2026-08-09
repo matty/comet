@@ -524,6 +524,11 @@ pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
+    /// Blocked-turn clock: `(key, first seen)` for the approval or tool call
+    /// the status strip is reporting. UI-local by construction — no part
+    /// carries a start timestamp, so a restart mid-wait under-reports rather
+    /// than inventing a start this client never observed.
+    blocked_stamp: Option<(SharedString, std::time::Instant)>,
     /// The pinned sidebar search field ("SidebarSearch" context: navigation
     /// keys stay unbound so ↑↓/⏎ bubble to the sidebar frame). Search is
     /// transient — never persisted, never restored on boot.
@@ -840,6 +845,7 @@ impl Shell {
             state,
             transcript,
             composer,
+            blocked_stamp: None,
             search_input,
             search_active: 0,
             composer_focus_pending: false,
@@ -1099,6 +1105,13 @@ impl Shell {
             }
             self.right_tween = None;
             self.terminal_tween = None;
+            // The blocked-turn clock is keyed only on the approval/tool id, not
+            // on the chat it belongs to — a stamp surviving the switch would be
+            // the clock's only OVER-report path (a same-keyed wait on the new
+            // chat inheriting a start time from the old one) in a design that
+            // otherwise only ever under-reports. Theoretical today (approval
+            // ids are UUIDs; tool keys are provider call ids), but free to close.
+            self.blocked_stamp = None;
             let panels = self.panels.get(&self.panel_key(cx));
             if let Some(panel) = self.terminal.clone() {
                 panel.update(cx, |panel, cx| panel.set_open(panels.terminal_open, cx));
@@ -3453,21 +3466,26 @@ impl Shell {
         let state = self.state.read(cx);
 
         // Aligned with the composer column: centered, same max width, small
-        // inner gutter (comet's `mx-auto h-6 max-w-3xl px-2`).
-        let strip = div()
-            .h(px(Theme::STATUS_STRIP_HEIGHT))
-            .flex_none()
-            .w_full()
-            .max_w(px(768.0))
-            .mx_auto()
-            .flex()
-            .items_center()
-            .gap(px(Theme::SPACE_SM))
-            .px(px(Theme::SPACE_LG + 8.0))
-            .text_size(px(11.0));
+        // inner gutter (comet's `mx-auto h-6 max-w-3xl px-2`). A closure, not
+        // a value: `Div` isn't `Clone` at the pinned gpui rev, and both a
+        // normal indicator arm and the blocked-turn line below need their own
+        // fresh strip with identical geometry.
+        let strip = || {
+            div()
+                .h(px(Theme::STATUS_STRIP_HEIGHT))
+                .flex_none()
+                .w_full()
+                .max_w(px(768.0))
+                .mx_auto()
+                .flex()
+                .items_center()
+                .gap(px(Theme::SPACE_SM))
+                .px(px(Theme::SPACE_LG + 8.0))
+                .text_size(px(11.0))
+        };
 
         let Some(chat_id) = state.selected_chat.clone().map(|id| id.local_id) else {
-            return strip.into_any_element();
+            return strip().into_any_element();
         };
         let indicator = state.indicator_for(&chat_id, now);
         let elapsed_secs = state
@@ -3476,12 +3494,80 @@ impl Shell {
             .map(|t| now.signed_duration_since(t).num_seconds())
             .unwrap_or(0);
         let sending = self.composer.read(cx).is_sending();
+        // Last read of `state` (borrowed from `cx`) in this call — everything
+        // after this point only touches `self`'s own fields and `cx` mutably,
+        // both of which are disjoint from it.
+        let blocked = crate::approvals::blocked_on(&state.transcript);
+
+        // Both indicator arms below consult this SAME helper. An approval
+        // sets the session to `AwaitingInput` (sessions.rs:1310), so an
+        // arm-specific implementation would go silent at exactly the moment
+        // the wait begins — see `crate::approvals` for the shared rule this
+        // closes (a tool call that never returns has no timeout and no
+        // recovery, same as an approval no one has answered).
+        let blocked = crate::approvals::blocked_line(
+            &mut self.blocked_stamp,
+            blocked,
+            std::time::Instant::now(),
+        );
+        let blocked_strip = blocked.map(|line| {
+            let stoppable = line.stoppable;
+            let elapsed = transcript::format_elapsed(line.elapsed_secs);
+            strip()
+                .child(loaders::gradient_spinner(
+                    "blocked-indicator",
+                    &theme,
+                    2.5,
+                    cx.entity_id(),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(line.text),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(elapsed)),
+                )
+                .when(stoppable, |el| {
+                    el.child(
+                        // The only cancellation Comet has is turn-level: no
+                        // provider exposes a per-call cancel, and the command
+                        // queue has one `interrupt`. So the line NAMES the
+                        // call and Stop ends the turn — the honest
+                        // affordance, not a per-call one that doesn't exist.
+                        div()
+                            .id("blocked-stop")
+                            .flex_none()
+                            .px(px(6.0))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .text_color(theme.text_muted)
+                            .hover(|s| s.text_color(theme.text))
+                            .child(SharedString::from("Stop"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.composer
+                                    .update(cx, |composer, cx| composer.interrupt(cx));
+                            })),
+                    )
+                })
+                .into_any_element()
+        });
 
         match indicator {
             Indicator::Working => {
+                if let Some(blocked) = blocked_strip {
+                    return blocked;
+                }
                 let word =
                     transcript::flavour_word(transcript::flavour_seed(&chat_id), elapsed_secs);
-                strip
+                strip()
                     .child(loaders::gradient_spinner(
                         "working-indicator",
                         &theme,
@@ -3502,14 +3588,16 @@ impl Shell {
                     )
                     .into_any_element()
             }
-            // No label: the QuestionPanel right below IS the awaiting-input
-            // surface — a strip caption above it was redundant (user request).
-            Indicator::AwaitingInput => strip.into_any_element(),
-            Indicator::Errored => strip
+            // The QuestionPanel right below IS the awaiting-input surface — a
+            // strip caption above it was redundant (user request) — but an
+            // APPROVAL wait carries elapsed time the panel does not show, and
+            // that is exactly the information a long wait must surface.
+            Indicator::AwaitingInput => blocked_strip.unwrap_or_else(|| strip().into_any_element()),
+            Indicator::Errored => strip()
                 .text_color(theme.danger)
                 .child(SharedString::from("Run failed"))
                 .into_any_element(),
-            Indicator::None if sending => strip
+            Indicator::None if sending => strip()
                 .child(loaders::gradient_spinner(
                     "sending-indicator",
                     &theme,
@@ -3524,7 +3612,7 @@ impl Shell {
                         .child(SharedString::from("Sending…")),
                 )
                 .into_any_element(),
-            Indicator::None => strip.into_any_element(),
+            Indicator::None => strip().into_any_element(),
         }
     }
 

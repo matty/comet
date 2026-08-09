@@ -6,7 +6,7 @@ use futures::stream::BoxStream;
 
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DoneStatus, FileOperation, HarnessCapabilities,
-    HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, UserInputQuestion,
+    HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, ToolCall, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls};
@@ -53,6 +53,38 @@ fn question_script() -> Vec<UserInputQuestion> {
             multi_select: true,
         },
     ]
+}
+
+/// The approval a `COMET_MOCK_APPROVAL` run asks for. The value names the
+/// KIND, so every card shape can be put on screen without a code edit —
+/// `1` keeps meaning the file-change run 1.4 shipped. An unrecognized value
+/// falls back to that same run rather than silently disabling the knob: a
+/// typo should still show a card, not nothing.
+fn mock_approval(value: &str) -> Option<ApprovalRequest> {
+    Some(match value {
+        "" | "0" => return None,
+        "command" => ApprovalRequest::Command {
+            command: "pwsh -NoProfile -Command \"Get-ChildItem -Recurse crates | Measure-Object\""
+                .into(),
+            cwd: Some("C:/dev/comet".into()),
+        },
+        "file-read" => ApprovalRequest::FileRead {
+            path: "crates/engine/src/sessions.rs".into(),
+        },
+        "mcp" => ApprovalRequest::Mcp {
+            server: "linear".into(),
+            tool: "create_issue".into(),
+        },
+        "unknown" => ApprovalRequest::Unknown {
+            summary: "an action Comet does not model".into(),
+        },
+        _ => ApprovalRequest::FileChange {
+            path: "src/reconcile.rs".into(),
+            operation: FileOperation::Modify,
+            added_lines: 24,
+            removed_lines: 6,
+        },
+    })
 }
 
 #[async_trait]
@@ -159,15 +191,17 @@ impl Harness for MockHarness {
             return Ok(stream.boxed());
         }
 
-        // Dev/testing knob: `COMET_MOCK_APPROVAL=1` swaps in a run that asks
-        // permission mid-stream via `controls.request_approval` (the host mints
-        // the request id, emits `ApprovalRequested`, and resolves it from the
-        // queued respond-approval command) — the only data-side way to put an
-        // approval card on screen.
-        let approval_mode = std::env::var("COMET_MOCK_APPROVAL")
+        // Dev/testing knob: `COMET_MOCK_APPROVAL=<kind>` swaps in a run that
+        // asks permission mid-stream via `controls.request_approval` (the host
+        // mints the request id, emits `ApprovalRequested`, and resolves it from
+        // the queued respond-approval command) — the only data-side way to put
+        // an approval card on screen. `<kind>` selects the shape (`command`,
+        // `file-change`, `file-read`, `mcp`, `unknown`); `1` keeps meaning the
+        // file-change run — see `mock_approval` below.
+        let approval = std::env::var("COMET_MOCK_APPROVAL")
             .ok()
-            .is_some_and(|v| !v.is_empty() && v != "0");
-        if approval_mode {
+            .and_then(|v| mock_approval(&v));
+        if let Some(approval) = approval {
             let request_approval = controls.request_approval;
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
             tokio::spawn(async move {
@@ -181,13 +215,7 @@ impl Harness for MockHarness {
                     text: "I need to edit the reconciliation module before I continue.\n\n".into(),
                 });
                 tokio::time::sleep(pause).await;
-                let decision = request_approval(ApprovalRequest::FileChange {
-                    path: "src/reconcile.rs".into(),
-                    operation: FileOperation::Modify,
-                    added_lines: 24,
-                    removed_lines: 6,
-                })
-                .await;
+                let decision = request_approval(approval).await;
                 tokio::time::sleep(pause).await;
                 let closing = match decision {
                     Ok(ApprovalDecision::Allow) | Ok(ApprovalDecision::AllowForSession) => {
@@ -207,6 +235,45 @@ impl Harness for MockHarness {
                     error: None,
                     session_id: None,
                 });
+            });
+            let stream = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (Ok(event), rx))
+            });
+            return Ok(stream.boxed());
+        }
+
+        // Dev/testing knob: `COMET_MOCK_HANG=1` emits a tool call and then
+        // NOTHING — no result, no Done. A tool call that never returns has no
+        // other data-side producer: every fake in this repo answers, which is
+        // why the state has only ever been seen against a live provider.
+        let hang_mode = std::env::var("COMET_MOCK_HANG")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        if hang_mode {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+            tokio::spawn(async move {
+                let pause = if delay_ms == 0 {
+                    std::time::Duration::from_millis(50)
+                } else {
+                    delay
+                };
+                tokio::time::sleep(pause).await;
+                let _ = tx.send(AgentEvent::TextDelta {
+                    text: "Counting the crates before I continue.\n\n".into(),
+                });
+                tokio::time::sleep(pause).await;
+                let _ = tx.send(AgentEvent::ToolCall {
+                    id: "mock-hang".into(),
+                    call: ToolCall::Exec {
+                        command:
+                            "pwsh -NoProfile -Command \"Get-ChildItem -Recurse crates | Measure-Object\""
+                                .into(),
+                    },
+                });
+                // Hold the sender — and therefore the stream — open forever.
+                // Dropping it would close the stream and end the turn, which is
+                // the opposite of the state being reproduced.
+                std::future::pending::<()>().await;
             });
             let stream = futures::stream::unfold(rx, |mut rx| async move {
                 rx.recv().await.map(|event| (Ok(event), rx))
@@ -378,5 +445,65 @@ impl Harness for MockHarness {
                 event
             })
             .boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every card shape must be reachable from the knob, or the rendered
+    /// check can only ever see the one kind 1.4 happened to script.
+    #[test]
+    fn every_approval_kind_has_a_mock_shape() {
+        assert!(matches!(
+            mock_approval("command"),
+            Some(ApprovalRequest::Command { .. })
+        ));
+        assert!(matches!(
+            mock_approval("file-change"),
+            Some(ApprovalRequest::FileChange { .. })
+        ));
+        assert!(matches!(
+            mock_approval("file-read"),
+            Some(ApprovalRequest::FileRead { .. })
+        ));
+        assert!(matches!(
+            mock_approval("mcp"),
+            Some(ApprovalRequest::Mcp { .. })
+        ));
+        assert!(matches!(
+            mock_approval("unknown"),
+            Some(ApprovalRequest::Unknown { .. })
+        ));
+    }
+
+    /// `COMET_MOCK_APPROVAL=1` is the value 1.4 shipped and documented; it
+    /// must keep meaning the file-change run.
+    #[test]
+    fn the_legacy_value_still_selects_the_file_change_run() {
+        assert!(matches!(
+            mock_approval("1"),
+            Some(ApprovalRequest::FileChange { .. })
+        ));
+    }
+
+    /// The absent case, written by hand: unset and "0" are off, and an empty
+    /// value is not a request for the default.
+    #[test]
+    fn the_off_values_produce_no_approval() {
+        assert!(mock_approval("").is_none());
+        assert!(mock_approval("0").is_none());
+    }
+
+    /// The hang knob's value must not accidentally become an "off" value for
+    /// the approval knob: an unrecognized value falls into the fallback arm,
+    /// not the `None` arm.
+    #[test]
+    fn an_unrecognized_value_falls_back_to_the_file_change_run() {
+        assert!(
+            mock_approval("hang").is_some(),
+            "unrecognized values fall back"
+        );
     }
 }
