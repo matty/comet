@@ -158,6 +158,10 @@ impl CodexHarness {
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: REASONING_LEVELS.to_vec(),
+            // Undeclared: nothing maps a runtime mode onto codex's approval
+            // policy yet, and declaring a mode the adapter does not honor
+            // would offer a promise the run cannot keep.
+            runtime_modes: Vec::new(),
         }
     }
 

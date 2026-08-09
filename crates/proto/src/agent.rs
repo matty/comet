@@ -114,6 +114,11 @@ pub struct HarnessCapabilities {
     pub steering_mode: SteeringMode,
     /// The effort ladder offered in the traits picker.
     pub reasoning_levels: Vec<ReasoningLevel>,
+    /// The runtime modes this harness honors, in the order they should be
+    /// offered. An empty list means the harness has not declared any — read it
+    /// as unknown, never as "supports nothing", or a harness that predates the
+    /// field is presented as offering no way to run at all.
+    pub runtime_modes: Vec<RuntimeMode>,
 }
 
 /// Whether a harness's CLI is usable on this device, as of the last probe.
@@ -396,6 +401,23 @@ mod capability_tests {
     fn derived_default_matches_empty_payload() {
         let decoded: HarnessCapabilities = serde_json::from_str("{}").unwrap();
         assert_eq!(decoded, HarnessCapabilities::default());
+    }
+
+    /// An undeclared mode list is the absent case a consumer has to write
+    /// itself: it means the harness has not said, not that it supports
+    /// nothing. Decoding must produce it rather than failing the batch.
+    #[test]
+    fn absent_runtime_modes_decode_to_an_empty_list() {
+        let caps: HarnessCapabilities = serde_json::from_str("{}").unwrap();
+        assert!(caps.runtime_modes.is_empty());
+
+        let partial: HarnessCapabilities =
+            serde_json::from_str(r#"{"runtimeModes":["approval-required","full-access"]}"#)
+                .unwrap();
+        assert_eq!(
+            partial.runtime_modes,
+            vec![RuntimeMode::ApprovalRequired, RuntimeMode::FullAccess]
+        );
     }
 }
 

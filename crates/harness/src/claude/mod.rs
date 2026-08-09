@@ -124,6 +124,12 @@ impl ClaudeHarness {
                 ReasoningLevel::XHigh,
                 ReasoningLevel::Max,
             ],
+            runtime_modes: vec![
+                RuntimeMode::ApprovalRequired,
+                RuntimeMode::AutoAcceptEdits,
+                RuntimeMode::Auto,
+                RuntimeMode::FullAccess,
+            ],
         }
     }
 
@@ -965,5 +971,27 @@ mod command_tests {
             Some("bypassPermissions")
         );
         assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
+    }
+
+    /// Every mode the adapter maps is a mode it declares. A mode declared but
+    /// unmapped would be offered to a user and then run as something else.
+    #[test]
+    fn every_declared_mode_is_a_mode_the_command_maps() {
+        let declared = ClaudeHarness::capabilities().runtime_modes;
+        assert_eq!(
+            declared,
+            vec![
+                RuntimeMode::ApprovalRequired,
+                RuntimeMode::AutoAcceptEdits,
+                RuntimeMode::Auto,
+                RuntimeMode::FullAccess,
+            ]
+        );
+        for mode in declared {
+            assert!(
+                value_of(&args_for(mode), "--permission-mode").is_some(),
+                "{mode:?} is declared but produces no permission mode"
+            );
+        }
     }
 }

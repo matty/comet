@@ -99,6 +99,7 @@ impl Harness for ScriptedHarness {
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![ReasoningLevel::Medium],
+            runtime_modes: Vec::new(),
         }
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
@@ -1715,6 +1716,7 @@ impl Harness for CapturingHarness {
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![ReasoningLevel::Medium],
+            runtime_modes: Vec::new(),
         }
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {

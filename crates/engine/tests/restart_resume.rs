@@ -72,6 +72,7 @@ impl Harness for RecordingHarness {
             supports_steering: false,
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: vec![ReasoningLevel::Medium],
+            runtime_modes: Vec::new(),
         }
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
@@ -436,6 +437,7 @@ impl Harness for PersistentHarness {
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![ReasoningLevel::Medium],
+            runtime_modes: Vec::new(),
         }
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {

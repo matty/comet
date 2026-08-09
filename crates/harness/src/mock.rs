@@ -21,6 +21,7 @@ impl MockHarness {
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![ReasoningLevel::Medium],
+            runtime_modes: Vec::new(),
         }
     }
 }
