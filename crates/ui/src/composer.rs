@@ -3816,11 +3816,21 @@ impl Composer {
         // already returns None for any decided approval, so a decision landing
         // anywhere — this device, a paired one, or the host's `Expired` stamp —
         // retires the row on the next state change.
+        let had_approval = self.approval.is_some();
         self.approval = approval.filter(|(id, _)| !self.answered_approvals.contains(id));
         if self.approval.is_some() {
             self.input.update(cx, |input, cx| {
                 input.set_placeholder("Add a note for the agent (optional)", cx)
             });
+        } else if had_approval {
+            // The row just retired with no local click behind it — Expired,
+            // a paired device's decision, or a superseding assistant entry.
+            // `respond_approval` already restores the default placeholder for
+            // the local-click path, so this arm only fires for the other
+            // three. If a wizard question is also pending, its own arm below
+            // reclaims the placeholder immediately after.
+            self.input
+                .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
         }
 
         // Question panel lifecycle (wizard state cached per request id).
@@ -4440,8 +4450,7 @@ impl Composer {
                 this.update(cx, |composer, cx| {
                     composer.failure = Some(crate::errors::approval_failure(&err).into());
                     // The decision never left this device — put the row back.
-                    composer.answered_approvals.remove(&request_id);
-                    cx.notify();
+                    composer.restore_approval_row(&request_id, cx);
                 })
                 .ok();
                 return;
@@ -4457,17 +4466,33 @@ impl Composer {
             // explanation, and this code cannot tell them apart.
             cx.background_executor().timer(Duration::from_secs(2)).await;
             this.update(cx, |composer, cx| {
-                let transcript = composer.state.read(cx).transcript.clone();
-                let still_pending = crate::approvals::pending_approval(&transcript)
-                    .is_some_and(|(pending_id, _)| pending_id == request_id)
-                    && crate::approvals::approval_decision(&transcript, &request_id).is_none();
-                if still_pending && composer.answered_approvals.remove(&request_id) {
-                    cx.notify();
-                }
+                composer.restore_approval_row(&request_id, cx);
             })
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Put the decision row back after a queued decision demonstrably didn't
+    /// take — a send that failed outright, or one the 2s safety net finds
+    /// still open.
+    ///
+    /// This recomputes `self.approval` from the transcript itself rather than
+    /// only clearing the local suppression: `on_state_changed` runs off the
+    /// state entity's own notify (`cx.observe(&state, …)`), which this task
+    /// has no reason to have triggered, so leaving the recompute to it could
+    /// strand the composer unblocked with the row gone — exactly what the
+    /// safety net exists to prevent.
+    fn restore_approval_row(&mut self, request_id: &str, cx: &mut Context<Self>) {
+        self.answered_approvals.remove(request_id);
+        let transcript = self.state.read(cx).transcript.clone();
+        if crate::approvals::approval_still_unanswered(&transcript, request_id) {
+            self.approval = crate::approvals::pending_approval(&transcript);
+            self.input.update(cx, |input, cx| {
+                input.set_placeholder("Add a note for the agent (optional)", cx)
+            });
+            cx.notify();
+        }
     }
 
     fn on_wizard_key(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {

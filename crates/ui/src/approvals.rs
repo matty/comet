@@ -74,6 +74,20 @@ pub fn approval_decision(
     })
 }
 
+/// Whether `request_id` is still an open approval with no decision recorded
+/// anywhere in the transcript — the composer's 2s safety net asks this before
+/// un-hiding the decision row.
+///
+/// Written out by hand rather than trusted to a fixture (the
+/// `.agents/rules/optional-wire-fields.md` trap in miniature): the case this
+/// guards — a decision that queued and was then REJECTED by the host because
+/// the run's resolver was already gone — produces a transcript no other test
+/// here constructs, so it earns its own.
+pub fn approval_still_unanswered(transcript: &[SessionMessageEntry], request_id: &str) -> bool {
+    pending_approval(transcript).is_some_and(|(id, _)| id == request_id)
+        && approval_decision(transcript, request_id).is_none()
+}
+
 /// What the current turn is waiting on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockedOn {
@@ -339,6 +353,45 @@ mod tests {
         ];
         assert_eq!(approval_decision(&t, "r1"), Some(ApprovalDecision::Allow));
         assert_eq!(approval_decision(&t, "other"), None);
+    }
+
+    /// The composer's 2s safety net asks this before un-hiding the decision
+    /// row — it must say yes only while the exact request is still both the
+    /// pending one AND carries no recorded decision.
+    #[test]
+    fn approval_still_unanswered_is_true_only_while_genuinely_open() {
+        let still_pending = vec![assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![approval_part("r1", None)],
+        )];
+        assert!(approval_still_unanswered(&still_pending, "r1"));
+
+        let decided_since = vec![assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![approval_part("r1", Some(ApprovalDecision::Allow))],
+        )];
+        assert!(!approval_still_unanswered(&decided_since, "r1"));
+
+        let superseded = vec![
+            assistant(
+                "m1",
+                MessageStatus::Aborted,
+                vec![approval_part("r1", None)],
+            ),
+            assistant(
+                "m2",
+                MessageStatus::Complete,
+                vec![MessagePart::Text {
+                    id: "t2".into(),
+                    text: "moved on".into(),
+                }],
+            ),
+        ];
+        assert!(!approval_still_unanswered(&superseded, "r1"));
+
+        assert!(!approval_still_unanswered(&still_pending, "other-request"));
     }
 
     #[test]
