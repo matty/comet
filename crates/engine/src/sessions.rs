@@ -541,16 +541,8 @@ impl SessionsEngine {
                     .or_else(|| {
                         let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
                         Some(RunRequest {
-                            prompt: String::new(),
-                            model: None,
-                            reasoning: None,
-                            model_options: Default::default(),
                             cwd,
-                            runtime_mode: RuntimeMode::default(),
-                            sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
-                            auto_approve: false,
-                            attachments: Vec::new(),
-                            resume: None,
+                            ..RunRequest::for_session(RuntimeMode::default())
                         })
                     });
                 let Some(mut request) = request else {
