@@ -409,6 +409,7 @@ async fn chat_config_selects_the_run_harness() {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
+                runtime_mode: RuntimeMode::default(),
             }),
             None,
         )

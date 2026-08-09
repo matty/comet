@@ -697,7 +697,7 @@ impl From<RawSession> for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comet_proto::{HarnessId, SandboxLevel};
+    use comet_proto::{HarnessId, RuntimeMode, SandboxLevel};
 
     fn ts(ms: i64) -> DateTime<Utc> {
         dt(ms)
@@ -729,6 +729,7 @@ mod tests {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
+                runtime_mode: RuntimeMode::default(),
             }),
             last_message_preview: None,
             last_message_at: None,
@@ -791,6 +792,7 @@ mod tests {
             reasoning: Some(comet_proto::ReasoningLevel::XHigh),
             model_options: options,
             sandbox: SandboxLevel::WorkspaceWrite,
+            runtime_mode: RuntimeMode::default(),
         };
         assert!(ws.set_chat_config("chat-1", &config).unwrap());
         let row = ws.chat("chat-1").unwrap().expect("row exists");

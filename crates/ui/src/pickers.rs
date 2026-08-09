@@ -22,7 +22,8 @@ use gpui::{
 
 use comet_engine::registry::HarnessDescriptor;
 use comet_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel, ServerRef,
+    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, RuntimeMode,
+    SandboxLevel, ServerRef,
 };
 use comet_rpc::methods;
 
@@ -119,6 +120,8 @@ impl ResolvedRunConfig {
             reasoning: self.reasoning,
             model_options: self.model_options.clone(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            // Placeholder until the picker exposes a runtime mode control.
+            runtime_mode: RuntimeMode::default(),
         })
     }
 }
