@@ -869,7 +869,11 @@ impl AccountsPage {
             .border_1()
             .border_color(theme.border)
             .bg(theme.surface)
-            .px(px(16.0))
+            // 20px, not 16 — this block stacks directly beneath the account
+            // card, whose rows inset by 20 (`widgets::section_card`). At 16 the
+            // heading and every row visibly hang left of the avatar above them.
+            // Verified by rendering the two cards adjacent.
+            .px(px(20.0))
             .py(px(12.0))
             .flex()
             .flex_col()
