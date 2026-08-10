@@ -344,7 +344,11 @@ pub struct EngineRuntime {
     /// owns clones of `SessionsEngine` and `Presence`, so a detached one keeps
     /// sweeping against shut-down stores, and every recreated embedded engine
     /// would leave another behind.
-    sweeper: tokio::task::JoinHandle<()>,
+    ///
+    /// `Mutex<Option<_>>` rather than a bare handle because `shutdown` only
+    /// borrows `&self` (it has callers that can't take `&mut`), but the handle
+    /// must be owned to await it — `take()` moves it out under the lock.
+    sweeper: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl EngineRuntime {
@@ -353,10 +357,17 @@ impl EngineRuntime {
     }
 
     pub async fn shutdown(&self) {
-        // Sweeper first: it must not start an expiry against stores that are
-        // about to close, and `interrupt` would race the run settlement
-        // `sessions.shutdown()` is performing.
-        self.sweeper.abort();
+        // Sweeper first, and awaited: `abort` only schedules cancellation, it
+        // doesn't stop the task before its next await point, so without the
+        // await a sweep already past that point could still call
+        // `expire_unattended` against stores `core.shutdown()` is closing.
+        // Awaiting the aborted handle guarantees the task has stopped before
+        // we proceed.
+        let sweeper = self.sweeper.lock().expect("sweeper mutex poisoned").take();
+        if let Some(sweeper) = sweeper {
+            sweeper.abort();
+            let _ = sweeper.await;
+        }
         self.core.shutdown().await;
     }
 }
@@ -393,7 +404,10 @@ impl Engine {
         );
 
         tracing::info!(device_id = %core.device_id, "engine core assembled");
-        Ok(EngineRuntime { core, sweeper })
+        Ok(EngineRuntime {
+            core,
+            sweeper: std::sync::Mutex::new(Some(sweeper)),
+        })
     }
 
     /// Run the local engine and opt-in LAN server until shutdown.
@@ -583,5 +597,54 @@ mod tests {
         let second = core.rpc_service();
         assert!(first.shares_mutation_authority(&second));
         core.shutdown().await;
+    }
+
+    /// `EngineRuntime::shutdown` must not return until the aborted sweeper
+    /// task has actually stopped, not merely been asked to. This core has
+    /// nothing live (no LAN server started, no sessions, no terminals), so
+    /// every step of `core.shutdown()` resolves on its first poll without
+    /// ever yielding to the scheduler — the only way the stand-in sweeper
+    /// task below gets polled and dropped at all is the explicit
+    /// `sweeper.await` inside `shutdown`. That makes this deterministic
+    /// rather than a race: pre-fix (bare `abort()`, no join) the flag is
+    /// reliably still unset when `shutdown()` returns; post-fix it is
+    /// reliably set, because `JoinHandle::await` only resolves after the
+    /// task's drop glue has run.
+    #[tokio::test]
+    async fn shutdown_waits_for_the_sweeper_to_actually_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = EngineCore::assemble(
+            dir.path(),
+            Arc::new(HarnessRegistry::new()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct MarkOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for MarkOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let guard = MarkOnDrop(stopped.clone());
+        let sweeper = tokio::spawn(async move {
+            let _guard = guard;
+            // Never completes on its own; only abort ends it, and abort only
+            // drops it at its next await point, which is right here.
+            std::future::pending::<()>().await
+        });
+
+        let runtime = EngineRuntime {
+            core,
+            sweeper: std::sync::Mutex::new(Some(sweeper)),
+        };
+        runtime.shutdown().await;
+
+        assert!(
+            stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "shutdown() returned before the aborted sweeper task finished dropping"
+        );
     }
 }
