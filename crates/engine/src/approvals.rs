@@ -43,7 +43,20 @@ pub(crate) fn approval_signature(request: &ApprovalRequest) -> Option<String> {
             path, operation, ..
         } => json!(["fileChange", path, format!("{operation:?}")]),
         ApprovalRequest::FileRead { path } => json!(["fileRead", path]),
-        ApprovalRequest::Mcp { server, tool } => json!(["mcp", server, tool]),
+        // The only variant that names a CAPABILITY rather than an action.
+        // `Mcp` carries no arguments — `create_issue` on one project and
+        // `create_issue` on another are the same value — so a signature built
+        // from it would grant every future call of that tool, whatever it was
+        // asked to do. Every other kind's grant is narrow: the same command
+        // text, the same path. This one would not be, and the user cannot see
+        // the difference either, because the card renders `server · tool` and
+        // no arguments.
+        //
+        // So: allow the call in front of the user, remember nothing. Same
+        // treatment as `Unknown` below, for the same reason one field up.
+        // Carrying a discriminating digest of the arguments would fix it
+        // properly and needs a proto change (`DEBT.md` D19).
+        ApprovalRequest::Mcp { .. } => return None,
         ApprovalRequest::Unknown { .. } => return None,
     };
     // Infallible: every value here is a string, a null, or an array of them.
@@ -155,22 +168,31 @@ mod tests {
 
     #[test]
     fn a_separator_in_a_path_or_a_server_name_does_not_collide_either() {
-        // Same defect, the other three variants. A file change's path and an
-        // MCP server/tool pair are equally unrestricted.
+        // Same defect, the other allowlistable variants. A path and a file
+        // change's path+operation pair are equally unrestricted.
+        //
+        // `Mcp` used to be the second half of this test and is no longer
+        // allowlistable at all, so it cannot carry it: two `None`s are equal
+        // and the assertion would pass for the wrong reason.
         let deep = ApprovalRequest::FileRead {
             path: "a\u{1f}b".into(),
         };
         let shallow = ApprovalRequest::FileRead { path: "a".into() };
         assert_ne!(approval_signature(&deep), approval_signature(&shallow));
 
-        let split = ApprovalRequest::Mcp {
-            server: "s\u{1f}t".into(),
-            tool: String::new(),
+        let split = ApprovalRequest::FileChange {
+            path: "a\u{1f}Modify".into(),
+            operation: FileOperation::Create,
+            added_lines: 0,
+            removed_lines: 0,
         };
-        let whole = ApprovalRequest::Mcp {
-            server: "s".into(),
-            tool: "t".into(),
+        let whole = ApprovalRequest::FileChange {
+            path: "a".into(),
+            operation: FileOperation::Modify,
+            added_lines: 0,
+            removed_lines: 0,
         };
+        assert!(approval_signature(&split).is_some());
         assert_ne!(approval_signature(&split), approval_signature(&whole));
     }
 
@@ -200,11 +222,30 @@ mod tests {
 
     #[test]
     fn kinds_never_collide_with_each_other() {
+        // Both sides must be allowlistable, or this passes on `Some != None`
+        // and proves nothing about the encoding.
         let read = ApprovalRequest::FileRead { path: "x".into() };
-        let mcp = ApprovalRequest::Mcp {
-            server: "x".into(),
-            tool: String::new(),
+        let command = ApprovalRequest::Command {
+            command: "x".into(),
+            cwd: None,
         };
-        assert_ne!(approval_signature(&read), approval_signature(&mcp));
+        assert!(approval_signature(&read).is_some());
+        assert!(approval_signature(&command).is_some());
+        assert_ne!(approval_signature(&read), approval_signature(&command));
+    }
+
+    #[test]
+    fn an_mcp_tool_is_never_allowlistable() {
+        // `Mcp` names a capability, not an action: it carries no arguments, so
+        // `create_issue` against one project and `create_issue` against another
+        // are the same value. A signature built from it would turn "allow this
+        // issue" into "allow every issue this tool ever creates", which is
+        // broader than any other kind's grant and broader than what the card
+        // showed the user (it renders `server · tool`, no arguments).
+        let one = ApprovalRequest::Mcp {
+            server: "linear".into(),
+            tool: "create_issue".into(),
+        };
+        assert_eq!(approval_signature(&one), None);
     }
 }
