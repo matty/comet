@@ -340,15 +340,16 @@ pub struct Engine {
 
 pub struct EngineRuntime {
     core: EngineCore,
-    /// The unattended sweeper's task. Held so `shutdown` can abort it: the task
-    /// owns clones of `SessionsEngine` and `Presence`, so a detached one keeps
-    /// sweeping against shut-down stores, and every recreated embedded engine
-    /// would leave another behind.
+    /// The unattended sweeper's task. Owned outright: the task owns clones of
+    /// `SessionsEngine` and `Presence`, so a detached one keeps sweeping
+    /// against shut-down stores, and every recreated embedded engine would
+    /// leave another behind.
     ///
-    /// `Mutex<Option<_>>` rather than a bare handle because `shutdown` only
-    /// borrows `&self` (it has callers that can't take `&mut`), but the handle
-    /// must be owned to await it — `take()` moves it out under the lock.
-    sweeper: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// `shutdown` consumes `self` to get at it, which is what makes a second
+    /// concurrent shutdown impossible to write rather than merely unlikely —
+    /// there is no `&self` path left that could observe the handle already
+    /// taken and skip the wait.
+    sweeper: tokio::task::JoinHandle<()>,
 }
 
 impl EngineRuntime {
@@ -356,18 +357,15 @@ impl EngineRuntime {
         &self.core
     }
 
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(self) {
         // Sweeper first, and awaited: `abort` only schedules cancellation, it
         // doesn't stop the task before its next await point, so without the
         // await a sweep already past that point could still call
         // `expire_unattended` against stores `core.shutdown()` is closing.
         // Awaiting the aborted handle guarantees the task has stopped before
         // we proceed.
-        let sweeper = self.sweeper.lock().expect("sweeper mutex poisoned").take();
-        if let Some(sweeper) = sweeper {
-            sweeper.abort();
-            let _ = sweeper.await;
-        }
+        self.sweeper.abort();
+        let _ = self.sweeper.await;
         self.core.shutdown().await;
     }
 }
@@ -404,10 +402,7 @@ impl Engine {
         );
 
         tracing::info!(device_id = %core.device_id, "engine core assembled");
-        Ok(EngineRuntime {
-            core,
-            sweeper: std::sync::Mutex::new(Some(sweeper)),
-        })
+        Ok(EngineRuntime { core, sweeper })
     }
 
     /// Run the local engine and opt-in LAN server until shutdown.
@@ -636,10 +631,7 @@ mod tests {
             std::future::pending::<()>().await
         });
 
-        let runtime = EngineRuntime {
-            core,
-            sweeper: std::sync::Mutex::new(Some(sweeper)),
-        };
+        let runtime = EngineRuntime { core, sweeper };
         runtime.shutdown().await;
 
         assert!(
