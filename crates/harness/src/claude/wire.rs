@@ -294,10 +294,11 @@ pub(crate) struct ControlRequestBody {
     /// The CLI's own one-line rendering of the request ("hello.txt", "Write
     /// \"one\" to a.txt"). Provider prose.
     ///
-    /// Decoded for exactly one consumer, and it is a test: `ApprovalRequest::
-    /// Unknown` promises its summary is Comet copy and never provider prose,
-    /// and the contract test in `claude/approval.rs` asserts this string does
-    /// not reach the card. No production path reads it. Do not "use" it.
+    /// Decoded for exactly one consumer, and it is a test:
+    /// `ApprovalRequest::Unknown` promises its summary is Comet copy and
+    /// never provider prose, and the contract test in `claude/approval.rs`
+    /// asserts this string does not reach the card. No production path reads
+    /// it. Do not "use" it.
     #[serde(default)]
     #[allow(dead_code)]
     pub description: Option<String>,

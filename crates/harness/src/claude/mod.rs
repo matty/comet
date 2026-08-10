@@ -12,6 +12,7 @@
 //! - Interrupt: cancelling [`RunControls::interrupt`] sends the protocol-level
 //!   interrupt control request, then escalates to SIGTERM and SIGKILL.
 
+mod approval;
 mod catalog;
 mod normalize;
 mod wire;
