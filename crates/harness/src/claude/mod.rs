@@ -833,6 +833,7 @@ mod control_request_tests {
                 subtype: subtype.into(),
                 tool_name: tool_name.into(),
                 input: serde_json::json!({"x": 1}),
+                ..Default::default()
             },
         }
     }

@@ -282,7 +282,13 @@ pub(crate) struct ControlRequestFrame {
     pub request: ControlRequestBody,
 }
 
+// The three fields below are decoded but not yet read by production code —
+// only by this file's tests. A later task in this slice (the approval card)
+// consumes them; `#[allow(dead_code)]` holds clippy off until then instead of
+// leaving the field undecoded, which the next reader would read as "the CLI
+// doesn't send this".
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) struct ControlRequestBody {
     #[serde(default)]
     pub subtype: String,
@@ -290,6 +296,23 @@ pub(crate) struct ControlRequestBody {
     pub tool_name: String,
     #[serde(default)]
     pub input: Value,
+    /// The CLI's own one-line rendering of the request ("hello.txt", "Write
+    /// \"one\" to a.txt"). Provider prose — never rendered raw; see
+    /// `claude/approval.rs` for what reaches the card.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub description: Option<String>,
+    /// The path a command was blocked from touching. Present on the Bash
+    /// request, ABSENT on the Write request (captured 2026-08-10) — `None`
+    /// means the CLI reported none, not that the path is empty.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub blocked_path: Option<String>,
+    /// Joins this approval to the assistant's tool call in the transcript.
+    /// Distinct from the control channel's `request_id`.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub tool_use_id: Option<String>,
 }
 
 /// Parse one stdout JSONL line. `Err` = not JSON; unclaimed types classify
@@ -533,5 +556,55 @@ mod tests {
                 other => panic!("{raw} should be Ignored({reason}), got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_can_use_tool_request_decodes_the_fields_a_card_needs() {
+        // Captured verbatim from Claude Code 2.1.226, 2026-08-10.
+        let line = r#"{"type":"control_request","request_id":"c012205e","request":{
+            "subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash",
+            "input":{"command":"echo one > a.txt","description":"Write \"one\" to a.txt"},
+            "description":"Write \"one\" to a.txt",
+            "blocked_path":"C:\\work\\a.txt","tool_use_id":"toolu_01NA3M"}}"#;
+        let Frame::ControlRequest(req) = parse_frame(line).unwrap() else {
+            panic!("expected a control request");
+        };
+        assert_eq!(req.request.subtype, "can_use_tool");
+        assert_eq!(req.request.tool_name, "Bash");
+        assert_eq!(
+            req.request.description.as_deref(),
+            Some("Write \"one\" to a.txt")
+        );
+        assert_eq!(req.request.blocked_path.as_deref(), Some("C:\\work\\a.txt"));
+        assert_eq!(req.request.tool_use_id.as_deref(), Some("toolu_01NA3M"));
+    }
+
+    #[test]
+    fn a_write_request_has_no_blocked_path_and_that_is_not_an_error() {
+        // The absent case, written by hand, per .agents/rules/optional-wire-fields.md.
+        // Captured: the Write request carries no `blocked_path`; the Bash one does.
+        // `None` here means "the CLI reported no blocked path", NOT "the empty path".
+        let line = r#"{"type":"control_request","request_id":"cc1cb7a8","request":{
+            "subtype":"can_use_tool","tool_name":"Write",
+            "input":{"file_path":"C:\\work\\hello.txt","content":"hi\n"},
+            "description":"hello.txt","tool_use_id":"toolu_01GmE4"}}"#;
+        let Frame::ControlRequest(req) = parse_frame(line).unwrap() else {
+            panic!("expected a control request");
+        };
+        assert_eq!(req.request.blocked_path, None);
+        assert_eq!(req.request.description.as_deref(), Some("hello.txt"));
+    }
+
+    #[test]
+    fn an_unknown_control_subtype_still_decodes() {
+        // Sink 3's input: the frame must decode so the subtype can be reported and
+        // answered, even though nothing understands it.
+        let line = r#"{"type":"control_request","request_id":"x","request":{"subtype":"request_user_dialog"}}"#;
+        let Frame::ControlRequest(req) = parse_frame(line).unwrap() else {
+            panic!("expected a control request");
+        };
+        assert_eq!(req.request.subtype, "request_user_dialog");
+        assert_eq!(req.request.tool_name, "");
+        assert_eq!(req.request.description, None);
     }
 }
