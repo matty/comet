@@ -371,11 +371,12 @@ pub fn approval_decision_label(decision: &crate::ApprovalDecision) -> &'static s
         // decision the user did not make, so it is the only one that has to
         // say why it is there.
         //
-        // Three causes now, all of them "the run ended first": a steer over an
-        // open card, an interrupt, and slice 1.9's unattended expiry. The
-        // wording stays deliberately about the RUN rather than about a cause,
-        // so do not narrow it to one of them — the accompanying error part is
-        // what names the reason.
+        // Four causes now, all of them "the run ended first": a steer over an
+        // open card, an interrupt, boot crash-recovery stamping a process that
+        // died while blocked (`DocHost::mark_abandoned_streams`), and slice
+        // 1.9's unattended expiry. The wording stays deliberately about the RUN
+        // rather than about a cause, so do not narrow it to one of them — the
+        // accompanying error part is what names the reason.
         ApprovalDecision::Expired => "Expired — the run ended first",
     }
 }
