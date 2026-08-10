@@ -27,6 +27,10 @@ async fn serve_connection_guarded(
     mut inbound: mpsc::Receiver<String>,
     guard: Option<ConnectionGuard>,
 ) {
+    // Held for the whole connection, and dropped on every exit including a
+    // panic — the reason this is a guard rather than a connect/disconnect pair.
+    // Every transport reaches this function, so nothing can attach unseen.
+    let _lease = service.attached();
     let mut running: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
     'connection: while let Some(payload) = inbound.recv().await {
         // ndjson: a transport may batch several frames per message.
@@ -310,5 +314,57 @@ mod authorization_tests {
         queued.await.unwrap();
 
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// Every transport funnels through `serve_connection_guarded`, so the lease
+    /// taken here is what makes presence impossible for a transport to forget.
+    #[tokio::test]
+    async fn a_connection_holds_a_service_lease_for_its_lifetime() {
+        struct Counting {
+            live: Arc<AtomicUsize>,
+        }
+        struct Lease(Arc<AtomicUsize>);
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        #[async_trait::async_trait]
+        impl RpcService for Counting {
+            async fn handle(
+                &self,
+                _method: &str,
+                params: serde_json::Value,
+            ) -> Result<RpcReply, RpcError> {
+                Ok(RpcReply::Value(params))
+            }
+            fn attached(&self) -> Option<crate::ConnectionLease> {
+                self.live.fetch_add(1, Ordering::SeqCst);
+                Some(Box::new(Lease(self.live.clone())))
+            }
+        }
+
+        let live = Arc::new(AtomicUsize::new(0));
+        let service = Arc::new(Counting { live: live.clone() });
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let (in_tx, in_rx) = mpsc::channel(8);
+        let server = tokio::spawn(serve_connection(service, out_tx, in_rx));
+
+        in_tx
+            .send("{\"id\":1,\"method\":\"Echo\",\"params\":{}}\n".to_string())
+            .await
+            .unwrap();
+        // The lease is taken before the first frame is dispatched, so once a
+        // reply is possible it is definitely held.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(live.load(Ordering::SeqCst), 1, "lease held while connected");
+
+        drop(in_tx);
+        server.await.unwrap();
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            0,
+            "lease dropped when the connection ended"
+        );
     }
 }

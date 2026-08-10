@@ -283,6 +283,12 @@ impl RpcService for RemoteRpcService {
             _ => Ok(reply),
         }
     }
+
+    /// Forwarded, not defaulted: a LAN client is a supervisor exactly like a
+    /// local one, and the default `None` would silently lose it.
+    fn attached(&self) -> Option<comet_rpc::ConnectionLease> {
+        self.inner.attached()
+    }
 }
 
 #[cfg(test)]

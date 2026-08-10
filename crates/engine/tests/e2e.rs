@@ -205,6 +205,22 @@ fn entries_now(core: &EngineCore) -> Vec<SessionMessageEntry> {
         .unwrap_or_default()
 }
 
+/// Every Text and Error part's message, across every entry, joined — for
+/// substring assertions about what the transcript says without caring which
+/// entry it landed in.
+fn entries_text(core: &EngineCore) -> String {
+    entries(core)
+        .iter()
+        .flat_map(|e| e.parts.iter())
+        .filter_map(|p| match p {
+            MessagePart::Text { text, .. } => Some(text.as_str()),
+            MessagePart::Error { message, .. } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn command_status(core: &EngineCore, id: &str) -> Option<(SessionCommandStatus, Option<String>)> {
     core.doc_host
         .open(CHAT)
@@ -3075,4 +3091,479 @@ async fn an_approval_pending_when_the_process_dies_becomes_expired() {
         resolution.unwrap(),
         "This approval is no longer waiting for an answer."
     );
+}
+
+// ---------------------------------------------------------------------------
+// Presence: how many supervisors are attached, across topologies. The
+// unattended sweeper (a later slice) is the only reader that turns this into
+// a policy decision; these tests only cover the counting.
+// ---------------------------------------------------------------------------
+
+/// The embedded-UI topology: `memory_client` is a real connection, so the
+/// engine must see the in-process UI as attached. Counting sockets instead
+/// would report zero watchers with the UI open on screen and expire runs in
+/// front of a present user.
+#[tokio::test]
+async fn an_in_memory_client_counts_as_an_attached_supervisor() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    assert_eq!(core.presence().attached_count(), 0);
+    assert!(core.presence().unattended_since().is_some());
+
+    let client = comet_rpc::memory_client(core.rpc_service());
+    wait_for(
+        || core.presence().attached_count() == 1,
+        "the in-memory client to be counted",
+    )
+    .await;
+    assert_eq!(core.presence().unattended_since(), None);
+
+    drop(client);
+    wait_for(
+        || core.presence().unattended_since().is_some(),
+        "the stretch to restart when the client goes",
+    )
+    .await;
+}
+
+/// `RemoteRpcService` wraps `EngineRpc`; a defaulted `attached()` compiles and
+/// silently loses every LAN client. This is the topology `remote_access.rs`
+/// exercises for RPC behavior — here it stands in as the "LAN-shaped" client
+/// that must still register as an attached supervisor.
+#[tokio::test]
+async fn the_remote_service_forwards_presence_to_the_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    let remote: Arc<dyn RpcService> = Arc::new(comet_engine::RemoteRpcService::new(
+        core.remote_rpc_service(),
+        core.device_id.clone(),
+    ));
+    let client = comet_rpc::memory_client(remote);
+    wait_for(
+        || core.presence().attached_count() == 1,
+        "a LAN-shaped client to be counted",
+    )
+    .await;
+    drop(client);
+}
+
+// ---------------------------------------------------------------------------
+// The unattended sweeper: a wait no connected client can answer gets ended
+// after `bound`, and the transcript says why rather than inventing a
+// decision the user never made. `expire_unattended` is called directly with
+// an explicit `now` so these tests don't wait out a real bound.
+// ---------------------------------------------------------------------------
+
+/// The rule, unattended half: the turn ends, the card reads Expired, the note
+/// says why, and NOTHING writes a decision. Auto-denying would tell the model
+/// the user refused something the user was never asked.
+#[tokio::test]
+async fn an_unanswerable_approval_expires_the_turn_without_inventing_a_decision() {
+    let dir = tempfile::tempdir().unwrap();
+    // No client ever attaches: `assemble` starts the engine unattended from boot.
+    let core = assemble(dir.path(), Arc::new(ApprovingHarness));
+    let presence = core.presence();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    drive_to_open_approval(&core, &handle, "cmd-run-unattended-approval").await;
+
+    let ended = core
+        .sessions
+        .expire_unattended(
+            &presence,
+            chrono::Utc::now() + chrono::TimeDelta::seconds(1),
+            Duration::from_millis(100),
+        )
+        .await;
+    assert_eq!(ended, 1, "the blocked run should have been ended");
+
+    wait_for(
+        || {
+            entries(&core).iter().any(|e| {
+                e.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        MessagePart::Approval {
+                            decision: Some(ApprovalDecision::Expired),
+                            ..
+                        }
+                    )
+                })
+            })
+        },
+        "the card to be stamped expired",
+    )
+    .await;
+
+    let text = entries_text(&core);
+    assert!(
+        text.contains("nothing was connected to ask"),
+        "the transcript must say why the turn ended: {text}"
+    );
+    assert!(
+        !entries(&core)
+            .iter()
+            .any(|e| e.parts.iter().any(|p| matches!(
+                p,
+                MessagePart::Approval {
+                    decision: Some(ApprovalDecision::Deny { .. }),
+                    ..
+                }
+            ))),
+        "an expiry must never be recorded as a denial"
+    );
+}
+
+/// The rule, attended half — and the test most likely to be broken by a later
+/// refactor. A user deliberating over a card did nothing wrong.
+#[tokio::test]
+async fn an_answerable_approval_never_expires_however_long_it_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ApprovingHarness));
+    let presence = core.presence();
+    let _client = comet_rpc::memory_client(core.rpc_service());
+    wait_for(
+        || presence.attached_count() == 1,
+        "a supervisor to be attached",
+    )
+    .await;
+
+    let handle = core.doc_host.open(CHAT).unwrap();
+    drive_to_open_approval(&core, &handle, "cmd-run-attended-approval").await;
+
+    let ended = core
+        .sessions
+        .expire_unattended(
+            &presence,
+            chrono::Utc::now() + chrono::TimeDelta::days(30),
+            Duration::from_millis(1),
+        )
+        .await;
+    assert_eq!(ended, 0, "an answerable wait is never bounded");
+    assert_eq!(
+        core.sessions.session_status(CHAT).map(|s| s.status),
+        Some(SessionStatus::AwaitingInput),
+        "and it is still there to answer"
+    );
+}
+
+/// Reconnecting clears the stretch; a later disconnect starts a fresh one.
+#[tokio::test]
+async fn reconnecting_resets_the_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ApprovingHarness));
+    let presence = core.presence();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    drive_to_open_approval(&core, &handle, "cmd-run-reconnect").await;
+
+    let client = comet_rpc::memory_client(core.rpc_service());
+    wait_for(|| presence.attached_count() == 1, "attached").await;
+    assert_eq!(
+        core.sessions
+            .expire_unattended(
+                &presence,
+                chrono::Utc::now() + chrono::TimeDelta::hours(2),
+                Duration::from_secs(60)
+            )
+            .await,
+        0,
+        "attended, so not due"
+    );
+
+    drop(client);
+    wait_for(
+        || presence.unattended_since().is_some(),
+        "the stretch to restart",
+    )
+    .await;
+    assert_eq!(
+        core.sessions
+            .expire_unattended(
+                &presence,
+                chrono::Utc::now() + chrono::TimeDelta::hours(2),
+                Duration::from_secs(60)
+            )
+            .await,
+        1,
+        "a fresh window elapsed"
+    );
+}
+
+/// The same rule at the other call site: a parked question wedges a run
+/// identically, so it expires identically.
+#[tokio::test]
+async fn an_unanswerable_input_question_expires_the_turn_too() {
+    // Same shape as `respond_input_resolves_pending_question`'s local harness:
+    // asks one question and echoes what it was told. Parked here means never
+    // answered, so the sweep's `interrupt` (which unparks with empty answers)
+    // is what lets it finish at all.
+    struct AskingHarness;
+    #[async_trait]
+    impl Harness for AskingHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Asking"
+        }
+        fn capabilities(&self) -> HarnessCapabilities {
+            HarnessCapabilities::default()
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            _request: RunRequest,
+            controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
+            tokio::spawn(async move {
+                let answers = (controls.request_input)(vec![comet_proto::UserInputQuestion {
+                    id: "q1".into(),
+                    header: "Pick".into(),
+                    question: "Which one?".into(),
+                    options: vec!["a".into(), "b".into()],
+                    multi_select: false,
+                }])
+                .await
+                .unwrap_or_default();
+                let picked = answers
+                    .first()
+                    .and_then(|a| a.labels.first().cloned())
+                    .unwrap_or_else(|| "none".into());
+                let _ = tx
+                    .send(Ok(AgentEvent::TextDelta {
+                        text: format!("picked {picked}"),
+                    }))
+                    .await;
+                let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
+            });
+            Ok(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            })
+            .boxed())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(AskingHarness));
+    let presence = core.presence();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-unattended-question",
+        SessionCommandPayload::Run {
+            request: run_request("ask me"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || {
+            core.sessions.session_status(CHAT).map(|s| s.status)
+                == Some(SessionStatus::AwaitingInput)
+        },
+        "awaiting input",
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        MessagePart::Input {
+                            resolved: false,
+                            ..
+                        }
+                    )
+                })
+            })
+        },
+        "input part in doc",
+    )
+    .await;
+
+    let ended = core
+        .sessions
+        .expire_unattended(
+            &presence,
+            chrono::Utc::now() + chrono::TimeDelta::seconds(1),
+            Duration::from_millis(100),
+        )
+        .await;
+    assert_eq!(ended, 1);
+
+    let text = entries_text(&core);
+    assert!(
+        text.contains("needed your answer"),
+        "a question expiry must name the question, not an approval: {text}"
+    );
+}
+
+/// A run with nothing parked is not blocked and must never be swept: a tool
+/// call in flight is `blocked_since() == None`, so `due_for_expiry` never runs
+/// for it regardless of how long it takes.
+#[tokio::test]
+async fn a_run_that_is_merely_slow_is_not_expired() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-1".into(),
+                    assistant_message_id: "a-1".into(),
+                    runtime_mode: comet_proto::RuntimeMode::default(),
+                },
+                AgentEvent::ToolCall {
+                    id: "tool-slow".into(),
+                    call: ToolCall::Exec {
+                        command: "long-running-command".into(),
+                    },
+                },
+            ],
+            step_delay: Duration::from_millis(5),
+            hang_until_interrupt: true,
+        }),
+    );
+    let presence = core.presence();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-slow",
+        SessionCommandPayload::Run {
+            request: run_request("do something slow"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Working),
+        "the slow run to start",
+    )
+    .await;
+
+    let ended = core
+        .sessions
+        .expire_unattended(
+            &presence,
+            chrono::Utc::now() + chrono::TimeDelta::days(1),
+            Duration::from_millis(1),
+        )
+        .await;
+    assert_eq!(ended, 0, "a working run is not a run waiting on a human");
+}
+
+/// Two chats parked past the same deadline must BOTH end in one pass.
+///
+/// The fail-closed re-check is per run, and the mistake it must not make is
+/// abandoning the rest of the list once one run is skipped or settled — a
+/// `break` where a `continue` belongs would leave every chat but the first
+/// parked forever, and every other test here parks exactly one.
+#[tokio::test]
+async fn one_sweep_ends_every_parked_chat_not_just_the_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ApprovingHarness));
+    let presence = core.presence();
+
+    let chats = ["chat-sweep-a", "chat-sweep-b"];
+    let handles: Vec<_> = chats
+        .iter()
+        .map(|chat| core.doc_host.open(chat).unwrap())
+        .collect();
+    for (chat, handle) in chats.iter().zip(&handles) {
+        queue_as_viewer(
+            handle.doc(),
+            &format!("cmd-{chat}"),
+            SessionCommandPayload::Run {
+                request: run_request("edit it"),
+                message_id: "m-1".into(),
+            },
+        );
+    }
+    for chat in chats {
+        wait_for(
+            || {
+                core.sessions.session_status(chat).map(|s| s.status)
+                    == Some(SessionStatus::AwaitingInput)
+            },
+            "both chats to park on an approval",
+        )
+        .await;
+    }
+
+    let ended = core
+        .sessions
+        .expire_unattended(
+            &presence,
+            chrono::Utc::now() + chrono::TimeDelta::seconds(1),
+            Duration::from_millis(100),
+        )
+        .await;
+    assert_eq!(ended, 2, "every parked chat is judged on its own");
+}
+
+/// Every other test above drives `expire_unattended` by hand — proof of the
+/// expiry logic, but not of the ticker `Engine::assemble_runtime` actually
+/// spawns. This calls `spawn_unattended_sweeper` itself, on a real interval
+/// and a real `Utc::now()`, and waits for the card to expire on its own with
+/// nothing manually pumping the sweep. `assemble_runtime` can't be driven
+/// directly here — it hard-codes `default_registry()`, and the mock harness's
+/// parking knob is the process-global `COMET_MOCK_APPROVAL` env var, the same
+/// parallel-test race `ScriptedHarness` was chosen over `COMET_MOCK_HANG` to
+/// avoid elsewhere in this file — so this builds a core the same way every
+/// other test here does and spawns the real function against it.
+#[tokio::test]
+async fn the_spawned_sweeper_expires_a_parked_approval_on_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ApprovingHarness));
+    // No client ever attaches: unattended from boot, same as the manual-sweep
+    // tests above.
+    let presence = core.presence();
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    // `sweep_interval` clamps the tick to 250ms even for a much shorter
+    // bound, so the wait below just needs to outlast a couple of ticks —
+    // the bound itself can stay near-instant.
+    // Bound rather than dropped: dropping a `JoinHandle` detaches the task, and
+    // this test wants it running for the wait below. `EngineRuntime` keeps the
+    // real one so shutdown can abort it.
+    let _sweeper = comet_engine::spawn_unattended_sweeper(
+        core.sessions.clone(),
+        presence,
+        Duration::from_millis(100),
+    );
+
+    drive_to_open_approval(&core, &handle, "cmd-run-real-sweeper").await;
+
+    wait_for(
+        || {
+            entries(&core).iter().any(|e| {
+                e.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        MessagePart::Approval {
+                            decision: Some(ApprovalDecision::Expired),
+                            ..
+                        }
+                    )
+                })
+            })
+        },
+        "the real sweeper to expire the card with nothing pumping it manually",
+    )
+    .await;
 }

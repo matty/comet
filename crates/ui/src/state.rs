@@ -287,6 +287,10 @@ impl EngineHandle {
             ipc_port: config.ipc_port,
             default_harness: config.default_harness,
             releases_url: config.releases_url,
+            // `EngineBootConfig` has no timeout knob of its own; reading the
+            // env var here rather than hard-coding the default is what lets
+            // an operator's override reach the embedded (headed) engine too.
+            unattended_timeout: comet_engine::unattended_timeout_from_env(),
         };
         let engine_runtime = Engine::assemble_runtime(&engine_config).await?;
         let service: Arc<dyn RpcService> = engine_runtime.core().rpc_service();

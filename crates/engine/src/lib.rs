@@ -14,6 +14,7 @@ pub use comet_proto::HarnessId;
 use comet_sync::DocsStore;
 
 mod approvals;
+mod unattended;
 
 pub mod agent_accounts;
 pub mod diff_sync;
@@ -50,6 +51,10 @@ pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
+pub use unattended::{
+    DEFAULT_UNATTENDED_TIMEOUT_SECS, Presence, PresenceLease, WaitKind, due_for_expiry,
+    humanize_bound, sweep_interval, unattended_note, unattended_timeout_from_env,
+};
 pub use uploads::{AttachmentChunk, Uploads};
 pub use workspace_host::{WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig};
 
@@ -90,6 +95,9 @@ pub struct EngineConfig {
     pub default_harness: HarnessId,
     /// Release metadata/download origin. It is not a runtime authority.
     pub releases_url: String,
+    /// How long a wait no client can answer may last before the turn ends.
+    /// `COMET_UNATTENDED_TIMEOUT_SECS`, default 24 hours.
+    pub unattended_timeout: std::time::Duration,
 }
 
 impl EngineConfig {
@@ -99,6 +107,7 @@ impl EngineConfig {
             ipc_port: 0,
             default_harness: HarnessId::Mock,
             releases_url: "http://127.0.0.1:1".into(),
+            unattended_timeout: std::time::Duration::from_secs(DEFAULT_UNATTENDED_TIMEOUT_SECS),
         }
     }
 }
@@ -120,6 +129,10 @@ pub struct EngineCore {
     device_identity: Arc<DeviceIdentity>,
     remote_config: RemoteConfigStore,
     lan_server: LanServerHandle,
+    /// Live supervisor count, tracked from boot so a daemon nobody ever
+    /// connects to still starts an unattended stretch. The sweeper (a later
+    /// slice) is the only reader that turns this into policy.
+    presence: Arc<Presence>,
     rpc: std::sync::OnceLock<Arc<EngineRpc>>,
     local_rpc: std::sync::OnceLock<Arc<LocalRpcService>>,
     /// Release checker (attached by [`Engine::assemble_runtime`]) — the
@@ -211,6 +224,7 @@ impl EngineCore {
             device_identity,
             remote_config,
             lan_server,
+            presence: Presence::new(chrono::Utc::now()),
             rpc: std::sync::OnceLock::new(),
             local_rpc: std::sync::OnceLock::new(),
             updater: std::sync::Mutex::new(None),
@@ -253,6 +267,7 @@ impl EngineCore {
                     self.diff_sync.clone(),
                     self.uploads.clone(),
                     self.agent_accounts.clone(),
+                    self.presence.clone(),
                 )
                 .with_server_hello(hello);
                 if let Some(updater) = self.updater() {
@@ -292,6 +307,12 @@ impl EngineCore {
         &self.remote_config
     }
 
+    /// Live supervisor count. The unattended sweeper reads it; nothing else
+    /// should make policy from it.
+    pub fn presence(&self) -> Arc<Presence> {
+        self.presence.clone()
+    }
+
     pub fn device_identity(&self) -> &DeviceIdentity {
         &self.device_identity
     }
@@ -319,6 +340,16 @@ pub struct Engine {
 
 pub struct EngineRuntime {
     core: EngineCore,
+    /// The unattended sweeper's task. Owned outright: the task owns clones of
+    /// `SessionsEngine` and `Presence`, so a detached one keeps sweeping
+    /// against shut-down stores, and every recreated embedded engine would
+    /// leave another behind.
+    ///
+    /// `shutdown` consumes `self` to get at it, which is what makes a second
+    /// concurrent shutdown impossible to write rather than merely unlikely —
+    /// there is no `&self` path left that could observe the handle already
+    /// taken and skip the wait.
+    sweeper: tokio::task::JoinHandle<()>,
 }
 
 impl EngineRuntime {
@@ -326,7 +357,15 @@ impl EngineRuntime {
         &self.core
     }
 
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(self) {
+        // Sweeper first, and awaited: `abort` only schedules cancellation, it
+        // doesn't stop the task before its next await point, so without the
+        // await a sweep already past that point could still call
+        // `expire_unattended` against stores `core.shutdown()` is closing.
+        // Awaiting the aborted handle guarantees the task has stopped before
+        // we proceed.
+        self.sweeper.abort();
+        let _ = self.sweeper.await;
         self.core.shutdown().await;
     }
 }
@@ -355,8 +394,15 @@ impl Engine {
             config.releases_url.clone(),
             Some(quiescent),
         ));
+
+        let sweeper = spawn_unattended_sweeper(
+            core.sessions.clone(),
+            core.presence(),
+            config.unattended_timeout,
+        );
+
         tracing::info!(device_id = %core.device_id, "engine core assembled");
-        Ok(EngineRuntime { core })
+        Ok(EngineRuntime { core, sweeper })
     }
 
     /// Run the local engine and opt-in LAN server until shutdown.
@@ -396,6 +442,36 @@ async fn shutdown_signal() -> std::io::Result<()> {
     {
         tokio::signal::ctrl_c().await
     }
+}
+
+/// Spawn the unattended sweeper: one task, not a timer per wait. Presence
+/// edges would otherwise have to cancel and re-arm N timers, and a deadline
+/// still has to be per-run for the park-while-disconnected case. At the
+/// 24-hour default this wakes once a minute.
+///
+/// A free function (not inlined into `assemble_runtime`) so a test can spawn
+/// it directly against a bare `EngineCore::assemble` core — `assemble_runtime`
+/// itself hard-codes `default_registry()`, which has no harness a test can
+/// park deterministically without a process-global env var.
+///
+/// Returns the task rather than detaching it: the loop never ends on its own,
+/// and it holds the sessions engine and presence, so only the owner aborting it
+/// stops it. [`EngineRuntime::shutdown`] is that owner.
+pub fn spawn_unattended_sweeper(
+    sessions: SessionsEngine,
+    presence: Arc<Presence>,
+    bound: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(sweep_interval(bound));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            sessions
+                .expire_unattended(&presence, chrono::Utc::now(), bound)
+                .await;
+        }
+    })
 }
 
 /// Serve the typed RPC on the localhost IPC port.
@@ -516,5 +592,51 @@ mod tests {
         let second = core.rpc_service();
         assert!(first.shares_mutation_authority(&second));
         core.shutdown().await;
+    }
+
+    /// `EngineRuntime::shutdown` must not return until the aborted sweeper
+    /// task has actually stopped, not merely been asked to. This core has
+    /// nothing live (no LAN server started, no sessions, no terminals), so
+    /// every step of `core.shutdown()` resolves on its first poll without
+    /// ever yielding to the scheduler — the only way the stand-in sweeper
+    /// task below gets polled and dropped at all is the explicit
+    /// `sweeper.await` inside `shutdown`. That makes this deterministic
+    /// rather than a race: pre-fix (bare `abort()`, no join) the flag is
+    /// reliably still unset when `shutdown()` returns; post-fix it is
+    /// reliably set, because `JoinHandle::await` only resolves after the
+    /// task's drop glue has run.
+    #[tokio::test]
+    async fn shutdown_waits_for_the_sweeper_to_actually_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = EngineCore::assemble(
+            dir.path(),
+            Arc::new(HarnessRegistry::new()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct MarkOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for MarkOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let guard = MarkOnDrop(stopped.clone());
+        let sweeper = tokio::spawn(async move {
+            let _guard = guard;
+            // Never completes on its own; only abort ends it, and abort only
+            // drops it at its next await point, which is right here.
+            std::future::pending::<()>().await
+        });
+
+        let runtime = EngineRuntime { core, sweeper };
+        runtime.shutdown().await;
+
+        assert!(
+            stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "shutdown() returned before the aborted sweeper task finished dropping"
+        );
     }
 }
