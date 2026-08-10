@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -37,7 +37,7 @@ use comet_proto::{
 use crate::doc_host::{ChatDocHandle, DocHost};
 use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
-use crate::{EngineError, new_id, now_ms};
+use crate::{EngineError, WaitKind, new_id, now_ms};
 
 /// One journaled event: the durable seq plus the event, as broadcast to subscribers.
 #[derive(Debug, Clone)]
@@ -55,13 +55,22 @@ pub enum SteerOutcome {
     NotSteerable,
 }
 
-type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
+/// A parked input question: the resolver, plus when it parked.
+pub(crate) struct PendingInput {
+    pub(crate) resolver: oneshot::Sender<Vec<UserInputAnswer>>,
+    pub(crate) parked_at: DateTime<Utc>,
+}
+
+type PendingInputs = Arc<Mutex<HashMap<String, PendingInput>>>;
 
 /// A parked approval: the resolver, plus what would have to match for a later
 /// identical request to be auto-allowed. `None` = never allowlistable.
 pub(crate) struct PendingApproval {
     pub(crate) signature: Option<String>,
     pub(crate) resolver: oneshot::Sender<ApprovalDecision>,
+    /// When this wait started. The unattended sweeper needs it; nothing else
+    /// reads it. Wall clock, because a sleeping laptop has really been waiting.
+    pub(crate) parked_at: DateTime<Utc>,
 }
 
 pub(crate) type PendingApprovals = Arc<Mutex<HashMap<String, PendingApproval>>>;
@@ -104,6 +113,7 @@ fn park_unless_session_allows(
         PendingApproval {
             signature,
             resolver,
+            parked_at: Utc::now(),
         },
     );
     None
@@ -135,6 +145,37 @@ struct RunHandle {
     session_allowed: SessionAllowlist,
 }
 
+impl RunHandle {
+    /// The earliest still-parked wait, and which kind it is. Derived from the
+    /// maps rather than cached in a field: a cached "blocked" flag is one more
+    /// thing to keep in sync, and the sync bug is silent.
+    ///
+    /// Approvals win ties — the note names the wait with a permission
+    /// consequence.
+    ///
+    /// Nothing calls this yet — the sweeper that polls it lands in a later
+    /// task of this slice — hence the `#[allow(dead_code)]` rather than
+    /// leaving the bookkeeping this method reads (`parked_at` on both maps)
+    /// to warn as unused in the meantime.
+    #[allow(dead_code)]
+    fn blocked_since(&self) -> Option<(DateTime<Utc>, WaitKind)> {
+        let approval = lock(&self.pending_approvals)
+            .values()
+            .map(|p| p.parked_at)
+            .min();
+        let input = lock(&self.pending_inputs)
+            .values()
+            .map(|p| p.parked_at)
+            .min();
+        match (approval, input) {
+            (Some(a), Some(i)) if i < a => Some((i, WaitKind::Answer)),
+            (Some(a), _) => Some((a, WaitKind::Approval)),
+            (None, Some(i)) => Some((i, WaitKind::Answer)),
+            (None, None) => None,
+        }
+    }
+}
+
 impl Drop for RunHandle {
     /// A handle leaves `runs` exactly when its run stops being answerable:
     /// `remove_run` at the end of the run task, or a replacement insert in
@@ -155,7 +196,7 @@ impl Drop for RunHandle {
     fn drop(&mut self) {
         let parked: Vec<_> = lock(&self.pending_inputs)
             .drain()
-            .map(|(_, tx)| tx)
+            .map(|(_, p)| p.resolver)
             .collect();
         for tx in parked {
             let _ = tx.send(Vec::new());
@@ -396,7 +437,13 @@ impl SessionsEngine {
             Box::new(move |questions: Vec<UserInputQuestion>| {
                 let (tx, rx) = oneshot::channel();
                 let request_id = new_id();
-                lock(&pending).insert(request_id.clone(), tx);
+                lock(&pending).insert(
+                    request_id.clone(),
+                    PendingInput {
+                        resolver: tx,
+                        parked_at: Utc::now(),
+                    },
+                );
                 let _ = engine_tx.send(AgentEvent::InputRequested {
                     request_id,
                     questions,
@@ -586,7 +633,10 @@ impl SessionsEngine {
         };
         // Unpark any blocked question FIRST (mirrors comet: harness teardown can await a
         // parked question callback — a run stuck on a question would deadlock the stop).
-        let parked: Vec<_> = lock(&pending_inputs).drain().map(|(_, tx)| tx).collect();
+        let parked: Vec<_> = lock(&pending_inputs)
+            .drain()
+            .map(|(_, p)| p.resolver)
+            .collect();
         for tx in parked {
             let _ = tx.send(Vec::new());
         }
@@ -627,10 +677,10 @@ impl SessionsEngine {
         let Some((pending, engine_tx)) = target else {
             return Ok(false);
         };
-        let Some(resolver) = lock(&pending).remove(request_id) else {
+        let Some(pending_input) = lock(&pending).remove(request_id) else {
             return Ok(false);
         };
-        let _ = resolver.send(answers);
+        let _ = pending_input.resolver.send(answers);
         let _ = engine_tx.send(AgentEvent::InputResolved {
             request_id: request_id.to_string(),
         });
@@ -1750,9 +1800,16 @@ mod tests {
             PendingApproval {
                 signature: None,
                 resolver,
+                parked_at: Utc::now(),
             },
         );
-        lock(&pending_inputs).insert(format!("{run_id}-question"), answers);
+        lock(&pending_inputs).insert(
+            format!("{run_id}-question"),
+            PendingInput {
+                resolver: answers,
+                parked_at: Utc::now(),
+            },
+        );
         let (steer_tx, _steer_rx) = mpsc::channel(1);
         let (cancel, _cancel_rx) = watch::channel(false);
         let (engine_tx, _engine_rx) = mpsc::unbounded_channel();
