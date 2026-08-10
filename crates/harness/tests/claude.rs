@@ -182,10 +182,12 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
     // resolver is parked under; a harness-emitted copy folded an unanswerable
     // duplicate chip into the doc).
     let asked: Arc<Mutex<Vec<UserInputQuestion>>> = Arc::new(Mutex::new(Vec::new()));
+    let approved: Arc<Mutex<Vec<comet_proto::ApprovalRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let _steer = steer_tx;
     let token = CancellationToken::new();
     let seen = asked.clone();
+    let seen_approvals = approved.clone();
     let controls = RunControls {
         request_input: Box::new(move |questions| {
             seen.lock().unwrap().extend(questions.iter().cloned());
@@ -200,14 +202,23 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
             let _ = tx.send(answers);
             rx
         }),
-        // Plain tools now round-trip through `request_approval` (this task);
-        // this fixture answers Allow so the run proceeds to the
-        // AskUserQuestion step it actually exercises. The deny/unanswered
-        // paths for this bridge are covered exhaustively by
-        // `claude::control_request_tests`.
-        request_approval: Box::new(|_approval: comet_proto::ApprovalRequest| {
+        // Records what it was asked, mirroring `asked` above, and answers
+        // Allow only for the expected Bash request — anything else drops the
+        // sender (not approved), same shape as the shared `controls()`
+        // helper. A call site that bypasses this bridge (e.g. reverting to
+        // the old `request_approval: _request_approval` plus an unconditional
+        // allow) records zero approvals here and fails the assertions below.
+        request_approval: Box::new(move |approval: comet_proto::ApprovalRequest| {
+            seen_approvals.lock().unwrap().push(approval.clone());
             let (tx, rx) = oneshot::channel::<comet_proto::ApprovalDecision>();
-            let _ = tx.send(comet_proto::ApprovalDecision::Allow);
+            if approval
+                == (comet_proto::ApprovalRequest::Command {
+                    command: "ls".into(),
+                    cwd: None,
+                })
+            {
+                let _ = tx.send(comet_proto::ApprovalDecision::Allow);
+            }
             rx
         }),
         steering: steer_rx,
@@ -226,6 +237,19 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
             AgentEvent::InputRequested { .. } | AgentEvent::InputResolved { .. }
         )),
         "harness must not emit input lifecycle events itself: {events:?}"
+    );
+
+    // Proves the approval bridge was actually consulted for the plain Bash
+    // can_use_tool, not bypassed: a bypassed bridge records zero approvals
+    // and this fails.
+    let approved = approved.lock().unwrap();
+    assert_eq!(approved.len(), 1, "expected exactly one approval request");
+    assert_eq!(
+        approved[0],
+        comet_proto::ApprovalRequest::Command {
+            command: "ls".into(),
+            cwd: None,
+        }
     );
 
     // "answered" proves both control round-trips: the plain Bash can_use_tool

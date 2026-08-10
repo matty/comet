@@ -946,6 +946,11 @@ mod control_request_tests {
         let line = recv_line(&mut stdin_rx).await;
         let sent: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(sent["response"]["response"]["behavior"], "allow");
+        assert_eq!(
+            sent["response"]["response"]["updatedInput"],
+            serde_json::json!({"x": 1}),
+            "the frame's input must ride back intact, unmodified by the approval round trip"
+        );
         assert!(
             sent["response"]["response"]
                 .get("updatedPermissions")
