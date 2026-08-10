@@ -50,6 +50,17 @@ new ones, and prefer fixing any you touch.
 
 Full procedure: `.agents/workflows/verify.md`.
 
+## Never test with Fable or Opus
+
+When you drive the app itself — a rendered check, a live provider run, any session you start to
+watch a change work — pick a cheap model in the picker. **Never Fable, never Opus.** They are the
+expensive tiers and a test run burns them for output nobody keeps; Sonnet or Haiku exercises the
+same surface. This is about models chosen *inside Comet* at test time and says nothing about which
+model you or a reviewer runs on.
+
+The picker's default is whatever the catalog lists first, so it will hand you Fable unless you
+change it. Change it before you send.
+
 ## The gpui fork rev is load-bearing
 
 `gpui` comes from `wingleeio/zed` at a pinned rev, not from crates.io. Comet depends on
