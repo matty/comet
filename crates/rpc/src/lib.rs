@@ -166,10 +166,26 @@ impl RpcReply {
     }
 }
 
+/// An opaque guard a service hands out per attached connection. `rpc` never
+/// looks inside it; it only guarantees the value lives exactly as long as the
+/// connection and is dropped when it ends.
+pub type ConnectionLease = Box<dyn Send>;
+
 /// Server-side dispatch: one implementation serves every transport.
 #[async_trait]
 pub trait RpcService: Send + Sync + 'static {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError>;
+
+    /// Called once when a connection attaches. The returned lease is dropped
+    /// when that connection ends, so a service can count live supervisors
+    /// without knowing anything about transports.
+    ///
+    /// Defaulted to `None` so existing services are unaffected. A wrapping
+    /// service MUST forward this to its inner service or the count silently
+    /// misses everything behind the wrapper.
+    fn attached(&self) -> Option<ConnectionLease> {
+        None
+    }
 }
 
 /// Deserialize typed params out of the envelope's `params` value.
