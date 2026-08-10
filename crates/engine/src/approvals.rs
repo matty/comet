@@ -7,7 +7,7 @@
 //! next call prompts anyway). Codex's `acceptForSession` lands on this same
 //! function in 1.7.
 
-use comet_proto::ApprovalRequest;
+use comet_proto::{ApprovalRequest, FileOperation};
 
 /// A stable identity for "this action", or `None` when the action cannot be
 /// identified well enough to allow it again unattended.
@@ -28,6 +28,16 @@ pub(crate) fn approval_signature(request: &ApprovalRequest) -> Option<String> {
             };
             format!("command{SEP}{command}{SEP}{cwd}")
         }
+        // An operation Comet could not determine is not an identity. Formatting
+        // it would make "Comet does not know what this edit does" a stable
+        // allowlist key, so a later edit to the same path that is equally
+        // unreadable — a different tool, a shape a future provider introduces —
+        // would be allowed unattended on the strength of the first one. Same
+        // reasoning as `Unknown` below, one field down.
+        ApprovalRequest::FileChange {
+            operation: FileOperation::Unknown,
+            ..
+        } => return None,
         ApprovalRequest::FileChange {
             path, operation, ..
         } => format!("fileChange{SEP}{path}{SEP}{operation:?}"),
@@ -40,7 +50,7 @@ pub(crate) fn approval_signature(request: &ApprovalRequest) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comet_proto::{ApprovalRequest, FileOperation};
+    use comet_proto::ApprovalRequest;
 
     #[test]
     fn the_same_edit_to_the_same_file_matches_across_different_line_counts() {
@@ -122,6 +132,20 @@ mod tests {
             summary: "an action Comet does not model".into(),
         };
         assert_eq!(approval_signature(&unknown), None);
+    }
+
+    #[test]
+    fn an_edit_comet_could_not_read_is_never_allowlistable() {
+        // `FileOperation::Unknown` means the adapter could not tell what the
+        // change does. A rule keyed on it would allow the NEXT equally
+        // unreadable change to the same path without asking.
+        let unreadable = ApprovalRequest::FileChange {
+            path: "src/main.rs".into(),
+            operation: FileOperation::Unknown,
+            added_lines: 0,
+            removed_lines: 0,
+        };
+        assert_eq!(approval_signature(&unreadable), None);
     }
 
     #[test]
