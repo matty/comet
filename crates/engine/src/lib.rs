@@ -376,6 +376,27 @@ impl Engine {
             config.releases_url.clone(),
             Some(quiescent),
         ));
+
+        // The unattended sweeper. One task, not a timer per wait: presence
+        // edges would otherwise have to cancel and re-arm N timers, and a
+        // deadline still has to be per-run for the park-while-disconnected
+        // case. At the 24-hour default this wakes once a minute.
+        {
+            let sessions = core.sessions.clone();
+            let presence = core.presence();
+            let bound = config.unattended_timeout;
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(sweep_interval(bound));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    sessions
+                        .expire_unattended(&presence, chrono::Utc::now(), bound)
+                        .await;
+                }
+            });
+        }
+
         tracing::info!(device_id = %core.device_id, "engine core assembled");
         Ok(EngineRuntime { core })
     }

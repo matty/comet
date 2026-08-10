@@ -37,7 +37,7 @@ use comet_proto::{
 use crate::doc_host::{ChatDocHandle, DocHost};
 use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
-use crate::{EngineError, WaitKind, new_id, now_ms};
+use crate::{EngineError, Presence, WaitKind, due_for_expiry, new_id, now_ms, unattended_note};
 
 /// One journaled event: the durable seq plus the event, as broadcast to subscribers.
 #[derive(Debug, Clone)]
@@ -152,12 +152,6 @@ impl RunHandle {
     ///
     /// Approvals win ties — the note names the wait with a permission
     /// consequence.
-    ///
-    /// Nothing calls this yet — the sweeper that polls it lands in a later
-    /// task of this slice — hence the `#[allow(dead_code)]` rather than
-    /// leaving the bookkeeping this method reads (`parked_at` on both maps)
-    /// to warn as unused in the meantime.
-    #[allow(dead_code)]
     fn blocked_since(&self) -> Option<(DateTime<Utc>, WaitKind)> {
         let approval = lock(&self.pending_approvals)
             .values()
@@ -661,6 +655,75 @@ impl SessionsEngine {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         Ok(true)
+    }
+
+    /// End every turn whose parked wait nobody can answer any more. Returns how
+    /// many were ended.
+    ///
+    /// `now` and `bound` are parameters, not reads of the clock and config, so
+    /// a test can drive one sweep instead of waiting out a 24-hour bound. This
+    /// is the same shape as `session_status` and `interrupt` taking their
+    /// inputs explicitly rather than reaching for ambient state.
+    pub async fn expire_unattended(
+        &self,
+        presence: &Presence,
+        now: DateTime<Utc>,
+        bound: std::time::Duration,
+    ) -> usize {
+        let unattended_since = presence.unattended_since();
+        // Answerable: no bound applies, and no lock needs taking.
+        if unattended_since.is_none() {
+            return 0;
+        }
+
+        // Collect first, act second. `interrupt` is async and takes the same
+        // locks, so holding `runs` across it would deadlock.
+        let due: Vec<(String, WaitKind, mpsc::UnboundedSender<AgentEvent>)> =
+            lock(&self.inner.runs)
+                .iter()
+                .filter_map(|(chat_id, handle)| {
+                    let (parked_at, kind) = handle.blocked_since()?;
+                    due_for_expiry(parked_at, unattended_since, now, bound)
+                        .then(|| (chat_id.clone(), kind, handle.engine_tx.clone()))
+                })
+                .collect();
+
+        let mut ended = 0;
+        for (chat_id, kind, engine_tx) in due {
+            // Re-check under a fresh read, not the value collected above: a
+            // supervisor can attach in the gap between the collect and here
+            // (tokio's `abort` on a dropped connection lands at the next yield
+            // point, not instantly — see the module note on presence and
+            // in-flight RPC tasks), and that makes this wait answerable again.
+            // Failing closed here means DO NOT expire.
+            if presence.unattended_since().is_none() {
+                break;
+            }
+            // Note BEFORE interrupt: this folds into the live entry via
+            // `engine_tx`, and after the interrupt the entry is finished and
+            // nothing can add to it — the same failure `expire_open_approvals`'
+            // doc comment warns about.
+            let _ = engine_tx.send(AgentEvent::Error {
+                message: unattended_note(bound, kind),
+            });
+            match self.interrupt(&chat_id).await {
+                Ok(true) => {
+                    ended += 1;
+                    tracing::info!(
+                        chat = %chat_id,
+                        bound_secs = bound.as_secs(),
+                        "ended a turn no connected client could answer"
+                    );
+                }
+                Ok(false) => {}
+                Err(err) => tracing::warn!(
+                    chat = %chat_id,
+                    error = %err,
+                    "unattended expiry could not settle the run"
+                ),
+            }
+        }
+        ended
     }
 
     /// Resolve a pending `request_input` question set. Returns `false` when no such
@@ -1998,5 +2061,120 @@ mod tests {
             .journal_harness_session("chat-1")
             .expect("journal names a session");
         assert_eq!(mode, RuntimeMode::AutoAcceptEdits);
+    }
+
+    /// A bare `RunHandle` with nothing wired to a run task — `blocked_since`
+    /// only ever reads the two pending maps, so this is cheaper than driving a
+    /// harness through an approval or a question just to inspect timestamps.
+    fn bare_handle(
+        pending_approvals: PendingApprovals,
+        pending_inputs: PendingInputs,
+    ) -> RunHandle {
+        let (steer_tx, _steer_rx) = mpsc::channel(1);
+        let (cancel, _cancel_rx) = watch::channel(false);
+        let (engine_tx, _engine_rx) = mpsc::unbounded_channel();
+        RunHandle {
+            run_id: "r1".into(),
+            steerable: false,
+            steer_tx,
+            interrupt_token: CancellationToken::new(),
+            cancel,
+            engine_tx,
+            pending_inputs,
+            pending_approvals,
+            minted_approvals: Arc::new(Mutex::new(HashSet::new())),
+            session_allowed: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// `blocked_since` untested by any e2e test: the `None` case (nothing
+    /// parked), which side wins when the two waits are NOT tied (the earlier
+    /// one, regardless of kind), and the tie itself (approvals win). An
+    /// integration test can't force an exact tie — two `Utc::now()` calls
+    /// never land on the same instant — so this builds the maps directly with
+    /// fixed timestamps instead.
+    #[test]
+    fn blocked_since_reports_the_earliest_wait_and_approvals_win_ties() {
+        fn t(secs: i64) -> DateTime<Utc> {
+            DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap()
+        }
+
+        let pending_approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
+        let handle = bare_handle(pending_approvals.clone(), pending_inputs.clone());
+
+        assert_eq!(handle.blocked_since(), None, "nothing parked, not blocked");
+
+        let (answers, _rx) = oneshot::channel();
+        lock(&pending_inputs).insert(
+            "q1".into(),
+            PendingInput {
+                resolver: answers,
+                parked_at: t(10),
+            },
+        );
+        assert_eq!(
+            handle.blocked_since(),
+            Some((t(10), WaitKind::Answer)),
+            "a lone question is the wait"
+        );
+
+        // An approval parked at the exact same instant: approvals win the tie.
+        let (resolver, _rx) = oneshot::channel();
+        lock(&pending_approvals).insert(
+            "a1".into(),
+            PendingApproval {
+                signature: None,
+                resolver,
+                parked_at: t(10),
+            },
+        );
+        assert_eq!(
+            handle.blocked_since(),
+            Some((t(10), WaitKind::Approval)),
+            "tied instants: the approval wins"
+        );
+
+        // A LATER question must not override the earlier approval.
+        let (later_answers, _rx) = oneshot::channel();
+        lock(&pending_inputs).insert(
+            "q2".into(),
+            PendingInput {
+                resolver: later_answers,
+                parked_at: t(20),
+            },
+        );
+        assert_eq!(
+            handle.blocked_since(),
+            Some((t(10), WaitKind::Approval)),
+            "the earliest wait wins, not the newest approval"
+        );
+
+        // An EARLIER question must win over a later approval — this is not a
+        // tie, so kind never overrides recency.
+        lock(&pending_approvals).clear();
+        lock(&pending_inputs).clear();
+        let (resolver2, _rx) = oneshot::channel();
+        lock(&pending_approvals).insert(
+            "a2".into(),
+            PendingApproval {
+                signature: None,
+                resolver: resolver2,
+                parked_at: t(30),
+            },
+        );
+        let (earlier_answers, _rx) = oneshot::channel();
+        lock(&pending_inputs).insert(
+            "q3".into(),
+            PendingInput {
+                resolver: earlier_answers,
+                parked_at: t(5),
+            },
+        );
+        assert_eq!(
+            handle.blocked_since(),
+            Some((t(5), WaitKind::Answer)),
+            "the earlier question beats the later approval outside a tie"
+        );
     }
 }
