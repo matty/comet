@@ -3467,6 +3467,55 @@ async fn a_run_that_is_merely_slow_is_not_expired() {
     assert_eq!(ended, 0, "a working run is not a run waiting on a human");
 }
 
+/// Two chats parked past the same deadline must BOTH end in one pass.
+///
+/// The fail-closed re-check is per run, and the mistake it must not make is
+/// abandoning the rest of the list once one run is skipped or settled — a
+/// `break` where a `continue` belongs would leave every chat but the first
+/// parked forever, and every other test here parks exactly one.
+#[tokio::test]
+async fn one_sweep_ends_every_parked_chat_not_just_the_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ApprovingHarness));
+    let presence = core.presence();
+
+    let chats = ["chat-sweep-a", "chat-sweep-b"];
+    let handles: Vec<_> = chats
+        .iter()
+        .map(|chat| core.doc_host.open(chat).unwrap())
+        .collect();
+    for (chat, handle) in chats.iter().zip(&handles) {
+        queue_as_viewer(
+            handle.doc(),
+            &format!("cmd-{chat}"),
+            SessionCommandPayload::Run {
+                request: run_request("edit it"),
+                message_id: "m-1".into(),
+            },
+        );
+    }
+    for chat in chats {
+        wait_for(
+            || {
+                core.sessions.session_status(chat).map(|s| s.status)
+                    == Some(SessionStatus::AwaitingInput)
+            },
+            "both chats to park on an approval",
+        )
+        .await;
+    }
+
+    let ended = core
+        .sessions
+        .expire_unattended(
+            &presence,
+            chrono::Utc::now() + chrono::TimeDelta::seconds(1),
+            Duration::from_millis(100),
+        )
+        .await;
+    assert_eq!(ended, 2, "every parked chat is judged on its own");
+}
+
 /// Every other test above drives `expire_unattended` by hand — proof of the
 /// expiry logic, but not of the ticker `Engine::assemble_runtime` actually
 /// spawns. This calls `spawn_unattended_sweeper` itself, on a real interval
@@ -3489,7 +3538,10 @@ async fn the_spawned_sweeper_expires_a_parked_approval_on_its_own() {
     // `sweep_interval` clamps the tick to 250ms even for a much shorter
     // bound, so the wait below just needs to outlast a couple of ticks —
     // the bound itself can stay near-instant.
-    comet_engine::spawn_unattended_sweeper(
+    // Bound rather than dropped: dropping a `JoinHandle` detaches the task, and
+    // this test wants it running for the wait below. `EngineRuntime` keeps the
+    // real one so shutdown can abort it.
+    let _sweeper = comet_engine::spawn_unattended_sweeper(
         core.sessions.clone(),
         presence,
         Duration::from_millis(100),

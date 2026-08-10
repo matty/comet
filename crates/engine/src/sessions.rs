@@ -170,6 +170,53 @@ impl RunHandle {
     }
 }
 
+/// A parked wait as re-read immediately before its unattended expiry, rather
+/// than as the collect pass saw it.
+struct LiveWait {
+    /// Which run this is *now*. `dispatch_inner` inserts a replacement handle
+    /// under the same chat id when an interrupt did not settle inside its
+    /// bounded wait, so the chat id alone does not identify a run.
+    run_id: String,
+    parked_at: DateTime<Utc>,
+    kind: WaitKind,
+    engine_tx: mpsc::UnboundedSender<AgentEvent>,
+}
+
+/// May the run collected as due still be expired? Every `false` means DO NOT
+/// expire — this is the fail-closed half of the unattended sweep.
+///
+/// `interrupt` bounded-waits up to 5s per run, so the gap between the collect
+/// pass and this run's turn is tens of seconds when several chats are parked.
+/// That is long enough for three separate things to invalidate the decision,
+/// and all three have to be ruled out:
+///
+/// - The user answered this card while an earlier run was settling. `live` is
+///   `None` (no handle, or a handle with nothing parked), so a run that is now
+///   actively progressing is not killed.
+/// - A steer or a re-dispatch replaced the handle. The run ids differ, and
+///   interrupting by chat id would hit the successor.
+/// - A client attached and left again. Re-reading only *whether* the engine is
+///   unattended is not enough: that read is `Some` again at a LATER instant,
+///   which restarts the window rather than proving nobody came back. Six chats
+///   past a 24h deadline, a client that connects at second 2 and quits at
+///   second 20, and a decision at second 25 would otherwise expire runs whose
+///   deadline is now a day away. So the deadline is recomputed, not assumed.
+///
+/// Reusing the sweep's `now` rather than reading the clock again is deliberate:
+/// a stale (earlier) `now` can only make `due_for_expiry` say no.
+fn still_expirable(
+    collected_run_id: &str,
+    live: Option<(&str, DateTime<Utc>)>,
+    unattended_since: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    bound: std::time::Duration,
+) -> bool {
+    let Some((run_id, parked_at)) = live else {
+        return false;
+    };
+    run_id == collected_run_id && due_for_expiry(parked_at, unattended_since, now, bound)
+}
+
 impl Drop for RunHandle {
     /// A handle leaves `runs` exactly when its run stops being answerable:
     /// `remove_run` at the end of the run task, or a replacement insert in
@@ -657,6 +704,23 @@ impl SessionsEngine {
         Ok(true)
     }
 
+    /// The `runs` entry for `chat_id`, re-read for the expiry decision. `None`
+    /// when no handle exists any more or when nothing is parked on it.
+    ///
+    /// Split out so the read is one short critical section: the caller must not
+    /// be holding `runs` when it awaits `interrupt`.
+    fn live_wait(&self, chat_id: &str) -> Option<LiveWait> {
+        lock(&self.inner.runs).get(chat_id).and_then(|handle| {
+            let (parked_at, kind) = handle.blocked_since()?;
+            Some(LiveWait {
+                run_id: handle.run_id.clone(),
+                parked_at,
+                kind,
+                engine_tx: handle.engine_tx.clone(),
+            })
+        })
+    }
+
     /// End every turn whose parked wait nobody can answer any more. Returns how
     /// many were ended.
     ///
@@ -664,6 +728,13 @@ impl SessionsEngine {
     /// a test can drive one sweep instead of waiting out a 24-hour bound. This
     /// is the same shape as `session_status` and `interrupt` taking their
     /// inputs explicitly rather than reaching for ambient state.
+    ///
+    /// Two passes, and the split matters: the first collects candidates under
+    /// the `runs` lock, the second re-reads each one and only then interrupts.
+    /// Everything the collect learned is treated as stale by the time the
+    /// interrupt runs, because `interrupt` bounded-waits up to 5s per run, so a
+    /// sweep over several parked chats can spend tens of seconds inside this
+    /// loop. See [`still_expirable`] for what the re-read has to prove.
     pub async fn expire_unattended(
         &self,
         presence: &Presence,
@@ -677,34 +748,45 @@ impl SessionsEngine {
         }
 
         // Collect first, act second. `interrupt` is async and takes the same
-        // locks, so holding `runs` across it would deadlock.
-        let due: Vec<(String, WaitKind, mpsc::UnboundedSender<AgentEvent>)> =
-            lock(&self.inner.runs)
-                .iter()
-                .filter_map(|(chat_id, handle)| {
-                    let (parked_at, kind) = handle.blocked_since()?;
-                    due_for_expiry(parked_at, unattended_since, now, bound)
-                        .then(|| (chat_id.clone(), kind, handle.engine_tx.clone()))
-                })
-                .collect();
+        // locks, so holding `runs` across it would deadlock. Only the identity
+        // survives the lock release — the facts the decision rests on are all
+        // re-read below.
+        let due: Vec<(String, String)> = lock(&self.inner.runs)
+            .iter()
+            .filter_map(|(chat_id, handle)| {
+                let (parked_at, _kind) = handle.blocked_since()?;
+                due_for_expiry(parked_at, unattended_since, now, bound)
+                    .then(|| (chat_id.clone(), handle.run_id.clone()))
+            })
+            .collect();
 
         let mut ended = 0;
-        for (chat_id, kind, engine_tx) in due {
-            // Re-check under a fresh read, not the value collected above: a
-            // supervisor can attach in the gap between the collect and here
-            // (tokio's `abort` on a dropped connection lands at the next yield
-            // point, not instantly — see the module note on presence and
-            // in-flight RPC tasks), and that makes this wait answerable again.
-            // Failing closed here means DO NOT expire.
-            if presence.unattended_since().is_none() {
-                break;
-            }
+        for (chat_id, collected_run_id) in due {
+            // Re-read the run and the stretch, then decide. Both reads release
+            // their locks before the await below.
+            let live = self.live_wait(&chat_id);
+            let still_due = still_expirable(
+                &collected_run_id,
+                live.as_ref().map(|l| (l.run_id.as_str(), l.parked_at)),
+                presence.unattended_since(),
+                now,
+                bound,
+            );
+            let Some(live) = live.filter(|_| still_due) else {
+                tracing::debug!(
+                    chat = %chat_id,
+                    run = %collected_run_id,
+                    "skipping an unattended expiry that stopped being due mid-sweep"
+                );
+                continue;
+            };
             // Note BEFORE interrupt: this folds into the live entry via
             // `engine_tx`, and after the interrupt the entry is finished and
             // nothing can add to it — the same failure `expire_open_approvals`'
-            // doc comment warns about.
-            let _ = engine_tx.send(AgentEvent::Error {
-                message: unattended_note(bound, kind),
+            // doc comment warns about. `kind` comes from the re-read too, so
+            // the wording names the wait that is open now.
+            let _ = live.engine_tx.send(AgentEvent::Error {
+                message: unattended_note(bound, live.kind),
             });
             match self.interrupt(&chat_id).await {
                 Ok(true) => {
@@ -2176,5 +2258,109 @@ mod tests {
             Some((t(5), WaitKind::Answer)),
             "the earlier question beats the later approval outside a tie"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The unattended sweep's fail-closed re-check. `expire_unattended` cannot
+    // be paused between its collect pass and an individual interrupt without a
+    // test-only hook, so the per-run decision is a pure function and these
+    // drive it directly with the facts each interleaving would produce.
+    // -----------------------------------------------------------------------
+
+    mod still_expirable {
+        use super::super::still_expirable;
+        use chrono::{DateTime, Utc};
+        use std::time::Duration;
+
+        fn t(secs: i64) -> DateTime<Utc> {
+            DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap()
+        }
+
+        const BOUND: Duration = Duration::from_secs(86_400);
+
+        /// The baseline the others are variations on: nothing changed between
+        /// the collect and the interrupt, so the expiry proceeds.
+        #[test]
+        fn an_unchanged_wait_is_still_expirable() {
+            assert!(still_expirable(
+                "run-1",
+                Some(("run-1", t(0))),
+                Some(t(0)),
+                t(86_500),
+                BOUND
+            ));
+        }
+
+        /// A supervisor attached in the gap. The wait is answerable again, so
+        /// nothing may end the turn however long it has been parked.
+        #[test]
+        fn a_supervisor_attaching_mid_sweep_cancels_the_expiry() {
+            assert!(!still_expirable(
+                "run-1",
+                Some(("run-1", t(0))),
+                None,
+                t(86_500),
+                BOUND
+            ));
+        }
+
+        /// The sharp one. A client that connects and quits again leaves
+        /// `unattended_since` as `Some` at a LATER instant, which is a FRESH
+        /// window, not a continuation of the expired one. Re-reading only
+        /// whether the engine is unattended would read this as "still nobody
+        /// here" and expire a run whose deadline is now a day away.
+        #[test]
+        fn a_reconnect_and_a_second_disconnect_restarts_the_window() {
+            // Parked and unattended since t(0); the 24h deadline passed at
+            // t(86_400). A client arrives at t(86_402) and quits at t(86_420).
+            assert!(!still_expirable(
+                "run-1",
+                Some(("run-1", t(0))),
+                Some(t(86_420)),
+                t(86_425),
+                BOUND
+            ));
+        }
+
+        /// The handle was replaced (a steer, or a re-dispatch over a run whose
+        /// interrupt did not settle in time). Interrupting by chat id alone
+        /// would kill the successor, which nobody judged due.
+        #[test]
+        fn a_replaced_run_is_not_interrupted_in_its_predecessors_name() {
+            assert!(!still_expirable(
+                "run-1",
+                Some(("run-2", t(0))),
+                Some(t(0)),
+                t(86_500),
+                BOUND
+            ));
+        }
+
+        /// The user answered the card while an earlier due run was settling, so
+        /// this run is now actively progressing. `live_wait` returns `None`
+        /// both for a vanished handle and for one with nothing parked.
+        #[test]
+        fn a_wait_that_was_answered_mid_sweep_is_left_alone() {
+            assert!(!still_expirable(
+                "run-1",
+                None,
+                Some(t(0)),
+                t(86_500),
+                BOUND
+            ));
+        }
+
+        /// A run that re-parked after the collect gets its own full window
+        /// measured from the new park, not the old one.
+        #[test]
+        fn a_freshly_re_parked_wait_is_not_yet_due() {
+            assert!(!still_expirable(
+                "run-1",
+                Some(("run-1", t(86_400))),
+                Some(t(0)),
+                t(86_500),
+                BOUND
+            ));
+        }
     }
 }
