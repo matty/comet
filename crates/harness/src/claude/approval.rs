@@ -62,8 +62,14 @@ pub(crate) fn approval_request(body: &ControlRequestBody) -> ApprovalRequest {
         }
         name if name.starts_with("mcp__") => {
             // `mcp__<server>__<tool>`; a name missing the tool half still
-            // names its server rather than degrading to Unknown.
-            let rest = name.trim_start_matches("mcp__");
+            // names its server rather than degrading to Unknown. `strip_prefix`
+            // removes the guard-matched prefix exactly once — `trim_start_matches`
+            // would also eat a literal leading "mcp__" off a server named `mcp`.
+            let rest = name.strip_prefix("mcp__").unwrap_or(name);
+            if rest.is_empty() {
+                // A bare "mcp__" names no server; nothing to put on the card.
+                return unknown(name);
+            }
             let (server, tool) = rest.split_once("__").unwrap_or((rest, ""));
             ApprovalRequest::Mcp {
                 server: server.to_owned(),
@@ -90,7 +96,7 @@ fn line_count(text: &str) -> u32 {
     if text.is_empty() {
         return 0;
     }
-    text.trim_end_matches('\n').split('\n').count() as u32
+    text.strip_suffix('\n').unwrap_or(text).split('\n').count() as u32
 }
 
 #[cfg(test)]
@@ -225,5 +231,88 @@ mod tests {
                 summary: "Run the Write tool".into(),
             }
         );
+    }
+
+    #[test]
+    fn an_edit_that_empties_the_text_is_a_pure_deletion() {
+        // (None, false) arm: new_string present but empty is filtered out by
+        // str_field, so this lands on the "no replacement text" branch with a
+        // non-empty old_string — a Modify that only removes lines.
+        let got = approval_request(&body(
+            "Edit",
+            json!({"file_path": "a.txt", "old_string": "one\ntwo\n", "new_string": ""}),
+        ));
+        assert_eq!(
+            got,
+            ApprovalRequest::FileChange {
+                path: "a.txt".into(),
+                operation: FileOperation::Modify,
+                added_lines: 0,
+                removed_lines: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn an_edit_with_neither_string_populated_is_an_unknown_operation() {
+        // (None, true) arm: no old_string and no new replacement text at all.
+        let got = approval_request(&body("Edit", json!({"file_path": "a.txt"})));
+        assert_eq!(
+            got,
+            ApprovalRequest::FileChange {
+                path: "a.txt".into(),
+                operation: FileOperation::Unknown,
+                added_lines: 0,
+                removed_lines: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn an_mcp_tool_missing_its_tool_half_still_names_the_server() {
+        let got = approval_request(&body("mcp__linear", json!({})));
+        assert_eq!(
+            got,
+            ApprovalRequest::Mcp {
+                server: "linear".into(),
+                tool: "".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_bare_mcp_prefix_names_no_server_and_is_unknown() {
+        let got = approval_request(&body("mcp__", json!({})));
+        assert_eq!(
+            got,
+            ApprovalRequest::Unknown {
+                summary: "Run the mcp__ tool".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_mcp_server_literally_named_mcp_keeps_both_halves() {
+        // strip_prefix removes the guard-matched "mcp__" exactly once; the
+        // old trim_start_matches would also eat the server's own "mcp__".
+        let got = approval_request(&body("mcp__mcp__foo", json!({})));
+        assert_eq!(
+            got,
+            ApprovalRequest::Mcp {
+                server: "mcp".into(),
+                tool: "foo".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn line_count_counts_lines_not_trailing_newlines() {
+        assert_eq!(line_count(""), 0);
+        assert_eq!(line_count("hi\n"), 1);
+        assert_eq!(line_count("\n"), 1);
+        assert_eq!(line_count("\n\n"), 2);
+        // A trailing newline does not begin a line (singular) — only the
+        // last one is stripped, so two blank lines still count.
+        assert_eq!(line_count("a\n\n\n"), 3);
     }
 }
