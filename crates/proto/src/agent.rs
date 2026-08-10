@@ -450,6 +450,20 @@ pub struct Model {
     pub reasoning_levels: Vec<ReasoningLevel>,
     #[serde(default)]
     pub options: Vec<ModelOption>,
+    /// Whether this model accepts image input.
+    ///
+    /// Defaulted TRUE, and the direction matters: a payload written before
+    /// this field existed, or a provider that does not report modality at
+    /// all (Claude's `ModelInfo` has no modality field), must not read as
+    /// "cannot take images" and silently disable the attachment button.
+    /// Codex's schema documents the same default for its own
+    /// `inputModalities`.
+    #[serde(default = "accepts_images_default")]
+    pub accepts_images: bool,
+}
+
+fn accepts_images_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -885,6 +899,43 @@ pub enum AgentEvent {
     },
 }
 
+/// Where a model list came from. The picker renders a quiet caption for
+/// `BuiltIn`, because a user looking at a stale list should be able to tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CatalogSource {
+    /// Merged with a live discovery answer.
+    Live,
+    /// The curated catalog alone — discovery failed or has not run.
+    BuiltIn,
+}
+
+/// A model list plus its provenance. Replaces the bare `Vec<Model>` that
+/// `ListModels` used to answer with; see `PROTOCOL_VERSION`'s doc comment for
+/// why that reshape bumps the version.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalog {
+    pub models: Vec<Model>,
+    pub source: CatalogSource,
+}
+
+impl ModelCatalog {
+    pub fn built_in(models: Vec<Model>) -> Self {
+        Self {
+            models,
+            source: CatalogSource::BuiltIn,
+        }
+    }
+
+    pub fn live(models: Vec<Model>) -> Self {
+        Self {
+            models,
+            source: CatalogSource::Live,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1304,5 +1355,40 @@ mod tests {
             let json = serde_json::to_string(&mode).unwrap();
             assert_eq!(serde_json::from_str::<RuntimeMode>(&json).unwrap(), mode);
         }
+    }
+
+    /// Absent means "this model takes images", because that is what every model
+    /// in both catalogs does today and what the Codex schema documents as its
+    /// default. Read as `false`, the gate would disable attachment on every
+    /// model whose payload predates the field — the exact `None`-as-a-value trap
+    /// `.agents/rules/optional-wire-fields.md` exists for.
+    #[test]
+    fn absent_accepts_images_reads_as_images_work() {
+        let model: Model =
+            serde_json::from_str(r#"{"id":"m","label":"M","reasoningLevels":[],"options":[]}"#)
+                .unwrap();
+        assert!(model.accepts_images);
+    }
+
+    #[test]
+    fn explicit_false_accepts_images_survives_a_round_trip() {
+        let model: Model = serde_json::from_str(
+            r#"{"id":"m","label":"M","reasoningLevels":[],"options":[],"acceptsImages":false}"#,
+        )
+        .unwrap();
+        assert!(!model.accepts_images);
+        let back: Model = serde_json::from_str(&serde_json::to_string(&model).unwrap()).unwrap();
+        assert!(!back.accepts_images);
+    }
+
+    /// The reply shape the picker decodes. `source` is what the caption reads.
+    #[test]
+    fn catalog_round_trips_and_defaults_to_built_in() {
+        let catalog = ModelCatalog::built_in(vec![]);
+        assert_eq!(catalog.source, CatalogSource::BuiltIn);
+        let json = serde_json::to_string(&catalog).unwrap();
+        assert!(json.contains(r#""source":"builtIn""#), "got {json}");
+        let back: ModelCatalog = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.source, CatalogSource::BuiltIn);
     }
 }

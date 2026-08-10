@@ -3312,6 +3312,7 @@ mod tests {
                     default_choice: "normal".into(),
                 },
             ],
+            accepts_images: true,
         };
         let mut selections = serde_json::Map::new();
         selections.insert("context".into(), serde_json::Value::String("1m".into()));
@@ -3544,6 +3545,7 @@ mod tests {
                 description: None,
                 reasoning_levels: vec![],
                 options: vec![],
+                accepts_images: true,
             },
             Model {
                 id: "fast".into(),
@@ -3551,6 +3553,7 @@ mod tests {
                 description: None,
                 reasoning_levels: vec![],
                 options: vec![],
+                accepts_images: true,
             },
         ];
         assert_eq!(default_model(&models).map(|m| &*m.id), Some("flagship"));

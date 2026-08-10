@@ -292,6 +292,7 @@ mod tests {
             description: None,
             reasoning_levels: vec![],
             options: vec![],
+            accepts_images: true,
         }
     }
 
