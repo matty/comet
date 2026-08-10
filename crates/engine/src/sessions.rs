@@ -98,6 +98,39 @@ struct RunHandle {
     session_allowed: SessionAllowlist,
 }
 
+impl Drop for RunHandle {
+    /// A handle leaves `runs` exactly when its run stops being answerable:
+    /// `remove_run` at the end of the run task, or a replacement insert in
+    /// `dispatch_inner` when an interrupt did not settle inside its bounded
+    /// wait. Either way nothing can answer what this run parked —
+    /// `respond_input` and `respond_approval` both look a run up by chat id
+    /// and from here on find the successor — so the drain belongs to the
+    /// handle's lifetime rather than to one of the paths that end it. The
+    /// previous version sat below `remove_run`'s run-id guard and so skipped
+    /// exactly the replaced-handle case it was written for.
+    ///
+    /// The bridge closures hold these maps through an `Arc` of their own, so
+    /// dropping the handle is not otherwise what releases them: the harness's
+    /// spawned task would await a reply that can never arrive (and, for
+    /// claude, leave the CLI blocked on a tool call). A question resolves to
+    /// no answers — what `interrupt()` sends — and an approval's resolver is
+    /// dropped, which every consumer reads as NOT approved.
+    fn drop(&mut self) {
+        let parked: Vec<_> = lock(&self.pending_inputs)
+            .drain()
+            .map(|(_, tx)| tx)
+            .collect();
+        for tx in parked {
+            let _ = tx.send(Vec::new());
+        }
+        let parked: Vec<_> = lock(&self.pending_approvals)
+            .drain()
+            .map(|(_, p)| p.resolver)
+            .collect();
+        drop(parked);
+    }
+}
+
 struct Inner {
     device_id: String,
     journal: Arc<RunJournal>,
@@ -368,10 +401,20 @@ impl SessionsEngine {
                         request_id: request_id.clone(),
                         approval,
                     });
-                    let _ = tx.send(ApprovalDecision::Allow);
+                    // `AllowForSession`, not `Allow`: the user never saw this
+                    // one. A card reading "Allowed" for an action Comet
+                    // allowed under an earlier grant is a false record, and
+                    // the record is the whole reason the card is emitted.
+                    // "Allowed for this session" is the true statement, and
+                    // it is the label both halves of the grant then carry.
+                    // Nothing branches on the distinction: the claude adapter
+                    // maps both to `allow_response`, the UI paints both
+                    // `ApprovalPaint::Allowed`, and the allowlist is written
+                    // only by `respond_approval` — never from this event.
+                    let _ = tx.send(ApprovalDecision::AllowForSession);
                     let _ = engine_tx.send(AgentEvent::ApprovalResolved {
                         request_id,
-                        decision: ApprovalDecision::Allow,
+                        decision: ApprovalDecision::AllowForSession,
                     });
                     return rx;
                 }
@@ -382,10 +425,20 @@ impl SessionsEngine {
                         resolver: tx,
                     },
                 );
-                let _ = engine_tx.send(AgentEvent::ApprovalRequested {
-                    request_id,
-                    approval,
-                });
+                if engine_tx
+                    .send(AgentEvent::ApprovalRequested {
+                        request_id: request_id.clone(),
+                        approval,
+                    })
+                    .is_err()
+                {
+                    // The run task is gone (its handle may already have been
+                    // replaced under this chat id), so no card will ever be
+                    // shown for this request and no drain will ever reach it.
+                    // Fail closed: dropping the resolver resolves the receiver
+                    // to `Err`, which every consumer reads as not approved.
+                    drop(lock(&pending).remove(&request_id));
+                }
                 rx
             })
         };
@@ -397,7 +450,7 @@ impl SessionsEngine {
             interrupt: interrupt_token.clone(),
         };
 
-        lock(&self.inner.runs).insert(
+        let displaced = lock(&self.inner.runs).insert(
             chat_id.to_string(),
             RunHandle {
                 run_id: run_id.clone(),
@@ -412,6 +465,13 @@ impl SessionsEngine {
                 session_allowed,
             },
         );
+        // A handle we replaced is a run nothing can answer any more: the
+        // interrupt above waits only 5s for the old run to settle and inserts
+        // regardless. Dropped explicitly, and outside the lock, so its parked
+        // questions and approvals are released here rather than at whatever
+        // statement boundary the temporary happened to end on
+        // (`RunHandle::drop`).
+        drop(displaced);
         self.set_status(chat_id, SessionStatus::Working, true);
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
@@ -566,16 +626,43 @@ impl SessionsEngine {
         };
         // "Allow for this session" on an action Comet could not identify
         // (`signature: None`) allows THIS call only — there is no rule to write.
+        let mut also_granted: Vec<(String, oneshot::Sender<ApprovalDecision>)> = Vec::new();
         if decision == ApprovalDecision::AllowForSession
             && let Some(signature) = parked.signature
         {
-            lock(&session_allowed).insert(signature);
+            lock(&session_allowed).insert(signature.clone());
+            // The grant applies to identical requests ALREADY waiting, not
+            // just to ones minted after it: claude batches parallel tool
+            // calls, so two copies of the same action can be parked at once
+            // and the pre-allow check at mint time ran before either. Leaving
+            // the second one open asks for a click one second after the user
+            // said not to ask again.
+            let mut pending = lock(&pending);
+            let same: Vec<String> = pending
+                .iter()
+                .filter(|(_, p)| p.signature.as_deref() == Some(signature.as_str()))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in same {
+                if let Some(p) = pending.remove(&id) {
+                    also_granted.push((id, p.resolver));
+                }
+            }
         }
         let _ = parked.resolver.send(decision.clone());
         let _ = engine_tx.send(AgentEvent::ApprovalResolved {
             request_id: request_id.to_string(),
             decision,
         });
+        // Same shape as the mint-time pre-allowed path, including the event:
+        // an action Comet allowed on the user's behalf stays visible.
+        for (id, resolver) in also_granted {
+            let _ = resolver.send(ApprovalDecision::AllowForSession);
+            let _ = engine_tx.send(AgentEvent::ApprovalResolved {
+                request_id: id,
+                decision: ApprovalDecision::AllowForSession,
+            });
+        }
         Ok(true)
     }
 
@@ -924,27 +1011,21 @@ impl Inner {
         found
     }
 
+    /// Retire `run_id`'s handle, if it is still the live one for this chat.
+    ///
+    /// The run-id guard stays: a handle under this chat id that belongs to a
+    /// LATER run is not ours to retire, and draining it would kill a card the
+    /// user is looking at. Releasing what the retired run parked is
+    /// `RunHandle::drop`'s job, which is also what covers the case this guard
+    /// declines — a replaced handle, drained by `dispatch_inner`'s insert.
     fn remove_run(&self, chat_id: &str, run_id: &str) {
         let mut runs = lock(&self.runs);
         if !runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
             return;
         }
-        let Some(handle) = runs.remove(chat_id) else {
-            return;
-        };
+        let retired = runs.remove(chat_id);
         drop(runs);
-        // Drain any still-parked approvals: a run can end (CLI stdout EOF,
-        // crash, engine restart) while a card is still open. Task 4's spawned
-        // harness task holds the approval bridge through an `Arc` independent
-        // of this handle, so removing the handle alone does not drop the
-        // parked oneshot sender — that task would await a decision that can
-        // never arrive. Dropping the senders resolves each to `Err`, which
-        // every consumer reads as not approved (same rule `interrupt()` uses).
-        let parked: Vec<_> = lock(&handle.pending_approvals)
-            .drain()
-            .map(|(_, p)| p.resolver)
-            .collect();
-        drop(parked);
+        drop(retired);
     }
 }
 
@@ -1027,6 +1108,37 @@ fn finish_segment<'a>(
             SegmentWriter::begin(doc, entry_id, device_id, started_at)?.finish(&rendered, status)
         }
         None => Ok(()),
+    }
+}
+
+/// Terminally resolve every approval this run still has open, both halves:
+/// drop the parked resolvers, and stamp the accumulated parts `Expired`.
+///
+/// Called wherever `folded` is about to be written into a FINISHED entry. Past
+/// that point neither half can happen any more — `fold_event_into_parts`'s
+/// `ApprovalResolved` arm and the run's own sweeps all walk the live
+/// accumulator only, so a card that leaves it undecided reads "waiting" for
+/// the life of the chat — while the resolver stays parked and the harness
+/// stays blocked on a tool call nobody will answer.
+///
+/// Dropping the resolver, rather than sending a decision, is deliberate: every
+/// consumer reads a dropped resolver as NOT approved, which is the same rule
+/// `interrupt()` and `RunHandle::drop` use.
+fn expire_open_approvals(inner: &Inner, chat_id: &str, run_id: &str, folded: &mut [MessagePart]) {
+    let pending = lock(&inner.runs)
+        .get(chat_id)
+        .filter(|h| h.run_id == run_id)
+        .map(|h| h.pending_approvals.clone());
+    if let Some(pending) = pending {
+        let parked: Vec<_> = lock(&pending).drain().map(|(_, p)| p.resolver).collect();
+        drop(parked);
+    }
+    for part in folded.iter_mut() {
+        if let MessagePart::Approval { decision, .. } = part
+            && decision.is_none()
+        {
+            *decision = Some(ApprovalDecision::Expired);
+        }
     }
 }
 
@@ -1309,6 +1421,13 @@ async fn drive_run(
         } = &event
         {
             inner.publish(&chat_id, &event);
+            // A steer abandons whatever the previous turn was waiting on, and
+            // this is the last moment either half of that can be recorded: the
+            // segment below is FINISHED, so a card left open in it can never be
+            // stamped by a later decision, by the Done-time sweep, or offered
+            // by the decision row again. Saying the tool call was dropped is
+            // the honest answer, and it releases the harness.
+            expire_open_approvals(&inner, &chat_id, &run_id, &mut folded);
             if let Err(err) = finish_segment(
                 doc_ref,
                 writer.take(),
@@ -1396,7 +1515,19 @@ async fn drive_run(
                 inner.set_status(&chat_id, SessionStatus::AwaitingInput, false);
             }
             AgentEvent::ApprovalResolved { .. } => {
-                inner.set_status(&chat_id, SessionStatus::Working, false);
+                // Only once NOTHING is still waiting on the user. Approvals
+                // arrive in batches (claude asks for parallel tool calls at
+                // once, and a session-auto-allowed one resolves the instant
+                // it is minted), so an unconditional step back to Working
+                // would report a run as running while a card is still open.
+                let pending = lock(&inner.runs)
+                    .get(&chat_id)
+                    .filter(|h| h.run_id == run_id)
+                    .map(|h| h.pending_approvals.clone());
+                let still_waiting = pending.is_some_and(|p| !lock(&p).is_empty());
+                if !still_waiting {
+                    inner.set_status(&chat_id, SessionStatus::Working, false);
+                }
             }
             _ => {}
         }
@@ -1447,17 +1578,17 @@ async fn drive_run(
             // unresolved question must not outlive the run that asked it
             // (its resolver died with the run; an answer could never land).
             for part in folded.iter_mut() {
-                match part {
-                    MessagePart::Input { resolved, .. } => *resolved = true,
-                    // Same rule for approvals, and the same reason. Expired is
-                    // the terminal state; one already answered keeps its
-                    // answer.
-                    MessagePart::Approval { decision, .. } if decision.is_none() => {
-                        *decision = Some(ApprovalDecision::Expired);
-                    }
-                    _ => {}
+                if let MessagePart::Input { resolved, .. } = part {
+                    *resolved = true;
                 }
             }
+            // Same rule for approvals, and the same reason — plus the drain,
+            // which the stamp alone left undone: a steerable harness PARKS
+            // after a completed turn (below), so its resolvers would outlive
+            // the transcript's "Expired" by up to the 30-minute idle reap,
+            // and `respond_approval` would keep answering `true` for one of
+            // them the whole time.
+            expire_open_approvals(&inner, &chat_id, &run_id, &mut folded);
             // A Done landing on a PARKED session with nothing streamed (the
             // idle reaper's or an interrupt's own teardown) has no entry to
             // finalize — writing one would leave an empty aborted stub.
@@ -1515,6 +1646,11 @@ async fn drive_run(
         }
     };
 
+    // Closed BEFORE the run is announced finished: the approval bridge fails
+    // closed on a send error, so an approval minted in the moment between the
+    // loop ending and this task's frame being dropped must find the channel
+    // already shut rather than park into a receiver nobody polls.
+    drop(engine_rx);
     inner.remove_run(&chat_id, &run_id);
     inner.set_status(&chat_id, final_status, false);
 }
@@ -1544,6 +1680,99 @@ mod tests {
             decision: None,
         };
         assert_eq!(render_parts(std::slice::from_ref(&part)), vec![part]);
+    }
+
+    /// A run with one question and one approval parked.
+    struct ParkedRun {
+        handle: RunHandle,
+        approval: oneshot::Receiver<ApprovalDecision>,
+        question: oneshot::Receiver<Vec<UserInputAnswer>>,
+        /// The `Arc`s the bridge closures hold — the reason a parked resolver
+        /// outlives its handle at all. Without them here the maps would die
+        /// with the handle and every assertion below would pass against a
+        /// `Drop` that did nothing.
+        _bridges: (PendingInputs, PendingApprovals),
+    }
+
+    fn parked_run_handle(run_id: &str) -> ParkedRun {
+        let pending_approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
+        let (resolver, approval_rx) = oneshot::channel();
+        let (answers, input_rx) = oneshot::channel();
+        lock(&pending_approvals).insert(
+            format!("{run_id}-approval"),
+            PendingApproval {
+                signature: None,
+                resolver,
+            },
+        );
+        lock(&pending_inputs).insert(format!("{run_id}-question"), answers);
+        let (steer_tx, _steer_rx) = mpsc::channel(1);
+        let (cancel, _cancel_rx) = watch::channel(false);
+        let (engine_tx, _engine_rx) = mpsc::unbounded_channel();
+        ParkedRun {
+            handle: RunHandle {
+                run_id: run_id.to_string(),
+                steerable: false,
+                steer_tx,
+                interrupt_token: CancellationToken::new(),
+                cancel,
+                engine_tx,
+                pending_inputs: pending_inputs.clone(),
+                pending_approvals: pending_approvals.clone(),
+                minted_approvals: Arc::new(Mutex::new(HashSet::new())),
+                session_allowed: Arc::new(Mutex::new(HashSet::new())),
+            },
+            approval: approval_rx,
+            question: input_rx,
+            _bridges: (pending_inputs, pending_approvals),
+        }
+    }
+
+    #[test]
+    fn a_replaced_run_releases_what_nobody_can_answer_any_more() {
+        // `dispatch_inner` waits 5s for an interrupt to settle and then inserts
+        // regardless, so a live run's handle can be replaced. From that moment
+        // `respond_approval` and `respond_input` find the successor, and the
+        // old run's `remove_run` declines the handle it no longer owns — its
+        // parked resolvers used to be leaked, leaving the harness (for claude,
+        // a CLI blocked on a tool call) awaiting a reply forever.
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = engine(dir.path());
+        let mut old = parked_run_handle("run-1");
+        let mut new = parked_run_handle("run-2");
+
+        lock(&sessions.inner.runs).insert("chat-1".into(), old.handle);
+        let displaced = lock(&sessions.inner.runs).insert("chat-1".into(), new.handle);
+        drop(displaced);
+
+        assert!(
+            matches!(
+                old.approval.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ),
+            "a dropped resolver is how every consumer reads NOT approved"
+        );
+        assert_eq!(
+            old.question.try_recv(),
+            Ok(Vec::new()),
+            "a parked question resolves to no answers, as interrupt() sends"
+        );
+
+        // The successor's open approval is NOT collateral: `remove_run` for the
+        // old run id must leave the handle it declines to retire untouched.
+        sessions.inner.remove_run("chat-1", "run-1");
+        assert!(matches!(
+            new.approval.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(lock(&sessions.inner.runs).contains_key("chat-1"));
+
+        sessions.inner.remove_run("chat-1", "run-2");
+        assert!(matches!(
+            new.approval.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
     }
 
     fn session_started(cwd: &str, runtime_mode: RuntimeMode) -> AgentEvent {

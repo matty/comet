@@ -2291,10 +2291,357 @@ async fn allow_for_session_answers_the_next_identical_request_without_asking() {
             _ => None,
         })
         .collect();
-    assert_eq!(approvals.len(), 2, "both requests must appear in the doc");
-    assert!(
-        approvals.iter().all(|d| d.is_some()),
-        "neither may be left open, got {approvals:?}"
+    // …and each says WHICH allow it was. Both read "Allowed for this session":
+    // the first because that is what the user clicked, the second because a
+    // card reading "Allowed" for an action the user never saw would be a false
+    // record — and the record is the only reason the second card exists.
+    assert_eq!(
+        approvals,
+        vec![
+            Some(ApprovalDecision::AllowForSession),
+            Some(ApprovalDecision::AllowForSession),
+        ],
+        "the user's grant and the auto-allow made under it, in that order"
+    );
+}
+
+/// Asks permission and then takes a steer instead of an answer — what a user
+/// typing over an open card produces, and what claude emits the moment a steer
+/// line is queued. Reports what the parked request finally resolved to, so a
+/// resolver left parked shows up as a report that never arrives.
+struct SteeredWhileAskingHarness;
+
+#[async_trait]
+impl Harness for SteeredWhileAskingHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "SteeredWhileAsking"
+    }
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities {
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: vec![ReasoningLevel::Medium],
+            runtime_modes: Vec::new(),
+        }
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let request_approval = controls.request_approval;
+        let mut steering = controls.steering;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tokio::spawn(async move {
+            let pending = request_approval(ApprovalRequest::FileChange {
+                path: "src/reconcile.rs".into(),
+                operation: FileOperation::Modify,
+                added_lines: 24,
+                removed_lines: 6,
+            });
+            let Some(steer) = steering.recv().await else {
+                return;
+            };
+            let _ = tx.send(AgentEvent::Steered {
+                assistant_message_id: None,
+                next_assistant_message_id: steer.message_id.map(|id| format!("a-{id}")),
+            });
+            let word = match pending.await {
+                Ok(ApprovalDecision::Allow) | Ok(ApprovalDecision::AllowForSession) => "allowed",
+                Ok(ApprovalDecision::Deny { .. }) => "denied",
+                Ok(ApprovalDecision::Expired) | Err(_) => "abandoned",
+            };
+            let _ = tx.send(AgentEvent::TextDelta {
+                text: format!("steered, edit {word}"),
+            });
+            let _ = tx.send(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            });
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (Ok(event), rx))
+        })
+        .boxed())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_steer_over_an_open_approval_terminates_it_rather_than_stranding_it() {
+    // A steer finishes the assistant entry the card lives in. Nothing can reach
+    // a part once it has left the accumulator — not a later decision, not the
+    // Done-time sweep, not the decision row — so the card would read "waiting"
+    // for the life of the chat while the CLI stayed blocked on the tool call.
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(SteeredWhileAskingHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let request_id = drive_to_open_approval(&core, &handle, "cmd-run-steered").await;
+
+    // The user types instead of answering: a routed dispatch steers the live run.
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-steer-1",
+        SessionCommandPayload::Run {
+            request: run_request("actually, do this instead"),
+            message_id: "m-steer".into(),
+        },
+    );
+
+    // Only reachable if the resolver was released: the harness reports nothing
+    // until its parked request resolves one way or the other.
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.parts.iter().any(
+                    |p| matches!(p, MessagePart::Text { text, .. } if text == "steered, edit abandoned"),
+                )
+            })
+        },
+        "the steered-over request to resolve",
+    )
+    .await;
+
+    // And the transcript says so, in the entry the steer finished.
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        MessagePart::Approval {
+                            request_id: rid,
+                            decision: Some(ApprovalDecision::Expired),
+                            ..
+                        } if *rid == request_id
+                    )
+                })
+            })
+        },
+        "the steered-over card to be stamped expired",
+    )
+    .await;
+}
+
+/// Asks permission AFTER its run has ended. That is the state a run whose
+/// handle was replaced reaches — its `ApprovalRequested` is dropped by the
+/// authority guard (which reads whatever handle now owns the chat) and no
+/// drain can reach the resolver — so the bridge itself has to fail closed.
+struct LateAskingHarness {
+    ask: Arc<tokio::sync::Notify>,
+    reported: tokio::sync::mpsc::UnboundedSender<&'static str>,
+}
+
+#[async_trait]
+impl Harness for LateAskingHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "LateAsking"
+    }
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities::default()
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let request_approval = controls.request_approval;
+        let ask = self.ask.clone();
+        let reported = self.reported.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tokio::spawn(async move {
+            let _ = tx.send(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            });
+            ask.notified().await;
+            let word = match request_approval(ApprovalRequest::Command {
+                command: "rm -rf /".into(),
+                cwd: None,
+            })
+            .await
+            {
+                Ok(ApprovalDecision::Allow) | Ok(ApprovalDecision::AllowForSession) => "allowed",
+                Ok(ApprovalDecision::Deny { .. }) => "denied",
+                Ok(ApprovalDecision::Expired) | Err(_) => "not approved",
+            };
+            let _ = reported.send(word);
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (Ok(event), rx))
+        })
+        .boxed())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_the_engine_can_no_longer_show_is_refused_not_parked() {
+    let dir = tempfile::tempdir().unwrap();
+    let ask = Arc::new(tokio::sync::Notify::new());
+    let (reported, mut reports) = tokio::sync::mpsc::unbounded_channel();
+    let core = assemble(
+        dir.path(),
+        Arc::new(LateAskingHarness {
+            ask: ask.clone(),
+            reported,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-late",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "the run to finish",
+    )
+    .await;
+
+    // The run task is gone, so this request can never become a card. Parking
+    // its resolver would leave the caller (for claude: a CLI blocked on a tool
+    // call) waiting on an answer nobody is left to give.
+    ask.notify_one();
+    let answer = tokio::time::timeout(Duration::from_secs(5), reports.recv())
+        .await
+        .expect("a request nothing can show must still be answered, not parked forever");
+    assert_eq!(answer, Some("not approved"));
+}
+
+/// Asks for the SAME action twice with both requests in flight — claude's
+/// parallel tool calls. The mint-time pre-allow check ran before either was
+/// answered, so a grant only helps the twin if it also sweeps what is already
+/// parked.
+struct BatchAskingHarness;
+
+#[async_trait]
+impl Harness for BatchAskingHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "BatchAsking"
+    }
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities::default()
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let request_approval = controls.request_approval;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tokio::spawn(async move {
+            let ask = || {
+                request_approval(ApprovalRequest::FileChange {
+                    path: "src/reconcile.rs".into(),
+                    operation: FileOperation::Modify,
+                    added_lines: 24,
+                    removed_lines: 6,
+                })
+            };
+            // Both parked BEFORE either is awaited: the bridge parks as it is
+            // called, so this is two open cards at once.
+            let (first, second) = tokio::join!(ask(), ask());
+            let word =
+                |d: &Result<ApprovalDecision, tokio::sync::oneshot::error::RecvError>| match d {
+                    Ok(ApprovalDecision::Allow) | Ok(ApprovalDecision::AllowForSession) => {
+                        "allowed"
+                    }
+                    Ok(ApprovalDecision::Deny { .. }) => "denied",
+                    _ => "unanswered",
+                };
+            let _ = tx.send(AgentEvent::TextDelta {
+                text: format!("{} and {}", word(&first), word(&second)),
+            });
+            let _ = tx.send(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            });
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (Ok(event), rx))
+        })
+        .boxed())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_grant_also_answers_an_identical_request_already_waiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(BatchAskingHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let request_id = drive_to_open_approval(&core, &handle, "cmd-run-batch").await;
+    let open_cards = || {
+        entries_now(&core)
+            .iter()
+            .flat_map(|e| e.parts.clone())
+            .filter(|p| matches!(p, MessagePart::Approval { decision: None, .. }))
+            .count()
+    };
+    wait_for(|| open_cards() == 2, "both parallel requests to open").await;
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-grant-1",
+        SessionCommandPayload::RespondApproval {
+            request_id,
+            decision: ApprovalDecision::AllowForSession,
+        },
+    );
+
+    // The twin must not survive the grant: asking again one second after the
+    // user said "don't ask again" is the whole defect.
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.parts.iter().any(
+                    |p| matches!(p, MessagePart::Text { text, .. } if text == "allowed and allowed"),
+                )
+            })
+        },
+        "the waiting twin to be answered by the grant",
+    )
+    .await;
+    let decisions: Vec<_> = entries_now(&core)
+        .iter()
+        .flat_map(|e| e.parts.clone())
+        .filter_map(|p| match p {
+            MessagePart::Approval { decision, .. } => Some(decision),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        decisions,
+        vec![
+            Some(ApprovalDecision::AllowForSession),
+            Some(ApprovalDecision::AllowForSession),
+        ],
+        "both cards stamped with the grant that answered them"
     );
 }
 
