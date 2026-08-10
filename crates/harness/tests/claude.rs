@@ -312,11 +312,19 @@ async fn a_run_asks_before_writing_and_tells_the_cli_what_the_user_said() {
     });
     let events = run_to_end(&harness(), request("scenario:approval"), controls).await;
 
-    // The card the user would have seen, built from the real frame shape.
+    // The card the user would have seen, built from the real frame shape. The
+    // path is absolute and under a directory that does not exist, so the
+    // adapter's real existence check (not a test double) resolves the Write to
+    // a create. Kept in step with `WRITE_TARGET_JSON` in fixtures/fake_claude.rs.
+    let write_target = if cfg!(windows) {
+        r"C:\comet-fake-fixture\a.txt"
+    } else {
+        "/comet-fake-fixture/a.txt"
+    };
     assert_eq!(
         asked_rx.recv().unwrap(),
         ApprovalRequest::FileChange {
-            path: "a.txt".into(),
+            path: write_target.into(),
             operation: FileOperation::Create,
             added_lines: 1,
             removed_lines: 0,

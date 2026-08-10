@@ -261,18 +261,31 @@ fn notices() {
     );
 }
 
+/// The Write's target, JSON-escaped for the frame below. Absolute, because the
+/// adapter reads a relative path as an operation it cannot determine — there is
+/// no cwd on the request to resolve one against. Under a directory that does
+/// not exist, so the adapter's existence check answers "nothing there" and the
+/// frame stays a create. Kept in step with `write_target` in tests/claude.rs.
+const WRITE_TARGET_JSON: &str = if cfg!(windows) {
+    r"C:\\comet-fake-fixture\\a.txt"
+} else {
+    "/comet-fake-fixture/a.txt"
+};
+
 /// Requests permission for a Write, then reports what it was told. The
 /// `control_request` frame shape is copied from a live capture (2026-08-10,
-/// CLI 2.1.226). The reply is echoed as a `stream_event` text delta rather
-/// than a full `assistant` message: `normalize.rs`'s `Frame::Assistant` arm
-/// only turns `tool_use` blocks into events and drops a bare text block, so
+/// CLI 2.1.226), with only the path swapped for one this machine can be
+/// trusted not to have. The reply is echoed as a `stream_event` text delta
+/// rather than a full `assistant` message: `normalize.rs`'s `Frame::Assistant`
+/// arm only turns `tool_use` blocks into events and drops a bare text block, so
 /// only the streamed form actually reaches the test as a `TextDelta`.
 fn approval(stdin: &mut StdinLock<'_>) {
     emit(
         r#"{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Write"],"cwd":"/tmp","session_id":"sess-1"}"#,
     );
     emit(
-        r#"{"type":"control_request","request_id":"fake-1","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"a.txt","content":"hi\n"},"description":"a.txt","tool_use_id":"toolu_fake"}}"#,
+        &r#"{"type":"control_request","request_id":"fake-1","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"__PATH__","content":"hi\n"},"description":"a.txt","tool_use_id":"toolu_fake"}}"#
+            .replace("__PATH__", WRITE_TARGET_JSON),
     );
     let reply = read_line(stdin);
     let reply: serde_json::Value = serde_json::from_str(&reply).expect("a control response");

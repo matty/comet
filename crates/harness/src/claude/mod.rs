@@ -740,7 +740,10 @@ fn handle_control_request(
     // subtask so the frame loop keeps flowing while the user thinks — a
     // blocked read here would stall the transcript the user is reading to
     // decide.
-    let approval = approval::approval_request(&req.request);
+    // The adapter runs on the machine holding the file, so whether a Write
+    // creates or overwrites is a question with an answer here — one `stat` per
+    // approval, on a request that is about to wait for a human anyway.
+    let approval = approval::approval_request(&req.request, |p| std::path::Path::new(p).exists());
     let request_approval = Arc::clone(request_approval);
     let stdin_tx = stdin_tx.clone();
     tokio::spawn(async move {
