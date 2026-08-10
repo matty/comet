@@ -282,11 +282,6 @@ pub(crate) struct ControlRequestFrame {
     pub request: ControlRequestBody,
 }
 
-// The three fields below are decoded but not yet read by production code —
-// only by this file's tests. A later task in this slice (the approval card)
-// consumes them; `#[allow(dead_code)]` holds clippy off until then instead of
-// leaving the field undecoded, which the next reader would read as "the CLI
-// doesn't send this".
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct ControlRequestBody {
@@ -297,22 +292,15 @@ pub(crate) struct ControlRequestBody {
     #[serde(default)]
     pub input: Value,
     /// The CLI's own one-line rendering of the request ("hello.txt", "Write
-    /// \"one\" to a.txt"). Provider prose — never rendered raw; see
-    /// `claude/approval.rs` for what reaches the card.
+    /// \"one\" to a.txt"). Provider prose.
+    ///
+    /// Decoded for exactly one consumer, and it is a test: `ApprovalRequest::
+    /// Unknown` promises its summary is Comet copy and never provider prose,
+    /// and the contract test in `claude/approval.rs` asserts this string does
+    /// not reach the card. No production path reads it. Do not "use" it.
     #[serde(default)]
     #[allow(dead_code)]
     pub description: Option<String>,
-    /// The path a command was blocked from touching. Present on the Bash
-    /// request, ABSENT on the Write request (captured 2026-08-10) — `None`
-    /// means the CLI reported none, not that the path is empty.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub blocked_path: Option<String>,
-    /// Joins this approval to the assistant's tool call in the transcript.
-    /// Distinct from the control channel's `request_id`.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub tool_use_id: Option<String>,
 }
 
 /// Parse one stdout JSONL line. `Err` = not JSON; unclaimed types classify
@@ -575,24 +563,32 @@ mod tests {
             req.request.description.as_deref(),
             Some("Write \"one\" to a.txt")
         );
-        assert_eq!(req.request.blocked_path.as_deref(), Some("C:\\work\\a.txt"));
-        assert_eq!(req.request.tool_use_id.as_deref(), Some("toolu_01NA3M"));
+        // blocked_path, tool_use_id, permission_suggestions and display_name are all
+        // present on this captured frame and all deliberately undecoded. Nothing
+        // reads them, and serde ignores unknown keys — so the frame parses either
+        // way and declaring them would buy availability nothing consumes.
     }
 
     #[test]
-    fn a_write_request_has_no_blocked_path_and_that_is_not_an_error() {
+    fn a_request_that_reports_no_description_is_not_an_error() {
         // The absent case, written by hand, per .agents/rules/optional-wire-fields.md.
-        // Captured: the Write request carries no `blocked_path`; the Bash one does.
-        // `None` here means "the CLI reported no blocked path", NOT "the empty path".
+        // `None` means "the CLI sent no description", NOT "the empty description" —
+        // the distinction Task 3's fallback copy depends on.
         let line = r#"{"type":"control_request","request_id":"cc1cb7a8","request":{
             "subtype":"can_use_tool","tool_name":"Write",
-            "input":{"file_path":"C:\\work\\hello.txt","content":"hi\n"},
-            "description":"hello.txt","tool_use_id":"toolu_01GmE4"}}"#;
+            "input":{"file_path":"C:\\work\\hello.txt","content":"hi\n"}}}"#;
         let Frame::ControlRequest(req) = parse_frame(line).unwrap() else {
             panic!("expected a control request");
         };
-        assert_eq!(req.request.blocked_path, None);
-        assert_eq!(req.request.description.as_deref(), Some("hello.txt"));
+        assert_eq!(req.request.description, None);
+
+        // ...and an empty one is a different answer, not the same one.
+        let empty = r#"{"type":"control_request","request_id":"x","request":{
+            "subtype":"can_use_tool","tool_name":"Write","input":{},"description":""}}"#;
+        let Frame::ControlRequest(req) = parse_frame(empty).unwrap() else {
+            panic!("expected a control request");
+        };
+        assert_eq!(req.request.description.as_deref(), Some(""));
     }
 
     #[test]
