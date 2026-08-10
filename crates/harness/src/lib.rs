@@ -88,6 +88,7 @@ pub trait Harness: Send + Sync {
 
 pub mod claude;
 pub mod codex;
+pub mod discovery;
 pub mod mock;
 pub mod shell_env;
 
