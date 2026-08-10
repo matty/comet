@@ -8,26 +8,27 @@
 //! function in 1.7.
 
 use comet_proto::{ApprovalRequest, FileOperation};
+use serde_json::json;
 
 /// A stable identity for "this action", or `None` when the action cannot be
 /// identified well enough to allow it again unattended.
 ///
 /// Volatile fields are excluded deliberately: a file change's line counts
 /// differ on every edit, so including them would make a session-allow match
-/// nothing. Fields are joined with `\u{1f}` (unit separator), which cannot
-/// occur in a path or a command, so two different actions cannot collide by
-/// concatenation.
+/// nothing.
+///
+/// The fields are encoded as a JSON array rather than joined with a separator.
+/// A separator only works if it cannot occur in a field, and `command`, `cwd`,
+/// `server` and `tool` are unrestricted strings — a command containing the
+/// separator could be spelled to produce another action's signature, and this
+/// is a permission boundary, so "unlikely input" is not the standard. JSON
+/// escapes the field contents, which makes the encoding injective: distinct
+/// field vectors cannot produce the same string.
 pub(crate) fn approval_signature(request: &ApprovalRequest) -> Option<String> {
-    const SEP: char = '\u{1f}';
-    Some(match request {
-        ApprovalRequest::Command { command, cwd } => {
-            // `None` and `Some("")` are different answers and must not collide.
-            let cwd = match cwd {
-                Some(dir) => format!("in{SEP}{dir}"),
-                None => "nowhere".to_string(),
-            };
-            format!("command{SEP}{command}{SEP}{cwd}")
-        }
+    let fields = match request {
+        // `None` serializes as `null` and `Some("")` as `""` — different
+        // answers, and they must not collide.
+        ApprovalRequest::Command { command, cwd } => json!(["command", command, cwd]),
         // An operation Comet could not determine is not an identity. Formatting
         // it would make "Comet does not know what this edit does" a stable
         // allowlist key, so a later edit to the same path that is equally
@@ -40,11 +41,13 @@ pub(crate) fn approval_signature(request: &ApprovalRequest) -> Option<String> {
         } => return None,
         ApprovalRequest::FileChange {
             path, operation, ..
-        } => format!("fileChange{SEP}{path}{SEP}{operation:?}"),
-        ApprovalRequest::FileRead { path } => format!("fileRead{SEP}{path}"),
-        ApprovalRequest::Mcp { server, tool } => format!("mcp{SEP}{server}{SEP}{tool}"),
+        } => json!(["fileChange", path, format!("{operation:?}")]),
+        ApprovalRequest::FileRead { path } => json!(["fileRead", path]),
+        ApprovalRequest::Mcp { server, tool } => json!(["mcp", server, tool]),
         ApprovalRequest::Unknown { .. } => return None,
-    })
+    };
+    // Infallible: every value here is a string, a null, or an array of them.
+    Some(fields.to_string())
 }
 
 #[cfg(test)]
@@ -113,8 +116,13 @@ mod tests {
             command: "cargo test".into(),
             cwd: None,
         };
+        let empty = ApprovalRequest::Command {
+            command: "cargo test".into(),
+            cwd: Some(String::new()),
+        };
         assert_ne!(approval_signature(&here), approval_signature(&there));
         assert_ne!(approval_signature(&here), approval_signature(&nowhere));
+        assert_ne!(approval_signature(&nowhere), approval_signature(&empty));
         assert_eq!(
             approval_signature(&here),
             approval_signature(&ApprovalRequest::Command {
@@ -122,6 +130,48 @@ mod tests {
                 cwd: Some("/repo".into()),
             })
         );
+    }
+
+    #[test]
+    fn fields_that_contain_the_old_separator_do_not_collide() {
+        // The signature used to join fields with `\u{1f}`, on the assumption
+        // that the separator could not occur inside a field. `command` and
+        // `cwd` are unrestricted strings, so it can: these two joined to the
+        // identical `command\u{1f}a\u{1f}in\u{1f}b\u{1f}in\u{1f}c`. Allowing
+        // the first for the session then allowed the second unattended, which
+        // is a permission boundary crossed by an input nobody has to be lucky
+        // to produce.
+        let one = ApprovalRequest::Command {
+            command: "a".into(),
+            cwd: Some("b\u{1f}in\u{1f}c".into()),
+        };
+        let two = ApprovalRequest::Command {
+            command: "a\u{1f}in\u{1f}b".into(),
+            cwd: Some("c".into()),
+        };
+        assert!(approval_signature(&one).is_some());
+        assert_ne!(approval_signature(&one), approval_signature(&two));
+    }
+
+    #[test]
+    fn a_separator_in_a_path_or_a_server_name_does_not_collide_either() {
+        // Same defect, the other three variants. A file change's path and an
+        // MCP server/tool pair are equally unrestricted.
+        let deep = ApprovalRequest::FileRead {
+            path: "a\u{1f}b".into(),
+        };
+        let shallow = ApprovalRequest::FileRead { path: "a".into() };
+        assert_ne!(approval_signature(&deep), approval_signature(&shallow));
+
+        let split = ApprovalRequest::Mcp {
+            server: "s\u{1f}t".into(),
+            tool: String::new(),
+        };
+        let whole = ApprovalRequest::Mcp {
+            server: "s".into(),
+            tool: "t".into(),
+        };
+        assert_ne!(approval_signature(&split), approval_signature(&whole));
     }
 
     #[test]
