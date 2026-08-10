@@ -204,15 +204,52 @@ pub fn reasoning_label(level: ReasoningLevel) -> &'static str {
     }
 }
 
-/// The TraitsPicker trigger summary: non-default reasoning + non-default model
-/// option choices, joined with " · " (comet: "High · 1M · Fast"). `None` when
-/// everything is at its default.
+/// Chip labels for the permission axis. User vocabulary, not the wire's: the
+/// menu says what the agent will do, never which policy string the provider is
+/// sent.
+pub fn runtime_mode_label(mode: RuntimeMode) -> &'static str {
+    match mode {
+        RuntimeMode::ApprovalRequired => "Ask first",
+        RuntimeMode::AutoAcceptEdits => "Auto-accept edits",
+        RuntimeMode::Auto => "Auto",
+        RuntimeMode::FullAccess => "Full access",
+    }
+}
+
+/// The one line under the chip row, describing the mode that is active.
+/// `FullAccess` is the only one that names a removal, because it is the only
+/// mode with no sandbox left behind it.
+pub fn runtime_mode_caption(mode: RuntimeMode) -> &'static str {
+    match mode {
+        RuntimeMode::ApprovalRequired => "Every file change and command waits for you.",
+        RuntimeMode::AutoAcceptEdits => {
+            "Edits inside the workspace go ahead; the sandbox is the boundary."
+        }
+        RuntimeMode::Auto => "Edits go ahead, and the agent reviews its own calls where it can.",
+        RuntimeMode::FullAccess => {
+            "No sandbox and no approvals — the agent can change anything on this machine."
+        }
+    }
+}
+
+/// The TraitsPicker trigger summary: a non-default runtime mode + non-default
+/// reasoning + non-default model option choices, joined with " · " (comet:
+/// "High · 1M · Fast"). `None` when everything is at its default.
+///
+/// The mode leads, because it is the only one of the three that changes what
+/// the agent is allowed to do to the machine.
 pub fn traits_summary(
     model: Option<&Model>,
     reasoning: Option<ReasoningLevel>,
     selections: &serde_json::Map<String, serde_json::Value>,
+    mode: RuntimeMode,
 ) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
+    // The default mode is what every chat has always run; naming it here would
+    // make the ordinary case read as a setting the user went and changed.
+    if mode != RuntimeMode::default() {
+        parts.push(runtime_mode_label(mode).to_string());
+    }
     if let Some(level) = reasoning {
         parts.push(reasoning_label(level).to_string());
     }
@@ -3047,6 +3084,7 @@ impl Render for Pickers {
             self.selected_model(cx),
             self.effective_reasoning(cx),
             &explicit_options,
+            self.effective_runtime_mode(cx),
         );
         let traits_label: SharedString = traits_set
             .clone()
@@ -3167,28 +3205,74 @@ mod tests {
         let mut selections = serde_json::Map::new();
         selections.insert("context".into(), serde_json::Value::String("1m".into()));
         selections.insert("speed".into(), serde_json::Value::String("fast".into()));
+        let default_mode = RuntimeMode::default();
         assert_eq!(
-            traits_summary(Some(&model), Some(ReasoningLevel::High), &selections),
+            traits_summary(
+                Some(&model),
+                Some(ReasoningLevel::High),
+                &selections,
+                default_mode
+            ),
             Some("High · 1M · Fast".to_string())
         );
         // All defaults → no summary.
         assert_eq!(
-            traits_summary(Some(&model), None, &serde_json::Map::new()),
+            traits_summary(Some(&model), None, &serde_json::Map::new(), default_mode),
             None
         );
         // Default-choice selections don't count as non-default.
         let mut defaults = serde_json::Map::new();
         defaults.insert("speed".into(), serde_json::Value::String("normal".into()));
-        assert_eq!(traits_summary(Some(&model), None, &defaults), None);
+        assert_eq!(
+            traits_summary(Some(&model), None, &defaults, default_mode),
+            None
+        );
         // Reasoning shows without a model too.
         assert_eq!(
             traits_summary(
                 None,
                 Some(ReasoningLevel::Ultrathink),
-                &serde_json::Map::new()
+                &serde_json::Map::new(),
+                default_mode
             ),
             Some("Ultrathink".to_string())
         );
+        // A non-default mode leads the summary, and the default one is silent:
+        // the chip is for what the user changed.
+        assert_eq!(
+            traits_summary(
+                Some(&model),
+                Some(ReasoningLevel::High),
+                &serde_json::Map::new(),
+                RuntimeMode::FullAccess
+            ),
+            Some("Full access · High".to_string())
+        );
+        assert_eq!(
+            traits_summary(
+                None,
+                None,
+                &serde_json::Map::new(),
+                RuntimeMode::ApprovalRequired
+            ),
+            Some("Ask first".to_string())
+        );
+    }
+
+    /// Every mode a provider can declare needs both strings — a chip with no
+    /// label is unpickable, and a mode with no caption ships the one surface
+    /// that explains what it does with a blank line.
+    #[test]
+    fn every_mode_has_a_label_and_a_caption() {
+        for mode in [
+            RuntimeMode::ApprovalRequired,
+            RuntimeMode::AutoAcceptEdits,
+            RuntimeMode::Auto,
+            RuntimeMode::FullAccess,
+        ] {
+            assert!(!runtime_mode_label(mode).is_empty());
+            assert!(!runtime_mode_caption(mode).is_empty());
+        }
     }
 
     #[test]
