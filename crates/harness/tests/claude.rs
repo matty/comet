@@ -11,8 +11,9 @@ use comet_harness::{
     CancellationToken, ClaudeHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use comet_proto::{
-    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, RunRequest,
-    RuntimeMode, ToolCall, UserInputAnswer, UserInputQuestion,
+    AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus, FileOperation,
+    HarnessId, NoticeKind, NoticeSeverity, RunRequest, RuntimeMode, ToolCall, UserInputAnswer,
+    UserInputQuestion,
 };
 
 /// The `fake-claude` bin target, built by cargo alongside this test.
@@ -76,6 +77,38 @@ async fn run_to_end(
     )
     .await
     .expect("run finished in time")
+}
+
+/// Controls whose `request_approval` hands each request to the test and waits
+/// on a caller-supplied decision, rather than `controls()`'s always-drops
+/// approver. Left as a sibling rather than a change to `controls()` — eight
+/// existing tests depend on that helper's never-approves behaviour.
+fn controls_with_approver(
+    approver: impl Fn(ApprovalRequest) -> oneshot::Receiver<ApprovalDecision> + Send + Sync + 'static,
+) -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let token = CancellationToken::new();
+    let controls = RunControls {
+        request_input: Box::new(|_| {
+            let (_tx, rx) = oneshot::channel();
+            rx
+        }),
+        request_approval: Box::new(approver),
+        steering: steer_rx,
+        interrupt: token.clone(),
+    };
+    (controls, steer_tx, token)
+}
+
+/// Concatenates every `AgentEvent::TextDelta`'s text, in event order.
+fn text_of(events: &[AgentEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -182,10 +215,12 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
     // resolver is parked under; a harness-emitted copy folded an unanswerable
     // duplicate chip into the doc).
     let asked: Arc<Mutex<Vec<UserInputQuestion>>> = Arc::new(Mutex::new(Vec::new()));
+    let approved: Arc<Mutex<Vec<comet_proto::ApprovalRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let _steer = steer_tx;
     let token = CancellationToken::new();
     let seen = asked.clone();
+    let seen_approvals = approved.clone();
     let controls = RunControls {
         request_input: Box::new(move |questions| {
             seen.lock().unwrap().extend(questions.iter().cloned());
@@ -200,12 +235,23 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
             let _ = tx.send(answers);
             rx
         }),
-        // No decision source in this fixture: the dropped sender resolves the
-        // receiver to an error, which a run must treat as not approved. Never
-        // default a fixture to Allow — that is how a permission defect ships
-        // looking correct.
-        request_approval: Box::new(|_approval: comet_proto::ApprovalRequest| {
-            let (_tx, rx) = oneshot::channel::<comet_proto::ApprovalDecision>();
+        // Records what it was asked, mirroring `asked` above, and answers
+        // Allow only for the expected Bash request — anything else drops the
+        // sender (not approved), same shape as the shared `controls()`
+        // helper. A call site that bypasses this bridge (e.g. reverting to
+        // the old `request_approval: _request_approval` plus an unconditional
+        // allow) records zero approvals here and fails the assertions below.
+        request_approval: Box::new(move |approval: comet_proto::ApprovalRequest| {
+            seen_approvals.lock().unwrap().push(approval.clone());
+            let (tx, rx) = oneshot::channel::<comet_proto::ApprovalDecision>();
+            if approval
+                == (comet_proto::ApprovalRequest::Command {
+                    command: "ls".into(),
+                    cwd: None,
+                })
+            {
+                let _ = tx.send(comet_proto::ApprovalDecision::Allow);
+            }
             rx
         }),
         steering: steer_rx,
@@ -226,9 +272,22 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
         "harness must not emit input lifecycle events itself: {events:?}"
     );
 
+    // Proves the approval bridge was actually consulted for the plain Bash
+    // can_use_tool, not bypassed: a bypassed bridge records zero approvals
+    // and this fails.
+    let approved = approved.lock().unwrap();
+    assert_eq!(approved.len(), 1, "expected exactly one approval request");
+    assert_eq!(
+        approved[0],
+        comet_proto::ApprovalRequest::Command {
+            command: "ls".into(),
+            cwd: None,
+        }
+    );
+
     // "answered" proves both control round-trips: the plain Bash can_use_tool
-    // was auto-allowed AND the answers reached the CLI as updatedInput.answers
-    // keyed by question text.
+    // was approved via `request_approval` AND the answers reached the CLI as
+    // updatedInput.answers keyed by question text.
     assert_eq!(
         events.last(),
         Some(&AgentEvent::Done {
@@ -238,6 +297,54 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
             session_id: Some("sess-ask".into()),
         })
     );
+}
+
+#[tokio::test]
+async fn a_run_asks_before_writing_and_tells_the_cli_what_the_user_said() {
+    let (asked_tx, asked_rx) = std::sync::mpsc::channel();
+    let (controls, _steer, _token) = controls_with_approver(move |req: ApprovalRequest| {
+        let (tx, rx) = oneshot::channel();
+        asked_tx.send(req).unwrap();
+        let _ = tx.send(ApprovalDecision::Deny {
+            message: "not that path".into(),
+        });
+        rx
+    });
+    let events = run_to_end(&harness(), request("scenario:approval"), controls).await;
+
+    // The card the user would have seen, built from the real frame shape. The
+    // path is absolute and under a directory that does not exist, so the
+    // adapter's real existence check (not a test double) resolves the Write to
+    // a create. Kept in step with `WRITE_TARGET_JSON` in fixtures/fake_claude.rs.
+    let write_target = if cfg!(windows) {
+        r"C:\comet-fake-fixture\a.txt"
+    } else {
+        "/comet-fake-fixture/a.txt"
+    };
+    assert_eq!(
+        asked_rx.recv().unwrap(),
+        ApprovalRequest::FileChange {
+            path: write_target.into(),
+            operation: FileOperation::Create,
+            added_lines: 1,
+            removed_lines: 0,
+        }
+    );
+    let text = text_of(&events);
+    assert!(
+        text.contains("told: deny"),
+        "the CLI must hear the denial, got {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_run_whose_approver_is_gone_denies_rather_than_writing() {
+    // `controls()`'s approver drops its sender. That must reach the CLI as a
+    // denial — not as silence, and never as an allow.
+    let (controls, _steer, _token) = controls("A");
+    let events = run_to_end(&harness(), request("scenario:approval"), controls).await;
+    let text = text_of(&events);
+    assert!(text.contains("told: deny"), "got {text:?}");
 }
 
 #[tokio::test]

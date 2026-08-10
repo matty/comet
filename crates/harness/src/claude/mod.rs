@@ -4,14 +4,16 @@
 //!
 //! - stdout JSONL frames are normalized into [`AgentEvent`]s (init dedupe,
 //!   subagent filtering, typed tool decoding, error-code mapping).
-//! - The bidirectional control channel is served: `can_use_tool` requests are
-//!   auto-allowed, except `AskUserQuestion` which round-trips through
-//!   [`RunControls::request_input`] (InputRequested → answers → InputResolved).
+//! - The bidirectional control channel is served: `can_use_tool` requests
+//!   round-trip through [`RunControls::request_approval`], except
+//!   `AskUserQuestion` which round-trips through [`RunControls::request_input`]
+//!   (InputRequested → answers → InputResolved) instead.
 //! - Steering: queued [`SteerMessage`]s are written to stdin as user lines at
 //!   any time; the CLI applies them at its own step boundary.
 //! - Interrupt: cancelling [`RunControls::interrupt`] sends the protocol-level
 //!   interrupt control request, then escalates to SIGTERM and SIGKILL.
 
+mod approval;
 mod catalog;
 mod normalize;
 mod wire;
@@ -30,15 +32,18 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use comet_proto::{
-    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessAvailability, HarnessCapabilities,
-    HarnessId, Model, ReasoningLevel, RunRequest, RuntimeMode, SteeringMode, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus,
+    HarnessAvailability, HarnessCapabilities, HarnessId, Model, ReasoningLevel, RunRequest,
+    RuntimeMode, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
 use catalog::{apply_ultrathink, static_models, to_effort};
 use normalize::Normalizer;
-use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
+use wire::{
+    ControlRequestFrame, Frame, allow_response, cancelled_response, control_response_line,
+    deny_response,
+};
 
 /// Locate the device's installed Claude Code CLI: `CLAUDE_CODE_EXECUTABLE`,
 /// then our own PATH, then the system's own PATH (a GUI/service launch's PATH
@@ -474,13 +479,12 @@ async fn run_session(session: Session) {
     } = session;
     let RunControls {
         request_input,
-        // Claude's approvals arrive over the control channel and are not
-        // claimed here yet; this adapter still auto-allows every tool call.
-        request_approval: _request_approval,
+        request_approval,
         mut steering,
         interrupt,
     } = controls;
     let request_input = Arc::new(request_input);
+    let request_approval = Arc::new(request_approval);
 
     let mut norm = Normalizer::new(runtime_mode);
     let mut steering_open = true;
@@ -520,8 +524,12 @@ async fn run_session(session: Session) {
                         }
                     };
                     if let Frame::ControlRequest(req) = frame {
-                        if let Some(ev) = handle_control_request(req, &request_input, &stdin_tx)
-                            && event_tx.send(Ok(ev)).await.is_err()
+                        if let Some(ev) = handle_control_request(
+                            req,
+                            &request_input,
+                            &request_approval,
+                            &stdin_tx,
+                        ) && event_tx.send(Ok(ev)).await.is_err()
                         {
                             break 'main;
                         }
@@ -646,25 +654,44 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
-/// Serve one `can_use_tool` control request. Every tool is auto-approved;
-/// `AskUserQuestion` is intercepted — surface the questions through the
-/// engine's input bridge (which owns the `InputRequested`/`InputResolved`
-/// lifecycle), wait for the user's answers (in a subtask so the frame loop
-/// keeps flowing), and hand them back keyed by question text, as the tool
-/// expects.
+type RequestApprovalFn =
+    Box<dyn Fn(ApprovalRequest) -> tokio::sync::oneshot::Receiver<ApprovalDecision> + Send + Sync>;
+
+/// Serve one `can_use_tool` control request. `AskUserQuestion` is intercepted
+/// — surface the questions through the engine's input bridge (which owns the
+/// `InputRequested`/`InputResolved` lifecycle), wait for the user's answers
+/// (in a subtask so the frame loop keeps flowing), and hand them back keyed
+/// by question text, as the tool expects. Every other tool round-trips
+/// through [`RunControls::request_approval`].
 fn handle_control_request(
     req: ControlRequestFrame,
     request_input: &Arc<RequestInputFn>,
+    request_approval: &Arc<RequestApprovalFn>,
     stdin_tx: &mpsc::UnboundedSender<StdinMsg>,
 ) -> Option<AgentEvent> {
     if req.request.subtype != "can_use_tool" {
-        // Sink 3: an unclaimed inbound control request — counted, and
-        // deliberately NOT answered. The SDK's `request_user_dialog` contract
-        // says hosts should reply `{behavior:"cancelled"}` to dialog kinds
-        // they don't recognize; adopting that is a behaviour change deferred
-        // to whichever slice first claims a control-request subtype. ~53
-        // subtypes exist in the SDK's inbound union and the capture saw none
-        // fire, so their frequency is unknown, not zero.
+        // Sink 3: an unclaimed inbound control request. Still counted as a
+        // diagnostic — a subtype Comet does not model is still something the
+        // user should be able to see was ignored — but no longer left
+        // hanging: sdk.d.ts requires a host to reply `{behavior:"cancelled"}`
+        // to a `request_user_dialog` kind it does not recognize, and skipping
+        // that reply leaves the CLI waiting on an answer that never comes.
+        // Comet applies the same reply to every unclaimed subtype (~52
+        // others), which the SDK does not specify. The reply shape is
+        // written blind — none of the nine 2026-08-10 capture runs against
+        // Claude Code 2.1.226 produced one of these, so it is checked
+        // against the typings, not a live frame.
+        //
+        // If one of the non-dialog subtypes ever does fire, the safer generic
+        // reply is a `control_response` with `subtype: "error"` (an
+        // `error` string in place of `response`): "this host does not serve
+        // that request" is true of every unclaimed subtype, whereas
+        // `{behavior:"cancelled"}` claims a permission answer the caller may
+        // not have asked for. Exposure is near zero today — Comet does no
+        // initialize handshake and declares no SDK hooks or SDK MCP servers,
+        // which is why the capture runs saw none — so the reply that IS
+        // specified for the one reachable kind stays until a live frame says
+        // otherwise.
         tracing::warn!(
             target: "comet_harness::claude",
             request = %serde_json::json!({
@@ -675,35 +702,65 @@ fn handle_control_request(
             }),
             "unclaimed control_request (recorded as a diagnostic)"
         );
-        return Some(crate::diagnostic(
+        let event = crate::diagnostic(
             &format!("control_request/{}", req.request.subtype),
             DiagnosticSeverity::Unknown,
-        ));
+        );
+        let _ = stdin_tx.send(StdinMsg::Line(control_response_line(
+            &req.request_id,
+            cancelled_response(),
+        )));
+        return Some(event);
     }
-    if req.request.tool_name != "AskUserQuestion" {
-        let line = control_response_line(&req.request_id, allow_response(req.request.input));
-        let _ = stdin_tx.send(StdinMsg::Line(line));
+    if req.request.tool_name == "AskUserQuestion" {
+        let request_input = Arc::clone(request_input);
+        let stdin_tx = stdin_tx.clone();
+        tokio::spawn(async move {
+            let request_id = req.request_id;
+            let input = req.request.input;
+            let questions = parse_questions(&input);
+            // The engine's input bridge is the SOLE emitter of
+            // `InputRequested`/`InputResolved`: it mints the request id, parks
+            // the resolver for `respond_input`, and surfaces both events.
+            // Emitting our own copy here (keyed by Claude's control-request
+            // id) folded a SECOND input part into the doc whose id no
+            // resolver knew — the QuestionPanel answered that unanswerable
+            // twin and the run never resumed.
+            //
+            // A dropped sender (caller went away) degrades to empty answers
+            // so the agent is unblocked rather than wedged.
+            let answers = (request_input)(questions.clone()).await.unwrap_or_default();
+            let updated = updated_input_with_answers(&input, &questions, &answers);
+            let line = control_response_line(&request_id, allow_response(updated));
+            let _ = stdin_tx.send(StdinMsg::Line(line));
+        });
         return None;
     }
-    let request_input = Arc::clone(request_input);
+    // Every other tool is the user's call. The reply is written from a
+    // subtask so the frame loop keeps flowing while the user thinks — a
+    // blocked read here would stall the transcript the user is reading to
+    // decide.
+    // The adapter runs on the machine holding the file, so whether a Write
+    // creates or overwrites is a question with an answer here — one `stat` per
+    // approval, on a request that is about to wait for a human anyway.
+    let approval = approval::approval_request(&req.request, |p| std::path::Path::new(p).exists());
+    let request_approval = Arc::clone(request_approval);
     let stdin_tx = stdin_tx.clone();
     tokio::spawn(async move {
         let request_id = req.request_id;
-        let input = req.request.input;
-        let questions = parse_questions(&input);
-        // The engine's input bridge is the SOLE emitter of
-        // `InputRequested`/`InputResolved`: it mints the request id, parks the
-        // resolver for `respond_input`, and surfaces both events. Emitting our
-        // own copy here (keyed by Claude's control-request id) folded a SECOND
-        // input part into the doc whose id no resolver knew — the QuestionPanel
-        // answered that unanswerable twin and the run never resumed.
-        //
-        // A dropped sender (caller went away) degrades to empty answers so the
-        // agent is unblocked rather than wedged.
-        let answers = (request_input)(questions.clone()).await.unwrap_or_default();
-        let updated = updated_input_with_answers(&input, &questions, &answers);
-        let line = control_response_line(&request_id, allow_response(updated));
-        let _ = stdin_tx.send(StdinMsg::Line(line));
+        let decision = (request_approval)(approval).await;
+        let response = match decision {
+            Ok(ApprovalDecision::Allow) | Ok(ApprovalDecision::AllowForSession) => {
+                allow_response(req.request.input)
+            }
+            Ok(ApprovalDecision::Deny { message }) => deny_response(message),
+            // Expired, or a dropped resolver: the user never answered and
+            // never will. Not approved.
+            Ok(ApprovalDecision::Expired) | Err(_) => {
+                deny_response(crate::approval_unanswered_message())
+            }
+        };
+        let _ = stdin_tx.send(StdinMsg::Line(control_response_line(&request_id, response)));
     });
     None
 }
@@ -833,6 +890,7 @@ mod control_request_tests {
                 subtype: subtype.into(),
                 tool_name: tool_name.into(),
                 input: serde_json::json!({"x": 1}),
+                ..Default::default()
             },
         }
     }
@@ -850,43 +908,193 @@ mod control_request_tests {
         (request_input, stdin_tx, stdin_rx)
     }
 
-    /// Sink 3: an unclaimed subtype is counted (Unknown, control_request/-
-    /// prefixed) and — deliberately — not answered. The SDK's
-    /// request_user_dialog contract says hosts must reply
-    /// {behavior:"cancelled"}; replying is a behaviour change to a frame the
-    /// capture never saw fire, deferred to whichever slice first claims a
-    /// control-request subtype.
-    #[test]
-    fn an_unclaimed_control_request_becomes_a_diagnostic_and_no_reply() {
-        use comet_proto::DiagnosticSeverity;
-        let (request_input, stdin_tx, mut stdin_rx) = bridge();
-        let ev =
-            handle_control_request(frame("request_user_dialog", ""), &request_input, &stdin_tx);
-        assert_eq!(
-            ev,
-            Some(AgentEvent::Diagnostic {
-                discriminator: "control_request/request_user_dialog".into(),
-                severity: DiagnosticSeverity::Unknown,
-                code: None,
-                summary: "The agent sent a message Comet doesn't recognize.".into(),
-            })
-        );
-        assert!(stdin_rx.try_recv().is_err(), "no reply is written today");
+    /// A decision source the test controls, shaped like the engine's bridge.
+    fn approver(answer: Option<ApprovalDecision>) -> Arc<RequestApprovalFn> {
+        Arc::new(Box::new(move |_req: ApprovalRequest| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if let Some(answer) = answer.clone() {
+                let _ = tx.send(answer);
+            }
+            // `None` drops the sender: the receiver resolves to Err, which must
+            // read as NOT approved.
+            rx
+        }))
     }
 
-    /// The claimed path is byte-for-byte what it was: the auto-approve reply
-    /// still goes out, and nothing is counted. Counting must never replace
-    /// answering.
-    #[test]
-    fn can_use_tool_still_answers_allow_and_counts_nothing() {
+    async fn recv_line(rx: &mut mpsc::UnboundedReceiver<StdinMsg>) -> String {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a control response must be sent")
+        {
+            Some(StdinMsg::Line(line)) => line,
+            _ => panic!("expected a control-response line"),
+        }
+    }
+
+    /// Sink 3, now answered. Still counted — a subtype Comet does not understand
+    /// is still a thing the user should be able to see was ignored.
+    #[tokio::test]
+    async fn an_unclaimed_control_request_is_cancelled_and_still_counted() {
         let (request_input, stdin_tx, mut stdin_rx) = bridge();
-        let ev = handle_control_request(frame("can_use_tool", "Bash"), &request_input, &stdin_tx);
-        assert_eq!(ev, None);
-        let StdinMsg::Line(line) = stdin_rx.try_recv().expect("an allow reply was written") else {
-            panic!("expected a stdin line");
-        };
-        assert!(line.contains(r#""behavior":"allow""#), "{line}");
-        assert!(line.contains("cr-1"), "{line}");
+        let ev = handle_control_request(
+            frame("request_user_dialog", ""),
+            &request_input,
+            &approver(Some(ApprovalDecision::Allow)),
+            &stdin_tx,
+        );
+        assert_eq!(
+            ev,
+            Some(crate::diagnostic(
+                "control_request/request_user_dialog",
+                DiagnosticSeverity::Unknown,
+            ))
+        );
+        let sent: serde_json::Value =
+            serde_json::from_str(&recv_line(&mut stdin_rx).await).unwrap();
+        assert_eq!(sent["response"]["response"]["behavior"], "cancelled");
+        assert_eq!(sent["response"]["request_id"], "cr-1"); // what `frame()` mints
+    }
+
+    #[tokio::test]
+    async fn an_unclaimed_subtype_never_reaches_the_approval_bridge() {
+        // It is not a permission question; raising a card for it would ask the
+        // user about something Comet cannot describe.
+        let (request_input, stdin_tx, _rx) = bridge();
+        let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = asked.clone();
+        let approver: Arc<RequestApprovalFn> = Arc::new(Box::new(move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let (_tx, rx) = tokio::sync::oneshot::channel();
+            rx
+        }));
+        handle_control_request(
+            frame("request_user_dialog", ""),
+            &request_input,
+            &approver,
+            &stdin_tx,
+        );
+        // `#[tokio::test]` is a current-thread runtime: it never polls a
+        // `tokio::spawn`ed task while this body runs synchronously. If the
+        // guard above were deleted, the approval route would spawn a task
+        // that calls the approver — but without a yield here, that task
+        // would never be polled and `asked` would read false regardless of
+        // whether the bridge was reached. Yielding once gives any spawned
+        // task its first poll, which is after the approver closure runs.
+        tokio::task::yield_now().await;
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn an_allowed_tool_is_answered_allow_with_its_input_intact() {
+        let (request_input, stdin_tx, mut stdin_rx) = bridge();
+        let ev = handle_control_request(
+            frame("can_use_tool", "Bash"),
+            &request_input,
+            &approver(Some(ApprovalDecision::Allow)),
+            &stdin_tx,
+        );
+        assert!(ev.is_none(), "an approval is not a diagnostic");
+        let line = recv_line(&mut stdin_rx).await;
+        let sent: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(sent["response"]["response"]["behavior"], "allow");
+        assert_eq!(
+            sent["response"]["response"]["updatedInput"],
+            serde_json::json!({"x": 1}),
+            "the frame's input must ride back intact, unmodified by the approval round trip"
+        );
+        assert!(
+            sent["response"]["response"]
+                .get("updatedPermissions")
+                .is_none(),
+            "capture 2026-08-10: updatedPermissions writes to the user's repo and does not work"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_tool_is_answered_deny_with_the_users_note() {
+        let (request_input, stdin_tx, mut stdin_rx) = bridge();
+        handle_control_request(
+            frame("can_use_tool", "Bash"),
+            &request_input,
+            &approver(Some(ApprovalDecision::Deny {
+                message: "not that path".into(),
+            })),
+            &stdin_tx,
+        );
+        let sent: serde_json::Value =
+            serde_json::from_str(&recv_line(&mut stdin_rx).await).unwrap();
+        assert_eq!(sent["response"]["response"]["behavior"], "deny");
+        assert_eq!(sent["response"]["response"]["message"], "not that path");
+    }
+
+    #[tokio::test]
+    async fn allow_for_session_is_answered_allow_and_sends_no_permission_update() {
+        // The engine remembers the session grant (Task 1). The CLI is told plain
+        // "allow" — capture runs 7-9: every updatedPermissions shape either
+        // persisted a rule to the user's repo, failed to silence the next call,
+        // or both.
+        let (request_input, stdin_tx, mut stdin_rx) = bridge();
+        handle_control_request(
+            frame("can_use_tool", "Write"),
+            &request_input,
+            &approver(Some(ApprovalDecision::AllowForSession)),
+            &stdin_tx,
+        );
+        let sent: serde_json::Value =
+            serde_json::from_str(&recv_line(&mut stdin_rx).await).unwrap();
+        assert_eq!(sent["response"]["response"]["behavior"], "allow");
+        assert!(
+            sent["response"]["response"]
+                .get("updatedPermissions")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unanswerable_approval_denies_rather_than_allowing() {
+        // The decision source went away (run torn down, client gone). Never
+        // default to allow: that is how a permission defect ships looking correct.
+        let (request_input, stdin_tx, mut stdin_rx) = bridge();
+        handle_control_request(
+            frame("can_use_tool", "Bash"),
+            &request_input,
+            &approver(None),
+            &stdin_tx,
+        );
+        let sent: serde_json::Value =
+            serde_json::from_str(&recv_line(&mut stdin_rx).await).unwrap();
+        assert_eq!(sent["response"]["response"]["behavior"], "deny");
+    }
+
+    #[tokio::test]
+    async fn expired_denies_too() {
+        let (request_input, stdin_tx, mut stdin_rx) = bridge();
+        handle_control_request(
+            frame("can_use_tool", "Bash"),
+            &request_input,
+            &approver(Some(ApprovalDecision::Expired)),
+            &stdin_tx,
+        );
+        let sent: serde_json::Value =
+            serde_json::from_str(&recv_line(&mut stdin_rx).await).unwrap();
+        assert_eq!(sent["response"]["response"]["behavior"], "deny");
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_still_goes_to_the_input_bridge_not_the_approval_bridge() {
+        // Regression guard: AskUserQuestion is a different contract and must not
+        // start raising approval cards.
+        let (request_input, stdin_tx, _rx) = bridge();
+        let ev = handle_control_request(
+            frame("can_use_tool", "AskUserQuestion"),
+            &request_input,
+            &approver(Some(ApprovalDecision::Deny {
+                message: "x".into(),
+            })),
+            &stdin_tx,
+        );
+        assert!(ev.is_none());
+        // The input bridge answered; nothing was denied.
     }
 }
 

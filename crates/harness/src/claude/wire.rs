@@ -283,6 +283,7 @@ pub(crate) struct ControlRequestFrame {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) struct ControlRequestBody {
     #[serde(default)]
     pub subtype: String,
@@ -290,6 +291,17 @@ pub(crate) struct ControlRequestBody {
     pub tool_name: String,
     #[serde(default)]
     pub input: Value,
+    /// The CLI's own one-line rendering of the request ("hello.txt", "Write
+    /// \"one\" to a.txt"). Provider prose.
+    ///
+    /// Decoded for exactly one consumer, and it is a test:
+    /// `ApprovalRequest::Unknown` promises its summary is Comet copy and
+    /// never provider prose, and the contract test in `claude/approval.rs`
+    /// asserts this string does not reach the card. No production path reads
+    /// it. Do not "use" it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub description: Option<String>,
 }
 
 /// Parse one stdout JSONL line. `Err` = not JSON; unclaimed types classify
@@ -388,9 +400,29 @@ pub(crate) fn control_response_line(request_id: &str, response: Value) -> String
     .to_string()
 }
 
+/// `can_use_tool` deny payload. `message` is what the model is told, and is
+/// the user's own note when they wrote one.
+///
+/// No `updatedPermissions` is ever sent, on this arm or the allow arm:
+/// capture 2026-08-10 (runs 7-9) showed every shape either wrote a permanent
+/// rule into the user's repository, failed to silence the next request, or
+/// both. Comet owns session grants — see `comet_engine::approvals`.
+pub(crate) fn deny_response(message: String) -> Value {
+    json!({ "behavior": "deny", "message": message })
+}
+
 /// `can_use_tool` allow payload with the (possibly updated) tool input.
 pub(crate) fn allow_response(updated_input: Value) -> Value {
     json!({ "behavior": "allow", "updatedInput": updated_input })
+}
+
+/// The reply sdk.d.ts requires for a dialog kind the host does not recognize.
+/// Leaving it unanswered leaves the CLI waiting on a reply that never comes.
+/// Written blind: none of the nine 2026-08-10 capture runs against Claude
+/// Code 2.1.226 produced a non-`can_use_tool` control request, so this shape
+/// is unverified against a live frame — only against the SDK's typings.
+pub(crate) fn cancelled_response() -> Value {
+    json!({ "behavior": "cancelled" })
 }
 
 /// Client→CLI interrupt control request.
@@ -533,5 +565,63 @@ mod tests {
                 other => panic!("{raw} should be Ignored({reason}), got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_can_use_tool_request_decodes_the_fields_a_card_needs() {
+        // Captured verbatim from Claude Code 2.1.226, 2026-08-10.
+        let line = r#"{"type":"control_request","request_id":"c012205e","request":{
+            "subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash",
+            "input":{"command":"echo one > a.txt","description":"Write \"one\" to a.txt"},
+            "description":"Write \"one\" to a.txt",
+            "blocked_path":"C:\\work\\a.txt","tool_use_id":"toolu_01NA3M"}}"#;
+        let Frame::ControlRequest(req) = parse_frame(line).unwrap() else {
+            panic!("expected a control request");
+        };
+        assert_eq!(req.request.subtype, "can_use_tool");
+        assert_eq!(req.request.tool_name, "Bash");
+        assert_eq!(
+            req.request.description.as_deref(),
+            Some("Write \"one\" to a.txt")
+        );
+        // blocked_path, tool_use_id, permission_suggestions and display_name are all
+        // present on this captured frame and all deliberately undecoded. Nothing
+        // reads them, and serde ignores unknown keys — so the frame parses either
+        // way and declaring them would buy availability nothing consumes.
+    }
+
+    #[test]
+    fn a_request_that_reports_no_description_is_not_an_error() {
+        // The absent case, written by hand, per .agents/rules/optional-wire-fields.md.
+        // `None` means "the CLI sent no description", NOT "the empty description" —
+        // the distinction Task 3's fallback copy depends on.
+        let line = r#"{"type":"control_request","request_id":"cc1cb7a8","request":{
+            "subtype":"can_use_tool","tool_name":"Write",
+            "input":{"file_path":"C:\\work\\hello.txt","content":"hi\n"}}}"#;
+        let Frame::ControlRequest(req) = parse_frame(line).unwrap() else {
+            panic!("expected a control request");
+        };
+        assert_eq!(req.request.description, None);
+
+        // ...and an empty one is a different answer, not the same one.
+        let empty = r#"{"type":"control_request","request_id":"x","request":{
+            "subtype":"can_use_tool","tool_name":"Write","input":{},"description":""}}"#;
+        let Frame::ControlRequest(req) = parse_frame(empty).unwrap() else {
+            panic!("expected a control request");
+        };
+        assert_eq!(req.request.description.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn an_unknown_control_subtype_still_decodes() {
+        // Sink 3's input: the frame must decode so the subtype can be reported and
+        // answered, even though nothing understands it.
+        let line = r#"{"type":"control_request","request_id":"x","request":{"subtype":"request_user_dialog"}}"#;
+        let Frame::ControlRequest(req) = parse_frame(line).unwrap() else {
+            panic!("expected a control request");
+        };
+        assert_eq!(req.request.subtype, "request_user_dialog");
+        assert_eq!(req.request.tool_name, "");
+        assert_eq!(req.request.description, None);
     }
 }

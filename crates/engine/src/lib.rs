@@ -13,6 +13,8 @@ pub use comet_proto::HarnessId;
 
 use comet_sync::DocsStore;
 
+mod approvals;
+
 pub mod agent_accounts;
 pub mod diff_sync;
 pub mod doc_host;
