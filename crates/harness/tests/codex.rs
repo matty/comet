@@ -11,9 +11,9 @@ use comet_harness::{
     CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use comet_proto::{
-    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessId, NoticeKind, NoticeSeverity,
-    ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel, TodoItem, ToolCall, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus, FileOperation,
+    HarnessId, NoticeKind, NoticeSeverity, ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel,
+    TodoItem, ToolCall, UserInputAnswer,
 };
 
 /// The `fake-codex` bin target, built by cargo alongside this test.
@@ -431,57 +431,64 @@ async fn rejected_steer_falls_back_to_a_follow_up_turn() {
 }
 
 #[tokio::test]
-async fn approvals_round_trip_as_input_requests() {
-    // Approvals must reach the ENGINE's input bridge (`request_input`) — and
-    // the harness must NOT emit its own `InputRequested`/`InputResolved`
-    // twins: the bridge owns that lifecycle (it mints the request id the
-    // resolver is parked under; a harness-emitted copy folded an unanswerable
-    // duplicate chip into the doc).
-    let asked: Arc<Mutex<Vec<UserInputQuestion>>> = Arc::new(Mutex::new(Vec::new()));
+async fn approvals_reach_the_approval_bridge_not_the_input_bridge() {
+    // Approvals must reach the ENGINE's approval bridge (`request_approval`).
+    // They used to be synthesized into a yes/no question on the INPUT bridge,
+    // which surfaced a permission decision as a generic prompt; that route is
+    // gone. The harness must still emit no input lifecycle events of its own —
+    // the bridge owns that lifecycle and mints the id the resolver parks under.
+    let asked: Arc<Mutex<Vec<ApprovalRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let _steer = steer_tx;
     let token = CancellationToken::new();
     let seen = asked.clone();
     let controls = RunControls {
-        request_input: Box::new(move |questions| {
-            seen.lock().unwrap().extend(questions.iter().cloned());
-            let (tx, rx) = oneshot::channel();
-            let answers: Vec<UserInputAnswer> = questions
-                .iter()
-                .map(|q| UserInputAnswer {
-                    question_id: q.id.clone(),
-                    labels: vec!["Yes".into()],
-                })
-                .collect();
-            let _ = tx.send(answers);
+        // Nothing on this run asks a question; an answer here would be a
+        // failure, so the fixture provides none.
+        request_input: Box::new(|_questions| {
+            let (_tx, rx) = oneshot::channel::<Vec<UserInputAnswer>>();
             rx
         }),
-        // No decision source in this fixture: the dropped sender resolves the
-        // receiver to an error, which a run must treat as not approved. Never
-        // default a fixture to Allow — that is how a permission defect ships
-        // looking correct.
-        request_approval: Box::new(|_approval: comet_proto::ApprovalRequest| {
-            let (_tx, rx) = oneshot::channel::<comet_proto::ApprovalDecision>();
+        request_approval: Box::new(move |approval: ApprovalRequest| {
+            seen.lock().unwrap().push(approval);
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(ApprovalDecision::Allow);
             rx
         }),
         steering: steer_rx,
         interrupt: token.clone(),
     };
     let mut req = request("scenario:approve");
-    // Any mode but `FullAccess` sends an approval through the input bridge.
-    // `ApprovalRequired` states that without asserting anything about what
-    // auto-accept-edits should do with a file change once the adapter derives
-    // its approval policy from the mode.
     req.runtime_mode = RuntimeMode::ApprovalRequired;
     let events = run_to_end(&harness(), req, controls).await;
 
     let asked = asked.lock().unwrap();
-    assert_eq!(asked.len(), 2, "{events:?}");
-    assert_eq!(asked[0].header, "Approve command");
-    assert!(asked[0].question.contains("rm -rf /tmp/x"));
-    assert_eq!(asked[0].options, vec!["Yes".to_string(), "No".to_string()]);
-    assert_eq!(asked[1].header, "Approve file change");
-    assert!(asked[1].question.contains("/tmp/a.rs"));
+    assert_eq!(asked.len(), 3, "{events:?}");
+    // The parsed action, not the launcher invocation wrapped around it.
+    assert_eq!(
+        asked[0],
+        ApprovalRequest::Command {
+            command: "rm -rf /tmp/x".into(),
+            cwd: Some("/tmp".into()),
+        }
+    );
+    // The path came from the item, because the request itself carries none.
+    assert_eq!(
+        asked[1],
+        ApprovalRequest::FileChange {
+            path: "/tmp/a.rs".into(),
+            operation: FileOperation::Modify,
+            added_lines: 1,
+            removed_lines: 0,
+        }
+    );
+    // The join missed: vague, and un-allowlistable, rather than a wrong path.
+    assert_eq!(
+        asked[2],
+        ApprovalRequest::Unknown {
+            summary: "Change a file".into()
+        }
+    );
     assert!(
         !events.iter().any(|e| matches!(
             e,
@@ -490,7 +497,7 @@ async fn approvals_round_trip_as_input_requests() {
         "harness must not emit input lifecycle events itself: {events:?}"
     );
 
-    // The fake only completes the turn after seeing BOTH accept decisions.
+    // The fake only completes the turn after seeing every accept decision.
     assert_eq!(
         events.last(),
         Some(&AgentEvent::Done {

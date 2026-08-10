@@ -25,11 +25,12 @@
 //!   escalating to SIGTERM → SIGKILL if the child is unresponsive; the stream
 //!   always ends with `Done { status: Interrupted }`.
 
+mod approval;
 mod catalog;
 mod normalize;
 mod rpc;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -44,8 +45,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use comet_proto::{
-    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessAvailability, HarnessCapabilities,
-    HarnessId, Model, RunRequest, RuntimeMode, SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus,
+    HarnessAvailability, HarnessCapabilities, HarnessId, Model, RunRequest, RuntimeMode,
+    SteeringMode,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
@@ -428,15 +430,16 @@ async fn run_session(session: Session) {
         stderr_tail,
     } = session;
     let RunControls {
-        request_input,
-        // Codex pins its approval policy at `never`, so the server issues no
-        // approval request for this to answer; unpinning it is what claims
-        // this field.
-        request_approval: _request_approval,
+        // Unclaimed on the Codex side: the synthesized yes/no question that used
+        // to stand in for an approval is gone, and this adapter answers
+        // `item/tool/requestUserInput` and `mcpServer/elicitation/request` with
+        // -32601. Whichever slice claims one of those claims this field.
+        request_input: _request_input,
+        request_approval,
         mut steering,
         interrupt,
     } = controls;
-    let request_input = Arc::new(request_input);
+    let request_approval = Arc::new(request_approval);
 
     // ---- wire params ------------------------------------------------------
     // Pinned rather than derived from `runtime_mode`: an approval Codex raises
@@ -620,6 +623,11 @@ async fn run_session(session: Session) {
     let mut rate_thresholds = RateLimitThresholds::default();
     // Token usage is held until the turn ends, emitted just before Done.
     let mut pending_usage: Option<AgentEvent> = None;
+    // `item/fileChange/requestApproval` carries no path and no diff — only an
+    // `itemId` (captured 2026-08-10; the generated schema agrees). The detail is
+    // on the `item/started` that precedes it, so it is held here until the
+    // request that needs it arrives, and dropped when the item completes.
+    let mut file_changes: HashMap<String, Value> = HashMap::new();
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
     // next `turn/start` when the expected turn's end notification arrives.
     let mut queued_steers: VecDeque<String> = VecDeque::new();
@@ -688,6 +696,7 @@ async fn run_session(session: Session) {
                                 }
                             }
                         } else {
+                            track_file_change(&mut file_changes, phase, &item);
                             for ev in map_item(phase, &item) {
                                 if !send(&event_tx, ev).await {
                                     break 'main;
@@ -708,6 +717,7 @@ async fn run_session(session: Session) {
                         // Item ids never span turns; without this the set grew
                         // one entry per message for a persistent session's life.
                         streamed_text.clear();
+                        file_changes.clear();
                         if let Some(usage) = pending_usage.take()
                             && !send(&event_tx, usage).await
                         {
@@ -859,13 +869,20 @@ async fn run_session(session: Session) {
                 },
 
                 Some(Incoming::Request { id, method, params }) => {
+                    // The join happens here, while the map is in scope; the
+                    // mapping itself stays a pure function of what it is handed.
+                    let changes = params
+                        .get("itemId")
+                        .and_then(Value::as_str)
+                        .and_then(|item_id| file_changes.get(item_id))
+                        .cloned();
                     if let Some(ev) = handle_server_request(
                         &client,
                         id,
                         &method,
                         &params,
-                        request.runtime_mode == RuntimeMode::FullAccess,
-                        &request_input,
+                        changes.as_ref(),
+                        &request_approval,
                     ) && !send(&event_tx, ev).await
                     {
                         break 'main;
@@ -1080,28 +1097,72 @@ async fn steer_as_new_turn(
 // Approvals (approval-as-input parity with comet's UX)
 // ---------------------------------------------------------------------------
 
-type RequestInputFn = Box<
-    dyn Fn(Vec<UserInputQuestion>) -> tokio::sync::oneshot::Receiver<Vec<UserInputAnswer>>
-        + Send
-        + Sync,
->;
+type RequestApprovalFn =
+    Box<dyn Fn(ApprovalRequest) -> tokio::sync::oneshot::Receiver<ApprovalDecision> + Send + Sync>;
+
+/// Remember what a `fileChange` item is changing, so the approval request that
+/// follows it — which carries only an `itemId` — can be rendered.
+///
+/// **Bounded.** A turn that changes thousands of files must not grow this
+/// without limit (`DEBT.md` D10 is the standing version of that mistake). At the
+/// cap the entry is simply not recorded, so its approval degrades to
+/// `Unknown` ("Change a file") rather than to a wrong path — vague, and on the
+/// safe side of the permission boundary, since `Unknown` is not allowlistable.
+fn track_file_change(map: &mut HashMap<String, Value>, phase: Phase, item: &Value) {
+    if !matches!(item_type(item), "fileChange" | "file_change") {
+        return;
+    }
+    let Some(id) = item.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    match phase {
+        Phase::Started => {
+            if map.len() >= MAX_TRACKED_FILE_CHANGES && !map.contains_key(id) {
+                tracing::debug!(
+                    target: "comet_harness::codex",
+                    item_id = id,
+                    "file-change detail not tracked (cap reached); its approval will read as Unknown"
+                );
+                return;
+            }
+            if let Some(changes) = item.get("changes") {
+                map.insert(id.to_owned(), changes.clone());
+            }
+        }
+        // The approval arrives between started and completed, so the detail is
+        // no longer needed once the item is done.
+        Phase::Completed => {
+            map.remove(id);
+        }
+    }
+}
+
+/// Bound for [`track_file_change`]. Comfortably above any turn a human watches
+/// approve one file at a time, and small enough that a runaway turn cannot use
+/// it as an allocator.
+const MAX_TRACKED_FILE_CHANGES: usize = 256;
 
 /// Serve one server→client request. Approval requests round-trip through
-/// `request_input` as a synthesized yes/no question (in a subtask so the
-/// message loop keeps flowing); a run that may proceed without asking accepts
-/// them outright (belt to the wire-level `approvalPolicy: "never"`). Anything
-/// else is rejected as unsupported so the server never wedges awaiting a reply.
+/// [`RunControls::request_approval`] (in a subtask so the message loop keeps
+/// flowing while the user thinks — a blocked read here would stall the very
+/// transcript they are reading to decide). Anything else is rejected as
+/// unsupported so the server never wedges awaiting a reply.
+///
+/// `changes` is the `changes` array recorded for this request's `itemId`, if
+/// any; see [`track_file_change`].
 fn handle_server_request(
     client: &RpcClient,
     id: Value,
     method: &str,
     params: &Value,
-    accept_without_asking: bool,
-    request_input: &Arc<RequestInputFn>,
+    changes: Option<&Value>,
+    request_approval: &Arc<RequestApprovalFn>,
 ) -> Option<AgentEvent> {
     let is_approval = matches!(
         method,
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
+        approval::COMMAND_APPROVAL
+            | approval::FILE_CHANGE_APPROVAL
+            | approval::PERMISSIONS_APPROVAL
     );
     if !is_approval {
         // Answer FIRST — the server must never wedge awaiting a reply — then
@@ -1117,81 +1178,22 @@ fn handle_server_request(
         );
         return Some(crate::diagnostic(method, DiagnosticSeverity::Unknown));
     }
-    if accept_without_asking {
-        client.respond(&id, json!({ "decision": "accept" }));
-        return None;
-    }
-
-    let question = approval_question(method, params);
+    let request = approval::approval_request(method, params, changes);
     let client = client.clone();
-    let request_input = Arc::clone(request_input);
+    let request_approval = Arc::clone(request_approval);
     tokio::spawn(async move {
-        // The engine's input bridge owns the `InputRequested`/`InputResolved`
-        // lifecycle (it mints the request id the resolver is parked under);
-        // emitting our own copy here doubled the doc's input part with an id
-        // `respond_input` could never match.
-        //
-        // A dropped sender (caller went away) degrades to a decline so the
-        // agent is unblocked — never silently allowed.
-        let answers = (request_input)(vec![question.clone()])
+        // A dropped resolver (the run went away) means the user never answered
+        // and never will. Decline — never silently accept, and never simply
+        // stay quiet, which would leave the turn blocked on this call forever.
+        let decision = (request_approval)(request)
             .await
-            .unwrap_or_default();
-        let accept = answers.iter().any(|a| {
-            a.question_id == question.id && a.labels.iter().any(|l| l.eq_ignore_ascii_case("yes"))
-        });
+            .unwrap_or(ApprovalDecision::Expired);
         client.respond(
             &id,
-            json!({ "decision": if accept { "accept" } else { "decline" } }),
+            json!({ "decision": approval::decision_literal(&decision) }),
         );
     });
     None
-}
-
-/// Synthesize the yes/no question an approval request surfaces to the user.
-fn approval_question(method: &str, params: &Value) -> UserInputQuestion {
-    let (header, question) = if method.contains("commandExecution") {
-        let command = match params.get("command") {
-            Some(Value::String(s)) => s.clone(),
-            Some(Value::Array(parts)) => parts
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" "),
-            _ => String::new(),
-        };
-        (
-            "Approve command".to_owned(),
-            if command.is_empty() {
-                "Codex wants to run a command. Allow it?".to_owned()
-            } else {
-                format!("Codex wants to run `{command}`. Allow it?")
-            },
-        )
-    } else {
-        let paths: Vec<&str> = params
-            .get("changes")
-            .and_then(Value::as_array)
-            .map(|a| a.as_slice())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|c| c.get("path").and_then(Value::as_str))
-            .collect();
-        (
-            "Approve file change".to_owned(),
-            if paths.is_empty() {
-                "Codex wants to modify files. Allow it?".to_owned()
-            } else {
-                format!("Codex wants to modify {}. Allow it?", paths.join(", "))
-            },
-        )
-    };
-    UserInputQuestion {
-        id: new_message_id(),
-        header,
-        question,
-        options: vec!["Yes".into(), "No".into()],
-        multi_select: false,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,30 +1254,39 @@ mod tests {
         assert!(!worktree_on_slashed_branch("/nonexistent/path"));
     }
 
+    /// The `changes` a file-change approval needs are held from `item/started`
+    /// and released at `item/completed` — the request arrives between the two.
     #[test]
-    fn approval_questions_are_yes_no() {
-        let q = approval_question(
-            "item/commandExecution/requestApproval",
-            &json!({"itemId": "c1", "command": "rm -rf /tmp/x"}),
-        );
-        assert_eq!(q.header, "Approve command");
-        assert!(q.question.contains("rm -rf /tmp/x"));
-        assert_eq!(q.options, vec!["Yes".to_string(), "No".to_string()]);
-        assert!(!q.multi_select);
+    fn a_file_changes_detail_is_held_only_while_the_item_is_open() {
+        let mut map = HashMap::new();
+        let item = json!({"type": "fileChange", "id": "f1",
+                          "changes": [{"path": "/a.rs", "kind": {"type": "add"}}]});
+        track_file_change(&mut map, Phase::Started, &item);
+        assert!(map.contains_key("f1"));
+        track_file_change(&mut map, Phase::Completed, &item);
+        assert!(map.is_empty(), "detail outlived the item it describes");
 
-        let q = approval_question(
-            "item/fileChange/requestApproval",
-            &json!({"changes": [{"path": "/a.rs"}, {"path": "/b.rs"}]}),
+        // Other item types never enter the map.
+        track_file_change(
+            &mut map,
+            Phase::Started,
+            &json!({"type": "commandExecution", "id": "c1", "command": "ls"}),
         );
-        assert_eq!(q.header, "Approve file change");
-        assert!(q.question.contains("/a.rs, /b.rs"));
+        assert!(map.is_empty());
+    }
 
-        // Command as argv array joins with spaces.
-        let q = approval_question(
-            "item/commandExecution/requestApproval",
-            &json!({"command": ["git", "push", "--force"]}),
-        );
-        assert!(q.question.contains("git push --force"));
+    #[test]
+    fn tracked_file_changes_are_bounded() {
+        // An unbounded map here is `DEBT.md` D10's mistake with a new name. At
+        // the cap a new item is not recorded, so its approval degrades to
+        // Unknown — vague, and un-allowlistable, which is the safe direction.
+        let mut map = HashMap::new();
+        for i in 0..MAX_TRACKED_FILE_CHANGES + 10 {
+            let item = json!({"type": "fileChange", "id": format!("f{i}"),
+                              "changes": [{"path": "/a.rs", "kind": {"type": "add"}}]});
+            track_file_change(&mut map, Phase::Started, &item);
+        }
+        assert_eq!(map.len(), MAX_TRACKED_FILE_CHANGES);
     }
 
     #[test]

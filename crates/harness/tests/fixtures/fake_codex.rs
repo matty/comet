@@ -307,9 +307,9 @@ fn steer(stdin: &mut StdinLock<'_>, tid: &str) {
 }
 
 fn approve(stdin: &mut StdinLock<'_>, turn_line: &str, thread_line: &str, tid: &str) {
-    // Wire policy is always "never" (unattended parity with the Claude
-    // adapter); the requests below are the STRAY-approval path, which must
-    // still round-trip as input questions.
+    // Task 7 flips this to the mode-derived policy; until then the wire pin
+    // stands, and the requests below exercise the route regardless of it —
+    // the fake raises them whatever the policy says.
     if !thread_line.contains(r#""approvalPolicy":"never""#) {
         fail_turn(tid, "thread approvalPolicy should be never");
         return;
@@ -322,8 +322,10 @@ fn approve(stdin: &mut StdinLock<'_>, turn_line: &str, thread_line: &str, tid: &
         r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
     ));
     emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    // The launcher invocation and the parsed action differ, as they do live:
+    // the card must name the action, not the pwsh path around it.
     emit(
-        r#"{"id":101,"method":"item/commandExecution/requestApproval","params":{"itemId":"c1","command":"rm -rf /tmp/x"}}"#,
+        r#"{"id":101,"method":"item/commandExecution/requestApproval","params":{"itemId":"c1","command":"pwsh.exe -Command 'rm -rf /tmp/x'","commandActions":[{"type":"unknown","command":"rm -rf /tmp/x"}],"cwd":"/tmp"}}"#,
     );
     let a1 = read_line(stdin);
     if !(a1.contains(r#""id":101"#) && a1.contains(r#""decision":"accept""#)) {
@@ -332,13 +334,30 @@ fn approve(stdin: &mut StdinLock<'_>, turn_line: &str, thread_line: &str, tid: &
         );
         return;
     }
+    // A file-change approval carries NO path — the detail is only ever on the
+    // item that precedes it, so the fake announces it the way the server does.
     emit(
-        r#"{"id":102,"method":"item/fileChange/requestApproval","params":{"itemId":"f1","changes":[{"path":"/tmp/a.rs","kind":"update"}]}}"#,
+        r#"{"method":"item/started","params":{"item":{"type":"fileChange","id":"f1","status":"inProgress","changes":[{"path":"/tmp/a.rs","kind":{"type":"update"},"diff":"@@ -1 +1,2 @@\n one\n+two\n"}]}}}"#,
+    );
+    emit(
+        r#"{"id":102,"method":"item/fileChange/requestApproval","params":{"itemId":"f1","startedAtMs":1,"reason":null,"grantRoot":null}}"#,
     );
     let a2 = read_line(stdin);
     if !(a2.contains(r#""id":102"#) && a2.contains(r#""decision":"accept""#)) {
         emit(
             r#"{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"file approval not accepted"}}}}"#,
+        );
+        return;
+    }
+    // An approval whose item was never announced: the adapter must still ask,
+    // as an Unknown, rather than inventing a path or dropping the request.
+    emit(
+        r#"{"id":103,"method":"item/fileChange/requestApproval","params":{"itemId":"never-seen","startedAtMs":1}}"#,
+    );
+    let a3 = read_line(stdin);
+    if !(a3.contains(r#""id":103"#) && a3.contains(r#""decision":"accept""#)) {
+        emit(
+            r#"{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"unjoined approval not accepted"}}}}"#,
         );
         return;
     }
