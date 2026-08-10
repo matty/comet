@@ -1555,6 +1555,20 @@ impl Pickers {
             .unwrap_or_default()
     }
 
+    /// Whether the chat's provider delivers a denial's note to the model.
+    /// `false` while the descriptor list is still loading: under-promising for
+    /// a frame is recoverable, promising delivery wrongly is not.
+    pub fn carries_deny_note(&self, cx: &App) -> bool {
+        self.effective_harness(cx)
+            .and_then(|h| {
+                self.harnesses
+                    .ready()
+                    .and_then(|list| list.iter().find(|d| d.id == h))
+                    .map(|d| d.capabilities.carries_deny_note)
+            })
+            .unwrap_or(false)
+    }
+
     /// The viewed harness's model list, when loaded (keyboard nav rows).
     fn model_rows_len(&self, cx: &App) -> usize {
         self.effective_harness(cx)

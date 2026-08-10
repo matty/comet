@@ -407,6 +407,20 @@ pub fn pending_input_request(
         })
 }
 
+/// What the borrowed input promises while an approval is waiting.
+///
+/// The note is worth typing either way — it is a record of the refusal that
+/// stays in the chat — but only some providers put it on the wire. Codex's
+/// decisions are bare literals with no message field, so a field labelled "for
+/// the agent" there promises a delivery that never happens (`DEBT.md` D24).
+pub fn deny_note_placeholder(carries_deny_note: bool) -> &'static str {
+    if carries_deny_note {
+        "Add a note for the agent (optional)"
+    } else {
+        "Add a note for this chat — the agent won't receive it"
+    }
+}
+
 /// Whether the transcript shows `request_id` explicitly resolved (here or on
 /// another device) — the wizard latch's release condition.
 pub fn input_request_resolved(transcript: &[SessionMessageEntry], request_id: &str) -> bool {
@@ -3836,9 +3850,10 @@ impl Composer {
             } else {
                 // Re-assert on every later state change: the wizard's own arm
                 // below can reclaim the placeholder when both are pending.
-                self.input.update(cx, |input, cx| {
-                    input.set_placeholder("Add a note for the agent (optional)", cx)
-                });
+                let placeholder =
+                    deny_note_placeholder(self.pickers.read(cx).carries_deny_note(cx));
+                self.input
+                    .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
             }
         } else if had_approval {
             // The row just retired with no local click behind it — Expired,
@@ -4544,6 +4559,7 @@ impl Composer {
     /// displaced by an approval and one displaced by a chat switch survive the
     /// same way.
     fn park_draft_for_note(&mut self, cx: &mut Context<Self>) {
+        let placeholder = deny_note_placeholder(self.pickers.read(cx).carries_deny_note(cx));
         let draft = self.input.read(cx).text().to_string();
         if draft.is_empty() {
             self.drafts.remove(&self.current_key);
@@ -4552,7 +4568,7 @@ impl Composer {
         }
         self.input.update(cx, |input, cx| {
             input.set_text("", cx);
-            input.set_placeholder("Add a note for the agent (optional)", cx);
+            input.set_placeholder(placeholder, cx);
         });
     }
 
@@ -5417,6 +5433,21 @@ mod tests {
             range,
             path: path.into(),
         }
+    }
+
+    /// A provider that cannot carry the note must not have a field promising
+    /// it will (`DEBT.md` D24). The field stays — the note is still a record
+    /// the user reads back in this chat — but the label stops overselling it.
+    #[test]
+    fn the_note_field_does_not_promise_what_the_provider_cannot_deliver() {
+        assert_eq!(
+            deny_note_placeholder(true),
+            "Add a note for the agent (optional)"
+        );
+        assert_eq!(
+            deny_note_placeholder(false),
+            "Add a note for this chat — the agent won't receive it"
+        );
     }
 
     #[test]
