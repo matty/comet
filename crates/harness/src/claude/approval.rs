@@ -10,13 +10,19 @@ use comet_proto::{ApprovalRequest, FileOperation};
 use super::wire::ControlRequestBody;
 
 pub(crate) fn approval_request(body: &ControlRequestBody) -> ApprovalRequest {
-    let str_field = |key: &str| {
+    // Two readings, because emptiness means different things per field. For a
+    // path or a command an empty string carries no more information than an
+    // absent one, so both degrade to `Unknown`. For the CONTENT of a write it
+    // is a value: `{"file_path":"x","content":""}` is claude creating an empty
+    // file, and reading that "" as absence renders it "+0 −0" with no
+    // operation at all instead of a create.
+    let raw_field = |key: &str| {
         body.input
             .get(key)
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
             .map(str::to_owned)
     };
+    let str_field = |key: &str| raw_field(key).filter(|s| !s.is_empty());
 
     match body.tool_name.as_str() {
         "Bash" => match str_field("command") {
@@ -37,8 +43,8 @@ pub(crate) fn approval_request(body: &ControlRequestBody) -> ApprovalRequest {
             let Some(path) = str_field("file_path") else {
                 return unknown(&body.tool_name);
             };
-            let old = str_field("old_string").unwrap_or_default();
-            let new = str_field("new_string").or_else(|| str_field("content"));
+            let old = raw_field("old_string").unwrap_or_default();
+            let new = raw_field("new_string").or_else(|| raw_field("content"));
             let (operation, added, removed) = match (&new, old.is_empty()) {
                 // Write with content and no prior text: a create.
                 (Some(text), true) if body.tool_name == "Write" => {
@@ -122,6 +128,23 @@ mod tests {
                 path: "a.txt".into(),
                 operation: FileOperation::Create,
                 added_lines: 1,
+                removed_lines: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn writing_an_empty_file_is_still_a_create() {
+        // `content: ""` is claude creating an empty file — a shape it emits.
+        // Read as absence it fell through to `FileOperation::Unknown`, so the
+        // card said "Change a file · +0 −0" for a plain create.
+        let got = approval_request(&body("Write", json!({"file_path": "a.txt", "content": ""})));
+        assert_eq!(
+            got,
+            ApprovalRequest::FileChange {
+                path: "a.txt".into(),
+                operation: FileOperation::Create,
+                added_lines: 0,
                 removed_lines: 0,
             }
         );
@@ -231,9 +254,10 @@ mod tests {
 
     #[test]
     fn an_edit_that_empties_the_text_is_a_pure_deletion() {
-        // (None, false) arm: new_string present but empty is filtered out by
-        // str_field, so this lands on the "no replacement text" branch with a
-        // non-empty old_string — a Modify that only removes lines.
+        // An empty `new_string` is a value — "replace it with nothing" — so it
+        // is read as present and counted as zero added lines against the old
+        // string's two. (The `(None, false)` arm, no `new_string` key at all,
+        // is the same answer by a different route.)
         let got = approval_request(&body(
             "Edit",
             json!({"file_path": "a.txt", "old_string": "one\ntwo\n", "new_string": ""}),

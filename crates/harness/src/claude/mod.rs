@@ -681,6 +681,17 @@ fn handle_control_request(
         // written blind — none of the nine 2026-08-10 capture runs against
         // Claude Code 2.1.226 produced one of these, so it is checked
         // against the typings, not a live frame.
+        //
+        // If one of the non-dialog subtypes ever does fire, the safer generic
+        // reply is a `control_response` with `subtype: "error"` (an
+        // `error` string in place of `response`): "this host does not serve
+        // that request" is true of every unclaimed subtype, whereas
+        // `{behavior:"cancelled"}` claims a permission answer the caller may
+        // not have asked for. Exposure is near zero today — Comet does no
+        // initialize handshake and declares no SDK hooks or SDK MCP servers,
+        // which is why the capture runs saw none — so the reply that IS
+        // specified for the one reachable kind stays until a live frame says
+        // otherwise.
         tracing::warn!(
             target: "comet_harness::claude",
             request = %serde_json::json!({
