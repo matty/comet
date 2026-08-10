@@ -72,6 +72,43 @@ pub(crate) type MintedApprovals = Arc<Mutex<HashSet<String>>>;
 /// Signatures the user allowed for the rest of this run.
 pub(crate) type SessionAllowlist = Arc<Mutex<HashSet<String>>>;
 
+/// Park an approval where `respond_approval` will find it — unless the user
+/// already allowed this exact action for the session, in which case the
+/// resolver comes back unparked for the caller to answer itself.
+///
+/// **`pending` is taken first and held across the read of `session_allowed`,
+/// and `respond_approval` takes the same two in the same order and holds
+/// `pending` across its write.** That single ordering is the whole point of
+/// this function existing. The check used to run under `session_allowed`
+/// alone, release it, and only then take `pending` — so a grant landing in
+/// between wrote its signature and swept a `pending` this request had not
+/// reached yet, leaving it open. The user was asked for a click a moment after
+/// saying "don't ask again". It failed closed (asked rather than allowed), so
+/// it was never a permission hole, only a promise the UI visibly broke.
+fn park_unless_session_allows(
+    pending: &PendingApprovals,
+    session_allowed: &SessionAllowlist,
+    request_id: &str,
+    signature: Option<String>,
+    resolver: oneshot::Sender<ApprovalDecision>,
+) -> Option<oneshot::Sender<ApprovalDecision>> {
+    let mut pending = lock(pending);
+    if signature
+        .as_deref()
+        .is_some_and(|sig| lock(session_allowed).contains(sig))
+    {
+        return Some(resolver);
+    }
+    pending.insert(
+        request_id.to_string(),
+        PendingApproval {
+            signature,
+            resolver,
+        },
+    );
+    None
+}
+
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
 /// directory — comet sessions.ts:563 "harness session stores are keyed by
@@ -392,11 +429,16 @@ impl SessionsEngine {
                 let (tx, rx) = oneshot::channel();
                 let request_id = new_id();
                 let signature = crate::approvals::approval_signature(&approval);
-                let pre_allowed = signature
-                    .as_ref()
-                    .is_some_and(|sig| lock(&session_allowed).contains(sig));
                 lock(&minted).insert(request_id.clone());
-                if pre_allowed {
+                // Check-and-park is one critical section; see the function.
+                let pre_allowed = park_unless_session_allows(
+                    &pending,
+                    &session_allowed,
+                    &request_id,
+                    signature,
+                    tx,
+                );
+                if let Some(tx) = pre_allowed {
                     let _ = engine_tx.send(AgentEvent::ApprovalRequested {
                         request_id: request_id.clone(),
                         approval,
@@ -418,13 +460,6 @@ impl SessionsEngine {
                     });
                     return rx;
                 }
-                lock(&pending).insert(
-                    request_id.clone(),
-                    PendingApproval {
-                        signature,
-                        resolver: tx,
-                    },
-                );
                 if engine_tx
                     .send(AgentEvent::ApprovalRequested {
                         request_id: request_id.clone(),
@@ -621,34 +656,43 @@ impl SessionsEngine {
         let Some((pending, session_allowed, engine_tx)) = target else {
             return Ok(false);
         };
-        let Some(parked) = lock(&pending).remove(request_id) else {
-            return Ok(false);
-        };
-        // "Allow for this session" on an action Comet could not identify
-        // (`signature: None`) allows THIS call only — there is no rule to write.
-        let mut also_granted: Vec<(String, oneshot::Sender<ApprovalDecision>)> = Vec::new();
-        if decision == ApprovalDecision::AllowForSession
-            && let Some(signature) = parked.signature
-        {
-            lock(&session_allowed).insert(signature.clone());
-            // The grant applies to identical requests ALREADY waiting, not
-            // just to ones minted after it: claude batches parallel tool
-            // calls, so two copies of the same action can be parked at once
-            // and the pre-allow check at mint time ran before either. Leaving
-            // the second one open asks for a click one second after the user
-            // said not to ask again.
+        // One critical section, and `pending` is held across the write to
+        // `session_allowed` — the same lock order `park_unless_session_allows`
+        // takes, and for the reason documented there: a request being minted
+        // must land either wholly before this grant (and be swept below) or
+        // wholly after it (and read the signature back). Nothing is sent from
+        // in here; the resolvers travel out and are answered below.
+        let (parked, also_granted) = {
             let mut pending = lock(&pending);
-            let same: Vec<String> = pending
-                .iter()
-                .filter(|(_, p)| p.signature.as_deref() == Some(signature.as_str()))
-                .map(|(id, _)| id.clone())
-                .collect();
-            for id in same {
-                if let Some(p) = pending.remove(&id) {
-                    also_granted.push((id, p.resolver));
+            let Some(parked) = pending.remove(request_id) else {
+                return Ok(false);
+            };
+            // "Allow for this session" on an action Comet could not identify
+            // (`signature: None`) allows THIS call only — no rule to write.
+            let mut also_granted: Vec<(String, oneshot::Sender<ApprovalDecision>)> = Vec::new();
+            if decision == ApprovalDecision::AllowForSession
+                && let Some(signature) = parked.signature.as_deref()
+            {
+                lock(&session_allowed).insert(signature.to_string());
+                // The grant applies to identical requests ALREADY waiting, not
+                // just to ones minted after it: claude batches parallel tool
+                // calls, so two copies of the same action can be parked at once
+                // and the pre-allow check at mint time ran before either.
+                // Leaving the second one open asks for a click one second after
+                // the user said not to ask again.
+                let same: Vec<String> = pending
+                    .iter()
+                    .filter(|(_, p)| p.signature.as_deref() == Some(signature))
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in same {
+                    if let Some(p) = pending.remove(&id) {
+                        also_granted.push((id, p.resolver));
+                    }
                 }
             }
-        }
+            (parked, also_granted)
+        };
         let _ = parked.resolver.send(decision.clone());
         let _ = engine_tx.send(AgentEvent::ApprovalResolved {
             request_id: request_id.to_string(),
@@ -1727,6 +1771,64 @@ mod tests {
             question: input_rx,
             _bridges: (pending_inputs, pending_approvals),
         }
+    }
+
+    #[test]
+    fn a_grant_that_lands_mid_mint_is_read_rather_than_missed() {
+        // The window this lock order closes. The bridge used to read
+        // `session_allowed`, release it, and only then take `pending`; a grant
+        // slipping into that gap wrote its signature and swept a `pending` the
+        // new request had not reached yet, so the request stayed open and the
+        // user was asked for a click a moment after saying "don't ask again".
+        //
+        // Deterministic because this thread stands in for `respond_approval`'s
+        // critical section: it holds `pending` — the lock `respond_approval`
+        // now holds across its grant — and writes the signature while the
+        // minting thread is running. With the fix the minting thread is still
+        // waiting on `pending` and reads the signature after it; without it,
+        // the minting thread has already read `session_allowed` and parks
+        // regardless.
+        //
+        // The sleep is a head start for the WRONG behavior, never the right
+        // one: a machine too loaded to get through those few instructions in
+        // 50ms loses this coverage rather than gaining a flake.
+        let pending: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        let session_allowed: SessionAllowlist = Arc::new(Mutex::new(HashSet::new()));
+        let signature = "sig-1".to_string();
+        let (resolver, _rx) = oneshot::channel::<ApprovalDecision>();
+
+        let granting = lock(&pending);
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let minting = std::thread::spawn({
+            let pending = pending.clone();
+            let session_allowed = session_allowed.clone();
+            let signature = signature.clone();
+            let started = started.clone();
+            move || {
+                started.wait();
+                park_unless_session_allows(
+                    &pending,
+                    &session_allowed,
+                    "req-1",
+                    Some(signature),
+                    resolver,
+                )
+                .is_some()
+            }
+        });
+        started.wait();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        lock(&session_allowed).insert(signature);
+        drop(granting);
+
+        assert!(
+            minting.join().unwrap(),
+            "a request minted around a session grant must read the grant, not park behind it"
+        );
+        assert!(
+            lock(&pending).is_empty(),
+            "and must leave nothing parked for the user to click"
+        );
     }
 
     #[test]
