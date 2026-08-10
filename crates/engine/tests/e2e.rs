@@ -100,6 +100,7 @@ impl Harness for ScriptedHarness {
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![ReasoningLevel::Medium],
             runtime_modes: Vec::new(),
+            ..HarnessCapabilities::default()
         }
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
@@ -801,6 +802,92 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
             .iter()
             .any(|e| e.id == "m-2" && e.role == MessageRole::User)
     );
+}
+
+/// A mode change applies to the next dispatch, including one that takes the
+/// remembered-request fallback. The remembered request is stamped at the
+/// previous dispatch and never updated, so without the overlay a user who
+/// tightens a chat to `approval-required` and then steers would still run
+/// under the looser mode the last turn used — the divergence `DEBT.md` D11
+/// records, and it runs in the permissive direction.
+#[tokio::test]
+async fn a_tightened_mode_reaches_a_steer_turned_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    let config = |mode: RuntimeMode| comet_proto::ChatConfig {
+        harness: HarnessId::Mock,
+        model: None,
+        reasoning: None,
+        model_options: Default::default(),
+        sandbox: mode.sandbox(),
+        runtime_mode: mode,
+    };
+    core.workspace
+        .create_space("space-mode", &core.device_id, "/tmp", None, false)
+        .expect("create space row");
+    core.workspace
+        .create_chat(
+            CHAT,
+            "space-mode",
+            Some(config(RuntimeMode::AutoAcceptEdits)),
+            Some("/tmp".into()),
+        )
+        .expect("create chat row");
+
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-1",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "first run settled",
+    )
+    .await;
+    assert_eq!(
+        core.sessions.last_request(CHAT).map(|r| r.runtime_mode),
+        Some(RuntimeMode::AutoAcceptEdits),
+        "the first turn stamped the mode it ran under"
+    );
+
+    // The user tightens the chat between turns.
+    core.workspace
+        .set_chat_config(CHAT, &config(RuntimeMode::ApprovalRequired))
+        .expect("tighten the mode");
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-steer-1",
+        SessionCommandPayload::Steer {
+            prompt: "also do this".into(),
+            message_id: Some("m-2".into()),
+        },
+    );
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "cmd-steer-1"),
+                Some((SessionCommandStatus::Applied, Some(_)))
+            )
+        },
+        "steer fallback applied",
+    )
+    .await;
+
+    let dispatched = core.sessions.last_request(CHAT).expect("a second dispatch");
+    assert_eq!(dispatched.runtime_mode, RuntimeMode::ApprovalRequired);
+    // The sandbox is re-derived rather than carried over, so the request's two
+    // permission fields cannot be dispatched disagreeing.
+    assert_eq!(dispatched.sandbox, SandboxLevel::ReadOnly);
 }
 
 #[tokio::test]
@@ -1717,6 +1804,7 @@ impl Harness for CapturingHarness {
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![ReasoningLevel::Medium],
             runtime_modes: Vec::new(),
+            ..HarnessCapabilities::default()
         }
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
@@ -2325,6 +2413,7 @@ impl Harness for SteeredWhileAskingHarness {
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![ReasoningLevel::Medium],
             runtime_modes: Vec::new(),
+            ..HarnessCapabilities::default()
         }
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {

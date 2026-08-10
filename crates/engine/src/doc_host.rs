@@ -576,6 +576,10 @@ impl DocHost {
                             ));
                         };
                         request.prompt = prompt.clone();
+                        // The remembered request carries the previous turn's
+                        // mode; this dispatch runs under the one the chat names
+                        // now.
+                        self.apply_chat_row_runtime_mode(chat_id, &mut request);
                         request.resume = None; // dispatch re-derives the harness session
                         // A reused config must not re-inline the PREVIOUS
                         // turn's images; this steer's own refs (if any) already
@@ -653,6 +657,9 @@ impl DocHost {
                     ));
                 };
                 request.prompt = respond_input_prompt(&questions, answers);
+                // As above: the answer runs under the chat's current mode, not
+                // the one the dead run happened to be started with.
+                self.apply_chat_row_runtime_mode(chat_id, &mut request);
                 request.resume = None; // dispatch re-derives the harness session
                 request.attachments = Vec::new();
                 if let Err(err) = handle.doc.resolve_input(request_id) {
@@ -733,6 +740,46 @@ impl DocHost {
             cwd: chat.cwd.unwrap_or_default(),
             ..comet_proto::RunRequest::for_session(runtime_mode)
         })
+    }
+
+    /// Overlay the chat row's *current* runtime mode onto a request rebuilt
+    /// from the remembered one, and re-derive the sandbox from it.
+    ///
+    /// `last_request` is stamped at dispatch and never touched again, so it
+    /// carries the mode of the previous turn. A mode change applies to the next
+    /// dispatch — there is no mid-process change to make, since the provider
+    /// was spawned with its permission mode — and these fallback paths *are* a
+    /// next dispatch. Without this the divergence runs in the permissive
+    /// direction: a user tightens a chat to `approval-required`, steers, and
+    /// the steered run still writes unattended (`DEBT.md` D11).
+    ///
+    /// The sandbox is derived here rather than carried over, because the two
+    /// must not be left disagreeing — the same rule `apply_owned_fields`
+    /// follows in the UI. Titling's never-ask/read-only pairing is unaffected:
+    /// it builds its own request and never takes this path.
+    pub(crate) fn apply_chat_row_runtime_mode(
+        &self,
+        chat_id: &str,
+        request: &mut comet_proto::RunRequest,
+    ) {
+        let Some(mode) = self.chat_row_runtime_mode(chat_id) else {
+            return; // no workspace or no row: the remembered mode is all there is
+        };
+        request.runtime_mode = mode;
+        request.sandbox = mode.sandbox();
+    }
+
+    /// The mode the chat row currently names, if the row exists and carries a
+    /// config. `None` is "unknown", never "the default".
+    fn chat_row_runtime_mode(&self, chat_id: &str) -> Option<comet_proto::RuntimeMode> {
+        let workspace = self.workspace()?;
+        match workspace.doc().chat(chat_id) {
+            Ok(chat) => chat?.config.map(|c| c.runtime_mode),
+            Err(err) => {
+                tracing::warn!(chat = %chat_id, error = %err, "workspace chat read failed");
+                None
+            }
+        }
     }
 
     fn save_snapshot(&self, handle: &ChatDocHandle) {
