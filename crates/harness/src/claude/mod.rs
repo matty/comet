@@ -676,9 +676,11 @@ fn handle_control_request(
         // hanging: sdk.d.ts requires a host to reply `{behavior:"cancelled"}`
         // to a `request_user_dialog` kind it does not recognize, and skipping
         // that reply leaves the CLI waiting on an answer that never comes.
-        // The reply shape is written blind — none of the nine 2026-08-10
-        // capture runs against Claude Code 2.1.226 produced one of these, so
-        // it is checked against the typings, not a live frame.
+        // Comet applies the same reply to every unclaimed subtype (~52
+        // others), which the SDK does not specify. The reply shape is
+        // written blind — none of the nine 2026-08-10 capture runs against
+        // Claude Code 2.1.226 produced one of these, so it is checked
+        // against the typings, not a live frame.
         tracing::warn!(
             target: "comet_harness::claude",
             request = %serde_json::json!({
@@ -957,6 +959,14 @@ mod control_request_tests {
             &approver,
             &stdin_tx,
         );
+        // `#[tokio::test]` is a current-thread runtime: it never polls a
+        // `tokio::spawn`ed task while this body runs synchronously. If the
+        // guard above were deleted, the approval route would spawn a task
+        // that calls the approver — but without a yield here, that task
+        // would never be polled and `asked` would read false regardless of
+        // whether the bridge was reached. Yielding once gives any spawned
+        // task its first poll, which is after the approver closure runs.
+        tokio::task::yield_now().await;
         assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
     }
 
