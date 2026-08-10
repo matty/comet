@@ -150,10 +150,16 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                 .unwrap_or_default()
                 .iter()
                 .map(|c| {
-                    // Unknown kinds degrade to "update", like codex.ts.
+                    // `kind` is an OBJECT on the wire — `{"type":"add"}`,
+                    // `{"type":"update","move_path":null}` (codex-cli 0.147.0,
+                    // captured 2026-08-10). Reading it only as a string answered
+                    // `None` for every change and fell through to "update", so a
+                    // file the agent created rendered as an edit. The bare-string
+                    // arm is kept for an older peer; unknown kinds still degrade
+                    // to "update", like codex.ts.
                     let kind = c
                         .get("kind")
-                        .and_then(Value::as_str)
+                        .and_then(|k| k.as_str().or_else(|| k.get("type").and_then(Value::as_str)))
                         .filter(|k| matches!(*k, "add" | "delete" | "update"))
                         .unwrap_or("update");
                     (str_field(c, &["path"]), kind.to_owned())
@@ -471,6 +477,10 @@ mod tests {
         );
     }
 
+    // These fixtures spell `kind` as a bare string, which is NOT what
+    // codex-cli 0.147.0 sends — see `a_file_changes_kind_is_an_object_on_the_wire`
+    // for the live shape. They are kept deliberately, as the coverage for the
+    // fallback arms: an older peer's string, and a change with no `kind` at all.
     #[test]
     fn file_change_variants_map_to_typed_calls() {
         let add = map_item(
@@ -519,6 +529,60 @@ mod tests {
             vec![AgentEvent::ToolCall {
                 id: "f3".into(),
                 call: ToolCall::ApplyPatch { path: None },
+            }]
+        );
+    }
+
+    #[test]
+    fn a_file_changes_kind_is_an_object_on_the_wire() {
+        // codex-cli 0.147.0 sends `{"type":"add"}` / `{"type":"update","move_path":null}`,
+        // never a bare string (capture 2026-08-10). Reading it as a string
+        // answered `None` and fell back to "update", so every file the agent
+        // CREATED rendered as an edit, and every delete did too.
+        let add = map_item(
+            Phase::Started,
+            &json!({"type": "fileChange", "id": "f1",
+                    "changes": [{"path": "/a.rs", "kind": {"type": "add"}, "diff": "hello\n"}]}),
+        );
+        assert_eq!(
+            add,
+            vec![AgentEvent::ToolCall {
+                id: "f1".into(),
+                call: ToolCall::WriteFile {
+                    path: "/a.rs".into(),
+                    content: None
+                },
+            }]
+        );
+        let update = map_item(
+            Phase::Started,
+            &json!({"type": "fileChange", "id": "f2",
+                    "changes": [{"path": "/b.rs", "kind": {"type": "update", "move_path": null}}]}),
+        );
+        assert_eq!(
+            update,
+            vec![AgentEvent::ToolCall {
+                id: "f2".into(),
+                call: ToolCall::EditFile {
+                    path: "/b.rs".into(),
+                    old_string: None,
+                    new_string: None
+                },
+            }]
+        );
+        // A delete is a patch, and it is the arm that silently read as an edit.
+        let delete = map_item(
+            Phase::Started,
+            &json!({"type": "fileChange", "id": "f3",
+                    "changes": [{"path": "/c.rs", "kind": {"type": "delete"}}]}),
+        );
+        assert_eq!(
+            delete,
+            vec![AgentEvent::ToolCall {
+                id: "f3".into(),
+                call: ToolCall::ApplyPatch {
+                    path: Some("/c.rs".into())
+                },
             }]
         );
     }

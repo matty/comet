@@ -79,6 +79,27 @@ pub(crate) fn sandbox_policy_value(sandbox: SandboxLevel) -> serde_json::Value {
 /// `"never"`, so no approval is ever raised for a reviewer to answer. It is
 /// sent anyway so the thread carries the mode's full intent, and so the
 /// change that unpins the policy changes one literal rather than three.
+/// `thread/start`'s and `turn/start`'s `approvalPolicy`: when the server stops
+/// to ask.
+///
+/// **`untrusted` and `on-request` are not two settings on one dial** — captured
+/// 2026-08-10, and worth knowing before reading either name as a severity:
+///
+/// - `untrusted` asks **before every command**, with no `reason`. One turn asked
+///   four times for two commands, because each retry is a fresh request.
+/// - `on-request` asks **only after a sandboxed attempt has already failed**,
+///   carrying a `reason` that says so. The user sees a failed command in the
+///   transcript first, then a card offering to run it unsandboxed.
+///
+/// `never` removes the prompt, which is what `FullAccess` means on the wire.
+pub(crate) fn approval_policy(mode: RuntimeMode) -> &'static str {
+    match mode {
+        RuntimeMode::ApprovalRequired => "untrusted",
+        RuntimeMode::AutoAcceptEdits | RuntimeMode::Auto => "on-request",
+        RuntimeMode::FullAccess => "never",
+    }
+}
+
 pub(crate) fn approvals_reviewer(mode: RuntimeMode) -> &'static str {
     match mode {
         RuntimeMode::Auto => "auto_review",
@@ -246,6 +267,22 @@ mod tests {
             (RuntimeMode::FullAccess, "user"),
         ] {
             assert_eq!(approvals_reviewer(mode), want, "{mode:?}");
+        }
+    }
+
+    /// Every mode maps to a policy literal `AskForApproval` accepts. The pair
+    /// that matters is the middle two: they share `on-request`, which asks only
+    /// after a sandboxed attempt fails, while `ApprovalRequired` takes
+    /// `untrusted`, which asks before every command.
+    #[test]
+    fn every_runtime_mode_maps_to_a_schema_approval_policy() {
+        for (mode, want) in [
+            (RuntimeMode::ApprovalRequired, "untrusted"),
+            (RuntimeMode::AutoAcceptEdits, "on-request"),
+            (RuntimeMode::Auto, "on-request"),
+            (RuntimeMode::FullAccess, "never"),
+        ] {
+            assert_eq!(approval_policy(mode), want, "{mode:?}");
         }
     }
 }
