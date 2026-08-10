@@ -416,6 +416,15 @@ pub(crate) fn allow_response(updated_input: Value) -> Value {
     json!({ "behavior": "allow", "updatedInput": updated_input })
 }
 
+/// The reply sdk.d.ts requires for a dialog kind the host does not recognize.
+/// Leaving it unanswered leaves the CLI waiting on a reply that never comes.
+/// Written blind: none of the nine 2026-08-10 capture runs against Claude
+/// Code 2.1.226 produced a non-`can_use_tool` control request, so this shape
+/// is unverified against a live frame — only against the SDK's typings.
+pub(crate) fn cancelled_response() -> Value {
+    json!({ "behavior": "cancelled" })
+}
+
 /// Client→CLI interrupt control request.
 pub(crate) fn interrupt_request_line(request_id: &str) -> String {
     json!({

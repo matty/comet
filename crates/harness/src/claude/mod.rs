@@ -40,7 +40,10 @@ use comet_proto::{
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
 use catalog::{apply_ultrathink, static_models, to_effort};
 use normalize::Normalizer;
-use wire::{ControlRequestFrame, Frame, allow_response, control_response_line, deny_response};
+use wire::{
+    ControlRequestFrame, Frame, allow_response, cancelled_response, control_response_line,
+    deny_response,
+};
 
 /// Locate the device's installed Claude Code CLI: `CLAUDE_CODE_EXECUTABLE`,
 /// then our own PATH, then the system's own PATH (a GUI/service launch's PATH
@@ -667,13 +670,15 @@ fn handle_control_request(
     stdin_tx: &mpsc::UnboundedSender<StdinMsg>,
 ) -> Option<AgentEvent> {
     if req.request.subtype != "can_use_tool" {
-        // Sink 3: an unclaimed inbound control request — counted, and
-        // deliberately NOT answered. The SDK's `request_user_dialog` contract
-        // says hosts should reply `{behavior:"cancelled"}` to dialog kinds
-        // they don't recognize; adopting that is a behaviour change deferred
-        // to whichever slice first claims a control-request subtype. ~53
-        // subtypes exist in the SDK's inbound union and the capture saw none
-        // fire, so their frequency is unknown, not zero.
+        // Sink 3: an unclaimed inbound control request. Still counted as a
+        // diagnostic — a subtype Comet does not model is still something the
+        // user should be able to see was ignored — but no longer left
+        // hanging: sdk.d.ts requires a host to reply `{behavior:"cancelled"}`
+        // to a `request_user_dialog` kind it does not recognize, and skipping
+        // that reply leaves the CLI waiting on an answer that never comes.
+        // The reply shape is written blind — none of the nine 2026-08-10
+        // capture runs against Claude Code 2.1.226 produced one of these, so
+        // it is checked against the typings, not a live frame.
         tracing::warn!(
             target: "comet_harness::claude",
             request = %serde_json::json!({
@@ -684,10 +689,15 @@ fn handle_control_request(
             }),
             "unclaimed control_request (recorded as a diagnostic)"
         );
-        return Some(crate::diagnostic(
+        let event = crate::diagnostic(
             &format!("control_request/{}", req.request.subtype),
             DiagnosticSeverity::Unknown,
-        ));
+        );
+        let _ = stdin_tx.send(StdinMsg::Line(control_response_line(
+            &req.request_id,
+            cancelled_response(),
+        )));
+        return Some(event);
     }
     if req.request.tool_name == "AskUserQuestion" {
         let request_input = Arc::clone(request_input);
@@ -905,15 +915,10 @@ mod control_request_tests {
         }
     }
 
-    /// Sink 3: an unclaimed subtype is counted (Unknown, control_request/-
-    /// prefixed) and — deliberately — not answered. The SDK's
-    /// request_user_dialog contract says hosts must reply
-    /// {behavior:"cancelled"}; replying is a behaviour change to a frame the
-    /// capture never saw fire, deferred to whichever slice first claims a
-    /// control-request subtype.
-    #[test]
-    fn an_unclaimed_control_request_becomes_a_diagnostic_and_no_reply() {
-        use comet_proto::DiagnosticSeverity;
+    /// Sink 3, now answered. Still counted — a subtype Comet does not understand
+    /// is still a thing the user should be able to see was ignored.
+    #[tokio::test]
+    async fn an_unclaimed_control_request_is_cancelled_and_still_counted() {
         let (request_input, stdin_tx, mut stdin_rx) = bridge();
         let ev = handle_control_request(
             frame("request_user_dialog", ""),
@@ -923,14 +928,36 @@ mod control_request_tests {
         );
         assert_eq!(
             ev,
-            Some(AgentEvent::Diagnostic {
-                discriminator: "control_request/request_user_dialog".into(),
-                severity: DiagnosticSeverity::Unknown,
-                code: None,
-                summary: "The agent sent a message Comet doesn't recognize.".into(),
-            })
+            Some(crate::diagnostic(
+                "control_request/request_user_dialog",
+                DiagnosticSeverity::Unknown,
+            ))
         );
-        assert!(stdin_rx.try_recv().is_err(), "no reply is written today");
+        let sent: serde_json::Value =
+            serde_json::from_str(&recv_line(&mut stdin_rx).await).unwrap();
+        assert_eq!(sent["response"]["response"]["behavior"], "cancelled");
+        assert_eq!(sent["response"]["request_id"], "cr-1"); // what `frame()` mints
+    }
+
+    #[tokio::test]
+    async fn an_unclaimed_subtype_never_reaches_the_approval_bridge() {
+        // It is not a permission question; raising a card for it would ask the
+        // user about something Comet cannot describe.
+        let (request_input, stdin_tx, _rx) = bridge();
+        let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = asked.clone();
+        let approver: Arc<RequestApprovalFn> = Arc::new(Box::new(move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let (_tx, rx) = tokio::sync::oneshot::channel();
+            rx
+        }));
+        handle_control_request(
+            frame("request_user_dialog", ""),
+            &request_input,
+            &approver,
+            &stdin_tx,
+        );
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
