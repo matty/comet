@@ -340,6 +340,11 @@ pub struct Engine {
 
 pub struct EngineRuntime {
     core: EngineCore,
+    /// The unattended sweeper's task. Held so `shutdown` can abort it: the task
+    /// owns clones of `SessionsEngine` and `Presence`, so a detached one keeps
+    /// sweeping against shut-down stores, and every recreated embedded engine
+    /// would leave another behind.
+    sweeper: tokio::task::JoinHandle<()>,
 }
 
 impl EngineRuntime {
@@ -348,6 +353,10 @@ impl EngineRuntime {
     }
 
     pub async fn shutdown(&self) {
+        // Sweeper first: it must not start an expiry against stores that are
+        // about to close, and `interrupt` would race the run settlement
+        // `sessions.shutdown()` is performing.
+        self.sweeper.abort();
         self.core.shutdown().await;
     }
 }
@@ -377,14 +386,14 @@ impl Engine {
             Some(quiescent),
         ));
 
-        spawn_unattended_sweeper(
+        let sweeper = spawn_unattended_sweeper(
             core.sessions.clone(),
             core.presence(),
             config.unattended_timeout,
         );
 
         tracing::info!(device_id = %core.device_id, "engine core assembled");
-        Ok(EngineRuntime { core })
+        Ok(EngineRuntime { core, sweeper })
     }
 
     /// Run the local engine and opt-in LAN server until shutdown.
@@ -435,11 +444,15 @@ async fn shutdown_signal() -> std::io::Result<()> {
 /// it directly against a bare `EngineCore::assemble` core — `assemble_runtime`
 /// itself hard-codes `default_registry()`, which has no harness a test can
 /// park deterministically without a process-global env var.
+///
+/// Returns the task rather than detaching it: the loop never ends on its own,
+/// and it holds the sessions engine and presence, so only the owner aborting it
+/// stops it. [`EngineRuntime::shutdown`] is that owner.
 pub fn spawn_unattended_sweeper(
     sessions: SessionsEngine,
     presence: Arc<Presence>,
     bound: std::time::Duration,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(sweep_interval(bound));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -449,7 +462,7 @@ pub fn spawn_unattended_sweeper(
                 .expire_unattended(&presence, chrono::Utc::now(), bound)
                 .await;
         }
-    });
+    })
 }
 
 /// Serve the typed RPC on the localhost IPC port.
