@@ -204,15 +204,52 @@ pub fn reasoning_label(level: ReasoningLevel) -> &'static str {
     }
 }
 
-/// The TraitsPicker trigger summary: non-default reasoning + non-default model
-/// option choices, joined with " · " (comet: "High · 1M · Fast"). `None` when
-/// everything is at its default.
+/// Chip labels for the permission axis. User vocabulary, not the wire's: the
+/// menu says what the agent will do, never which policy string the provider is
+/// sent.
+pub fn runtime_mode_label(mode: RuntimeMode) -> &'static str {
+    match mode {
+        RuntimeMode::ApprovalRequired => "Ask first",
+        RuntimeMode::AutoAcceptEdits => "Auto-accept edits",
+        RuntimeMode::Auto => "Auto",
+        RuntimeMode::FullAccess => "Full access",
+    }
+}
+
+/// The one line under the chip row, describing the mode that is active.
+/// `FullAccess` is the only one that names a removal, because it is the only
+/// mode with no sandbox left behind it.
+pub fn runtime_mode_caption(mode: RuntimeMode) -> &'static str {
+    match mode {
+        RuntimeMode::ApprovalRequired => "Every file change and command waits for you.",
+        RuntimeMode::AutoAcceptEdits => {
+            "Edits inside the workspace go ahead; the sandbox is the boundary."
+        }
+        RuntimeMode::Auto => "Edits go ahead, and the agent reviews its own calls where it can.",
+        RuntimeMode::FullAccess => {
+            "No sandbox and no approvals — the agent can change anything on this machine."
+        }
+    }
+}
+
+/// The TraitsPicker trigger summary: a non-default runtime mode + non-default
+/// reasoning + non-default model option choices, joined with " · " (comet:
+/// "High · 1M · Fast"). `None` when everything is at its default.
+///
+/// The mode leads, because it is the only one of the three that changes what
+/// the agent is allowed to do to the machine.
 pub fn traits_summary(
     model: Option<&Model>,
     reasoning: Option<ReasoningLevel>,
     selections: &serde_json::Map<String, serde_json::Value>,
+    mode: RuntimeMode,
 ) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
+    // The default mode is what every chat has always run; naming it here would
+    // make the ordinary case read as a setting the user went and changed.
+    if mode != RuntimeMode::default() {
+        parts.push(runtime_mode_label(mode).to_string());
+    }
     if let Some(level) = reasoning {
         parts.push(reasoning_label(level).to_string());
     }
@@ -1374,6 +1411,20 @@ impl Pickers {
         cx.notify();
     }
 
+    /// The permission axis. Unlike reasoning, a pick here is **not** written
+    /// into [`ComposerDefaults`]: `full-access` chosen once for one chat must
+    /// not become the setting every later chat silently starts in.
+    fn pick_runtime_mode(&mut self, mode: RuntimeMode, cx: &mut Context<Self>) {
+        if self.state.read(cx).selected_chat.is_some() {
+            // `apply_owned_fields` re-derives `sandbox` after the change, so
+            // the row's two permission fields cannot be written disagreeing.
+            self.update_chat_config(cx, move |config| config.runtime_mode = mode);
+        } else {
+            self.config.runtime_mode = mode;
+        }
+        cx.notify();
+    }
+
     fn pick_option(
         &mut self,
         option_id: String,
@@ -1487,6 +1538,35 @@ impl Pickers {
                     .map(|d| d.capabilities.reasoning_levels.clone())
             })
             .unwrap_or_default()
+    }
+
+    /// The modes the viewed harness declares, in the order it declares them
+    /// (safest first). Empty means "the harness has not said" — never
+    /// "supports nothing" — so the section is hidden rather than offering a
+    /// pick the provider would silently ignore.
+    fn runtime_mode_choices(&self, cx: &App) -> Vec<RuntimeMode> {
+        self.effective_harness(cx)
+            .and_then(|h| {
+                self.harnesses
+                    .ready()
+                    .and_then(|list| list.iter().find(|d| d.id == h))
+                    .map(|d| d.capabilities.runtime_modes.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether the chat's provider delivers a denial's note to the model.
+    /// `false` while the descriptor list is still loading: under-promising for
+    /// a frame is recoverable, promising delivery wrongly is not.
+    pub fn carries_deny_note(&self, cx: &App) -> bool {
+        self.effective_harness(cx)
+            .and_then(|h| {
+                self.harnesses
+                    .ready()
+                    .and_then(|list| list.iter().find(|d| d.id == h))
+                    .map(|d| d.capabilities.carries_deny_note)
+            })
+            .unwrap_or(false)
     }
 
     /// The viewed harness's model list, when loaded (keyboard nav rows).
@@ -2602,8 +2682,24 @@ impl Pickers {
     /// Mouse-only — arrow keys walk the model list above, never these chips.
     fn render_traits_sections(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
+        // Built before the model gate below: the modes come from the harness
+        // descriptor, so a model catalog still loading must not hide the one
+        // control that decides what the agent may do to the machine.
+        let permissions = self.render_permissions_section(cx);
         let Some(model) = self.selected_model(cx).cloned() else {
-            return popover::skeleton_rows("traits-skeleton", &theme, 3, cx.entity_id(), cx);
+            return div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(permissions)
+                .child(popover::skeleton_rows(
+                    "traits-skeleton",
+                    &theme,
+                    3,
+                    cx.entity_id(),
+                    cx,
+                ))
+                .into_any_element();
         };
         let levels = self.trait_ladder(cx);
         // Display the effective level (draft pick or the chat's config), so
@@ -2689,8 +2785,60 @@ impl Pickers {
             .flex_col()
             .gap(px(4.0))
             .pb(px(4.0))
+            .child(permissions)
             .child(ladder)
             .child(options)
+            .into_any_element()
+    }
+
+    /// The permission axis: one chip per mode the provider declares, with a
+    /// caption for the active one. Hidden entirely when the provider has
+    /// declared none (see [`Self::runtime_mode_choices`]).
+    ///
+    /// The caption's colour is the only thing that changes with the mode —
+    /// `full-access` is amber because it is a state to be aware of, not an
+    /// error the user caused. Every layout constant is shared, so the section
+    /// is the same height whichever mode is active.
+    fn render_permissions_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let modes = self.runtime_mode_choices(cx);
+        if modes.is_empty() {
+            return gpui::Empty.into_any_element();
+        }
+        let current = self.effective_runtime_mode(cx);
+        let caption_color = if current == RuntimeMode::FullAccess {
+            theme.warning_muted
+        } else {
+            theme.text_muted.opacity(0.7)
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child(popover::menu_heading(&theme, "Permissions"))
+            .child(
+                div()
+                    .px(px(4.0))
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap(px(4.0))
+                    .children(modes.into_iter().enumerate().map(|(ix, mode)| {
+                        trait_chip(&theme, current == mode)
+                            .id(("runtime-mode-row", ix))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.pick_runtime_mode(mode, cx);
+                            }))
+                            .child(SharedString::from(runtime_mode_label(mode)))
+                    })),
+            )
+            .child(
+                div()
+                    .px(px(4.0))
+                    .pt(px(4.0))
+                    .text_size(px(11.0))
+                    .text_color(caption_color)
+                    .child(SharedString::from(runtime_mode_caption(current))),
+            )
             .into_any_element()
     }
 }
@@ -3047,6 +3195,7 @@ impl Render for Pickers {
             self.selected_model(cx),
             self.effective_reasoning(cx),
             &explicit_options,
+            self.effective_runtime_mode(cx),
         );
         let traits_label: SharedString = traits_set
             .clone()
@@ -3167,28 +3316,74 @@ mod tests {
         let mut selections = serde_json::Map::new();
         selections.insert("context".into(), serde_json::Value::String("1m".into()));
         selections.insert("speed".into(), serde_json::Value::String("fast".into()));
+        let default_mode = RuntimeMode::default();
         assert_eq!(
-            traits_summary(Some(&model), Some(ReasoningLevel::High), &selections),
+            traits_summary(
+                Some(&model),
+                Some(ReasoningLevel::High),
+                &selections,
+                default_mode
+            ),
             Some("High · 1M · Fast".to_string())
         );
         // All defaults → no summary.
         assert_eq!(
-            traits_summary(Some(&model), None, &serde_json::Map::new()),
+            traits_summary(Some(&model), None, &serde_json::Map::new(), default_mode),
             None
         );
         // Default-choice selections don't count as non-default.
         let mut defaults = serde_json::Map::new();
         defaults.insert("speed".into(), serde_json::Value::String("normal".into()));
-        assert_eq!(traits_summary(Some(&model), None, &defaults), None);
+        assert_eq!(
+            traits_summary(Some(&model), None, &defaults, default_mode),
+            None
+        );
         // Reasoning shows without a model too.
         assert_eq!(
             traits_summary(
                 None,
                 Some(ReasoningLevel::Ultrathink),
-                &serde_json::Map::new()
+                &serde_json::Map::new(),
+                default_mode
             ),
             Some("Ultrathink".to_string())
         );
+        // A non-default mode leads the summary, and the default one is silent:
+        // the chip is for what the user changed.
+        assert_eq!(
+            traits_summary(
+                Some(&model),
+                Some(ReasoningLevel::High),
+                &serde_json::Map::new(),
+                RuntimeMode::FullAccess
+            ),
+            Some("Full access · High".to_string())
+        );
+        assert_eq!(
+            traits_summary(
+                None,
+                None,
+                &serde_json::Map::new(),
+                RuntimeMode::ApprovalRequired
+            ),
+            Some("Ask first".to_string())
+        );
+    }
+
+    /// Every mode a provider can declare needs both strings — a chip with no
+    /// label is unpickable, and a mode with no caption ships the one surface
+    /// that explains what it does with a blank line.
+    #[test]
+    fn every_mode_has_a_label_and_a_caption() {
+        for mode in [
+            RuntimeMode::ApprovalRequired,
+            RuntimeMode::AutoAcceptEdits,
+            RuntimeMode::Auto,
+            RuntimeMode::FullAccess,
+        ] {
+            assert!(!runtime_mode_label(mode).is_empty());
+            assert!(!runtime_mode_caption(mode).is_empty());
+        }
     }
 
     #[test]
@@ -3300,6 +3495,36 @@ mod tests {
             config.runtime_mode.sandbox(),
             "sandbox must never disagree with the mode it was derived from"
         );
+    }
+
+    /// The picker's own change: the mode moves and the sandbox follows it in
+    /// the same write. These are the two fields 1.1's one real bug came from,
+    /// and a row that stores a permissive sandbox beside a restrictive mode
+    /// would be read by whichever consumer looked at the wrong one.
+    #[test]
+    fn changing_the_mode_re_derives_the_sandbox() {
+        let existing = ChatConfig {
+            harness: HarnessId::ClaudeCode,
+            model: Some("opus".into()),
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+            runtime_mode: RuntimeMode::AutoAcceptEdits,
+        };
+        let mut config = existing.clone();
+        apply_owned_fields(&mut config, Some(&existing), |c| {
+            c.runtime_mode = RuntimeMode::ApprovalRequired;
+        });
+        assert_eq!(config.runtime_mode, RuntimeMode::ApprovalRequired);
+        assert_eq!(config.sandbox, SandboxLevel::ReadOnly);
+
+        // And in the loosening direction, where getting it wrong would leave a
+        // read-only sandbox on a mode the user picked to remove it.
+        let mut config = existing.clone();
+        apply_owned_fields(&mut config, Some(&existing), |c| {
+            c.runtime_mode = RuntimeMode::FullAccess;
+        });
+        assert_eq!(config.sandbox, RuntimeMode::FullAccess.sandbox());
     }
 
     #[test]

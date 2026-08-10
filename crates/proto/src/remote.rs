@@ -12,7 +12,13 @@ use serde::{Deserialize, Serialize};
 ///
 /// 2: `MessagePart::Notice`.
 /// 3: `MessagePart::Approval`.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// 4: the permission axis became user-selectable (slice 1.8). Not a decode
+///    problem — `runtimeMode` was always an additive field — but an older peer
+///    ignores the key and runs the turn under *its* default, so a user who
+///    picked `approval-required` here would get an unattended write on the
+///    other device. The absence of the field is indistinguishable from a
+///    deliberate value, so refusing the pairing is the honest failure.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

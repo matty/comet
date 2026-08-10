@@ -268,11 +268,10 @@ impl SessionsEngine {
     ///
     /// This carries the mode (and sandbox) of the *previous* turn, not the
     /// chat row's current one — it is stamped at dispatch and never touched
-    /// again. That's a no-op today because the mode is fixed for a chat's
-    /// lifetime, but once a mode can change mid-chat the two can diverge: a
-    /// steer or a resumed-input answer taking this fallback would still run
-    /// under the old mode until the next composer send re-derives the
-    /// request from the row.
+    /// again. Since 1.8 a user can change the mode mid-chat, so every caller
+    /// that dispatches from this overlays the row's current mode first with
+    /// [`DocHost::apply_chat_row_runtime_mode`]; without that the divergence
+    /// runs in the permissive direction (`DEBT.md` D11).
     pub fn last_request(&self, chat_id: &str) -> Option<RunRequest> {
         lock(&self.inner.last_requests).get(chat_id).cloned()
     }
@@ -816,6 +815,9 @@ impl SessionsEngine {
                     return;
                 };
                 request.prompt = prompt_text;
+                // The remembered request predates any mode change the user made
+                // while the run was dead; the chat row is the authority.
+                host.apply_chat_row_runtime_mode(&chat_id, &mut request);
                 request.resume = None; // dispatch re-injects the remembered session
                 request.attachments = Vec::new();
                 let harness_id = host.harness_for(&chat_id);

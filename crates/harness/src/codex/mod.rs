@@ -185,6 +185,10 @@ impl CodexHarness {
                 RuntimeMode::Auto,
                 RuntimeMode::FullAccess,
             ],
+            // `FileChangeApprovalDecision` / `CommandExecutionApprovalDecision`
+            // are bare literals — the wire carries `"decline"` and nothing
+            // else, so a note has no field to travel in (`DEBT.md` D24).
+            carries_deny_note: false,
         }
     }
 
@@ -1323,5 +1327,13 @@ mod tests {
         r.note_started("t-3".into());
         assert_eq!(r.active.as_deref(), Some("t-3"));
         assert!(r.is_completed("t-2"));
+    }
+
+    /// The decision literals have no message field, so a note typed into the
+    /// composer cannot reach the model (`DEBT.md` D24). This declaration is
+    /// what stops the UI promising delivery.
+    #[test]
+    fn codex_cannot_carry_a_deny_note() {
+        assert!(!CodexHarness::capabilities().carries_deny_note);
     }
 }
