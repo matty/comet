@@ -121,6 +121,8 @@ fn main() {
         steer(&mut stdin, &tid);
     } else if turn_line.contains("scenario:auto-reviewer") {
         auto_reviewer(&thread_line, &tid);
+    } else if turn_line.contains("scenario:echo-policy") {
+        echo_policy(&turn_line, &thread_line, &tid);
     } else if turn_line.contains("scenario:approve") {
         approve(&mut stdin, &turn_line, &thread_line, &tid);
     } else if turn_line.contains("scenario:decline") {
@@ -150,7 +152,6 @@ fn happy(turn_line: &str, thread_line: &str, tid: &str) {
         r#""model":"gpt-5.6-sol""#,
         r#""networkAccess":true"#,
         r#""type":"workspaceWrite""#,
-        r#""approvalPolicy":"never""#,
         r#""summary":"auto""#,
         r#""serviceTier":"fast""#,
     ] {
@@ -159,8 +160,10 @@ fn happy(turn_line: &str, thread_line: &str, tid: &str) {
             return;
         }
     }
+    // `approvalPolicy` is deliberately NOT asserted here: `happy` is reused by
+    // tests running in different runtime modes, and the policy is derived from
+    // the mode. `scenario:echo-policy` pins all four values instead.
     for want in [
-        r#""approvalPolicy":"never""#,
         r#""sandbox":"workspace-write""#,
         r#""cwd":"/tmp""#,
         r#""serviceTier":"fast""#,
@@ -306,16 +309,35 @@ fn steer(stdin: &mut StdinLock<'_>, tid: &str) {
     }
 }
 
+/// Fail the turn with the `approvalPolicy` seen on both lines, so a test can
+/// assert the exact wire value per runtime mode without a scenario each.
+fn echo_policy(turn_line: &str, thread_line: &str, tid: &str) {
+    let seen = |line: &str| {
+        line.split(r#""approvalPolicy":""#)
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or("<absent>")
+            .to_owned()
+    };
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    fail_turn(
+        tid,
+        &format!("thread={} turn={}", seen(thread_line), seen(turn_line)),
+    );
+}
+
 fn approve(stdin: &mut StdinLock<'_>, turn_line: &str, thread_line: &str, tid: &str) {
-    // Task 7 flips this to the mode-derived policy; until then the wire pin
-    // stands, and the requests below exercise the route regardless of it —
-    // the fake raises them whatever the policy says.
-    if !thread_line.contains(r#""approvalPolicy":"never""#) {
-        fail_turn(tid, "thread approvalPolicy should be never");
+    // The scenario runs in `ApprovalRequired`, the mode that asks before every
+    // command.
+    if !thread_line.contains(r#""approvalPolicy":"untrusted""#) {
+        fail_turn(tid, "thread approvalPolicy should be untrusted");
         return;
     }
-    if !turn_line.contains(r#""approvalPolicy":"never""#) {
-        fail_turn(tid, "turn approvalPolicy should be never");
+    if !turn_line.contains(r#""approvalPolicy":"untrusted""#) {
+        fail_turn(tid, "turn approvalPolicy should be untrusted");
         return;
     }
     emit(&format!(

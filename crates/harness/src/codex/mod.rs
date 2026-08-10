@@ -11,12 +11,13 @@
 //! - Notifications map to [`AgentEvent`]s: agentMessage/reasoning deltas (both
 //!   `delta`/`textDelta` spellings), item lifecycles → typed ToolCall/ToolResult,
 //!   `thread/tokenUsage/updated` → Usage, turn/completed|failed|aborted → Done.
-//! - Approvals: the wire policy is pinned to `"never"` for now, not
-//!   permanently — see [`CodexHarness::run`] for what pinning it still costs
-//!   and what deriving it from `runtime_mode` would fix. Stray
-//!   `item/commandExecution/requestApproval` +
-//!   `item/fileChange/requestApproval` still round-trip through
-//!   [`RunControls::request_input`] as a synthesized yes/no question.
+//! - Approvals: the wire policy is derived from `runtime_mode`
+//!   (`catalog::approval_policy`), and `item/commandExecution/requestApproval`,
+//!   `item/fileChange/requestApproval` and `item/permissions/requestApproval`
+//!   round-trip through [`RunControls::request_approval`]. A file-change
+//!   request carries no path, so its detail is joined from the `item/started`
+//!   that precedes it. Comet's engine owns "allow for this session"; the wire
+//!   only ever hears `accept` or `decline`.
 //! - Steering: `turn/steer { expectedTurnId }` into the live turn; a rejected
 //!   steer (the turn-completed race) is queued and delivered as the next
 //!   `turn/start` on the same thread. The session is persistent across turns
@@ -52,8 +53,8 @@ use comet_proto::{
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
 use catalog::{
-    REASONING_LEVELS, approvals_reviewer, sandbox_mode, sandbox_policy_value, static_models,
-    to_effort,
+    REASONING_LEVELS, approval_policy, approvals_reviewer, sandbox_mode, sandbox_policy_value,
+    static_models, to_effort,
 };
 use normalize::{
     Phase, RateLimitThresholds, delta_text, ignored_notification_reason, item_id, item_type,
@@ -164,15 +165,26 @@ impl CodexHarness {
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: REASONING_LEVELS.to_vec(),
-            // Only the modes the pinned wire approval policy actually honors:
-            // both mean "no approval prompt", which is what a `"never"` policy
-            // delivers. The asking modes belong to the change that derives the
-            // policy from the mode — declaring one the adapter cannot keep
-            // would offer a promise the run breaks. One declared promise is
-            // still conditional: the linked-worktree sandbox workaround below
-            // can silently raise `AutoAcceptEdits`'s workspace-write sandbox
-            // to danger-full-access.
-            runtime_modes: vec![RuntimeMode::AutoAcceptEdits, RuntimeMode::FullAccess],
+            // All four, now that the wire policy is derived from the mode and an
+            // approval it raises reaches the user. `ApprovalRequired` and `Auto`
+            // were withheld while the policy was pinned at `"never"`, because
+            // declaring a mode the adapter could not keep is a promise the run
+            // breaks.
+            //
+            // Two of the four carry a caveat worth knowing before reading this
+            // list as four guarantees. `AutoAcceptEdits`'s workspace-write
+            // sandbox can be silently raised to danger-full-access by the
+            // linked-worktree workaround below (`DEBT.md` D13). And `Auto`
+            // hands review to the provider via `approvalsReviewer:
+            // "auto_review"` — no capture exercised that path, so what reaches
+            // Comet in that mode follows the mapping table rather than an
+            // observed run.
+            runtime_modes: vec![
+                RuntimeMode::ApprovalRequired,
+                RuntimeMode::AutoAcceptEdits,
+                RuntimeMode::Auto,
+                RuntimeMode::FullAccess,
+            ],
         }
     }
 
@@ -442,17 +454,18 @@ async fn run_session(session: Session) {
     let request_approval = Arc::new(request_approval);
 
     // ---- wire params ------------------------------------------------------
-    // Pinned rather than derived from `runtime_mode`: an approval Codex raises
-    // today has nowhere honest to go, so it round-trips through the
-    // synthesized yes/no input question and surfaces to the user as a generic
-    // prompt — "on-request" turned every command into exactly that (user
-    // report: "asking me for approval at every step"). `"never"` removes the
-    // prompt entirely; the approval-as-input plumbing below stays for stray
-    // requests. `FullAccess` and `Auto` already mean what `"never"` says, but
-    // `ApprovalRequired` and `AutoAcceptEdits` do not — deriving the policy
-    // from `runtime_mode` instead of pinning it is what makes those two modes
-    // honest.
-    let approval_policy = "never";
+    // Derived, not pinned. The pin existed because an approval Codex raised had
+    // nowhere honest to go — it round-tripped through a synthesized yes/no
+    // question and surfaced as a generic prompt, which is why "on-request"
+    // read as "asking me for approval at every step". Approvals now reach the
+    // approval surface, so the mode can mean what it says.
+    //
+    // The user report was accurate about `untrusted`, and that is the mode
+    // `ApprovalRequired` maps to: captured live, it asks before every command,
+    // three times for the same command in one turn. `on-request` — where
+    // `AutoAcceptEdits` and `Auto` land — asks only after a sandboxed attempt
+    // has already failed. See `catalog::approval_policy`.
+    let approval_policy = approval_policy(request.runtime_mode);
     let effort = to_effort(request.reasoning);
     // Service tier rides thread-start and every turn (mirrors the Codex IDE
     // client). "default" means Standard — omit it entirely.

@@ -849,15 +849,49 @@ async fn unclaimed_notifications_items_and_requests_surface_as_diagnostics() {
     ));
 }
 
-/// Codex declares only the modes the pinned approval policy lets it keep:
-/// both promise no approval prompt, and neither gets one. The asking modes
-/// are declared by the change that derives the policy from the mode —
-/// declaring them sooner would offer a promise the run cannot keep.
+/// All four, now that the policy is derived from the mode and an approval it
+/// raises reaches the user. `ApprovalRequired` and `Auto` were withheld while
+/// the policy was pinned at `"never"`, because a declared mode the adapter
+/// cannot keep is a promise the run breaks.
 #[test]
-fn declared_runtime_modes_are_the_ones_the_pinned_policy_honors() {
+fn every_runtime_mode_is_declared_once_the_policy_is_derived() {
     let caps = CodexHarness::capabilities();
     assert_eq!(
         caps.runtime_modes,
-        vec![RuntimeMode::AutoAcceptEdits, RuntimeMode::FullAccess]
+        vec![
+            RuntimeMode::ApprovalRequired,
+            RuntimeMode::AutoAcceptEdits,
+            RuntimeMode::Auto,
+            RuntimeMode::FullAccess,
+        ]
     );
+}
+
+/// Every declared mode reaches the wire as the policy the mapping table names,
+/// on **both** `thread/start` and `turn/start` — they are one binding and two
+/// sites, and a mode honoured on one but not the other would be silent.
+#[tokio::test]
+async fn every_runtime_mode_reaches_the_wire_as_its_approval_policy() {
+    for (mode, want) in [
+        (RuntimeMode::ApprovalRequired, "untrusted"),
+        (RuntimeMode::AutoAcceptEdits, "on-request"),
+        (RuntimeMode::Auto, "on-request"),
+        (RuntimeMode::FullAccess, "never"),
+    ] {
+        let (controls, _steer, _token) = controls("Yes");
+        let mut req = request("scenario:echo-policy");
+        req.runtime_mode = mode;
+        let events = run_to_end(&harness(), req, controls).await;
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Done { error, .. } => error.clone(),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{mode:?}: no Done carrying the observed policy"));
+        assert!(
+            error.contains(&format!("thread={want} turn={want}")),
+            "{mode:?} wanted {want}, wire said {error}"
+        );
+    }
 }
