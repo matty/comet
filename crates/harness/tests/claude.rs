@@ -200,12 +200,14 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
             let _ = tx.send(answers);
             rx
         }),
-        // No decision source in this fixture: the dropped sender resolves the
-        // receiver to an error, which a run must treat as not approved. Never
-        // default a fixture to Allow — that is how a permission defect ships
-        // looking correct.
+        // Plain tools now round-trip through `request_approval` (this task);
+        // this fixture answers Allow so the run proceeds to the
+        // AskUserQuestion step it actually exercises. The deny/unanswered
+        // paths for this bridge are covered exhaustively by
+        // `claude::control_request_tests`.
         request_approval: Box::new(|_approval: comet_proto::ApprovalRequest| {
-            let (_tx, rx) = oneshot::channel::<comet_proto::ApprovalDecision>();
+            let (tx, rx) = oneshot::channel::<comet_proto::ApprovalDecision>();
+            let _ = tx.send(comet_proto::ApprovalDecision::Allow);
             rx
         }),
         steering: steer_rx,
@@ -227,8 +229,8 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
     );
 
     // "answered" proves both control round-trips: the plain Bash can_use_tool
-    // was auto-allowed AND the answers reached the CLI as updatedInput.answers
-    // keyed by question text.
+    // was approved via `request_approval` AND the answers reached the CLI as
+    // updatedInput.answers keyed by question text.
     assert_eq!(
         events.last(),
         Some(&AgentEvent::Done {

@@ -205,6 +205,12 @@ pub(crate) fn not_installed_message(stem: &str, override_var: &str) -> String {
     format!("{stem}. {hint}")
 }
 
+/// What the model is told when an approval ended without an answer. Comet copy:
+/// it reaches the transcript through the model's own reply.
+pub(crate) fn approval_unanswered_message() -> String {
+    "The user did not answer this request, so it was not approved.".to_string()
+}
+
 /// Byte budget for a notice `summary` built from provider prose.
 pub(crate) const NOTICE_SUMMARY_MAX: usize = 160;
 /// Byte budget for a notice `detail` built from provider prose.

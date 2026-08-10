@@ -9,10 +9,6 @@ use comet_proto::{ApprovalRequest, FileOperation};
 
 use super::wire::ControlRequestBody;
 
-// Not yet called from `handle_control_request`: this task is the pure
-// decision table only. Wiring it into the control-request path (replacing
-// the current auto-allow) is a later task in this slice.
-#[allow(dead_code)]
 pub(crate) fn approval_request(body: &ControlRequestBody) -> ApprovalRequest {
     let str_field = |key: &str| {
         body.input

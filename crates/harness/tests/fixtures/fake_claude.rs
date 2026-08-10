@@ -149,7 +149,8 @@ fn askuser(stdin: &mut StdinLock<'_>) {
     emit(
         r#"{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash"],"cwd":"/tmp","session_id":"sess-ask"}"#,
     );
-    // A plain tool permission request: must be auto-allowed.
+    // A plain tool permission request: must round-trip through approval and
+    // be allowed.
     emit(
         r#"{"type":"control_request","request_id":"cr-0","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}"#,
     );

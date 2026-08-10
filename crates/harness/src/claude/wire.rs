@@ -400,6 +400,17 @@ pub(crate) fn control_response_line(request_id: &str, response: Value) -> String
     .to_string()
 }
 
+/// `can_use_tool` deny payload. `message` is what the model is told, and is
+/// the user's own note when they wrote one.
+///
+/// No `updatedPermissions` is ever sent, on this arm or the allow arm:
+/// capture 2026-08-10 (runs 7-9) showed every shape either wrote a permanent
+/// rule into the user's repository, failed to silence the next request, or
+/// both. Comet owns session grants — see `comet_engine::approvals`.
+pub(crate) fn deny_response(message: String) -> Value {
+    json!({ "behavior": "deny", "message": message })
+}
+
 /// `can_use_tool` allow payload with the (possibly updated) tool input.
 pub(crate) fn allow_response(updated_input: Value) -> Value {
     json!({ "behavior": "allow", "updatedInput": updated_input })
