@@ -2192,6 +2192,112 @@ async fn drive_to_open_approval(
         .expect("approval part carries a request id")
 }
 
+/// Asks for the same file change twice and reports what it was told each time.
+/// The second request is the one under test: after AllowForSession the user
+/// must not be asked again, and the run must still be told "allowed".
+struct TwiceAskingHarness;
+
+#[async_trait]
+impl Harness for TwiceAskingHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "TwiceAsking"
+    }
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities::default()
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let request_approval = controls.request_approval;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tokio::spawn(async move {
+            let ask = || {
+                request_approval(ApprovalRequest::FileChange {
+                    path: "src/reconcile.rs".into(),
+                    operation: FileOperation::Modify,
+                    added_lines: 24,
+                    removed_lines: 6,
+                })
+            };
+            let first = ask().await;
+            let second = ask().await;
+            let word = |d: &Result<ApprovalDecision, _>| match d {
+                Ok(ApprovalDecision::Allow) | Ok(ApprovalDecision::AllowForSession) => "allowed",
+                Ok(ApprovalDecision::Deny { .. }) => "denied",
+                _ => "unanswered",
+            };
+            let _ = tx.send(AgentEvent::TextDelta {
+                text: format!("{} then {}", word(&first), word(&second)),
+            });
+            let _ = tx.send(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            });
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (Ok(event), rx))
+        })
+        .boxed())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn allow_for_session_answers_the_next_identical_request_without_asking() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(TwiceAskingHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    // Drive to the first open approval and answer it AllowForSession.
+    let request_id = drive_to_open_approval(&core, &handle, "cmd-1").await;
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-2",
+        SessionCommandPayload::RespondApproval {
+            request_id: request_id.clone(),
+            decision: ApprovalDecision::AllowForSession,
+        },
+    );
+
+    // The run must finish without a second question reaching the user.
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.parts.iter().any(|p| {
+                    matches!(p, MessagePart::Text { text, .. } if text.contains("allowed then allowed"))
+                })
+            })
+        },
+        "the second identical request answers itself",
+    )
+    .await;
+
+    // Both are VISIBLE: two approval parts, both carrying a decision. An
+    // auto-allowed action the user cannot see is the failure 0b exists to stop.
+    let approvals: Vec<_> = entries_now(&core)
+        .iter()
+        .flat_map(|e| e.parts.iter())
+        .filter_map(|p| match p {
+            MessagePart::Approval { decision, .. } => Some(decision.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(approvals.len(), 2, "both requests must appear in the doc");
+    assert!(
+        approvals.iter().all(|d| d.is_some()),
+        "neither may be left open, got {approvals:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_approval_round_trips_from_request_to_decision() {
     let dir = tempfile::tempdir().unwrap();

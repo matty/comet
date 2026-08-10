@@ -17,7 +17,7 @@
 //! Every dying path must instead carry its own visible error (child crash with stderr,
 //! spawn failure, stream error, engine-restart recovery).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use chrono::Utc;
@@ -56,7 +56,21 @@ pub enum SteerOutcome {
 }
 
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
-type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>;
+
+/// A parked approval: the resolver, plus what would have to match for a later
+/// identical request to be auto-allowed. `None` = never allowlistable.
+pub(crate) struct PendingApproval {
+    pub(crate) signature: Option<String>,
+    pub(crate) resolver: oneshot::Sender<ApprovalDecision>,
+}
+
+pub(crate) type PendingApprovals = Arc<Mutex<HashMap<String, PendingApproval>>>;
+/// Ids this engine minted. The authority record the `ApprovalRequested` guard
+/// checks — separate from "still open", because an auto-allowed request is
+/// resolved before the guard ever sees its event.
+pub(crate) type MintedApprovals = Arc<Mutex<HashSet<String>>>;
+/// Signatures the user allowed for the rest of this run.
+pub(crate) type SessionAllowlist = Arc<Mutex<HashSet<String>>>;
 
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
@@ -80,6 +94,8 @@ struct RunHandle {
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
     pending_inputs: PendingInputs,
     pending_approvals: PendingApprovals,
+    minted_approvals: MintedApprovals,
+    session_allowed: SessionAllowlist,
 }
 
 struct Inner {
@@ -320,17 +336,52 @@ impl SessionsEngine {
             })
         };
         let pending_approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        let minted_approvals: MintedApprovals = Arc::new(Mutex::new(HashSet::new()));
+        let session_allowed: SessionAllowlist = Arc::new(Mutex::new(HashSet::new()));
 
         // Approval bridge: same shape as the input bridge above — mint the id,
         // park the resolver, then emit. Parking before emitting is what makes
         // a legitimate id always resolvable by the time the event is seen.
+        //
+        // A request the user already allowed for this session resolves itself,
+        // but is still emitted and then immediately resolved: an auto-allowed
+        // action MUST stay visible in the transcript. `blocked_on` keys on open
+        // approvals, so a card resolved on arrival never blocks the composer.
+        // The id is recorded in `minted_approvals` either way — that, not
+        // `pending_approvals`, is what the drive_run guard checks, because this
+        // request is already answered by the time the guard runs.
         let request_approval = {
             let pending = pending_approvals.clone();
+            let minted = minted_approvals.clone();
             let engine_tx = engine_tx.clone();
+            let session_allowed = session_allowed.clone();
             Box::new(move |approval: ApprovalRequest| {
                 let (tx, rx) = oneshot::channel();
                 let request_id = new_id();
-                lock(&pending).insert(request_id.clone(), tx);
+                let signature = crate::approvals::approval_signature(&approval);
+                let pre_allowed = signature
+                    .as_ref()
+                    .is_some_and(|sig| lock(&session_allowed).contains(sig));
+                lock(&minted).insert(request_id.clone());
+                if pre_allowed {
+                    let _ = engine_tx.send(AgentEvent::ApprovalRequested {
+                        request_id: request_id.clone(),
+                        approval,
+                    });
+                    let _ = tx.send(ApprovalDecision::Allow);
+                    let _ = engine_tx.send(AgentEvent::ApprovalResolved {
+                        request_id,
+                        decision: ApprovalDecision::Allow,
+                    });
+                    return rx;
+                }
+                lock(&pending).insert(
+                    request_id.clone(),
+                    PendingApproval {
+                        signature,
+                        resolver: tx,
+                    },
+                );
                 let _ = engine_tx.send(AgentEvent::ApprovalRequested {
                     request_id,
                     approval,
@@ -357,6 +408,8 @@ impl SessionsEngine {
                 engine_tx,
                 pending_inputs,
                 pending_approvals,
+                minted_approvals,
+                session_allowed,
             },
         );
         self.set_status(chat_id, SessionStatus::Working, true);
@@ -446,7 +499,10 @@ impl SessionsEngine {
         // Same reason for a parked approval. Dropping the senders resolves the
         // receivers to an error, which a run must treat as not approved — the
         // same signal every non-answering caller of this bridge produces.
-        let parked: Vec<_> = lock(&pending_approvals).drain().map(|(_, tx)| tx).collect();
+        let parked: Vec<_> = lock(&pending_approvals)
+            .drain()
+            .map(|(_, p)| p.resolver)
+            .collect();
         drop(parked);
         // Harness-level interrupt (protocol + child teardown) …
         token.cancel();
@@ -495,16 +551,27 @@ impl SessionsEngine {
         request_id: &str,
         decision: ApprovalDecision,
     ) -> Result<bool, EngineError> {
-        let target = lock(&self.inner.runs)
-            .get(chat_id)
-            .map(|h| (h.pending_approvals.clone(), h.engine_tx.clone()));
-        let Some((pending, engine_tx)) = target else {
+        let target = lock(&self.inner.runs).get(chat_id).map(|h| {
+            (
+                h.pending_approvals.clone(),
+                h.session_allowed.clone(),
+                h.engine_tx.clone(),
+            )
+        });
+        let Some((pending, session_allowed, engine_tx)) = target else {
             return Ok(false);
         };
-        let Some(resolver) = lock(&pending).remove(request_id) else {
+        let Some(parked) = lock(&pending).remove(request_id) else {
             return Ok(false);
         };
-        let _ = resolver.send(decision.clone());
+        // "Allow for this session" on an action Comet could not identify
+        // (`signature: None`) allows THIS call only — there is no rule to write.
+        if decision == ApprovalDecision::AllowForSession
+            && let Some(signature) = parked.signature
+        {
+            lock(&session_allowed).insert(signature);
+        }
+        let _ = parked.resolver.send(decision.clone());
         let _ = engine_tx.send(AgentEvent::ApprovalResolved {
             request_id: request_id.to_string(),
             decision,
@@ -859,9 +926,25 @@ impl Inner {
 
     fn remove_run(&self, chat_id: &str, run_id: &str) {
         let mut runs = lock(&self.runs);
-        if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
-            runs.remove(chat_id);
+        if !runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
+            return;
         }
+        let Some(handle) = runs.remove(chat_id) else {
+            return;
+        };
+        drop(runs);
+        // Drain any still-parked approvals: a run can end (CLI stdout EOF,
+        // crash, engine restart) while a card is still open. Task 4's spawned
+        // harness task holds the approval bridge through an `Arc` independent
+        // of this handle, so removing the handle alone does not drop the
+        // parked oneshot sender — that task would await a decision that can
+        // never arrive. Dropping the senders resolves each to `Err`, which
+        // every consumer reads as not approved (same rule `interrupt()` uses).
+        let parked: Vec<_> = lock(&handle.pending_approvals)
+            .drain()
+            .map(|(_, p)| p.resolver)
+            .collect();
+        drop(parked);
     }
 }
 
@@ -1288,13 +1371,16 @@ async fn drive_run(
             }
             AgentEvent::ApprovalRequested { request_id, .. } => {
                 // Same authority rule as input requests: the host mints the id
-                // and parks the resolver before emitting, so a legitimate id
-                // is always pending here. An adapter emitting its own copy
-                // would fold an unanswerable card into the doc.
-                let pending = lock(&inner.runs)
+                // before emitting, so a legitimate id is always recorded here.
+                // An adapter emitting its own copy would fold an unanswerable
+                // card into the doc. Checked against `minted_approvals`, not
+                // `pending_approvals`: a session-auto-allowed request is
+                // already resolved (and removed from `pending`) by the time
+                // this guard runs, so `pending` would wrongly reject it.
+                let minted = lock(&inner.runs)
                     .get(&chat_id)
-                    .map(|h| h.pending_approvals.clone());
-                let known = pending.is_some_and(|p| lock(&p).contains_key(request_id));
+                    .map(|h| h.minted_approvals.clone());
+                let known = minted.is_some_and(|m| lock(&m).contains(request_id));
                 if !known {
                     tracing::warn!(
                         chat = %chat_id,
