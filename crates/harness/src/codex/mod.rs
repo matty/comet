@@ -1138,8 +1138,11 @@ fn track_file_change(map: &mut HashMap<String, Value>, phase: Phase, item: &Valu
                 );
                 return;
             }
+            // Reduced here, never stored raw: what is held until the approval
+            // arrives must not scale with the size of the change. See
+            // `approval::summarize_changes`.
             if let Some(changes) = item.get("changes") {
-                map.insert(id.to_owned(), changes.clone());
+                map.insert(id.to_owned(), approval::summarize_changes(changes));
             }
         }
         // The approval arrives between started and completed, so the detail is

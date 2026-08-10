@@ -8,7 +8,7 @@
 //! accepting it unasked.
 
 use comet_proto::{ApprovalDecision, ApprovalRequest, FileOperation};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 pub(crate) const COMMAND_APPROVAL: &str = "item/commandExecution/requestApproval";
 pub(crate) const FILE_CHANGE_APPROVAL: &str = "item/fileChange/requestApproval";
@@ -89,8 +89,42 @@ fn command_text(params: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn file_change(changes: Option<&Value>) -> ApprovalRequest {
-    let Some(changes) = changes.and_then(Value::as_array) else {
+/// Reduce a `fileChange` item's `changes` to the little the card can render,
+/// at the moment the item is announced.
+///
+/// The adapter holds the result until the approval request that needs it
+/// arrives, so **what it holds must not scale with what the agent is
+/// changing.** Only two things are ever read back: a single change's path,
+/// operation and line counts, or — for a multi-file change, which
+/// `ApprovalRequest::FileChange` cannot render — how many files there were.
+/// Every `diff` is consumed into counts here and dropped, so a large patch
+/// costs the same to remember as a one-line edit.
+pub(crate) fn summarize_changes(changes: &Value) -> Value {
+    let Some([change]) = changes.as_array().map(|c| c.as_slice()) else {
+        let count = changes.as_array().map(|c| c.len()).unwrap_or(0);
+        return json!({ "count": count });
+    };
+    let operation = change_kind(change);
+    let diff = change.get("diff").and_then(Value::as_str).unwrap_or("");
+    let (added, removed) = match operation {
+        // An add's `diff` is the raw content of the new file, not a patch.
+        FileOperation::Create => (line_count(diff), 0),
+        FileOperation::Delete => (0, line_count(diff)),
+        // An update's is a unified diff.
+        _ => unified_diff_counts(diff),
+    };
+    json!({
+        "path": change.get("path").and_then(Value::as_str).unwrap_or(""),
+        "operation": operation,
+        "addedLines": added,
+        "removedLines": removed,
+    })
+}
+
+/// Takes the reduced value [`summarize_changes`] produced, not the raw wire
+/// array — see there for why the raw payload is not kept.
+fn file_change(summary: Option<&Value>) -> ApprovalRequest {
+    let Some(summary) = summary else {
         // The join missed: the request named an `itemId` whose `item/started`
         // the adapter never saw. Say so vaguely rather than rendering a
         // `FileChange` with an empty path, which would read as a change to a
@@ -101,17 +135,18 @@ fn file_change(changes: Option<&Value>) -> ApprovalRequest {
     };
     // `FileChange` names ONE path. A multi-file change has no honest rendering
     // in it, and `Unknown` is the un-allowlistable variant, which is the
-    // conservative answer for a change Comet cannot state in full.
-    let [change] = changes.as_slice() else {
+    // conservative answer for a change Comet cannot state in full. The count is
+    // all `summarize_changes` kept for that case.
+    if let Some(count) = summary.get("count").and_then(Value::as_u64) {
         return ApprovalRequest::Unknown {
-            summary: if changes.is_empty() {
+            summary: if count == 0 {
                 "Change a file".to_owned()
             } else {
-                format!("Change {} files", changes.len())
+                format!("Change {count} files")
             },
         };
-    };
-    let Some(path) = change
+    }
+    let Some(path) = summary
         .get("path")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
@@ -120,21 +155,21 @@ fn file_change(changes: Option<&Value>) -> ApprovalRequest {
             summary: "Change a file".to_owned(),
         };
     };
-    let kind = change_kind(change);
-    let diff = change.get("diff").and_then(Value::as_str).unwrap_or("");
-    let (added, removed) = match kind {
-        // An add's `diff` is the raw content of the new file, not a patch.
-        FileOperation::Create => (line_count(diff), 0),
-        FileOperation::Delete => (0, line_count(diff)),
-        // An update's is a unified diff.
-        _ => unified_diff_counts(diff),
-    };
     ApprovalRequest::FileChange {
         path: path.to_owned(),
-        operation: kind,
-        added_lines: added,
-        removed_lines: removed,
+        operation: serde_json::from_value(summary.get("operation").cloned().unwrap_or(Value::Null))
+            .unwrap_or(FileOperation::Unknown),
+        added_lines: u32_field(summary, "addedLines"),
+        removed_lines: u32_field(summary, "removedLines"),
     }
+}
+
+fn u32_field(value: &Value, key: &str) -> u32 {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32
 }
 
 /// `kind` is an object on the wire (`{"type":"add"}`); the bare-string arm is
@@ -160,20 +195,48 @@ fn line_count(text: &str) -> u32 {
     text.lines().count() as u32
 }
 
-/// `+`/`-` line counts of a unified diff, skipping the `+++`/`---` file
-/// headers and the `@@` hunk markers.
+/// `+`/`-` line counts of a unified diff.
+///
+/// **File headers are excluded by position, not by prefix.** `--- a/x` and
+/// `+++ b/x` can only appear before the first `@@`, so that is what gates them.
+/// A prefix test cannot do this job at all: an added line whose content begins
+/// with `++` is spelled `+++…` in the diff and is indistinguishable from a
+/// header by its opening characters — a trailing space does not separate them
+/// either, since `++ foo` is a perfectly ordinary added line. Skipping on
+/// prefix therefore drops real changes from the count.
+///
+/// A diff with no `@@` at all is not a unified diff; rather than report nothing
+/// for a shape this has not seen, it falls back to counting every `+`/`-` line.
+/// Codex's own update diffs are headerless and hunked
+/// (`"@@ -1 +1,2 @@\n one\n+two\n"`, captured), so the preamble is normally
+/// empty and neither rule has anything to do.
 fn unified_diff_counts(diff: &str) -> (u32, u32) {
     let mut added = 0;
     let mut removed = 0;
+    let mut in_hunk = false;
     for line in diff.lines() {
-        if line.starts_with("+++") || line.starts_with("---") {
+        if line.starts_with("@@") {
+            in_hunk = true;
             continue;
         }
-        if let Some(rest) = line.strip_prefix('+') {
-            let _ = rest;
+        if !in_hunk {
+            continue;
+        }
+        if line.starts_with('+') {
             added += 1;
-        } else if let Some(rest) = line.strip_prefix('-') {
-            let _ = rest;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    if in_hunk {
+        return (added, removed);
+    }
+    let mut added = 0;
+    let mut removed = 0;
+    for line in diff.lines() {
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
             removed += 1;
         }
     }
@@ -293,11 +356,14 @@ mod tests {
         );
     }
 
+    /// End to end over the real wire shape: what the item announces, reduced
+    /// the way the adapter reduces it, then mapped.
     #[test]
     fn a_file_change_is_read_off_the_joined_item() {
         let changes = json!([{"path": "/a.rs", "kind": {"type": "add"}, "diff": "one\ntwo\n"}]);
+        let summary = summarize_changes(&changes);
         assert_eq!(
-            approval_request(FILE_CHANGE_APPROVAL, &json!({}), Some(&changes)),
+            approval_request(FILE_CHANGE_APPROVAL, &json!({}), Some(&summary)),
             ApprovalRequest::FileChange {
                 path: "/a.rs".into(),
                 operation: FileOperation::Create,
@@ -307,8 +373,9 @@ mod tests {
         );
         let update = json!([{"path": "/b.rs", "kind": {"type": "update"},
                              "diff": "@@ -1 +1,2 @@\n one\n+two\n"}]);
+        let summary = summarize_changes(&update);
         assert_eq!(
-            approval_request(FILE_CHANGE_APPROVAL, &json!({}), Some(&update)),
+            approval_request(FILE_CHANGE_APPROVAL, &json!({}), Some(&summary)),
             ApprovalRequest::FileChange {
                 path: "/b.rs".into(),
                 operation: FileOperation::Modify,
@@ -316,6 +383,54 @@ mod tests {
                 removed_lines: 0,
             }
         );
+    }
+
+    /// What is remembered between the item and its approval must not scale
+    /// with the size of the change: capping the number of tracked items is no
+    /// bound at all if one item can carry an arbitrarily large payload.
+    #[test]
+    fn a_summary_keeps_no_diff_however_big_the_change_is() {
+        let huge = "@@ -1 +1,20000 @@\n".to_owned() + &"+line\n".repeat(20_000);
+        let changes = json!([{"path": "/a.rs", "kind": {"type": "update"}, "diff": huge}]);
+        let summary = summarize_changes(&changes);
+        assert!(
+            summary.to_string().len() < 200,
+            "summary retained the payload: {} bytes",
+            summary.to_string().len()
+        );
+        assert_eq!(summary["addedLines"], 20_000);
+
+        // A multi-file change keeps only how many files there were, because
+        // that is all the `Unknown` copy can say.
+        let many: Vec<Value> = (0..5_000)
+            .map(|i| json!({"path": format!("/f{i}.rs"), "kind": {"type": "add"}, "diff": "x\n"}))
+            .collect();
+        let summary = summarize_changes(&Value::Array(many));
+        assert_eq!(summary, json!({"count": 5_000}));
+        assert_eq!(
+            approval_request(FILE_CHANGE_APPROVAL, &json!({}), Some(&summary)),
+            ApprovalRequest::Unknown {
+                summary: "Change 5000 files".into()
+            }
+        );
+    }
+
+    /// A prefix test cannot tell a file header from an added line whose content
+    /// starts with `++`, with or without a trailing space. Position can: headers
+    /// only ever precede the first `@@`.
+    #[test]
+    fn diff_counts_do_not_drop_lines_that_look_like_headers() {
+        let changes = json!([{"path": "/a.rs", "kind": {"type": "update"},
+                              "diff": "--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,3 @@\n+++ added\n++also\n-- removed\n context\n"}]);
+        let summary = summarize_changes(&changes);
+        assert_eq!(summary["addedLines"], 2, "real `+` lines were skipped");
+        assert_eq!(summary["removedLines"], 1, "a real `-` line was skipped");
+
+        // The headers themselves are still excluded, by position.
+        let headers_only = json!([{"path": "/a.rs", "kind": {"type": "update"},
+                                   "diff": "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n+one\n"}]);
+        assert_eq!(summarize_changes(&headers_only)["addedLines"], 1);
+        assert_eq!(summarize_changes(&headers_only)["removedLines"], 0);
     }
 
     #[test]
@@ -334,8 +449,9 @@ mod tests {
     fn a_multi_file_change_is_unknown_rather_than_one_of_its_paths() {
         let changes = json!([{"path": "/a.rs", "kind": {"type": "add"}},
                              {"path": "/b.rs", "kind": {"type": "delete"}}]);
+        let summary = summarize_changes(&changes);
         assert_eq!(
-            approval_request(FILE_CHANGE_APPROVAL, &json!({}), Some(&changes)),
+            approval_request(FILE_CHANGE_APPROVAL, &json!({}), Some(&summary)),
             ApprovalRequest::Unknown {
                 summary: "Change 2 files".into()
             }
@@ -345,8 +461,9 @@ mod tests {
     #[test]
     fn an_unreadable_kind_is_vague_rather_than_wrong() {
         let changes = json!([{"path": "/a.rs", "kind": {"type": "teleport"}}]);
+        let summary = summarize_changes(&changes);
         assert_eq!(
-            approval_request(FILE_CHANGE_APPROVAL, &json!({}), Some(&changes)),
+            approval_request(FILE_CHANGE_APPROVAL, &json!({}), Some(&summary)),
             ApprovalRequest::FileChange {
                 path: "/a.rs".into(),
                 operation: FileOperation::Unknown,
