@@ -11,8 +11,9 @@ use comet_harness::{
     CancellationToken, ClaudeHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use comet_proto::{
-    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, RunRequest,
-    RuntimeMode, ToolCall, UserInputAnswer, UserInputQuestion,
+    AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus, FileOperation,
+    HarnessId, NoticeKind, NoticeSeverity, RunRequest, RuntimeMode, ToolCall, UserInputAnswer,
+    UserInputQuestion,
 };
 
 /// The `fake-claude` bin target, built by cargo alongside this test.
@@ -76,6 +77,38 @@ async fn run_to_end(
     )
     .await
     .expect("run finished in time")
+}
+
+/// Controls whose `request_approval` hands each request to the test and waits
+/// on a caller-supplied decision, rather than `controls()`'s always-drops
+/// approver. Left as a sibling rather than a change to `controls()` — eight
+/// existing tests depend on that helper's never-approves behaviour.
+fn controls_with_approver(
+    approver: impl Fn(ApprovalRequest) -> oneshot::Receiver<ApprovalDecision> + Send + Sync + 'static,
+) -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let token = CancellationToken::new();
+    let controls = RunControls {
+        request_input: Box::new(|_| {
+            let (_tx, rx) = oneshot::channel();
+            rx
+        }),
+        request_approval: Box::new(approver),
+        steering: steer_rx,
+        interrupt: token.clone(),
+    };
+    (controls, steer_tx, token)
+}
+
+/// Concatenates every `AgentEvent::TextDelta`'s text, in event order.
+fn text_of(events: &[AgentEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -264,6 +297,46 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
             session_id: Some("sess-ask".into()),
         })
     );
+}
+
+#[tokio::test]
+async fn a_run_asks_before_writing_and_tells_the_cli_what_the_user_said() {
+    let (asked_tx, asked_rx) = std::sync::mpsc::channel();
+    let (controls, _steer, _token) = controls_with_approver(move |req: ApprovalRequest| {
+        let (tx, rx) = oneshot::channel();
+        asked_tx.send(req).unwrap();
+        let _ = tx.send(ApprovalDecision::Deny {
+            message: "not that path".into(),
+        });
+        rx
+    });
+    let events = run_to_end(&harness(), request("scenario:approval"), controls).await;
+
+    // The card the user would have seen, built from the real frame shape.
+    assert_eq!(
+        asked_rx.recv().unwrap(),
+        ApprovalRequest::FileChange {
+            path: "a.txt".into(),
+            operation: FileOperation::Create,
+            added_lines: 1,
+            removed_lines: 0,
+        }
+    );
+    let text = text_of(&events);
+    assert!(
+        text.contains("told: deny"),
+        "the CLI must hear the denial, got {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_run_whose_approver_is_gone_denies_rather_than_writing() {
+    // `controls()`'s approver drops its sender. That must reach the CLI as a
+    // denial — not as silence, and never as an allow.
+    let (controls, _steer, _token) = controls("A");
+    let events = run_to_end(&harness(), request("scenario:approval"), controls).await;
+    let text = text_of(&events);
+    assert!(text.contains("told: deny"), "got {text:?}");
 }
 
 #[tokio::test]
