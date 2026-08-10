@@ -20,6 +20,44 @@ use chrono::{DateTime, TimeDelta, Utc};
 /// and its memory. Overridden by `COMET_UNATTENDED_TIMEOUT_SECS`.
 pub const DEFAULT_UNATTENDED_TIMEOUT_SECS: u64 = 86_400;
 
+/// The env var's name, named once so the warn log and any future reference
+/// agree with each other.
+const UNATTENDED_TIMEOUT_ENV_VAR: &str = "COMET_UNATTENDED_TIMEOUT_SECS";
+
+/// `COMET_UNATTENDED_TIMEOUT_SECS`, resolved once so the headed and headless
+/// entry points (`apps/comet/src/main.rs`, `crates/ui/src/state.rs`) cannot
+/// silently drift on what counts as a valid override.
+///
+/// Thin wrapper over [`parse_unattended_timeout`] — the env read itself isn't
+/// unit-testable (env vars are process-global), so the parsing logic lives in
+/// a pure function this only calls.
+pub fn unattended_timeout_from_env() -> Duration {
+    parse_unattended_timeout(std::env::var(UNATTENDED_TIMEOUT_ENV_VAR).ok())
+}
+
+/// Parse the raw env value, falling back to the default and warning once for
+/// anything that isn't a positive integer.
+///
+/// Zero is deliberately rejected rather than taken literally: an operator
+/// writing `0` means "turn this off", and a literal zero-second bound would
+/// instead expire every blocked run almost immediately — the opposite of
+/// what they asked for. Treating it as invalid (and falling back to the
+/// generous default) is the only reading that fails safe in both directions.
+fn parse_unattended_timeout(raw: Option<String>) -> Duration {
+    match raw.as_deref().map(|v| v.trim()) {
+        None => {}
+        Some(value) => match value.parse::<u64>() {
+            Ok(secs) if secs > 0 => return Duration::from_secs(secs),
+            _ => tracing::warn!(
+                var = UNATTENDED_TIMEOUT_ENV_VAR,
+                value,
+                "ignoring invalid unattended timeout override; using the default"
+            ),
+        },
+    }
+    Duration::from_secs(DEFAULT_UNATTENDED_TIMEOUT_SECS)
+}
+
 /// Which kind of parked wait ended the turn. Only changes one word of the note.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitKind {
@@ -327,5 +365,48 @@ mod tests {
             t(1),
             Duration::from_secs(u64::MAX)
         ));
+    }
+
+    #[test]
+    fn unset_falls_back_to_the_default_silently() {
+        assert_eq!(
+            parse_unattended_timeout(None),
+            Duration::from_secs(DEFAULT_UNATTENDED_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn a_good_value_overrides_the_default() {
+        assert_eq!(
+            parse_unattended_timeout(Some("30".into())),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn a_malformed_value_falls_back_to_the_default() {
+        assert_eq!(
+            parse_unattended_timeout(Some("not-a-number".into())),
+            Duration::from_secs(DEFAULT_UNATTENDED_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn an_empty_value_falls_back_to_the_default() {
+        assert_eq!(
+            parse_unattended_timeout(Some(String::new())),
+            Duration::from_secs(DEFAULT_UNATTENDED_TIMEOUT_SECS)
+        );
+    }
+
+    /// Zero is rejected rather than taken literally: an operator writing `0`
+    /// means "turn this off", and a literal zero-second bound would instead
+    /// expire every blocked run almost immediately.
+    #[test]
+    fn zero_is_treated_as_invalid_not_as_an_instant_bound() {
+        assert_eq!(
+            parse_unattended_timeout(Some("0".into())),
+            Duration::from_secs(DEFAULT_UNATTENDED_TIMEOUT_SECS)
+        );
     }
 }

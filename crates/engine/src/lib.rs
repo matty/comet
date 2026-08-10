@@ -53,7 +53,7 @@ pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use unattended::{
     DEFAULT_UNATTENDED_TIMEOUT_SECS, Presence, PresenceLease, WaitKind, due_for_expiry,
-    humanize_bound, sweep_interval, unattended_note,
+    humanize_bound, sweep_interval, unattended_note, unattended_timeout_from_env,
 };
 pub use uploads::{AttachmentChunk, Uploads};
 pub use workspace_host::{WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig};

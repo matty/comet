@@ -290,12 +290,7 @@ impl EngineHandle {
             // `EngineBootConfig` has no timeout knob of its own; reading the
             // env var here rather than hard-coding the default is what lets
             // an operator's override reach the embedded (headed) engine too.
-            unattended_timeout: std::time::Duration::from_secs(
-                std::env::var("COMET_UNATTENDED_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(comet_engine::DEFAULT_UNATTENDED_TIMEOUT_SECS),
-            ),
+            unattended_timeout: comet_engine::unattended_timeout_from_env(),
         };
         let engine_runtime = Engine::assemble_runtime(&engine_config).await?;
         let service: Arc<dyn RpcService> = engine_runtime.core().rpc_service();

@@ -184,12 +184,7 @@ fn engine_config_from_env() -> comet_engine::EngineConfig {
             .unwrap_or(27654),
         default_harness: harness_from_env(),
         releases_url: comet_update::releases_url_from_env(),
-        unattended_timeout: std::time::Duration::from_secs(
-            std::env::var("COMET_UNATTENDED_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(comet_engine::DEFAULT_UNATTENDED_TIMEOUT_SECS),
-        ),
+        unattended_timeout: comet_engine::unattended_timeout_from_env(),
     }
 }
 
