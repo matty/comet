@@ -349,6 +349,7 @@ pub struct EngineRpc {
     updater: Option<comet_update::Updater>,
     server_hello: Option<ServerHello>,
     mutation_authority: DocMutationGate,
+    presence: std::sync::Arc<crate::Presence>,
 }
 
 #[derive(Clone)]
@@ -370,6 +371,7 @@ impl EngineRpc {
         diff_sync: CheckoutDiffSync,
         uploads: Uploads,
         agent_accounts: AgentAccounts,
+        presence: std::sync::Arc<crate::Presence>,
     ) -> Self {
         let mutation_authority = workspace.mutation_gate();
         Self {
@@ -385,6 +387,7 @@ impl EngineRpc {
             updater: None,
             server_hello: None,
             mutation_authority,
+            presence,
         }
     }
 
@@ -962,6 +965,13 @@ impl RpcService for LocalRpcService {
             _ => self.inner.handle(method, params).await,
         }
     }
+
+    /// Forwarded, not defaulted: `rpc_service()` hands out this wrapper, so a
+    /// defaulted `None` here would silently drop every embedded-UI client
+    /// from the presence count.
+    fn attached(&self) -> Option<comet_rpc::ConnectionLease> {
+        self.inner.attached()
+    }
 }
 
 #[async_trait]
@@ -1303,6 +1313,10 @@ impl RpcService for EngineRpc {
             }
             other => Err(RpcError::UnknownMethod(other.to_string())),
         }
+    }
+
+    fn attached(&self) -> Option<comet_rpc::ConnectionLease> {
+        Some(Box::new(self.presence.attach()))
     }
 }
 

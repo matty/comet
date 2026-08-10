@@ -95,6 +95,9 @@ pub struct EngineConfig {
     pub default_harness: HarnessId,
     /// Release metadata/download origin. It is not a runtime authority.
     pub releases_url: String,
+    /// How long a wait no client can answer may last before the turn ends.
+    /// `COMET_UNATTENDED_TIMEOUT_SECS`, default 24 hours.
+    pub unattended_timeout: std::time::Duration,
 }
 
 impl EngineConfig {
@@ -104,6 +107,7 @@ impl EngineConfig {
             ipc_port: 0,
             default_harness: HarnessId::Mock,
             releases_url: "http://127.0.0.1:1".into(),
+            unattended_timeout: std::time::Duration::from_secs(DEFAULT_UNATTENDED_TIMEOUT_SECS),
         }
     }
 }
@@ -125,6 +129,10 @@ pub struct EngineCore {
     device_identity: Arc<DeviceIdentity>,
     remote_config: RemoteConfigStore,
     lan_server: LanServerHandle,
+    /// Live supervisor count, tracked from boot so a daemon nobody ever
+    /// connects to still starts an unattended stretch. The sweeper (a later
+    /// slice) is the only reader that turns this into policy.
+    presence: Arc<Presence>,
     rpc: std::sync::OnceLock<Arc<EngineRpc>>,
     local_rpc: std::sync::OnceLock<Arc<LocalRpcService>>,
     /// Release checker (attached by [`Engine::assemble_runtime`]) — the
@@ -216,6 +224,7 @@ impl EngineCore {
             device_identity,
             remote_config,
             lan_server,
+            presence: Presence::new(chrono::Utc::now()),
             rpc: std::sync::OnceLock::new(),
             local_rpc: std::sync::OnceLock::new(),
             updater: std::sync::Mutex::new(None),
@@ -258,6 +267,7 @@ impl EngineCore {
                     self.diff_sync.clone(),
                     self.uploads.clone(),
                     self.agent_accounts.clone(),
+                    self.presence.clone(),
                 )
                 .with_server_hello(hello);
                 if let Some(updater) = self.updater() {
@@ -295,6 +305,12 @@ impl EngineCore {
 
     pub fn remote_config(&self) -> &RemoteConfigStore {
         &self.remote_config
+    }
+
+    /// Live supervisor count. The unattended sweeper reads it; nothing else
+    /// should make policy from it.
+    pub fn presence(&self) -> Arc<Presence> {
+        self.presence.clone()
     }
 
     pub fn device_identity(&self) -> &DeviceIdentity {

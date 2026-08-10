@@ -3076,3 +3076,67 @@ async fn an_approval_pending_when_the_process_dies_becomes_expired() {
         "This approval is no longer waiting for an answer."
     );
 }
+
+// ---------------------------------------------------------------------------
+// Presence: how many supervisors are attached, across topologies. The
+// unattended sweeper (a later slice) is the only reader that turns this into
+// a policy decision; these tests only cover the counting.
+// ---------------------------------------------------------------------------
+
+/// The embedded-UI topology: `memory_client` is a real connection, so the
+/// engine must see the in-process UI as attached. Counting sockets instead
+/// would report zero watchers with the UI open on screen and expire runs in
+/// front of a present user.
+#[tokio::test]
+async fn an_in_memory_client_counts_as_an_attached_supervisor() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    assert_eq!(core.presence().attached_count(), 0);
+    assert!(core.presence().unattended_since().is_some());
+
+    let client = comet_rpc::memory_client(core.rpc_service());
+    wait_for(
+        || core.presence().attached_count() == 1,
+        "the in-memory client to be counted",
+    )
+    .await;
+    assert_eq!(core.presence().unattended_since(), None);
+
+    drop(client);
+    wait_for(
+        || core.presence().unattended_since().is_some(),
+        "the stretch to restart when the client goes",
+    )
+    .await;
+}
+
+/// `RemoteRpcService` wraps `EngineRpc`; a defaulted `attached()` compiles and
+/// silently loses every LAN client. This is the topology `remote_access.rs`
+/// exercises for RPC behavior — here it stands in as the "LAN-shaped" client
+/// that must still register as an attached supervisor.
+#[tokio::test]
+async fn the_remote_service_forwards_presence_to_the_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    let remote: Arc<dyn RpcService> = Arc::new(comet_engine::RemoteRpcService::new(
+        core.remote_rpc_service(),
+        core.device_id.clone(),
+    ));
+    let client = comet_rpc::memory_client(remote);
+    wait_for(
+        || core.presence().attached_count() == 1,
+        "a LAN-shaped client to be counted",
+    )
+    .await;
+    drop(client);
+}
