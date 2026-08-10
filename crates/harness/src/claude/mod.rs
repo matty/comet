@@ -135,6 +135,9 @@ impl ClaudeHarness {
                 RuntimeMode::Auto,
                 RuntimeMode::FullAccess,
             ],
+            // `deny_response(message)` puts the note on the wire, and 1.6's
+            // capture saw the model read it back.
+            carries_deny_note: true,
         }
     }
 
@@ -1208,5 +1211,11 @@ mod command_tests {
                 "{mode:?} is declared but produces no permission mode"
             );
         }
+    }
+
+    /// The deny arm puts the note on the wire, so the composer may promise it.
+    #[test]
+    fn claude_carries_a_deny_note() {
+        assert!(ClaudeHarness::capabilities().carries_deny_note);
     }
 }

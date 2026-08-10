@@ -22,6 +22,9 @@ impl MockHarness {
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![ReasoningLevel::Medium],
             runtime_modes: Vec::new(),
+            // The mock scripts Claude-flavoured runs, so the approval surface
+            // it drives for a rendered check has to read as Claude's does.
+            carries_deny_note: true,
         }
     }
 }

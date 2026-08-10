@@ -119,6 +119,13 @@ pub struct HarnessCapabilities {
     /// as unknown, never as "supports nothing", or a harness that predates the
     /// field is presented as offering no way to run at all.
     pub runtime_modes: Vec<RuntimeMode>,
+    /// Whether the note attached to a denial reaches the model. Claude's deny
+    /// response carries a message; Codex's decisions are bare literals with
+    /// nowhere to put one, so the same control means different things per
+    /// provider (`DEBT.md` D24). The composer labels its note field from this:
+    /// a promise the provider cannot keep is worse than copy admitting the
+    /// limit, which is why the conservative default is "cannot carry it".
+    pub carries_deny_note: bool,
 }
 
 /// Whether a harness's CLI is usable on this device, as of the last probe.
@@ -418,6 +425,15 @@ mod capability_tests {
             partial.runtime_modes,
             vec![RuntimeMode::ApprovalRequired, RuntimeMode::FullAccess]
         );
+    }
+
+    /// The absent case is what a peer predating the field sends. A note that
+    /// silently goes nowhere is worse than copy that says so, so "has not
+    /// declared" has to land on "cannot carry it".
+    #[test]
+    fn absent_deny_note_capability_reads_as_cannot_carry() {
+        let caps: HarnessCapabilities = serde_json::from_str("{}").unwrap();
+        assert!(!caps.carries_deny_note);
     }
 }
 
