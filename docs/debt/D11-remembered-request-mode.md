@@ -1,5 +1,15 @@
 # D11 — the remembered request carries the previous turn's mode
 
+> **Closed by slice 1.8 ([PR #39](https://github.com/matty/comet/pull/39)).**
+> `DocHost::apply_chat_row_runtime_mode` overlays the chat row's current mode on
+> all three paths below and re-derives the sandbox from it, covered by
+> `a_tightened_mode_reaches_a_steer_turned_run` (confirmed failing without the
+> fix). **The decision this page asked for, now made: a mode change applies to
+> the next dispatch and never to a run in flight** — the provider process was
+> spawned with its permission mode, so there is nothing to change mid-process.
+> The text below is what the deferral looked like; it is kept because the
+> "two sources of truth for one value" shape recurs.
+
 `last_requests` is stamped at dispatch (`crates/engine/src/sessions.rs`) and is
 preferred over `request_from_chat_row` on three paths: the steer-turned-run and
 `RespondInput` dead-run fallbacks (`crates/engine/src/doc_host.rs`) and

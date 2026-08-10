@@ -1,5 +1,12 @@
 # D12 — the permission axis crosses RPC with no version signal
 
+> **Closed by slice 1.8 ([PR #39](https://github.com/matty/comet/pull/39)).**
+> `PROTOCOL_VERSION` is `4`. A mixed pair is now refused outright
+> (`RemoteConnectionState::IncompatibleVersion`) rather than running a session
+> under a mode nobody chose. Note the version numbers below are stale — the
+> constant was already `3` by 1.4; read `crates/proto/src/remote.rs` for the
+> current reason list, never this page.
+
 `PROTOCOL_VERSION` is still `1`. Slice 1.1 added `runtimeMode` and 1.2 removed
 `autoApprove`, both additively, so a pre-1.1 daemon and a post-1.2 client both
 advertise `1` and pair successfully. The older peer ignores the unknown
