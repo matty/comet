@@ -42,6 +42,28 @@ comet daemon start|stop|restart|status
 There is no `comet login`, `comet logout`, or `comet migrate` command. Existing
 cloud profiles are not imported or merged into the local store.
 
+## Runs left unattended end after a day
+
+An agent that asks for approval stops and waits for an answer. If no client is
+connected, nobody can answer, so that wait is capped: after **24 hours with
+nothing attached** the turn ends, the approval card is marked expired, and the
+transcript says why. Send the prompt again to continue — the session keeps its
+context, and nothing is ever recorded as a denial you did not make.
+
+A connected client means the wait is answerable, so it never expires however long
+you take to decide. Connecting resets the clock; disconnecting starts it again.
+
+```bash
+COMET_UNATTENDED_TIMEOUT_SECS=3600 comet headless   # cap the wait at an hour
+```
+
+The cap cannot be turned off. `0` is rejected (it would expire every waiting run
+at once, the opposite of what it looks like), and while an absurdly large value
+does disable the cap in practice, that is an accident of arithmetic overflow
+rather than a supported setting — do not rely on it. This only affects a daemon:
+the Desktop app holds a connection for as long as it is running, so an embedded
+engine never reaches the cap.
+
 ## Connect two Comet machines
 
 Incoming remote connections are disabled by default. On server B, choose a LAN
