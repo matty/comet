@@ -3466,3 +3466,52 @@ async fn a_run_that_is_merely_slow_is_not_expired() {
         .await;
     assert_eq!(ended, 0, "a working run is not a run waiting on a human");
 }
+
+/// Every other test above drives `expire_unattended` by hand — proof of the
+/// expiry logic, but not of the ticker `Engine::assemble_runtime` actually
+/// spawns. This calls `spawn_unattended_sweeper` itself, on a real interval
+/// and a real `Utc::now()`, and waits for the card to expire on its own with
+/// nothing manually pumping the sweep. `assemble_runtime` can't be driven
+/// directly here — it hard-codes `default_registry()`, and the mock harness's
+/// parking knob is the process-global `COMET_MOCK_APPROVAL` env var, the same
+/// parallel-test race `ScriptedHarness` was chosen over `COMET_MOCK_HANG` to
+/// avoid elsewhere in this file — so this builds a core the same way every
+/// other test here does and spawns the real function against it.
+#[tokio::test]
+async fn the_spawned_sweeper_expires_a_parked_approval_on_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ApprovingHarness));
+    // No client ever attaches: unattended from boot, same as the manual-sweep
+    // tests above.
+    let presence = core.presence();
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    // `sweep_interval` clamps the tick to 250ms even for a much shorter
+    // bound, so the wait below just needs to outlast a couple of ticks —
+    // the bound itself can stay near-instant.
+    comet_engine::spawn_unattended_sweeper(
+        core.sessions.clone(),
+        presence,
+        Duration::from_millis(100),
+    );
+
+    drive_to_open_approval(&core, &handle, "cmd-run-real-sweeper").await;
+
+    wait_for(
+        || {
+            entries(&core).iter().any(|e| {
+                e.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        MessagePart::Approval {
+                            decision: Some(ApprovalDecision::Expired),
+                            ..
+                        }
+                    )
+                })
+            })
+        },
+        "the real sweeper to expire the card with nothing pumping it manually",
+    )
+    .await;
+}
