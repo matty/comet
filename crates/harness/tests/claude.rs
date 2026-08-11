@@ -670,3 +670,35 @@ async fn models_come_back_live_and_merged() {
         "a curated model the CLI did not list is still kept, got {ids:?}"
     );
 }
+
+/// An answer we cannot read is the one failure that means a provider changed
+/// its protocol under us, and it must survive as `Unparseable` so the engine
+/// raises its `Diagnostic` (`crates/engine/src/rpc.rs:1010`).
+#[tokio::test]
+async fn an_unreadable_answer_is_reported_as_drift() {
+    let harness =
+        ClaudeHarness::new().with_executable(env!("CARGO_BIN_EXE_fake-claude-bad-discovery"));
+    let catalog = harness.models().await.expect("still answers");
+    assert_eq!(
+        catalog.source,
+        comet_proto::CatalogSource::BuiltIn,
+        "a broken handshake still serves the curated list"
+    );
+    assert_eq!(
+        harness.take_unreported_discovery_failure(),
+        Some(comet_harness::discovery::DiscoveryFailure::Unparseable)
+    );
+}
+
+/// A CLI that cannot be spawned is ordinary, not drift — otherwise every
+/// machine without Claude installed would report a protocol failure on boot.
+#[tokio::test]
+async fn a_missing_cli_is_not_drift() {
+    let harness = ClaudeHarness::new().with_executable("/nonexistent/claude-nowhere");
+    let catalog = harness.models().await.expect("curated list still answers");
+    assert_eq!(catalog.source, comet_proto::CatalogSource::BuiltIn);
+    assert_eq!(
+        harness.take_unreported_discovery_failure(),
+        Some(comet_harness::discovery::DiscoveryFailure::Unreachable)
+    );
+}
