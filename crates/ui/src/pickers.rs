@@ -576,7 +576,12 @@ impl Pickers {
     }
 
     /// Effective harness: picked, or the chat's config, or the first listed.
-    fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
+    ///
+    /// Public because the composer's `/` menu asks the same question the chips
+    /// do — the command list belongs to whichever agent this turn will run on,
+    /// and a menu answering for a different one offers commands that do not
+    /// exist there.
+    pub fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
         if let Some(harness) = self.config.harness {
             return Some(harness);
         }

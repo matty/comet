@@ -1444,6 +1444,23 @@ impl ComposerInput {
     ) {
         self.invalidate_mention_tooltip();
         let path = local_file_link(path, is_dir);
+        self.replace_completion(range, &path, cx);
+    }
+
+    /// Splice `inserted` over `range` and leave the cursor after it, with
+    /// exactly one separating space.
+    ///
+    /// Shared by the two completions because the separator rule is the same and
+    /// getting it wrong is invisible in a test that only checks the text: a
+    /// second space, or none at all before an existing one, reads as a typo the
+    /// user then has to fix by hand.
+    pub fn replace_completion(
+        &mut self,
+        range: Range<usize>,
+        inserted: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let path = inserted.to_owned();
         let next = self.content[range.end..].chars().next();
         let existing_separator = next.filter(|ch| ch.is_whitespace() && *ch != '\n' && *ch != '\r');
         let inserted = if existing_separator.is_some() {
@@ -3113,10 +3130,79 @@ fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
     })
 }
 
+/// Which completion the one popup is showing.
+///
+/// The two share a token, an active index, a dismissal rule and a popup,
+/// because they are the same affordance with different rows — duplicating that
+/// lifecycle is how the second one drifts from the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Completion {
+    #[default]
+    Files,
+    Commands,
+}
+
+/// The `/` must be the very first character of the prompt, and the cursor must
+/// still be inside that first word.
+///
+/// Narrower than [`mention_token`]'s "any token boundary" on purpose, and the
+/// capture is the reason (`2026-08-11-slash-command-expansion.md`): at the
+/// start of the prompt the CLI expands the command itself in one turn, while
+/// mid-text the model picks it up as a Skill tool in three. Both work, so this
+/// is about offering the affordance where the cheap path is.
+///
+/// Past the first space the user is typing arguments — `/code-review --fix` —
+/// and a menu that stayed open over them would be completing a word nobody is
+/// writing.
+fn command_token(text: &str, cursor: usize) -> Option<MentionToken> {
+    if cursor == 0 || cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    if !text.starts_with('/') || text[..cursor].chars().any(char::is_whitespace) {
+        return None;
+    }
+    let end = text[cursor..]
+        .char_indices()
+        .find_map(|(at, ch)| ch.is_whitespace().then_some(cursor + at))
+        .unwrap_or(text.len());
+    Some(MentionToken {
+        range: 0..end,
+        query: text[1..cursor].to_string(),
+    })
+}
+
+/// Rows for `query`, matched on the name and on aliases but never listing an
+/// alias as a row of its own — `/cr` finds `code-review`, and the menu still
+/// shows one entry for it.
+fn matching_commands<'a>(
+    commands: &'a [comet_proto::AgentCommand],
+    query: &str,
+) -> Vec<&'a comet_proto::AgentCommand> {
+    let needle = query.to_lowercase();
+    commands
+        .iter()
+        .filter(|command| {
+            needle.is_empty()
+                || command.name.to_lowercase().contains(&needle)
+                || command
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.to_lowercase().contains(&needle))
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Default)]
 struct FileMentionState {
     token: Option<MentionToken>,
+    /// Which rows the popup is showing. The rest of this struct is shared by
+    /// both, so anything that reads `results` must read `kind` first.
+    kind: Completion,
     results: Vec<FileSearchMatch>,
+    /// The provider's command list for this chat's directory, unfiltered. The
+    /// query filters at render time rather than at fetch time — one spawn per
+    /// directory per boot, not one per keystroke.
+    commands: Vec<comet_proto::AgentCommand>,
     active: Option<usize>,
     request: u64,
     loading: bool,
@@ -3132,6 +3218,55 @@ struct FileMentionState {
 
 fn mention_response_is_current(state: &FileMentionState, request: u64) -> bool {
     state.request == request && state.token.is_some()
+}
+
+impl FileMentionState {
+    /// How many rows the popup is showing, which is what bounds the active
+    /// index. Reading `results.len()` unconditionally would let the arrow keys
+    /// walk off the end of a command menu.
+    fn row_count(&self) -> usize {
+        match self.kind {
+            Completion::Files => self.results.len(),
+            Completion::Commands => self
+                .token
+                .as_ref()
+                .map(|token| matching_commands(&self.commands, &token.query).len())
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// The single place `ListCommands`' reply is decoded.
+///
+/// Takes the raw `serde_json::Value` the engine sent and is tested against the
+/// literal bytes rather than a round trip through `AgentCommand` — the round
+/// trip is exactly what stayed green while 2.1's reshaped `ListModels` left the
+/// picker broken at run time (AGENTS.md, "Changing what an RPC method answers
+/// with").
+fn decode_commands_reply(
+    value: serde_json::Value,
+) -> Result<Vec<comet_proto::AgentCommand>, serde_json::Error> {
+    #[derive(serde::Deserialize)]
+    struct Reply {
+        commands: Vec<comet_proto::AgentCommand>,
+    }
+    serde_json::from_value::<Reply>(value).map(|reply| reply.commands)
+}
+
+/// A failed command list, translated for the popup.
+///
+/// `UnknownMethod` is the version-skew case and it is REACHABLE: `ListCommands`
+/// ships in this slice, so a session hosted by a paired device on an older
+/// daemon answers exactly this. It must not read as "no commands" — the agent
+/// has plenty, the device just cannot be asked.
+fn command_error_message(err: &RpcError) -> SharedString {
+    match err {
+        RpcError::UnknownMethod(_) => {
+            "The session's device runs an older comet — update it to list its commands".into()
+        }
+        RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
+        RpcError::BadParams(_) | RpcError::Failed(_) => "Couldn't reach this agent".into(),
+    }
 }
 
 /// A failed file search, translated for the popup. `UnknownMethod` is the
@@ -3520,7 +3655,12 @@ impl Composer {
             let input = self.input.read(cx);
             (input.text().to_string(), input.cursor_offset())
         };
-        let token = mention_token(&text, cursor);
+        // `/` is checked first and only wins at the very start of the prompt,
+        // so the two token rules cannot both match the same text.
+        let (kind, token) = match command_token(&text, cursor) {
+            Some(token) => (Completion::Commands, Some(token)),
+            None => (Completion::Files, mention_token(&text, cursor)),
+        };
         let still_dismissed = token.as_ref().is_some_and(|token| {
             self.mention
                 .dismissed
@@ -3547,19 +3687,34 @@ impl Composer {
         // Refining an open menu keeps the stale rows visible until the new
         // response lands — clearing here made the popup bounce through the
         // skeleton (and a different height) on every keystroke.
-        let refining = self.mention.token.is_some() && token.is_some();
+        // Switching KIND is not refining: `@` rows must never be left on screen
+        // under a `/` token.
+        let refining = self.mention.token.is_some() && token.is_some() && self.mention.kind == kind;
+        self.mention.kind = kind;
         self.mention.token = token.clone();
         if !refining {
             self.mention.results.clear();
             self.mention.active = None;
         }
         self.mention.error = None;
-        self.mention.loading = token.is_some();
         self.sync_mention_controls(cx);
         let Some(token) = token else {
+            self.mention.loading = false;
             cx.notify();
             return;
         };
+        // The command list is fetched once per directory per boot, so a menu
+        // that already has it must not flash a skeleton on every keystroke —
+        // and must not re-spawn a CLI that runs the user's SessionStart hooks.
+        if kind == Completion::Commands && !self.mention.commands.is_empty() {
+            self.mention.loading = false;
+            self.mention.active = (self.mention.row_count() > 0).then_some(0);
+            self.sync_mention_controls(cx);
+            cx.notify();
+            return;
+        }
+        self.mention.loading = true;
+        self.sync_mention_controls(cx);
         let engine = {
             let state = self.state.read(cx);
             mention_search_owner(state.selected_chat.as_ref(), state.selected_space.as_ref())
@@ -3574,6 +3729,10 @@ impl Composer {
             crate::pickers::CheckoutPlan::ReuseWorktree { path, .. } => Some(path),
             _ => None,
         };
+        if kind == Completion::Commands {
+            self.fetch_commands(engine, token, selected_worktree, cx);
+            return;
+        }
         let params = {
             let state = self.state.read(cx);
             let mut params = serde_json::Map::new();
@@ -3641,9 +3800,80 @@ impl Composer {
         cx.notify();
     }
 
+    /// Ask the owning device for this chat's command list.
+    ///
+    /// No debounce, unlike the file search: this is one call per directory per
+    /// boot (the engine caches it), and the query filters rows locally. A
+    /// debounce here would only delay the first `/`.
+    fn fetch_commands(
+        &mut self,
+        engine: crate::state::ServerClient,
+        token: MentionToken,
+        selected_worktree: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(harness) = self.pickers.read(cx).effective_harness(cx) else {
+            self.mention.loading = false;
+            cx.notify();
+            return;
+        };
+        // The chat's own directory, or the worktree a new chat is about to run
+        // in. With neither there is nothing to ask ABOUT: answering for some
+        // other directory would serve another project's skills, which is the
+        // wrong answer this method's cwd parameter exists to prevent.
+        let cwd = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.cwd.clone())
+            .or(selected_worktree);
+        let Some(cwd) = cwd else {
+            self.mention.loading = false;
+            cx.notify();
+            return;
+        };
+        let params = serde_json::json!({ "harness": harness, "cwd": cwd });
+        let request = self.mention.request;
+        self.mention_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::LIST_COMMANDS, params).await;
+            this.update(cx, |composer, cx| {
+                if !mention_response_is_current(&composer.mention, request) {
+                    return;
+                }
+                composer.mention.loading = false;
+                match result {
+                    Ok(value) => match decode_commands_reply(value) {
+                        Ok(commands) => {
+                            composer.mention.error = None;
+                            composer.mention.commands = commands;
+                            composer.mention.active =
+                                (composer.mention.row_count() > 0).then_some(0);
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, "command list decode failed");
+                            composer.mention.error =
+                                Some("Couldn't read this agent's commands".into());
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!(%err, "command list request failed");
+                        composer.mention.commands.clear();
+                        composer.mention.active = None;
+                        composer.mention.error = Some(command_error_message(&err));
+                    }
+                }
+                composer.sync_mention_controls(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+        let _ = token;
+        cx.notify();
+    }
+
     fn move_mention(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.mention.active =
-            crate::popover::menu_step(self.mention.active, self.mention.results.len(), delta);
+            crate::popover::menu_step(self.mention.active, self.mention.row_count(), delta);
         self.sync_mention_controls(cx);
         cx.notify();
     }
@@ -3664,6 +3894,29 @@ impl Composer {
         let Some(token) = self.mention.token.clone() else {
             return;
         };
+        if self.mention.kind == Completion::Commands {
+            let name = self
+                .mention
+                .active
+                .and_then(|active| {
+                    matching_commands(&self.mention.commands, &token.query)
+                        .get(active)
+                        .map(|command| command.name.clone())
+                })
+                .filter(|name| !name.is_empty());
+            let Some(name) = name else {
+                return;
+            };
+            // Plain text, deliberately: the CLI parses `/name` out of the
+            // prompt itself, so a command is not a chip or a link — it is the
+            // first word of what the user is sending.
+            self.input.update(cx, |input, cx| {
+                input.replace_completion(token.range, &format!("/{name}"), cx)
+            });
+            self.reset_mention(None, cx);
+            cx.notify();
+            return;
+        }
         let Some((path, is_dir)) = self
             .mention
             .active
@@ -3707,6 +3960,75 @@ impl Composer {
                     .text_color(theme.danger_muted)
                     .child(error),
             );
+        } else if self.mention.kind == Completion::Commands {
+            let rows = matching_commands(&self.mention.commands, &token.query);
+            if rows.is_empty() {
+                card = card.child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(10.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(if self.mention.commands.is_empty() {
+                            "This agent has no commands here"
+                        } else {
+                            "No matching commands"
+                        }),
+                );
+            }
+            for (ix, command) in rows.into_iter().enumerate() {
+                let selected = self.mention.active == Some(ix);
+                let name: SharedString = format!("/{}", command.name).into();
+                let hint: Option<SharedString> =
+                    command.argument_hint.clone().map(SharedString::from);
+                // The provider's description rides the tooltip rather than the
+                // row: Claude's run to several hundred characters (the capture
+                // measured one at ~500), and truncated to a row's width they
+                // read as noise rather than as help.
+                let tooltip: Option<SharedString> =
+                    command.description.clone().map(SharedString::from);
+                card = card.child(
+                    crate::popover::menu_row(theme, selected, format!("command-result-{ix}"))
+                        .id(("command-result", ix))
+                        .when_some(tooltip, |row, text| {
+                            row.tooltip(move |_, cx| {
+                                cx.new(|_| MentionPathTooltip {
+                                    path: text.clone(),
+                                    activation: ix as u64,
+                                })
+                                .into()
+                            })
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.mention.active = Some(ix);
+                            this.accept_mention(cx);
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(12.5))
+                                        .text_color(theme.text)
+                                        .child(name),
+                                )
+                                .children(hint.map(|hint| {
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .truncate()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.text_muted)
+                                        .child(hint)
+                                })),
+                        ),
+                );
+            }
         } else if self.mention.results.is_empty() {
             card = card.child(
                 div()
@@ -5539,6 +5861,135 @@ mod tests {
         assert_eq!(
             mention_token("See (@lib", 9).map(|token| token.range),
             Some(5..9)
+        );
+    }
+
+    fn command(name: &str, hint: Option<&str>, aliases: &[&str]) -> comet_proto::AgentCommand {
+        comet_proto::AgentCommand {
+            name: name.into(),
+            description: Some(format!("{name} description")),
+            argument_hint: hint.map(str::to_string),
+            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+
+    /// The `/` only completes at the very start of the prompt. Mid-text it
+    /// still reaches the provider — the model launches it as a skill — but by
+    /// the dearer route (3 turns against 1, measured in the 2026-08-11
+    /// capture), so the affordance points at the cheap path.
+    #[test]
+    fn a_command_token_is_only_the_first_word_of_the_prompt() {
+        assert_eq!(
+            command_token("/comm", 5),
+            Some(MentionToken {
+                range: 0..5,
+                query: "comm".into(),
+            })
+        );
+        assert!(
+            command_token("Please run /verify", 18).is_none(),
+            "mid-text `/` is not completed"
+        );
+        assert!(
+            command_token("/code-review --fix", 18).is_none(),
+            "past the first space the user is typing arguments"
+        );
+        assert!(command_token("no slash", 3).is_none());
+        assert!(
+            command_token("/verify", 0).is_none(),
+            "a cursor before the slash has nothing to complete"
+        );
+    }
+
+    /// The token spans the whole first word, not just up to the cursor, so
+    /// accepting a completion mid-word replaces what is already typed instead
+    /// of doubling it.
+    #[test]
+    fn a_command_token_covers_the_whole_word_around_the_cursor() {
+        assert_eq!(command_token("/verify", 3).map(|t| t.range), Some(0..7));
+        assert_eq!(command_token("/verify now", 3).map(|t| t.range), Some(0..7));
+    }
+
+    /// Aliases are matched but never listed. `/cr` has to find `code-review`,
+    /// and the menu must still show one row for it rather than two.
+    #[test]
+    fn commands_match_on_aliases_without_listing_them() {
+        let commands = vec![
+            command("code-review", Some("[--fix]"), &["cr", "review"]),
+            command("verify", None, &[]),
+        ];
+        let names = |query: &str| -> Vec<String> {
+            matching_commands(&commands, query)
+                .iter()
+                .map(|c| c.name.clone())
+                .collect()
+        };
+        assert_eq!(names("cr"), vec!["code-review".to_string()]);
+        assert_eq!(names("rev"), vec!["code-review".to_string()]);
+        assert_eq!(names("ver"), vec!["verify".to_string()]);
+        assert_eq!(names("").len(), 2, "an empty query lists everything");
+        assert!(names("zzz").is_empty());
+    }
+
+    /// The active index is bounded by the rows on screen, which for a command
+    /// menu is the FILTERED count. Bounding it by `results` (the file vector,
+    /// empty here) would leave the arrow keys unable to move at all.
+    #[test]
+    fn the_active_index_is_bounded_by_the_filtered_command_rows() {
+        let state = FileMentionState {
+            kind: Completion::Commands,
+            token: command_token("/c", 2),
+            commands: vec![
+                command("code-review", None, &[]),
+                command("commit-pr", None, &[]),
+                command("verify", None, &[]),
+            ],
+            ..FileMentionState::default()
+        };
+        assert_eq!(state.row_count(), 2, "only the two matching `/c` rows");
+    }
+
+    /// Pinned to the literal bytes the engine sends, not a round trip through
+    /// `AgentCommand`. A round-trip test cannot catch the reply's SHAPE moving
+    /// — which is exactly how 2.1 shipped a runtime-broken picker with 501
+    /// tests green.
+    #[test]
+    fn the_engines_literal_command_reply_decodes() {
+        let sent = serde_json::json!({
+            "commands": [
+                {"name": "verify", "description": "Run the gate. (project)", "argumentHint": "[target]"},
+                {"name": "code-review", "description": "Review it.", "aliases": ["cr"]},
+                {"name": "bare"}
+            ]
+        });
+        let commands = decode_commands_reply(sent).expect("decodes");
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0].argument_hint.as_deref(), Some("[target]"));
+        assert_eq!(commands[1].aliases, vec!["cr".to_string()]);
+        assert_eq!(commands[2].description, None, "prose is optional");
+        assert!(commands[2].aliases.is_empty());
+    }
+
+    /// A bare array is the shape this reply deliberately is NOT, and the decode
+    /// has to fail rather than quietly produce nothing.
+    #[test]
+    fn a_bare_array_reply_does_not_decode_as_a_command_list() {
+        let sent = serde_json::json!([{ "name": "verify" }]);
+        assert!(decode_commands_reply(sent).is_err());
+    }
+
+    /// `UnknownMethod` is reachable the day this ships — a paired device on an
+    /// older daemon — and it must not read as "this agent has no commands".
+    #[test]
+    fn a_version_skewed_device_says_so_rather_than_reporting_no_commands() {
+        let message = command_error_message(&RpcError::UnknownMethod("ListCommands".into()));
+        assert!(
+            message.contains("older comet"),
+            "expected an actionable version-skew sentence, got {message:?}"
+        );
+        assert!(
+            !message.to_lowercase().contains("no commands"),
+            "a failure must never read as an empty menu, got {message:?}"
         );
     }
 
