@@ -48,8 +48,8 @@ use tokio::sync::mpsc;
 
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus,
-    HarnessAvailability, HarnessCapabilities, HarnessId, ModelCatalog, RunRequest, RuntimeMode,
-    SteeringMode,
+    HarnessCapabilities, HarnessId, HarnessProbe, InstallMethod, ModelCatalog, RunRequest,
+    RuntimeMode, SteeringMode,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
@@ -70,34 +70,46 @@ use rpc::{Incoming, RpcClient};
 /// locations as a last resort. Resolved per call — cheap after the snapshot is
 /// cached.
 pub fn resolve_codex_executable() -> Option<PathBuf> {
-    crate::resolve_cli("CODEX_EXECUTABLE", "codex", codex_install_dirs())
+    crate::resolve_cli(
+        "CODEX_EXECUTABLE",
+        "codex",
+        crate::all_known_dirs(codex_install_dirs()),
+    )
 }
 
-/// Where a Codex CLI lands when PATH doesn't name it.
-fn codex_install_dirs() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
+/// Where a Codex CLI lands when PATH doesn't name it, each tagged with what
+/// finding it there means (see [`crate::KnownDir`]).
+fn codex_install_dirs() -> Vec<crate::KnownDir> {
+    let mut dirs: Vec<crate::KnownDir> = Vec::new();
     if let Some(home) = crate::home_dir() {
-        dirs.push(home.join(".local").join("bin"));
-        dirs.push(home.join(".codex").join("bin"));
-        dirs.push(home.join(".npm-global").join("bin"));
+        dirs.push((home.join(".local").join("bin"), InstallMethod::Native));
+        dirs.push((home.join(".codex").join("bin"), InstallMethod::Native));
+        dirs.push((home.join(".npm-global").join("bin"), InstallMethod::Npm));
     }
     if cfg!(windows) {
         // The official Windows installer is per-user under LOCALAPPDATA; the
         // rest are the package managers' shim dirs (all `.cmd`/`.exe`).
-        dirs.extend(
-            crate::env_dir("LOCALAPPDATA")
-                .map(|d| d.join("Programs").join("OpenAI").join("Codex").join("bin")),
-        );
-        dirs.extend(
-            crate::env_dir("LOCALAPPDATA")
-                .map(|d| d.join("Microsoft").join("WinGet").join("Links")),
-        );
+        dirs.extend(crate::env_dir("LOCALAPPDATA").map(|d| {
+            (
+                d.join("Programs").join("OpenAI").join("Codex").join("bin"),
+                InstallMethod::Native,
+            )
+        }));
+        dirs.extend(crate::env_dir("LOCALAPPDATA").map(|d| {
+            (
+                d.join("Microsoft").join("WinGet").join("Links"),
+                InstallMethod::Winget,
+            )
+        }));
         if let Some(home) = crate::home_dir() {
-            dirs.push(home.join("scoop").join("shims"));
+            dirs.push((home.join("scoop").join("shims"), InstallMethod::Scoop));
         }
     } else {
-        dirs.push(PathBuf::from("/opt/homebrew/bin"));
-        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push((PathBuf::from("/opt/homebrew/bin"), InstallMethod::Homebrew));
+        // Untagged for the same reason as Claude's list: `/usr/local/bin` is
+        // Intel Homebrew, a manual copy, and several installers' fallback all
+        // at once.
+        dirs.push((PathBuf::from("/usr/local/bin"), InstallMethod::Unknown));
     }
     dirs
 }
@@ -263,11 +275,14 @@ impl Harness for CodexHarness {
         Self::capabilities()
     }
 
-    async fn availability(&self) -> HarnessAvailability {
-        match self.resolve_executable() {
-            Ok(exe) => crate::probe_cli_version(&exe).await,
-            Err(err) => crate::unavailable_from_resolve(&err, "codex", "CODEX_EXECUTABLE"),
-        }
+    async fn probe(&self) -> HarnessProbe {
+        crate::probe_installed_cli(
+            self.resolve_executable(),
+            "codex",
+            "CODEX_EXECUTABLE",
+            crate::all_known_dirs(codex_install_dirs()),
+        )
+        .await
     }
 
     /// The curated catalog (see [`catalog`]) unioned with whatever a
@@ -1282,6 +1297,52 @@ async fn shutdown_child(child: &mut Child, kill_grace: Duration) {
     }
     let _ = child.start_kill();
     let _ = child.wait().await;
+}
+
+#[cfg(test)]
+mod install_dir_tests {
+    use super::*;
+
+    /// The tags on the real catalogue, not a fabricated one. `classify_install`
+    /// is only ever as right as the list it is handed, so the lookup being
+    /// tested elsewhere proves nothing about the label a user actually sees.
+    ///
+    /// Windows-only because the entries asserted are the Windows branch, and
+    /// they are built from `%LOCALAPPDATA%` at call time.
+    #[test]
+    #[cfg(windows)]
+    fn the_windows_catalogue_tags_the_official_installer_as_native() {
+        let dirs = codex_install_dirs();
+        let localappdata = crate::env_dir("LOCALAPPDATA").expect("set on every Windows machine");
+        let official = localappdata
+            .join("Programs")
+            .join("OpenAI")
+            .join("Codex")
+            .join("bin");
+        let tag = dirs
+            .iter()
+            .find(|(d, _)| *d == official)
+            .map(|(_, m)| *m)
+            .expect("the official installer dir must be in the catalogue");
+        assert_eq!(tag, InstallMethod::Native);
+    }
+
+    /// `~/.npm-global/bin` is an npm prefix, not a native install — it sits in
+    /// the same list as the native dirs and is the easiest one to mislabel.
+    #[test]
+    fn the_npm_prefix_is_tagged_npm_not_native() {
+        let Some(home) = crate::home_dir() else {
+            return;
+        };
+        let dirs = codex_install_dirs();
+        let npm_global = home.join(".npm-global").join("bin");
+        let tag = dirs
+            .iter()
+            .find(|(d, _)| *d == npm_global)
+            .map(|(_, m)| *m)
+            .expect("the npm prefix must be in the catalogue");
+        assert_eq!(tag, InstallMethod::Npm);
+    }
 }
 
 #[cfg(test)]
