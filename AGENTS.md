@@ -48,6 +48,11 @@ locally first — don't use CI as the first place a change is checked.
 Clippy is not yet `-D warnings`: the workspace carries ~24 pre-existing warnings. Don't add
 new ones, and prefer fixing any you touch.
 
+A failure you write off as a known flake must name where it is recorded. "The documented
+flake" was claimed once for a titling test the record says was *fixed*, on a branch that
+touched titling — a citation nobody can follow is how a real regression gets waved through.
+No record to point at? Run it several times in isolation and report the count.
+
 Full procedure: `.agents/workflows/verify.md`.
 
 ## Known debt lives in `docs/debt/`
@@ -71,6 +76,34 @@ model you or a reviewer runs on.
 
 The picker's default is whatever the catalog lists first, so it will hand you Fable unless you
 change it. Change it before you send.
+
+## Changing what an RPC method answers with
+
+`cargo build` will not find every consumer. Untyped JSON assertions in `crates/engine/tests/`
+index a reply directly, and `apps/ios` decodes it in Swift. When `ListModels` went from an
+array to an object, the build stayed clean, all 501 `comet-ui` tests stayed green, and the
+model picker was broken at runtime until a later slice fixed it.
+
+Two rules follow. **Decode each reply in exactly one place**, and point its test at the literal
+JSON the engine sends — `crates/ui/src/pickers.rs`'s `decode_models_reply` is the worked
+example, and its comment records why a test that round-trips through the Rust type would have
+stayed green through exactly this failure. **And re-read `PROTOCOL_VERSION`'s own doc comment**
+(`crates/proto/src/remote.rs`): a reshaped reply bumps it, an added field does not.
+
+More generally: where a constant carries its own reason list in a doc comment, that comment is
+the record. Read it rather than any spec, plan or handoff file quoting it. `PROTOCOL_VERSION`
+has been quoted secondhand twice and was a slice out of date both times, and both times a spec
+inherited the wrong number.
+
+## Subagent-driven slices
+
+Model tiering, passed explicitly on every dispatch: **Sonnet implements, Opus reviews each
+task, Fable runs the final whole-branch pass.** An omitted `model` silently inherits the
+session's, which defeats the tiering and is the expensive default. Record the tiering in the
+slice's SDD ledger so a resumed session doesn't re-derive it.
+
+This is about the models *running* the work. It is separate from the picker rule above, which
+is about the model a test session drives inside Comet.
 
 ## The gpui fork rev is load-bearing
 
