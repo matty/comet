@@ -50,13 +50,20 @@ pub enum DiscoveryFailure {
 }
 
 /// Reasoning levels Comet layers on top of a provider rather than reading
-/// from one: `ultrathink` is a prompt prefix, `ultracode` an `xhigh` plus a
-/// setting, `ultra` a Codex-only tier. A model nobody has curated must not be
-/// offered any of them.
+/// from one: `ultrathink` is a prompt prefix and `ultracode` an `xhigh` plus a
+/// setting. A model nobody has curated must not be offered either.
+///
+/// **`ultra` is deliberately not on this list**, though it was until slice 2.3.
+/// Codex reports it in `supportedReasoningEfforts` on gpt-5.6+ (capture
+/// `2026-08-11-codex-model-list.md`) and `codex/catalog.rs`'s `to_effort`
+/// already sends it on the wire, so it is provider-reported, not
+/// Comet-layered. Filtering it stripped the top effort off exactly the models
+/// this phase exists to surface: the ones no one has curated yet. Claude is
+/// unaffected — its ladder tops out at `max`.
 fn is_comet_special(level: ReasoningLevel) -> bool {
     matches!(
         level,
-        ReasoningLevel::Ultracode | ReasoningLevel::Ultrathink | ReasoningLevel::Ultra
+        ReasoningLevel::Ultracode | ReasoningLevel::Ultrathink
     )
 }
 
@@ -587,5 +594,30 @@ mod tests {
         let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         assert_eq!(program_path(&abs), abs);
     }
-
+    /// `ultra` is provider-reported on Codex, not layered on by Comet, so a
+    /// model nobody has curated must keep it. Slice 2.3's capture is the
+    /// evidence; before that it was filtered with the two real specials.
+    #[test]
+    fn a_live_only_model_keeps_a_provider_reported_ultra() {
+        let answer = Discovery {
+            models: vec![DiscoveredModel {
+                id: "gpt-5.7-nova".into(),
+                label: "Nova".into(),
+                description: None,
+                reasoning_levels: vec![
+                    ReasoningLevel::High,
+                    ReasoningLevel::Ultra,
+                    ReasoningLevel::Ultracode,
+                    ReasoningLevel::Ultrathink,
+                ],
+                accepts_images: Some(true),
+            }],
+        };
+        let merged = merge(Vec::new(), &answer);
+        assert_eq!(
+            merged[0].reasoning_levels,
+            vec![ReasoningLevel::High, ReasoningLevel::Ultra],
+            "ultracode and ultrathink are Comet's own; ultra is the provider's"
+        );
+    }
 }
