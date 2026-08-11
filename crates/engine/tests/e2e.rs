@@ -14,12 +14,13 @@ use comet_doc::{
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
 };
 use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
+use comet_harness::discovery::{DiscoveredModel, Discovery};
 use comet_harness::mock::MockHarness;
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus, FileOperation,
-    HarnessCapabilities, HarnessId, ModelCatalog, NoticeKind, NoticeSeverity, ReasoningLevel,
-    RunRequest, RuntimeMode, SandboxLevel, SessionStatus, SteeringMode, ToolCall,
+    AgentEvent, ApprovalDecision, ApprovalRequest, CatalogSource, DiagnosticSeverity, DoneStatus,
+    FileOperation, HarnessCapabilities, HarnessId, ModelCatalog, NoticeKind, NoticeSeverity,
+    ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel, SessionStatus, SteeringMode, ToolCall,
 };
 use comet_rpc::RpcService;
 use comet_sync::DocsStore;
@@ -238,9 +239,7 @@ async fn queued_run_command_executes_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
         dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
+        Arc::new(MockHarness::with_script(mock_script())),
     );
     let handle = core.doc_host.open(CHAT).unwrap();
 
@@ -745,9 +744,7 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
         dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
+        Arc::new(MockHarness::with_script(mock_script())),
     );
     let handle = core.doc_host.open(CHAT).unwrap();
 
@@ -831,9 +828,7 @@ async fn a_tightened_mode_reaches_a_steer_turned_run() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
         dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
+        Arc::new(MockHarness::with_script(mock_script())),
     );
     let config = |mode: RuntimeMode| comet_proto::ChatConfig {
         harness: HarnessId::Mock,
@@ -919,9 +914,7 @@ async fn processed_commands_are_skipped_on_redelivery() {
 
     let core = assemble(
         dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
+        Arc::new(MockHarness::with_script(mock_script())),
     );
     let handle = core.doc_host.open(CHAT).unwrap();
     queue_as_viewer(
@@ -1016,9 +1009,7 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
     // Boot: EngineCore::assemble runs recover_stale.
     let core = assemble(
         dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
+        Arc::new(MockHarness::with_script(mock_script())),
     );
     assert_eq!(core.device_id, device_id);
 
@@ -1052,9 +1043,7 @@ async fn rpc_surface_over_in_memory_transport() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
         dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
+        Arc::new(MockHarness::with_script(mock_script())),
     );
     let client = comet_rpc::memory_client(core.rpc_service());
 
@@ -1832,11 +1821,9 @@ impl Harness for CapturingHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         self.seen.lock().unwrap().push(request.clone());
-        MockHarness {
-            script: self.script.clone(),
-        }
-        .run(request, controls)
-        .await
+        MockHarness::with_script(self.script.clone())
+            .run(request, controls)
+            .await
     }
 }
 
@@ -2104,7 +2091,7 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
         session_id: None,
     });
     let dir = tempfile::tempdir().unwrap();
-    let core = assemble(dir.path(), Arc::new(MockHarness { script }));
+    let core = assemble(dir.path(), Arc::new(MockHarness::with_script(script)));
     let handle = core.doc_host.open(CHAT).unwrap();
     queue_as_viewer(
         handle.doc(),
@@ -3108,9 +3095,7 @@ async fn an_in_memory_client_counts_as_an_attached_supervisor() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
         dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
+        Arc::new(MockHarness::with_script(mock_script())),
     );
     assert_eq!(core.presence().attached_count(), 0);
     assert!(core.presence().unattended_since().is_some());
@@ -3140,9 +3125,7 @@ async fn the_remote_service_forwards_presence_to_the_engine() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
         dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
+        Arc::new(MockHarness::with_script(mock_script())),
     );
     let remote: Arc<dyn RpcService> = Arc::new(comet_engine::RemoteRpcService::new(
         core.remote_rpc_service(),
@@ -3683,4 +3666,54 @@ async fn retry_re_arms_a_cached_discovery_failure() {
 
     engine.list_models(HarnessId::Mock, true).await.unwrap();
     assert_eq!(harness.discovery_runs(), 2, "force re-arms the cell");
+}
+
+/// Assembles an engine around a `MockHarness` scripted with the given
+/// discovery answer — task 7's end-to-end proof that a discovered model
+/// reaches the client with no CLI on the machine.
+async fn engine_with_mock_discovery(discovery: Discovery) -> TestEngine {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(MockHarness::with_discovery(discovery));
+    let core = assemble(dir.path(), harness);
+    let client = comet_rpc::memory_client(core.rpc_service());
+    TestEngine {
+        _dir: dir,
+        _core: core,
+        client,
+    }
+}
+
+/// The end-to-end shape 2.2 and 2.3 will inherit: a discovered model the
+/// curated list has never heard of reaches the client, the curated models
+/// survive beside it, and the reply says the list is live.
+#[tokio::test]
+async fn a_discovered_model_reaches_the_client_and_the_list_reads_live() {
+    let engine = engine_with_mock_discovery(Discovery {
+        models: vec![DiscoveredModel {
+            id: "mock-tomorrow".into(),
+            label: "Tomorrow".into(),
+            description: None,
+            reasoning_levels: vec![ReasoningLevel::High],
+            accepts_images: None,
+        }],
+    })
+    .await;
+
+    let catalog = engine.list_models(HarnessId::Mock, false).await.unwrap();
+    assert_eq!(catalog.source, CatalogSource::Live);
+    let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
+    assert!(ids.contains(&"mock-1"), "curated models survive: {ids:?}");
+    assert!(
+        ids.contains(&"mock-tomorrow"),
+        "live model appears: {ids:?}"
+    );
+    assert!(
+        catalog
+            .models
+            .iter()
+            .find(|m| m.id == "mock-tomorrow")
+            .unwrap()
+            .accepts_images,
+        "absent modality means images work"
+    );
 }

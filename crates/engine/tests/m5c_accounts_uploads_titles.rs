@@ -115,7 +115,7 @@ fn account_emails(snapshot: &AgentAccountsSnapshot, harness: HarnessId) -> Vec<(
 fn assemble_with_mock(dir: &Path, script: Vec<AgentEvent>) -> EngineCore {
     std::fs::create_dir_all(dir).expect("data dir");
     let registry = HarnessRegistry::new();
-    registry.register(Arc::new(MockHarness { script }));
+    registry.register(Arc::new(MockHarness::with_script(script)));
     EngineCore::assemble(dir, Arc::new(registry), HarnessId::Mock, None).expect("engine assembles")
 }
 

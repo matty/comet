@@ -10,13 +10,89 @@ use comet_proto::{
     UserInputQuestion,
 };
 
+use crate::discovery::{Discovery, DiscoveryCache, DiscoveryFailure};
 use crate::{Harness, HarnessError, RunControls};
 
+#[derive(Default)]
 pub struct MockHarness {
     pub script: Vec<AgentEvent>,
+    /// A scripted discovery answer. The outer `None` means the mock behaves
+    /// as it always has (built-in list only); a scripted `Err` exercises the
+    /// negative-caching and `Diagnostic` paths without a CLI on the machine.
+    scripted_discovery: Option<Result<Discovery, DiscoveryFailure>>,
+    discovery_cache: DiscoveryCache,
 }
 
 impl MockHarness {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A scripted event sequence with no discovery answer — the shape every
+    /// pre-existing test fixture wants, exposed as a constructor because
+    /// `script` is the only field a caller outside this module may set (the
+    /// other two are private, so `MockHarness { script, ..Self::new() }`
+    /// cannot be written from another crate).
+    pub fn with_script(script: Vec<AgentEvent>) -> Self {
+        Self {
+            script,
+            ..Self::new()
+        }
+    }
+
+    pub fn with_discovery(discovery: Discovery) -> Self {
+        Self {
+            scripted_discovery: Some(Ok(discovery)),
+            ..Self::new()
+        }
+    }
+
+    pub fn with_failing_discovery(failure: DiscoveryFailure) -> Self {
+        Self {
+            scripted_discovery: Some(Err(failure)),
+            ..Self::new()
+        }
+    }
+
+    /// The cache behind `models()`, kept reachable rather than buried: a test
+    /// that scripts a failure (`with_failing_discovery`) needs to read the
+    /// cached failure kind back off the harness without re-running discovery.
+    pub fn discovery_cache(&self) -> &DiscoveryCache {
+        &self.discovery_cache
+    }
+
+    /// The curated model list both the unscripted and scripted arms of
+    /// `models()` name — kept in one place so a change to one can't drift
+    /// from the other. `mock-1` and `mock-fable-5` are used by scripted UI
+    /// runs that expect those exact ids and labels; do not change them.
+    fn curated_models() -> Vec<Model> {
+        vec![
+            Model {
+                id: "mock-1".into(),
+                label: "Mock 1".into(),
+                description: None,
+                reasoning_levels: vec![ReasoningLevel::Medium],
+                options: vec![],
+                accepts_images: true,
+            },
+            // Claude-mirroring demo model: lets scripted runs carry the same
+            // chip labels ("Fable 5 · High") as a real Claude session.
+            Model {
+                id: "mock-fable-5".into(),
+                label: "Fable 5".into(),
+                description: None,
+                reasoning_levels: vec![
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                    ReasoningLevel::XHigh,
+                ],
+                options: vec![],
+                accepts_images: true,
+            },
+        ]
+    }
+
     pub fn capabilities() -> HarnessCapabilities {
         HarnessCapabilities {
             supports_steering: true,
@@ -103,31 +179,12 @@ impl Harness for MockHarness {
         Self::capabilities()
     }
     async fn models(&self) -> Result<ModelCatalog, HarnessError> {
-        Ok(ModelCatalog::built_in(vec![
-            Model {
-                id: "mock-1".into(),
-                label: "Mock 1".into(),
-                description: None,
-                reasoning_levels: vec![ReasoningLevel::Medium],
-                options: vec![],
-                accepts_images: true,
-            },
-            // Claude-mirroring demo model: lets scripted runs carry the same
-            // chip labels ("Fable 5 · High") as a real Claude session.
-            Model {
-                id: "mock-fable-5".into(),
-                label: "Fable 5".into(),
-                description: None,
-                reasoning_levels: vec![
-                    ReasoningLevel::Low,
-                    ReasoningLevel::Medium,
-                    ReasoningLevel::High,
-                    ReasoningLevel::XHigh,
-                ],
-                options: vec![],
-                accepts_images: true,
-            },
-        ]))
+        let curated = Self::curated_models();
+        let Some(scripted) = self.scripted_discovery.clone() else {
+            return Ok(ModelCatalog::built_in(curated));
+        };
+        let discovery = self.discovery_cache.get(|| async move { scripted }).await;
+        Ok(self.discovery_cache.catalog(curated, discovery))
     }
     async fn run(
         &self,
