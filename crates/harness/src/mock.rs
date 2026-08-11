@@ -186,6 +186,11 @@ impl Harness for MockHarness {
         let discovery = self.discovery_cache.get(|| async move { scripted }).await;
         Ok(self.discovery_cache.catalog(curated, discovery))
     }
+    /// Only the mock implements this in this slice: the two real adapters
+    /// keep the trait's defaulted `None` until 2.2/2.3 give them a cache.
+    fn last_discovery_failure(&self) -> Option<DiscoveryFailure> {
+        self.discovery_cache.cached_failure()
+    }
     async fn run(
         &self,
         _request: RunRequest,

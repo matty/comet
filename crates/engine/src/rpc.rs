@@ -42,8 +42,8 @@ use tokio::sync::watch;
 
 use comet_doc::{MessagePart, SessionCommandPayload};
 use comet_proto::{
-    ChatConfig, HarnessId, LanSettings, RemoteConnectionState, RemoteEntry, ServerHello, ServerId,
-    ToolCall,
+    ChatConfig, DiagnosticSeverity, HarnessId, LanSettings, RemoteConnectionState, RemoteEntry,
+    ServerHello, ServerId, ToolCall,
 };
 use comet_rpc::{RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -999,6 +999,18 @@ impl RpcService for EngineRpc {
                     .models()
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Only an unreadable answer is drift. An absent CLI is
+                // ordinary and stays out of the diagnostics surface, or the
+                // card reads a figure on every healthy boot.
+                if harness.last_discovery_failure()
+                    == Some(comet_harness::discovery::DiscoveryFailure::Unparseable)
+                {
+                    self.registry.record_diagnostic(
+                        p.harness,
+                        "discovery/unreadable",
+                        DiagnosticSeverity::Malformed,
+                    );
+                }
                 RpcReply::value(&catalog)
             }
             methods::QUEUE_COMMAND => {

@@ -88,6 +88,14 @@ pub trait Harness: Send + Sync {
     /// Defaulted to a no-op: an in-process harness has nothing to discover,
     /// and an adapter that has not grown discovery yet has nothing to clear.
     fn clear_discovery(&self) {}
+    /// The kind of the cached discovery failure, if the last attempt failed.
+    ///
+    /// Defaulted to `None`: a harness with no discovery has no failure to
+    /// report. Read by the engine AFTER `models()` returns, because that is
+    /// what populates the cell.
+    fn last_discovery_failure(&self) -> Option<discovery::DiscoveryFailure> {
+        None
+    }
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
     async fn run(
         &self,

@@ -157,6 +157,16 @@ impl DiscoveryCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(Cell::new());
     }
 
+    /// The cached failure, if this boot's discovery already ran and failed.
+    ///
+    /// A read-only peek: unlike [`get`], it never runs a discovery, so the
+    /// engine can ask "did that call fail, and how" after `models()` returns
+    /// without starting one on a cell that was never filled. `None` covers
+    /// both "not tried" and "succeeded" — neither is drift.
+    pub fn cached_failure(&self) -> Option<DiscoveryFailure> {
+        self.current().get().and_then(|r| r.as_ref().err().copied())
+    }
+
     /// The single place `CatalogSource` is decided, so no adapter can report
     /// a built-in list as live.
     pub fn catalog(
@@ -385,6 +395,41 @@ mod tests {
         cache.clear();
         assert!(cache.get(run).await.is_err());
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    /// The peek must never itself trigger a discovery: an empty cell reads
+    /// `None`, not a run of anything.
+    #[test]
+    fn cached_failure_is_none_before_any_discovery_runs() {
+        let cache = DiscoveryCache::default();
+        assert_eq!(cache.cached_failure(), None);
+    }
+
+    /// The kind reaches the peek unchanged, so the engine can tell
+    /// `Unparseable` (drift) from `Unreachable` (ordinary) after the fact.
+    #[tokio::test]
+    async fn cached_failure_reports_the_cached_kind() {
+        let cache = DiscoveryCache::default();
+        cache
+            .get(|| async { Err(DiscoveryFailure::Unparseable) })
+            .await
+            .ok();
+        assert_eq!(cache.cached_failure(), Some(DiscoveryFailure::Unparseable));
+    }
+
+    /// A success is not a failure to report — `None` covers it too.
+    #[tokio::test]
+    async fn cached_failure_is_none_after_a_success() {
+        let cache = DiscoveryCache::default();
+        cache
+            .get(|| async {
+                Ok(Discovery {
+                    models: vec![discovered("m-1", "One")],
+                })
+            })
+            .await
+            .ok();
+        assert_eq!(cache.cached_failure(), None);
     }
 
     /// The caption's whole input. A failed discovery still answers with a

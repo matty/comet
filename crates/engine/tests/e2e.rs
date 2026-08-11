@@ -14,7 +14,7 @@ use comet_doc::{
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
 };
 use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
-use comet_harness::discovery::{DiscoveredModel, Discovery};
+use comet_harness::discovery::{DiscoveredModel, Discovery, DiscoveryFailure};
 use comet_harness::mock::MockHarness;
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
@@ -3632,6 +3632,14 @@ impl TestEngine {
             )
             .await
     }
+
+    /// The registry `LIST_MODELS` records diagnostics into — the discovery
+    /// tests read it directly rather than round-tripping through
+    /// `ListHarnessDiagnostics`, since the point is what the engine recorded,
+    /// not the RPC surface that later reports it.
+    fn registry(&self) -> &HarnessRegistry {
+        &self._core.registry
+    }
 }
 
 async fn engine_with_counting_discovery() -> (TestEngine, Arc<CountingDiscoveryHarness>) {
@@ -3668,19 +3676,25 @@ async fn retry_re_arms_a_cached_discovery_failure() {
     assert_eq!(harness.discovery_runs(), 2, "force re-arms the cell");
 }
 
-/// Assembles an engine around a `MockHarness` scripted with the given
-/// discovery answer — task 7's end-to-end proof that a discovered model
-/// reaches the client with no CLI on the machine.
-async fn engine_with_mock_discovery(discovery: Discovery) -> TestEngine {
+/// Assembles an engine around a given `MockHarness` — the shape both the
+/// discovered-model test (task 7) and the drift-diagnostic tests (task 8)
+/// need, differing only in how the mock is scripted.
+async fn engine_with_mock(harness: MockHarness) -> TestEngine {
     let dir = tempfile::tempdir().unwrap();
-    let harness = Arc::new(MockHarness::with_discovery(discovery));
-    let core = assemble(dir.path(), harness);
+    let core = assemble(dir.path(), Arc::new(harness));
     let client = comet_rpc::memory_client(core.rpc_service());
     TestEngine {
         _dir: dir,
         _core: core,
         client,
     }
+}
+
+/// Assembles an engine around a `MockHarness` scripted with the given
+/// discovery answer — task 7's end-to-end proof that a discovered model
+/// reaches the client with no CLI on the machine.
+async fn engine_with_mock_discovery(discovery: Discovery) -> TestEngine {
+    engine_with_mock(MockHarness::with_discovery(discovery)).await
 }
 
 /// The end-to-end shape 2.2 and 2.3 will inherit: a discovered model the
@@ -3715,5 +3729,50 @@ async fn a_discovered_model_reaches_the_client_and_the_list_reads_live() {
             .unwrap()
             .accepts_images,
         "absent modality means images work"
+    );
+}
+
+/// A provider that answered nonsense has changed its protocol under us.
+/// That is the whole reason 0b.2's channel exists.
+#[tokio::test]
+async fn an_unreadable_discovery_answer_is_reported_as_drift() {
+    let engine = engine_with_mock(MockHarness::with_failing_discovery(
+        DiscoveryFailure::Unparseable,
+    ))
+    .await;
+
+    let catalog = engine.list_models(HarnessId::Mock, false).await.unwrap();
+    assert_eq!(catalog.source, CatalogSource::BuiltIn, "list still works");
+
+    let diagnostics = engine.registry().diagnostics();
+    let bucket = diagnostics
+        .iter()
+        .find(|d| d.harness == HarnessId::Mock)
+        .expect("a bucket");
+    assert!(
+        bucket
+            .entries
+            .iter()
+            .any(|e| e.discriminator.contains("discovery")),
+        "expected a discovery drift entry, got {:?}",
+        bucket.entries
+    );
+}
+
+/// The ordinary case must stay silent. A machine with no CLI installed
+/// would otherwise report protocol drift on every single boot, which is how
+/// a diagnostics surface becomes noise nobody reads.
+#[tokio::test]
+async fn an_unreachable_provider_raises_no_diagnostic() {
+    let engine = engine_with_mock(MockHarness::with_failing_discovery(
+        DiscoveryFailure::Unreachable,
+    ))
+    .await;
+
+    engine.list_models(HarnessId::Mock, false).await.unwrap();
+
+    assert!(
+        engine.registry().diagnostics().is_empty(),
+        "an absent CLI is not a protocol change"
     );
 }
