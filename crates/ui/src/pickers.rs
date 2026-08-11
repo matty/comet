@@ -188,6 +188,22 @@ fn caption_for(source: CatalogSource, harness: HarnessId) -> Option<&'static str
     }
 }
 
+/// Whether images may be attached for `model`.
+///
+/// Split out of the entity so the rule is testable at all: the UI crate has no
+/// gpui test context, so anything reachable only through `App` is verified by
+/// the rendered check and nothing else. The part worth pinning here is the
+/// direction of the unknown case.
+///
+/// `None` means no model has resolved yet, which is true on every boot until
+/// the catalog lands. It must ALLOW — a gate that closed while the catalog was
+/// in flight would disable the paperclip at startup for everyone. Same
+/// direction as `Model::accepts_images`' own default, and for the same reason
+/// (`.agents/rules/optional-wire-fields.md`): absent is "not said", never "no".
+fn images_allowed(model: Option<&Model>) -> bool {
+    model.map(|model| model.accepts_images).unwrap_or(true)
+}
+
 /// The one place the `ListModels` reply is decoded. Extracted so a test can
 /// bind THIS function rather than re-deriving the same `from_value` call:
 /// a test that decodes the wire literal into `ModelCatalog` on its own stays
@@ -576,7 +592,12 @@ impl Pickers {
     }
 
     /// Effective harness: picked, or the chat's config, or the first listed.
-    fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
+    ///
+    /// Public because the composer's `/` menu asks the same question the chips
+    /// do — the command list belongs to whichever agent this turn will run on,
+    /// and a menu answering for a different one offers commands that do not
+    /// exist there.
+    pub fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
         if let Some(harness) = self.config.harness {
             return Some(harness);
         }
@@ -643,6 +664,25 @@ impl Pickers {
     /// The selected model — concrete from the moment the list loads: the
     /// effective id when the list still offers it, else the harness default
     /// (first row). Never `None` with a non-empty catalog.
+    /// Whether the model this turn will run on takes image input.
+    ///
+    /// **True whenever we do not know**, and the direction is the whole point:
+    /// `accepts_images` defaults true on the wire because a provider that does
+    /// not report modality (Claude reports none at all) must not read as
+    /// "cannot take images". A model nobody has heard of, or a catalog that has
+    /// not landed yet, therefore keeps the attachment affordance rather than
+    /// silently disabling it (`.agents/rules/optional-wire-fields.md`).
+    /// The selected model's display name, when the catalog has resolved one.
+    /// Used by copy that has to name the model rather than say "this model".
+    pub fn selected_model_label(&self, cx: &App) -> Option<SharedString> {
+        self.selected_model(cx)
+            .map(|model| SharedString::from(model.label.clone()))
+    }
+
+    pub fn effective_accepts_images(&self, cx: &App) -> bool {
+        images_allowed(self.selected_model(cx))
+    }
+
     fn selected_model<'a>(&'a self, cx: &'a App) -> Option<&'a Model> {
         let harness = self.effective_harness(cx)?;
         let models = &self.models.get(&harness)?.ready()?.models;
@@ -3628,6 +3668,29 @@ mod tests {
         assert_eq!(
             ResolvedRunConfig::default().runtime_mode,
             RuntimeMode::AutoAcceptEdits
+        );
+    }
+
+    /// The modality gate's rule. Phase 2's whole point is that a live catalog
+    /// can now say `false` here — `gpt-5.3-codex-spark` reports
+    /// `inputModalities: ["text"]` against a curated `accepts_images: true`
+    /// (2.3's capture), and that row is the first one this gate ever closes on.
+    #[test]
+    fn images_are_allowed_unless_a_model_says_otherwise() {
+        let mut model = Model {
+            id: "spark".into(),
+            label: "Spark".into(),
+            description: None,
+            reasoning_levels: vec![],
+            options: vec![],
+            accepts_images: true,
+        };
+        assert!(images_allowed(Some(&model)));
+        model.accepts_images = false;
+        assert!(!images_allowed(Some(&model)), "an explicit false closes it");
+        assert!(
+            images_allowed(None),
+            "no model resolved yet must not disable the paperclip at boot"
         );
     }
 

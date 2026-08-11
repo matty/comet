@@ -1444,6 +1444,23 @@ impl ComposerInput {
     ) {
         self.invalidate_mention_tooltip();
         let path = local_file_link(path, is_dir);
+        self.replace_completion(range, &path, cx);
+    }
+
+    /// Splice `inserted` over `range` and leave the cursor after it, with
+    /// exactly one separating space.
+    ///
+    /// Shared by the two completions because the separator rule is the same and
+    /// getting it wrong is invisible in a test that only checks the text: a
+    /// second space, or none at all before an existing one, reads as a typo the
+    /// user then has to fix by hand.
+    pub fn replace_completion(
+        &mut self,
+        range: Range<usize>,
+        inserted: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let path = inserted.to_owned();
         let next = self.content[range.end..].chars().next();
         let existing_separator = next.filter(|ch| ch.is_whitespace() && *ch != '\n' && *ch != '\r');
         let inserted = if existing_separator.is_some() {
@@ -3113,10 +3130,101 @@ fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
     })
 }
 
+/// Which completion the one popup is showing.
+///
+/// The two share a token, an active index, a dismissal rule and a popup,
+/// because they are the same affordance with different rows — duplicating that
+/// lifecycle is how the second one drifts from the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Completion {
+    #[default]
+    Files,
+    Commands,
+}
+
+/// The `/` must be the very first character of the prompt, and the cursor must
+/// still be inside that first word.
+///
+/// Narrower than [`mention_token`]'s "any token boundary" on purpose, and the
+/// capture is the reason (`2026-08-11-slash-command-expansion.md`): at the
+/// start of the prompt the CLI expands the command itself in one turn, while
+/// mid-text the model picks it up as a Skill tool in three. Both work, so this
+/// is about offering the affordance where the cheap path is.
+///
+/// Past the first space the user is typing arguments — `/code-review --fix` —
+/// and a menu that stayed open over them would be completing a word nobody is
+/// writing.
+fn command_token(text: &str, cursor: usize) -> Option<MentionToken> {
+    if cursor == 0 || cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    if !text.starts_with('/') || text[..cursor].chars().any(char::is_whitespace) {
+        return None;
+    }
+    let end = text[cursor..]
+        .char_indices()
+        .find_map(|(at, ch)| ch.is_whitespace().then_some(cursor + at))
+        .unwrap_or(text.len());
+    Some(MentionToken {
+        range: 0..end,
+        query: text[1..cursor].to_string(),
+    })
+}
+
+/// Rows for `query`, matched on the name and on aliases but never listing an
+/// alias as a row of its own — `/cr` finds `code-review`, and the menu still
+/// shows one entry for it.
+///
+/// **Rows that START with the query come first**, and the rendered check is why:
+/// typing `/code` put `/superpowers:receiving-code-review` at the top and
+/// `/code-review` third, because plain substring matching keeps the provider's
+/// own order and namespaced skills contain everything. The first row is the one
+/// Enter takes, so ranking is not cosmetic here. Within each group the
+/// provider's order is preserved.
+fn matching_commands<'a>(
+    commands: &'a [comet_proto::AgentCommand],
+    query: &str,
+) -> Vec<&'a comet_proto::AgentCommand> {
+    let needle = query.to_lowercase();
+    if needle.is_empty() {
+        return commands.iter().collect();
+    }
+    let names = |command: &'a comet_proto::AgentCommand| -> Vec<String> {
+        std::iter::once(command.name.to_lowercase())
+            .chain(command.aliases.iter().map(|alias| alias.to_lowercase()))
+            .collect()
+    };
+    let (mut prefixed, mut contained) = (Vec::new(), Vec::new());
+    for command in commands {
+        let names = names(command);
+        if names.iter().any(|name| name.starts_with(&needle)) {
+            prefixed.push(command);
+        } else if names.iter().any(|name| name.contains(&needle)) {
+            contained.push(command);
+        }
+    }
+    prefixed.append(&mut contained);
+    prefixed
+}
+
 #[derive(Debug, Clone, Default)]
 struct FileMentionState {
     token: Option<MentionToken>,
+    /// Which rows the popup is showing. The rest of this struct is shared by
+    /// both, so anything that reads `results` must read `kind` first.
+    kind: Completion,
     results: Vec<FileSearchMatch>,
+    /// The provider's command list for this chat's directory, unfiltered. The
+    /// query filters at render time rather than at fetch time — one spawn per
+    /// directory per boot, not one per keystroke.
+    commands: Vec<comet_proto::AgentCommand>,
+    /// The `(harness, cwd)` the cached `commands` were fetched for.
+    ///
+    /// Without it the list is a cache with no key: the harness picker sits in
+    /// this very composer, and switching agent or checkout mid-draft only
+    /// notifies — nothing clears the list — so the next `/` would serve
+    /// Claude's commands under Codex. Reported by review on PR #45.
+    commands_key: Option<(comet_proto::HarnessId, String)>,
     active: Option<usize>,
     request: u64,
     loading: bool,
@@ -3132,6 +3240,151 @@ struct FileMentionState {
 
 fn mention_response_is_current(state: &FileMentionState, request: u64) -> bool {
     state.request == request && state.token.is_some()
+}
+
+impl FileMentionState {
+    /// How many rows the popup is showing, which is what bounds the active
+    /// index. Reading `results.len()` unconditionally would let the arrow keys
+    /// walk off the end of a command menu.
+    fn row_count(&self) -> usize {
+        match self.kind {
+            Completion::Files => self.results.len(),
+            Completion::Commands => self
+                .token
+                .as_ref()
+                .map(|token| matching_commands(&self.commands, &token.query).len())
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// Whether the cached command list can answer a `/` for `context` without
+/// re-asking the engine.
+///
+/// The key is the whole test, and **an empty list is a real answer**. A
+/// directory with no commands is a legitimate result, so keying reuse off
+/// `commands.is_empty()` would re-ask on every keystroke — and on Codex, which
+/// always answers empty, that is every `/` keystroke in the app.
+///
+/// The key is stamped on SUCCESS only, so a failed or unreadable fetch leaves
+/// nothing to reuse and stays retryable. It has to match the agent AND the
+/// directory: the harness picker sits in this composer, so a draft can change
+/// agent without the chat changing, and the observer on the pickers only
+/// notifies. Both reported by review on PR #45.
+fn commands_reusable(
+    state: &FileMentionState,
+    context: Option<&(comet_proto::HarnessId, String)>,
+) -> bool {
+    context.is_some() && state.commands_key.as_ref() == context
+}
+
+/// Width of the completion popup's scrollbar, and the gutter reserved for it.
+/// Plain numbers, independent of what is painted (`.agents/rules/gpui-ui.md`).
+const SCROLLBAR_W: f32 = 4.0;
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+
+/// The scrollbar thumb for a scrollable list, or `None` when everything fits.
+///
+/// Read off the live [`gpui::ScrollHandle`] rather than from row counts, so it
+/// stays honest for a wheel scroll as well as for keyboard navigation — a
+/// count-derived thumb only tracks the active row and sits still under the
+/// wheel.
+///
+/// Absent on the first frame by construction: the handle has no bounds until
+/// the list has been laid out once. The popup re-renders on the next keystroke
+/// or scroll, which is when it appears.
+fn completion_scrollbar(handle: &gpui::ScrollHandle, theme: &Theme) -> Option<gpui::Div> {
+    let viewport = f32::from(handle.bounds().size.height);
+    let max_offset = f32::from(handle.max_offset().y);
+    if viewport <= 0.0 || max_offset <= 0.5 {
+        return None;
+    }
+    let content = viewport + max_offset;
+    let thumb = (viewport * viewport / content)
+        .max(SCROLLBAR_MIN_THUMB)
+        .min(viewport);
+    // gpui scrolls by moving content up, so a scrolled list has a negative y.
+    let scrolled = (-f32::from(handle.offset().y)).clamp(0.0, max_offset);
+    let top = (scrolled / max_offset) * (viewport - thumb);
+    Some(
+        div()
+            .absolute()
+            .top(px(top))
+            .right(px(0.0))
+            .w(px(SCROLLBAR_W))
+            .h(px(thumb))
+            .rounded(px(SCROLLBAR_W / 2.0))
+            // A hairline in the same token the card's own edge uses: present
+            // enough to say "there is more", quiet enough not to compete with
+            // the rows it sits beside.
+            .bg(theme.border),
+    )
+}
+
+/// How the composer's notice band should read.
+///
+/// Declared by whoever raises the notice, **not derived from its wording**.
+/// The tone used to be decided by `message == "Engine not connected"`, which
+/// made the copy load-bearing: editing that sentence would have silently
+/// turned an amber "not connected yet" into a red failure, with no test and
+/// nothing on screen to say why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeTone {
+    /// A state to resolve, not something that went wrong: the engine has not
+    /// connected yet, no space is chosen, the model cannot take images. 0.2a's
+    /// ruling on the availability rail — amber, because the user caused
+    /// nothing and the fix is theirs to make.
+    Pending,
+    /// Something failed: a send, a run, an unreadable attachment.
+    Failure,
+}
+
+/// Why an image was refused, naming the model that refused it.
+///
+/// One sentence with the reason and the fix, never a raw provider error: the
+/// user chose this model and can choose another. The model's own label is used
+/// when the catalog has one, because "this model" reads as a bug when the chip
+/// three centimetres away says a name.
+fn attachment_blocked_message(model_label: Option<SharedString>) -> SharedString {
+    match model_label {
+        Some(label) => {
+            format!("{label} doesn't accept images — pick another model to attach one").into()
+        }
+        None => "This model doesn't accept images — pick another model to attach one".into(),
+    }
+}
+
+/// The single place `ListCommands`' reply is decoded.
+///
+/// Takes the raw `serde_json::Value` the engine sent and is tested against the
+/// literal bytes rather than a round trip through `AgentCommand` — the round
+/// trip is exactly what stayed green while 2.1's reshaped `ListModels` left the
+/// picker broken at run time (AGENTS.md, "Changing what an RPC method answers
+/// with").
+fn decode_commands_reply(
+    value: serde_json::Value,
+) -> Result<Vec<comet_proto::AgentCommand>, serde_json::Error> {
+    #[derive(serde::Deserialize)]
+    struct Reply {
+        commands: Vec<comet_proto::AgentCommand>,
+    }
+    serde_json::from_value::<Reply>(value).map(|reply| reply.commands)
+}
+
+/// A failed command list, translated for the popup.
+///
+/// `UnknownMethod` is the version-skew case and it is REACHABLE: `ListCommands`
+/// ships in this slice, so a session hosted by a paired device on an older
+/// daemon answers exactly this. It must not read as "no commands" — the agent
+/// has plenty, the device just cannot be asked.
+fn command_error_message(err: &RpcError) -> SharedString {
+    match err {
+        RpcError::UnknownMethod(_) => {
+            "The session's device runs an older comet — update it to list its commands".into()
+        }
+        RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
+        RpcError::BadParams(_) | RpcError::Failed(_) => "Couldn't reach this agent".into(),
+    }
 }
 
 /// A failed file search, translated for the popup. `UnknownMethod` is the
@@ -3167,10 +3420,13 @@ pub struct Composer {
     /// In-flight file-picker prompt (paperclip).
     picker_task: Option<Task<()>>,
     mention_task: Option<Task<()>>,
+    /// Scroll position of the completion popup's row list, so keyboard
+    /// navigation can keep the active row in view (`scroll_to_item`).
+    completion_scroll: gpui::ScrollHandle,
     mention: FileMentionState,
     current_key: Option<ServerRef>,
     sending: bool,
-    failure: Option<SharedString>,
+    failure: Option<(SharedString, NoticeTone)>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
     /// Requests already answered locally (suppresses the panel until the doc
@@ -3265,6 +3521,7 @@ impl Composer {
             preview: None,
             picker_task: None,
             mention_task: None,
+            completion_scroll: gpui::ScrollHandle::new(),
             mention: FileMentionState::default(),
             current_key,
             sending: false,
@@ -3348,8 +3605,26 @@ impl Composer {
             .unwrap_or(&[])
     }
 
+    /// The one place images become staged attachments, and therefore the one
+    /// place the modality gate belongs.
+    ///
+    /// The paperclip is not the only door: paste
+    /// (`ComposerInputEvent::PastedImages`), drop and pasted paths all arrive
+    /// here too. Gating the button alone would leave a disabled affordance
+    /// beside a working paste — two states that contradict each other on the
+    /// same surface, which is the class of defect every rendered check in this
+    /// project has found so far.
     fn add_staged(&mut self, staged: Vec<StagedAttachment>, cx: &mut Context<Self>) {
         if staged.is_empty() {
+            return;
+        }
+        if !self.pickers.read(cx).effective_accepts_images(cx) {
+            // Named, not generic: the user picked this model, and the fix is to
+            // pick another one. Per `.agents/rules/user-facing-errors.md` the
+            // state says what happened and what to do about it.
+            let label = self.pickers.read(cx).selected_model_label(cx);
+            self.failure = Some((attachment_blocked_message(label), NoticeTone::Pending));
+            cx.notify();
             return;
         }
         self.attachments
@@ -3371,7 +3646,7 @@ impl Composer {
             match attachments::stage_file(path) {
                 Ok(att) => staged.push(att),
                 Err(message) => {
-                    self.failure = Some(message.into());
+                    self.failure = Some((message.into(), NoticeTone::Failure));
                     cx.notify();
                 }
             }
@@ -3501,6 +3776,11 @@ impl Composer {
     fn reset_mention(&mut self, dismissed: Option<(Range<usize>, String)>, cx: &mut Context<Self>) {
         let request = self.mention.request.wrapping_add(1);
         self.mention_task = None;
+        // The scroll offset belongs to the session that scrolled, not to the
+        // handle. Carried over, the next popup opens at the old offset with row
+        // 0 selected off-screen — and Enter then accepts a row the user cannot
+        // see. Reported by review on PR #45.
+        self.completion_scroll = gpui::ScrollHandle::new();
         self.mention = FileMentionState {
             request,
             dismissed,
@@ -3520,7 +3800,12 @@ impl Composer {
             let input = self.input.read(cx);
             (input.text().to_string(), input.cursor_offset())
         };
-        let token = mention_token(&text, cursor);
+        // `/` is checked first and only wins at the very start of the prompt,
+        // so the two token rules cannot both match the same text.
+        let (kind, token) = match command_token(&text, cursor) {
+            Some(token) => (Completion::Commands, Some(token)),
+            None => (Completion::Files, mention_token(&text, cursor)),
+        };
         let still_dismissed = token.as_ref().is_some_and(|token| {
             self.mention
                 .dismissed
@@ -3547,19 +3832,43 @@ impl Composer {
         // Refining an open menu keeps the stale rows visible until the new
         // response lands — clearing here made the popup bounce through the
         // skeleton (and a different height) on every keystroke.
-        let refining = self.mention.token.is_some() && token.is_some();
+        // Switching KIND is not refining: `@` rows must never be left on screen
+        // under a `/` token.
+        let refining = self.mention.token.is_some() && token.is_some() && self.mention.kind == kind;
+        self.mention.kind = kind;
         self.mention.token = token.clone();
         if !refining {
             self.mention.results.clear();
             self.mention.active = None;
         }
         self.mention.error = None;
-        self.mention.loading = token.is_some();
         self.sync_mention_controls(cx);
         let Some(token) = token else {
+            self.mention.loading = false;
             cx.notify();
             return;
         };
+        // The command list is fetched once per directory per boot, so a menu
+        // that already has it must not flash a skeleton on every keystroke —
+        // and must not re-spawn a CLI that runs the user's SessionStart hooks.
+        //
+        // Reused only when the cached list belongs to THIS agent and directory.
+        // The harness picker lives in this composer, so "same chat" does not
+        // mean "same context".
+        let command_context = (kind == Completion::Commands)
+            .then(|| self.command_context(cx))
+            .flatten();
+        if kind == Completion::Commands
+            && commands_reusable(&self.mention, command_context.as_ref())
+        {
+            self.mention.loading = false;
+            self.mention.active = (self.mention.row_count() > 0).then_some(0);
+            self.sync_mention_controls(cx);
+            cx.notify();
+            return;
+        }
+        self.mention.loading = true;
+        self.sync_mention_controls(cx);
         let engine = {
             let state = self.state.read(cx);
             mention_search_owner(state.selected_chat.as_ref(), state.selected_space.as_ref())
@@ -3574,6 +3883,10 @@ impl Composer {
             crate::pickers::CheckoutPlan::ReuseWorktree { path, .. } => Some(path),
             _ => None,
         };
+        if kind == Completion::Commands {
+            self.fetch_commands(engine, token, cx);
+            return;
+        }
         let params = {
             let state = self.state.read(cx);
             let mut params = serde_json::Map::new();
@@ -3641,9 +3954,127 @@ impl Composer {
         cx.notify();
     }
 
+    /// Which agent, and which directory, a `/` menu here would be about.
+    ///
+    /// The cwd precedence is `send`'s own, and it has to be: a menu answering
+    /// for a different directory than the turn will run in offers commands that
+    /// do not exist there. The space's folder is the load-bearing arm — a NEW
+    /// chat has no row yet and most reuse no worktree, so stopping at the first
+    /// two leaves the menu dead in the commonest case of all.
+    ///
+    /// `None` means there is nothing to ask about, and the menu stays shut
+    /// rather than guessing a directory.
+    fn command_context(&self, cx: &App) -> Option<(comet_proto::HarnessId, String)> {
+        let harness = self.pickers.read(cx).effective_harness(cx)?;
+        let selected_worktree = match self.pickers.read(cx).checkout_plan() {
+            crate::pickers::CheckoutPlan::ReuseWorktree { path, .. } => Some(path),
+            _ => None,
+        };
+        let state = self.state.read(cx);
+        let cwd = state
+            .selected_chat_row()
+            .and_then(|chat| chat.cwd.clone())
+            .or(selected_worktree)
+            .or_else(|| state.selected_space_row().map(|space| space.path.clone()))?;
+        Some((harness, cwd))
+    }
+
+    /// Ask the owning device for this chat's command list.
+    ///
+    /// No debounce, unlike the file search: this is one call per directory per
+    /// boot (the engine caches it), and the query filters rows locally. A
+    /// debounce here would only delay the first `/`.
+    fn fetch_commands(
+        &mut self,
+        engine: crate::state::ServerClient,
+        token: MentionToken,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((harness, cwd)) = self.command_context(cx) else {
+            self.mention.loading = false;
+            cx.notify();
+            return;
+        };
+        // A list from another agent or directory is not a slower answer to this
+        // question — it is the wrong one, and it stays SELECTABLE while the new
+        // request is in flight, so Enter would insert a row that is no longer on
+        // screen. Drop it the moment the context changes.
+        let context = (harness, cwd.clone());
+        if self.mention.commands_key.as_ref() != Some(&context) {
+            self.mention.commands.clear();
+            self.mention.commands_key = None;
+            self.mention.active = None;
+        }
+        let params = serde_json::json!({ "harness": harness, "cwd": cwd });
+        let request = self.mention.request;
+        self.mention_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::LIST_COMMANDS, params).await;
+            this.update(cx, |composer, cx| {
+                if !mention_response_is_current(&composer.mention, request) {
+                    return;
+                }
+                // The generation counter tracks the TOKEN, and nothing bumps it
+                // when the pickers change — their observer only notifies. So a
+                // reply fired under one agent can land under another and be
+                // stored as current. Re-ask what the context is now rather than
+                // trusting the one captured at request time.
+                if composer.command_context(cx).as_ref() != Some(&context) {
+                    return;
+                }
+                composer.mention.loading = false;
+                match result {
+                    Ok(value) => match decode_commands_reply(value) {
+                        Ok(commands) => {
+                            composer.mention.error = None;
+                            composer.mention.commands = commands;
+                            // Stamped on SUCCESS, and it is what marks the
+                            // fetch done. Keyed off `commands.is_empty()`
+                            // instead, a directory that legitimately has no
+                            // commands would re-ask on every keystroke — and on
+                            // Codex, which always answers empty, that is every
+                            // `/` keystroke in the app.
+                            composer.mention.commands_key = Some(context.clone());
+                            composer.mention.active =
+                                (composer.mention.row_count() > 0).then_some(0);
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, "command list decode failed");
+                            // No key: an unreadable answer is retryable, and
+                            // nothing stale may stay selectable behind the
+                            // error.
+                            composer.mention.commands.clear();
+                            composer.mention.commands_key = None;
+                            composer.mention.active = None;
+                            composer.mention.error =
+                                Some("Couldn't read this agent's commands".into());
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!(%err, "command list request failed");
+                        composer.mention.commands.clear();
+                        composer.mention.commands_key = None;
+                        composer.mention.active = None;
+                        composer.mention.error = Some(command_error_message(&err));
+                    }
+                }
+                composer.sync_mention_controls(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+        let _ = token;
+        cx.notify();
+    }
+
     fn move_mention(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.mention.active =
-            crate::popover::menu_step(self.mention.active, self.mention.results.len(), delta);
+            crate::popover::menu_step(self.mention.active, self.mention.row_count(), delta);
+        // Keep the selection on screen. Without this the highlight walks past
+        // the viewport's bottom edge and the user is arrowing through rows they
+        // cannot see — the same reason the model menu tracks its own handle.
+        if let Some(active) = self.mention.active {
+            self.completion_scroll.scroll_to_item(active);
+        }
         self.sync_mention_controls(cx);
         cx.notify();
     }
@@ -3664,6 +4095,29 @@ impl Composer {
         let Some(token) = self.mention.token.clone() else {
             return;
         };
+        if self.mention.kind == Completion::Commands {
+            let name = self
+                .mention
+                .active
+                .and_then(|active| {
+                    matching_commands(&self.mention.commands, &token.query)
+                        .get(active)
+                        .map(|command| command.name.clone())
+                })
+                .filter(|name| !name.is_empty());
+            let Some(name) = name else {
+                return;
+            };
+            // Plain text, deliberately: the CLI parses `/name` out of the
+            // prompt itself, so a command is not a chip or a link — it is the
+            // first word of what the user is sending.
+            self.input.update(cx, |input, cx| {
+                input.replace_completion(token.range, &format!("/{name}"), cx)
+            });
+            self.reset_mention(None, cx);
+            cx.notify();
+            return;
+        }
         let Some((path, is_dir)) = self
             .mention
             .active
@@ -3707,6 +4161,104 @@ impl Composer {
                     .text_color(theme.danger_muted)
                     .child(error),
             );
+        } else if self.mention.kind == Completion::Commands {
+            let rows = matching_commands(&self.mention.commands, &token.query);
+            if rows.is_empty() {
+                card = card.child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(10.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(if self.mention.commands.is_empty() {
+                            "This agent has no commands here"
+                        } else {
+                            "No matching commands"
+                        }),
+                );
+            }
+            // Rows are DIRECT children of the scroll container so
+            // `scroll_to_item(active)` indices line up, exactly as the model
+            // menu does it (`pickers.rs:2739-2749`). Without this the card
+            // clipped at 280px and the remaining rows — 64 of them in this
+            // repo — were unreachable by wheel or by keyboard (user report).
+            let mut list = div()
+                .id("completion-scroll")
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .max_h(px(264.0))
+                .overflow_y_scroll()
+                .track_scroll(&self.completion_scroll);
+            for (ix, command) in rows.into_iter().enumerate() {
+                let selected = self.mention.active == Some(ix);
+                let name: SharedString = format!("/{}", command.name).into();
+                let hint: Option<SharedString> =
+                    command.argument_hint.clone().map(SharedString::from);
+                // The provider's description rides the tooltip rather than the
+                // row: Claude's run to several hundred characters (the capture
+                // measured one at ~500), and truncated to a row's width they
+                // read as noise rather than as help.
+                let tooltip: Option<SharedString> =
+                    command.description.clone().map(SharedString::from);
+                list = list.child(
+                    crate::popover::menu_row(theme, selected, format!("command-result-{ix}"))
+                        .id(("command-result", ix))
+                        .when_some(tooltip, |row, text| {
+                            row.tooltip(move |_, cx| {
+                                cx.new(|_| MentionPathTooltip {
+                                    path: text.clone(),
+                                    activation: ix as u64,
+                                })
+                                .into()
+                            })
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.mention.active = Some(ix);
+                            this.accept_mention(cx);
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                // Without these the row is free to grow past
+                                // the card, and the hint is then clipped by the
+                                // card's `overflow_hidden` instead of
+                                // truncating inside the row — it renders cut
+                                // mid-word, hard against the border, with no
+                                // ellipsis. Found by the rendered check.
+                                .w_full()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(12.5))
+                                        .text_color(theme.text)
+                                        .child(name),
+                                )
+                                .children(hint.map(|hint| {
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .truncate()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.text_muted)
+                                        .child(hint)
+                                })),
+                        ),
+                );
+            }
+            card = card.child(
+                div()
+                    .relative()
+                    // The gutter is reserved on the rows, not taken from the
+                    // thumb, so a row's text never runs underneath it.
+                    .child(list.pr(px(SCROLLBAR_W + 2.0)))
+                    .children(completion_scrollbar(&self.completion_scroll, theme)),
+            );
         } else if self.mention.results.is_empty() {
             card = card.child(
                 div()
@@ -3721,11 +4273,21 @@ impl Composer {
                     }),
             );
         } else {
+            // The file list had the same ceiling and the same fix; a search
+            // returning more rows than fit was equally unreachable.
+            let mut list = div()
+                .id("completion-scroll")
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .max_h(px(264.0))
+                .overflow_y_scroll()
+                .track_scroll(&self.completion_scroll);
             for (ix, result) in self.mention.results.iter().enumerate() {
                 let selected = self.mention.active == Some(ix);
                 let path = result.path.clone();
                 let tooltip_path: SharedString = path.clone().into();
-                card = card.child(
+                list = list.child(
                     crate::popover::menu_row(theme, selected, format!("file-mention-result-{ix}"))
                         .id(("file-mention-result", ix))
                         .tooltip(move |_, cx| {
@@ -3767,6 +4329,14 @@ impl Composer {
                         ),
                 );
             }
+            card = card.child(
+                div()
+                    .relative()
+                    // The gutter is reserved on the rows, not taken from the
+                    // thumb, so a row's text never runs underneath it.
+                    .child(list.pr(px(SCROLLBAR_W + 2.0)))
+                    .children(completion_scrollbar(&self.completion_scroll, theme)),
+            );
         }
         let anchor = self
             .input
@@ -3963,8 +4533,23 @@ impl Composer {
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
     fn send(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
+        // The staging gate is a check at ONE MOMENT, and the model can change
+        // after it: stage an image on a model that takes them, switch to one
+        // that does not, and the attachment is still in the strip. Rechecking
+        // here is what makes the gate hold over time. Reported by review on
+        // PR #45.
+        //
+        // Blocked rather than dropped: silently discarding a staged image the
+        // user chose is worse than refusing to send it, and the fix — pick
+        // another model, or remove the attachment — is theirs either way.
+        if !self.staged().is_empty() && !self.pickers.read(cx).effective_accepts_images(cx) {
+            let label = self.pickers.read(cx).selected_model_label(cx);
+            self.failure = Some((attachment_blocked_message(label), NoticeTone::Pending));
+            cx.notify();
+            return;
+        }
         let Some(engine) = self.state.read(cx).selected_client() else {
-            self.failure = Some("Engine not connected".into());
+            self.failure = Some(("Engine not connected".into(), NoticeTone::Pending));
             cx.notify();
             return;
         };
@@ -3995,7 +4580,10 @@ impl Composer {
         // device, not necessarily this one.
         let space = self.state.read(cx).selected_space_row().cloned();
         if is_new && space.is_none() {
-            self.failure = Some("Add a space first".into());
+            // Left on `Failure` deliberately: it is red today, and recolouring
+            // an unrelated surface is not this slice's change to make. It reads
+            // like a `Pending` state and is the obvious next one to move.
+            self.failure = Some(("Add a space first".into(), NoticeTone::Failure));
             cx.notify();
             return;
         }
@@ -4271,7 +4859,7 @@ impl Composer {
                         cx.notify();
                     });
                     if composer.current_key == err_chat_key {
-                        composer.failure = Some(message.into());
+                        composer.failure = Some((message.into(), NoticeTone::Failure));
                         composer
                             .input
                             .update(cx, |input, cx| input.set_text(restore_text, cx));
@@ -4315,7 +4903,8 @@ impl Composer {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
-                    composer.failure = Some(format!("Stop failed: {err}").into());
+                    composer.failure =
+                        Some((format!("Stop failed: {err}").into(), NoticeTone::Failure));
                     cx.notify();
                 })
                 .ok();
@@ -4417,7 +5006,8 @@ impl Composer {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
-                    composer.failure = Some(format!("Answer failed: {err}").into());
+                    composer.failure =
+                        Some((format!("Answer failed: {err}").into(), NoticeTone::Failure));
                     // The answer never left this device — put the panel back.
                     composer.answered_requests.remove(&request_id);
                     cx.notify();
@@ -4492,7 +5082,10 @@ impl Composer {
                     if composer.current_key != owner {
                         return;
                     }
-                    composer.failure = Some(crate::errors::approval_failure(&err).into());
+                    composer.failure = Some((
+                        crate::errors::approval_failure(&err).into(),
+                        NoticeTone::Failure,
+                    ));
                     // The decision never left this device — put the row back.
                     // Unconditional, unlike `restore_approval_row`'s own
                     // notify: if the approval resolved externally during the
@@ -5130,15 +5723,14 @@ impl Render for Composer {
             .gap(px(Theme::SPACE_SM))
             .px(px(Theme::SPACE_LG))
             .pb(px(Theme::SPACE_LG))
-            .when_some(failure, |el, message| {
+            .when_some(failure, |el, (message, tone)| {
                 // comet composer.tsx `Notice` (matches the transcript
                 // ErrorChip palette): `flex items-start gap-2 rounded-xl
                 // border px-3 py-2 text-[12px] leading-snug` with a 14px
                 // DangerTriangle — a subtle tinted wash, not a bare red
-                // stroke. Amber for the offline-ish case (engine not
-                // connected), red for send/run failures. Click dismisses.
-                let offline = message.as_ref() == "Engine not connected";
-                let (border_c, wash, text_c) = if offline {
+                // stroke. Amber for a state to resolve, red for a failure;
+                // the raiser declares which. Click dismisses.
+                let (border_c, wash, text_c) = if tone == NoticeTone::Pending {
                     let amber = theme.warning; // amber-400
                     let amber_200 = theme.warning_muted;
                     (
@@ -5241,6 +5833,19 @@ impl Render for Composer {
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
         // the same strip. `ml-1` per the source cluster — chips→attach reads
         // 8px (4 gap + 4 margin) in BOTH modes.
+        // The effective model decides whether this affordance is live. The
+        // colour and the cursor change; the SIZE does not — a control that
+        // resized with its state would move the send button beside it (the
+        // layout-vs-paint rule, `.agents/rules/gpui-ui.md`).
+        let accepts_images = self.pickers.read(cx).effective_accepts_images(cx);
+        // The tooltip explains the dimmed button BEFORE it is clicked. Once
+        // the click (or a paste, or a drop) has put the same sentence in the
+        // failure banner, the tooltip is the same words a second time, hovering
+        // over the copy it duplicates — 0.2a found exactly this pair on the
+        // availability rail, and 1.5 found it again on the approval card.
+        let attach_tooltip: Option<SharedString> = (!accepts_images)
+            .then(|| attachment_blocked_message(self.pickers.read(cx).selected_model_label(cx)))
+            .filter(|message| self.failure.as_ref().map(|(text, _)| text) != Some(message));
         let attach = div()
             .id("composer-attach")
             .ml(px(4.0))
@@ -5250,19 +5855,53 @@ impl Render for Composer {
             .items_center()
             .justify_center()
             .rounded_full()
-            .cursor_pointer()
-            // comet composer-actions.tsx attach: `transition-colors`.
-            .bg(motion::hover_blend(
-                "composer-attach",
-                gpui::transparent_black(),
-                crate::theme::ink(0.10),
-            ))
-            .on_hover(motion::hover_listener("composer-attach"))
-            .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
+            .when(accepts_images, |el| {
+                el.cursor_pointer()
+                    // comet composer-actions.tsx attach: `transition-colors`.
+                    .bg(motion::hover_blend(
+                        "composer-attach",
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.10),
+                    ))
+                    .on_hover(motion::hover_listener("composer-attach"))
+            })
+            // Attached in BOTH states, and guarded inside. A dimmed control
+            // that swallows the click explains nothing until the user happens
+            // to hover — 0.2a's finding, and the same shape as the rail row
+            // whose `on_click` is unconditional with the guard in
+            // `pick_harness`. Blocked, the click says why, in the one place
+            // paste and drop already say it.
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.pickers.read(cx).effective_accepts_images(cx) {
+                    this.open_file_picker(cx);
+                } else {
+                    let label = this.pickers.read(cx).selected_model_label(cx);
+                    this.failure = Some((attachment_blocked_message(label), NoticeTone::Pending));
+                    cx.notify();
+                }
+            }))
+            .when_some(attach_tooltip, |el, message| {
+                el.tooltip(move |_, cx| {
+                    cx.new(|_| MentionPathTooltip {
+                        path: message.clone(),
+                        activation: 0,
+                    })
+                    .into()
+                })
+            })
             .child(
                 crate::icons::icon(crate::icons::PAPERCLIP)
                     .size(px(16.0))
-                    .text_color(theme.text_muted),
+                    // `text_faint` is the documented disabled token. Dimming
+                    // with `opacity()` instead drives it under the contrast
+                    // floor `text_contrast_is_paired_across_appearances`
+                    // exists to guarantee — the defect 0.2a's rendered check
+                    // found on the availability rail.
+                    .text_color(if accepts_images {
+                        theme.text_muted
+                    } else {
+                        theme.text_faint
+                    }),
             );
         // Staged-thumbnail strip (attachment-ui.tsx AttachmentStrip), above
         // the input inside the pill in both modes.
@@ -5540,6 +6179,235 @@ mod tests {
             mention_token("See (@lib", 9).map(|token| token.range),
             Some(5..9)
         );
+    }
+
+    fn command(name: &str, hint: Option<&str>, aliases: &[&str]) -> comet_proto::AgentCommand {
+        comet_proto::AgentCommand {
+            name: name.into(),
+            description: Some(format!("{name} description")),
+            argument_hint: hint.map(str::to_string),
+            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+
+    /// The `/` only completes at the very start of the prompt. Mid-text it
+    /// still reaches the provider — the model launches it as a skill — but by
+    /// the dearer route (3 turns against 1, measured in the 2026-08-11
+    /// capture), so the affordance points at the cheap path.
+    #[test]
+    fn a_command_token_is_only_the_first_word_of_the_prompt() {
+        assert_eq!(
+            command_token("/comm", 5),
+            Some(MentionToken {
+                range: 0..5,
+                query: "comm".into(),
+            })
+        );
+        assert!(
+            command_token("Please run /verify", 18).is_none(),
+            "mid-text `/` is not completed"
+        );
+        assert!(
+            command_token("/code-review --fix", 18).is_none(),
+            "past the first space the user is typing arguments"
+        );
+        assert!(command_token("no slash", 3).is_none());
+        assert!(
+            command_token("/verify", 0).is_none(),
+            "a cursor before the slash has nothing to complete"
+        );
+    }
+
+    /// The token spans the whole first word, not just up to the cursor, so
+    /// accepting a completion mid-word replaces what is already typed instead
+    /// of doubling it.
+    #[test]
+    fn a_command_token_covers_the_whole_word_around_the_cursor() {
+        assert_eq!(command_token("/verify", 3).map(|t| t.range), Some(0..7));
+        assert_eq!(command_token("/verify now", 3).map(|t| t.range), Some(0..7));
+    }
+
+    /// Aliases are matched but never listed. `/cr` has to find `code-review`,
+    /// and the menu must still show one row for it rather than two.
+    #[test]
+    fn commands_match_on_aliases_without_listing_them() {
+        let commands = vec![
+            command("code-review", Some("[--fix]"), &["cr", "review"]),
+            command("verify", None, &[]),
+        ];
+        let names = |query: &str| -> Vec<String> {
+            matching_commands(&commands, query)
+                .iter()
+                .map(|c| c.name.clone())
+                .collect()
+        };
+        assert_eq!(names("cr"), vec!["code-review".to_string()]);
+        assert_eq!(names("rev"), vec!["code-review".to_string()]);
+        assert_eq!(names("code-rev"), vec!["code-review".to_string()]);
+        assert_eq!(names("ver"), vec!["verify".to_string()]);
+        assert_eq!(names("").len(), 2, "an empty query lists everything");
+        assert!(names("zzz").is_empty());
+    }
+
+    /// The cached list is keyed, not merely non-empty. The harness picker is
+    /// in this composer, so switching agent mid-draft changes what `/` means
+    /// without the chat changing — and a bare "have I got any?" check would
+    /// serve Claude's commands under Codex. Reported by review on PR #45.
+    #[test]
+    fn a_cached_command_list_is_only_reused_for_its_own_agent_and_directory() {
+        let claude = (comet_proto::HarnessId::ClaudeCode, "/repo".to_string());
+        let state = FileMentionState {
+            kind: Completion::Commands,
+            commands: vec![command("verify", None, &[])],
+            commands_key: Some(claude.clone()),
+            ..FileMentionState::default()
+        };
+        assert!(commands_reusable(&state, Some(&claude)));
+        assert!(
+            !commands_reusable(
+                &state,
+                Some(&(comet_proto::HarnessId::Codex, "/repo".into()))
+            ),
+            "a different agent must re-ask"
+        );
+        assert!(
+            !commands_reusable(
+                &state,
+                Some(&(comet_proto::HarnessId::ClaudeCode, "/other".into()))
+            ),
+            "a different directory must re-ask"
+        );
+        assert!(
+            !commands_reusable(&state, None),
+            "no context means nothing to answer for"
+        );
+        let unkeyed = FileMentionState {
+            commands: vec![command("verify", None, &[])],
+            ..FileMentionState::default()
+        };
+        assert!(
+            !commands_reusable(&unkeyed, Some(&claude)),
+            "a list with no key was never confirmed for any context"
+        );
+
+        // An empty answer is an answer. Keyed off `commands.is_empty()`, a
+        // directory with no commands would re-ask on every keystroke — and
+        // Codex answers empty always, so that would be every `/` in the app.
+        let empty_but_answered = FileMentionState {
+            kind: Completion::Commands,
+            commands: Vec::new(),
+            commands_key: Some(claude.clone()),
+            ..FileMentionState::default()
+        };
+        assert!(
+            commands_reusable(&empty_but_answered, Some(&claude)),
+            "an empty reply is a cached result, not a cache miss"
+        );
+    }
+
+    /// A row whose name STARTS with the query outranks one that merely contains
+    /// it. Straight from the rendered check: typing `/code` in this repo put
+    /// `/superpowers:receiving-code-review` first and `/code-review` third,
+    /// and the first row is the one Enter takes.
+    #[test]
+    fn a_prefix_match_outranks_a_substring_match() {
+        let commands = vec![
+            command("superpowers:receiving-code-review", None, &[]),
+            command("superpowers:requesting-code-review", None, &[]),
+            command("code-review", None, &[]),
+        ];
+        let ranked: Vec<&str> = matching_commands(&commands, "code")
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            ranked,
+            vec![
+                "code-review",
+                "superpowers:receiving-code-review",
+                "superpowers:requesting-code-review",
+            ],
+            "the prefix match leads; the rest keep the provider's order"
+        );
+    }
+
+    /// The active index is bounded by the rows on screen, which for a command
+    /// menu is the FILTERED count. Bounding it by `results` (the file vector,
+    /// empty here) would leave the arrow keys unable to move at all.
+    #[test]
+    fn the_active_index_is_bounded_by_the_filtered_command_rows() {
+        let state = FileMentionState {
+            kind: Completion::Commands,
+            token: command_token("/c", 2),
+            commands: vec![
+                command("code-review", None, &[]),
+                command("commit-pr", None, &[]),
+                command("verify", None, &[]),
+            ],
+            ..FileMentionState::default()
+        };
+        assert_eq!(state.row_count(), 2, "only the two matching `/c` rows");
+    }
+
+    /// Pinned to the literal bytes the engine sends, not a round trip through
+    /// `AgentCommand`. A round-trip test cannot catch the reply's SHAPE moving
+    /// — which is exactly how 2.1 shipped a runtime-broken picker with 501
+    /// tests green.
+    #[test]
+    fn the_engines_literal_command_reply_decodes() {
+        let sent = serde_json::json!({
+            "commands": [
+                {"name": "verify", "description": "Run the gate. (project)", "argumentHint": "[target]"},
+                {"name": "code-review", "description": "Review it.", "aliases": ["cr"]},
+                {"name": "bare"}
+            ]
+        });
+        let commands = decode_commands_reply(sent).expect("decodes");
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0].argument_hint.as_deref(), Some("[target]"));
+        assert_eq!(commands[1].aliases, vec!["cr".to_string()]);
+        assert_eq!(commands[2].description, None, "prose is optional");
+        assert!(commands[2].aliases.is_empty());
+    }
+
+    /// A bare array is the shape this reply deliberately is NOT, and the decode
+    /// has to fail rather than quietly produce nothing.
+    #[test]
+    fn a_bare_array_reply_does_not_decode_as_a_command_list() {
+        let sent = serde_json::json!([{ "name": "verify" }]);
+        assert!(decode_commands_reply(sent).is_err());
+    }
+
+    /// `UnknownMethod` is reachable the day this ships — a paired device on an
+    /// older daemon — and it must not read as "this agent has no commands".
+    #[test]
+    fn a_version_skewed_device_says_so_rather_than_reporting_no_commands() {
+        let message = command_error_message(&RpcError::UnknownMethod("ListCommands".into()));
+        assert!(
+            message.contains("older comet"),
+            "expected an actionable version-skew sentence, got {message:?}"
+        );
+        assert!(
+            !message.to_lowercase().contains("no commands"),
+            "a failure must never read as an empty menu, got {message:?}"
+        );
+    }
+
+    /// The refusal names the model, because the chip a few centimetres away
+    /// names it too — "this model" reads as a bug beside a label. And it never
+    /// carries a provider error string, per
+    /// `.agents/rules/user-facing-errors.md`.
+    #[test]
+    fn a_blocked_attachment_names_the_model_and_the_fix() {
+        let named = attachment_blocked_message(Some("GPT-5.3 Codex Spark".into()));
+        assert!(named.contains("GPT-5.3 Codex Spark"), "got {named:?}");
+        assert!(named.contains("pick another model"), "got {named:?}");
+
+        // Before the catalog resolves there is no label, and the sentence still
+        // has to stand on its own.
+        let unnamed = attachment_blocked_message(None);
+        assert!(unnamed.starts_with("This model"), "got {unnamed:?}");
+        assert!(unnamed.contains("pick another model"), "got {unnamed:?}");
     }
 
     #[test]
