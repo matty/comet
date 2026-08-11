@@ -732,3 +732,26 @@ async fn live_cli_discovery_lands_on_curated_ids() {
         "six curated rows: no `sonnet`, no `opus[1m]`, no `default`"
     );
 }
+
+/// The cache belongs to the CLI it asked, not to the harness value. Pointing a
+/// harness at a different executable and re-asking must re-run discovery —
+/// otherwise the second CLI's answer is whatever the first one said. Latent
+/// today (production never calls `with_executable`, and every test builds the
+/// harness in one chain), but the builder is public and the failure would be
+/// silent.
+#[tokio::test]
+async fn changing_the_executable_re_runs_discovery() {
+    let harness = harness();
+    assert_eq!(
+        harness.models().await.expect("first").source,
+        comet_proto::CatalogSource::Live,
+        "the good fixture answers"
+    );
+
+    let harness = harness.with_executable(env!("CARGO_BIN_EXE_fake-claude-bad-discovery"));
+    assert_eq!(
+        harness.models().await.expect("second").source,
+        comet_proto::CatalogSource::BuiltIn,
+        "the new executable is asked, not the old answer replayed"
+    );
+}

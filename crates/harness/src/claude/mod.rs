@@ -151,6 +151,11 @@ impl ClaudeHarness {
     /// Use a fixed CLI binary instead of PATH/known-location resolution.
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
+        // A cached answer belongs to the CLI that gave it. Carried across a
+        // change of executable it would be replayed for a binary that was
+        // never asked, and the picker would show one CLI's models under
+        // another's name.
+        self.discovery_cache = crate::discovery::DiscoveryCache::default();
         self
     }
 

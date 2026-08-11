@@ -162,7 +162,12 @@ struct ControlResponseBody {
 /// modelled — see debt rows D31 and D32.
 #[derive(Deserialize)]
 struct InitializeReply {
-    #[serde(default)]
+    /// No `#[serde(default)]`, deliberately: `models` is required in
+    /// sdk.d.ts (:3274), so a success reply without it is the provider having
+    /// stopped answering the question — drift. Defaulted to an empty list it
+    /// would instead serve the curated catalog as `CatalogSource::Live`, with
+    /// the fallback caption suppressed and no `Diagnostic` raised. An
+    /// explicit `[]` still decodes, because that is the CLI answering.
     models: Vec<InitializeModel>,
 }
 
@@ -442,6 +447,29 @@ mod tests {
             discovery_from_reply(line, &[]),
             Err(DiscoveryFailure::Unreachable)
         );
+    }
+
+    /// A success reply with no `models` key at all is drift, not an empty
+    /// catalog. Decoded leniently it would serve the curated list under
+    /// `CatalogSource::Live` — the caption suppressed and no `Diagnostic`
+    /// raised, while the provider had in fact stopped answering the question.
+    /// `models` is required in sdk.d.ts (:3274); only an explicit `[]` is an
+    /// answer.
+    #[test]
+    fn a_reply_with_no_models_key_is_drift() {
+        let line = r#"{"type":"control_response","response":{"subtype":"success","request_id":"i","response":{"commands":[]}}}"#;
+        assert_eq!(
+            discovery_from_reply(line, &[]),
+            Err(DiscoveryFailure::Unparseable)
+        );
+    }
+
+    /// An explicitly empty list is the CLI answering, so it stays a success.
+    #[test]
+    fn an_explicitly_empty_model_list_still_decodes() {
+        let line = r#"{"type":"control_response","response":{"subtype":"success","request_id":"i","response":{"models":[]}}}"#;
+        let discovery = discovery_from_reply(line, &[]).expect("an empty answer is an answer");
+        assert!(discovery.models.is_empty());
     }
 
     #[test]
