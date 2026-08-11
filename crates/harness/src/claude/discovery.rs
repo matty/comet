@@ -87,7 +87,33 @@ pub(crate) async fn discover(
     }
 }
 
+/// The path to hand `Command::new` when the child's working directory is about
+/// to be changed.
+///
+/// `current_dir` changes what a **relative** program path resolves against, and
+/// std documents that as platform-specific and unstable — on Unix the child
+/// chdirs before exec, so `./bin/claude` would be looked for under the temp
+/// directory and the spawn would fail into a silent built-in-list fallback.
+/// `CLAUDE_CODE_EXECUTABLE` is taken verbatim (`lib.rs:161-163`), so a relative
+/// override is a real user configuration, not a hypothetical.
+///
+/// Two cases are deliberately left alone. An absolute path is returned
+/// unchanged rather than canonicalized, because on Windows canonicalization
+/// rewrites it to a `\\?\` verbatim path, which would then land in the child's
+/// PATH via `compose_child_path`. A bare command name (`claude`, no separator)
+/// stays bare, because that is a PATH lookup — absolutizing it against the
+/// parent's cwd would prefer a stray `./claude` over the installed CLI.
+fn program_path(exe: &Path) -> PathBuf {
+    if exe.is_absolute() || exe.components().count() < 2 {
+        return exe.to_path_buf();
+    }
+    // A path that cannot be resolved is left as it came: failing the spawn on
+    // the CLI's own terms beats substituting a path nobody configured.
+    std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf())
+}
+
 async fn handshake(exe: &Path, curated_ids: &[String]) -> Result<Discovery, DiscoveryFailure> {
+    let exe = &program_path(exe);
     let mut cmd = Command::new(exe);
     crate::compose_child_path(&mut cmd, exe);
     cmd.args(DISCOVERY_ARGS)
@@ -447,6 +473,40 @@ mod tests {
             discovery_from_reply(line, &[]),
             Err(DiscoveryFailure::Unreachable)
         );
+    }
+
+    /// A relative program path with a directory in it is the case std warns
+    /// about: with `current_dir` set to the temp directory, a Unix child
+    /// chdirs before exec and the CLI is looked for in the wrong place. The
+    /// spawn failure would degrade silently to the built-in list.
+    #[test]
+    fn a_relative_program_path_is_absolutized() {
+        // Two components and it exists relative to the crate root, which is
+        // where cargo runs the test from.
+        let rel = std::path::Path::new("src/claude");
+        let out = program_path(rel);
+        assert!(
+            out.is_absolute(),
+            "a relative path with a directory must be resolved against the parent's cwd, got {out:?}"
+        );
+    }
+
+    /// A bare name is a PATH lookup, and must stay one — absolutizing it
+    /// against the parent's cwd would prefer a stray `./claude` over the
+    /// installed CLI.
+    #[test]
+    fn a_bare_command_name_stays_a_path_lookup() {
+        let bare = std::path::Path::new("claude");
+        assert_eq!(program_path(bare), bare.to_path_buf());
+    }
+
+    /// An absolute path is returned byte-identical, not canonicalized: on
+    /// Windows canonicalization yields a `\?\` verbatim path, which
+    /// `compose_child_path` would then put in the child's PATH.
+    #[test]
+    fn an_absolute_path_is_left_exactly_as_it_came() {
+        let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        assert_eq!(program_path(&abs), abs);
     }
 
     /// A success reply with no `models` key at all is drift, not an empty
