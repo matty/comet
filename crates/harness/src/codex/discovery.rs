@@ -43,10 +43,20 @@ const MAX_PAGES: usize = 20;
 /// declares itself differently from a real one is a difference nobody would
 /// think to look for later.
 fn initialize_line() -> String {
-    format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"clientInfo":{{"name":"comet-native","title":"Comet","version":"{}"}},"capabilities":{{"experimentalApi":true}}}}}}"#,
-        env!("CARGO_PKG_VERSION")
-    )
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": "comet-native",
+                "title": "Comet",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "capabilities": { "experimentalApi": true },
+        },
+    })
+    .to_string()
 }
 
 const INITIALIZED_LINE: &str = r#"{"jsonrpc":"2.0","method":"initialized"}"#;
@@ -55,15 +65,24 @@ const INITIALIZED_LINE: &str = r#"{"jsonrpc":"2.0","method":"initialized"}"#;
 /// models, and the two the server hides are a Work Mode routing alias and
 /// `codex-auto-review` — the model slice 1.7 delegates an auto-review to, not
 /// something to offer in a picker.
+///
+/// Serialized rather than interpolated, because **the cursor is the server's
+/// string, not ours**. 0.147.0 sends a stringified offset, but the schema calls
+/// it opaque, and one containing a quote or a backslash pasted into a request
+/// literal would send malformed JSON on the second page — degrading to the
+/// curated list with nothing saying why.
 fn model_list_line(id: u32, cursor: Option<&str>) -> String {
-    match cursor {
-        Some(cursor) => format!(
-            r#"{{"jsonrpc":"2.0","id":{id},"method":"model/list","params":{{"cursor":"{cursor}"}}}}"#
-        ),
-        None => {
-            format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"model/list","params":{{}}}}"#)
-        }
+    let mut params = serde_json::Map::new();
+    if let Some(cursor) = cursor {
+        params.insert("cursor".into(), serde_json::Value::String(cursor.into()));
     }
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "model/list",
+        "params": params,
+    })
+    .to_string()
 }
 
 /// Where this device's Codex credentials live: `$CODEX_HOME`, else `~/.codex`.
@@ -102,14 +121,13 @@ pub(crate) async fn discover(
     exe: PathBuf,
     home: Option<PathBuf>,
 ) -> Result<Discovery, DiscoveryFailure> {
-    if !logged_in(home.as_deref()) {
+    let Some(home) = home.filter(|home| logged_in(Some(home))) else {
         tracing::debug!(
-            home = ?home,
             "codex discovery skipped: no auth.json, so model/list would answer with the CLI's own fallback list"
         );
         return Err(DiscoveryFailure::Unreachable);
-    }
-    match tokio::time::timeout(DISCOVERY_TIMEOUT, handshake(&exe)).await {
+    };
+    match tokio::time::timeout(DISCOVERY_TIMEOUT, handshake(&exe, &home)).await {
         Ok(result) => result,
         Err(_) => {
             tracing::debug!(cli = %exe.display(), "codex discovery timed out");
@@ -118,11 +136,17 @@ pub(crate) async fn discover(
     }
 }
 
-async fn handshake(exe: &Path) -> Result<Discovery, DiscoveryFailure> {
+async fn handshake(exe: &Path, home: &Path) -> Result<Discovery, DiscoveryFailure> {
     let exe = &program_path(exe);
     let mut cmd = Command::new(exe);
     cmd.arg("app-server");
     crate::compose_child_path(&mut cmd, exe);
+    // The child is told the same home the login check just read `auth.json`
+    // from. Left to the ambient environment, the two can be different homes —
+    // the check passes against one account's credentials while the CLI answers
+    // from another's, or from the logged-out fallback list, and the result is
+    // still labelled live.
+    cmd.env("CODEX_HOME", home);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

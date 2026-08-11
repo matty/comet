@@ -1080,6 +1080,48 @@ async fn an_endless_pager_is_stopped_by_the_page_cap() {
     );
 }
 
+/// The home the login check reads `auth.json` from must be the home the CLI is
+/// actually given. Left to the ambient environment they can differ, and the
+/// check then passes against one account's credentials while the CLI answers
+/// from another's — or from its logged-out fallback list — with the result
+/// still labelled live.
+///
+/// The fixture echoes its own `CODEX_HOME` back as a model label, because the
+/// child is the only thing that can say which home it got.
+#[tokio::test]
+async fn the_child_is_given_the_home_the_login_check_validated() {
+    let catalog = harness().models().await.expect("models");
+    let echo = catalog
+        .models
+        .iter()
+        .find(|m| m.id == "codex-home-echo")
+        .expect("the fixture echoes its CODEX_HOME");
+    assert_eq!(
+        std::path::Path::new(&echo.label),
+        logged_in_home(),
+        "the CLI was handed a different home than the one that was checked"
+    );
+}
+
+/// The cursor is the server's string, not ours: 0.147.0 sends a stringified
+/// offset but the schema calls it opaque. The fixture issues one containing a
+/// quote and a backslash, so a request built by interpolation is malformed
+/// JSON on page two — and the models on the later pages silently disappear.
+#[tokio::test]
+async fn an_opaque_cursor_survives_the_next_request() {
+    let catalog = harness().models().await.expect("models");
+    let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
+    assert!(
+        ids.contains(&"gpt-5.7-nova"),
+        "a page reached through a quoted cursor is missing, got {ids:?}"
+    );
+    assert_eq!(
+        catalog.source,
+        comet_proto::CatalogSource::Live,
+        "a malformed follow-up request degrades to the built-in list"
+    );
+}
+
 /// A logged-out `codex` answers `model/list` **successfully**, with a
 /// hardcoded five-model list that does not match the account: it contains a
 /// model the account cannot use and misses three it has (capture
