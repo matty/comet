@@ -88,20 +88,39 @@ pub(crate) async fn discover(
 }
 
 async fn handshake(exe: &Path, curated_ids: &[String]) -> Result<Discovery, DiscoveryFailure> {
+    // Any directory would do for models — the capture found the model list
+    // identical across cwds while `commands` varied — and a neutral one avoids
+    // loading a project's own settings for a session with no turn.
+    let line = initialize_reply(exe, DISCOVERY_ARGS, &std::env::temp_dir()).await?;
+    let borrowed: Vec<&str> = curated_ids.iter().map(String::as_str).collect();
+    discovery_from_reply(&line, &borrowed)
+}
+
+/// Spawn a short-lived CLI in `cwd`, send one `initialize`, and hand back the
+/// raw `control_response` line.
+///
+/// Shared with the command discovery in `commands.rs`, which differs from this
+/// one only in its arguments (no `--bare`), its directory (the chat's, not a
+/// neutral one) and what it reads off the reply. Keeping the spawn in one place
+/// is what stops the two drifting on the details that have already cost this
+/// phase three fixes — `program_path`, `kill_on_drop`, `CREATE_NO_WINDOW`, and
+/// reading *past* the hook frames rather than taking the first line.
+pub(super) async fn initialize_reply(
+    exe: &Path,
+    args: &[&str],
+    cwd: &Path,
+) -> Result<String, DiscoveryFailure> {
     let exe = &program_path(exe);
     let mut cmd = Command::new(exe);
     crate::compose_child_path(&mut cmd, exe);
-    cmd.args(DISCOVERY_ARGS)
+    cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         // The timeout arm drops this future; without kill_on_drop the child
         // outlives the discovery and we leak a CLI per attempt.
         .kill_on_drop(true)
-        // Any directory would do for models — the capture found the model list
-        // identical across cwds while `commands` varied — and a neutral one
-        // avoids loading a project's own settings for a session with no turn.
-        .current_dir(std::env::temp_dir());
+        .current_dir(cwd);
     #[cfg(windows)]
     {
         // CREATE_NO_WINDOW, as in `probe_cli_version`: the `.cmd` shims are
@@ -132,8 +151,7 @@ async fn handshake(exe: &Path, curated_ids: &[String]) -> Result<Discovery, Disc
     let mut answer = Err(DiscoveryFailure::Unreachable);
     while let Ok(Some(line)) = lines.next_line().await {
         if line.contains("\"control_response\"") {
-            let borrowed: Vec<&str> = curated_ids.iter().map(String::as_str).collect();
-            answer = discovery_from_reply(&line, &borrowed);
+            answer = Ok(line);
             break;
         }
     }

@@ -671,6 +671,108 @@ async fn models_come_back_live_and_merged() {
     );
 }
 
+/// The `/` menu's spawn, proven from the child's side.
+///
+/// The fixture reports its own working directory and whether `--bare` reached
+/// it, as two command entries. Nothing else can establish either: a decode test
+/// reads bytes this process wrote, so it would pass just as happily if the
+/// adapter spawned in the wrong directory or with the model discovery's
+/// arguments. Slice 2.3 shipped exactly that bug — a login check reading one
+/// `CODEX_HOME` while the child used another — with every test green.
+#[tokio::test]
+async fn commands_are_read_from_the_requested_directory_without_bare() {
+    let dir = std::env::temp_dir().join("comet-command-cwd-probe");
+    std::fs::create_dir_all(&dir).expect("probe dir");
+    let commands = harness()
+        .commands(&dir.display().to_string())
+        .await
+        .expect("commands");
+
+    let cwd_echo = commands
+        .iter()
+        .find(|c| c.name == "cwd-echo")
+        .expect("the fixture echoes its cwd");
+    assert_eq!(
+        cwd_echo.description.as_deref(),
+        Some(dir.display().to_string().as_str()),
+        "the child must be started in the directory the caller asked about"
+    );
+
+    let bare_echo = commands
+        .iter()
+        .find(|c| c.name == "bare-echo")
+        .expect("the fixture echoes its arguments");
+    assert_eq!(
+        bare_echo.description.as_deref(),
+        Some("false"),
+        "--bare skips user and project skill discovery, which is the whole list (D32)"
+    );
+}
+
+/// Aliases survive the trip and empty hints do not. The composer matches on
+/// aliases without listing them, so losing them here silently costs `/cr` with
+/// no test noticing.
+#[tokio::test]
+async fn command_aliases_and_hints_survive_the_round_trip() {
+    let commands = harness()
+        .commands(&std::env::temp_dir().display().to_string())
+        .await
+        .expect("commands");
+    let review = commands
+        .iter()
+        .find(|c| c.name == "review")
+        .expect("review command");
+    assert_eq!(review.aliases, vec!["cr".to_string()]);
+    assert_eq!(review.argument_hint.as_deref(), Some("[--fix]"));
+    let cwd_echo = commands.iter().find(|c| c.name == "cwd-echo").unwrap();
+    assert_eq!(
+        cwd_echo.argument_hint, None,
+        "the CLI's empty-string hint must not reach the menu as a blank slot"
+    );
+}
+
+/// A CLI that cannot be spawned must not answer "this agent has no commands".
+/// An empty list is a real answer — a directory with nothing in it — so the
+/// failure has to stay distinguishable all the way to the caller.
+#[tokio::test]
+async fn a_missing_cli_fails_rather_than_reporting_no_commands() {
+    let harness = ClaudeHarness::new().with_executable("/nonexistent/claude-nowhere");
+    let answer = harness
+        .commands(&std::env::temp_dir().display().to_string())
+        .await;
+    assert!(
+        answer.is_err(),
+        "a failed read must not degrade to an empty menu, got {answer:?}"
+    );
+}
+
+/// Two directories are two answers. The cache keys on the directory precisely
+/// because a project's skills belong to it, and serving them elsewhere is a
+/// wrong answer rather than a missing one.
+#[tokio::test]
+async fn each_directory_gets_its_own_command_list() {
+    let harness = harness();
+    let a = std::env::temp_dir().join("comet-cmd-a");
+    let b = std::env::temp_dir().join("comet-cmd-b");
+    std::fs::create_dir_all(&a).expect("a");
+    std::fs::create_dir_all(&b).expect("b");
+
+    let from_a = harness.commands(&a.display().to_string()).await.expect("a");
+    let from_b = harness.commands(&b.display().to_string()).await.expect("b");
+    let echo = |list: &[comet_proto::AgentCommand]| {
+        list.iter()
+            .find(|c| c.name == "cwd-echo")
+            .and_then(|c| c.description.clone())
+            .expect("cwd echo")
+    };
+    assert_eq!(echo(&from_a), a.display().to_string());
+    assert_eq!(
+        echo(&from_b),
+        b.display().to_string(),
+        "the second directory must not be served the first one's cached answer"
+    );
+}
+
 /// An answer we cannot read is the one failure that means a provider changed
 /// its protocol under us, and it must survive as `Unparseable` so the engine
 /// raises its `Diagnostic` (`crates/engine/src/rpc.rs:1010`).
@@ -730,6 +832,38 @@ async fn live_cli_discovery_lands_on_curated_ids() {
             "claude-haiku-4-5",
         ],
         "six curated rows: no `sonnet`, no `opus[1m]`, no `default`"
+    );
+}
+
+/// The live check for the `/` menu: the real CLI, in this repository, answers
+/// with the project's own skills. Ignored by default; spends no tokens, because
+/// this session never runs a turn either.
+///
+/// It asserts a project-scoped command specifically, because that is what the
+/// non-bare spawn buys: with `--bare` the same call answers with built-ins only
+/// (42 against 67 in the 2026-08-11 capture) and every other assertion here
+/// would still pass.
+/// Run with: `cargo test -p comet-harness --test claude -- --ignored`
+#[tokio::test]
+#[ignore = "requires installed+authenticated claude CLI (spends no tokens)"]
+async fn live_cli_commands_include_this_repositorys_own_skills() {
+    let repo = env!("CARGO_MANIFEST_DIR")
+        .rsplit_once("crates")
+        .map(|(root, _)| root.to_owned())
+        .expect("crate lives under the repo root");
+    let commands = ClaudeHarness::new()
+        .commands(&repo)
+        .await
+        .expect("commands");
+    let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+    assert!(
+        names.contains(&"verify"),
+        "comet's own project skill must be in the list, got {} commands: {names:?}",
+        names.len()
+    );
+    assert!(
+        commands.iter().any(|c| c.argument_hint.is_some()),
+        "at least one command carries an argument hint"
     );
 }
 
