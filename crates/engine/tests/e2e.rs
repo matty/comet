@@ -14,12 +14,13 @@ use comet_doc::{
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
 };
 use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
+use comet_harness::discovery::{DiscoveredModel, Discovery, DiscoveryFailure};
 use comet_harness::mock::MockHarness;
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus, FileOperation,
-    HarnessCapabilities, HarnessId, Model, NoticeKind, NoticeSeverity, ReasoningLevel, RunRequest,
-    RuntimeMode, SandboxLevel, SessionStatus, SteeringMode, ToolCall,
+    AgentEvent, ApprovalDecision, ApprovalRequest, CatalogSource, DiagnosticSeverity, DoneStatus,
+    FileOperation, HarnessCapabilities, HarnessId, ModelCatalog, NoticeKind, NoticeSeverity,
+    ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel, SessionStatus, SteeringMode, ToolCall,
 };
 use comet_rpc::RpcService;
 use comet_sync::DocsStore;
@@ -103,8 +104,8 @@ impl Harness for ScriptedHarness {
             ..HarnessCapabilities::default()
         }
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,
@@ -238,9 +239,7 @@ async fn queued_run_command_executes_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
         dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
+        Arc::new(MockHarness::with_script(mock_script())),
     );
     let handle = core.doc_host.open(CHAT).unwrap();
 
@@ -745,9 +744,7 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
         dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
+        Arc::new(MockHarness::with_script(mock_script())),
     );
     let handle = core.doc_host.open(CHAT).unwrap();
 
@@ -831,9 +828,7 @@ async fn a_tightened_mode_reaches_a_steer_turned_run() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
         dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
+        Arc::new(MockHarness::with_script(mock_script())),
     );
     let config = |mode: RuntimeMode| comet_proto::ChatConfig {
         harness: HarnessId::Mock,
@@ -919,9 +914,7 @@ async fn processed_commands_are_skipped_on_redelivery() {
 
     let core = assemble(
         dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
+        Arc::new(MockHarness::with_script(mock_script())),
     );
     let handle = core.doc_host.open(CHAT).unwrap();
     queue_as_viewer(
@@ -1016,9 +1009,7 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
     // Boot: EngineCore::assemble runs recover_stale.
     let core = assemble(
         dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
+        Arc::new(MockHarness::with_script(mock_script())),
     );
     assert_eq!(core.device_id, device_id);
 
@@ -1052,9 +1043,7 @@ async fn rpc_surface_over_in_memory_transport() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
         dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
+        Arc::new(MockHarness::with_script(mock_script())),
     );
     let client = comet_rpc::memory_client(core.rpc_service());
 
@@ -1071,7 +1060,7 @@ async fn rpc_surface_over_in_memory_transport() {
         )
         .await
         .unwrap();
-    assert_eq!(models[0]["id"], "mock-1");
+    assert_eq!(models["models"][0]["id"], "mock-1");
 
     // WatchSessions + WatchDocMessages streams.
     let mut sessions_stream = client
@@ -1165,8 +1154,8 @@ async fn respond_input_resolves_pending_question() {
         fn capabilities(&self) -> HarnessCapabilities {
             HarnessCapabilities::default()
         }
-        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-            Ok(vec![])
+        async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+            Ok(ModelCatalog::built_in(vec![]))
         }
         async fn run(
             &self,
@@ -1312,8 +1301,8 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
         fn capabilities(&self) -> HarnessCapabilities {
             HarnessCapabilities::default()
         }
-        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-            Ok(vec![])
+        async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+            Ok(ModelCatalog::built_in(vec![]))
         }
         async fn run(
             &self,
@@ -1482,8 +1471,8 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
         fn capabilities(&self) -> HarnessCapabilities {
             HarnessCapabilities::default()
         }
-        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-            Ok(vec![])
+        async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+            Ok(ModelCatalog::built_in(vec![]))
         }
         async fn run(
             &self,
@@ -1638,8 +1627,8 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
         fn capabilities(&self) -> HarnessCapabilities {
             HarnessCapabilities::default()
         }
-        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-            Ok(vec![])
+        async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+            Ok(ModelCatalog::built_in(vec![]))
         }
         async fn run(
             &self,
@@ -1823,8 +1812,8 @@ impl Harness for CapturingHarness {
             ..HarnessCapabilities::default()
         }
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,
@@ -1832,11 +1821,9 @@ impl Harness for CapturingHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         self.seen.lock().unwrap().push(request.clone());
-        MockHarness {
-            script: self.script.clone(),
-        }
-        .run(request, controls)
-        .await
+        MockHarness::with_script(self.script.clone())
+            .run(request, controls)
+            .await
     }
 }
 
@@ -2104,7 +2091,7 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
         session_id: None,
     });
     let dir = tempfile::tempdir().unwrap();
-    let core = assemble(dir.path(), Arc::new(MockHarness { script }));
+    let core = assemble(dir.path(), Arc::new(MockHarness::with_script(script)));
     let handle = core.doc_host.open(CHAT).unwrap();
     queue_as_viewer(
         handle.doc(),
@@ -2210,8 +2197,8 @@ impl Harness for ApprovingHarness {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities::default()
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,
@@ -2312,8 +2299,8 @@ impl Harness for TwiceAskingHarness {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities::default()
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,
@@ -2432,8 +2419,8 @@ impl Harness for SteeredWhileAskingHarness {
             ..HarnessCapabilities::default()
         }
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,
@@ -2555,8 +2542,8 @@ impl Harness for LateAskingHarness {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities::default()
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,
@@ -2648,8 +2635,8 @@ impl Harness for BatchAskingHarness {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities::default()
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,
@@ -3108,9 +3095,7 @@ async fn an_in_memory_client_counts_as_an_attached_supervisor() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
         dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
+        Arc::new(MockHarness::with_script(mock_script())),
     );
     assert_eq!(core.presence().attached_count(), 0);
     assert!(core.presence().unattended_since().is_some());
@@ -3140,9 +3125,7 @@ async fn the_remote_service_forwards_presence_to_the_engine() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
         dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
+        Arc::new(MockHarness::with_script(mock_script())),
     );
     let remote: Arc<dyn RpcService> = Arc::new(comet_engine::RemoteRpcService::new(
         core.remote_rpc_service(),
@@ -3318,8 +3301,8 @@ async fn an_unanswerable_input_question_expires_the_turn_too() {
         fn capabilities(&self) -> HarnessCapabilities {
             HarnessCapabilities::default()
         }
-        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-            Ok(vec![])
+        async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+            Ok(ModelCatalog::built_in(vec![]))
         }
         async fn run(
             &self,
@@ -3566,4 +3549,300 @@ async fn the_spawned_sweeper_expires_a_parked_approval_on_its_own() {
         "the real sweeper to expire the card with nothing pumping it manually",
     )
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Retry clears the discovery cell (slice 2.1, task 6)
+// ---------------------------------------------------------------------------
+
+/// Fixture harness whose `models()` runs a discovery closure through a real
+/// `DiscoveryCache`, counting every time the closure actually executes. The
+/// production shape (2.2/2.3) wires a `DiscoveryCache` into `ClaudeHarness`/
+/// `CodexHarness`; this fixture exercises the same cache without a real CLI.
+struct CountingDiscoveryHarness {
+    cache: comet_harness::discovery::DiscoveryCache,
+    runs: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Harness for CountingDiscoveryHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Counting"
+    }
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities::default()
+    }
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        let runs = self.runs.clone();
+        let discovery = self
+            .cache
+            .get(|| async move {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(comet_harness::discovery::Discovery { models: vec![] })
+            })
+            .await;
+        Ok(self.cache.catalog(vec![], discovery))
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        unimplemented!("not exercised by the discovery-retry test")
+    }
+    fn clear_discovery(&self) {
+        self.cache.clear();
+    }
+}
+
+impl CountingDiscoveryHarness {
+    fn discovery_runs(&self) -> usize {
+        self.runs.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// The RPC-surface handle the discovery-retry test drives `list_models`
+/// through — `EngineCore` has no typed `list_models` method of its own (out
+/// of this task's scope), so this wraps the same in-memory `RpcClient` the
+/// `rpc_surface_over_in_memory_transport` test above uses, adding the
+/// `force` field `ListModelsParams` gains in this task.
+///
+/// Holds the `TempDir` and `EngineCore` alongside the client so nothing the
+/// registered `RpcService` depends on is dropped out from under a still-live
+/// background connection task.
+struct TestEngine {
+    _dir: tempfile::TempDir,
+    _core: EngineCore,
+    client: comet_rpc::RpcClient,
+}
+
+impl TestEngine {
+    async fn list_models(
+        &self,
+        harness: HarnessId,
+        force: bool,
+    ) -> Result<ModelCatalog, comet_rpc::RpcError> {
+        self.client
+            .call_as(
+                comet_rpc::methods::LIST_MODELS,
+                serde_json::json!({ "harness": harness, "force": force }),
+            )
+            .await
+    }
+
+    /// The registry `LIST_MODELS` records diagnostics into — the discovery
+    /// tests read it directly rather than round-tripping through
+    /// `ListHarnessDiagnostics`, since the point is what the engine recorded,
+    /// not the RPC surface that later reports it.
+    fn registry(&self) -> &HarnessRegistry {
+        &self._core.registry
+    }
+}
+
+async fn engine_with_counting_discovery() -> (TestEngine, Arc<CountingDiscoveryHarness>) {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(CountingDiscoveryHarness {
+        cache: Default::default(),
+        runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+    let core = assemble(dir.path(), harness.clone());
+    let client = comet_rpc::memory_client(core.rpc_service());
+    (
+        TestEngine {
+            _dir: dir,
+            _core: core,
+            client,
+        },
+        harness,
+    )
+}
+
+/// A cached failure must survive an ordinary reopen and must NOT survive a
+/// Retry. Both halves matter: the first is what stops a broken login
+/// spawning a subprocess per picker open, the second is what stops Retry
+/// being a button that does nothing.
+#[tokio::test]
+async fn retry_re_arms_a_cached_discovery_failure() {
+    let (engine, harness) = engine_with_counting_discovery().await;
+
+    engine.list_models(HarnessId::Mock, false).await.unwrap();
+    engine.list_models(HarnessId::Mock, false).await.unwrap();
+    assert_eq!(harness.discovery_runs(), 1, "cached between ordinary calls");
+
+    engine.list_models(HarnessId::Mock, true).await.unwrap();
+    assert_eq!(harness.discovery_runs(), 2, "force re-arms the cell");
+}
+
+/// Assembles an engine around a given `MockHarness` — the shape both the
+/// discovered-model test (task 7) and the drift-diagnostic tests (task 8)
+/// need, differing only in how the mock is scripted.
+async fn engine_with_mock(harness: MockHarness) -> TestEngine {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(harness));
+    let client = comet_rpc::memory_client(core.rpc_service());
+    TestEngine {
+        _dir: dir,
+        _core: core,
+        client,
+    }
+}
+
+/// Assembles an engine around a `MockHarness` scripted with the given
+/// discovery answer — task 7's end-to-end proof that a discovered model
+/// reaches the client with no CLI on the machine.
+async fn engine_with_mock_discovery(discovery: Discovery) -> TestEngine {
+    engine_with_mock(MockHarness::with_discovery(discovery)).await
+}
+
+/// The end-to-end shape 2.2 and 2.3 will inherit: a discovered model the
+/// curated list has never heard of reaches the client, the curated models
+/// survive beside it, and the reply says the list is live.
+#[tokio::test]
+async fn a_discovered_model_reaches_the_client_and_the_list_reads_live() {
+    let engine = engine_with_mock_discovery(Discovery {
+        models: vec![DiscoveredModel {
+            id: "mock-tomorrow".into(),
+            label: "Tomorrow".into(),
+            description: None,
+            reasoning_levels: vec![ReasoningLevel::High],
+            accepts_images: None,
+        }],
+    })
+    .await;
+
+    let catalog = engine.list_models(HarnessId::Mock, false).await.unwrap();
+    assert_eq!(catalog.source, CatalogSource::Live);
+    let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
+    assert!(ids.contains(&"mock-1"), "curated models survive: {ids:?}");
+    assert!(
+        ids.contains(&"mock-tomorrow"),
+        "live model appears: {ids:?}"
+    );
+    assert!(
+        catalog
+            .models
+            .iter()
+            .find(|m| m.id == "mock-tomorrow")
+            .unwrap()
+            .accepts_images,
+        "absent modality means images work"
+    );
+}
+
+/// A provider that answered nonsense has changed its protocol under us.
+/// That is the whole reason 0b.2's channel exists.
+#[tokio::test]
+async fn an_unreadable_discovery_answer_is_reported_as_drift() {
+    let engine = engine_with_mock(MockHarness::with_failing_discovery(
+        DiscoveryFailure::Unparseable,
+    ))
+    .await;
+
+    let catalog = engine.list_models(HarnessId::Mock, false).await.unwrap();
+    assert_eq!(catalog.source, CatalogSource::BuiltIn, "list still works");
+
+    let diagnostics = engine.registry().diagnostics();
+    let bucket = diagnostics
+        .iter()
+        .find(|d| d.harness == HarnessId::Mock)
+        .expect("a bucket");
+    assert!(
+        bucket
+            .entries
+            .iter()
+            .any(|e| e.discriminator.contains("discovery")),
+        "expected a discovery drift entry, got {:?}",
+        bucket.entries
+    );
+}
+
+/// One unreadable answer is ONE incident, however many times the picker is
+/// opened afterwards. The failure is cached for the whole boot, so a
+/// re-reporting read would climb the count and refresh `last_seen_ms` on every
+/// `ListModels` — rendering a provider that failed once as one failing
+/// continuously.
+#[tokio::test]
+async fn a_cached_drift_failure_is_reported_once_not_once_per_request() {
+    let engine = engine_with_mock(MockHarness::with_failing_discovery(
+        DiscoveryFailure::Unparseable,
+    ))
+    .await;
+
+    for _ in 0..5 {
+        engine.list_models(HarnessId::Mock, false).await.unwrap();
+    }
+
+    let diagnostics = engine.registry().diagnostics();
+    let bucket = diagnostics
+        .iter()
+        .find(|d| d.harness == HarnessId::Mock)
+        .expect("a bucket");
+    let entry = bucket
+        .entries
+        .iter()
+        .find(|e| e.discriminator.contains("discovery"))
+        .expect("a discovery drift entry");
+    assert_eq!(
+        entry.count, 1,
+        "five requests, one cached failure, one incident"
+    );
+}
+
+/// Retry has to reach the harness, not just the UI's slot. The mock caches a
+/// scripted failure like a real adapter would, so a `force` that did not clear
+/// it would hand back the same failure and the Retry path could never be
+/// exercised end to end.
+///
+/// This counts incidents as its proxy for "discovery ran again", which only
+/// discriminates while a failure is reported once per attempt. Break that and
+/// this test passes for the wrong reason — two reads of one cached failure
+/// also make two. Verified by falsification: with report-once intact and the
+/// mock's `clear_discovery` removed it fails 1 vs 2; with both broken it
+/// passes. If reporting ever stops being once-per-attempt, rewrite this to
+/// count discovery runs directly.
+#[tokio::test]
+async fn a_forced_request_re_runs_mock_discovery() {
+    let engine = engine_with_mock(MockHarness::with_failing_discovery(
+        DiscoveryFailure::Unparseable,
+    ))
+    .await;
+
+    engine.list_models(HarnessId::Mock, false).await.unwrap();
+    engine.list_models(HarnessId::Mock, true).await.unwrap();
+
+    let diagnostics = engine.registry().diagnostics();
+    let entry = diagnostics
+        .iter()
+        .find(|d| d.harness == HarnessId::Mock)
+        .and_then(|b| {
+            b.entries
+                .iter()
+                .find(|e| e.discriminator.contains("discovery"))
+        })
+        .expect("a discovery drift entry");
+    assert_eq!(
+        entry.count, 2,
+        "the forced call re-ran discovery, so its failure is a second incident"
+    );
+}
+
+/// The ordinary case must stay silent. A machine with no CLI installed
+/// would otherwise report protocol drift on every single boot, which is how
+/// a diagnostics surface becomes noise nobody reads.
+#[tokio::test]
+async fn an_unreachable_provider_raises_no_diagnostic() {
+    let engine = engine_with_mock(MockHarness::with_failing_discovery(
+        DiscoveryFailure::Unreachable,
+    ))
+    .await;
+
+    engine.list_models(HarnessId::Mock, false).await.unwrap();
+
+    assert!(
+        engine.registry().diagnostics().is_empty(),
+        "an absent CLI is not a protocol change"
+    );
 }

@@ -320,8 +320,7 @@ pub fn default_registry() -> HarnessRegistry {
     // claude/codex resolve doesn't pay the shell-startup latency inline.
     comet_harness::shell_env::prewarm();
     let registry = HarnessRegistry::new();
-    registry.register(Arc::new(MockHarness {
-        script: vec![
+    registry.register(Arc::new(MockHarness::with_script(vec![
             AgentEvent::TextDelta {
                 text: "## Streaming pipeline\n\nEvery turn flows through the same path:\n\n".into(),
             },
@@ -365,8 +364,7 @@ pub fn default_registry() -> HarnessRegistry {
                 error: None,
                 session_id: None,
             },
-        ],
-    }));
+        ])));
     // The lazy descriptors name the harness's own `capabilities()`, so the
     // catalog entry `ListHarnesses` reports before first use is the same value
     // `describe()` produces after the slot resolves. CLI discovery still only

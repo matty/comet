@@ -47,7 +47,7 @@ use tokio::sync::mpsc;
 
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus,
-    HarnessAvailability, HarnessCapabilities, HarnessId, Model, RunRequest, RuntimeMode,
+    HarnessAvailability, HarnessCapabilities, HarnessId, ModelCatalog, RunRequest, RuntimeMode,
     SteeringMode,
 };
 
@@ -241,9 +241,12 @@ impl Harness for CodexHarness {
     /// so an absent binary surfaces as [`HarnessError::NotInstalled`] here.
     /// This is the seam for live discovery: a short-lived `codex app-server`
     /// paging `model/list` (experimentalApi) exactly as codex.ts does.
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
         self.resolve_executable()?;
-        Ok(static_models())
+        // 2.2/2.3 replace this with a `DiscoveryCache::get` over a real
+        // handshake. Until then the adapter must report `BuiltIn` honestly,
+        // or the picker's caption would lie in the other direction.
+        Ok(ModelCatalog::built_in(static_models()))
     }
 
     async fn run(

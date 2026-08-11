@@ -13,7 +13,7 @@ use comet_doc::{CommandBasedOn, SessionCommandEntry, SessionCommandPayload, Sess
 use comet_engine::{EngineCore, HarnessRegistry};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
-    AgentEvent, ChatConfig, DoneStatus, HarnessCapabilities, HarnessId, Model, RunRequest,
+    AgentEvent, ChatConfig, DoneStatus, HarnessCapabilities, HarnessId, ModelCatalog, RunRequest,
     RuntimeMode, SandboxLevel, SessionStatus,
 };
 use comet_rpc::methods;
@@ -39,8 +39,8 @@ impl Harness for ScriptedHarness {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities::default()
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,

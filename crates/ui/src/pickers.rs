@@ -22,7 +22,8 @@ use gpui::{
 
 use comet_engine::registry::HarnessDescriptor;
 use comet_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, RuntimeMode, ServerRef,
+    CatalogSource, ChatConfig, FolderListing, HarnessId, Model, ModelCatalog, ReasoningLevel,
+    RepoRef, RuntimeMode, ServerRef,
 };
 use comet_rpc::methods;
 
@@ -165,6 +166,35 @@ pub fn clamp_reasoning(
         Some(level) if ladder.contains(&level) => Some(level),
         _ => default_reasoning(ladder),
     }
+}
+
+/// Shown under the model list while discovery has failed. Amber
+/// `warning_muted`, not red: a state to resolve, not an error the user
+/// caused (0.2a's rail caption is the worked example). No Retry button of
+/// its own — the pane's existing Retry row is the escape hatch.
+fn built_in_caption(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::ClaudeCode => "Built-in list — couldn't reach Claude",
+        HarnessId::Codex => "Built-in list — couldn't reach Codex",
+        HarnessId::Cursor => "Built-in list — couldn't reach Cursor",
+        HarnessId::Mock => "Built-in list",
+    }
+}
+
+fn caption_for(source: CatalogSource, harness: HarnessId) -> Option<&'static str> {
+    match source {
+        CatalogSource::Live => None,
+        CatalogSource::BuiltIn => Some(built_in_caption(harness)),
+    }
+}
+
+/// The one place the `ListModels` reply is decoded. Extracted so a test can
+/// bind THIS function rather than re-deriving the same `from_value` call:
+/// a test that decodes the wire literal into `ModelCatalog` on its own stays
+/// green while the call site drifts, which is exactly what happened when the
+/// reply gained its `{models, source}` envelope.
+fn decode_models_reply(value: serde_json::Value) -> Result<ModelCatalog, serde_json::Error> {
+    serde_json::from_value(value)
 }
 
 /// Applies a picker's field change to a chat config that is about to be
@@ -352,7 +382,7 @@ pub struct Pickers {
     /// queue no more than one refetch.
     harness_revalidating: bool,
     revalidate_task: Option<Task<()>>,
-    models: HashMap<HarnessId, Loadable<Vec<Model>>>,
+    models: HashMap<HarnessId, Loadable<ModelCatalog>>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<ServerRef>,
@@ -615,7 +645,7 @@ impl Pickers {
     /// (first row). Never `None` with a non-empty catalog.
     fn selected_model<'a>(&'a self, cx: &'a App) -> Option<&'a Model> {
         let harness = self.effective_harness(cx)?;
-        let models = self.models.get(&harness)?.ready()?;
+        let models = &self.models.get(&harness)?.ready()?.models;
         match self.effective_model_id(cx) {
             Some(id) => models
                 .iter()
@@ -687,15 +717,19 @@ impl Pickers {
         }
     }
 
-    /// Put cancelled model slots back to `Idle` so the next `ensure_models`
-    /// loads them again.
+    /// Put cancelled model slots back to `Idle` and immediately re-request
+    /// them with `force: true`, so a slot the user gave up waiting on cannot
+    /// come back to a discovery failure the engine cached while nobody was
+    /// watching.
     ///
     /// Called only from discrete user demand (opening the picker, picking a
     /// harness), never from render: render runs `ensure_models` every frame, so
     /// re-arming there would restart the request the moment it was cancelled
     /// and the toast would never go away.
-    fn rearm_cancelled_models(&mut self) {
-        rearm_cancelled(&mut self.models, &mut self.models_cancelled);
+    fn rearm_cancelled_models(&mut self, cx: &mut Context<Self>) {
+        for harness in rearm_cancelled(&mut self.models, &mut self.models_cancelled) {
+            self.ensure_models(harness, true, cx);
+        }
     }
 
     /// The catalog's half of [`Self::rearm_cancelled_models`], with the same
@@ -746,7 +780,7 @@ impl Pickers {
         if kind == PickerKind::HarnessModel {
             self.model_scroll.set_offset(gpui::Point::default());
             // Opening the menu IS asking for the models again.
-            self.rearm_cancelled_models();
+            self.rearm_cancelled_models(cx);
         }
         // Searchable pickers focus the filter input (it sits inside the frame,
         // so the frame's key handler still sees arrows/Enter); the rest focus
@@ -781,7 +815,7 @@ impl Pickers {
                 // refs arm above).
                 self.revalidate_harnesses(cx);
                 if let Some(harness) = self.effective_harness(cx) {
-                    self.ensure_models(harness, cx);
+                    self.ensure_models(harness, false, cx);
                 }
             }
         }
@@ -847,7 +881,7 @@ impl Pickers {
                     }
                 };
                 if let Some(harness) = pickers.effective_harness(cx) {
-                    pickers.ensure_models(harness, cx);
+                    pickers.ensure_models(harness, false, cx);
                 }
                 cx.notify();
             })
@@ -959,7 +993,16 @@ impl Pickers {
         )
     }
 
-    fn ensure_models(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+    /// `force` reaches the engine as-is and must never be `true` from a call
+    /// made in `render`: the engine clears the harness's `DiscoveryCache` on
+    /// a forced call, and render re-runs its eager load every frame — a
+    /// `force` there would re-spawn a discovery subprocess per frame. Only a
+    /// discrete user demand (the Retry row, re-arming a cancelled slot) may
+    /// force; opening the picker and the eager render kick both pass `false`.
+    /// `force` is read only after the Absent-or-Idle guard below, so a forced
+    /// call still no-ops on a Loading/Ready/Error slot; the caller must clear
+    /// the slot first.
+    fn ensure_models(&mut self, harness: HarnessId, force: bool, cx: &mut Context<Self>) {
         // Absent or Idle only — same render-loop hazard as `ensure_harnesses`;
         // the retry row clears the map to re-arm.
         if self
@@ -988,7 +1031,7 @@ impl Pickers {
         // path out, including the cancelled one.
         let (request_id, cancelled) = toast::begin(cx, errors::Loading::Models);
         cx.spawn(async move |this, cx| {
-            let params = serde_json::json!({ "harness": harness });
+            let params = serde_json::json!({ "harness": harness, "force": force });
             let call = std::pin::pin!(engine.client().call(methods::LIST_MODELS, params));
             // Losing this race DROPS the RPC future, which is what makes cancel
             // real rather than cosmetic: `PendingGuard` turns the drop into a
@@ -1014,8 +1057,8 @@ impl Pickers {
                     }
                 };
                 let loaded = match result {
-                    Ok(value) => match serde_json::from_value::<Vec<Model>>(value) {
-                        Ok(models) => Loadable::Ready(models),
+                    Ok(value) => match decode_models_reply(value) {
+                        Ok(catalog) => Loadable::Ready(catalog),
                         Err(err) => {
                             Loadable::Error(errors::decode_failure(errors::Loading::Models, &err))
                         }
@@ -1024,10 +1067,13 @@ impl Pickers {
                         Loadable::Error(errors::load_failure(errors::Loading::Models, &err))
                     }
                 };
-                if let Loadable::Ready(models) = &loaded {
-                    let fresh = pickers
-                        .defaults
-                        .remember_labels(models.iter().map(|m| (m.id.as_str(), m.label.as_str())));
+                if let Loadable::Ready(catalog) = &loaded {
+                    let fresh = pickers.defaults.remember_labels(
+                        catalog
+                            .models
+                            .iter()
+                            .map(|m| (m.id.as_str(), m.label.as_str())),
+                    );
                     if fresh {
                         pickers.save_defaults();
                     }
@@ -1370,8 +1416,8 @@ impl Pickers {
         self.model_scroll.set_offset(gpui::Point::default());
         // Picking the harness IS asking for its models again, so a cancelled
         // slot must not stay cancelled here either.
-        self.rearm_cancelled_models();
-        self.ensure_models(harness, cx);
+        self.rearm_cancelled_models(cx);
+        self.ensure_models(harness, false, cx);
         cx.notify();
     }
 
@@ -1389,7 +1435,7 @@ impl Pickers {
                     .models
                     .get(&harness)
                     .and_then(|l| l.ready())
-                    .and_then(|models| models.iter().find(|m| m.id == model_id))
+                    .and_then(|catalog| catalog.models.iter().find(|m| m.id == model_id))
                     .map(|m| m.label.clone())
                     .unwrap_or_else(|| model_id.clone());
                 self.defaults.remember_model(harness, model_id, label);
@@ -1481,11 +1527,11 @@ impl Pickers {
         // Reasoning must stay concrete for whatever model the row now names —
         // same ladder resolution as [`Self::trait_ladder`] (model levels, else
         // the harness's advertised ladder).
-        if let Some(models) = self.models.get(&config.harness).and_then(|l| l.ready()) {
+        if let Some(catalog) = self.models.get(&config.harness).and_then(|l| l.ready()) {
             let mut ladder = config
                 .model
                 .as_deref()
-                .and_then(|id| models.iter().find(|m| m.id == id))
+                .and_then(|id| catalog.models.iter().find(|m| m.id == id))
                 .map(|m| m.reasoning_levels.clone())
                 .unwrap_or_default();
             if ladder.is_empty()
@@ -1574,7 +1620,7 @@ impl Pickers {
         self.effective_harness(cx)
             .and_then(|h| self.models.get(&h))
             .and_then(|l| l.ready())
-            .map(|m| m.len())
+            .map(|catalog| catalog.models.len())
             .unwrap_or(0)
     }
 
@@ -1584,7 +1630,7 @@ impl Pickers {
             .effective_harness(cx)
             .and_then(|h| self.models.get(&h))
             .and_then(|l| l.ready())
-            .and_then(|m| m.get(self.active))
+            .and_then(|catalog| catalog.models.get(self.active))
             .map(|m| m.id.clone())
         else {
             return;
@@ -2076,9 +2122,26 @@ impl Pickers {
                     .on_click(cx.listener(move |this, _, _, cx| match kind {
                         PickerKind::Branch | PickerKind::Checkout => this.ensure_refs(true, cx),
                         PickerKind::HarnessModel | PickerKind::Traits => {
+                            // Read the harness BEFORE clearing the catalog.
+                            // With no explicit pick and nothing remembered,
+                            // `effective_harness` falls back to the first
+                            // visible row of `self.harnesses` — so resetting
+                            // that to `Idle` first makes it answer `None`, the
+                            // forced refetch never runs, and the reload that
+                            // follows asks with `force: false` and gets the
+                            // boot-cached failure straight back. Retry would
+                            // look like it worked and change nothing.
+                            let harness = this.effective_harness(cx);
                             this.harnesses = Loadable::Idle;
                             this.models.clear();
                             this.ensure_harnesses(cx);
+                            // `force: true` — this is the escape hatch from a
+                            // discovery failure the engine cached for the
+                            // whole boot (`DiscoveryCache`): without it, this
+                            // row refetches the same cached failure forever.
+                            if let Some(harness) = harness {
+                                this.ensure_models(harness, true, cx);
+                            }
                         }
                     }))
                     .child(SharedString::from("Retry")),
@@ -2499,12 +2562,12 @@ impl Pickers {
         // direct children so `scroll_to_item(active)` maps 1:1 (the palette's
         // keyboard-follow standard).
         let model_children: Vec<AnyElement> = match effective.map(|h| (h, self.models.get(&h))) {
-            Some((_, Some(Loadable::Ready(models)))) => {
+            Some((_, Some(Loadable::Ready(catalog)))) => {
                 // The check mirrors the chip: the resolved concrete pick (draft
                 // / chat config / remembered, else the harness default row).
                 let selected = self.selected_model(cx).map(|m| m.id.clone());
                 let active = self.active;
-                let models = models.clone();
+                let models = catalog.models.clone();
                 models
                     .into_iter()
                     .enumerate()
@@ -2575,6 +2638,16 @@ impl Pickers {
             ],
         };
 
+        // Quiet caption for a `BuiltIn` catalog — see `caption_for`. `None`
+        // while loading/erroring too: those states already say their own
+        // thing and don't need a second, contradictory line under them.
+        let built_in_caption = effective.and_then(|h| {
+            self.models
+                .get(&h)
+                .and_then(|l| l.ready())
+                .and_then(|catalog| caption_for(catalog.source, h))
+        });
+
         // One combined menu (user request): harness tabs across the top,
         // then the viewed harness's models, then the reasoning ladder and
         // model options that used to live in the separate traits popover.
@@ -2636,6 +2709,21 @@ impl Pickers {
                                         .children(model_children),
                                 ),
                             )
+                            .when_some(built_in_caption, |el, caption| {
+                                el.child(
+                                    // Quiet, not an error: amber `warning_muted`,
+                                    // same 11px as the row description line, no
+                                    // Retry of its own (the pane's existing Retry
+                                    // row is the escape hatch — Task 6 wires it).
+                                    div()
+                                        .flex_none()
+                                        .px(px(8.0))
+                                        .pb(px(4.0))
+                                        .text_size(px(11.0))
+                                        .text_color(theme.warning_muted)
+                                        .child(SharedString::from(caption)),
+                                )
+                            })
                             .child(
                                 // The pinned inspector tray (scrolls only if
                                 // a model advertises many option groups).
@@ -2969,6 +3057,8 @@ fn harness_catalog_settled(slot: &Loadable<Vec<HarnessDescriptor>>) -> bool {
 }
 
 /// Put cancelled slots back to `Idle` so the next `ensure_*` reloads them.
+/// Returns the harnesses actually re-armed, so a caller that needs to kick
+/// off their reload itself (`rearm_cancelled_models`) knows which ones.
 ///
 /// Re-arms **only a slot still holding an `Error`**. A marker can outlive the
 /// state it described — a Retry, or a space switch clearing the map, reloads
@@ -2980,12 +3070,15 @@ fn harness_catalog_settled(slot: &Loadable<Vec<HarnessDescriptor>>) -> bool {
 fn rearm_cancelled<T>(
     slots: &mut HashMap<HarnessId, Loadable<T>>,
     cancelled: &mut std::collections::HashSet<HarnessId>,
-) {
+) -> Vec<HarnessId> {
+    let mut rearmed = Vec::new();
     for harness in cancelled.drain() {
         if matches!(slots.get(&harness), Some(Loadable::Error(_))) {
             slots.insert(harness, Loadable::Idle);
+            rearmed.push(harness);
         }
     }
+    rearmed
 }
 
 /// [`rearm_cancelled`] for a surface with one slot rather than a map.
@@ -3149,7 +3242,9 @@ impl Render for Pickers {
         // chip reads "Fable 5" (a concrete pick) before any popover opens.
         self.ensure_harnesses(cx);
         if let Some(harness) = self.effective_harness(cx) {
-            self.ensure_models(harness, cx);
+            // `render` runs every frame — `force: true` here would re-spawn a
+            // discovery subprocess per frame. See `ensure_models`.
+            self.ensure_models(harness, false, cx);
         }
         // A popover opened data-side (COMET_OPEN_PICKER) never went through
         // `toggle`, so kick its loads here (all ensure_* are idempotent).
@@ -3312,6 +3407,7 @@ mod tests {
                     default_choice: "normal".into(),
                 },
             ],
+            accepts_images: true,
         };
         let mut selections = serde_json::Map::new();
         selections.insert("context".into(), serde_json::Value::String("1m".into()));
@@ -3544,6 +3640,7 @@ mod tests {
                 description: None,
                 reasoning_levels: vec![],
                 options: vec![],
+                accepts_images: true,
             },
             Model {
                 id: "fast".into(),
@@ -3551,6 +3648,7 @@ mod tests {
                 description: None,
                 reasoning_levels: vec![],
                 options: vec![],
+                accepts_images: true,
             },
         ];
         assert_eq!(default_model(&models).map(|m| &*m.id), Some("flagship"));
@@ -3839,5 +3937,53 @@ mod tests {
         // …and opted back in by COMET_HARNESS=mock (the e2e rig).
         assert_eq!(visible_harnesses_impl(&mixed, true).len(), 2);
         assert_eq!(visible_harnesses_impl(&mixed, true)[0].id, HarnessId::Mock);
+    }
+
+    /// The caption exists so a user looking at a stale list can tell. It is
+    /// copy, not a raw error: no provider name from an error string, no
+    /// `err.to_string()`, nothing the user cannot act on.
+    #[test]
+    fn built_in_caption_names_the_agent_and_nothing_technical() {
+        let caption = built_in_caption(HarnessId::ClaudeCode);
+        assert!(caption.contains("Built-in list"), "got {caption}");
+        assert!(!caption.contains("Error"), "no error vocabulary: {caption}");
+        assert!(
+            !caption.contains("harness"),
+            "internal word on screen: {caption}"
+        );
+    }
+
+    /// A live answer says nothing at all — the caption is for the degraded case.
+    #[test]
+    fn a_live_catalog_shows_no_caption() {
+        assert!(caption_for(CatalogSource::Live, HarnessId::ClaudeCode).is_none());
+        assert!(caption_for(CatalogSource::BuiltIn, HarnessId::ClaudeCode).is_some());
+    }
+
+    /// The decode is pinned against the reply's REAL JSON, not against a
+    /// `ModelCatalog` this test built and re-serialized. Task 4 changed the
+    /// wire shape and every one of `comet-ui`'s 501 tests stayed green while
+    /// the picker was left decoding the old one — a round-trip through the
+    /// Rust type would have stayed green too. Only the literal the engine
+    /// actually sends catches that.
+    #[test]
+    fn the_picker_decodes_the_reply_the_engine_actually_sends() {
+        let reply = serde_json::json!({
+            "models": [{
+                "id": "claude-sonnet-5",
+                "label": "Sonnet 5",
+                "reasoningLevels": [],
+                "options": []
+            }],
+            "source": "builtIn"
+        });
+        let catalog = decode_models_reply(reply).expect("decode");
+        assert_eq!(catalog.source, CatalogSource::BuiltIn);
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(catalog.models[0].id, "claude-sonnet-5");
+        assert!(
+            catalog.models[0].accepts_images,
+            "absent acceptsImages means images work"
+        );
     }
 }

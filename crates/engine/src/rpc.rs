@@ -3,7 +3,7 @@
 //!
 //! Methods (feature-inventory §2):
 //! - `ListHarnesses` → `[HarnessDescriptor]`
-//! - `ListModels {harness}` → `[Model]`
+//! - `ListModels {harness, force}` → `{models, source}`
 //! - `QueueCommand {chatId, command}` → `{commandId}` (durable doc command)
 //! - `WatchDocMessages {chatId}` → stream of joined `SessionMessageEntry[]`,
 //!   re-emitted on every doc change
@@ -42,8 +42,8 @@ use tokio::sync::watch;
 
 use comet_doc::{MessagePart, SessionCommandPayload};
 use comet_proto::{
-    ChatConfig, HarnessId, LanSettings, RemoteConnectionState, RemoteEntry, ServerHello, ServerId,
-    ToolCall,
+    ChatConfig, DiagnosticSeverity, HarnessId, LanSettings, RemoteConnectionState, RemoteEntry,
+    ServerHello, ServerId, ToolCall,
 };
 use comet_rpc::{RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -71,6 +71,11 @@ struct ChatParams {
 #[serde(rename_all = "camelCase")]
 struct ListModelsParams {
     harness: HarnessId,
+    /// Set by the picker's Retry row. A new FIELD on an existing method, so
+    /// it stays additive and needs no version bump of its own — an older
+    /// peer simply never asks for a refresh.
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -987,11 +992,31 @@ impl RpcService for EngineRpc {
                     .registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let models = harness
+                if p.force {
+                    harness.clear_discovery();
+                }
+                let catalog = harness
                     .models()
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&models)
+                // Only an unreadable answer is drift. An absent CLI is
+                // ordinary and stays out of the diagnostics surface, or the
+                // card reads a figure on every healthy boot.
+                //
+                // Taking rather than peeking: the failure stays cached for the
+                // whole boot, so peeking would record one unreadable answer
+                // again on every picker open, inflating the count and
+                // refreshing `last_seen_ms` as if the provider kept failing.
+                if harness.take_unreported_discovery_failure()
+                    == Some(comet_harness::discovery::DiscoveryFailure::Unparseable)
+                {
+                    self.registry.record_diagnostic(
+                        p.harness,
+                        "discovery/unreadable",
+                        DiagnosticSeverity::Malformed,
+                    );
+                }
+                RpcReply::value(&catalog)
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;

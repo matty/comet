@@ -18,7 +18,11 @@ use serde::{Deserialize, Serialize};
 ///    picked `approval-required` here would get an unattended write on the
 ///    other device. The absence of the field is indistinguishable from a
 ///    deliberate value, so refusing the pairing is the honest failure.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// 5: `ListModels` answers `{models, source}` instead of a bare `Vec<Model>`.
+///    A decode problem, unlike 4: the reply is a whole-value decode, so an
+///    older peer fails the array-vs-object shape outright rather than
+///    ignoring a key.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

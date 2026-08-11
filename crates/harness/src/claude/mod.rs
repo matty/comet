@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus,
-    HarnessAvailability, HarnessCapabilities, HarnessId, Model, ReasoningLevel, RunRequest,
+    HarnessAvailability, HarnessCapabilities, HarnessId, ModelCatalog, ReasoningLevel, RunRequest,
     RuntimeMode, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
@@ -268,9 +268,12 @@ impl Harness for ClaudeHarness {
     /// The curated static catalog (see [`catalog`]); requires an installed CLI
     /// so an absent binary surfaces as [`HarnessError::NotInstalled`] here,
     /// like the TS harness's discovery call.
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
         self.resolve_executable()?;
-        Ok(static_models())
+        // 2.2/2.3 replace this with a `DiscoveryCache::get` over a real
+        // handshake. Until then the adapter must report `BuiltIn` honestly,
+        // or the picker's caption would lie in the other direction.
+        Ok(ModelCatalog::built_in(static_models()))
     }
 
     async fn run(

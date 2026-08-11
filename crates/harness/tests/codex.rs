@@ -668,7 +668,14 @@ async fn missing_binary_is_not_installed() {
 
 #[tokio::test]
 async fn models_returns_curated_catalog() {
-    let models = harness().models().await.expect("models");
+    let catalog = harness().models().await.expect("models");
+    assert_eq!(
+        catalog.source,
+        comet_proto::CatalogSource::BuiltIn,
+        "no discovery ships in 2.1; the adapter must not claim a live list"
+    );
+    assert!(!catalog.models.is_empty());
+    let models = catalog.models;
     assert_eq!(models.len(), 7);
     assert_eq!(models[0].id, "gpt-5.6-sol");
     assert!(models[0].reasoning_levels.contains(&ReasoningLevel::Ultra));

@@ -25,8 +25,8 @@ use comet_doc::{
 use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessCapabilities, HarnessId, Model, ReasoningLevel, RunRequest,
-    RuntimeMode, SandboxLevel, SteeringMode,
+    AgentEvent, DoneStatus, HarnessCapabilities, HarnessId, ModelCatalog, ReasoningLevel,
+    RunRequest, RuntimeMode, SandboxLevel, SteeringMode,
 };
 use comet_sync::DocsStore;
 
@@ -76,8 +76,8 @@ impl Harness for RecordingHarness {
             ..HarnessCapabilities::default()
         }
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,
@@ -442,8 +442,8 @@ impl Harness for PersistentHarness {
             ..HarnessCapabilities::default()
         }
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,

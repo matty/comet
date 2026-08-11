@@ -161,6 +161,7 @@ fn model(id: &str, label: &str, description: &str, ladder: &[ReasoningLevel]) ->
         description: (!description.is_empty()).then(|| description.into()),
         reasoning_levels: ladder.to_vec(),
         options: vec![service_tier()],
+        accepts_images: true,
     }
 }
 

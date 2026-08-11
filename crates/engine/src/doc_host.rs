@@ -876,9 +876,7 @@ mod tests {
     // the stock mock harness (empty script) is enough to satisfy assembly.
     fn registry() -> Arc<crate::registry::HarnessRegistry> {
         let registry = crate::registry::HarnessRegistry::new();
-        registry.register(Arc::new(comet_harness::mock::MockHarness {
-            script: vec![],
-        }));
+        registry.register(Arc::new(comet_harness::mock::MockHarness::new()));
         Arc::new(registry)
     }
 
