@@ -3218,6 +3218,13 @@ struct FileMentionState {
     /// query filters at render time rather than at fetch time — one spawn per
     /// directory per boot, not one per keystroke.
     commands: Vec<comet_proto::AgentCommand>,
+    /// The `(harness, cwd)` the cached `commands` were fetched for.
+    ///
+    /// Without it the list is a cache with no key: the harness picker sits in
+    /// this very composer, and switching agent or checkout mid-draft only
+    /// notifies — nothing clears the list — so the next `/` would serve
+    /// Claude's commands under Codex. Reported by review on PR #45.
+    commands_key: Option<(comet_proto::HarnessId, String)>,
     active: Option<usize>,
     request: u64,
     loading: bool,
@@ -3249,6 +3256,20 @@ impl FileMentionState {
                 .unwrap_or(0),
         }
     }
+}
+
+/// Whether the cached command list can answer a `/` for `context` without
+/// re-asking the engine.
+///
+/// A non-empty list is not enough: it has to belong to the same agent AND the
+/// same directory. The harness picker sits in this composer, so a draft can
+/// change agent without the chat changing, and the observer on the pickers only
+/// notifies — nothing clears the list. Reported by review on PR #45.
+fn commands_reusable(
+    state: &FileMentionState,
+    context: Option<&(comet_proto::HarnessId, String)>,
+) -> bool {
+    !state.commands.is_empty() && context.is_some() && state.commands_key.as_ref() == context
 }
 
 /// Width of the completion popup's scrollbar, and the gutter reserved for it.
@@ -3749,6 +3770,11 @@ impl Composer {
     fn reset_mention(&mut self, dismissed: Option<(Range<usize>, String)>, cx: &mut Context<Self>) {
         let request = self.mention.request.wrapping_add(1);
         self.mention_task = None;
+        // The scroll offset belongs to the session that scrolled, not to the
+        // handle. Carried over, the next popup opens at the old offset with row
+        // 0 selected off-screen — and Enter then accepts a row the user cannot
+        // see. Reported by review on PR #45.
+        self.completion_scroll = gpui::ScrollHandle::new();
         self.mention = FileMentionState {
             request,
             dismissed,
@@ -3819,7 +3845,16 @@ impl Composer {
         // The command list is fetched once per directory per boot, so a menu
         // that already has it must not flash a skeleton on every keystroke —
         // and must not re-spawn a CLI that runs the user's SessionStart hooks.
-        if kind == Completion::Commands && !self.mention.commands.is_empty() {
+        //
+        // Reused only when the cached list belongs to THIS agent and directory.
+        // The harness picker lives in this composer, so "same chat" does not
+        // mean "same context".
+        let command_context = (kind == Completion::Commands)
+            .then(|| self.command_context(cx))
+            .flatten();
+        if kind == Completion::Commands
+            && commands_reusable(&self.mention, command_context.as_ref())
+        {
             self.mention.loading = false;
             self.mention.active = (self.mention.row_count() > 0).then_some(0);
             self.sync_mention_controls(cx);
@@ -3843,7 +3878,7 @@ impl Composer {
             _ => None,
         };
         if kind == Completion::Commands {
-            self.fetch_commands(engine, token, selected_worktree, cx);
+            self.fetch_commands(engine, token, cx);
             return;
         }
         let params = {
@@ -3913,6 +3948,31 @@ impl Composer {
         cx.notify();
     }
 
+    /// Which agent, and which directory, a `/` menu here would be about.
+    ///
+    /// The cwd precedence is `send`'s own, and it has to be: a menu answering
+    /// for a different directory than the turn will run in offers commands that
+    /// do not exist there. The space's folder is the load-bearing arm — a NEW
+    /// chat has no row yet and most reuse no worktree, so stopping at the first
+    /// two leaves the menu dead in the commonest case of all.
+    ///
+    /// `None` means there is nothing to ask about, and the menu stays shut
+    /// rather than guessing a directory.
+    fn command_context(&self, cx: &App) -> Option<(comet_proto::HarnessId, String)> {
+        let harness = self.pickers.read(cx).effective_harness(cx)?;
+        let selected_worktree = match self.pickers.read(cx).checkout_plan() {
+            crate::pickers::CheckoutPlan::ReuseWorktree { path, .. } => Some(path),
+            _ => None,
+        };
+        let state = self.state.read(cx);
+        let cwd = state
+            .selected_chat_row()
+            .and_then(|chat| chat.cwd.clone())
+            .or(selected_worktree)
+            .or_else(|| state.selected_space_row().map(|space| space.path.clone()))?;
+        Some((harness, cwd))
+    }
+
     /// Ask the owning device for this chat's command list.
     ///
     /// No debounce, unlike the file search: this is one call per directory per
@@ -3922,35 +3982,14 @@ impl Composer {
         &mut self,
         engine: crate::state::ServerClient,
         token: MentionToken,
-        selected_worktree: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(harness) = self.pickers.read(cx).effective_harness(cx) else {
+        let Some((harness, cwd)) = self.command_context(cx) else {
             self.mention.loading = false;
             cx.notify();
             return;
         };
-        // Same precedence `send` resolves a run's cwd by, and it has to be:
-        // a menu answering for a different directory than the turn will run in
-        // offers commands that do not exist there.
-        //
-        // The space's folder is the load-bearing one. A NEW chat has no row
-        // yet, and most new chats reuse no worktree, so stopping at the first
-        // two would leave the menu dead in the commonest case of all — open a
-        // space, type `/`, nothing.
-        let cwd = {
-            let state = self.state.read(cx);
-            state
-                .selected_chat_row()
-                .and_then(|chat| chat.cwd.clone())
-                .or(selected_worktree)
-                .or_else(|| state.selected_space_row().map(|space| space.path.clone()))
-        };
-        let Some(cwd) = cwd else {
-            self.mention.loading = false;
-            cx.notify();
-            return;
-        };
+        self.mention.commands_key = Some((harness, cwd.clone()));
         let params = serde_json::json!({ "harness": harness, "cwd": cwd });
         let request = self.mention.request;
         self.mention_task = Some(cx.spawn(async move |this, cx| {
@@ -4457,6 +4496,21 @@ impl Composer {
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
     fn send(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
+        // The staging gate is a check at ONE MOMENT, and the model can change
+        // after it: stage an image on a model that takes them, switch to one
+        // that does not, and the attachment is still in the strip. Rechecking
+        // here is what makes the gate hold over time. Reported by review on
+        // PR #45.
+        //
+        // Blocked rather than dropped: silently discarding a staged image the
+        // user chose is worse than refusing to send it, and the fix — pick
+        // another model, or remove the attachment — is theirs either way.
+        if !self.staged().is_empty() && !self.pickers.read(cx).effective_accepts_images(cx) {
+            let label = self.pickers.read(cx).selected_model_label(cx);
+            self.failure = Some((attachment_blocked_message(label), NoticeTone::Pending));
+            cx.notify();
+            return;
+        }
         let Some(engine) = self.state.read(cx).selected_client() else {
             self.failure = Some(("Engine not connected".into(), NoticeTone::Pending));
             cx.notify();
@@ -6156,6 +6210,45 @@ mod tests {
         assert_eq!(names("ver"), vec!["verify".to_string()]);
         assert_eq!(names("").len(), 2, "an empty query lists everything");
         assert!(names("zzz").is_empty());
+    }
+
+    /// The cached list is keyed, not merely non-empty. The harness picker is
+    /// in this composer, so switching agent mid-draft changes what `/` means
+    /// without the chat changing — and a bare "have I got any?" check would
+    /// serve Claude's commands under Codex. Reported by review on PR #45.
+    #[test]
+    fn a_cached_command_list_is_only_reused_for_its_own_agent_and_directory() {
+        let claude = (comet_proto::HarnessId::ClaudeCode, "/repo".to_string());
+        let state = FileMentionState {
+            kind: Completion::Commands,
+            commands: vec![command("verify", None, &[])],
+            commands_key: Some(claude.clone()),
+            ..FileMentionState::default()
+        };
+        assert!(commands_reusable(&state, Some(&claude)));
+        assert!(
+            !commands_reusable(
+                &state,
+                Some(&(comet_proto::HarnessId::Codex, "/repo".into()))
+            ),
+            "a different agent must re-ask"
+        );
+        assert!(
+            !commands_reusable(
+                &state,
+                Some(&(comet_proto::HarnessId::ClaudeCode, "/other".into()))
+            ),
+            "a different directory must re-ask"
+        );
+        assert!(
+            !commands_reusable(&state, None),
+            "no context means nothing to answer for"
+        );
+        let unkeyed = FileMentionState {
+            commands: vec![command("verify", None, &[])],
+            ..FileMentionState::default()
+        };
+        assert!(!commands_reusable(&unkeyed, Some(&claude)));
     }
 
     /// A row whose name STARTS with the query outranks one that merely contains
