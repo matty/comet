@@ -88,6 +88,22 @@ gpui has no `div` scale transform at the pinned rev — only `svg` transformatio
 known limitation, not an oversight; don't "fix" it by bumping the rev. translateY is a
 relative-position `top` inset, which taffy applies after layout, so siblings never move.
 
+## Invalidation that stops one layer short
+
+A handler that resets state and then reads something derived from it gets the *post*-reset
+answer. The picker's Retry row did exactly this: it set `harnesses` to `Loadable::Idle` and
+then called `effective_harness`, whose last fallback reads the first row of that list. On the
+first-run path — no explicit pick, no chat config, nothing remembered — it answered `None`, the
+forced refetch never ran, and the reload behind it asked without `force` and got the cached
+failure straight back. Retry looked like it worked and changed nothing. **Read derived values
+before you invalidate what they derive from.**
+
+The same shape has a second half: an invalidation is only as deep as its last layer. Clearing a
+`Loadable` slot re-arms the UI, not the engine, and a `force` flag that reaches a harness whose
+own cache ignores it clears nothing at all. When something is cached at more than one level,
+follow the invalidation to whoever actually holds the value and prove it there — a test at the
+top layer passes while the bottom one keeps serving the stale answer.
+
 ## Driving the UI while you work
 
 `COMET_HARNESS=mock` with the `COMET_MOCK_*` variables runs the UI without a real agent CLI.
