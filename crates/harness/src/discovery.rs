@@ -11,7 +11,7 @@
 //!    and never mentions `ultracode`/`ultrathink`/`ultra`, and neither provider
 //!    reports Comet's option sets (context window, fast mode) at all.
 
-use comet_proto::{Model, ReasoningLevel};
+use comet_proto::{Model, ModelCatalog, ReasoningLevel};
 
 /// One model as a provider described it. Deliberately narrower than
 /// [`Model`]: it holds only what a provider can actually tell us, so an
@@ -94,6 +94,81 @@ pub fn merge(curated: Vec<Model>, discovery: &Discovery) -> Vec<Model> {
         });
     }
     merged
+}
+
+/// A discovery answer for the life of the engine boot.
+///
+/// Holds the FAILURE as well as the success on purpose: a provider that
+/// cannot answer (not logged in, CLI missing, protocol changed) would
+/// otherwise be re-spawned on every picker open, and every one of those
+/// spawns costs a 10-second timeout. The escape hatch is [`DiscoveryCache::clear`], wired to
+/// the picker's existing Retry row.
+///
+/// Callers AWAIT this rather than reading a snapshot. That is what keeps a
+/// push channel out of the design: the picker's `Loadable` slot, slow-request
+/// toast and Cancel already cover a slow await, whereas a
+/// stale-list-then-swap would change the rows under the user's cursor.
+type Cell = tokio::sync::OnceCell<Result<Discovery, DiscoveryFailure>>;
+
+#[derive(Debug, Default)]
+pub struct DiscoveryCache {
+    /// The cell is behind an `Arc` swapped under a std `Mutex` so that
+    /// `clear` can take `&self`: the `Harness` trait hands out `&self`
+    /// everywhere, and a `&mut self` clear would be uncallable from
+    /// `clear_discovery`.
+    ///
+    /// The lock is released before any await — `get` clones the `Arc` out
+    /// and awaits on the clone. Holding a std `MutexGuard` across an await
+    /// point is the deadlock this shape exists to avoid.
+    cell: std::sync::Mutex<std::sync::Arc<Cell>>,
+}
+
+impl DiscoveryCache {
+    fn current(&self) -> std::sync::Arc<Cell> {
+        self.cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Run `run` at most once per boot and hand back its answer. An `Err` is
+    /// a cached failure, not "not yet tried" — and it keeps its kind, because
+    /// only `Unparseable` earns a `Diagnostic`.
+    ///
+    /// Returns an owned answer rather than a borrow: the cell it came from
+    /// can be swapped out by `clear` at any time, so a reference into it
+    /// cannot be handed across that boundary.
+    pub async fn get<F, Fut>(&self, run: F) -> Result<Discovery, DiscoveryFailure>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Discovery, DiscoveryFailure>>,
+    {
+        let cell = self.current();
+        cell.get_or_init(run).await.clone()
+    }
+
+    /// Re-arm the cell, so the next `get` runs its closure again. Wired to
+    /// the picker's Retry row; it is the only escape from a cached failure
+    /// inside one boot.
+    pub fn clear(&self) {
+        *self
+            .cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(Cell::new());
+    }
+
+    /// The single place `CatalogSource` is decided, so no adapter can report
+    /// a built-in list as live.
+    pub fn catalog(
+        &self,
+        curated: Vec<Model>,
+        discovery: Result<Discovery, DiscoveryFailure>,
+    ) -> ModelCatalog {
+        match discovery {
+            Ok(discovery) => ModelCatalog::live(merge(curated, &discovery)),
+            Err(_) => ModelCatalog::built_in(curated),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -227,5 +302,108 @@ mod tests {
             &Discovery { models: vec![live] },
         );
         assert!(!merged[0].accepts_images);
+    }
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The subprocess runs once per boot, not once per caller. `models()` is
+    /// called from the picker's render path AND from titling
+    /// (`crates/engine/src/titles.rs:159`), so a cache that missed would spawn a
+    /// CLI on a path the user never sees.
+    #[tokio::test]
+    async fn discovery_runs_once_across_concurrent_callers() {
+        let cache = DiscoveryCache::default();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let run = || {
+            let runs = runs.clone();
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                Ok(Discovery {
+                    models: vec![discovered("m-1", "One")],
+                })
+            }
+        };
+        let (a, b) = tokio::join!(cache.get(run), cache.get(run));
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "one spawn, two callers");
+    }
+
+    /// A failure is cached too. Without this, a broken login spawns a doomed
+    /// subprocess on every picker open for the rest of the session.
+    #[tokio::test]
+    async fn a_failure_is_cached_for_the_boot() {
+        let cache = DiscoveryCache::default();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let run = || {
+            let runs = runs.clone();
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Err(DiscoveryFailure::Unreachable)
+            }
+        };
+        assert_eq!(cache.get(run).await, Err(DiscoveryFailure::Unreachable));
+        assert_eq!(cache.get(run).await, Err(DiscoveryFailure::Unreachable));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the failure is remembered");
+    }
+
+    /// The kind survives the cache. Only `Unparseable` raises a `Diagnostic`,
+    /// so a cache that flattened both kinds would silently stop reporting the
+    /// one failure that means a provider changed its protocol.
+    #[tokio::test]
+    async fn the_failure_kind_survives_caching() {
+        let cache = DiscoveryCache::default();
+        let answer = cache
+            .get(|| async { Err(DiscoveryFailure::Unparseable) })
+            .await;
+        assert_eq!(answer, Err(DiscoveryFailure::Unparseable));
+        let again = cache
+            .get(|| async { Err(DiscoveryFailure::Unreachable) })
+            .await;
+        assert_eq!(
+            again,
+            Err(DiscoveryFailure::Unparseable),
+            "the cached kind wins; the closure must not run again"
+        );
+    }
+
+    /// Retry is the only escape hatch from a cached failure, so clearing has to
+    /// actually re-arm the cell.
+    #[tokio::test]
+    async fn clearing_re_arms_a_cached_failure() {
+        let cache = DiscoveryCache::default();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let run = || {
+            let runs = runs.clone();
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Err(DiscoveryFailure::Unreachable)
+            }
+        };
+        assert!(cache.get(run).await.is_err());
+        cache.clear();
+        assert!(cache.get(run).await.is_err());
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    /// The caption's whole input. A failed discovery still answers with a
+    /// working list — it is just the built-in one, and the picker says so.
+    #[test]
+    fn source_reports_built_in_when_discovery_failed() {
+        let cache = DiscoveryCache::default();
+        let answer = Discovery {
+            models: vec![discovered("m-2", "Live")],
+        };
+        let live = cache.catalog(vec![curated("m-1", "Curated", &[])], Ok(answer));
+        assert_eq!(live.source, comet_proto::CatalogSource::Live);
+        assert_eq!(live.models.len(), 2);
+
+        let failed = cache.catalog(
+            vec![curated("m-1", "Curated", &[])],
+            Err(DiscoveryFailure::Unreachable),
+        );
+        assert_eq!(failed.source, comet_proto::CatalogSource::BuiltIn);
+        assert_eq!(failed.models.len(), 1, "the curated list still works");
     }
 }
