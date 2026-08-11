@@ -4013,6 +4013,14 @@ impl Composer {
                 if !mention_response_is_current(&composer.mention, request) {
                     return;
                 }
+                // The generation counter tracks the TOKEN, and nothing bumps it
+                // when the pickers change — their observer only notifies. So a
+                // reply fired under one agent can land under another and be
+                // stored as current. Re-ask what the context is now rather than
+                // trusting the one captured at request time.
+                if composer.command_context(cx).as_ref() != Some(&context) {
+                    return;
+                }
                 composer.mention.loading = false;
                 match result {
                     Ok(value) => match decode_commands_reply(value) {
