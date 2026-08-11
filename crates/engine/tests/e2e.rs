@@ -18,8 +18,8 @@ use comet_harness::mock::MockHarness;
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus, FileOperation,
-    HarnessCapabilities, HarnessId, Model, NoticeKind, NoticeSeverity, ReasoningLevel, RunRequest,
-    RuntimeMode, SandboxLevel, SessionStatus, SteeringMode, ToolCall,
+    HarnessCapabilities, HarnessId, ModelCatalog, NoticeKind, NoticeSeverity, ReasoningLevel,
+    RunRequest, RuntimeMode, SandboxLevel, SessionStatus, SteeringMode, ToolCall,
 };
 use comet_rpc::RpcService;
 use comet_sync::DocsStore;
@@ -103,8 +103,8 @@ impl Harness for ScriptedHarness {
             ..HarnessCapabilities::default()
         }
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,
@@ -1071,7 +1071,7 @@ async fn rpc_surface_over_in_memory_transport() {
         )
         .await
         .unwrap();
-    assert_eq!(models[0]["id"], "mock-1");
+    assert_eq!(models["models"][0]["id"], "mock-1");
 
     // WatchSessions + WatchDocMessages streams.
     let mut sessions_stream = client
@@ -1165,8 +1165,8 @@ async fn respond_input_resolves_pending_question() {
         fn capabilities(&self) -> HarnessCapabilities {
             HarnessCapabilities::default()
         }
-        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-            Ok(vec![])
+        async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+            Ok(ModelCatalog::built_in(vec![]))
         }
         async fn run(
             &self,
@@ -1312,8 +1312,8 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
         fn capabilities(&self) -> HarnessCapabilities {
             HarnessCapabilities::default()
         }
-        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-            Ok(vec![])
+        async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+            Ok(ModelCatalog::built_in(vec![]))
         }
         async fn run(
             &self,
@@ -1482,8 +1482,8 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
         fn capabilities(&self) -> HarnessCapabilities {
             HarnessCapabilities::default()
         }
-        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-            Ok(vec![])
+        async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+            Ok(ModelCatalog::built_in(vec![]))
         }
         async fn run(
             &self,
@@ -1638,8 +1638,8 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
         fn capabilities(&self) -> HarnessCapabilities {
             HarnessCapabilities::default()
         }
-        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-            Ok(vec![])
+        async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+            Ok(ModelCatalog::built_in(vec![]))
         }
         async fn run(
             &self,
@@ -1823,8 +1823,8 @@ impl Harness for CapturingHarness {
             ..HarnessCapabilities::default()
         }
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,
@@ -2210,8 +2210,8 @@ impl Harness for ApprovingHarness {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities::default()
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,
@@ -2312,8 +2312,8 @@ impl Harness for TwiceAskingHarness {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities::default()
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,
@@ -2432,8 +2432,8 @@ impl Harness for SteeredWhileAskingHarness {
             ..HarnessCapabilities::default()
         }
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,
@@ -2555,8 +2555,8 @@ impl Harness for LateAskingHarness {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities::default()
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,
@@ -2648,8 +2648,8 @@ impl Harness for BatchAskingHarness {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities::default()
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
     }
     async fn run(
         &self,
@@ -3318,8 +3318,8 @@ async fn an_unanswerable_input_question_expires_the_turn_too() {
         fn capabilities(&self) -> HarnessCapabilities {
             HarnessCapabilities::default()
         }
-        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-            Ok(vec![])
+        async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+            Ok(ModelCatalog::built_in(vec![]))
         }
         async fn run(
             &self,

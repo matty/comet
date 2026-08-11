@@ -13,7 +13,7 @@ use comet_engine::{
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_identity::DeviceIdentity;
 use comet_proto::{
-    AgentEvent, Device, HarnessCapabilities, HarnessId, Model, PROTOCOL_VERSION,
+    AgentEvent, Device, HarnessCapabilities, HarnessId, ModelCatalog, PROTOCOL_VERSION,
     RemoteConnectionState, RemoteEndpoint, RemoteEntry, RunRequest, ServerId, TrustedClient,
 };
 use comet_rpc::{
@@ -38,8 +38,8 @@ impl Harness for EmptyHarness {
         HarnessCapabilities::default()
     }
 
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(Vec::new())
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(Vec::new()))
     }
 
     async fn run(

@@ -15,7 +15,7 @@ pub use tokio_util::sync::CancellationToken;
 
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, HarnessAvailability, HarnessCapabilities,
-    HarnessId, Model, RunRequest, UserInputAnswer, UserInputQuestion,
+    HarnessId, ModelCatalog, RunRequest, UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -77,7 +77,12 @@ pub trait Harness: Send + Sync {
     async fn availability(&self) -> HarnessAvailability {
         HarnessAvailability::Available { version: None }
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError>;
+    /// The model list, plus where it came from.
+    ///
+    /// Called from the picker's render path AND from titling
+    /// (`comet_engine::titles`), so an implementation that spawns a
+    /// subprocess must cache it — see [`discovery::DiscoveryCache`].
+    async fn models(&self) -> Result<ModelCatalog, HarnessError>;
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
     async fn run(
         &self,

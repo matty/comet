@@ -6,7 +6,8 @@ use futures::stream::BoxStream;
 
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DoneStatus, FileOperation, HarnessCapabilities,
-    HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, ToolCall, UserInputQuestion,
+    HarnessId, Model, ModelCatalog, ReasoningLevel, RunRequest, SteeringMode, ToolCall,
+    UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls};
@@ -101,8 +102,8 @@ impl Harness for MockHarness {
     fn capabilities(&self) -> HarnessCapabilities {
         Self::capabilities()
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![
             Model {
                 id: "mock-1".into(),
                 label: "Mock 1".into(),
@@ -126,7 +127,7 @@ impl Harness for MockHarness {
                 options: vec![],
                 accepts_images: true,
             },
-        ])
+        ]))
     }
     async fn run(
         &self,
