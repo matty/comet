@@ -11,7 +11,7 @@
 //!    and never mentions `ultracode`/`ultrathink`/`ultra`, and neither provider
 //!    reports Comet's option sets (context window, fast mode) at all.
 
-use comet_proto::{Model, ModelCatalog, ReasoningLevel};
+use comet_proto::{AgentCommand, Model, ModelCatalog, ReasoningLevel};
 
 /// One model as a provider described it. Deliberately narrower than
 /// [`Model`]: it holds only what a provider can actually tell us, so an
@@ -238,6 +238,62 @@ impl DiscoveryCache {
             Ok(discovery) => ModelCatalog::live(merge(curated, &discovery)),
             Err(_) => ModelCatalog::built_in(curated),
         }
+    }
+}
+
+/// One directory's command list for the life of the engine boot.
+///
+/// The same shape as [`DiscoveryCache`] — one attempt, failures cached, `&self`
+/// throughout — with one difference that is the whole reason it is a separate
+/// type: **commands are cwd-scoped and models are not.** A single cell would
+/// serve one directory's project skills to every other directory, which is
+/// exactly the wrong answer rather than a missing one (debt row D32).
+///
+/// There is no `take_unreported_failure` twin here. A command list that cannot
+/// be read raises no `Diagnostic`: the menu says so on screen, where the user
+/// who typed `/` is already looking, and a provider that answers models but not
+/// commands is not the protocol-drift signal 0b.2 built that channel for.
+#[derive(Debug, Default)]
+pub struct CommandCache {
+    /// Same `Arc`-under-a-std-`Mutex` shape as `DiscoveryCache`, and for the
+    /// same reason: the cell is cloned out before any await, because holding a
+    /// std guard across an await point deadlocks.
+    cells: std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::sync::OnceCell<Result<Vec<AgentCommand>, DiscoveryFailure>>>,
+        >,
+    >,
+}
+
+impl CommandCache {
+    /// Run `run` at most once per directory per boot.
+    pub async fn get<F, Fut>(
+        &self,
+        cwd: &str,
+        run: F,
+    ) -> Result<Vec<AgentCommand>, DiscoveryFailure>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<AgentCommand>, DiscoveryFailure>>,
+    {
+        let cell = {
+            let mut cells = self
+                .cells
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cells.entry(cwd.to_owned()).or_default().clone()
+        };
+        cell.get_or_init(run).await.clone()
+    }
+
+    /// Drop every directory's answer, so the next `get` runs again. Wired to
+    /// the same Retry the model catalog uses.
+    pub fn clear(&self) {
+        self.cells
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 }
 
@@ -619,5 +675,92 @@ mod tests {
             vec![ReasoningLevel::High, ReasoningLevel::Ultra],
             "ultracode and ultrathink are Comet's own; ultra is the provider's"
         );
+    }
+
+    fn command(name: &str) -> AgentCommand {
+        AgentCommand {
+            name: name.into(),
+            description: None,
+            argument_hint: None,
+            aliases: Vec::new(),
+        }
+    }
+
+    /// The reason this cache is not `DiscoveryCache`. Two directories are two
+    /// answers: serving one project's skills to another directory is a wrong
+    /// answer that looks like a right one, which is the failure mode this
+    /// phase has now paid for three times.
+    #[tokio::test]
+    async fn two_directories_get_their_own_answers() {
+        let cache = CommandCache::default();
+        let a = cache
+            .get("/a", || async { Ok(vec![command("from-a")]) })
+            .await
+            .unwrap();
+        let b = cache
+            .get("/b", || async { Ok(vec![command("from-b")]) })
+            .await
+            .unwrap();
+        assert_eq!(a[0].name, "from-a");
+        assert_eq!(b[0].name, "from-b");
+    }
+
+    /// One spawn per directory per boot, however many callers ask. The spawn
+    /// is a non-bare CLI that runs the user's `SessionStart` hooks, so a cache
+    /// miss is not merely slow — it re-runs their hooks.
+    #[tokio::test]
+    async fn one_directory_spawns_once_across_concurrent_callers() {
+        let cache = CommandCache::default();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let run = || {
+            let runs = runs.clone();
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                Ok(vec![command("one")])
+            }
+        };
+        let (a, b) = tokio::join!(cache.get("/same", run), cache.get("/same", run));
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "one spawn, two callers");
+    }
+
+    /// A failure is cached like a success, per directory. Without it, every
+    /// `/` keystroke in a directory whose CLI cannot answer spawns another
+    /// doomed subprocess and waits out another timeout.
+    #[tokio::test]
+    async fn a_failure_is_cached_per_directory() {
+        let cache = CommandCache::default();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let run = || {
+            let runs = runs.clone();
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Err(DiscoveryFailure::Unreachable)
+            }
+        };
+        assert!(cache.get("/x", run).await.is_err());
+        assert!(cache.get("/x", run).await.is_err());
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the failure is remembered");
+        assert!(cache.get("/y", run).await.is_err());
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "a different cwd still runs");
+    }
+
+    /// Retry is the only escape from a cached failure inside one boot.
+    #[tokio::test]
+    async fn clearing_re_arms_every_directory() {
+        let cache = CommandCache::default();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let run = || {
+            let runs = runs.clone();
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Err(DiscoveryFailure::Unreachable)
+            }
+        };
+        assert!(cache.get("/x", run).await.is_err());
+        cache.clear();
+        assert!(cache.get("/x", run).await.is_err());
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 }

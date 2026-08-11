@@ -466,6 +466,34 @@ fn accepts_images_default() -> bool {
     true
 }
 
+/// One slash command a provider offers in a given directory.
+///
+/// Cwd-scoped, unlike [`Model`]: the same CLI answers with a different list per
+/// directory, because user and project skills are discovered from it (67 in
+/// comet's own checkout against 63 in a home directory — capture
+/// `2026-08-11-claude-initialize-handshake.md`). That is why the cache behind
+/// this keys on the directory and the model cache does not.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCommand {
+    /// Without the leading `/`, as the provider reports it.
+    pub name: String,
+    /// The provider's own prose. Claude appends a `(user)` / `(project)` scope
+    /// suffix and these run to several hundred characters, so a caller that
+    /// renders it inline has to give it room or leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The argument shape, e.g. `[low|medium|high] [--fix]`. Absent on most
+    /// commands; empty and missing mean the same thing here, because the
+    /// provider sends `""` for a command that takes no arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
+    /// Other names that invoke the same command (`code-review` → `review`).
+    /// Matched when completing, never listed as rows of their own.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelOption {
