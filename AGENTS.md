@@ -48,6 +48,11 @@ locally first — don't use CI as the first place a change is checked.
 Clippy is not yet `-D warnings`: the workspace carries ~24 pre-existing warnings. Don't add
 new ones, and prefer fixing any you touch.
 
+A failure you write off as a known flake must name where it is recorded. "The documented
+flake" was claimed once for a titling test the record says was *fixed*, on a branch that
+touched titling — a citation nobody can follow is how a real regression gets waved through.
+No record to point at? Run it several times in isolation and report the count.
+
 Full procedure: `.agents/workflows/verify.md`.
 
 ## Known debt lives in `docs/debt/`
@@ -72,6 +77,29 @@ model you or a reviewer runs on.
 The picker's default is whatever the catalog lists first, so it will hand you Fable unless you
 change it. Change it before you send.
 
+## Changing what an RPC method answers with
+
+`cargo build` will not find every consumer. Untyped JSON assertions in `crates/engine/tests/`
+index a reply directly, and `apps/ios` decodes it in Swift. When `ListModels` went from an
+array to an object, the build stayed clean, all 501 `comet-ui` tests stayed green, and the
+model picker was broken at runtime until a later slice fixed it.
+
+Two rules follow. **Decode each reply in exactly one place**, and point its test at the literal
+JSON the engine sends — `crates/ui/src/pickers.rs`'s `decode_models_reply` is the worked
+example, and its comment records why a test that round-trips through the Rust type would have
+stayed green through exactly this failure. **And re-read `PROTOCOL_VERSION`'s own doc comment**
+(`crates/proto/src/remote.rs`). A reshaped reply bumps it, because the decode is all-or-nothing.
+An added field usually does not — but it *does* when an older peer silently ignoring it would
+act on a stale assumption. Version 4 is that case: `runtimeMode` was purely additive, and it
+bumped anyway, because a peer that drops the key runs the turn under its own default and a user
+who picked `approval-required` here would get an unattended write over there. Ask what the peer
+does with the field missing, not whether the shape still decodes.
+
+More generally: where a constant carries its own reason list in a doc comment, that comment is
+the record. Read it rather than any spec, plan or handoff file quoting it. `PROTOCOL_VERSION`
+has been quoted secondhand twice and was a slice out of date both times, and both times a spec
+inherited the wrong number.
+
 ## The gpui fork rev is load-bearing
 
 `gpui` comes from `wingleeio/zed` at a pinned rev, not from crates.io. Comet depends on
@@ -91,13 +119,20 @@ current when the rev changes.
 (`--resume` after resolving a conflict). Full procedure:
 `.agents/workflows/sync-upstream.md`.
 
-## Windows is the primary dev machine
+## Windows ships, and no PR ever tests it
 
-Prefer PowerShell; use bash only for genuinely POSIX scripts. `scripts/*.sh`
-(`package-linux.sh`, `package-macos.sh`, `e2e-smoke.sh`) do not run here — they are
-CI/platform scripts. Windows path and process-lifetime behavior has bitten this repo
-repeatedly (see the `fix: ... on Windows` commits); when touching harness CLI resolution,
-terminal exit, or diff capture, check the Windows path explicitly.
+`release.yml` builds `comet.exe` on `windows-latest` and gates the release on that job, so
+Windows is a shipped platform. `ci.yml` runs entirely on `ubuntu-24.04`. **Nothing in the PR
+gate can catch a Windows regression**, which is why the checks below fall to whoever writes
+the change, whatever they develop on.
+
+Windows path and process-lifetime behavior has bitten this repo repeatedly — see the
+`fix: ... on Windows` commits. When touching harness CLI resolution, terminal exit, or diff
+capture, reason about the Windows path explicitly, and say in the PR whether you were able to
+run it there.
+
+`scripts/*.sh` (`package-linux.sh`, `package-macos.sh`, `e2e-smoke.sh`) are CI and platform
+packaging scripts, not local dev tooling. They are not part of the verify gate on any OS.
 
 Parallel branches live in `.worktrees/` *inside* the repo and are gitignored. Files under
 `.worktrees/` belong to another branch — never edit them while working in the main checkout.
