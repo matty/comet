@@ -3174,22 +3174,37 @@ fn command_token(text: &str, cursor: usize) -> Option<MentionToken> {
 /// Rows for `query`, matched on the name and on aliases but never listing an
 /// alias as a row of its own — `/cr` finds `code-review`, and the menu still
 /// shows one entry for it.
+///
+/// **Rows that START with the query come first**, and the rendered check is why:
+/// typing `/code` put `/superpowers:receiving-code-review` at the top and
+/// `/code-review` third, because plain substring matching keeps the provider's
+/// own order and namespaced skills contain everything. The first row is the one
+/// Enter takes, so ranking is not cosmetic here. Within each group the
+/// provider's order is preserved.
 fn matching_commands<'a>(
     commands: &'a [comet_proto::AgentCommand],
     query: &str,
 ) -> Vec<&'a comet_proto::AgentCommand> {
     let needle = query.to_lowercase();
-    commands
-        .iter()
-        .filter(|command| {
-            needle.is_empty()
-                || command.name.to_lowercase().contains(&needle)
-                || command
-                    .aliases
-                    .iter()
-                    .any(|alias| alias.to_lowercase().contains(&needle))
-        })
-        .collect()
+    if needle.is_empty() {
+        return commands.iter().collect();
+    }
+    let names = |command: &'a comet_proto::AgentCommand| -> Vec<String> {
+        std::iter::once(command.name.to_lowercase())
+            .chain(command.aliases.iter().map(|alias| alias.to_lowercase()))
+            .collect()
+    };
+    let (mut prefixed, mut contained) = (Vec::new(), Vec::new());
+    for command in commands {
+        let names = names(command);
+        if names.iter().any(|name| name.starts_with(&needle)) {
+            prefixed.push(command);
+        } else if names.iter().any(|name| name.contains(&needle)) {
+            contained.push(command);
+        }
+    }
+    prefixed.append(&mut contained);
+    prefixed
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3234,6 +3249,49 @@ impl FileMentionState {
                 .unwrap_or(0),
         }
     }
+}
+
+/// Width of the completion popup's scrollbar, and the gutter reserved for it.
+/// Plain numbers, independent of what is painted (`.agents/rules/gpui-ui.md`).
+const SCROLLBAR_W: f32 = 4.0;
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+
+/// The scrollbar thumb for a scrollable list, or `None` when everything fits.
+///
+/// Read off the live [`gpui::ScrollHandle`] rather than from row counts, so it
+/// stays honest for a wheel scroll as well as for keyboard navigation — a
+/// count-derived thumb only tracks the active row and sits still under the
+/// wheel.
+///
+/// Absent on the first frame by construction: the handle has no bounds until
+/// the list has been laid out once. The popup re-renders on the next keystroke
+/// or scroll, which is when it appears.
+fn completion_scrollbar(handle: &gpui::ScrollHandle, theme: &Theme) -> Option<gpui::Div> {
+    let viewport = f32::from(handle.bounds().size.height);
+    let max_offset = f32::from(handle.max_offset().y);
+    if viewport <= 0.0 || max_offset <= 0.5 {
+        return None;
+    }
+    let content = viewport + max_offset;
+    let thumb = (viewport * viewport / content)
+        .max(SCROLLBAR_MIN_THUMB)
+        .min(viewport);
+    // gpui scrolls by moving content up, so a scrolled list has a negative y.
+    let scrolled = (-f32::from(handle.offset().y)).clamp(0.0, max_offset);
+    let top = (scrolled / max_offset) * (viewport - thumb);
+    Some(
+        div()
+            .absolute()
+            .top(px(top))
+            .right(px(0.0))
+            .w(px(SCROLLBAR_W))
+            .h(px(thumb))
+            .rounded(px(SCROLLBAR_W / 2.0))
+            // A hairline in the same token the card's own edge uses: present
+            // enough to say "there is more", quiet enough not to compete with
+            // the rows it sits beside.
+            .bg(theme.border),
+    )
 }
 
 /// Why an image was refused, naming the model that refused it.
@@ -3317,6 +3375,9 @@ pub struct Composer {
     /// In-flight file-picker prompt (paperclip).
     picker_task: Option<Task<()>>,
     mention_task: Option<Task<()>>,
+    /// Scroll position of the completion popup's row list, so keyboard
+    /// navigation can keep the active row in view (`scroll_to_item`).
+    completion_scroll: gpui::ScrollHandle,
     mention: FileMentionState,
     current_key: Option<ServerRef>,
     sending: bool,
@@ -3415,6 +3476,7 @@ impl Composer {
             preview: None,
             picker_task: None,
             mention_task: None,
+            completion_scroll: gpui::ScrollHandle::new(),
             mention: FileMentionState::default(),
             current_key,
             sending: false,
@@ -3850,16 +3912,22 @@ impl Composer {
             cx.notify();
             return;
         };
-        // The chat's own directory, or the worktree a new chat is about to run
-        // in. With neither there is nothing to ask ABOUT: answering for some
-        // other directory would serve another project's skills, which is the
-        // wrong answer this method's cwd parameter exists to prevent.
-        let cwd = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .and_then(|chat| chat.cwd.clone())
-            .or(selected_worktree);
+        // Same precedence `send` resolves a run's cwd by, and it has to be:
+        // a menu answering for a different directory than the turn will run in
+        // offers commands that do not exist there.
+        //
+        // The space's folder is the load-bearing one. A NEW chat has no row
+        // yet, and most new chats reuse no worktree, so stopping at the first
+        // two would leave the menu dead in the commonest case of all — open a
+        // space, type `/`, nothing.
+        let cwd = {
+            let state = self.state.read(cx);
+            state
+                .selected_chat_row()
+                .and_then(|chat| chat.cwd.clone())
+                .or(selected_worktree)
+                .or_else(|| state.selected_space_row().map(|space| space.path.clone()))
+        };
         let Some(cwd) = cwd else {
             self.mention.loading = false;
             cx.notify();
@@ -3907,6 +3975,12 @@ impl Composer {
     fn move_mention(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.mention.active =
             crate::popover::menu_step(self.mention.active, self.mention.row_count(), delta);
+        // Keep the selection on screen. Without this the highlight walks past
+        // the viewport's bottom edge and the user is arrowing through rows they
+        // cannot see — the same reason the model menu tracks its own handle.
+        if let Some(active) = self.mention.active {
+            self.completion_scroll.scroll_to_item(active);
+        }
         self.sync_mention_controls(cx);
         cx.notify();
     }
@@ -4009,6 +4083,19 @@ impl Composer {
                         }),
                 );
             }
+            // Rows are DIRECT children of the scroll container so
+            // `scroll_to_item(active)` indices line up, exactly as the model
+            // menu does it (`pickers.rs:2739-2749`). Without this the card
+            // clipped at 280px and the remaining rows — 64 of them in this
+            // repo — were unreachable by wheel or by keyboard (user report).
+            let mut list = div()
+                .id("completion-scroll")
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .max_h(px(264.0))
+                .overflow_y_scroll()
+                .track_scroll(&self.completion_scroll);
             for (ix, command) in rows.into_iter().enumerate() {
                 let selected = self.mention.active == Some(ix);
                 let name: SharedString = format!("/{}", command.name).into();
@@ -4020,7 +4107,7 @@ impl Composer {
                 // read as noise rather than as help.
                 let tooltip: Option<SharedString> =
                     command.description.clone().map(SharedString::from);
-                card = card.child(
+                list = list.child(
                     crate::popover::menu_row(theme, selected, format!("command-result-{ix}"))
                         .id(("command-result", ix))
                         .when_some(tooltip, |row, text| {
@@ -4042,6 +4129,14 @@ impl Composer {
                                 .flex_row()
                                 .items_center()
                                 .gap(px(8.0))
+                                // Without these the row is free to grow past
+                                // the card, and the hint is then clipped by the
+                                // card's `overflow_hidden` instead of
+                                // truncating inside the row — it renders cut
+                                // mid-word, hard against the border, with no
+                                // ellipsis. Found by the rendered check.
+                                .w_full()
+                                .min_w_0()
                                 .child(
                                     div()
                                         .flex_none()
@@ -4062,6 +4157,14 @@ impl Composer {
                         ),
                 );
             }
+            card = card.child(
+                div()
+                    .relative()
+                    // The gutter is reserved on the rows, not taken from the
+                    // thumb, so a row's text never runs underneath it.
+                    .child(list.pr(px(SCROLLBAR_W + 2.0)))
+                    .children(completion_scrollbar(&self.completion_scroll, theme)),
+            );
         } else if self.mention.results.is_empty() {
             card = card.child(
                 div()
@@ -4076,11 +4179,21 @@ impl Composer {
                     }),
             );
         } else {
+            // The file list had the same ceiling and the same fix; a search
+            // returning more rows than fit was equally unreachable.
+            let mut list = div()
+                .id("completion-scroll")
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .max_h(px(264.0))
+                .overflow_y_scroll()
+                .track_scroll(&self.completion_scroll);
             for (ix, result) in self.mention.results.iter().enumerate() {
                 let selected = self.mention.active == Some(ix);
                 let path = result.path.clone();
                 let tooltip_path: SharedString = path.clone().into();
-                card = card.child(
+                list = list.child(
                     crate::popover::menu_row(theme, selected, format!("file-mention-result-{ix}"))
                         .id(("file-mention-result", ix))
                         .tooltip(move |_, cx| {
@@ -4122,6 +4235,14 @@ impl Composer {
                         ),
                 );
             }
+            card = card.child(
+                div()
+                    .relative()
+                    // The gutter is reserved on the rows, not taken from the
+                    // thumb, so a row's text never runs underneath it.
+                    .child(list.pr(px(SCROLLBAR_W + 2.0)))
+                    .children(completion_scrollbar(&self.completion_scroll, theme)),
+            );
         }
         let anchor = self
             .input
@@ -5986,9 +6107,36 @@ mod tests {
         };
         assert_eq!(names("cr"), vec!["code-review".to_string()]);
         assert_eq!(names("rev"), vec!["code-review".to_string()]);
+        assert_eq!(names("code-rev"), vec!["code-review".to_string()]);
         assert_eq!(names("ver"), vec!["verify".to_string()]);
         assert_eq!(names("").len(), 2, "an empty query lists everything");
         assert!(names("zzz").is_empty());
+    }
+
+    /// A row whose name STARTS with the query outranks one that merely contains
+    /// it. Straight from the rendered check: typing `/code` in this repo put
+    /// `/superpowers:receiving-code-review` first and `/code-review` third,
+    /// and the first row is the one Enter takes.
+    #[test]
+    fn a_prefix_match_outranks_a_substring_match() {
+        let commands = vec![
+            command("superpowers:receiving-code-review", None, &[]),
+            command("superpowers:requesting-code-review", None, &[]),
+            command("code-review", None, &[]),
+        ];
+        let ranked: Vec<&str> = matching_commands(&commands, "code")
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            ranked,
+            vec![
+                "code-review",
+                "superpowers:receiving-code-review",
+                "superpowers:requesting-code-review",
+            ],
+            "the prefix match leads; the rest keep the provider's order"
+        );
     }
 
     /// The active index is bounded by the rows on screen, which for a command
