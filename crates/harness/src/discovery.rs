@@ -253,17 +253,16 @@ impl DiscoveryCache {
 /// be read raises no `Diagnostic`: the menu says so on screen, where the user
 /// who typed `/` is already looking, and a provider that answers models but not
 /// commands is not the protocol-drift signal 0b.2 built that channel for.
+/// One directory's attempt. Named for the same reason [`Cell`] is: the nested
+/// generic is unreadable inline, and clippy calls it out.
+type CommandCell = tokio::sync::OnceCell<Result<Vec<AgentCommand>, DiscoveryFailure>>;
+
 #[derive(Debug, Default)]
 pub struct CommandCache {
     /// Same `Arc`-under-a-std-`Mutex` shape as `DiscoveryCache`, and for the
     /// same reason: the cell is cloned out before any await, because holding a
     /// std guard across an await point deadlocks.
-    cells: std::sync::Mutex<
-        std::collections::HashMap<
-            String,
-            std::sync::Arc<tokio::sync::OnceCell<Result<Vec<AgentCommand>, DiscoveryFailure>>>,
-        >,
-    >,
+    cells: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<CommandCell>>>,
 }
 
 impl CommandCache {
