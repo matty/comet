@@ -1002,7 +1002,12 @@ impl RpcService for EngineRpc {
                 // Only an unreadable answer is drift. An absent CLI is
                 // ordinary and stays out of the diagnostics surface, or the
                 // card reads a figure on every healthy boot.
-                if harness.last_discovery_failure()
+                //
+                // Taking rather than peeking: the failure stays cached for the
+                // whole boot, so peeking would record one unreadable answer
+                // again on every picker open, inflating the count and
+                // refreshing `last_seen_ms` as if the provider kept failing.
+                if harness.take_unreported_discovery_failure()
                     == Some(comet_harness::discovery::DiscoveryFailure::Unparseable)
                 {
                     self.registry.record_diagnostic(

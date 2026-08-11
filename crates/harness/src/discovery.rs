@@ -110,25 +110,40 @@ pub fn merge(curated: Vec<Model>, discovery: &Discovery) -> Vec<Model> {
 /// stale-list-then-swap would change the rows under the user's cursor.
 type Cell = tokio::sync::OnceCell<Result<Discovery, DiscoveryFailure>>;
 
+/// One attempt at discovery, plus whether its failure has been reported.
+///
+/// The two travel together so a failure is reported exactly once per attempt.
+/// Kept apart, the count on the diagnostics card would climb every time
+/// anything re-read the cached failure — one unreadable answer rendering as
+/// dozens of protocol failures with a refreshed timestamp.
+#[derive(Debug, Default)]
+struct Attempt {
+    cell: std::sync::Arc<Cell>,
+    failure_reported: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct DiscoveryCache {
-    /// The cell is behind an `Arc` swapped under a std `Mutex` so that
-    /// `clear` can take `&self`: the `Harness` trait hands out `&self`
+    /// The attempt is behind a std `Mutex` and its cell behind an `Arc` so
+    /// that `clear` can take `&self`: the `Harness` trait hands out `&self`
     /// everywhere, and a `&mut self` clear would be uncallable from
     /// `clear_discovery`.
     ///
     /// The lock is released before any await — `get` clones the `Arc` out
     /// and awaits on the clone. Holding a std `MutexGuard` across an await
     /// point is the deadlock this shape exists to avoid.
-    cell: std::sync::Mutex<std::sync::Arc<Cell>>,
+    attempt: std::sync::Mutex<Attempt>,
 }
 
 impl DiscoveryCache {
-    fn current(&self) -> std::sync::Arc<Cell> {
-        self.cell
+    fn lock(&self) -> std::sync::MutexGuard<'_, Attempt> {
+        self.attempt
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+    }
+
+    fn current(&self) -> std::sync::Arc<Cell> {
+        self.lock().cell.clone()
     }
 
     /// Run `run` at most once per boot and hand back its answer. An `Err` is
@@ -147,24 +162,36 @@ impl DiscoveryCache {
         cell.get_or_init(run).await.clone()
     }
 
-    /// Re-arm the cell, so the next `get` runs its closure again. Wired to
+    /// Re-arm the cache, so the next `get` runs its closure again. Wired to
     /// the picker's Retry row; it is the only escape from a cached failure
-    /// inside one boot.
+    /// inside one boot. The new attempt starts unreported, so a failure that
+    /// recurs is reported again.
     pub fn clear(&self) {
-        *self
-            .cell
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(Cell::new());
+        *self.lock() = Attempt::default();
     }
 
-    /// The cached failure, if this boot's discovery already ran and failed.
+    /// The cached failure, if this attempt failed and nobody has reported it
+    /// yet. Reports it at most once, then answers `None` for that attempt.
     ///
-    /// A read-only peek: unlike [`get`], it never runs a discovery, so the
-    /// engine can ask "did that call fail, and how" after `models()` returns
-    /// without starting one on a cell that was never filled. `None` covers
-    /// both "not tried" and "succeeded" — neither is drift.
-    pub fn cached_failure(&self) -> Option<DiscoveryFailure> {
-        self.current().get().and_then(|r| r.as_ref().err().copied())
+    /// Never runs a discovery, unlike [`get`], so the engine can ask "did that
+    /// fail, and how" after `models()` returns without starting one on a cell
+    /// nothing filled. `None` covers "not tried", "succeeded", and "already
+    /// reported" — none of the three is a fresh drift signal.
+    ///
+    /// The check and the mark happen under one lock, so two concurrent callers
+    /// cannot both report the same failure. One residual race is accepted and
+    /// not worth more machinery: a forced retry that lands between another
+    /// caller's `get` and its report swaps in a fresh attempt, and the older
+    /// caller then sees nothing to report. That only loses the signal when the
+    /// retry it raced *succeeded*, which means the drift is already over.
+    pub fn take_unreported_failure(&self) -> Option<DiscoveryFailure> {
+        let mut attempt = self.lock();
+        if attempt.failure_reported {
+            return None;
+        }
+        let failure = attempt.cell.get().and_then(|r| r.as_ref().err().copied())?;
+        attempt.failure_reported = true;
+        Some(failure)
     }
 
     /// The single place `CatalogSource` is decided, so no adapter can report
@@ -397,29 +424,32 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 
-    /// The peek must never itself trigger a discovery: an empty cell reads
+    /// The read must never itself trigger a discovery: an empty cell reads
     /// `None`, not a run of anything.
     #[test]
-    fn cached_failure_is_none_before_any_discovery_runs() {
+    fn no_failure_to_report_before_any_discovery_runs() {
         let cache = DiscoveryCache::default();
-        assert_eq!(cache.cached_failure(), None);
+        assert_eq!(cache.take_unreported_failure(), None);
     }
 
-    /// The kind reaches the peek unchanged, so the engine can tell
-    /// `Unparseable` (drift) from `Unreachable` (ordinary) after the fact.
+    /// The kind survives, so the engine can tell `Unparseable` (drift) from
+    /// `Unreachable` (ordinary) after the fact.
     #[tokio::test]
-    async fn cached_failure_reports_the_cached_kind() {
+    async fn the_failure_kind_reaches_the_reader() {
         let cache = DiscoveryCache::default();
         cache
             .get(|| async { Err(DiscoveryFailure::Unparseable) })
             .await
             .ok();
-        assert_eq!(cache.cached_failure(), Some(DiscoveryFailure::Unparseable));
+        assert_eq!(
+            cache.take_unreported_failure(),
+            Some(DiscoveryFailure::Unparseable)
+        );
     }
 
     /// A success is not a failure to report — `None` covers it too.
     #[tokio::test]
-    async fn cached_failure_is_none_after_a_success() {
+    async fn no_failure_to_report_after_a_success() {
         let cache = DiscoveryCache::default();
         cache
             .get(|| async {
@@ -429,7 +459,53 @@ mod tests {
             })
             .await
             .ok();
-        assert_eq!(cache.cached_failure(), None);
+        assert_eq!(cache.take_unreported_failure(), None);
+    }
+
+    /// One unreadable answer is ONE signal. The failure stays cached for the
+    /// whole boot, so a reader that answered every time would turn a single
+    /// event into a climbing count with a refreshed timestamp — a provider
+    /// that failed once reading as one that keeps failing.
+    #[tokio::test]
+    async fn a_failure_is_reported_once_per_attempt() {
+        let cache = DiscoveryCache::default();
+        cache
+            .get(|| async { Err(DiscoveryFailure::Unparseable) })
+            .await
+            .ok();
+        assert_eq!(
+            cache.take_unreported_failure(),
+            Some(DiscoveryFailure::Unparseable)
+        );
+        assert_eq!(
+            cache.take_unreported_failure(),
+            None,
+            "the same failure must not report twice"
+        );
+        assert_eq!(cache.take_unreported_failure(), None);
+    }
+
+    /// A retry is a new attempt, so a failure that recurs is news again.
+    /// Without this, Retry would silence the drift signal permanently.
+    #[tokio::test]
+    async fn a_failure_that_recurs_after_a_retry_reports_again() {
+        let cache = DiscoveryCache::default();
+        cache
+            .get(|| async { Err(DiscoveryFailure::Unparseable) })
+            .await
+            .ok();
+        assert!(cache.take_unreported_failure().is_some());
+
+        cache.clear();
+        cache
+            .get(|| async { Err(DiscoveryFailure::Unparseable) })
+            .await
+            .ok();
+        assert_eq!(
+            cache.take_unreported_failure(),
+            Some(DiscoveryFailure::Unparseable),
+            "a fresh attempt starts unreported"
+        );
     }
 
     /// The caption's whole input. A failed discovery still answers with a

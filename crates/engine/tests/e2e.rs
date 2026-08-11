@@ -3759,6 +3759,76 @@ async fn an_unreadable_discovery_answer_is_reported_as_drift() {
     );
 }
 
+/// One unreadable answer is ONE incident, however many times the picker is
+/// opened afterwards. The failure is cached for the whole boot, so a
+/// re-reporting read would climb the count and refresh `last_seen_ms` on every
+/// `ListModels` — rendering a provider that failed once as one failing
+/// continuously.
+#[tokio::test]
+async fn a_cached_drift_failure_is_reported_once_not_once_per_request() {
+    let engine = engine_with_mock(MockHarness::with_failing_discovery(
+        DiscoveryFailure::Unparseable,
+    ))
+    .await;
+
+    for _ in 0..5 {
+        engine.list_models(HarnessId::Mock, false).await.unwrap();
+    }
+
+    let diagnostics = engine.registry().diagnostics();
+    let bucket = diagnostics
+        .iter()
+        .find(|d| d.harness == HarnessId::Mock)
+        .expect("a bucket");
+    let entry = bucket
+        .entries
+        .iter()
+        .find(|e| e.discriminator.contains("discovery"))
+        .expect("a discovery drift entry");
+    assert_eq!(
+        entry.count, 1,
+        "five requests, one cached failure, one incident"
+    );
+}
+
+/// Retry has to reach the harness, not just the UI's slot. The mock caches a
+/// scripted failure like a real adapter would, so a `force` that did not clear
+/// it would hand back the same failure and the Retry path could never be
+/// exercised end to end.
+///
+/// This counts incidents as its proxy for "discovery ran again", which only
+/// discriminates while a failure is reported once per attempt. Break that and
+/// this test passes for the wrong reason — two reads of one cached failure
+/// also make two. Verified by falsification: with report-once intact and the
+/// mock's `clear_discovery` removed it fails 1 vs 2; with both broken it
+/// passes. If reporting ever stops being once-per-attempt, rewrite this to
+/// count discovery runs directly.
+#[tokio::test]
+async fn a_forced_request_re_runs_mock_discovery() {
+    let engine = engine_with_mock(MockHarness::with_failing_discovery(
+        DiscoveryFailure::Unparseable,
+    ))
+    .await;
+
+    engine.list_models(HarnessId::Mock, false).await.unwrap();
+    engine.list_models(HarnessId::Mock, true).await.unwrap();
+
+    let diagnostics = engine.registry().diagnostics();
+    let entry = diagnostics
+        .iter()
+        .find(|d| d.harness == HarnessId::Mock)
+        .and_then(|b| {
+            b.entries
+                .iter()
+                .find(|e| e.discriminator.contains("discovery"))
+        })
+        .expect("a discovery drift entry");
+    assert_eq!(
+        entry.count, 2,
+        "the forced call re-ran discovery, so its failure is a second incident"
+    );
+}
+
 /// The ordinary case must stay silent. A machine with no CLI installed
 /// would otherwise report protocol drift on every single boot, which is how
 /// a diagnostics surface becomes noise nobody reads.

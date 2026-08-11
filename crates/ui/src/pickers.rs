@@ -2122,6 +2122,16 @@ impl Pickers {
                     .on_click(cx.listener(move |this, _, _, cx| match kind {
                         PickerKind::Branch | PickerKind::Checkout => this.ensure_refs(true, cx),
                         PickerKind::HarnessModel | PickerKind::Traits => {
+                            // Read the harness BEFORE clearing the catalog.
+                            // With no explicit pick and nothing remembered,
+                            // `effective_harness` falls back to the first
+                            // visible row of `self.harnesses` — so resetting
+                            // that to `Idle` first makes it answer `None`, the
+                            // forced refetch never runs, and the reload that
+                            // follows asks with `force: false` and gets the
+                            // boot-cached failure straight back. Retry would
+                            // look like it worked and change nothing.
+                            let harness = this.effective_harness(cx);
                             this.harnesses = Loadable::Idle;
                             this.models.clear();
                             this.ensure_harnesses(cx);
@@ -2129,7 +2139,7 @@ impl Pickers {
                             // discovery failure the engine cached for the
                             // whole boot (`DiscoveryCache`): without it, this
                             // row refetches the same cached failure forever.
-                            if let Some(harness) = this.effective_harness(cx) {
+                            if let Some(harness) = harness {
                                 this.ensure_models(harness, true, cx);
                             }
                         }
