@@ -88,7 +88,12 @@ Two rules follow. **Decode each reply in exactly one place**, and point its test
 JSON the engine sends — `crates/ui/src/pickers.rs`'s `decode_models_reply` is the worked
 example, and its comment records why a test that round-trips through the Rust type would have
 stayed green through exactly this failure. **And re-read `PROTOCOL_VERSION`'s own doc comment**
-(`crates/proto/src/remote.rs`): a reshaped reply bumps it, an added field does not.
+(`crates/proto/src/remote.rs`). A reshaped reply bumps it, because the decode is all-or-nothing.
+An added field usually does not — but it *does* when an older peer silently ignoring it would
+act on a stale assumption. Version 4 is that case: `runtimeMode` was purely additive, and it
+bumped anyway, because a peer that drops the key runs the turn under its own default and a user
+who picked `approval-required` here would get an unattended write over there. Ask what the peer
+does with the field missing, not whether the shape still decodes.
 
 More generally: where a constant carries its own reason list in a doc comment, that comment is
 the record. Read it rather than any spec, plan or handoff file quoting it. `PROTOCOL_VERSION`
