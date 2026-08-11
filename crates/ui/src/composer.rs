@@ -3236,6 +3236,21 @@ impl FileMentionState {
     }
 }
 
+/// Why an image was refused, naming the model that refused it.
+///
+/// One sentence with the reason and the fix, never a raw provider error: the
+/// user chose this model and can choose another. The model's own label is used
+/// when the catalog has one, because "this model" reads as a bug when the chip
+/// three centimetres away says a name.
+fn attachment_blocked_message(model_label: Option<SharedString>) -> SharedString {
+    match model_label {
+        Some(label) => {
+            format!("{label} doesn't accept images — pick another model to attach one").into()
+        }
+        None => "This model doesn't accept images — pick another model to attach one".into(),
+    }
+}
+
 /// The single place `ListCommands`' reply is decoded.
 ///
 /// Takes the raw `serde_json::Value` the engine sent and is tested against the
@@ -3483,8 +3498,26 @@ impl Composer {
             .unwrap_or(&[])
     }
 
+    /// The one place images become staged attachments, and therefore the one
+    /// place the modality gate belongs.
+    ///
+    /// The paperclip is not the only door: paste
+    /// (`ComposerInputEvent::PastedImages`), drop and pasted paths all arrive
+    /// here too. Gating the button alone would leave a disabled affordance
+    /// beside a working paste — two states that contradict each other on the
+    /// same surface, which is the class of defect every rendered check in this
+    /// project has found so far.
     fn add_staged(&mut self, staged: Vec<StagedAttachment>, cx: &mut Context<Self>) {
         if staged.is_empty() {
+            return;
+        }
+        if !self.pickers.read(cx).effective_accepts_images(cx) {
+            // Named, not generic: the user picked this model, and the fix is to
+            // pick another one. Per `.agents/rules/user-facing-errors.md` the
+            // state says what happened and what to do about it.
+            let label = self.pickers.read(cx).selected_model_label(cx);
+            self.failure = Some(attachment_blocked_message(label));
+            cx.notify();
             return;
         }
         self.attachments
@@ -5563,6 +5596,13 @@ impl Render for Composer {
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
         // the same strip. `ml-1` per the source cluster — chips→attach reads
         // 8px (4 gap + 4 margin) in BOTH modes.
+        // The effective model decides whether this affordance is live. The
+        // colour and the cursor change; the SIZE does not — a control that
+        // resized with its state would move the send button beside it (the
+        // layout-vs-paint rule, `.agents/rules/gpui-ui.md`).
+        let accepts_images = self.pickers.read(cx).effective_accepts_images(cx);
+        let attach_tooltip: Option<SharedString> = (!accepts_images)
+            .then(|| attachment_blocked_message(self.pickers.read(cx).selected_model_label(cx)));
         let attach = div()
             .id("composer-attach")
             .ml(px(4.0))
@@ -5572,19 +5612,39 @@ impl Render for Composer {
             .items_center()
             .justify_center()
             .rounded_full()
-            .cursor_pointer()
-            // comet composer-actions.tsx attach: `transition-colors`.
-            .bg(motion::hover_blend(
-                "composer-attach",
-                gpui::transparent_black(),
-                crate::theme::ink(0.10),
-            ))
-            .on_hover(motion::hover_listener("composer-attach"))
-            .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
+            .when(accepts_images, |el| {
+                el.cursor_pointer()
+                    // comet composer-actions.tsx attach: `transition-colors`.
+                    .bg(motion::hover_blend(
+                        "composer-attach",
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.10),
+                    ))
+                    .on_hover(motion::hover_listener("composer-attach"))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
+            })
+            .when_some(attach_tooltip, |el, message| {
+                el.tooltip(move |_, cx| {
+                    cx.new(|_| MentionPathTooltip {
+                        path: message.clone(),
+                        activation: 0,
+                    })
+                    .into()
+                })
+            })
             .child(
                 crate::icons::icon(crate::icons::PAPERCLIP)
                     .size(px(16.0))
-                    .text_color(theme.text_muted),
+                    // `text_faint` is the documented disabled token. Dimming
+                    // with `opacity()` instead drives it under the contrast
+                    // floor `text_contrast_is_paired_across_appearances`
+                    // exists to guarantee — the defect 0.2a's rendered check
+                    // found on the availability rail.
+                    .text_color(if accepts_images {
+                        theme.text_muted
+                    } else {
+                        theme.text_faint
+                    }),
             );
         // Staged-thumbnail strip (attachment-ui.tsx AttachmentStrip), above
         // the input inside the pill in both modes.
@@ -5991,6 +6051,23 @@ mod tests {
             !message.to_lowercase().contains("no commands"),
             "a failure must never read as an empty menu, got {message:?}"
         );
+    }
+
+    /// The refusal names the model, because the chip a few centimetres away
+    /// names it too — "this model" reads as a bug beside a label. And it never
+    /// carries a provider error string, per
+    /// `.agents/rules/user-facing-errors.md`.
+    #[test]
+    fn a_blocked_attachment_names_the_model_and_the_fix() {
+        let named = attachment_blocked_message(Some("GPT-5.3 Codex Spark".into()));
+        assert!(named.contains("GPT-5.3 Codex Spark"), "got {named:?}");
+        assert!(named.contains("pick another model"), "got {named:?}");
+
+        // Before the catalog resolves there is no label, and the sentence still
+        // has to stand on its own.
+        let unnamed = attachment_blocked_message(None);
+        assert!(unnamed.starts_with("This model"), "got {unnamed:?}");
+        assert!(unnamed.contains("pick another model"), "got {unnamed:?}");
     }
 
     #[test]
