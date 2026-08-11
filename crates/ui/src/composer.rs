@@ -3261,15 +3261,21 @@ impl FileMentionState {
 /// Whether the cached command list can answer a `/` for `context` without
 /// re-asking the engine.
 ///
-/// A non-empty list is not enough: it has to belong to the same agent AND the
-/// same directory. The harness picker sits in this composer, so a draft can
-/// change agent without the chat changing, and the observer on the pickers only
-/// notifies — nothing clears the list. Reported by review on PR #45.
+/// The key is the whole test, and **an empty list is a real answer**. A
+/// directory with no commands is a legitimate result, so keying reuse off
+/// `commands.is_empty()` would re-ask on every keystroke — and on Codex, which
+/// always answers empty, that is every `/` keystroke in the app.
+///
+/// The key is stamped on SUCCESS only, so a failed or unreadable fetch leaves
+/// nothing to reuse and stays retryable. It has to match the agent AND the
+/// directory: the harness picker sits in this composer, so a draft can change
+/// agent without the chat changing, and the observer on the pickers only
+/// notifies. Both reported by review on PR #45.
 fn commands_reusable(
     state: &FileMentionState,
     context: Option<&(comet_proto::HarnessId, String)>,
 ) -> bool {
-    !state.commands.is_empty() && context.is_some() && state.commands_key.as_ref() == context
+    context.is_some() && state.commands_key.as_ref() == context
 }
 
 /// Width of the completion popup's scrollbar, and the gutter reserved for it.
@@ -3989,7 +3995,16 @@ impl Composer {
             cx.notify();
             return;
         };
-        self.mention.commands_key = Some((harness, cwd.clone()));
+        // A list from another agent or directory is not a slower answer to this
+        // question — it is the wrong one, and it stays SELECTABLE while the new
+        // request is in flight, so Enter would insert a row that is no longer on
+        // screen. Drop it the moment the context changes.
+        let context = (harness, cwd.clone());
+        if self.mention.commands_key.as_ref() != Some(&context) {
+            self.mention.commands.clear();
+            self.mention.commands_key = None;
+            self.mention.active = None;
+        }
         let params = serde_json::json!({ "harness": harness, "cwd": cwd });
         let request = self.mention.request;
         self.mention_task = Some(cx.spawn(async move |this, cx| {
@@ -4004,11 +4019,24 @@ impl Composer {
                         Ok(commands) => {
                             composer.mention.error = None;
                             composer.mention.commands = commands;
+                            // Stamped on SUCCESS, and it is what marks the
+                            // fetch done. Keyed off `commands.is_empty()`
+                            // instead, a directory that legitimately has no
+                            // commands would re-ask on every keystroke — and on
+                            // Codex, which always answers empty, that is every
+                            // `/` keystroke in the app.
+                            composer.mention.commands_key = Some(context.clone());
                             composer.mention.active =
                                 (composer.mention.row_count() > 0).then_some(0);
                         }
                         Err(err) => {
                             tracing::warn!(%err, "command list decode failed");
+                            // No key: an unreadable answer is retryable, and
+                            // nothing stale may stay selectable behind the
+                            // error.
+                            composer.mention.commands.clear();
+                            composer.mention.commands_key = None;
+                            composer.mention.active = None;
                             composer.mention.error =
                                 Some("Couldn't read this agent's commands".into());
                         }
@@ -4016,6 +4044,7 @@ impl Composer {
                     Err(err) => {
                         tracing::warn!(%err, "command list request failed");
                         composer.mention.commands.clear();
+                        composer.mention.commands_key = None;
                         composer.mention.active = None;
                         composer.mention.error = Some(command_error_message(&err));
                     }
@@ -6248,7 +6277,24 @@ mod tests {
             commands: vec![command("verify", None, &[])],
             ..FileMentionState::default()
         };
-        assert!(!commands_reusable(&unkeyed, Some(&claude)));
+        assert!(
+            !commands_reusable(&unkeyed, Some(&claude)),
+            "a list with no key was never confirmed for any context"
+        );
+
+        // An empty answer is an answer. Keyed off `commands.is_empty()`, a
+        // directory with no commands would re-ask on every keystroke — and
+        // Codex answers empty always, so that would be every `/` in the app.
+        let empty_but_answered = FileMentionState {
+            kind: Completion::Commands,
+            commands: Vec::new(),
+            commands_key: Some(claude.clone()),
+            ..FileMentionState::default()
+        };
+        assert!(
+            commands_reusable(&empty_but_answered, Some(&claude)),
+            "an empty reply is a cached result, not a cache miss"
+        );
     }
 
     /// A row whose name STARTS with the query outranks one that merely contains
