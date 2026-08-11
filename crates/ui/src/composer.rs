@@ -5722,8 +5722,14 @@ impl Render for Composer {
         // resized with its state would move the send button beside it (the
         // layout-vs-paint rule, `.agents/rules/gpui-ui.md`).
         let accepts_images = self.pickers.read(cx).effective_accepts_images(cx);
+        // The tooltip explains the dimmed button BEFORE it is clicked. Once
+        // the click (or a paste, or a drop) has put the same sentence in the
+        // failure banner, the tooltip is the same words a second time, hovering
+        // over the copy it duplicates — 0.2a found exactly this pair on the
+        // availability rail, and 1.5 found it again on the approval card.
         let attach_tooltip: Option<SharedString> = (!accepts_images)
-            .then(|| attachment_blocked_message(self.pickers.read(cx).selected_model_label(cx)));
+            .then(|| attachment_blocked_message(self.pickers.read(cx).selected_model_label(cx)))
+            .filter(|message| self.failure.as_ref() != Some(message));
         let attach = div()
             .id("composer-attach")
             .ml(px(4.0))
@@ -5742,8 +5748,22 @@ impl Render for Composer {
                         crate::theme::ink(0.10),
                     ))
                     .on_hover(motion::hover_listener("composer-attach"))
-                    .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
             })
+            // Attached in BOTH states, and guarded inside. A dimmed control
+            // that swallows the click explains nothing until the user happens
+            // to hover — 0.2a's finding, and the same shape as the rail row
+            // whose `on_click` is unconditional with the guard in
+            // `pick_harness`. Blocked, the click says why, in the one place
+            // paste and drop already say it.
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.pickers.read(cx).effective_accepts_images(cx) {
+                    this.open_file_picker(cx);
+                } else {
+                    let label = this.pickers.read(cx).selected_model_label(cx);
+                    this.failure = Some(attachment_blocked_message(label));
+                    cx.notify();
+                }
+            }))
             .when_some(attach_tooltip, |el, message| {
                 el.tooltip(move |_, cx| {
                     cx.new(|_| MentionPathTooltip {
