@@ -42,3 +42,15 @@ path = "tests/fixtures/fake_codex.rs"
 [[bin]]
 name = "fake-claude-bad-discovery"
 path = "tests/fixtures/fake_claude_bad_discovery.rs"
+
+[[bin]]
+name = "fake-codex-bad-discovery"
+path = "tests/fixtures/fake_codex_bad_discovery.rs"
+
+[[bin]]
+name = "fake-codex-stuck-cursor"
+path = "tests/fixtures/fake_codex_stuck_cursor.rs"
+
+[[bin]]
+name = "fake-codex-endless-cursor"
+path = "tests/fixtures/fake_codex_endless_cursor.rs"

@@ -1,8 +1,8 @@
 //! Fake Codex app-server for comet-harness tests.
 //!
-//! Speaks scripted JSON-RPC 2.0 over stdio: initialize handshake, thread
-//! start/resume, then a scenario picked from the turn/start prompt text. Driven
-//! by crates/harness/tests/codex.rs.
+//! Speaks scripted JSON-RPC 2.0 over stdio: initialize handshake, then either a
+//! `model/list` discovery session or thread start/resume plus a scenario picked
+//! from the turn/start prompt text. Driven by crates/harness/tests/codex.rs.
 //!
 //! Rust rather than `#!/bin/sh` because Windows cannot spawn a shell script:
 //! the harness hands the path straight to `CreateProcess`, which rejects a
@@ -50,6 +50,119 @@ fn fail_turn(id: &str, message: &str) {
     ));
 }
 
+/// A `supportedReasoningEfforts` array. Objects, not strings — the shape the
+/// real server answers with (capture `2026-08-11-codex-model-list.md`), and the
+/// one the phase spec's field summary gets wrong.
+fn efforts(levels: &[&str]) -> String {
+    let items: Vec<String> = levels
+        .iter()
+        .map(|l| format!(r#"{{"reasoningEffort":"{l}","description":"effort {l}"}}"#))
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// One `model/list` entry. `modalities` is pasted in verbatim so a model can
+/// omit `inputModalities` altogether.
+fn model_entry(id: &str, hidden: bool, levels: &[&str], modalities: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","model":"{id}","displayName":"{id} label","description":"{id} description",
+"modelSpecialty":null,"hidden":{hidden},"isDefault":false,"defaultReasoningEffort":"medium",
+"supportedReasoningEfforts":{efforts}{modalities},"supportsPersonality":false,
+"additionalSpeedTiers":[],"serviceTiers":[],"defaultServiceTier":null}}"#,
+        efforts = efforts(levels),
+    )
+    .replace('\n', "")
+}
+
+/// The discovery catalog. Three curated ids, one model only the server knows,
+/// and one hidden model the adapter must drop:
+///
+/// - `gpt-5.3-codex-spark` is text-only, so the live answer has to override a
+///   curated `accepts_images: true`.
+/// - `gpt-5.7-nova` omits `inputModalities` entirely — the absent case, which
+///   no live model produces and which the schema documents as images-on.
+/// - `gpt-5.7-nova` also reports `ultra`, which the provider genuinely supports
+///   and which must survive onto a model nobody has curated.
+fn discovery_models() -> Vec<String> {
+    const ULTRA: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+    const XHIGH: &[&str] = &["low", "medium", "high", "xhigh"];
+    const IMAGE: &str = r#","inputModalities":["text","image"]"#;
+    const TEXT: &str = r#","inputModalities":["text"]"#;
+    vec![
+        model_entry("gpt-5.6-sol", false, ULTRA, IMAGE),
+        model_entry("gpt-5.5", false, XHIGH, IMAGE),
+        model_entry("gpt-5.3-codex-spark", false, XHIGH, TEXT),
+        model_entry("gpt-5.7-nova", false, ULTRA, ""),
+        model_entry("codex-auto-review", true, XHIGH, IMAGE),
+    ]
+}
+
+/// The integer value of `"<key>":<digits>` on a line, if present.
+fn num_field(line: &str, key: &str) -> Option<usize> {
+    let needle = format!("\"{key}\":");
+    let at = line.find(&needle)? + needle.len();
+    line[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// The string value of `"<key>":"<value>"` on a line, if present.
+fn str_field(line: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let at = line.find(&needle)? + needle.len();
+    Some(line[at..].chars().take_while(|c| *c != '"').collect())
+}
+
+/// Serve `model/list` until the client stops asking.
+///
+/// **Pages by default**, two at a time, because the real server returns all
+/// seven models in one page and would never exercise the client's loop. The
+/// cursor is a stringified offset, as 0.147.0's is, and the last page carries
+/// an explicit `"nextCursor":null` rather than omitting the key.
+fn model_list(stdin: &mut StdinLock<'_>, first: &str) {
+    let models = discovery_models();
+    let mut line = first.to_string();
+    // Every real session emits this, unprompted, before the reply the client is
+    // waiting on — on every run of the 2026-08-11 capture it arrived ahead of
+    // the `initialize` result. A client that reads the next line rather than
+    // the line carrying its own id takes this as its answer.
+    emit(
+        r#"{"method":"remoteControl/status/changed","params":{"status":"disabled","hostname":"fake"}}"#,
+    );
+    loop {
+        let offset: usize = str_field(&line, "cursor")
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let limit = num_field(&line, "limit").unwrap_or(2).max(1);
+        let end = (offset + limit).min(models.len());
+        let page = models.get(offset..end).unwrap_or_default().join(",");
+        let next = if end < models.len() {
+            format!("\"{end}\"")
+        } else {
+            "null".to_string()
+        };
+        emit(&format!(
+            r#"{{"id":{},"result":{{"data":[{page}],"nextCursor":{next}}}}}"#,
+            rid(&line)
+        ));
+
+        // EOF is the ordinary end of a discovery session: the client closes
+        // stdin once it has every page. Unlike `read_line`, that is not a
+        // failure here.
+        let mut buf = String::new();
+        match stdin.read_line(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => line = buf.trim_end_matches(['\r', '\n']).to_string(),
+        }
+        if !line.contains(r#""method":"model/list""#) {
+            return;
+        }
+    }
+}
+
 fn main() {
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
@@ -75,8 +188,15 @@ fn main() {
         exit(1);
     }
 
-    // ---- thread start / resume ---------------------------------------------
+    // ---- discovery, or a real session --------------------------------------
+    // A discovery session asks `model/list` and never starts a thread, so the
+    // branch is on the next method rather than on a scenario marker: it carries
+    // no prompt to put one in.
     let thread_line = read_line(&mut stdin);
+    if thread_line.contains(r#""method":"model/list""#) {
+        model_list(&mut stdin, &thread_line);
+        return;
+    }
     if thread_line.contains(r#""method":"thread/resume""#) {
         if thread_line.contains(r#""threadId":"resume-fail""#) {
             // Missing/foreign rollout: reject, expect the fresh-start fallback.
