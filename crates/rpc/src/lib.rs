@@ -41,6 +41,7 @@ pub mod methods {
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     pub const LIST_HARNESS_DIAGNOSTICS: &str = "ListHarnessDiagnostics";
     pub const LIST_MODELS: &str = "ListModels";
+    pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     pub const WATCH_CHATS: &str = "WatchChats";

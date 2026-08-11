@@ -1062,6 +1062,26 @@ async fn rpc_surface_over_in_memory_transport() {
         .unwrap();
     assert_eq!(models["models"][0]["id"], "mock-1");
 
+    // ListCommands answers an OBJECT, not a bare array. `ListModels` shipped as
+    // an array in 0.1 and had to be reshaped in 2.1, which broke the picker at
+    // run time while every test stayed green (AGENTS.md, "Changing what an RPC
+    // method answers with") — this untyped assertion is one of the consumers
+    // that rule is about.
+    let commands = client
+        .call(
+            comet_rpc::methods::LIST_COMMANDS,
+            serde_json::json!({"harness": "mock", "cwd": "/tmp"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        commands["commands"].is_array(),
+        "expected {{commands: []}}, got {commands}"
+    );
+    // A harness with no command surface answers an empty list rather than
+    // failing: the mock has none, and neither does Codex.
+    assert_eq!(commands["commands"].as_array().unwrap().len(), 0);
+
     // WatchSessions + WatchDocMessages streams.
     let mut sessions_stream = client
         .subscribe(comet_rpc::methods::WATCH_SESSIONS, serde_json::Value::Null)
