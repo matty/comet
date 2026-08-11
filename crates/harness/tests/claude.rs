@@ -702,3 +702,33 @@ async fn a_missing_cli_is_not_drift() {
         Some(comet_harness::discovery::DiscoveryFailure::Unreachable)
     );
 }
+
+/// The live check, against the real CLI rather than the fixture: the handshake
+/// answers, the merge lands on curated ids, and no alias or duplicate reaches
+/// the picker. Ignored by default — it needs an installed, authenticated
+/// `claude` — but it spends no tokens, because a discovery session never runs
+/// a turn.
+/// Run with: `cargo test -p comet-harness --test claude -- --ignored`
+#[tokio::test]
+#[ignore = "requires installed+authenticated claude CLI (spends no tokens)"]
+async fn live_cli_discovery_lands_on_curated_ids() {
+    let catalog = ClaudeHarness::new().models().await.expect("models");
+    let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        catalog.source,
+        comet_proto::CatalogSource::Live,
+        "the real handshake answered, got {ids:?}"
+    );
+    assert_eq!(
+        ids,
+        vec![
+            "claude-fable-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+        ],
+        "six curated rows: no `sonnet`, no `opus[1m]`, no `default`"
+    );
+}
