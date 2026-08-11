@@ -83,6 +83,11 @@ pub trait Harness: Send + Sync {
     /// (`comet_engine::titles`), so an implementation that spawns a
     /// subprocess must cache it — see [`discovery::DiscoveryCache`].
     async fn models(&self) -> Result<ModelCatalog, HarnessError>;
+    /// Drop any cached discovery answer so the next `models()` re-runs it.
+    ///
+    /// Defaulted to a no-op: an in-process harness has nothing to discover,
+    /// and an adapter that has not grown discovery yet has nothing to clear.
+    fn clear_discovery(&self) {}
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
     async fn run(
         &self,

@@ -188,6 +188,15 @@ fn caption_for(source: CatalogSource, harness: HarnessId) -> Option<&'static str
     }
 }
 
+/// The one place the `ListModels` reply is decoded. Extracted so a test can
+/// bind THIS function rather than re-deriving the same `from_value` call:
+/// a test that decodes the wire literal into `ModelCatalog` on its own stays
+/// green while the call site drifts, which is exactly what happened when the
+/// reply gained its `{models, source}` envelope.
+fn decode_models_reply(value: serde_json::Value) -> Result<ModelCatalog, serde_json::Error> {
+    serde_json::from_value(value)
+}
+
 /// Applies a picker's field change to a chat config that is about to be
 /// persisted: preserve the row's own runtime mode across the change (the
 /// caller's `config` may already carry the draft's default, not the row's),
@@ -708,15 +717,19 @@ impl Pickers {
         }
     }
 
-    /// Put cancelled model slots back to `Idle` so the next `ensure_models`
-    /// loads them again.
+    /// Put cancelled model slots back to `Idle` and immediately re-request
+    /// them with `force: true`, so a slot the user gave up waiting on cannot
+    /// come back to a discovery failure the engine cached while nobody was
+    /// watching.
     ///
     /// Called only from discrete user demand (opening the picker, picking a
     /// harness), never from render: render runs `ensure_models` every frame, so
     /// re-arming there would restart the request the moment it was cancelled
     /// and the toast would never go away.
-    fn rearm_cancelled_models(&mut self) {
-        rearm_cancelled(&mut self.models, &mut self.models_cancelled);
+    fn rearm_cancelled_models(&mut self, cx: &mut Context<Self>) {
+        for harness in rearm_cancelled(&mut self.models, &mut self.models_cancelled) {
+            self.ensure_models(harness, true, cx);
+        }
     }
 
     /// The catalog's half of [`Self::rearm_cancelled_models`], with the same
@@ -767,7 +780,7 @@ impl Pickers {
         if kind == PickerKind::HarnessModel {
             self.model_scroll.set_offset(gpui::Point::default());
             // Opening the menu IS asking for the models again.
-            self.rearm_cancelled_models();
+            self.rearm_cancelled_models(cx);
         }
         // Searchable pickers focus the filter input (it sits inside the frame,
         // so the frame's key handler still sees arrows/Enter); the rest focus
@@ -802,7 +815,7 @@ impl Pickers {
                 // refs arm above).
                 self.revalidate_harnesses(cx);
                 if let Some(harness) = self.effective_harness(cx) {
-                    self.ensure_models(harness, cx);
+                    self.ensure_models(harness, false, cx);
                 }
             }
         }
@@ -868,7 +881,7 @@ impl Pickers {
                     }
                 };
                 if let Some(harness) = pickers.effective_harness(cx) {
-                    pickers.ensure_models(harness, cx);
+                    pickers.ensure_models(harness, false, cx);
                 }
                 cx.notify();
             })
@@ -980,7 +993,13 @@ impl Pickers {
         )
     }
 
-    fn ensure_models(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+    /// `force` reaches the engine as-is and must never be `true` from a call
+    /// made in `render`: the engine clears the harness's `DiscoveryCache` on
+    /// a forced call, and render re-runs its eager load every frame — a
+    /// `force` there would re-spawn a discovery subprocess per frame. Only a
+    /// discrete user demand (the Retry row, re-arming a cancelled slot) may
+    /// force; opening the picker and the eager render kick both pass `false`.
+    fn ensure_models(&mut self, harness: HarnessId, force: bool, cx: &mut Context<Self>) {
         // Absent or Idle only — same render-loop hazard as `ensure_harnesses`;
         // the retry row clears the map to re-arm.
         if self
@@ -1009,7 +1028,7 @@ impl Pickers {
         // path out, including the cancelled one.
         let (request_id, cancelled) = toast::begin(cx, errors::Loading::Models);
         cx.spawn(async move |this, cx| {
-            let params = serde_json::json!({ "harness": harness });
+            let params = serde_json::json!({ "harness": harness, "force": force });
             let call = std::pin::pin!(engine.client().call(methods::LIST_MODELS, params));
             // Losing this race DROPS the RPC future, which is what makes cancel
             // real rather than cosmetic: `PendingGuard` turns the drop into a
@@ -1035,7 +1054,7 @@ impl Pickers {
                     }
                 };
                 let loaded = match result {
-                    Ok(value) => match serde_json::from_value::<ModelCatalog>(value) {
+                    Ok(value) => match decode_models_reply(value) {
                         Ok(catalog) => Loadable::Ready(catalog),
                         Err(err) => {
                             Loadable::Error(errors::decode_failure(errors::Loading::Models, &err))
@@ -1394,8 +1413,8 @@ impl Pickers {
         self.model_scroll.set_offset(gpui::Point::default());
         // Picking the harness IS asking for its models again, so a cancelled
         // slot must not stay cancelled here either.
-        self.rearm_cancelled_models();
-        self.ensure_models(harness, cx);
+        self.rearm_cancelled_models(cx);
+        self.ensure_models(harness, false, cx);
         cx.notify();
     }
 
@@ -2103,6 +2122,13 @@ impl Pickers {
                             this.harnesses = Loadable::Idle;
                             this.models.clear();
                             this.ensure_harnesses(cx);
+                            // `force: true` — this is the escape hatch from a
+                            // discovery failure the engine cached for the
+                            // whole boot (`DiscoveryCache`): without it, this
+                            // row refetches the same cached failure forever.
+                            if let Some(harness) = this.effective_harness(cx) {
+                                this.ensure_models(harness, true, cx);
+                            }
                         }
                     }))
                     .child(SharedString::from("Retry")),
@@ -3018,6 +3044,8 @@ fn harness_catalog_settled(slot: &Loadable<Vec<HarnessDescriptor>>) -> bool {
 }
 
 /// Put cancelled slots back to `Idle` so the next `ensure_*` reloads them.
+/// Returns the harnesses actually re-armed, so a caller that needs to kick
+/// off their reload itself (`rearm_cancelled_models`) knows which ones.
 ///
 /// Re-arms **only a slot still holding an `Error`**. A marker can outlive the
 /// state it described — a Retry, or a space switch clearing the map, reloads
@@ -3029,12 +3057,15 @@ fn harness_catalog_settled(slot: &Loadable<Vec<HarnessDescriptor>>) -> bool {
 fn rearm_cancelled<T>(
     slots: &mut HashMap<HarnessId, Loadable<T>>,
     cancelled: &mut std::collections::HashSet<HarnessId>,
-) {
+) -> Vec<HarnessId> {
+    let mut rearmed = Vec::new();
     for harness in cancelled.drain() {
         if matches!(slots.get(&harness), Some(Loadable::Error(_))) {
             slots.insert(harness, Loadable::Idle);
+            rearmed.push(harness);
         }
     }
+    rearmed
 }
 
 /// [`rearm_cancelled`] for a surface with one slot rather than a map.
@@ -3198,7 +3229,9 @@ impl Render for Pickers {
         // chip reads "Fable 5" (a concrete pick) before any popover opens.
         self.ensure_harnesses(cx);
         if let Some(harness) = self.effective_harness(cx) {
-            self.ensure_models(harness, cx);
+            // `render` runs every frame — `force: true` here would re-spawn a
+            // discovery subprocess per frame. See `ensure_models`.
+            self.ensure_models(harness, false, cx);
         }
         // A popover opened data-side (COMET_OPEN_PICKER) never went through
         // `toggle`, so kick its loads here (all ensure_* are idempotent).
@@ -3931,7 +3964,7 @@ mod tests {
             }],
             "source": "builtIn"
         });
-        let catalog: ModelCatalog = serde_json::from_value(reply).expect("decode");
+        let catalog = decode_models_reply(reply).expect("decode");
         assert_eq!(catalog.source, CatalogSource::BuiltIn);
         assert_eq!(catalog.models.len(), 1);
         assert_eq!(catalog.models[0].id, "claude-sonnet-5");

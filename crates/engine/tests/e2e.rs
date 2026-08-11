@@ -3567,3 +3567,120 @@ async fn the_spawned_sweeper_expires_a_parked_approval_on_its_own() {
     )
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// Retry clears the discovery cell (slice 2.1, task 6)
+// ---------------------------------------------------------------------------
+
+/// Fixture harness whose `models()` runs a discovery closure through a real
+/// `DiscoveryCache`, counting every time the closure actually executes. The
+/// production shape (2.2/2.3) wires a `DiscoveryCache` into `ClaudeHarness`/
+/// `CodexHarness`; this fixture exercises the same cache without a real CLI.
+struct CountingDiscoveryHarness {
+    cache: comet_harness::discovery::DiscoveryCache,
+    runs: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Harness for CountingDiscoveryHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Counting"
+    }
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities::default()
+    }
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        let runs = self.runs.clone();
+        let discovery = self
+            .cache
+            .get(|| async move {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(comet_harness::discovery::Discovery { models: vec![] })
+            })
+            .await;
+        Ok(self.cache.catalog(vec![], discovery))
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        unimplemented!("not exercised by the discovery-retry test")
+    }
+    fn clear_discovery(&self) {
+        self.cache.clear();
+    }
+}
+
+impl CountingDiscoveryHarness {
+    fn discovery_runs(&self) -> usize {
+        self.runs.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// The RPC-surface handle the discovery-retry test drives `list_models`
+/// through — `EngineCore` has no typed `list_models` method of its own (out
+/// of this task's scope), so this wraps the same in-memory `RpcClient` the
+/// `rpc_surface_over_in_memory_transport` test above uses, adding the
+/// `force` field `ListModelsParams` gains in this task.
+///
+/// Holds the `TempDir` and `EngineCore` alongside the client so nothing the
+/// registered `RpcService` depends on is dropped out from under a still-live
+/// background connection task.
+struct TestEngine {
+    _dir: tempfile::TempDir,
+    _core: EngineCore,
+    client: comet_rpc::RpcClient,
+}
+
+impl TestEngine {
+    async fn list_models(
+        &self,
+        harness: HarnessId,
+        force: bool,
+    ) -> Result<ModelCatalog, comet_rpc::RpcError> {
+        self.client
+            .call_as(
+                comet_rpc::methods::LIST_MODELS,
+                serde_json::json!({ "harness": harness, "force": force }),
+            )
+            .await
+    }
+}
+
+async fn engine_with_counting_discovery() -> (TestEngine, Arc<CountingDiscoveryHarness>) {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(CountingDiscoveryHarness {
+        cache: Default::default(),
+        runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+    let core = assemble(dir.path(), harness.clone());
+    let client = comet_rpc::memory_client(core.rpc_service());
+    (
+        TestEngine {
+            _dir: dir,
+            _core: core,
+            client,
+        },
+        harness,
+    )
+}
+
+/// A cached failure must survive an ordinary reopen and must NOT survive a
+/// Retry. Both halves matter: the first is what stops a broken login
+/// spawning a subprocess per picker open, the second is what stops Retry
+/// being a button that does nothing.
+#[tokio::test]
+async fn retry_re_arms_a_cached_discovery_failure() {
+    let (engine, harness) = engine_with_counting_discovery().await;
+
+    engine.list_models(HarnessId::Mock, false).await.unwrap();
+    engine.list_models(HarnessId::Mock, false).await.unwrap();
+    assert_eq!(harness.discovery_runs(), 1, "cached between ordinary calls");
+
+    engine.list_models(HarnessId::Mock, true).await.unwrap();
+    assert_eq!(harness.discovery_runs(), 2, "force re-arms the cell");
+}

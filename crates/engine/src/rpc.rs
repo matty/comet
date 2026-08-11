@@ -71,6 +71,11 @@ struct ChatParams {
 #[serde(rename_all = "camelCase")]
 struct ListModelsParams {
     harness: HarnessId,
+    /// Set by the picker's Retry row. A new FIELD on an existing method, so
+    /// it stays additive and needs no version bump of its own — an older
+    /// peer simply never asks for a refresh.
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -987,6 +992,9 @@ impl RpcService for EngineRpc {
                     .registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                if p.force {
+                    harness.clear_discovery();
+                }
                 let catalog = harness
                     .models()
                     .await
