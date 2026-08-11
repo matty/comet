@@ -22,7 +22,26 @@ fn fixture_path() -> &'static str {
 }
 
 fn harness() -> CodexHarness {
-    CodexHarness::new().with_executable(fixture_path())
+    CodexHarness::new()
+        .with_executable(fixture_path())
+        .with_codex_home(logged_in_home())
+}
+
+/// A `CODEX_HOME` that looks logged in, created once and alive for the whole
+/// test process.
+///
+/// Discovery refuses to ask a logged-out CLI — it answers with a hardcoded
+/// list that does not match the account — and neither CI nor a fresh checkout
+/// has a real `~/.codex/auth.json`. Without this every discovery test would
+/// pass here and assert nothing there.
+fn logged_in_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("auth.json"), "{}").expect("auth.json");
+        dir
+    })
+    .path()
 }
 
 fn request(prompt: &str) -> RunRequest {
@@ -666,13 +685,19 @@ async fn missing_binary_is_not_installed() {
     assert!(matches!(err, HarnessError::NotInstalled(_)), "{err:?}");
 }
 
+/// The curated list 2.1 pinned, now reached through the built-in path: a CLI
+/// that cannot answer leaves it exactly as it was, which is what makes a failed
+/// discovery harmless.
 #[tokio::test]
-async fn models_returns_curated_catalog() {
-    let catalog = harness().models().await.expect("models");
+async fn the_curated_catalog_survives_a_failed_discovery() {
+    let missing = CodexHarness::new()
+        .with_executable("/nonexistent/codex-nowhere")
+        .with_codex_home(logged_in_home());
+    let catalog = missing.models().await.expect("models");
     assert_eq!(
         catalog.source,
         comet_proto::CatalogSource::BuiltIn,
-        "no discovery ships in 2.1; the adapter must not claim a live list"
+        "a CLI that cannot answer must not be reported as a live list"
     );
     assert!(!catalog.models.is_empty());
     let models = catalog.models;
@@ -685,7 +710,6 @@ async fn models_returns_curated_catalog() {
             .all(|m| m.options.iter().any(|o| o.id == "serviceTier"))
     );
 
-    let missing = CodexHarness::new().with_executable("/nonexistent/codex-nowhere");
     // models() requires a resolvable binary… but with_executable trusts the
     // caller's path, so only the default resolution can report NotInstalled —
     // exercise the harness identity surface instead.
@@ -901,4 +925,257 @@ async fn every_runtime_mode_reaches_the_wire_as_its_approval_policy() {
             "{mode:?} wanted {want}, wire said {error}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Live discovery (slice 2.3)
+// ---------------------------------------------------------------------------
+
+/// The slice's deliverable: a real spawn, a real `initialize` + `model/list`
+/// round trip, and a merged catalog that says it is live. The fixture answers
+/// shaped exactly as codex-cli 0.147.0 did in the 2026-08-11 capture, and pages
+/// by default — the real server returns all seven models in one page and would
+/// never exercise the loop.
+#[tokio::test]
+async fn models_come_back_live_and_merged() {
+    let catalog = harness().models().await.expect("models");
+    assert_eq!(catalog.source, comet_proto::CatalogSource::Live);
+    let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
+    assert!(
+        ids.contains(&"gpt-5.7-nova"),
+        "a model only the server knows appears, got {ids:?}"
+    );
+    assert!(
+        ids.contains(&"gpt-5.4-mini"),
+        "a curated model the server did not list is still kept, got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"codex-auto-review"),
+        "a hidden model never reaches the picker, got {ids:?}"
+    );
+    assert_eq!(
+        ids.iter().filter(|id| **id == "gpt-5.6-sol").count(),
+        1,
+        "a matched id is one row, not two, got {ids:?}"
+    );
+}
+
+/// Paging is only ever exercised by the fixture, so it is worth asserting the
+/// loop reassembled every page rather than stopping at the first: the models
+/// the fake serves last are the ones a broken loop drops.
+#[tokio::test]
+async fn every_page_of_the_model_list_is_collected() {
+    let catalog = harness().models().await.expect("models");
+    let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
+    // The fake serves five models two at a time; `gpt-5.7-nova` is fourth and
+    // only reachable through two cursor round trips.
+    assert!(
+        ids.contains(&"gpt-5.7-nova"),
+        "the third page never arrived, got {ids:?}"
+    );
+}
+
+/// The live answer overrides a curated capability, which is the whole point of
+/// reading `inputModalities`: `catalog.rs` marks every model image-capable and
+/// the server says one of them is not.
+#[tokio::test]
+async fn a_text_only_model_loses_the_curated_image_flag() {
+    let catalog = harness().models().await.expect("models");
+    let spark = catalog
+        .models
+        .iter()
+        .find(|m| m.id == "gpt-5.3-codex-spark")
+        .expect("curated model present");
+    assert!(
+        !spark.accepts_images,
+        "the server reports text-only; the curated `true` must not win"
+    );
+    let sol = catalog
+        .models
+        .iter()
+        .find(|m| m.id == "gpt-5.6-sol")
+        .expect("curated model present");
+    assert!(sol.accepts_images, "an image-capable model is unchanged");
+}
+
+/// A model nobody has curated keeps the effort the provider reported for it,
+/// `ultra` included — Codex reports it natively and `to_effort` already sends
+/// it. It must not acquire Comet's own ultracode/ultrathink.
+#[tokio::test]
+async fn a_live_only_model_keeps_its_reported_ladder() {
+    let catalog = harness().models().await.expect("models");
+    let nova = catalog
+        .models
+        .iter()
+        .find(|m| m.id == "gpt-5.7-nova")
+        .expect("live-only model present");
+    assert!(nova.reasoning_levels.contains(&ReasoningLevel::Ultra));
+    assert!(!nova.reasoning_levels.contains(&ReasoningLevel::Ultracode));
+    assert!(!nova.reasoning_levels.contains(&ReasoningLevel::Ultrathink));
+    assert!(
+        nova.accepts_images,
+        "the fixture omits inputModalities entirely: absent means images work"
+    );
+}
+
+/// An answer we cannot read is the one failure that means a provider changed
+/// its protocol under us, and it must survive as `Unparseable` so the engine
+/// raises its `Diagnostic` (`crates/engine/src/rpc.rs:1010`).
+#[tokio::test]
+async fn an_unreadable_answer_is_reported_as_drift() {
+    let harness = CodexHarness::new()
+        .with_executable(env!("CARGO_BIN_EXE_fake-codex-bad-discovery"))
+        .with_codex_home(logged_in_home());
+    let catalog = harness.models().await.expect("still answers");
+    assert_eq!(
+        catalog.source,
+        comet_proto::CatalogSource::BuiltIn,
+        "a broken reply still serves the curated list"
+    );
+    assert_eq!(
+        harness.take_unreported_discovery_failure(),
+        Some(comet_harness::discovery::DiscoveryFailure::Unparseable)
+    );
+}
+
+/// The cursor is opaque and server-chosen, so nothing in the schema stops a
+/// server handing back one that never advances. Unbounded, the picker would
+/// await a loop that never ends.
+///
+/// The fixture stops answering after three pages so this cannot pass on the
+/// page cap instead: without the did-not-advance guard the loop runs into EOF
+/// and reports `Unreachable`, not drift.
+#[tokio::test]
+async fn a_cursor_that_never_advances_is_drift() {
+    let harness = CodexHarness::new()
+        .with_executable(env!("CARGO_BIN_EXE_fake-codex-stuck-cursor"))
+        .with_codex_home(logged_in_home());
+    let catalog = tokio::time::timeout(Duration::from_secs(20), harness.models())
+        .await
+        .expect("the paging loop terminated")
+        .expect("still answers");
+    assert_eq!(catalog.source, comet_proto::CatalogSource::BuiltIn);
+    assert_eq!(
+        harness.take_unreported_discovery_failure(),
+        Some(comet_harness::discovery::DiscoveryFailure::Unparseable)
+    );
+}
+
+/// A server whose cursor keeps advancing can page forever, and the
+/// did-not-advance guard cannot see it. The page cap is the only thing that
+/// ends this, and the picker is awaiting the answer while it runs.
+#[tokio::test]
+async fn an_endless_pager_is_stopped_by_the_page_cap() {
+    let harness = CodexHarness::new()
+        .with_executable(env!("CARGO_BIN_EXE_fake-codex-endless-cursor"))
+        .with_codex_home(logged_in_home());
+    let catalog = tokio::time::timeout(Duration::from_secs(20), harness.models())
+        .await
+        .expect("the paging loop terminated")
+        .expect("still answers");
+    assert_eq!(catalog.source, comet_proto::CatalogSource::BuiltIn);
+    assert_eq!(
+        harness.take_unreported_discovery_failure(),
+        Some(comet_harness::discovery::DiscoveryFailure::Unparseable)
+    );
+}
+
+/// A logged-out `codex` answers `model/list` **successfully**, with a
+/// hardcoded five-model list that does not match the account: it contains a
+/// model the account cannot use and misses three it has (capture
+/// `2026-08-11-codex-model-list.md`, run 6). Nothing in the envelope says so,
+/// so the only defence is not to ask.
+///
+/// The fixture here is the good one — it would answer `Live`. Getting the
+/// built-in list back is the proof that the gate fired before the spawn.
+#[tokio::test]
+async fn a_logged_out_cli_is_never_asked() {
+    let home = tempfile::tempdir().expect("temp dir");
+    let harness = harness().with_codex_home(home.path());
+    let catalog = harness.models().await.expect("curated list still answers");
+    assert_eq!(
+        catalog.source,
+        comet_proto::CatalogSource::BuiltIn,
+        "no auth.json: the built-in list, honestly captioned"
+    );
+    assert_eq!(
+        harness.take_unreported_discovery_failure(),
+        Some(comet_harness::discovery::DiscoveryFailure::Unreachable),
+        "not being logged in is ordinary, not protocol drift"
+    );
+}
+
+/// The live check, against the real CLI rather than the fixture: `model/list`
+/// answers cold, the ids land on the curated rows, and the one text-only model
+/// comes back marked as such. Ignored by default — it needs an installed,
+/// logged-in `codex` — but it spends no tokens, because discovery never starts
+/// a thread.
+/// Run with: `cargo test -p comet-harness --test codex -- --ignored`
+#[tokio::test]
+#[ignore = "requires installed+logged-in codex CLI (spends no tokens)"]
+async fn live_cli_discovery_lands_on_curated_ids() {
+    let catalog = CodexHarness::new().models().await.expect("models");
+    let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        catalog.source,
+        comet_proto::CatalogSource::Live,
+        "the real model/list answered, got {ids:?}"
+    );
+    assert_eq!(
+        ids,
+        vec![
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex-spark",
+        ],
+        "seven curated rows, no duplicates and nothing hidden"
+    );
+    let spark = catalog
+        .models
+        .iter()
+        .find(|m| m.id == "gpt-5.3-codex-spark")
+        .expect("present");
+    assert!(
+        !spark.accepts_images,
+        "the live inputModalities override reached the merged catalog"
+    );
+}
+
+/// A CLI that cannot be spawned is ordinary, not drift — otherwise every
+/// machine without Codex installed would report a protocol failure on boot.
+#[tokio::test]
+async fn a_missing_cli_is_not_drift() {
+    let harness = CodexHarness::new()
+        .with_executable("/nonexistent/codex-nowhere")
+        .with_codex_home(logged_in_home());
+    let catalog = harness.models().await.expect("curated list still answers");
+    assert_eq!(catalog.source, comet_proto::CatalogSource::BuiltIn);
+    assert_eq!(
+        harness.take_unreported_discovery_failure(),
+        Some(comet_harness::discovery::DiscoveryFailure::Unreachable)
+    );
+}
+
+/// The cache belongs to the CLI it asked, not to the harness value. Pointing a
+/// harness at a different executable and re-asking must re-run discovery —
+/// otherwise the second CLI's answer is whatever the first one said.
+#[tokio::test]
+async fn changing_the_executable_re_runs_discovery() {
+    let harness = harness();
+    assert_eq!(
+        harness.models().await.expect("first").source,
+        comet_proto::CatalogSource::Live,
+        "the good fixture answers"
+    );
+
+    let harness = harness.with_executable(env!("CARGO_BIN_EXE_fake-codex-bad-discovery"));
+    assert_eq!(
+        harness.models().await.expect("second").source,
+        comet_proto::CatalogSource::BuiltIn,
+        "the new executable is asked, not the old answer replayed"
+    );
 }
