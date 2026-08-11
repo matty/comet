@@ -95,16 +95,6 @@ the record. Read it rather than any spec, plan or handoff file quoting it. `PROT
 has been quoted secondhand twice and was a slice out of date both times, and both times a spec
 inherited the wrong number.
 
-## Subagent-driven slices
-
-Model tiering, passed explicitly on every dispatch: **Sonnet implements, Opus reviews each
-task, Fable runs the final whole-branch pass.** An omitted `model` silently inherits the
-session's, which defeats the tiering and is the expensive default. Record the tiering in the
-slice's SDD ledger so a resumed session doesn't re-derive it.
-
-This is about the models *running* the work. It is separate from the picker rule above, which
-is about the model a test session drives inside Comet.
-
 ## The gpui fork rev is load-bearing
 
 `gpui` comes from `wingleeio/zed` at a pinned rev, not from crates.io. Comet depends on
@@ -124,13 +114,20 @@ current when the rev changes.
 (`--resume` after resolving a conflict). Full procedure:
 `.agents/workflows/sync-upstream.md`.
 
-## Windows is the primary dev machine
+## Windows ships, and no PR ever tests it
 
-Prefer PowerShell; use bash only for genuinely POSIX scripts. `scripts/*.sh`
-(`package-linux.sh`, `package-macos.sh`, `e2e-smoke.sh`) do not run here — they are
-CI/platform scripts. Windows path and process-lifetime behavior has bitten this repo
-repeatedly (see the `fix: ... on Windows` commits); when touching harness CLI resolution,
-terminal exit, or diff capture, check the Windows path explicitly.
+`release.yml` builds `comet.exe` on `windows-latest` and gates the release on that job, so
+Windows is a shipped platform. `ci.yml` runs entirely on `ubuntu-24.04`. **Nothing in the PR
+gate can catch a Windows regression**, which is why the checks below fall to whoever writes
+the change, whatever they develop on.
+
+Windows path and process-lifetime behavior has bitten this repo repeatedly — see the
+`fix: ... on Windows` commits. When touching harness CLI resolution, terminal exit, or diff
+capture, reason about the Windows path explicitly, and say in the PR whether you were able to
+run it there.
+
+`scripts/*.sh` (`package-linux.sh`, `package-macos.sh`, `e2e-smoke.sh`) are CI and platform
+packaging scripts, not local dev tooling. They are not part of the verify gate on any OS.
 
 Parallel branches live in `.worktrees/` *inside* the repo and are gitignored. Files under
 `.worktrees/` belong to another branch — never edit them while working in the main checkout.
