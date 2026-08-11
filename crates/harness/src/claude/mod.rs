@@ -15,6 +15,7 @@
 
 mod approval;
 mod catalog;
+mod discovery;
 mod normalize;
 mod wire;
 
