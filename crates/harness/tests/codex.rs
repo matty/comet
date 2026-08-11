@@ -1103,6 +1103,44 @@ async fn the_child_is_given_the_home_the_login_check_validated() {
     );
 }
 
+/// A relative `CODEX_HOME` is real configuration — `env_dir` returns the
+/// variable verbatim — and the child runs with its working directory set to the
+/// temp directory. Handed on as-is, the parent would check `auth.json` here
+/// while the CLI read a directory under the temp dir, and answer from its
+/// logged-out fallback list with the result still labelled live.
+#[tokio::test]
+async fn a_relative_codex_home_reaches_the_child_as_an_absolute_one() {
+    // Created inside the crate root, which is where cargo runs the test from,
+    // so the relative spelling below is one the parent can resolve and the
+    // child cannot.
+    let home = tempfile::TempDir::new_in(".").expect("temp dir in crate root");
+    std::fs::write(home.path().join("auth.json"), "{}").expect("auth.json");
+    let relative = std::path::Path::new(".").join(
+        home.path()
+            .file_name()
+            .expect("the temp dir has a final component"),
+    );
+    assert!(!relative.is_absolute(), "the fixture needs a relative home");
+
+    let harness = harness().with_codex_home(&relative);
+    let catalog = harness.models().await.expect("models");
+    let echo = catalog
+        .models
+        .iter()
+        .find(|m| m.id == "codex-home-echo")
+        .expect("discovery ran and the fixture echoed its CODEX_HOME");
+    let echoed = std::path::Path::new(&echo.label);
+    assert!(
+        echoed.is_absolute(),
+        "the child got a relative home to resolve against its own cwd: {echoed:?}"
+    );
+    assert_eq!(
+        echoed.canonicalize().ok(),
+        home.path().canonicalize().ok(),
+        "the child's home is not the directory the login check read"
+    );
+}
+
 /// The cursor is the server's string, not ours: 0.147.0 sends a stringified
 /// offset but the schema calls it opaque. The fixture issues one containing a
 /// quote and a backslash, so a request built by interpolation is malformed

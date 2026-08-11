@@ -112,6 +112,32 @@ fn logged_in(home: Option<&Path>) -> bool {
     home.is_some_and(|home| home.join("auth.json").exists())
 }
 
+/// `home`, resolved against the parent's working directory.
+///
+/// The same trap [`program_path`] exists for, from the other side: the child is
+/// spawned with `current_dir(temp_dir())`, so a relative `CODEX_HOME` would
+/// resolve there while the parent's `auth.json` check resolved it here. The
+/// check would pass against one directory and the CLI answer from another —
+/// its logged-out fallback list, labelled live. `env_dir` returns the variable
+/// verbatim (`lib.rs:129-131`), so a relative value is real configuration.
+///
+/// Joined rather than canonicalized, deliberately: on Windows canonicalization
+/// yields a `\\?\` verbatim path, and this value is handed to another program
+/// as an environment variable. Both sides resolving the same directory is what
+/// is needed here, not a normalized spelling.
+fn absolute_home(home: PathBuf) -> Option<PathBuf> {
+    if home.is_absolute() {
+        return Some(home);
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => Some(cwd.join(home)),
+        Err(err) => {
+            tracing::debug!(%err, "codex discovery cannot resolve a relative CODEX_HOME");
+            None
+        }
+    }
+}
+
 /// Spawn a short-lived app-server, page `model/list`, and hand back what it
 /// said.
 ///
@@ -121,7 +147,10 @@ pub(crate) async fn discover(
     exe: PathBuf,
     home: Option<PathBuf>,
 ) -> Result<Discovery, DiscoveryFailure> {
-    let Some(home) = home.filter(|home| logged_in(Some(home))) else {
+    let Some(home) = home
+        .and_then(absolute_home)
+        .filter(|home| logged_in(Some(home)))
+    else {
         tracing::debug!(
             "codex discovery skipped: no auth.json, so model/list would answer with the CLI's own fallback list"
         );
