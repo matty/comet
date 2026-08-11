@@ -22,7 +22,8 @@ use gpui::{
 
 use comet_engine::registry::HarnessDescriptor;
 use comet_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, RuntimeMode, ServerRef,
+    CatalogSource, ChatConfig, FolderListing, HarnessId, Model, ModelCatalog, ReasoningLevel,
+    RepoRef, RuntimeMode, ServerRef,
 };
 use comet_rpc::methods;
 
@@ -164,6 +165,26 @@ pub fn clamp_reasoning(
     match level {
         Some(level) if ladder.contains(&level) => Some(level),
         _ => default_reasoning(ladder),
+    }
+}
+
+/// Shown under the model list while discovery has failed. Amber
+/// `warning_muted`, not red: a state to resolve, not an error the user
+/// caused (0.2a's rail caption is the worked example). No Retry button of
+/// its own — the pane's existing Retry row is the escape hatch.
+fn built_in_caption(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::ClaudeCode => "Built-in list — couldn't reach Claude",
+        HarnessId::Codex => "Built-in list — couldn't reach Codex",
+        HarnessId::Cursor => "Built-in list — couldn't reach Cursor",
+        HarnessId::Mock => "Built-in list",
+    }
+}
+
+fn caption_for(source: CatalogSource, harness: HarnessId) -> Option<&'static str> {
+    match source {
+        CatalogSource::Live => None,
+        CatalogSource::BuiltIn => Some(built_in_caption(harness)),
     }
 }
 
@@ -352,7 +373,7 @@ pub struct Pickers {
     /// queue no more than one refetch.
     harness_revalidating: bool,
     revalidate_task: Option<Task<()>>,
-    models: HashMap<HarnessId, Loadable<Vec<Model>>>,
+    models: HashMap<HarnessId, Loadable<ModelCatalog>>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<ServerRef>,
@@ -615,7 +636,7 @@ impl Pickers {
     /// (first row). Never `None` with a non-empty catalog.
     fn selected_model<'a>(&'a self, cx: &'a App) -> Option<&'a Model> {
         let harness = self.effective_harness(cx)?;
-        let models = self.models.get(&harness)?.ready()?;
+        let models = &self.models.get(&harness)?.ready()?.models;
         match self.effective_model_id(cx) {
             Some(id) => models
                 .iter()
@@ -1014,8 +1035,8 @@ impl Pickers {
                     }
                 };
                 let loaded = match result {
-                    Ok(value) => match serde_json::from_value::<Vec<Model>>(value) {
-                        Ok(models) => Loadable::Ready(models),
+                    Ok(value) => match serde_json::from_value::<ModelCatalog>(value) {
+                        Ok(catalog) => Loadable::Ready(catalog),
                         Err(err) => {
                             Loadable::Error(errors::decode_failure(errors::Loading::Models, &err))
                         }
@@ -1024,10 +1045,13 @@ impl Pickers {
                         Loadable::Error(errors::load_failure(errors::Loading::Models, &err))
                     }
                 };
-                if let Loadable::Ready(models) = &loaded {
-                    let fresh = pickers
-                        .defaults
-                        .remember_labels(models.iter().map(|m| (m.id.as_str(), m.label.as_str())));
+                if let Loadable::Ready(catalog) = &loaded {
+                    let fresh = pickers.defaults.remember_labels(
+                        catalog
+                            .models
+                            .iter()
+                            .map(|m| (m.id.as_str(), m.label.as_str())),
+                    );
                     if fresh {
                         pickers.save_defaults();
                     }
@@ -1389,7 +1413,7 @@ impl Pickers {
                     .models
                     .get(&harness)
                     .and_then(|l| l.ready())
-                    .and_then(|models| models.iter().find(|m| m.id == model_id))
+                    .and_then(|catalog| catalog.models.iter().find(|m| m.id == model_id))
                     .map(|m| m.label.clone())
                     .unwrap_or_else(|| model_id.clone());
                 self.defaults.remember_model(harness, model_id, label);
@@ -1481,11 +1505,11 @@ impl Pickers {
         // Reasoning must stay concrete for whatever model the row now names —
         // same ladder resolution as [`Self::trait_ladder`] (model levels, else
         // the harness's advertised ladder).
-        if let Some(models) = self.models.get(&config.harness).and_then(|l| l.ready()) {
+        if let Some(catalog) = self.models.get(&config.harness).and_then(|l| l.ready()) {
             let mut ladder = config
                 .model
                 .as_deref()
-                .and_then(|id| models.iter().find(|m| m.id == id))
+                .and_then(|id| catalog.models.iter().find(|m| m.id == id))
                 .map(|m| m.reasoning_levels.clone())
                 .unwrap_or_default();
             if ladder.is_empty()
@@ -1574,7 +1598,7 @@ impl Pickers {
         self.effective_harness(cx)
             .and_then(|h| self.models.get(&h))
             .and_then(|l| l.ready())
-            .map(|m| m.len())
+            .map(|catalog| catalog.models.len())
             .unwrap_or(0)
     }
 
@@ -1584,7 +1608,7 @@ impl Pickers {
             .effective_harness(cx)
             .and_then(|h| self.models.get(&h))
             .and_then(|l| l.ready())
-            .and_then(|m| m.get(self.active))
+            .and_then(|catalog| catalog.models.get(self.active))
             .map(|m| m.id.clone())
         else {
             return;
@@ -2499,12 +2523,12 @@ impl Pickers {
         // direct children so `scroll_to_item(active)` maps 1:1 (the palette's
         // keyboard-follow standard).
         let model_children: Vec<AnyElement> = match effective.map(|h| (h, self.models.get(&h))) {
-            Some((_, Some(Loadable::Ready(models)))) => {
+            Some((_, Some(Loadable::Ready(catalog)))) => {
                 // The check mirrors the chip: the resolved concrete pick (draft
                 // / chat config / remembered, else the harness default row).
                 let selected = self.selected_model(cx).map(|m| m.id.clone());
                 let active = self.active;
-                let models = models.clone();
+                let models = catalog.models.clone();
                 models
                     .into_iter()
                     .enumerate()
@@ -2575,6 +2599,16 @@ impl Pickers {
             ],
         };
 
+        // Quiet caption for a `BuiltIn` catalog — see `caption_for`. `None`
+        // while loading/erroring too: those states already say their own
+        // thing and don't need a second, contradictory line under them.
+        let built_in_caption = effective.and_then(|h| {
+            self.models
+                .get(&h)
+                .and_then(|l| l.ready())
+                .and_then(|catalog| caption_for(catalog.source, h))
+        });
+
         // One combined menu (user request): harness tabs across the top,
         // then the viewed harness's models, then the reasoning ladder and
         // model options that used to live in the separate traits popover.
@@ -2636,6 +2670,21 @@ impl Pickers {
                                         .children(model_children),
                                 ),
                             )
+                            .when_some(built_in_caption, |el, caption| {
+                                el.child(
+                                    // Quiet, not an error: amber `warning_muted`,
+                                    // same 11px as the row description line, no
+                                    // Retry of its own (the pane's existing Retry
+                                    // row is the escape hatch — Task 6 wires it).
+                                    div()
+                                        .flex_none()
+                                        .px(px(8.0))
+                                        .pb(px(4.0))
+                                        .text_size(px(11.0))
+                                        .text_color(theme.warning_muted)
+                                        .child(SharedString::from(caption)),
+                                )
+                            })
                             .child(
                                 // The pinned inspector tray (scrolls only if
                                 // a model advertises many option groups).
@@ -3842,5 +3891,53 @@ mod tests {
         // …and opted back in by COMET_HARNESS=mock (the e2e rig).
         assert_eq!(visible_harnesses_impl(&mixed, true).len(), 2);
         assert_eq!(visible_harnesses_impl(&mixed, true)[0].id, HarnessId::Mock);
+    }
+
+    /// The caption exists so a user looking at a stale list can tell. It is
+    /// copy, not a raw error: no provider name from an error string, no
+    /// `err.to_string()`, nothing the user cannot act on.
+    #[test]
+    fn built_in_caption_names_the_agent_and_nothing_technical() {
+        let caption = built_in_caption(HarnessId::ClaudeCode);
+        assert!(caption.contains("Built-in list"), "got {caption}");
+        assert!(!caption.contains("Error"), "no error vocabulary: {caption}");
+        assert!(
+            !caption.contains("harness"),
+            "internal word on screen: {caption}"
+        );
+    }
+
+    /// A live answer says nothing at all — the caption is for the degraded case.
+    #[test]
+    fn a_live_catalog_shows_no_caption() {
+        assert!(caption_for(CatalogSource::Live, HarnessId::ClaudeCode).is_none());
+        assert!(caption_for(CatalogSource::BuiltIn, HarnessId::ClaudeCode).is_some());
+    }
+
+    /// The decode is pinned against the reply's REAL JSON, not against a
+    /// `ModelCatalog` this test built and re-serialized. Task 4 changed the
+    /// wire shape and every one of `comet-ui`'s 501 tests stayed green while
+    /// the picker was left decoding the old one — a round-trip through the
+    /// Rust type would have stayed green too. Only the literal the engine
+    /// actually sends catches that.
+    #[test]
+    fn the_picker_decodes_the_reply_the_engine_actually_sends() {
+        let reply = serde_json::json!({
+            "models": [{
+                "id": "claude-sonnet-5",
+                "label": "Sonnet 5",
+                "reasoningLevels": [],
+                "options": []
+            }],
+            "source": "builtIn"
+        });
+        let catalog: ModelCatalog = serde_json::from_value(reply).expect("decode");
+        assert_eq!(catalog.source, CatalogSource::BuiltIn);
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(catalog.models[0].id, "claude-sonnet-5");
+        assert!(
+            catalog.models[0].accepts_images,
+            "absent acceptsImages means images work"
+        );
     }
 }
