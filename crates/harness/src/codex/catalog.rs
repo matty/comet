@@ -70,15 +70,6 @@ pub(crate) fn sandbox_policy_value(sandbox: SandboxLevel) -> serde_json::Value {
     serde_json::Value::Object(policy)
 }
 
-/// `thread/start`'s `approvalsReviewer`: who answers an approval when one is
-/// raised. Only `Auto` delegates that to the provider; the others keep the
-/// user in the role, which is also the app-server's default when the key is
-/// absent.
-///
-/// Sending this is currently inert — the wire approval policy is pinned to
-/// `"never"`, so no approval is ever raised for a reviewer to answer. It is
-/// sent anyway so the thread carries the mode's full intent, and so the
-/// change that unpins the policy changes one literal rather than three.
 /// `thread/start`'s and `turn/start`'s `approvalPolicy`: when the server stops
 /// to ask.
 ///
@@ -100,6 +91,14 @@ pub(crate) fn approval_policy(mode: RuntimeMode) -> &'static str {
     }
 }
 
+/// `thread/start`'s `approvalsReviewer`: who answers an approval when one is
+/// raised. Only `Auto` delegates that to the provider; the others keep the user
+/// in the role, which is also the app-server's default when the key is absent.
+///
+/// This used to carry a note calling itself inert, because the wire approval
+/// policy was pinned at `"never"` and no approval could be raised for a
+/// reviewer to answer. **Slice 1.7 unpinned it** — see `approval_policy` above,
+/// which now derives all four modes — so the field has been live since then.
 pub(crate) fn approvals_reviewer(mode: RuntimeMode) -> &'static str {
     match mode {
         RuntimeMode::Auto => "auto_review",

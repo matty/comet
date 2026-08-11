@@ -725,6 +725,7 @@ fn operational_surface_is_explicitly_allowed() {
         methods::LIST_HARNESSES,
         methods::LIST_HARNESS_DIAGNOSTICS,
         methods::LIST_MODELS,
+        methods::LIST_COMMANDS,
         methods::QUEUE_COMMAND,
         methods::WATCH_DOC_MESSAGES,
         methods::WATCH_CHATS,

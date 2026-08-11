@@ -15,6 +15,7 @@
 
 mod approval;
 mod catalog;
+mod commands;
 mod discovery;
 mod normalize;
 mod wire;
@@ -101,6 +102,11 @@ pub struct ClaudeHarness {
     /// uncached discovery would spawn a CLI on a path the user never sees —
     /// and each spawn runs the user's `SessionStart` hooks.
     discovery_cache: crate::discovery::DiscoveryCache,
+    /// One command handshake per directory per boot. Separate from
+    /// `discovery_cache` because commands are cwd-scoped and models are not,
+    /// and because this one's spawn is the expensive non-bare handshake that
+    /// runs the user's `SessionStart` hooks.
+    command_cache: crate::discovery::CommandCache,
 }
 
 impl Default for ClaudeHarness {
@@ -110,6 +116,7 @@ impl Default for ClaudeHarness {
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             discovery_cache: crate::discovery::DiscoveryCache::default(),
+            command_cache: crate::discovery::CommandCache::default(),
         }
     }
 }
@@ -156,6 +163,7 @@ impl ClaudeHarness {
         // never asked, and the picker would show one CLI's models under
         // another's name.
         self.discovery_cache = crate::discovery::DiscoveryCache::default();
+        self.command_cache = crate::discovery::CommandCache::default();
         self
     }
 
@@ -293,8 +301,25 @@ impl Harness for ClaudeHarness {
         Ok(self.discovery_cache.catalog(curated, discovery))
     }
 
+    async fn commands(&self, cwd: &str) -> Result<Vec<comet_proto::AgentCommand>, HarnessError> {
+        let exe = self.resolve_executable()?;
+        let dir = PathBuf::from(cwd);
+        // A failure must NOT degrade to an empty list. An empty list is a real
+        // answer — a directory whose CLI offers no commands — and rendering
+        // "couldn't reach Claude" as "no commands" is the same class of
+        // confident-wrong-answer the `--bare` bug and the logged-out Codex
+        // model list both were. The caller gets an error and says so.
+        self.command_cache
+            .get(cwd, move || commands::discover_commands(exe, dir))
+            .await
+            .map_err(|failure| {
+                HarnessError::Protocol(format!("claude command discovery failed: {failure:?}"))
+            })
+    }
+
     fn clear_discovery(&self) {
         self.discovery_cache.clear();
+        self.command_cache.clear();
     }
 
     fn take_unreported_discovery_failure(&self) -> Option<crate::discovery::DiscoveryFailure> {

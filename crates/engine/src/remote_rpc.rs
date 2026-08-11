@@ -17,6 +17,7 @@ pub fn remote_method_allowed(method: &str) -> bool {
             | methods::LIST_HARNESSES
             | methods::LIST_HARNESS_DIAGNOSTICS
             | methods::LIST_MODELS
+            | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
             | methods::WATCH_DOC_MESSAGES
             | methods::WATCH_CHATS

@@ -87,6 +87,26 @@ fn check_permission_mode() {
 /// `claude/discovery.rs`'s unit test.
 const INITIALIZE_REPLY: &str = r#"{"type":"control_response","response":{"subtype":"success","request_id":"comet-discovery-1","response":{"commands":[],"agents":[],"output_style":"default","available_output_styles":["default"],"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-5","displayName":"Sonnet","description":"Sonnet 5","supportsEffort":true,"supportedEffortLevels":["low","high"]},{"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001","displayName":"Haiku","description":"Haiku 4.5"}],"account":{"email":"user@example.test","organization":"Example","subscriptionType":"Claude Max","apiProvider":"firstParty"},"pid":1234,"current_permission_mode":"acceptEdits"}}}"#;
 
+/// The initialize reply for a **command** discovery: the same frame, with a
+/// `commands` array whose entries report what this child was actually handed.
+///
+/// The child is the only thing that can say which directory it was started in
+/// and which arguments reached it, and a test that cannot see those cannot tell
+/// a right answer from a plausible one. Slice 2.3 learned this the expensive
+/// way — a login check read one `CODEX_HOME` while the child used another, and
+/// every test passed — so the echo is the fixture's whole job here.
+fn command_reply() -> String {
+    let args: Vec<String> = std::env::args().collect();
+    let bare = args.iter().any(|a| a == "--bare");
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<none>".into());
+    let escaped = cwd.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"comet-discovery-1","response":{{"commands":[{{"name":"cwd-echo","description":"{escaped}","argumentHint":""}},{{"name":"bare-echo","description":"{bare}","argumentHint":""}},{{"name":"review","description":"Review the diff.","argumentHint":"[--fix]","aliases":["cr"]}}],"agents":[],"models":[],"account":{{}}}}}}}}"#
+    )
+}
+
 fn main() {
     check_permission_mode();
     let stdin = std::io::stdin();
@@ -96,8 +116,16 @@ fn main() {
     // A discovery session sends no prompt: its first line is the control
     // request. Answering it here is what gives `models()` a real spawn and a
     // real round-trip to be tested against.
+    //
+    // Model discovery and command discovery send the SAME request and differ
+    // only in their arguments, so the fixture splits on `--bare` exactly as the
+    // adapter does: with it, the caller wants models; without it, commands.
     if first.contains("control_request") {
-        emit(INITIALIZE_REPLY);
+        if std::env::args().any(|a| a == "--bare") {
+            emit(INITIALIZE_REPLY);
+        } else {
+            emit(&command_reply());
+        }
         // The adapter closes stdin to end the session; a real CLI exits 0.
         exit(0);
     }

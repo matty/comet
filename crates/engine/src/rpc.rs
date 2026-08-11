@@ -78,6 +78,16 @@ struct ListModelsParams {
     force: bool,
 }
 
+/// The `/` menu's parameters. `cwd` is required and has no default: the answer
+/// is directory-scoped, and a missing directory silently answering for some
+/// other one is the failure this method exists to avoid.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListCommandsParams {
+    harness: HarnessId,
+    cwd: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QueueCommandParams {
@@ -1017,6 +1027,23 @@ impl RpcService for EngineRpc {
                     );
                 }
                 RpcReply::value(&catalog)
+            }
+            methods::LIST_COMMANDS => {
+                let p: ListCommandsParams = parse_params(params)?;
+                let harness = self
+                    .registry
+                    .resolve(p.harness)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let commands = harness
+                    .commands(&p.cwd)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Answered as an object rather than a bare array, unlike the
+                // shape `ListModels` shipped and had to reshape in 2.1: a
+                // top-level array leaves nowhere to add a field without a
+                // whole-value decode change, and that reshape is what broke the
+                // picker at run time with every test green.
+                RpcReply::value(&serde_json::json!({ "commands": commands }))
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;

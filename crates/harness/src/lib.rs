@@ -14,8 +14,8 @@ use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
 
 use comet_proto::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, HarnessAvailability, HarnessCapabilities,
-    HarnessId, ModelCatalog, RunRequest, UserInputAnswer, UserInputQuestion,
+    AgentCommand, AgentEvent, ApprovalDecision, ApprovalRequest, HarnessAvailability,
+    HarnessCapabilities, HarnessId, ModelCatalog, RunRequest, UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -83,6 +83,21 @@ pub trait Harness: Send + Sync {
     /// (`comet_engine::titles`), so an implementation that spawns a
     /// subprocess must cache it — see [`discovery::DiscoveryCache`].
     async fn models(&self) -> Result<ModelCatalog, HarnessError>;
+    /// The slash commands this harness offers **in `cwd`**, for the composer's
+    /// `/` menu.
+    ///
+    /// Takes a directory because the answer depends on one: a provider
+    /// discovers user and project skills from the working directory, so the
+    /// same CLI answers differently per chat. An implementation that spawns
+    /// must cache per directory — see [`discovery::CommandCache`].
+    ///
+    /// Defaults to an empty list, which is the honest answer for a harness with
+    /// no command surface, and the answer Codex gives deliberately: its
+    /// app-server does not parse slash commands at all, and its skills are
+    /// invoked through a structured turn-input item instead (debt row D39).
+    async fn commands(&self, _cwd: &str) -> Result<Vec<AgentCommand>, HarnessError> {
+        Ok(Vec::new())
+    }
     /// Drop any cached discovery answer so the next `models()` re-runs it.
     ///
     /// Defaulted to a no-op: an in-process harness has nothing to discover,
