@@ -829,7 +829,17 @@ mod install_classification_tests {
     /// is a *different install of the same CLI*, a full minor behind the native
     /// one, and the only thing that distinguishes them on screen is this label
     /// plus the path beside it.
+    ///
+    /// Windows-only, and not for the reason the other `cfg(windows)` tests
+    /// here are. A backslash path is only a *path* on Windows: on unix
+    /// `Path::new(r"C:\a\b\claude.exe").parent()` is `""`, because nothing in
+    /// the string is a separator — so off Windows this would assert `Unknown`
+    /// for a reason that has nothing to do with the classifier. CI runs on
+    /// Ubuntu and caught exactly that. The unix half of the same lookup is
+    /// covered by `the_unix_locations_carry_their_documented_meanings`, whose
+    /// forward-slash paths parse on both platforms.
     #[test]
+    #[cfg(windows)]
     fn the_captured_windows_installs_classify_as_captured() {
         let dirs = windows_dirs();
         assert_eq!(
@@ -973,12 +983,12 @@ mod install_classification_tests {
     /// the row changes.
     #[test]
     fn an_unrecognized_directory_is_unknown_not_a_failure() {
+        // Forward slashes, which parse as a path on both platforms. A
+        // backslash literal would answer `Unknown` off Windows by failing to
+        // split into components at all — the right answer for the wrong
+        // reason, which is no test.
         assert_eq!(
-            classify_install(
-                Path::new(r"D:\tools\bin\claude.exe"),
-                false,
-                &windows_dirs()
-            ),
+            classify_install(Path::new("/opt/tools/bin/claude"), false, &unix_dirs()),
             InstallMethod::Unknown
         );
     }
