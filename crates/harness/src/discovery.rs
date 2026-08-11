@@ -50,14 +50,47 @@ pub enum DiscoveryFailure {
 }
 
 /// Reasoning levels Comet layers on top of a provider rather than reading
-/// from one: `ultrathink` is a prompt prefix, `ultracode` an `xhigh` plus a
-/// setting, `ultra` a Codex-only tier. A model nobody has curated must not be
-/// offered any of them.
+/// from one: `ultrathink` is a prompt prefix and `ultracode` an `xhigh` plus a
+/// setting. A model nobody has curated must not be offered either.
+///
+/// **`ultra` is deliberately not on this list**, though it was until slice 2.3.
+/// Codex reports it in `supportedReasoningEfforts` on gpt-5.6+ (capture
+/// `2026-08-11-codex-model-list.md`) and `codex/catalog.rs`'s `to_effort`
+/// already sends it on the wire, so it is provider-reported, not
+/// Comet-layered. Filtering it stripped the top effort off exactly the models
+/// this phase exists to surface: the ones no one has curated yet. Claude is
+/// unaffected — its ladder tops out at `max`.
 fn is_comet_special(level: ReasoningLevel) -> bool {
     matches!(
         level,
-        ReasoningLevel::Ultracode | ReasoningLevel::Ultrathink | ReasoningLevel::Ultra
+        ReasoningLevel::Ultracode | ReasoningLevel::Ultrathink
     )
+}
+
+/// The path to hand `Command::new` when the child's working directory is about
+/// to be changed.
+///
+/// `current_dir` changes what a **relative** program path resolves against, and
+/// std documents that as platform-specific and unstable — on Unix the child
+/// chdirs before exec, so `./bin/claude` would be looked for under the temp
+/// directory and the spawn would fail into a silent built-in-list fallback.
+/// Both `CLAUDE_CODE_EXECUTABLE` and `CODEX_EXECUTABLE` are taken verbatim
+/// (`lib.rs:161-163`), so a relative override is a real user configuration, not
+/// a hypothetical.
+///
+/// Two cases are deliberately left alone. An absolute path is returned
+/// unchanged rather than canonicalized, because on Windows canonicalization
+/// rewrites it to a `\\?\` verbatim path, which would then land in the child's
+/// PATH via `compose_child_path`. A bare command name (`codex`, no separator)
+/// stays bare, because that is a PATH lookup — absolutizing it against the
+/// parent's cwd would prefer a stray `./codex` over the installed CLI.
+pub(crate) fn program_path(exe: &std::path::Path) -> std::path::PathBuf {
+    if exe.is_absolute() || exe.components().count() < 2 {
+        return exe.to_path_buf();
+    }
+    // A path that cannot be resolved is left as it came: failing the spawn on
+    // the CLI's own terms beats substituting a path nobody configured.
+    std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf())
 }
 
 /// Merge a discovery answer over the curated catalog. Curated order first,
@@ -526,5 +559,65 @@ mod tests {
         );
         assert_eq!(failed.source, comet_proto::CatalogSource::BuiltIn);
         assert_eq!(failed.models.len(), 1, "the curated list still works");
+    }
+
+    /// A relative program path with a directory in it is the case std warns
+    /// about: with `current_dir` set to the temp directory, a Unix child
+    /// chdirs before exec and the CLI is looked for in the wrong place. The
+    /// spawn failure would degrade silently to the built-in list.
+    #[test]
+    fn a_relative_program_path_is_absolutized() {
+        // Two components and it exists relative to the crate root, which is
+        // where cargo runs the test from.
+        let rel = std::path::Path::new("src/claude");
+        let out = program_path(rel);
+        assert!(
+            out.is_absolute(),
+            "a relative path with a directory must be resolved against the parent's cwd, got {out:?}"
+        );
+    }
+
+    /// A bare name is a PATH lookup, and must stay one — absolutizing it
+    /// against the parent's cwd would prefer a stray `./codex` over the
+    /// installed CLI.
+    #[test]
+    fn a_bare_command_name_stays_a_path_lookup() {
+        let bare = std::path::Path::new("codex");
+        assert_eq!(program_path(bare), bare.to_path_buf());
+    }
+
+    /// An absolute path is returned byte-identical, not canonicalized: on
+    /// Windows canonicalization yields a `\?\` verbatim path, which
+    /// `compose_child_path` would then put in the child's PATH.
+    #[test]
+    fn an_absolute_path_is_left_exactly_as_it_came() {
+        let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        assert_eq!(program_path(&abs), abs);
+    }
+    /// `ultra` is provider-reported on Codex, not layered on by Comet, so a
+    /// model nobody has curated must keep it. Slice 2.3's capture is the
+    /// evidence; before that it was filtered with the two real specials.
+    #[test]
+    fn a_live_only_model_keeps_a_provider_reported_ultra() {
+        let answer = Discovery {
+            models: vec![DiscoveredModel {
+                id: "gpt-5.7-nova".into(),
+                label: "Nova".into(),
+                description: None,
+                reasoning_levels: vec![
+                    ReasoningLevel::High,
+                    ReasoningLevel::Ultra,
+                    ReasoningLevel::Ultracode,
+                    ReasoningLevel::Ultrathink,
+                ],
+                accepts_images: Some(true),
+            }],
+        };
+        let merged = merge(Vec::new(), &answer);
+        assert_eq!(
+            merged[0].reasoning_levels,
+            vec![ReasoningLevel::High, ReasoningLevel::Ultra],
+            "ultracode and ultrathink are Comet's own; ultra is the provider's"
+        );
     }
 }

@@ -1,8 +1,8 @@
 //! Fake Codex app-server for comet-harness tests.
 //!
-//! Speaks scripted JSON-RPC 2.0 over stdio: initialize handshake, thread
-//! start/resume, then a scenario picked from the turn/start prompt text. Driven
-//! by crates/harness/tests/codex.rs.
+//! Speaks scripted JSON-RPC 2.0 over stdio: initialize handshake, then either a
+//! `model/list` discovery session or thread start/resume plus a scenario picked
+//! from the turn/start prompt text. Driven by crates/harness/tests/codex.rs.
 //!
 //! Rust rather than `#!/bin/sh` because Windows cannot spawn a shell script:
 //! the harness hands the path straight to `CreateProcess`, which rejects a
@@ -11,6 +11,8 @@
 use std::io::{BufRead, StdinLock, Write};
 use std::process::exit;
 use std::time::Duration;
+
+use serde_json::{Value, json};
 
 /// One JSON-RPC line. Rust's stdout is line-buffered even on a pipe, so each
 /// line reaches the harness before the fixture blocks on its next read.
@@ -50,6 +52,160 @@ fn fail_turn(id: &str, message: &str) {
     ));
 }
 
+/// One `model/list` entry, built through `serde_json` so a Windows path or a
+/// quoted cursor cannot produce a fixture that emits invalid JSON.
+///
+/// `modalities` is an `Option` because a model may omit `inputModalities`
+/// altogether — the absent case the schema documents as images-on.
+fn model_entry(
+    id: &str,
+    display_name: &str,
+    hidden: bool,
+    levels: &[&str],
+    modalities: Option<&[&str]>,
+) -> Value {
+    // Objects, not strings — the shape the real server answers with (capture
+    // `2026-08-11-codex-model-list.md`), and the one the phase spec's field
+    // summary gets wrong.
+    let efforts: Vec<Value> = levels
+        .iter()
+        .map(|l| json!({"reasoningEffort": l, "description": format!("effort {l}")}))
+        .collect();
+    let mut entry = json!({
+        "id": id,
+        "model": id,
+        "displayName": display_name,
+        "description": format!("{id} description"),
+        "modelSpecialty": null,
+        "hidden": hidden,
+        "isDefault": false,
+        "defaultReasoningEffort": "medium",
+        "supportedReasoningEfforts": efforts,
+        "supportsPersonality": false,
+        "additionalSpeedTiers": [],
+        "serviceTiers": [],
+        "defaultServiceTier": null,
+    });
+    if let Some(modalities) = modalities {
+        entry["inputModalities"] = json!(modalities);
+    }
+    entry
+}
+
+/// The discovery catalog. Three curated ids, two models only the server knows,
+/// and one hidden model the adapter must drop:
+///
+/// - `gpt-5.3-codex-spark` is text-only, so the live answer has to override a
+///   curated `accepts_images: true`.
+/// - `gpt-5.7-nova` omits `inputModalities` entirely — the absent case, which
+///   no live model produces and which the schema documents as images-on.
+/// - `gpt-5.7-nova` also reports `ultra`, which the provider genuinely supports
+///   and which must survive onto a model nobody has curated.
+/// - `codex-home-echo` carries the child's own `CODEX_HOME` as its label. The
+///   login check reads `auth.json` from a home the parent resolved, and only
+///   the child can say which home the CLI was actually handed; a test that
+///   cannot see this cannot tell the two apart.
+fn discovery_models() -> Vec<Value> {
+    const ULTRA: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+    const XHIGH: &[&str] = &["low", "medium", "high", "xhigh"];
+    const IMAGE: Option<&[&str]> = Some(&["text", "image"]);
+    const TEXT: Option<&[&str]> = Some(&["text"]);
+    let home = std::env::var("CODEX_HOME").unwrap_or_else(|_| "unset".into());
+    vec![
+        model_entry("gpt-5.6-sol", "gpt-5.6-sol label", false, ULTRA, IMAGE),
+        model_entry("gpt-5.5", "gpt-5.5 label", false, XHIGH, IMAGE),
+        model_entry(
+            "gpt-5.3-codex-spark",
+            "gpt-5.3-codex-spark label",
+            false,
+            XHIGH,
+            TEXT,
+        ),
+        model_entry("gpt-5.7-nova", "gpt-5.7-nova label", false, ULTRA, None),
+        model_entry("codex-home-echo", &home, false, XHIGH, TEXT),
+        model_entry(
+            "codex-auto-review",
+            "codex-auto-review label",
+            true,
+            XHIGH,
+            IMAGE,
+        ),
+    ]
+}
+
+/// Serve `model/list` until the client stops asking.
+///
+/// **Pages by default**, two at a time, because the real server returns all
+/// seven models in one page and would never exercise the client's loop. The
+/// last page carries an explicit `"nextCursor":null` rather than omitting the
+/// key, as 0.147.0 does.
+///
+/// **The cursor is deliberately hostile.** The real one is a stringified
+/// offset, but the schema calls it opaque, so this one keeps the offset and
+/// adds a quote and a backslash: a client that pastes it into a request string
+/// rather than serializing it sends malformed JSON on page two, and the paging
+/// silently degrades to the curated catalog.
+fn cursor_for(offset: usize) -> String {
+    format!("{offset}\"\\ opaque")
+}
+
+/// The offset back out of a cursor this fixture issued.
+fn offset_of(cursor: &str) -> usize {
+    cursor
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
+}
+
+fn model_list(stdin: &mut StdinLock<'_>, first: &str) {
+    let models = discovery_models();
+    let mut line = first.to_string();
+    // Every real session emits this, unprompted, before the reply the client is
+    // waiting on — on every run of the 2026-08-11 capture it arrived ahead of
+    // the `initialize` result. A client that reads the next line rather than
+    // the line carrying its own id takes this as its answer.
+    emit(
+        r#"{"method":"remoteControl/status/changed","params":{"status":"disabled","hostname":"fake"}}"#,
+    );
+    loop {
+        // Parsed rather than scanned: the cursor this fixture issues contains a
+        // quote, so a substring search would read it back truncated and serve
+        // the wrong page — hiding the very bug the hostile cursor exists to
+        // catch.
+        let request: Value = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(_) => exit(1),
+        };
+        let params = &request["params"];
+        let offset = params["cursor"].as_str().map(offset_of).unwrap_or(0);
+        let limit = params["limit"].as_u64().unwrap_or(2).max(1) as usize;
+        let end = (offset + limit).min(models.len());
+        let page: Vec<Value> = models.get(offset..end).unwrap_or_default().to_vec();
+        let next = if end < models.len() {
+            Value::String(cursor_for(end))
+        } else {
+            Value::Null
+        };
+        emit(
+            &json!({"id": request["id"], "result": {"data": page, "nextCursor": next}}).to_string(),
+        );
+
+        // EOF is the ordinary end of a discovery session: the client closes
+        // stdin once it has every page. Unlike `read_line`, that is not a
+        // failure here.
+        let mut buf = String::new();
+        match stdin.read_line(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => line = buf.trim_end_matches(['\r', '\n']).to_string(),
+        }
+        if !line.contains(r#""method":"model/list""#) {
+            return;
+        }
+    }
+}
+
 fn main() {
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
@@ -75,8 +231,15 @@ fn main() {
         exit(1);
     }
 
-    // ---- thread start / resume ---------------------------------------------
+    // ---- discovery, or a real session --------------------------------------
+    // A discovery session asks `model/list` and never starts a thread, so the
+    // branch is on the next method rather than on a scenario marker: it carries
+    // no prompt to put one in.
     let thread_line = read_line(&mut stdin);
+    if thread_line.contains(r#""method":"model/list""#) {
+        model_list(&mut stdin, &thread_line);
+        return;
+    }
     if thread_line.contains(r#""method":"thread/resume""#) {
         if thread_line.contains(r#""threadId":"resume-fail""#) {
             // Missing/foreign rollout: reject, expect the fresh-start fallback.

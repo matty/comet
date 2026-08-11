@@ -28,6 +28,7 @@
 
 mod approval;
 mod catalog;
+mod discovery;
 mod normalize;
 mod rpc;
 
@@ -137,6 +138,13 @@ pub struct CodexHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
+    /// One `model/list` per boot. `models()` is also called by titling
+    /// (`crates/engine/src/titles.rs:159`) on every title generation, so an
+    /// uncached discovery would spawn an app-server on a path the user never
+    /// sees.
+    discovery_cache: crate::discovery::DiscoveryCache,
+    /// Overrides `$CODEX_HOME`/`~/.codex` for the login check; tests set it.
+    codex_home: Option<PathBuf>,
 }
 
 impl Default for CodexHarness {
@@ -145,6 +153,8 @@ impl Default for CodexHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
+            discovery_cache: crate::discovery::DiscoveryCache::default(),
+            codex_home: None,
         }
     }
 }
@@ -195,7 +205,30 @@ impl CodexHarness {
     /// Use a fixed CLI binary instead of PATH/known-location resolution.
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
+        // A cached answer belongs to the CLI that gave it. Carried across a
+        // change of executable it would be replayed for a binary that was
+        // never asked, and the picker would show one CLI's models under
+        // another's name.
+        self.discovery_cache = crate::discovery::DiscoveryCache::default();
         self
+    }
+
+    /// Use a fixed Codex home instead of `$CODEX_HOME`/`~/.codex`.
+    ///
+    /// Discovery reads `auth.json` there to decide whether asking the CLI is
+    /// worth anything (see [`discovery::codex_home`]), so a test driving the
+    /// fake app-server has to bring a home that looks logged in — otherwise it
+    /// asserts against whatever the machine running it happens to have.
+    pub fn with_codex_home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.codex_home = Some(home.into());
+        self.discovery_cache = crate::discovery::DiscoveryCache::default();
+        self
+    }
+
+    /// Where this device's Codex credentials live. Overridden by
+    /// [`Self::with_codex_home`], else `$CODEX_HOME`, else `~/.codex`.
+    fn codex_home(&self) -> Option<PathBuf> {
+        self.codex_home.clone().or_else(discovery::codex_home)
     }
 
     /// Tune the interrupt→SIGTERM→SIGKILL escalation timing.
@@ -237,16 +270,28 @@ impl Harness for CodexHarness {
         }
     }
 
-    /// The curated static catalog (see [`catalog`]); requires an installed CLI
-    /// so an absent binary surfaces as [`HarnessError::NotInstalled`] here.
-    /// This is the seam for live discovery: a short-lived `codex app-server`
-    /// paging `model/list` (experimentalApi) exactly as codex.ts does.
+    /// The curated catalog (see [`catalog`]) unioned with whatever a
+    /// short-lived `codex app-server` reported. An absent CLI still surfaces as
+    /// [`HarnessError::NotInstalled`] rather than as a failed discovery: the
+    /// user's action is different, and the picker's caption is not the place to
+    /// say "no CLI".
     async fn models(&self) -> Result<ModelCatalog, HarnessError> {
-        self.resolve_executable()?;
-        // 2.2/2.3 replace this with a `DiscoveryCache::get` over a real
-        // handshake. Until then the adapter must report `BuiltIn` honestly,
-        // or the picker's caption would lie in the other direction.
-        Ok(ModelCatalog::built_in(static_models()))
+        let exe = self.resolve_executable()?;
+        let home = self.codex_home();
+        let curated = static_models();
+        let discovery = self
+            .discovery_cache
+            .get(move || discovery::discover(exe, home))
+            .await;
+        Ok(self.discovery_cache.catalog(curated, discovery))
+    }
+
+    fn clear_discovery(&self) {
+        self.discovery_cache.clear();
+    }
+
+    fn take_unreported_discovery_failure(&self) -> Option<crate::discovery::DiscoveryFailure> {
+        self.discovery_cache.take_unreported_failure()
     }
 
     async fn run(
