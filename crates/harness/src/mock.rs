@@ -54,13 +54,6 @@ impl MockHarness {
         }
     }
 
-    /// The cache behind `models()`, kept reachable rather than buried: a test
-    /// that scripts a failure (`with_failing_discovery`) needs to read the
-    /// cached failure kind back off the harness without re-running discovery.
-    pub fn discovery_cache(&self) -> &DiscoveryCache {
-        &self.discovery_cache
-    }
-
     /// The curated model list both the unscripted and scripted arms of
     /// `models()` name — kept in one place so a change to one can't drift
     /// from the other. `mock-1` and `mock-fable-5` are used by scripted UI

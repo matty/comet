@@ -3,7 +3,7 @@
 //!
 //! Methods (feature-inventory §2):
 //! - `ListHarnesses` → `[HarnessDescriptor]`
-//! - `ListModels {harness}` → `{models, source}`
+//! - `ListModels {harness, force}` → `{models, source}`
 //! - `QueueCommand {chatId, command}` → `{commandId}` (durable doc command)
 //! - `WatchDocMessages {chatId}` → stream of joined `SessionMessageEntry[]`,
 //!   re-emitted on every doc change

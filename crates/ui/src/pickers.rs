@@ -999,6 +999,9 @@ impl Pickers {
     /// `force` there would re-spawn a discovery subprocess per frame. Only a
     /// discrete user demand (the Retry row, re-arming a cancelled slot) may
     /// force; opening the picker and the eager render kick both pass `false`.
+    /// `force` is read only after the Absent-or-Idle guard below, so a forced
+    /// call still no-ops on a Loading/Ready/Error slot; the caller must clear
+    /// the slot first.
     fn ensure_models(&mut self, harness: HarnessId, force: bool, cx: &mut Context<Self>) {
         // Absent or Idle only — same render-loop hazard as `ensure_harnesses`;
         // the retry row clears the map to re-arm.
