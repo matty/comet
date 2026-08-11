@@ -26,15 +26,36 @@ use comet_proto::ReasoningLevel;
 
 use crate::discovery::{DiscoveredModel, Discovery, DiscoveryFailure};
 
-/// Matches `PROBE_TIMEOUT`: the observed answer is ~1.2s, and the wait is paid
-/// once per boot by a caller that already has a spinner and a Cancel (2.1's
-/// `Loadable` slot).
+/// Matches `PROBE_TIMEOUT`. With `--bare` the observed answer is under a
+/// second, and the wait is paid once per boot by a caller that already has a
+/// spinner and a Cancel (2.1's `Loadable` slot). Ten seconds is therefore a
+/// long way past a healthy answer — but see `DISCOVERY_ARGS`: a spawn that
+/// runs the user's hooks blew through it, and the margin is what makes a slow
+/// machine degrade to the built-in list rather than a slow one hang.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The spawn arguments for a session that will never run a turn: the
-/// stream-json transport and nothing else. Deliberately NOT `build_command`'s
+/// stream-json transport, and `--bare`. Deliberately NOT `build_command`'s
 /// list — `--permission-prompt-tool`, `--permission-mode`, `--model` and
 /// `--include-partial-messages` all describe a turn, and there is none.
+///
+/// **`--bare` is load-bearing, not tidiness.** It skips hooks, LSP, plugin
+/// sync, auto-memory and CLAUDE.md discovery. Without it the user's
+/// `SessionStart` hooks run in a session that will never prompt: measured in
+/// the real app on Windows, that was 7.1s of startup plus 3.5s of hook before
+/// the reply, i.e. **10.6s — past this timeout**, and the picker fell back to
+/// the built-in list. With `--bare` the same machine answers in 0.7s with a
+/// byte-identical model list.
+///
+/// Two consequences worth knowing. `account` degrades to
+/// `{"tokenSource":"none"}` because OAuth and keychain are never read — fine
+/// here, since nothing reads `account`, and it keeps the user's email off the
+/// wire entirely. And `commands` shrinks to the built-ins (42 vs 66 observed),
+/// because user and project skills are not discovered: **slice 2.4 cannot read
+/// the command list from this spawn.**
+///
+/// An older CLI that does not know `--bare` fails the spawn, which degrades to
+/// the built-in list and its caption rather than to a wrong answer.
 const DISCOVERY_ARGS: &[&str] = &[
     "--print",
     "--input-format",
@@ -42,6 +63,7 @@ const DISCOVERY_ARGS: &[&str] = &[
     "--output-format",
     "stream-json",
     "--verbose",
+    "--bare",
 ];
 
 /// Every field but `subtype` is optional (sdk.d.ts:3227-3264), and an empty
