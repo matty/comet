@@ -68,6 +68,8 @@ pub(crate) const NOTICE_SUBTYPES: &[&str] = &[
 /// elicitation_complete, files_persisted, plugin_install, worker_shutting_down.
 pub(crate) const IGNORED_FRAMES: &[(&str, &str)] = &[
     // top-level frame types
+    // Still ignored on a RUN stream; the discovery session reads its own
+    // (claude/discovery.rs), and nothing on a run replies to us.
     ("control_response", "reply-channel"),
     ("control_cancel_request", "control-plumbing"),
     ("keep_alive", "transport-ping"),

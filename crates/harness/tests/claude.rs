@@ -648,3 +648,110 @@ async fn unclaimed_frames_surface_as_diagnostics_and_ignored_frames_stay_silent(
         })
     ));
 }
+
+/// The slice's deliverable: a real spawn, a real handshake round-trip, and a
+/// merged catalog that says it is live. The fixture answers `initialize`
+/// shaped exactly as Claude Code 2.1.227 did in the 2026-08-11 capture.
+#[tokio::test]
+async fn models_come_back_live_and_merged() {
+    let catalog = harness().models().await.expect("models");
+    assert_eq!(catalog.source, comet_proto::CatalogSource::Live);
+    let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
+    assert!(
+        ids.contains(&"claude-sonnet-5"),
+        "the live `sonnet` merged onto its curated row, got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"sonnet"),
+        "an alias must not become its own row, got {ids:?}"
+    );
+    assert!(
+        ids.contains(&"claude-opus-4-8"),
+        "a curated model the CLI did not list is still kept, got {ids:?}"
+    );
+}
+
+/// An answer we cannot read is the one failure that means a provider changed
+/// its protocol under us, and it must survive as `Unparseable` so the engine
+/// raises its `Diagnostic` (`crates/engine/src/rpc.rs:1010`).
+#[tokio::test]
+async fn an_unreadable_answer_is_reported_as_drift() {
+    let harness =
+        ClaudeHarness::new().with_executable(env!("CARGO_BIN_EXE_fake-claude-bad-discovery"));
+    let catalog = harness.models().await.expect("still answers");
+    assert_eq!(
+        catalog.source,
+        comet_proto::CatalogSource::BuiltIn,
+        "a broken handshake still serves the curated list"
+    );
+    assert_eq!(
+        harness.take_unreported_discovery_failure(),
+        Some(comet_harness::discovery::DiscoveryFailure::Unparseable)
+    );
+}
+
+/// A CLI that cannot be spawned is ordinary, not drift — otherwise every
+/// machine without Claude installed would report a protocol failure on boot.
+#[tokio::test]
+async fn a_missing_cli_is_not_drift() {
+    let harness = ClaudeHarness::new().with_executable("/nonexistent/claude-nowhere");
+    let catalog = harness.models().await.expect("curated list still answers");
+    assert_eq!(catalog.source, comet_proto::CatalogSource::BuiltIn);
+    assert_eq!(
+        harness.take_unreported_discovery_failure(),
+        Some(comet_harness::discovery::DiscoveryFailure::Unreachable)
+    );
+}
+
+/// The live check, against the real CLI rather than the fixture: the handshake
+/// answers, the merge lands on curated ids, and no alias or duplicate reaches
+/// the picker. Ignored by default — it needs an installed, authenticated
+/// `claude` — but it spends no tokens, because a discovery session never runs
+/// a turn.
+/// Run with: `cargo test -p comet-harness --test claude -- --ignored`
+#[tokio::test]
+#[ignore = "requires installed+authenticated claude CLI (spends no tokens)"]
+async fn live_cli_discovery_lands_on_curated_ids() {
+    let catalog = ClaudeHarness::new().models().await.expect("models");
+    let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        catalog.source,
+        comet_proto::CatalogSource::Live,
+        "the real handshake answered, got {ids:?}"
+    );
+    assert_eq!(
+        ids,
+        vec![
+            "claude-fable-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+        ],
+        "six curated rows: no `sonnet`, no `opus[1m]`, no `default`"
+    );
+}
+
+/// The cache belongs to the CLI it asked, not to the harness value. Pointing a
+/// harness at a different executable and re-asking must re-run discovery —
+/// otherwise the second CLI's answer is whatever the first one said. Latent
+/// today (production never calls `with_executable`, and every test builds the
+/// harness in one chain), but the builder is public and the failure would be
+/// silent.
+#[tokio::test]
+async fn changing_the_executable_re_runs_discovery() {
+    let harness = harness();
+    assert_eq!(
+        harness.models().await.expect("first").source,
+        comet_proto::CatalogSource::Live,
+        "the good fixture answers"
+    );
+
+    let harness = harness.with_executable(env!("CARGO_BIN_EXE_fake-claude-bad-discovery"));
+    assert_eq!(
+        harness.models().await.expect("second").source,
+        comet_proto::CatalogSource::BuiltIn,
+        "the new executable is asked, not the old answer replayed"
+    );
+}

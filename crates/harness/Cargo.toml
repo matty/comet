@@ -38,3 +38,7 @@ path = "tests/fixtures/fake_claude.rs"
 [[bin]]
 name = "fake-codex"
 path = "tests/fixtures/fake_codex.rs"
+
+[[bin]]
+name = "fake-claude-bad-discovery"
+path = "tests/fixtures/fake_claude_bad_discovery.rs"
