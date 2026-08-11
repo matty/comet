@@ -648,3 +648,25 @@ async fn unclaimed_frames_surface_as_diagnostics_and_ignored_frames_stay_silent(
         })
     ));
 }
+
+/// The slice's deliverable: a real spawn, a real handshake round-trip, and a
+/// merged catalog that says it is live. The fixture answers `initialize`
+/// shaped exactly as Claude Code 2.1.227 did in the 2026-08-11 capture.
+#[tokio::test]
+async fn models_come_back_live_and_merged() {
+    let catalog = harness().models().await.expect("models");
+    assert_eq!(catalog.source, comet_proto::CatalogSource::Live);
+    let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
+    assert!(
+        ids.contains(&"claude-sonnet-5"),
+        "the live `sonnet` merged onto its curated row, got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"sonnet"),
+        "an alias must not become its own row, got {ids:?}"
+    );
+    assert!(
+        ids.contains(&"claude-opus-4-8"),
+        "a curated model the CLI did not list is still kept, got {ids:?}"
+    );
+}

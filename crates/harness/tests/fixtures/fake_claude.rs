@@ -81,11 +81,26 @@ fn check_permission_mode() {
     }
 }
 
+/// Shaped exactly like Claude Code 2.1.227's answer, including the double
+/// nesting and `resolvedModel` — see the 2026-08-11 initialize capture. Two
+/// models are enough to prove the merge; the full five are pinned in
+/// `claude/discovery.rs`'s unit test.
+const INITIALIZE_REPLY: &str = r#"{"type":"control_response","response":{"subtype":"success","request_id":"comet-discovery-1","response":{"commands":[],"agents":[],"output_style":"default","available_output_styles":["default"],"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-5","displayName":"Sonnet","description":"Sonnet 5","supportsEffort":true,"supportedEffortLevels":["low","high"]},{"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001","displayName":"Haiku","description":"Haiku 4.5"}],"account":{"email":"user@example.test","organization":"Example","subscriptionType":"Claude Max","apiProvider":"firstParty"},"pid":1234,"current_permission_mode":"acceptEdits"}}}"#;
+
 fn main() {
     check_permission_mode();
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
     let first = read_line(&mut stdin);
+
+    // A discovery session sends no prompt: its first line is the control
+    // request. Answering it here is what gives `models()` a real spawn and a
+    // real round-trip to be tested against.
+    if first.contains("control_request") {
+        emit(INITIALIZE_REPLY);
+        // The adapter closes stdin to end the session; a real CLI exits 0.
+        exit(0);
+    }
 
     if first.contains("scenario:happy") {
         happy();

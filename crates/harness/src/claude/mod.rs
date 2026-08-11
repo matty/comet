@@ -96,6 +96,11 @@ pub struct ClaudeHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
+    /// One handshake per boot. `models()` is also called by titling
+    /// (`crates/engine/src/titles.rs:159`) on every title generation, so an
+    /// uncached discovery would spawn a CLI on a path the user never sees —
+    /// and each spawn runs the user's `SessionStart` hooks.
+    discovery_cache: crate::discovery::DiscoveryCache,
 }
 
 impl Default for ClaudeHarness {
@@ -104,6 +109,7 @@ impl Default for ClaudeHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
+            discovery_cache: crate::discovery::DiscoveryCache::default(),
         }
     }
 }
@@ -266,15 +272,28 @@ impl Harness for ClaudeHarness {
         }
     }
 
-    /// The curated static catalog (see [`catalog`]); requires an installed CLI
-    /// so an absent binary surfaces as [`HarnessError::NotInstalled`] here,
-    /// like the TS harness's discovery call.
+    /// The curated catalog (see [`catalog`]) unioned with whatever the live
+    /// handshake reported. An absent CLI still surfaces as
+    /// [`HarnessError::NotInstalled`] rather than as a failed discovery: the
+    /// user's action is different, and the picker's caption is not the place to
+    /// say "no CLI".
     async fn models(&self) -> Result<ModelCatalog, HarnessError> {
-        self.resolve_executable()?;
-        // 2.2/2.3 replace this with a `DiscoveryCache::get` over a real
-        // handshake. Until then the adapter must report `BuiltIn` honestly,
-        // or the picker's caption would lie in the other direction.
-        Ok(ModelCatalog::built_in(static_models()))
+        let exe = self.resolve_executable()?;
+        let curated = static_models();
+        let curated_ids: Vec<String> = curated.iter().map(|m| m.id.clone()).collect();
+        let discovery = self
+            .discovery_cache
+            .get(move || discovery::discover(exe, curated_ids))
+            .await;
+        Ok(self.discovery_cache.catalog(curated, discovery))
+    }
+
+    fn clear_discovery(&self) {
+        self.discovery_cache.clear();
+    }
+
+    fn take_unreported_discovery_failure(&self) -> Option<crate::discovery::DiscoveryFailure> {
+        self.discovery_cache.take_unreported_failure()
     }
 
     async fn run(

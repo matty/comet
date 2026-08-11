@@ -14,11 +14,111 @@
 //! `resolvedModel` is a Claude field; `crate::discovery` stays
 //! provider-agnostic and unchanged.
 
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
 use serde::Deserialize;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 
 use comet_proto::ReasoningLevel;
 
 use crate::discovery::{DiscoveredModel, Discovery, DiscoveryFailure};
+
+/// Matches `PROBE_TIMEOUT`: the observed answer is ~1.2s, and the wait is paid
+/// once per boot by a caller that already has a spinner and a Cancel (2.1's
+/// `Loadable` slot).
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The spawn arguments for a session that will never run a turn: the
+/// stream-json transport and nothing else. Deliberately NOT `build_command`'s
+/// list — `--permission-prompt-tool`, `--permission-mode`, `--model` and
+/// `--include-partial-messages` all describe a turn, and there is none.
+const DISCOVERY_ARGS: &[&str] = &[
+    "--print",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+];
+
+/// Every field but `subtype` is optional (sdk.d.ts:3227-3264), and an empty
+/// request is what the capture drove.
+const INITIALIZE_LINE: &str = r#"{"type":"control_request","request_id":"comet-discovery-1","request":{"subtype":"initialize"}}"#;
+
+/// Spawn a short-lived CLI, ask once, and take the first control response.
+///
+/// Owned arguments because the future is handed to `DiscoveryCache` and
+/// outlives the caller's frame.
+pub(crate) async fn discover(
+    exe: PathBuf,
+    curated_ids: Vec<String>,
+) -> Result<Discovery, DiscoveryFailure> {
+    match tokio::time::timeout(DISCOVERY_TIMEOUT, handshake(&exe, &curated_ids)).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::debug!(cli = %exe.display(), "claude discovery timed out");
+            Err(DiscoveryFailure::Unreachable)
+        }
+    }
+}
+
+async fn handshake(exe: &Path, curated_ids: &[String]) -> Result<Discovery, DiscoveryFailure> {
+    let mut cmd = Command::new(exe);
+    crate::compose_child_path(&mut cmd, exe);
+    cmd.args(DISCOVERY_ARGS)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        // The timeout arm drops this future; without kill_on_drop the child
+        // outlives the discovery and we leak a CLI per attempt.
+        .kill_on_drop(true)
+        // Any directory would do for models — the capture found the model list
+        // identical across cwds while `commands` varied — and a neutral one
+        // avoids loading a project's own settings for a session with no turn.
+        .current_dir(std::env::temp_dir());
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW, as in `probe_cli_version`: the `.cmd` shims are
+        // console apps and would flash a window on every boot otherwise.
+        cmd.creation_flags(0x0800_0000);
+    }
+
+    let mut child = cmd.spawn().map_err(|err| {
+        tracing::debug!(cli = %exe.display(), %err, "claude discovery spawn failed");
+        DiscoveryFailure::Unreachable
+    })?;
+    let mut stdin = child.stdin.take().ok_or(DiscoveryFailure::Unreachable)?;
+    let stdout = child.stdout.take().ok_or(DiscoveryFailure::Unreachable)?;
+
+    stdin
+        .write_all(format!("{INITIALIZE_LINE}\n").as_bytes())
+        .await
+        .map_err(|_| DiscoveryFailure::Unreachable)?;
+    stdin
+        .flush()
+        .await
+        .map_err(|_| DiscoveryFailure::Unreachable)?;
+
+    // The session emits hook and system frames before the answer — the user's
+    // SessionStart hooks run even in a session with no turn — so read until the
+    // control response rather than taking the first line.
+    let mut lines = BufReader::new(stdout).lines();
+    let mut answer = Err(DiscoveryFailure::Unreachable);
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.contains("\"control_response\"") {
+            let borrowed: Vec<&str> = curated_ids.iter().map(String::as_str).collect();
+            answer = discovery_from_reply(&line, &borrowed);
+            break;
+        }
+    }
+    // Closing stdin is what ends the session; the capture saw exit 0 within
+    // 600ms of the close. `kill_on_drop` covers a CLI that does not.
+    drop(stdin);
+    answer
+}
 
 #[derive(Deserialize)]
 struct ControlResponseFrame {
