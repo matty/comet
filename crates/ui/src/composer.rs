@@ -3294,6 +3294,24 @@ fn completion_scrollbar(handle: &gpui::ScrollHandle, theme: &Theme) -> Option<gp
     )
 }
 
+/// How the composer's notice band should read.
+///
+/// Declared by whoever raises the notice, **not derived from its wording**.
+/// The tone used to be decided by `message == "Engine not connected"`, which
+/// made the copy load-bearing: editing that sentence would have silently
+/// turned an amber "not connected yet" into a red failure, with no test and
+/// nothing on screen to say why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeTone {
+    /// A state to resolve, not something that went wrong: the engine has not
+    /// connected yet, no space is chosen, the model cannot take images. 0.2a's
+    /// ruling on the availability rail — amber, because the user caused
+    /// nothing and the fix is theirs to make.
+    Pending,
+    /// Something failed: a send, a run, an unreadable attachment.
+    Failure,
+}
+
 /// Why an image was refused, naming the model that refused it.
 ///
 /// One sentence with the reason and the fix, never a raw provider error: the
@@ -3381,7 +3399,7 @@ pub struct Composer {
     mention: FileMentionState,
     current_key: Option<ServerRef>,
     sending: bool,
-    failure: Option<SharedString>,
+    failure: Option<(SharedString, NoticeTone)>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
     /// Requests already answered locally (suppresses the panel until the doc
@@ -3578,7 +3596,7 @@ impl Composer {
             // pick another one. Per `.agents/rules/user-facing-errors.md` the
             // state says what happened and what to do about it.
             let label = self.pickers.read(cx).selected_model_label(cx);
-            self.failure = Some(attachment_blocked_message(label));
+            self.failure = Some((attachment_blocked_message(label), NoticeTone::Pending));
             cx.notify();
             return;
         }
@@ -3601,7 +3619,7 @@ impl Composer {
             match attachments::stage_file(path) {
                 Ok(att) => staged.push(att),
                 Err(message) => {
-                    self.failure = Some(message.into());
+                    self.failure = Some((message.into(), NoticeTone::Failure));
                     cx.notify();
                 }
             }
@@ -4440,7 +4458,7 @@ impl Composer {
     /// reasoning / options on the Run request itself (§1.7).
     fn send(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).selected_client() else {
-            self.failure = Some("Engine not connected".into());
+            self.failure = Some(("Engine not connected".into(), NoticeTone::Pending));
             cx.notify();
             return;
         };
@@ -4471,7 +4489,10 @@ impl Composer {
         // device, not necessarily this one.
         let space = self.state.read(cx).selected_space_row().cloned();
         if is_new && space.is_none() {
-            self.failure = Some("Add a space first".into());
+            // Left on `Failure` deliberately: it is red today, and recolouring
+            // an unrelated surface is not this slice's change to make. It reads
+            // like a `Pending` state and is the obvious next one to move.
+            self.failure = Some(("Add a space first".into(), NoticeTone::Failure));
             cx.notify();
             return;
         }
@@ -4747,7 +4768,7 @@ impl Composer {
                         cx.notify();
                     });
                     if composer.current_key == err_chat_key {
-                        composer.failure = Some(message.into());
+                        composer.failure = Some((message.into(), NoticeTone::Failure));
                         composer
                             .input
                             .update(cx, |input, cx| input.set_text(restore_text, cx));
@@ -4791,7 +4812,8 @@ impl Composer {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
-                    composer.failure = Some(format!("Stop failed: {err}").into());
+                    composer.failure =
+                        Some((format!("Stop failed: {err}").into(), NoticeTone::Failure));
                     cx.notify();
                 })
                 .ok();
@@ -4893,7 +4915,8 @@ impl Composer {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
-                    composer.failure = Some(format!("Answer failed: {err}").into());
+                    composer.failure =
+                        Some((format!("Answer failed: {err}").into(), NoticeTone::Failure));
                     // The answer never left this device — put the panel back.
                     composer.answered_requests.remove(&request_id);
                     cx.notify();
@@ -4968,7 +4991,10 @@ impl Composer {
                     if composer.current_key != owner {
                         return;
                     }
-                    composer.failure = Some(crate::errors::approval_failure(&err).into());
+                    composer.failure = Some((
+                        crate::errors::approval_failure(&err).into(),
+                        NoticeTone::Failure,
+                    ));
                     // The decision never left this device — put the row back.
                     // Unconditional, unlike `restore_approval_row`'s own
                     // notify: if the approval resolved externally during the
@@ -5606,15 +5632,14 @@ impl Render for Composer {
             .gap(px(Theme::SPACE_SM))
             .px(px(Theme::SPACE_LG))
             .pb(px(Theme::SPACE_LG))
-            .when_some(failure, |el, message| {
+            .when_some(failure, |el, (message, tone)| {
                 // comet composer.tsx `Notice` (matches the transcript
                 // ErrorChip palette): `flex items-start gap-2 rounded-xl
                 // border px-3 py-2 text-[12px] leading-snug` with a 14px
                 // DangerTriangle — a subtle tinted wash, not a bare red
-                // stroke. Amber for the offline-ish case (engine not
-                // connected), red for send/run failures. Click dismisses.
-                let offline = message.as_ref() == "Engine not connected";
-                let (border_c, wash, text_c) = if offline {
+                // stroke. Amber for a state to resolve, red for a failure;
+                // the raiser declares which. Click dismisses.
+                let (border_c, wash, text_c) = if tone == NoticeTone::Pending {
                     let amber = theme.warning; // amber-400
                     let amber_200 = theme.warning_muted;
                     (
@@ -5729,7 +5754,7 @@ impl Render for Composer {
         // availability rail, and 1.5 found it again on the approval card.
         let attach_tooltip: Option<SharedString> = (!accepts_images)
             .then(|| attachment_blocked_message(self.pickers.read(cx).selected_model_label(cx)))
-            .filter(|message| self.failure.as_ref() != Some(message));
+            .filter(|message| self.failure.as_ref().map(|(text, _)| text) != Some(message));
         let attach = div()
             .id("composer-attach")
             .ml(px(4.0))
@@ -5760,7 +5785,7 @@ impl Render for Composer {
                     this.open_file_picker(cx);
                 } else {
                     let label = this.pickers.read(cx).selected_model_label(cx);
-                    this.failure = Some(attachment_blocked_message(label));
+                    this.failure = Some((attachment_blocked_message(label), NoticeTone::Pending));
                     cx.notify();
                 }
             }))
