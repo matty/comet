@@ -558,10 +558,18 @@
       "fact": "Healthy runs emit the routine notification methods assigned to the ignored tier.",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/fresh-text/manifest.json",
+          "manifest": "codex/0.147.0/fresh-text/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 3,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 16,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 17,
               "channel": "stdout"
             }
           ]
@@ -574,10 +582,18 @@
       "fact": "The diagnostic fixture emits the capture-confirmed routine Codex notification set.",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/fresh-text/manifest.json",
+          "manifest": "codex/0.147.0/fresh-text/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 3,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 16,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 17,
               "channel": "stdout"
             }
           ]
@@ -590,10 +606,18 @@
       "fact": "Capture-confirmed routine Codex notifications produce no diagnostic event.",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/fresh-text/manifest.json",
+          "manifest": "codex/0.147.0/fresh-text/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 3,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 16,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 17,
               "channel": "stdout"
             }
           ]

@@ -944,7 +944,7 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
     );
 
     let errors = validate_corpus(&corpus_root);
-    assert_eq!(errors.len(), 12, "inventory errors: {errors:#?}");
+    assert_eq!(errors.len(), 9, "inventory errors: {errors:#?}");
     assert!(
         errors
             .iter()
@@ -982,14 +982,6 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "codex-file-change-diff-shape",
             "codex-file-change-kind-object",
             "codex-file-change-kind-source",
-        ],
-    );
-    add(
-        "codex/pending-observed-version/fresh-text/manifest.json",
-        &[
-            "codex-routine-notification-fixture",
-            "codex-routine-notification-ignore-list",
-            "codex-routine-notification-integration",
         ],
     );
     assert_eq!(actual, expected, "pending error identity/path set changed");
@@ -1064,6 +1056,9 @@ fn corpus_promoted_token_free_claims_are_valid() {
             "codex-model-request-shape",
             "codex-model-source-notification-order",
             "codex-model-text-only-integration",
+            "codex-routine-notification-fixture",
+            "codex-routine-notification-ignore-list",
+            "codex-routine-notification-integration",
         ])
     );
     let errors = validate_corpus(&corpus_root);
