@@ -379,6 +379,256 @@ mod availability_tests {
     }
 }
 
+/// Where the CLI Comet spawns came from.
+///
+/// Always *derived* from the resolved path against the directory lists the
+/// harness already searches — never asked of the CLI. `claude doctor` exists
+/// but is a health checkup rather than a machine-readable install report, and
+/// it costs a subprocess to learn less than the path already says.
+///
+/// [`Unknown`] is the default and the catch-all, which is load-bearing: this
+/// rides inside the `Vec<HarnessDescriptor>` that `ListHarnesses` answers with,
+/// and that decode is all-or-nothing. A strict enum would mean adding a variant
+/// here blanks the entire agent catalog on every older peer, so the
+/// `Deserialize` below folds anything unrecognized into `Unknown` instead. That
+/// is also why adding a variant needs no `PROTOCOL_VERSION` bump.
+///
+/// [`Unknown`]: InstallMethod::Unknown
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InstallMethod {
+    /// `CLAUDE_CODE_EXECUTABLE` / `CODEX_EXECUTABLE` named this binary.
+    ///
+    /// Deliberately not a method. When the user points an env var at a file,
+    /// how it was installed is genuinely unknowable, and naming the override is
+    /// honest where guessing "native" would not be.
+    Override,
+    /// The provider's own installer, in its per-user directory.
+    Native,
+    /// A global npm install.
+    Npm,
+    Fnm,
+    Volta,
+    Pnpm,
+    Bun,
+    Nvm,
+    Winget,
+    Scoop,
+    Homebrew,
+    /// Resolved from somewhere we do not recognize. A real answer rather than a
+    /// failure — a CLI on PATH in a bespoke location works fine, and saying so
+    /// beats implying something is wrong with it.
+    #[default]
+    Unknown,
+}
+
+impl InstallMethod {
+    /// The wire spelling, matching what `Serialize` emits.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Override => "override",
+            Self::Native => "native",
+            Self::Npm => "npm",
+            Self::Fnm => "fnm",
+            Self::Volta => "volta",
+            Self::Pnpm => "pnpm",
+            Self::Bun => "bun",
+            Self::Nvm => "nvm",
+            Self::Winget => "winget",
+            Self::Scoop => "scoop",
+            Self::Homebrew => "homebrew",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Anything unrecognized becomes [`Unknown`] rather than an error. See the
+    /// type's own doc for why that is not laziness.
+    ///
+    /// [`Unknown`]: InstallMethod::Unknown
+    pub fn from_wire(raw: &str) -> Self {
+        match raw {
+            "override" => Self::Override,
+            "native" => Self::Native,
+            "npm" => Self::Npm,
+            "fnm" => Self::Fnm,
+            "volta" => Self::Volta,
+            "pnpm" => Self::Pnpm,
+            "bun" => Self::Bun,
+            "nvm" => Self::Nvm,
+            "winget" => Self::Winget,
+            "scoop" => Self::Scoop,
+            "homebrew" => Self::Homebrew,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// How this reads on a settings card.
+    ///
+    /// The package managers keep their own lowercase spelling — `npm` and
+    /// `pnpm` are wordmarks, and title-casing them reads as a typo.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Override => "Set by override",
+            Self::Native => "Native installer",
+            Self::Npm => "npm (global)",
+            Self::Fnm => "fnm",
+            Self::Volta => "Volta",
+            Self::Pnpm => "pnpm",
+            Self::Bun => "Bun",
+            Self::Nvm => "nvm",
+            Self::Winget => "WinGet",
+            Self::Scoop => "Scoop",
+            Self::Homebrew => "Homebrew",
+            Self::Unknown => "Unrecognized location",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for InstallMethod {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::from_wire(&raw))
+    }
+}
+
+/// The install Comet actually spawns: which binary, and how it got there.
+///
+/// A sibling of [`HarnessAvailability`] rather than a field inside it, because
+/// the path is worth most exactly when the CLI is *broken* — a "Not working"
+/// row that names the binary is the difference between a shrug and a diagnosis,
+/// and hanging it off the `Available` variant would lose it there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessInstall {
+    /// The resolved executable, as a display string.
+    ///
+    /// A path and nothing more. Never read, hashed, or copied: a native
+    /// `claude.exe` is ~300MB, so anything that touches the file itself turns a
+    /// settings card into a disk-bound operation.
+    pub path: String,
+    #[serde(default)]
+    pub method: InstallMethod,
+}
+
+/// What one resolve-and-probe pass learned about a provider's CLI.
+///
+/// Deliberately **not** a wire type: `HarnessDescriptor` publishes the two
+/// halves as siblings, matching how they are consumed. This exists so the pass
+/// that produces them cannot produce one without the other — a path shown
+/// beside a version it was not probed with would be worse than showing
+/// neither.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HarnessProbe {
+    pub availability: HarnessAvailability,
+    /// Absent only when resolution never yielded a path at all.
+    pub install: Option<HarnessInstall>,
+}
+
+impl HarnessProbe {
+    /// A probe that never got as far as a path: the CLI did not resolve, or the
+    /// harness could not be constructed to ask.
+    pub fn unresolved(availability: HarnessAvailability) -> Self {
+        Self {
+            availability,
+            install: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+
+    /// The blast-radius rule, in the direction that actually bites: a NEWER
+    /// peer sending a method this build has never heard of. `ListHarnesses`
+    /// decodes as one vector, so an error here would blank every harness rather
+    /// than degrade one line of one card.
+    #[test]
+    fn an_unknown_method_degrades_instead_of_failing_the_batch() {
+        let decoded: HarnessInstall = serde_json::from_str(
+            r#"{"path":"/opt/nix/store/abc/bin/codex","method":"nixProfile"}"#,
+        )
+        .expect("an unrecognized method must not fail the decode");
+        assert_eq!(decoded.method, InstallMethod::Unknown);
+        // The path still arrives, which is the half that was worth sending.
+        assert_eq!(decoded.path, "/opt/nix/store/abc/bin/codex");
+    }
+
+    /// An older engine sends the path with no method at all.
+    #[test]
+    fn an_absent_method_reads_as_unknown() {
+        let decoded: HarnessInstall =
+            serde_json::from_str(r#"{"path":"C:\\Users\\a\\.local\\bin\\claude.exe"}"#).unwrap();
+        assert_eq!(decoded.method, InstallMethod::Unknown);
+    }
+
+    /// `as_wire_str` and the derived `Serialize` must not drift — `from_wire`
+    /// is written against the strings the derive emits, so a `rename_all`
+    /// change that silently altered one would break decoding in a way no
+    /// round-trip through the Rust type alone would catch.
+    #[test]
+    fn every_variant_round_trips_through_its_wire_spelling() {
+        for method in [
+            InstallMethod::Override,
+            InstallMethod::Native,
+            InstallMethod::Npm,
+            InstallMethod::Fnm,
+            InstallMethod::Volta,
+            InstallMethod::Pnpm,
+            InstallMethod::Bun,
+            InstallMethod::Nvm,
+            InstallMethod::Winget,
+            InstallMethod::Scoop,
+            InstallMethod::Homebrew,
+            InstallMethod::Unknown,
+        ] {
+            let json = serde_json::to_string(&method).unwrap();
+            assert_eq!(
+                json,
+                format!(r#""{}""#, method.as_wire_str()),
+                "the derive and as_wire_str disagree"
+            );
+            assert_eq!(
+                InstallMethod::from_wire(method.as_wire_str()),
+                method,
+                "{} did not decode back",
+                method.as_wire_str()
+            );
+        }
+    }
+
+    /// Every label is non-empty and none of them repeat, so a card can never
+    /// render a blank method or two indistinguishable ones.
+    #[test]
+    fn labels_are_distinct_and_present() {
+        let labels: Vec<&str> = [
+            InstallMethod::Override,
+            InstallMethod::Native,
+            InstallMethod::Npm,
+            InstallMethod::Fnm,
+            InstallMethod::Volta,
+            InstallMethod::Pnpm,
+            InstallMethod::Bun,
+            InstallMethod::Nvm,
+            InstallMethod::Winget,
+            InstallMethod::Scoop,
+            InstallMethod::Homebrew,
+            InstallMethod::Unknown,
+        ]
+        .iter()
+        .map(|m| m.label())
+        .collect();
+        assert!(labels.iter().all(|l| !l.trim().is_empty()));
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "two methods share a label");
+    }
+}
+
 #[cfg(test)]
 mod capability_tests {
     use super::*;

@@ -19,10 +19,10 @@ use gpui::{
 };
 use std::time::Duration;
 
-use comet_engine::registry::HarnessDiagnostics;
+use comet_engine::registry::{HarnessDescriptor, HarnessDiagnostics};
 use comet_proto::{
     AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
-    AgentLoginStatus, HarnessId,
+    AgentLoginStatus, HarnessAvailability, HarnessId,
 };
 use comet_rpc::methods;
 
@@ -47,6 +47,49 @@ pub enum UsageLevel {
     Warn,
     /// ≥ 95% — red.
     Critical,
+}
+
+/// The two lines under a provider's name: what version answered and how it got
+/// there, then which binary that was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallLine {
+    /// `"2.1.228 · Native installer"`, or just the method when the CLI answered
+    /// without a readable version.
+    pub summary: String,
+    /// The resolved executable, verbatim.
+    pub path: String,
+}
+
+/// The install line for one provider, or `None` when there is nothing honest to
+/// say.
+///
+/// Pure and split out of the entity for the reason `pickers::images_allowed`
+/// is: this crate has no gpui test context, so anything reachable only through
+/// `App` is verified by the rendered check and nothing else.
+///
+/// Three absent cases, all deliberate. No descriptor means the catalog has not
+/// landed or the engine predates the fields; no `install` means the CLI never
+/// resolved, which the card's own empty state already explains; and a resolved
+/// CLI with no readable version still earns a line, because **the method and
+/// path are the diagnostic half**. A broken install is exactly when knowing
+/// which binary was asked matters most.
+pub fn install_line(descriptor: Option<&HarnessDescriptor>) -> Option<InstallLine> {
+    let descriptor = descriptor?;
+    let install = descriptor.install.as_ref()?;
+    let version = match &descriptor.availability {
+        HarnessAvailability::Available { version } => version.as_deref(),
+        // An unprobed or failed CLI has no version to quote. Saying nothing
+        // beats quoting a stale one from a previous probe.
+        HarnessAvailability::Unknown | HarnessAvailability::Unavailable { .. } => None,
+    };
+    let method = install.method.label();
+    Some(InstallLine {
+        summary: match version {
+            Some(version) => format!("{version} \u{00b7} {method}"),
+            None => method.to_string(),
+        },
+        path: install.path.clone(),
+    })
 }
 
 /// Threshold classification of a usage fraction. Pure.
@@ -238,12 +281,18 @@ pub struct AccountsPage {
     /// block is supplementary and hides either way (an older engine without
     /// the method simply lacks the feature).
     diagnostics: Vec<HarnessDiagnostics>,
+    /// The agent catalog, fetched alongside the accounts list purely for the
+    /// installed-version line under each provider name. Supplementary in the
+    /// same way `diagnostics` is: empty means the fetch failed or the engine
+    /// predates the fields, and the line is simply absent.
+    harnesses: Vec<HarnessDescriptor>,
     /// Account id with an in-flight Switch/Forget.
     busy_account: Option<String>,
     login: Option<LoginFlow>,
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
     load_task: Option<Task<()>>,
+    harness_poll_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
     _observe: Subscription,
@@ -266,11 +315,13 @@ impl AccountsPage {
             device_menu_dismissed_at: None,
             snapshot: Loadable::Idle,
             diagnostics: Vec::new(),
+            harnesses: Vec::new(),
             busy_account: None,
             login: None,
             error: None,
             code_input,
             load_task: None,
+            harness_poll_task: None,
             action_task: None,
             poll_task: None,
             _observe: observe,
@@ -490,17 +541,26 @@ impl AccountsPage {
             let accounts_call = client.call(methods::LIST_AGENT_ACCOUNTS, params);
             let diagnostics_call =
                 client.call(methods::LIST_HARNESS_DIAGNOSTICS, serde_json::Value::Null);
-            let both = std::pin::pin!(futures::future::join(accounts_call, diagnostics_call));
+            // Nor is the harness catalog device-qualified: it describes the CLIs
+            // installed on the engine answering, which is the same engine the
+            // diagnostics counts belong to.
+            let harnesses_call = client.call(methods::LIST_HARNESSES, serde_json::Value::Null);
+            let both = std::pin::pin!(futures::future::join3(
+                accounts_call,
+                diagnostics_call,
+                harnesses_call
+            ));
             let outcome = futures::future::select(both, cancelled).await;
             this.update(cx, |page, cx| {
                 crate::toast::end(cx, request_id);
-                let (result, diagnostics_result) = match outcome {
+                let (result, diagnostics_result, harnesses_result) = match outcome {
                     futures::future::Either::Left((results, _)) => results,
                     futures::future::Either::Right(_) => {
                         page.snapshot = Loadable::Error(crate::toast::cancelled_message(
                             errors::Loading::Accounts,
                         ));
                         page.diagnostics = Vec::new();
+                        page.harnesses = Vec::new();
                         cx.notify();
                         return;
                     }
@@ -536,11 +596,100 @@ impl AccountsPage {
                         Vec::new()
                     }
                 };
+                // Same supplementary treatment: the version line is a nicety
+                // beside the accounts this pane exists for, so a failure here
+                // hides one line rather than erroring the pane.
+                page.harnesses = match harnesses_result {
+                    Ok(value) => {
+                        crate::pickers::decode_harnesses_reply(value).unwrap_or_else(|err| {
+                            tracing::warn!(
+                                error = %err,
+                                "harness catalog decode failed (version line hidden)"
+                            );
+                            Vec::new()
+                        })
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "harness catalog load failed (version line hidden)"
+                        );
+                        Vec::new()
+                    }
+                };
+                page.poll_harness_installs(cx);
                 cx.notify();
             })
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Keep asking for the catalog while provider probes are still landing.
+    ///
+    /// The pane fetches `ListHarnesses` exactly once, at mount, but the engine
+    /// probes providers in the background *after* boot — so on a cold start the
+    /// install line was simply absent for the rest of the session, and the only
+    /// way to reveal it was a Refresh nobody has a reason to press. **Found by
+    /// the rendered check, not by a test**: with both CLIs already warm the race
+    /// is almost always won, and the run that lost it was the one where a
+    /// deliberately-broken override answered instantly while the real CLI was
+    /// still starting a Node runtime.
+    ///
+    /// `catalog_awaits_probes` is the same predicate the picker revalidates on,
+    /// and it is the right one here rather than a coincidence: `install` is
+    /// filled by the same probe that fills `availability`, so "unprobed" and "no
+    /// path yet" are one state.
+    ///
+    /// Bounded exactly as `pickers::revalidate_harnesses` is — every entry
+    /// answered (a probed *failure* is an answer), or
+    /// [`HARNESS_REVALIDATE_ATTEMPTS`] tries. Hitting the cap degrades to no
+    /// line, which is the same thing an older engine shows, never a spinner
+    /// that waits forever.
+    ///
+    /// [`HARNESS_REVALIDATE_ATTEMPTS`]: crate::pickers::HARNESS_REVALIDATE_ATTEMPTS
+    fn poll_harness_installs(&mut self, cx: &mut Context<Self>) {
+        // Drop any poll left over from an earlier load FIRST, so every exit
+        // below cancels it rather than only the one that reassigns. A poll
+        // holds the `engine` it captured at spawn and writes straight into
+        // `page.harnesses`, and `set_selected_device` calls `load` too — so a
+        // survivor can paint the previous machine's catalog over the one this
+        // load just settled.
+        self.harness_poll_task = None;
+        if !crate::pickers::catalog_awaits_probes(&self.harnesses) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).selected_client() else {
+            return;
+        };
+        self.harness_poll_task = Some(cx.spawn(async move |this, cx| {
+            for _ in 0..crate::pickers::HARNESS_REVALIDATE_ATTEMPTS {
+                cx.background_executor()
+                    .timer(crate::pickers::HARNESS_REVALIDATE_INTERVAL)
+                    .await;
+                let result = engine
+                    .client()
+                    .call(methods::LIST_HARNESSES, serde_json::Value::Null)
+                    .await;
+                let stop = this
+                    .update(cx, |page, cx| {
+                        // No toast and no `Loading` flip: the pane is fully
+                        // rendered throughout, and this only ever ADDS a line.
+                        // A failed poll keeps what is on screen and tries again.
+                        if let Ok(value) = result
+                            && let Ok(list) = crate::pickers::decode_harnesses_reply(value)
+                        {
+                            page.harnesses = list;
+                            cx.notify();
+                        }
+                        !crate::pickers::catalog_awaits_probes(&page.harnesses)
+                    })
+                    .unwrap_or(true);
+                if stop {
+                    break;
+                }
+            }
+        }));
     }
 
     /// Switch / Forget an account.
@@ -1462,20 +1611,13 @@ impl Render for AccountsPage {
             Loadable::Error(message) => {
                 let message = message.clone();
                 vec![
-                    widgets::error_strip(&theme, message)
+                    widgets::error_strip_with_hint(&theme, message, "Click to retry")
                         .id("accounts-load-error")
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
                             // Retry IS the visit's first successful list — force usage.
                             this.load(force_usage_for(LoadTrigger::Retry), cx)
                         }))
-                        .child(
-                            div()
-                                .mt(px(4.0))
-                                .text_size(px(11.5))
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from("Click to retry")),
-                        )
                         .into_any_element(),
                 ]
             }
@@ -1500,6 +1642,7 @@ impl Render for AccountsPage {
                             })
                             .collect();
                         let add_id: SharedString = format!("add-account-{name}").into();
+                        let install_for = self.harnesses.iter().find(|d| d.id == harness);
                         let card = widgets::section_card(&theme).mt(px(8.0));
                         let card = if rows.is_empty() {
                             card.child(
@@ -1529,13 +1672,51 @@ impl Render for AccountsPage {
                                     .gap(px(8.0))
                                     .child(provider_mark(harness, &theme))
                                     .child(
+                                        // `min_w_0` + `flex_1` on the name column
+                                        // and `truncate` on the path: a resolved
+                                        // Windows path is long enough to push the
+                                        // Add-account button off the row
+                                        // otherwise, and this header is a fixed
+                                        // two-line shape whatever the path is.
                                         div()
-                                            .text_size(px(14.0))
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .text_color(theme.text)
-                                            .child(SharedString::from(name)),
+                                            .flex()
+                                            .flex_col()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .child(
+                                                div()
+                                                    .text_size(px(14.0))
+                                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                                    .text_color(theme.text)
+                                                    .child(SharedString::from(name)),
+                                            )
+                                            .children(install_line(install_for).map(|line| {
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_baseline()
+                                                    .gap(px(6.0))
+                                                    .mt(px(2.0))
+                                                    .text_size(px(11.5))
+                                                    .child(
+                                                        div()
+                                                            .flex_none()
+                                                            .text_color(theme.text_muted)
+                                                            .child(SharedString::from(
+                                                                line.summary,
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .min_w_0()
+                                                            .truncate()
+                                                            .text_color(
+                                                                theme.text_muted.opacity(0.6),
+                                                            )
+                                                            .child(SharedString::from(line.path)),
+                                                    )
+                                            })),
                                     )
-                                    .child(div().flex_1())
                                     .child(
                                         widgets::ghost_action(&theme)
                                             .id(add_id)
@@ -1647,6 +1828,85 @@ impl Render for AccountsPage {
 mod tests {
     use super::*;
     use chrono::TimeDelta;
+    use comet_proto::{HarnessInstall, InstallMethod};
+
+    fn descriptor(
+        availability: HarnessAvailability,
+        install: Option<HarnessInstall>,
+    ) -> HarnessDescriptor {
+        HarnessDescriptor {
+            id: HarnessId::ClaudeCode,
+            name: "Claude Code".into(),
+            capabilities: comet_proto::HarnessCapabilities::default(),
+            availability,
+            install,
+        }
+    }
+
+    /// The ordinary case, built from the capture's real values
+    /// (`captures/2026-08-11-agent-version-install-method.md`).
+    #[test]
+    fn a_working_install_reads_version_then_method() {
+        let d = descriptor(
+            HarnessAvailability::Available {
+                version: Some("2.1.228".into()),
+            },
+            Some(HarnessInstall {
+                path: r"C:\Users\coding\.local\bin\claude.exe".into(),
+                method: InstallMethod::Native,
+            }),
+        );
+        let line = install_line(Some(&d)).expect("a probed install has a line");
+        assert_eq!(line.summary, "2.1.228 \u{00b7} Native installer");
+        assert_eq!(line.path, r"C:\Users\coding\.local\bin\claude.exe");
+    }
+
+    /// The case the whole sibling design exists for: the CLI resolved and then
+    /// failed, so there is no version — but the line still names the binary,
+    /// which is the only way to tell which of two installs was asked.
+    #[test]
+    fn a_broken_install_still_names_its_binary() {
+        let d = descriptor(
+            HarnessAvailability::unavailable("Not working", Some("`--version` failed.".into())),
+            Some(HarnessInstall {
+                path: r"C:\Users\coding\AppData\Roaming\npm\codex.cmd".into(),
+                method: InstallMethod::Npm,
+            }),
+        );
+        let line = install_line(Some(&d)).expect("a broken install still has a line");
+        assert_eq!(line.summary, "npm (global)");
+        assert_eq!(line.path, r"C:\Users\coding\AppData\Roaming\npm\codex.cmd");
+    }
+
+    /// A CLI that answered without a parseable version is still available. The
+    /// method carries the line on its own rather than the row vanishing.
+    #[test]
+    fn an_unreadable_version_leaves_the_method_alone_on_the_line() {
+        let d = descriptor(
+            HarnessAvailability::Available { version: None },
+            Some(HarnessInstall {
+                path: "/opt/homebrew/bin/codex".into(),
+                method: InstallMethod::Homebrew,
+            }),
+        );
+        let line = install_line(Some(&d)).unwrap();
+        assert_eq!(line.summary, "Homebrew");
+    }
+
+    /// Nothing to say, said as nothing. A CLI that never resolved has no path,
+    /// and an engine that predates the field sends no descriptor half at all —
+    /// neither may render an empty or invented line.
+    #[test]
+    fn nothing_known_renders_no_line() {
+        assert_eq!(install_line(None), None);
+        let unresolved = descriptor(
+            HarnessAvailability::unavailable("Not installed", None),
+            None,
+        );
+        assert_eq!(install_line(Some(&unresolved)), None);
+        let unprobed = descriptor(HarnessAvailability::Unknown, None);
+        assert_eq!(install_line(Some(&unprobed)), None);
+    }
 
     #[test]
     fn first_load_of_a_visit_forces_the_usage_probe() {
