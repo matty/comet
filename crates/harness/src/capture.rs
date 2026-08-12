@@ -1357,6 +1357,7 @@ struct SemanticContext {
     speaker: Speaker,
     codex_turn_input: bool,
     codex_assistant_prose: bool,
+    codex_assistant_prose_array: bool,
     discovery_metadata: bool,
     codex_catalog: bool,
     codex_root_notification: CodexNotification,
@@ -1860,6 +1861,10 @@ impl Redactor {
     }
 
     fn collect_semantics(&mut self, value: &Value, context: SemanticContext) {
+        if context.codex_assistant_prose_array && value.is_string() {
+            self.register(RedactionKind::AssistantProse, value);
+            return;
+        }
         match value {
             Value::Array(values) => {
                 for value in values {
@@ -1900,6 +1905,9 @@ impl Redactor {
         context: SemanticContext,
         location: &str,
     ) -> Result<(), SanitizationError> {
+        if context.codex_assistant_prose_array && value.is_string() {
+            self.replace_semantic(RedactionKind::AssistantProse, value);
+        }
         match value {
             Value::Array(values) => {
                 for (index, value) in values.iter_mut().enumerate() {
@@ -2149,7 +2157,11 @@ fn object_context(
         Some("assistant") => Speaker::Assistant,
         _ => context.speaker,
     };
-    if object.get("method").and_then(Value::as_str) == Some("turn/start") {
+    if object
+        .get("method")
+        .and_then(Value::as_str)
+        .is_some_and(|method| matches!(method, "turn/start" | "turn/steer"))
+    {
         context.codex_turn_input = true;
     }
     if context.json_root && !context.claude_capture {
@@ -2211,7 +2223,7 @@ fn semantic_kind(
         "requestid" => return Some(RedactionKind::ClaudeRequestId),
         "sessionid" => return Some(RedactionKind::SessionId),
         "threadid" => return Some(RedactionKind::ThreadId),
-        "turnid" => return Some(RedactionKind::TurnId),
+        "turnid" | "expectedturnid" => return Some(RedactionKind::TurnId),
         "tooluseid" | "parenttooluseid" | "itemid" => {
             return Some(RedactionKind::ToolUseId);
         }
@@ -2220,6 +2232,13 @@ fn semantic_kind(
             return Some(RedactionKind::MachineId);
         }
         "id" if object.contains_key("jsonrpc") => return Some(RedactionKind::CodexRpcId),
+        "id" if !context.claude_capture
+            && context.json_root
+            && !object.contains_key("method")
+            && (object.contains_key("result") || object.contains_key("error")) =>
+        {
+            return Some(RedactionKind::CodexRpcId);
+        }
         "id" if matches!(context.entity, Entity::Thread) => {
             return Some(RedactionKind::ThreadId);
         }
@@ -2354,6 +2373,12 @@ fn child_context(mut context: SemanticContext, key: &str) -> SemanticContext {
     }
     if normalized == "input" && context.claude_tool_use {
         context.claude_tool_input = true;
+    }
+    if !context.claude_capture
+        && normalized == "summary"
+        && matches!(context.speaker, Speaker::Assistant)
+    {
+        context.codex_assistant_prose_array = true;
     }
     context
 }

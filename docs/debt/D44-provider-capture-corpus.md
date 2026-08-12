@@ -30,8 +30,18 @@ attempts contradicted the proposed capture contract. The operator procedure is
 [`docs/testing/provider-captures.md`](../testing/provider-captures.md).
 
 D44 remains open because the plan's all-twelve-scenarios acceptance criterion is
-not met. Codex ordinary approval remains unreproducible in the bounded scenario;
-Codex on-request, steer, and interruption were not launched after the approved
-stop boundary. No more live runs belong to this task. A future explicitly owned
-slice may capture those residual scenario artifacts under fresh authorization,
-but must not restore the removed claims without real supporting evidence.
+not met. A fresh explicitly authorized residual slice is recording each scenario
+independently under the contradiction policy.
+
+## Residual scenarios
+
+- `codex-steer-reply-before-completion` is backed by a successful sanitized
+  `codex-cli 0.147.0` capture. The request, matching successful reply, and terminal
+  completion are literal frames in the promoted artifact.
+- Ordinary approval stopped after its single permitted attempt when the run emitted
+  one failed command execution instead of the reviewed multi-command ordering.
+  Its `codex-cli 0.147.0` partial remains ignored and cannot satisfy a claim.
+- On-request approval stopped when its approval request arrived before the required
+  sandbox-failure completion. Its `codex-cli 0.147.0` partial remains ignored and
+  cannot satisfy a claim.
+- Interruption remains to be attempted within the current authorized residual slice.

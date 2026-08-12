@@ -818,6 +818,30 @@
         }
       ],
       "fact": "The live server answered the captured model list in one page."
+    },
+    {
+      "id": "codex-steer-reply-before-completion",
+      "consumer": "docs/debt/D44-provider-capture-corpus.md:residual-scenarios",
+      "evidence": [
+        {
+          "manifest": "codex/0.147.0/steer/manifest.json",
+          "frames": [
+            {
+              "sequence": 19,
+              "channel": "stdin"
+            },
+            {
+              "sequence": 20,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 56,
+              "channel": "stdout"
+            }
+          ]
+        }
+      ],
+      "fact": "Codex acknowledged the bounded steer request before completing the same active turn."
     }
   ]
 }
