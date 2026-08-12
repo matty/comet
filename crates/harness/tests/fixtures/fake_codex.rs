@@ -309,10 +309,12 @@ fn main() {
         capture_approval_bad_id(&mut stdin, &tid, false);
     } else if turn_line.contains("scenario:capture-approval-invalid-id") {
         capture_approval_bad_id(&mut stdin, &tid, true);
+    } else if turn_line.contains("scenario:capture-approval-single-launcher") {
+        capture_approval(&mut stdin, &tid, true);
     } else if turn_line.contains("scenario:capture-onrequest:") {
         capture_on_request(&mut stdin, &turn_line, &tid);
     } else if turn_line.contains("scenario:capture-approval") {
-        capture_approval(&mut stdin, &tid);
+        capture_approval(&mut stdin, &tid, false);
     } else if turn_line.contains("scenario:capture-fresh") {
         simple_completed(&tid);
     } else if turn_line.contains("scenario:happy") {
@@ -358,26 +360,32 @@ fn simple_completed(tid: &str) {
 fn approval_launchers() -> [&'static str; 3] {
     [
         r#""pwsh.exe" -Command 'echo capture'"#,
-        r#""C:\Program Files\PowerShell\7\pwsh.exe" -Command 'echo capture'"#,
         r#""pwsh.exe" -NoProfile -Command 'echo capture'"#,
+        r#""pwsh.exe" -Command 'echo capture'"#,
     ]
 }
 
 #[cfg(not(windows))]
 fn approval_launchers() -> [&'static str; 3] {
     [
-        "/bin/sh -lc 'echo capture'",
-        "/bin/bash -lc 'echo capture'",
-        "/bin/zsh -lc 'echo capture'",
+        "unobserved-unix-launcher echo capture",
+        "unobserved-unix-launcher echo capture",
+        "unobserved-unix-launcher echo capture",
     ]
 }
 
-fn capture_approval(stdin: &mut StdinLock<'_>, tid: &str) {
+fn capture_approval(stdin: &mut StdinLock<'_>, tid: &str, single_launcher: bool) {
     emit(&format!(
         r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
     ));
     emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
-    for (id, launcher) in (301..=303).zip(approval_launchers()) {
+    let launchers = approval_launchers();
+    let launchers = if single_launcher {
+        [launchers[0]; 3]
+    } else {
+        launchers
+    };
+    for (id, launcher) in (301..=303).zip(launchers) {
         emit(&format!(
             r#"{{"id":{id},"method":"item/commandExecution/requestApproval","params":{{"itemId":"c{id}","command":{},"commandActions":[{{"type":"unknown","command":"echo capture"}}]}}}}"#,
             serde_json::to_string(launcher).expect("launcher serializes"),
