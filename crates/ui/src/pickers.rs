@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, SharedString,
-    Subscription, Task, Window, div, prelude::*, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, PathBuilder,
+    SharedString, Subscription, Task, Window, canvas, div, point, prelude::*, px,
 };
 
 use comet_engine::registry::HarnessDescriptor;
@@ -300,6 +300,81 @@ pub fn runtime_mode_caption(mode: RuntimeMode) -> &'static str {
 ///
 /// The mode leads, because it is the only one of the three that changes what
 /// the agent is allowed to do to the machine.
+/// Diameter of the context gauge. A plain number: it must not vary with the
+/// palette, or a theme toggle reflows the traits row.
+const CONTEXT_GAUGE_SIZE: f32 = 12.0;
+
+/// Dev/testing knob: `COMET_CONTEXT_DEMO=<percent>` supplies a context reading
+/// so the gauge can be checked at any fill without a provider.
+///
+/// Filling a real window costs a long session, and the states worth reviewing
+/// — nearly empty, nearly full — are the expensive ones to reach. This only
+/// fills in where there is no real reading, so it can never mask live data.
+fn demo_context() -> Option<comet_proto::ContextUsage> {
+    const WINDOW: u64 = 200_000;
+    let percent: u64 = std::env::var("COMET_CONTEXT_DEMO").ok()?.parse().ok()?;
+    Some(comet_proto::ContextUsage {
+        prompt_tokens: WINDOW * percent.min(100) / 100,
+        context_window: WINDOW,
+    })
+}
+
+/// Points on the wedge outline for `fraction` of a disc, filled clockwise from
+/// twelve o'clock: centre, then the rim sampled to the sweep's end.
+///
+/// Split out from the painter so the geometry is testable — the painter itself
+/// only turns these into a path. Sampled rather than arced because a 12px rim
+/// is a handful of device pixels: line segments at this size are
+/// indistinguishable from a curve, and they avoid depending on how the fork's
+/// `arc_to` handles a sweep past a quadrant.
+fn gauge_wedge_points(centre: (f32, f32), radius: f32, fraction: f32) -> Vec<(f32, f32)> {
+    let fraction = fraction.clamp(0.0, 1.0);
+    if fraction <= 0.0 {
+        return Vec::new();
+    }
+    // One segment per ~6 degrees, so the rim never shows a flat edge.
+    let steps = ((fraction * 60.0).ceil() as usize).max(2);
+    let sweep = fraction * std::f32::consts::TAU;
+    let mut points = Vec::with_capacity(steps + 2);
+    points.push(centre);
+    for step in 0..=steps {
+        // Zero at twelve o'clock, increasing clockwise: screen y grows
+        // downward, so the vertical term is negated rather than added.
+        let angle = sweep * (step as f32 / steps as f32);
+        points.push((
+            centre.0 + radius * angle.sin(),
+            centre.1 - radius * angle.cos(),
+        ));
+    }
+    points
+}
+
+fn paint_gauge_wedge(
+    bounds: gpui::Bounds<gpui::Pixels>,
+    fraction: f32,
+    fill: gpui::Hsla,
+    window: &mut Window,
+) {
+    let radius = CONTEXT_GAUGE_SIZE / 2.0;
+    let centre = (
+        f32::from(bounds.origin.x) + radius,
+        f32::from(bounds.origin.y) + radius,
+    );
+    let points = gauge_wedge_points(centre, radius, fraction);
+    let Some((first, rest)) = points.split_first() else {
+        return; // nothing drawn at zero: an empty track is the honest picture
+    };
+    let mut path = PathBuilder::fill();
+    path.move_to(point(px(first.0), px(first.1)));
+    for (x, y) in rest {
+        path.line_to(point(px(*x), px(*y)));
+    }
+    path.close();
+    if let Ok(path) = path.build() {
+        window.paint_path(path, fill);
+    }
+}
+
 pub fn traits_summary(
     model: Option<&Model>,
     reasoning: Option<ReasoningLevel>,
@@ -727,6 +802,60 @@ impl Pickers {
 
     /// The chat's persisted mode for an existing chat, the draft's for the
     /// new-chat canvas.
+    /// The context gauge: a disc that fills clockwise as the chat's context
+    /// window fills, with the percentage on hover.
+    ///
+    /// Absent until the chat has completed a model request, because that is
+    /// when a window size first exists — and absent for good on a provider
+    /// that never publishes one. An unknown window is not an empty one, so
+    /// there is nothing honest to draw.
+    ///
+    /// A disc rather than a ring: at this diameter a ring's stroke is about
+    /// 2px, which reads as a smudge rather than a shape. One neutral tone at
+    /// every level, deliberately — amber in this app means a state you must
+    /// resolve (an unavailable agent, a failed update, an expired approval),
+    /// and a context window at 85% is a fact, not a problem to fix.
+    fn context_gauge(&self, theme: &Theme, cx: &App) -> Option<AnyElement> {
+        let state = self.state.read(cx);
+        let usage = state
+            .session_for(state.selected_chat_id()?)
+            .and_then(|s| s.context)
+            .or_else(demo_context)?;
+        let fraction = usage.fraction();
+        let track = crate::theme::ink(0.12);
+        let fill = theme.text_muted;
+        Some(
+            div()
+                .id("context-gauge")
+                .flex_none()
+                .size(px(CONTEXT_GAUGE_SIZE))
+                .rounded_full()
+                .bg(track)
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            paint_gauge_wedge(bounds, fraction, fill, window);
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                // Reuses the rail's tooltip card rather than a second one:
+                // the chrome is identical and `row` exists only to re-key the
+                // fade, so a constant that no rail index can collide with is
+                // all this needs.
+                .tooltip(move |_, cx| {
+                    cx.new(|_| HarnessRowTooltip {
+                        message: format!("Context window: {}%", usage.percent()).into(),
+                        row: usize::MAX,
+                    })
+                    .into()
+                })
+                .into_any_element(),
+        )
+    }
+
     fn effective_runtime_mode(&self, cx: &App) -> RuntimeMode {
         match self
             .state
@@ -3408,7 +3537,11 @@ impl Render for Pickers {
                 &mut overlay,
                 PickerKind::HarnessModel,
                 "model-popover",
-            ));
+            ))
+            // After the model chip, by user request. The popover still anchors
+            // to the chip's own right edge rather than the row's, so the menu
+            // now sits a gauge-width in from the row end.
+            .children(self.context_gauge(&theme, cx));
         div()
             .w_full()
             .min_w_0()
@@ -3426,6 +3559,40 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice, SandboxLevel};
+
+    /// The wedge starts at twelve o'clock and sweeps clockwise. Screen y grows
+    /// downward, so getting the sign wrong fills anticlockwise or starts at
+    /// three o'clock — both of which still look like a plausible gauge in a
+    /// screenshot, which is why this is pinned rather than eyeballed.
+    #[test]
+    fn gauge_fills_clockwise_from_twelve() {
+        let quarter = gauge_wedge_points((10.0, 10.0), 5.0, 0.25);
+        let (first, last) = (quarter[0], *quarter.last().unwrap());
+        assert_eq!(first, (10.0, 10.0), "the wedge starts at the centre");
+        // First rim point is due north; the sweep ends due east.
+        assert!((quarter[1].0 - 10.0).abs() < 0.01 && (quarter[1].1 - 5.0).abs() < 0.01);
+        assert!((last.0 - 15.0).abs() < 0.01 && (last.1 - 10.0).abs() < 0.01);
+
+        // Half a turn ends due south, not back at the top.
+        let half = *gauge_wedge_points((10.0, 10.0), 5.0, 0.5).last().unwrap();
+        assert!((half.0 - 10.0).abs() < 0.01 && (half.1 - 15.0).abs() < 0.01);
+    }
+
+    /// Nothing to paint at zero, and a reading past the window paints a full
+    /// disc rather than wrapping into a thin sliver that reads as nearly empty.
+    #[test]
+    fn gauge_paints_nothing_at_zero_and_a_full_disc_when_over() {
+        assert!(gauge_wedge_points((10.0, 10.0), 5.0, 0.0).is_empty());
+
+        let over = gauge_wedge_points((10.0, 10.0), 5.0, 3.0);
+        let full = gauge_wedge_points((10.0, 10.0), 5.0, 1.0);
+        assert_eq!(over.len(), full.len());
+        let last = *over.last().unwrap();
+        assert!(
+            (last.0 - 10.0).abs() < 0.01 && (last.1 - 5.0).abs() < 0.01,
+            "a full sweep closes back at twelve o'clock"
+        );
+    }
 
     #[test]
     fn traits_summary_formats_non_defaults() {
