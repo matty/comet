@@ -1,0 +1,150 @@
+{
+  "captured_at_unix_ms": 1786541043817,
+  "channels": [
+    "stdin",
+    "stdout"
+  ],
+  "cli_version": "codex-cli 0.147.0",
+  "command": {
+    "args": [
+      "app-server"
+    ],
+    "configured_env": {},
+    "creation_flags": 0,
+    "cwd": "<CWD>",
+    "kill_on_drop": true,
+    "program": "<HOME>\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe",
+    "stderr": "Piped",
+    "stdin": "Piped",
+    "stdout": "Piped"
+  },
+  "exit_code": 0,
+  "normalized_cli_version": "codex-cli 0.147.0",
+  "placeholders": [
+    {
+      "kind": "codex_rpc_id",
+      "placeholder": "<CODEX_RPC_ID_1>"
+    },
+    {
+      "kind": "codex_rpc_id",
+      "placeholder": "<CODEX_RPC_ID_2>"
+    },
+    {
+      "kind": "codex_rpc_id",
+      "placeholder": "<CODEX_RPC_ID_3>"
+    },
+    {
+      "kind": "session_id",
+      "placeholder": "<SESSION_ID_1>"
+    },
+    {
+      "kind": "thread_id",
+      "placeholder": "<THREAD_ID_1>"
+    },
+    {
+      "kind": "turn_id",
+      "placeholder": "<TURN_ID_1>"
+    },
+    {
+      "kind": "turn_id",
+      "placeholder": "<TURN_ID_2>"
+    },
+    {
+      "kind": "tool_use_id",
+      "placeholder": "<TOOL_USE_ID_1>"
+    },
+    {
+      "kind": "tool_use_id",
+      "placeholder": "<TOOL_USE_ID_2>"
+    },
+    {
+      "kind": "tool_use_id",
+      "placeholder": "<TOOL_USE_ID_3>"
+    },
+    {
+      "kind": "tool_use_id",
+      "placeholder": "<TOOL_USE_ID_4>"
+    },
+    {
+      "kind": "user_text",
+      "placeholder": "<USER_TEXT_1>"
+    },
+    {
+      "kind": "user_text",
+      "placeholder": "<USER_TEXT_2>"
+    },
+    {
+      "kind": "assistant_prose",
+      "placeholder": "<ASSISTANT_PROSE_1>"
+    },
+    {
+      "kind": "assistant_prose",
+      "placeholder": "<ASSISTANT_PROSE_2>"
+    },
+    {
+      "kind": "assistant_prose",
+      "placeholder": "<ASSISTANT_PROSE_3>"
+    },
+    {
+      "kind": "assistant_prose",
+      "placeholder": "<ASSISTANT_PROSE_4>"
+    },
+    {
+      "kind": "assistant_prose",
+      "placeholder": "<ASSISTANT_PROSE_5>"
+    },
+    {
+      "kind": "machine_id",
+      "placeholder": "<MACHINE_ID_1>"
+    },
+    {
+      "kind": "machine_id",
+      "placeholder": "<MACHINE_ID_2>"
+    },
+    {
+      "kind": "codex_mcp_server_name",
+      "placeholder": "<CODEX_MCP_SERVER_NAME_1>"
+    },
+    {
+      "kind": "codex_mcp_server_name",
+      "placeholder": "<CODEX_MCP_SERVER_NAME_2>"
+    },
+    {
+      "kind": "codex_thread_path",
+      "placeholder": "<CODEX_THREAD_PATH_1>"
+    },
+    {
+      "kind": "cwd_path",
+      "placeholder": "<CWD>"
+    },
+    {
+      "kind": "home_path",
+      "placeholder": "<HOME>"
+    }
+  ],
+  "platform": {
+    "arch": "x86_64",
+    "os": "windows"
+  },
+  "provider": "codex",
+  "purpose": "capture one bounded Codex run script",
+  "redaction_counts": {
+    "assistant_prose": 6,
+    "codex_mcp_server_name": 10,
+    "codex_rpc_id": 3,
+    "codex_thread_path": 1,
+    "cwd_path": 6,
+    "home_path": 3,
+    "machine_id": 2,
+    "session_id": 1,
+    "thread_id": 28,
+    "tool_use_id": 9,
+    "turn_id": 12,
+    "user_text": 4
+  },
+  "scenario": "resume",
+  "schema_version": 1,
+  "source": "capture.json",
+  "consumers": []
+}
+
