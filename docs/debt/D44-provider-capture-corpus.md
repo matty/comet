@@ -44,4 +44,11 @@ independently under the contradiction policy.
 - On-request approval stopped when its approval request arrived before the required
   sandbox-failure completion. Its `codex-cli 0.147.0` partial remains ignored and
   cannot satisfy a claim.
-- Interruption remains to be attempted within the current authorized residual slice.
+- Interruption stopped after Codex acknowledged the request but emitted
+  `turn/completed` with status `interrupted`, not the required `turn/aborted` terminal
+  event. Its `codex-cli 0.147.0` partial remains ignored and cannot satisfy a claim.
+
+The three partials record only `driver_error` outcomes and remain beneath the ignored
+raw capture root. Checking any incomplete evidence into the corpus requires a separate
+contradiction-artifact specification and implementation plan; this successful-capture
+schema remains unchanged.
