@@ -12,17 +12,17 @@
 //! or an older engine replying `UnknownMethod` because it predates this
 //! surface — hides the block and logs instead of erroring the pane.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use gpui::{
     AnyElement, Context, Entity, Hsla, SharedString, Subscription, Task, Window, div, prelude::*,
     px,
 };
 use std::time::Duration;
 
-use comet_engine::registry::HarnessDiagnostics;
+use comet_engine::registry::{HarnessDescriptor, HarnessDiagnostics};
 use comet_proto::{
     AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
-    AgentLoginStatus, HarnessId,
+    AgentLoginStatus, HarnessAvailability, HarnessId, HarnessUpdate, UpdateState,
 };
 use comet_rpc::methods;
 
@@ -47,6 +47,170 @@ pub enum UsageLevel {
     Warn,
     /// ≥ 95% — red.
     Critical,
+}
+
+/// The lines under a provider's name: what version answered and how it got
+/// there, which binary that was, and how current the provider says it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallLine {
+    /// `"2.1.228 · Native installer"`, or just the method when the CLI answered
+    /// without a readable version.
+    pub summary: String,
+    /// The resolved executable, verbatim.
+    pub path: String,
+    /// Absent whenever the provider says nothing usable, which is the common
+    /// case on a CLI that has never updated. One line fewer, never a placeholder.
+    pub update: Option<UpdateLine>,
+}
+
+/// The update caption, and whether it is a state to resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateLine {
+    pub text: String,
+    /// A failed updater, and only that. Painted amber — a state to resolve
+    /// rather than an error the user caused, following the same reasoning
+    /// 0.2a settled for unavailable providers.
+    ///
+    /// An available update is deliberately *not* attention: both CLIs update
+    /// themselves, so it is a passing fact, and colouring it would make the
+    /// card nag about something that resolves on its own.
+    pub needs_attention: bool,
+    /// Carries a fact the reader might act on later — today, a version to move
+    /// to. Painted at full `text_muted` rather than the path's dimmed weight,
+    /// because a version number rendered fainter than the file path beside it
+    /// inverts which of the two matters.
+    pub is_informational: bool,
+    /// What to do about it, for the tooltip. Only ever set alongside
+    /// `needs_attention` — the rest of the states need no action.
+    pub hint: Option<String>,
+}
+
+/// How long ago `then` was, in words, or `None` if that cannot be said.
+///
+/// `None` covers an unparseable timestamp and a future one. Clock skew between
+/// a provider's record and this machine is real, and "in 3 hours" on a settings
+/// card reads as a bug in Comet rather than a disagreement about the time.
+///
+/// **Deliberately not [`format_ago`]**, whose lack of a day bucket is a pinned
+/// decision rather than an omission: it ages per-boot diagnostic counts, where
+/// days cannot happen. These timestamps come from a provider's own state file
+/// and routinely span weeks — a six-month-old check would read "4344h ago"
+/// through that one. Different inputs, too: RFC 3339 from a file rather than
+/// epoch milliseconds.
+fn relative_age(then: &str, now: DateTime<Utc>) -> Option<String> {
+    let then = DateTime::parse_from_rfc3339(then).ok()?.with_timezone(&Utc);
+    let elapsed = now.signed_duration_since(then);
+    if elapsed < TimeDelta::zero() {
+        return None;
+    }
+    let hours = elapsed.num_hours();
+    let days = elapsed.num_days();
+    Some(match (hours, days) {
+        (0, _) => "under an hour ago".to_string(),
+        (h, 0..=1) => format!("{h}h ago"),
+        (_, d) if d < 30 => format!("{d} days ago"),
+        (_, d) => {
+            let months = (d / 30).max(1);
+            format!("{months} months ago")
+        }
+    })
+}
+
+/// The update caption for one provider, or `None` when there is nothing honest
+/// to say.
+///
+/// The asymmetry between providers is the whole design and is preserved here
+/// rather than smoothed over: Codex publishes a latest version so its line can
+/// claim currency, Claude publishes only what its updater last did so its line
+/// reports exactly that. See `UpdateState`'s own doc for why merging them would
+/// let this card tell a user Claude is up to date while its updater has been
+/// failing for a week.
+fn update_line(update: Option<&HarnessUpdate>, now: DateTime<Utc>) -> Option<UpdateLine> {
+    let update = update?;
+    let age = update
+        .checked_at
+        .as_deref()
+        .and_then(|checked| relative_age(checked, now));
+    let plain = |text: String| {
+        Some(UpdateLine {
+            text,
+            needs_attention: false,
+            is_informational: false,
+            hint: None,
+        })
+    };
+    match update.state {
+        // The version is the point of this line, so a state claiming one
+        // without carrying it says nothing worth a row.
+        UpdateState::Available => Some(UpdateLine {
+            text: format!("Update available: {}", update.latest.as_ref()?),
+            needs_attention: false,
+            is_informational: true,
+            hint: None,
+        }),
+        UpdateState::Current => plain(match age {
+            Some(age) => format!("Up to date \u{00b7} checked {age}"),
+            None => "Up to date".to_string(),
+        }),
+        // Never "up to date": nothing Claude publishes says the installed
+        // version is the newest one that exists.
+        UpdateState::SelfUpdating => plain(match age {
+            Some(age) => format!("Last updated {age}"),
+            None => "Updates automatically".to_string(),
+        }),
+        UpdateState::UpdateFailed => Some(UpdateLine {
+            text: match age {
+                Some(age) => format!("Last update failed {age}"),
+                None => "Last update failed".to_string(),
+            },
+            needs_attention: true,
+            is_informational: false,
+            hint: Some(
+                "The CLI updates itself, and its last attempt did not finish. Run it in a \
+                 terminal to see what it reports."
+                    .to_string(),
+            ),
+        }),
+        // A state this build does not recognize, or a provider that publishes
+        // nothing. Silence beats a row that says "unknown".
+        UpdateState::Unknown => None,
+    }
+}
+
+/// The install line for one provider, or `None` when there is nothing honest to
+/// say.
+///
+/// Pure and split out of the entity for the reason `pickers::images_allowed`
+/// is: this crate has no gpui test context, so anything reachable only through
+/// `App` is verified by the rendered check and nothing else.
+///
+/// Three absent cases, all deliberate. No descriptor means the catalog has not
+/// landed or the engine predates the fields; no `install` means the CLI never
+/// resolved, which the card's own empty state already explains; and a resolved
+/// CLI with no readable version still earns a line, because **the method and
+/// path are the diagnostic half**. A broken install is exactly when knowing
+/// which binary was asked matters most.
+pub fn install_line(
+    descriptor: Option<&HarnessDescriptor>,
+    now: DateTime<Utc>,
+) -> Option<InstallLine> {
+    let descriptor = descriptor?;
+    let install = descriptor.install.as_ref()?;
+    let version = match &descriptor.availability {
+        HarnessAvailability::Available { version } => version.as_deref(),
+        // An unprobed or failed CLI has no version to quote. Saying nothing
+        // beats quoting a stale one from a previous probe.
+        HarnessAvailability::Unknown | HarnessAvailability::Unavailable { .. } => None,
+    };
+    let method = install.method.label();
+    Some(InstallLine {
+        summary: match version {
+            Some(version) => format!("{version} \u{00b7} {method}"),
+            None => method.to_string(),
+        },
+        path: install.path.clone(),
+        update: update_line(descriptor.update.as_ref(), now),
+    })
 }
 
 /// Threshold classification of a usage fraction. Pure.
@@ -171,6 +335,9 @@ pub fn diagnostics_rollup(
 
 /// Compact relative age for the diagnostics rows. Pure given `now_ms`; a
 /// clock that ran backwards degrades to "just now".
+/// Ages a per-boot diagnostic count. Has no day bucket on purpose — see the
+/// bucket-edge test. [`relative_age`] is the one for provider timestamps that
+/// can be months old; the two are not a duplication to collapse.
 pub fn format_ago(last_seen_ms: i64, now_ms: i64) -> String {
     let secs = (now_ms - last_seen_ms).max(0) / 1000;
     if secs < 10 {
@@ -238,12 +405,18 @@ pub struct AccountsPage {
     /// block is supplementary and hides either way (an older engine without
     /// the method simply lacks the feature).
     diagnostics: Vec<HarnessDiagnostics>,
+    /// The agent catalog, fetched alongside the accounts list purely for the
+    /// installed-version line under each provider name. Supplementary in the
+    /// same way `diagnostics` is: empty means the fetch failed or the engine
+    /// predates the fields, and the line is simply absent.
+    harnesses: Vec<HarnessDescriptor>,
     /// Account id with an in-flight Switch/Forget.
     busy_account: Option<String>,
     login: Option<LoginFlow>,
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
     load_task: Option<Task<()>>,
+    harness_poll_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
     _observe: Subscription,
@@ -266,11 +439,13 @@ impl AccountsPage {
             device_menu_dismissed_at: None,
             snapshot: Loadable::Idle,
             diagnostics: Vec::new(),
+            harnesses: Vec::new(),
             busy_account: None,
             login: None,
             error: None,
             code_input,
             load_task: None,
+            harness_poll_task: None,
             action_task: None,
             poll_task: None,
             _observe: observe,
@@ -490,17 +665,26 @@ impl AccountsPage {
             let accounts_call = client.call(methods::LIST_AGENT_ACCOUNTS, params);
             let diagnostics_call =
                 client.call(methods::LIST_HARNESS_DIAGNOSTICS, serde_json::Value::Null);
-            let both = std::pin::pin!(futures::future::join(accounts_call, diagnostics_call));
+            // Nor is the harness catalog device-qualified: it describes the CLIs
+            // installed on the engine answering, which is the same engine the
+            // diagnostics counts belong to.
+            let harnesses_call = client.call(methods::LIST_HARNESSES, serde_json::Value::Null);
+            let both = std::pin::pin!(futures::future::join3(
+                accounts_call,
+                diagnostics_call,
+                harnesses_call
+            ));
             let outcome = futures::future::select(both, cancelled).await;
             this.update(cx, |page, cx| {
                 crate::toast::end(cx, request_id);
-                let (result, diagnostics_result) = match outcome {
+                let (result, diagnostics_result, harnesses_result) = match outcome {
                     futures::future::Either::Left((results, _)) => results,
                     futures::future::Either::Right(_) => {
                         page.snapshot = Loadable::Error(crate::toast::cancelled_message(
                             errors::Loading::Accounts,
                         ));
                         page.diagnostics = Vec::new();
+                        page.harnesses = Vec::new();
                         cx.notify();
                         return;
                     }
@@ -536,11 +720,100 @@ impl AccountsPage {
                         Vec::new()
                     }
                 };
+                // Same supplementary treatment: the version line is a nicety
+                // beside the accounts this pane exists for, so a failure here
+                // hides one line rather than erroring the pane.
+                page.harnesses = match harnesses_result {
+                    Ok(value) => {
+                        crate::pickers::decode_harnesses_reply(value).unwrap_or_else(|err| {
+                            tracing::warn!(
+                                error = %err,
+                                "harness catalog decode failed (version line hidden)"
+                            );
+                            Vec::new()
+                        })
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "harness catalog load failed (version line hidden)"
+                        );
+                        Vec::new()
+                    }
+                };
+                page.poll_harness_installs(cx);
                 cx.notify();
             })
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Keep asking for the catalog while provider probes are still landing.
+    ///
+    /// The pane fetches `ListHarnesses` exactly once, at mount, but the engine
+    /// probes providers in the background *after* boot — so on a cold start the
+    /// install line was simply absent for the rest of the session, and the only
+    /// way to reveal it was a Refresh nobody has a reason to press. **Found by
+    /// the rendered check, not by a test**: with both CLIs already warm the race
+    /// is almost always won, and the run that lost it was the one where a
+    /// deliberately-broken override answered instantly while the real CLI was
+    /// still starting a Node runtime.
+    ///
+    /// `catalog_awaits_probes` is the same predicate the picker revalidates on,
+    /// and it is the right one here rather than a coincidence: `install` is
+    /// filled by the same probe that fills `availability`, so "unprobed" and "no
+    /// path yet" are one state.
+    ///
+    /// Bounded exactly as `pickers::revalidate_harnesses` is — every entry
+    /// answered (a probed *failure* is an answer), or
+    /// [`HARNESS_REVALIDATE_ATTEMPTS`] tries. Hitting the cap degrades to no
+    /// line, which is the same thing an older engine shows, never a spinner
+    /// that waits forever.
+    ///
+    /// [`HARNESS_REVALIDATE_ATTEMPTS`]: crate::pickers::HARNESS_REVALIDATE_ATTEMPTS
+    fn poll_harness_installs(&mut self, cx: &mut Context<Self>) {
+        // Drop any poll left over from an earlier load FIRST, so every exit
+        // below cancels it rather than only the one that reassigns. A poll
+        // holds the `engine` it captured at spawn and writes straight into
+        // `page.harnesses`, and `set_selected_device` calls `load` too — so a
+        // survivor can paint the previous machine's catalog over the one this
+        // load just settled.
+        self.harness_poll_task = None;
+        if !crate::pickers::catalog_awaits_probes(&self.harnesses) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).selected_client() else {
+            return;
+        };
+        self.harness_poll_task = Some(cx.spawn(async move |this, cx| {
+            for _ in 0..crate::pickers::HARNESS_REVALIDATE_ATTEMPTS {
+                cx.background_executor()
+                    .timer(crate::pickers::HARNESS_REVALIDATE_INTERVAL)
+                    .await;
+                let result = engine
+                    .client()
+                    .call(methods::LIST_HARNESSES, serde_json::Value::Null)
+                    .await;
+                let stop = this
+                    .update(cx, |page, cx| {
+                        // No toast and no `Loading` flip: the pane is fully
+                        // rendered throughout, and this only ever ADDS a line.
+                        // A failed poll keeps what is on screen and tries again.
+                        if let Ok(value) = result
+                            && let Ok(list) = crate::pickers::decode_harnesses_reply(value)
+                        {
+                            page.harnesses = list;
+                            cx.notify();
+                        }
+                        !crate::pickers::catalog_awaits_probes(&page.harnesses)
+                    })
+                    .unwrap_or(true);
+                if stop {
+                    break;
+                }
+            }
+        }));
     }
 
     /// Switch / Forget an account.
@@ -1462,20 +1735,13 @@ impl Render for AccountsPage {
             Loadable::Error(message) => {
                 let message = message.clone();
                 vec![
-                    widgets::error_strip(&theme, message)
+                    widgets::error_strip_with_hint(&theme, message, "Click to retry")
                         .id("accounts-load-error")
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
                             // Retry IS the visit's first successful list — force usage.
                             this.load(force_usage_for(LoadTrigger::Retry), cx)
                         }))
-                        .child(
-                            div()
-                                .mt(px(4.0))
-                                .text_size(px(11.5))
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from("Click to retry")),
-                        )
                         .into_any_element(),
                 ]
             }
@@ -1500,6 +1766,7 @@ impl Render for AccountsPage {
                             })
                             .collect();
                         let add_id: SharedString = format!("add-account-{name}").into();
+                        let install_for = self.harnesses.iter().find(|d| d.id == harness);
                         let card = widgets::section_card(&theme).mt(px(8.0));
                         let card = if rows.is_empty() {
                             card.child(
@@ -1529,13 +1796,144 @@ impl Render for AccountsPage {
                                     .gap(px(8.0))
                                     .child(provider_mark(harness, &theme))
                                     .child(
+                                        // `min_w_0` + `flex_1` on the name column
+                                        // and `truncate` on the path: a resolved
+                                        // Windows path is long enough to push the
+                                        // Add-account button off the row
+                                        // otherwise, and this header is a fixed
+                                        // two-line shape whatever the path is.
                                         div()
-                                            .text_size(px(14.0))
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .text_color(theme.text)
-                                            .child(SharedString::from(name)),
+                                            .flex()
+                                            .flex_col()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .child(
+                                                div()
+                                                    .text_size(px(14.0))
+                                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                                    .text_color(theme.text)
+                                                    .child(SharedString::from(name)),
+                                            )
+                                            .children(install_line(install_for, Utc::now()).map(
+                                                |line| {
+                                                    let update = line.update;
+                                                    div()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .child(
+                                                            div()
+                                                                .flex()
+                                                                .flex_row()
+                                                                .items_baseline()
+                                                                .gap(px(6.0))
+                                                                .mt(px(2.0))
+                                                                .text_size(px(11.5))
+                                                                .child(
+                                                                    div()
+                                                                        .flex_none()
+                                                                        .text_color(
+                                                                            theme.text_muted,
+                                                                        )
+                                                                        .child(SharedString::from(
+                                                                            line.summary,
+                                                                        )),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .min_w_0()
+                                                                        .truncate()
+                                                                        .text_color(
+                                                                            theme
+                                                                                .text_muted
+                                                                                .opacity(0.6),
+                                                                        )
+                                                                        .child(SharedString::from(
+                                                                            line.path,
+                                                                        )),
+                                                                ),
+                                                        )
+                                                        .children(update.map(|update| {
+                                                            // Amber only for a
+                                                            // state to resolve;
+                                                            // everything else
+                                                            // sits at the
+                                                            // path's weight so
+                                                            // the card reads as
+                                                            // one block.
+                                                            // Three weights, by
+                                                            // what the line
+                                                            // asks of the
+                                                            // reader. A state
+                                                            // with nothing to
+                                                            // do sits at the
+                                                            // path's weight; a
+                                                            // version to move
+                                                            // to is
+                                                            // information and
+                                                            // must not be
+                                                            // dimmer than the
+                                                            // path beside it;
+                                                            // a failure is
+                                                            // amber.
+                                                            let tone = if update.needs_attention {
+                                                                theme.warning_muted
+                                                            } else if update.is_informational {
+                                                                theme.text_muted
+                                                            } else {
+                                                                theme.text_muted.opacity(0.6)
+                                                            };
+                                                            div()
+                                                                .flex()
+                                                                .flex_col()
+                                                                .mt(px(1.0))
+                                                                .text_size(px(11.5))
+                                                                .child(
+                                                                    div().text_color(tone).child(
+                                                                        SharedString::from(
+                                                                            update.text,
+                                                                        ),
+                                                                    ),
+                                                                )
+                                                                // Stacked, not
+                                                                // a tooltip:
+                                                                // 3.1 already
+                                                                // landed that
+                                                                // choice for
+                                                                // the accounts
+                                                                // error strip,
+                                                                // and a hover
+                                                                // nobody knows
+                                                                // to try is not
+                                                                // an
+                                                                // instruction.
+                                                                // `text_muted`
+                                                                // undimmed: the
+                                                                // hint is the
+                                                                // actionable
+                                                                // half, and
+                                                                // 0.2a settled
+                                                                // that opacity
+                                                                // on text a
+                                                                // user must act
+                                                                // on drops it
+                                                                // under the
+                                                                // contrast
+                                                                // floor the
+                                                                // theme test
+                                                                // guarantees.
+                                                                .children(update.hint.map(|hint| {
+                                                                    div()
+                                                                        .text_color(
+                                                                            theme.text_muted,
+                                                                        )
+                                                                        .child(SharedString::from(
+                                                                            hint,
+                                                                        ))
+                                                                }))
+                                                        }))
+                                                },
+                                            )),
                                     )
-                                    .child(div().flex_1())
                                     .child(
                                         widgets::ghost_action(&theme)
                                             .id(add_id)
@@ -1647,6 +2045,272 @@ impl Render for AccountsPage {
 mod tests {
     use super::*;
     use chrono::TimeDelta;
+    use comet_proto::{HarnessInstall, InstallMethod};
+
+    fn descriptor(
+        availability: HarnessAvailability,
+        install: Option<HarnessInstall>,
+    ) -> HarnessDescriptor {
+        with_update(availability, install, None)
+    }
+
+    fn with_update(
+        availability: HarnessAvailability,
+        install: Option<HarnessInstall>,
+        update: Option<HarnessUpdate>,
+    ) -> HarnessDescriptor {
+        HarnessDescriptor {
+            id: HarnessId::ClaudeCode,
+            name: "Claude Code".into(),
+            capabilities: comet_proto::HarnessCapabilities::default(),
+            availability,
+            install,
+            update,
+        }
+    }
+
+    /// A fixed clock, so the relative ages below assert a value rather than
+    /// whatever the machine running the suite happens to think the time is.
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-12T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn an_install() -> Option<HarnessInstall> {
+        Some(HarnessInstall {
+            path: r"C:\Users\coding\.local\bin\claude.exe".into(),
+            method: InstallMethod::Native,
+        })
+    }
+
+    fn update_at(state: UpdateState, latest: Option<&str>, checked: Option<&str>) -> HarnessUpdate {
+        HarnessUpdate {
+            state,
+            latest: latest.map(str::to_owned),
+            checked_at: checked.map(str::to_owned),
+        }
+    }
+
+    fn line_for(update: HarnessUpdate) -> Option<UpdateLine> {
+        install_line(
+            Some(&with_update(
+                HarnessAvailability::Available {
+                    version: Some("2.1.228".into()),
+                },
+                an_install(),
+                Some(update),
+            )),
+            now(),
+        )
+        .expect("a probed install has a line")
+        .update
+    }
+
+    /// The ordinary case, built from the capture's real values
+    /// (`captures/2026-08-11-agent-version-install-method.md`).
+    #[test]
+    fn a_working_install_reads_version_then_method() {
+        let d = descriptor(
+            HarnessAvailability::Available {
+                version: Some("2.1.228".into()),
+            },
+            Some(HarnessInstall {
+                path: r"C:\Users\coding\.local\bin\claude.exe".into(),
+                method: InstallMethod::Native,
+            }),
+        );
+        let line = install_line(Some(&d), now()).expect("a probed install has a line");
+        assert_eq!(line.summary, "2.1.228 \u{00b7} Native installer");
+        assert_eq!(line.path, r"C:\Users\coding\.local\bin\claude.exe");
+    }
+
+    /// The case the whole sibling design exists for: the CLI resolved and then
+    /// failed, so there is no version — but the line still names the binary,
+    /// which is the only way to tell which of two installs was asked.
+    #[test]
+    fn a_broken_install_still_names_its_binary() {
+        let d = descriptor(
+            HarnessAvailability::unavailable("Not working", Some("`--version` failed.".into())),
+            Some(HarnessInstall {
+                path: r"C:\Users\coding\AppData\Roaming\npm\codex.cmd".into(),
+                method: InstallMethod::Npm,
+            }),
+        );
+        let line = install_line(Some(&d), now()).expect("a broken install still has a line");
+        assert_eq!(line.summary, "npm (global)");
+        assert_eq!(line.path, r"C:\Users\coding\AppData\Roaming\npm\codex.cmd");
+    }
+
+    /// A CLI that answered without a parseable version is still available. The
+    /// method carries the line on its own rather than the row vanishing.
+    #[test]
+    fn an_unreadable_version_leaves_the_method_alone_on_the_line() {
+        let d = descriptor(
+            HarnessAvailability::Available { version: None },
+            Some(HarnessInstall {
+                path: "/opt/homebrew/bin/codex".into(),
+                method: InstallMethod::Homebrew,
+            }),
+        );
+        let line = install_line(Some(&d), now()).unwrap();
+        assert_eq!(line.summary, "Homebrew");
+    }
+
+    /// Nothing to say, said as nothing. A CLI that never resolved has no path,
+    /// and an engine that predates the field sends no descriptor half at all —
+    /// neither may render an empty or invented line.
+    #[test]
+    fn nothing_known_renders_no_line() {
+        assert_eq!(install_line(None, now()), None);
+        let unresolved = descriptor(
+            HarnessAvailability::unavailable("Not installed", None),
+            None,
+        );
+        assert_eq!(install_line(Some(&unresolved), now()), None);
+        let unprobed = descriptor(HarnessAvailability::Unknown, None);
+        assert_eq!(install_line(Some(&unprobed), now()), None);
+    }
+
+    /// Codex's line, the only one that can name a version to move to.
+    #[test]
+    fn an_available_update_names_the_version() {
+        let line = line_for(update_at(
+            UpdateState::Available,
+            Some("0.148.0"),
+            Some("2026-08-12T00:48:08.145707800Z"),
+        ))
+        .expect("an available update has a line");
+        assert_eq!(line.text, "Update available: 0.148.0");
+        // Not amber: both CLIs update themselves, so this resolves on its own
+        // and colouring it would make the card nag.
+        assert!(!line.needs_attention);
+        // But not the path's dimmed weight either — a version number fainter
+        // than the file path beside it inverts which of the two matters.
+        assert!(line.is_informational);
+    }
+
+    /// The states with nothing to do stay at the quiet weight. Only a version
+    /// to move to is lifted, so "Up to date" cannot draw the eye first.
+    #[test]
+    fn a_settled_state_is_not_lifted_off_the_quiet_weight() {
+        for state in [UpdateState::Current, UpdateState::SelfUpdating] {
+            let line = line_for(update_at(state, Some("0.147.0"), None))
+                .expect("a settled state still has a line");
+            assert!(
+                !line.is_informational && !line.needs_attention,
+                "{state:?} should sit at the quiet weight"
+            );
+        }
+    }
+
+    /// A state claiming an update without carrying the version says nothing
+    /// worth a row — the version is the entire content of that sentence.
+    #[test]
+    fn an_available_update_without_a_version_renders_no_line() {
+        assert_eq!(
+            line_for(update_at(UpdateState::Available, None, None)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_current_install_reports_when_it_was_checked() {
+        let line = line_for(update_at(
+            UpdateState::Current,
+            Some("0.147.0"),
+            Some("2026-08-12T00:48:08Z"),
+        ))
+        .expect("a current install has a line");
+        assert_eq!(line.text, "Up to date \u{00b7} checked 11h ago");
+    }
+
+    /// The asymmetry, asserted rather than described: Claude's strongest line
+    /// reports what its updater did, never that it is up to date.
+    #[test]
+    fn a_self_updating_cli_never_claims_to_be_up_to_date() {
+        let line = line_for(update_at(
+            UpdateState::SelfUpdating,
+            None,
+            Some("2026-08-11T19:59:18.645Z"),
+        ))
+        .expect("a self-updating cli has a line");
+        assert_eq!(line.text, "Last updated 16h ago");
+        assert!(
+            !line.text.contains("Up to date"),
+            "nothing Claude publishes supports that claim: {}",
+            line.text
+        );
+    }
+
+    /// The one state a user can act on, so it is the one that gets colour and
+    /// a hint. Per `.agents/rules/user-facing-errors.md` the hint is actionable
+    /// and the diagnostic detail stays in tracing.
+    #[test]
+    fn a_failed_update_is_flagged_and_actionable() {
+        let line = line_for(update_at(
+            UpdateState::UpdateFailed,
+            None,
+            Some("2026-08-05T09:00:00Z"),
+        ))
+        .expect("a failed update has a line");
+        assert_eq!(line.text, "Last update failed 7 days ago");
+        assert!(line.needs_attention);
+        let hint = line.hint.expect("a failed update must say what to do");
+        assert!(!hint.trim().is_empty());
+    }
+
+    /// An unrecognized state from a newer engine renders nothing rather than
+    /// the word "unknown".
+    #[test]
+    fn an_unknown_state_renders_no_line() {
+        assert_eq!(line_for(update_at(UpdateState::Unknown, None, None)), None);
+        let no_update = install_line(
+            Some(&with_update(
+                HarnessAvailability::Available {
+                    version: Some("2.1.228".into()),
+                },
+                an_install(),
+                None,
+            )),
+            now(),
+        )
+        .expect("the install line survives an absent update");
+        assert_eq!(no_update.update, None);
+    }
+
+    /// A timestamp Comet cannot read, and one from the future. Clock skew
+    /// between a provider's record and this machine is real, and "in 3 hours"
+    /// on a settings card reads as a bug in Comet.
+    #[test]
+    fn an_unusable_timestamp_degrades_to_the_stateless_wording() {
+        let unparseable = line_for(update_at(
+            UpdateState::Current,
+            Some("0.147.0"),
+            Some("later"),
+        ))
+        .expect("a current install still has a line");
+        assert_eq!(unparseable.text, "Up to date");
+        let future = line_for(update_at(
+            UpdateState::SelfUpdating,
+            None,
+            Some("2026-08-12T15:00:00Z"),
+        ))
+        .expect("a self-updating cli still has a line");
+        assert_eq!(future.text, "Updates automatically");
+    }
+
+    /// The buckets, including the one a naive `hours` format would render as
+    /// "0h ago".
+    #[test]
+    fn relative_ages_read_as_words() {
+        let ago = |mins: i64| relative_age(&(now() - TimeDelta::minutes(mins)).to_rfc3339(), now());
+        assert_eq!(ago(20).as_deref(), Some("under an hour ago"));
+        assert_eq!(ago(60 * 5).as_deref(), Some("5h ago"));
+        assert_eq!(ago(60 * 40).as_deref(), Some("40h ago"));
+        assert_eq!(ago(60 * 24 * 3).as_deref(), Some("3 days ago"));
+        assert_eq!(ago(60 * 24 * 400).as_deref(), Some("13 months ago"));
+    }
 
     #[test]
     fn first_load_of_a_visit_forces_the_usage_probe() {

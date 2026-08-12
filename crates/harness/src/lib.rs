@@ -15,7 +15,8 @@ pub use tokio_util::sync::CancellationToken;
 
 use comet_proto::{
     AgentCommand, AgentEvent, ApprovalDecision, ApprovalRequest, HarnessAvailability,
-    HarnessCapabilities, HarnessId, ModelCatalog, RunRequest, UserInputAnswer, UserInputQuestion,
+    HarnessCapabilities, HarnessId, HarnessInstall, HarnessProbe, InstallMethod, ModelCatalog,
+    RunRequest, UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -66,16 +67,23 @@ pub trait Harness: Send + Sync {
     /// associated `capabilities()` so the engine registry can name the same
     /// value without re-typing it — see [`comet_proto::HarnessCapabilities`].
     fn capabilities(&self) -> HarnessCapabilities;
-    /// Whether this harness is usable on this device right now.
+    /// Whether this harness is usable on this device right now, and which
+    /// binary answered.
     ///
-    /// Defaults to available: an in-process harness (the mock, and every test
-    /// fixture) has no CLI to resolve, so there is nothing that could be
-    /// missing. Only the harnesses that spawn a real binary override this.
+    /// One call for both, on purpose: the resolve that finds the path is the
+    /// same resolve the version probe runs against, so returning them together
+    /// is what makes the path shown provably the path probed. Two methods would
+    /// resolve twice and could disagree between the calls.
+    ///
+    /// Defaults to available with no install: an in-process harness (the mock,
+    /// and every test fixture) has no CLI to resolve, so there is nothing that
+    /// could be missing and no path to name. Only the harnesses that spawn a
+    /// real binary override this.
     ///
     /// Called off the hot path — the engine probes in the background at boot
     /// and caches the result, because this spawns a subprocess.
-    async fn availability(&self) -> HarnessAvailability {
-        HarnessAvailability::Available { version: None }
+    async fn probe(&self) -> HarnessProbe {
+        HarnessProbe::unresolved(HarnessAvailability::Available { version: None })
     }
     /// The model list, plus where it came from.
     ///
@@ -164,15 +172,32 @@ pub(crate) fn executable_names(stem: &str) -> Vec<String> {
     }
 }
 
+/// A directory Comet knows how to look in, tagged with what finding a CLI
+/// there *means*.
+///
+/// One tagged list serves both jobs on purpose. The place we search and the
+/// label we report are the same entry, so they cannot drift apart — add a
+/// lookup location without saying what it implies and it will not compile.
+pub(crate) type KnownDir = (std::path::PathBuf, InstallMethod);
+
 /// Resolve an installed CLI: `$override_var`, then our own PATH, then the
 /// system's own PATH (the login-shell snapshot on unix, the persisted machine +
 /// user environment on Windows — see [`shell_env`]), then `known_dirs` and the
 /// Node version managers' bin dirs as a last resort. Each directory is probed
 /// with every [`executable_names`] spelling.
+///
+/// Pass the list from [`all_known_dirs`], so the directories searched and the
+/// directories classified are the same values.
+///
+/// The tags are discarded here: search order is PATH-first, and a
+/// normally-installed CLI is therefore almost always found through PATH rather
+/// than through the entry that describes it. Which is exactly why
+/// classification is a separate pass over the *resolved* path instead of a
+/// by-product of the search.
 pub(crate) fn resolve_cli(
     override_var: &str,
     stem: &str,
-    known_dirs: Vec<std::path::PathBuf>,
+    known_dirs: Vec<KnownDir>,
 ) -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os(override_var).filter(|p| !p.is_empty()) {
         return Some(std::path::PathBuf::from(p));
@@ -184,8 +209,7 @@ pub(crate) fn resolve_cli(
     if let Some(system_path) = shell_env::system_path() {
         dirs.extend(std::env::split_paths(system_path));
     }
-    dirs.extend(known_dirs);
-    dirs.extend(node_version_manager_bins());
+    dirs.extend(known_dirs.into_iter().map(|(dir, _)| dir));
     let names = executable_names(stem);
     dirs.into_iter()
         .filter(|d| !d.as_os_str().is_empty())
@@ -198,6 +222,108 @@ pub(crate) fn resolve_cli(
         // `is_file` rather than `exists`: a DIRECTORY named `codex` on PATH
         // would otherwise resolve and then fail at spawn.
         .find(|p| p.is_file())
+}
+
+/// A provider's own install locations plus the Node version managers' bin
+/// dirs — the complete set of places Comet recognizes, in search order.
+///
+/// Built once per resolve and handed to both [`resolve_cli`] and
+/// [`classify_install`], so "where we looked" and "what that location means"
+/// are literally the same list.
+pub(crate) fn all_known_dirs(install_dirs: Vec<KnownDir>) -> Vec<KnownDir> {
+    let mut dirs = install_dirs;
+    dirs.extend(node_version_manager_bins());
+    dirs
+}
+
+/// What finding the CLI at `exe` says about how it was installed.
+///
+/// Derived, never asked: the classification is a lookup of the resolved
+/// binary's parent directory in the same tagged catalogue `resolve_cli`
+/// searches. Nothing is spawned and the binary itself is never opened — a
+/// native `claude.exe` is ~300MB.
+///
+/// `override_is_set` is the caller's answer to "was `$override_var`
+/// non-empty", and it is checked first because it mirrors `resolve_cli`'s own
+/// control flow: that function returns the override path before it looks
+/// anywhere else, so when the variable is set, the resolved binary *is* the
+/// override, whatever directory it happens to sit in. Reporting the override
+/// rather than the directory's usual meaning is the deliberate choice — it is
+/// the fact that explains why this binary and not another one, and it is the
+/// one case where "how was this installed" is genuinely unanswerable.
+///
+/// An unrecognized directory yields [`InstallMethod::Unknown`], which is a real
+/// answer rather than a failure: a CLI on PATH in a bespoke location works
+/// fine.
+pub(crate) fn classify_install(
+    exe: &std::path::Path,
+    override_is_set: bool,
+    known_dirs: &[KnownDir],
+) -> InstallMethod {
+    if override_is_set {
+        return InstallMethod::Override;
+    }
+    let Some(parent) = exe.parent() else {
+        return InstallMethod::Unknown;
+    };
+    let parent = dir_key(parent);
+    known_dirs
+        .iter()
+        .find(|(dir, _)| dir_key(dir) == parent)
+        .map(|(_, method)| *method)
+        .unwrap_or(InstallMethod::Unknown)
+}
+
+/// The shared body of both real adapters' [`Harness::probe`]: resolve, record
+/// where it landed, then ask it for a version.
+///
+/// The install is recorded *before* the version probe and survives the probe
+/// failing. That ordering is the point of the whole shape — a CLI that resolved
+/// and then crashed on `--version` is exactly when naming the binary is worth
+/// most, and building the install only on success would drop it there.
+pub(crate) async fn probe_installed_cli(
+    resolved: Result<std::path::PathBuf, HarnessError>,
+    stem: &str,
+    override_var: &str,
+    known_dirs: Vec<KnownDir>,
+) -> HarnessProbe {
+    let exe = match resolved {
+        Ok(exe) => exe,
+        Err(err) => {
+            return HarnessProbe::unresolved(unavailable_from_resolve(&err, stem, override_var));
+        }
+    };
+    let override_is_set = std::env::var_os(override_var).is_some_and(|v| !v.is_empty());
+    let install = HarnessInstall {
+        path: exe.display().to_string(),
+        method: classify_install(&exe, override_is_set, &known_dirs),
+    };
+    HarnessProbe {
+        availability: probe_cli_version(&exe).await,
+        install: Some(install),
+        // Filled by the per-provider update readers; a provider that publishes
+        // no state leaves this `None` and simply renders one line less.
+        update: None,
+    }
+}
+
+/// Normalize a directory for comparison: drop any trailing separator, and on
+/// Windows fold case and separator direction too, because the string that
+/// reaches us from PATH need not match the one we composed from `%APPDATA%`
+/// in either respect.
+///
+/// Deliberately textual rather than `canonicalize`: canonicalizing would touch
+/// the filesystem for every candidate directory on a settings render, and on
+/// Windows it rewrites to the `\\?\` verbatim form that `program_path` exists
+/// to avoid.
+fn dir_key(dir: &std::path::Path) -> String {
+    let raw = dir.to_string_lossy();
+    let trimmed = raw.trim_end_matches(['/', '\\']);
+    if cfg!(windows) {
+        trimmed.to_lowercase().replace('/', "\\")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Every place [`find_on_path`] and its callers look for a CLI. Diagnostic
@@ -346,24 +472,26 @@ pub(crate) fn unavailable_from_resolve(
 /// GUI launches never see these on PATH — the managers shape PATH in shell
 /// init (fnm's per-shell multishells, nvm's shell function), which a
 /// Dock/Finder-launched app never runs.
-pub(crate) fn node_version_manager_bins() -> Vec<std::path::PathBuf> {
+pub(crate) fn node_version_manager_bins() -> Vec<KnownDir> {
     use std::path::PathBuf;
     let home = home_dir();
-    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut dirs: Vec<KnownDir> = Vec::new();
     if cfg!(windows) {
         // Windows managers keep shims in fixed per-user dirs, and the version
         // dirs hold the shims directly (no `bin` subdir).
-        dirs.extend(env_dir("APPDATA").map(|d| d.join("npm")));
+        dirs.extend(env_dir("APPDATA").map(|d| (d.join("npm"), InstallMethod::Npm)));
         for root in env_dir("FNM_DIR")
             .into_iter()
             .chain(env_dir("APPDATA").map(|d| d.join("fnm")))
         {
-            dirs.push(root.join("aliases").join("default"));
+            dirs.push((root.join("aliases").join("default"), InstallMethod::Fnm));
         }
-        dirs.extend(env_dir("LOCALAPPDATA").map(|d| d.join("Volta").join("bin")));
-        dirs.extend(env_dir("LOCALAPPDATA").map(|d| d.join("pnpm")));
+        dirs.extend(
+            env_dir("LOCALAPPDATA").map(|d| (d.join("Volta").join("bin"), InstallMethod::Volta)),
+        );
+        dirs.extend(env_dir("LOCALAPPDATA").map(|d| (d.join("pnpm"), InstallMethod::Pnpm)));
         if let Some(home) = &home {
-            dirs.push(home.join(".bun").join("bin"));
+            dirs.push((home.join(".bun").join("bin"), InstallMethod::Bun));
         }
         return dirs;
     }
@@ -379,20 +507,31 @@ pub(crate) fn node_version_manager_bins() -> Vec<std::path::PathBuf> {
         fnm_roots.push(home.join(".fnm"));
     }
     for root in fnm_roots {
-        dirs.push(root.join("aliases").join("default").join("bin"));
+        dirs.push((
+            root.join("aliases").join("default").join("bin"),
+            InstallMethod::Fnm,
+        ));
     }
     if let Some(home) = &home {
         // volta / bun keep real shims in a fixed bin dir; pnpm has a global bin.
-        dirs.push(home.join(".volta").join("bin"));
-        dirs.push(home.join(".bun").join("bin"));
-        dirs.push(home.join("Library").join("pnpm"));
-        dirs.push(home.join(".local").join("share").join("pnpm"));
+        dirs.push((home.join(".volta").join("bin"), InstallMethod::Volta));
+        dirs.push((home.join(".bun").join("bin"), InstallMethod::Bun));
+        dirs.push((home.join("Library").join("pnpm"), InstallMethod::Pnpm));
+        dirs.push((
+            home.join(".local").join("share").join("pnpm"),
+            InstallMethod::Pnpm,
+        ));
         // nvm: every installed version's bin, newest first.
         let nvm = home.join(".nvm").join("versions").join("node");
         if let Ok(entries) = std::fs::read_dir(&nvm) {
-            let mut versions: Vec<PathBuf> =
-                entries.flatten().map(|e| e.path().join("bin")).collect();
-            versions.sort();
+            let mut versions: Vec<KnownDir> = entries
+                .flatten()
+                .map(|e| (e.path().join("bin"), InstallMethod::Nvm))
+                .collect();
+            // By path only — every entry carries the same method, and sorting
+            // the pair would demand an `Ord` on `InstallMethod` that means
+            // nothing.
+            versions.sort_by(|(a, _), (b, _)| a.cmp(b));
             versions.reverse();
             dirs.append(&mut versions);
         }
@@ -530,6 +669,45 @@ pub(crate) fn drain_discovery_stderr(
     });
 }
 
+/// Compare two dotted-numeric versions, or decline to.
+///
+/// **String comparison is the bug this exists to prevent**: lexically
+/// `"0.9.0" > "0.147.0"`, which would report a year-old CLI as newer than the
+/// one that supersedes it. Components are compared numerically, and a missing
+/// component counts as zero so `1.2` and `1.2.0` are equal.
+///
+/// `None` means "cannot say", and **every component must parse strictly** for
+/// an answer to come back. A nightly tag, a git describe string, a pre-release
+/// suffix like `0.148.0-rc1`, or a component too large for `u64` all decline.
+/// The caller renders nothing rather than guessing, because both guesses are
+/// wrong in a way the user would act on: "up to date" hides a real update, and
+/// "update available" sends them to reinstall what they already have.
+///
+/// An earlier version truncated each component at its first non-digit, so
+/// `0.148.0-rc1` compared *equal* to `0.148.0`. That was described as the
+/// conservative direction and it was not: it is the "up to date" failure above,
+/// telling someone on a release candidate that the stable release superseding
+/// it does not exist. Truncation lost the one fact that mattered — that this
+/// string is not a plain version and cannot be ranked against one.
+pub(crate) fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    // Strict per component: `parse` rejects a pre-release suffix, an empty
+    // component, and an overflowing one alike, and all three mean the same
+    // thing here — this is not a dotted-numeric version.
+    fn components(v: &str) -> Option<Vec<u64>> {
+        v.split('.').map(|part| part.parse::<u64>().ok()).collect()
+    }
+    let (left, right) = (components(a)?, components(b)?);
+    let width = left.len().max(right.len());
+    for i in 0..width {
+        let l = left.get(i).copied().unwrap_or(0);
+        let r = right.get(i).copied().unwrap_or(0);
+        if l != r {
+            return Some(l.cmp(&r));
+        }
+    }
+    Some(std::cmp::Ordering::Equal)
+}
+
 /// Rolling tail of a child's stderr, shared between the reader task and the
 /// crash-message composer: an unexpected exit surfaces "<name> exited
 /// unexpectedly (<status>): <last stderr lines>" instead of a bare shrug —
@@ -663,6 +841,259 @@ pub use claude::{ClaudeHarness, resolve_claude_executable};
 pub use codex::{CodexHarness, resolve_codex_executable};
 
 #[cfg(test)]
+mod install_classification_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// The Windows half of the capture
+    /// (`captures/2026-08-11-agent-version-install-method.md`), as the tagged
+    /// list the real `all_known_dirs` would produce on that machine. Hard-coded
+    /// rather than built from the environment so the test asserts the same
+    /// thing on every machine and on CI's Linux runner.
+    fn windows_dirs() -> Vec<KnownDir> {
+        vec![
+            (
+                PathBuf::from(r"C:\Users\coding\.local\bin"),
+                InstallMethod::Native,
+            ),
+            (
+                PathBuf::from(r"C:\Users\coding\AppData\Local\Programs\OpenAI\Codex\bin"),
+                InstallMethod::Native,
+            ),
+            (
+                PathBuf::from(r"C:\Users\coding\AppData\Roaming\npm"),
+                InstallMethod::Npm,
+            ),
+            (
+                PathBuf::from(r"C:\Users\coding\AppData\Local\Microsoft\WinGet\Links"),
+                InstallMethod::Winget,
+            ),
+        ]
+    }
+
+    /// Fabricated, because this machine is Windows and cannot exercise them.
+    /// Written against the two `*_install_dirs` functions, not observed.
+    fn unix_dirs() -> Vec<KnownDir> {
+        vec![
+            (PathBuf::from("/Users/a/.local/bin"), InstallMethod::Native),
+            (PathBuf::from("/opt/homebrew/bin"), InstallMethod::Homebrew),
+            (PathBuf::from("/usr/local/bin"), InstallMethod::Unknown),
+            (PathBuf::from("/Users/a/.volta/bin"), InstallMethod::Volta),
+            (
+                PathBuf::from("/Users/a/.nvm/versions/node/v22.3.0/bin"),
+                InstallMethod::Nvm,
+            ),
+        ]
+    }
+
+    /// The three binaries the capture actually found on this machine, each
+    /// classified from its real path. The npm row is the one that matters: it
+    /// is a *different install of the same CLI*, a full minor behind the native
+    /// one, and the only thing that distinguishes them on screen is this label
+    /// plus the path beside it.
+    ///
+    /// Windows-only, and not for the reason the other `cfg(windows)` tests
+    /// here are. A backslash path is only a *path* on Windows: on unix
+    /// `Path::new(r"C:\a\b\claude.exe").parent()` is `""`, because nothing in
+    /// the string is a separator — so off Windows this would assert `Unknown`
+    /// for a reason that has nothing to do with the classifier. CI runs on
+    /// Ubuntu and caught exactly that. The unix half of the same lookup is
+    /// covered by `the_unix_locations_carry_their_documented_meanings`, whose
+    /// forward-slash paths parse on both platforms.
+    #[test]
+    #[cfg(windows)]
+    fn the_captured_windows_installs_classify_as_captured() {
+        let dirs = windows_dirs();
+        assert_eq!(
+            classify_install(
+                Path::new(r"C:\Users\coding\.local\bin\claude.exe"),
+                false,
+                &dirs
+            ),
+            InstallMethod::Native
+        );
+        assert_eq!(
+            classify_install(
+                Path::new(r"C:\Users\coding\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe"),
+                false,
+                &dirs
+            ),
+            InstallMethod::Native
+        );
+        assert_eq!(
+            classify_install(
+                Path::new(r"C:\Users\coding\AppData\Roaming\npm\codex.cmd"),
+                false,
+                &dirs
+            ),
+            InstallMethod::Npm
+        );
+    }
+
+    /// An override is reported as an override even when it points *into* a
+    /// directory we would otherwise recognize. The variable is why this binary
+    /// and not another one, which is the fact worth showing; and `resolve_cli`
+    /// returns the override before consulting any directory, so any other
+    /// answer would describe a lookup that never happened.
+    #[test]
+    fn an_override_outranks_the_directory_it_points_into() {
+        assert_eq!(
+            classify_install(
+                Path::new(r"C:\Users\coding\.local\bin\claude.exe"),
+                true,
+                &windows_dirs()
+            ),
+            InstallMethod::Override
+        );
+    }
+
+    /// Windows PATH entries arrive in whatever case and separator direction the
+    /// user's environment wrote them, while our own list is composed from
+    /// `%APPDATA%`. Comparing them raw would classify the *same* directory two
+    /// different ways depending on which list found it.
+    #[test]
+    #[cfg(windows)]
+    fn windows_matching_ignores_case_separator_and_trailing_slash() {
+        let dirs = windows_dirs();
+        for spelling in [
+            r"c:\users\coding\appdata\roaming\npm\codex.cmd",
+            r"C:/Users/coding/AppData/Roaming/npm/codex.cmd",
+            r"C:\USERS\CODING\APPDATA\ROAMING\NPM\codex.cmd",
+        ] {
+            assert_eq!(
+                classify_install(Path::new(spelling), false, &dirs),
+                InstallMethod::Npm,
+                "{spelling} did not match the npm dir"
+            );
+        }
+        // A trailing separator on the catalogue side must not break the match
+        // either — `%APPDATA%` itself can arrive with one.
+        let trailing = vec![(
+            PathBuf::from(r"C:\Users\coding\AppData\Roaming\npm\"),
+            InstallMethod::Npm,
+        )];
+        assert_eq!(
+            classify_install(
+                Path::new(r"C:\Users\coding\AppData\Roaming\npm\codex.cmd"),
+                false,
+                &trailing
+            ),
+            InstallMethod::Npm,
+            "a trailing separator on the catalogue side broke the match"
+        );
+    }
+
+    /// Unix paths are case-SENSITIVE, so two directories differing only in case
+    /// are two directories. Folding them the way Windows does would be a wrong
+    /// answer, not a lenient one.
+    #[test]
+    #[cfg(not(windows))]
+    fn unix_matching_is_case_sensitive() {
+        let dirs = unix_dirs();
+        assert_eq!(
+            classify_install(Path::new("/opt/homebrew/bin/claude"), false, &dirs),
+            InstallMethod::Homebrew
+        );
+        assert_eq!(
+            classify_install(Path::new("/opt/Homebrew/bin/claude"), false, &dirs),
+            InstallMethod::Unknown,
+            "a differently-cased unix path is a different directory"
+        );
+    }
+
+    /// The platform branches this machine cannot run, asserted against the
+    /// lists they are written from. Fabricated paths — see `unix_dirs`.
+    #[test]
+    fn the_unix_locations_carry_their_documented_meanings() {
+        let dirs = unix_dirs();
+        for (path, expected) in [
+            ("/Users/a/.local/bin/claude", InstallMethod::Native),
+            ("/opt/homebrew/bin/codex", InstallMethod::Homebrew),
+            ("/Users/a/.volta/bin/codex", InstallMethod::Volta),
+            (
+                "/Users/a/.nvm/versions/node/v22.3.0/bin/codex",
+                InstallMethod::Nvm,
+            ),
+        ] {
+            assert_eq!(
+                classify_install(Path::new(path), false, &dirs),
+                expected,
+                "{path}"
+            );
+        }
+    }
+
+    /// `/usr/local/bin` is Intel Homebrew, a manual copy, and several
+    /// installers' fallback at once. It is listed as a place to LOOK while
+    /// staying `Unknown` as an answer, and the two are not the same statement —
+    /// tagging it `Homebrew` would be a guess rendered as a fact.
+    #[test]
+    fn usr_local_bin_is_searched_without_being_attributed() {
+        let dirs = unix_dirs();
+        assert!(
+            dirs.iter().any(|(d, _)| d == Path::new("/usr/local/bin")),
+            "it must still be a searched location"
+        );
+        assert_eq!(
+            classify_install(Path::new("/usr/local/bin/codex"), false, &dirs),
+            InstallMethod::Unknown
+        );
+    }
+
+    /// A CLI on PATH somewhere bespoke is a working install, not a broken one.
+    /// The label says we do not recognize the location, and nothing else about
+    /// the row changes.
+    #[test]
+    fn an_unrecognized_directory_is_unknown_not_a_failure() {
+        // Forward slashes, which parse as a path on both platforms. A
+        // backslash literal would answer `Unknown` off Windows by failing to
+        // split into components at all — the right answer for the wrong
+        // reason, which is no test.
+        assert_eq!(
+            classify_install(Path::new("/opt/tools/bin/claude"), false, &unix_dirs()),
+            InstallMethod::Unknown
+        );
+    }
+
+    /// A bare file name has no parent directory to look up. Reachable through
+    /// the override, which is not required to be absolute.
+    #[test]
+    fn a_path_with_no_parent_directory_is_unknown() {
+        assert_eq!(
+            classify_install(Path::new("claude"), false, &windows_dirs()),
+            InstallMethod::Unknown
+        );
+    }
+
+    /// The catalogue handed to `classify_install` must be the same one
+    /// `resolve_cli` searched, or a binary found through a version manager
+    /// classifies as `Unknown`. `all_known_dirs` is what guarantees it, so
+    /// assert it actually appends them.
+    #[test]
+    fn all_known_dirs_includes_the_version_managers() {
+        // Every path this returns is derived from the environment, so one with
+        // none of those variables set legitimately yields nothing and the
+        // length assertion below would blame the append. Fail on the
+        // precondition instead, naming the actual cause.
+        assert!(
+            !node_version_manager_bins().is_empty(),
+            "no version-manager dir is derivable here \
+             (HOME/USERPROFILE, FNM_DIR, APPDATA and LOCALAPPDATA all unset)"
+        );
+        let install_only = vec![(PathBuf::from("/tmp/example"), InstallMethod::Native)];
+        let combined = all_known_dirs(install_only.clone());
+        assert!(
+            combined.len() > install_only.len(),
+            "the version-manager dirs were not appended"
+        );
+        assert_eq!(
+            combined[0], install_only[0],
+            "the provider's own locations must stay first, matching search order"
+        );
+    }
+}
+
+#[cfg(test)]
 mod probe_tests {
     use super::*;
 
@@ -695,6 +1126,65 @@ mod probe_tests {
         assert_eq!(parse_cli_version("codex 2 beta\n"), None);
     }
 
+    /// The whole reason this is not `a < b` on strings. Both of these are real
+    /// codex-cli versions and the lexical order is the wrong way round.
+    #[test]
+    fn versions_compare_numerically_not_lexically() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            compare_versions("0.147.0", "0.9.0"),
+            Some(Ordering::Greater),
+            "0.147.0 supersedes 0.9.0; a string sort says the opposite"
+        );
+        assert_eq!(
+            compare_versions("2.1.228", "2.1.228"),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(compare_versions("2.1.227", "2.1.228"), Some(Ordering::Less));
+        // Differing component counts: the missing one is zero, not "smaller".
+        assert_eq!(compare_versions("1.2", "1.2.0"), Some(Ordering::Equal));
+        assert_eq!(compare_versions("1.2.1", "1.2"), Some(Ordering::Greater));
+    }
+
+    /// A version that is not plainly dotted-numeric is not orderable, and
+    /// guessing either way misleads: "up to date" hides a real update, "update
+    /// available" sends the user to reinstall what they have.
+    #[test]
+    fn an_unorderable_version_declines_to_compare() {
+        assert_eq!(compare_versions("nightly", "0.147.0"), None);
+        assert_eq!(compare_versions("0.147.0", "main-4a2077e"), None);
+    }
+
+    /// A pre-release must not compare EQUAL to its release. It used to, by
+    /// truncating at the first non-digit, which told a user on `0.148.0-rc1`
+    /// that the stable `0.148.0` superseding it did not exist. Declining is the
+    /// honest answer: this string cannot be ranked against a plain version.
+    #[test]
+    fn a_pre_release_declines_rather_than_reading_as_its_release() {
+        assert_eq!(compare_versions("0.148.0", "0.148.0-rc1"), None);
+        assert_eq!(compare_versions("0.148.0-rc1", "0.148.0"), None);
+    }
+
+    /// A component too large for `u64` must decline, not silently become zero.
+    /// Read as zero it inverts the comparison and suppresses a real update.
+    #[test]
+    fn an_overflowing_component_declines_rather_than_reading_as_zero() {
+        assert_eq!(compare_versions("18446744073709551616.0", "0.147.0"), None);
+        assert_eq!(compare_versions("0.147.0", "18446744073709551616.0"), None);
+        // The largest value that does fit still compares.
+        assert_eq!(
+            compare_versions("18446744073709551615.0", "0.147.0"),
+            Some(std::cmp::Ordering::Greater)
+        );
+    }
+
+    /// An empty component is not a zero. `1..2` is malformed, not `1.0.2`.
+    #[test]
+    fn an_empty_component_declines() {
+        assert_eq!(compare_versions("1..2", "1.0.2"), None);
+        assert_eq!(compare_versions("1.2.", "1.2.0"), None);
+    }
+
     /// Windows resolves these CLIs to `.cmd` shims when they come from npm —
     /// [`executable_names`] exists precisely because that is the only spelling
     /// present. `CreateProcess` handling of batch files is a real trip hazard
@@ -715,6 +1205,59 @@ mod probe_tests {
             },
             "a .cmd shim must probe like any other executable"
         );
+    }
+
+    /// The claim the whole sibling design rests on: a CLI that resolved and
+    /// then failed `--version` still reports WHICH binary failed.
+    ///
+    /// Hanging the path off `HarnessAvailability::Available` would lose it in
+    /// exactly this case, which is the case where it is worth most — the hint
+    /// deliberately does not name the binary (see the test below for why), so
+    /// without this the user is told a provider is broken with no way to learn
+    /// which of several installs was asked.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_broken_cli_still_names_the_binary_that_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("broken-cli.cmd");
+        std::fs::write(&shim, "@echo off\r\necho boom 1>&2\r\nexit /b 3\r\n").unwrap();
+
+        let probe = probe_installed_cli(
+            Ok(shim.clone()),
+            "broken-cli",
+            "NO_SUCH_OVERRIDE_VAR",
+            vec![(dir.path().to_path_buf(), InstallMethod::Npm)],
+        )
+        .await;
+
+        assert!(
+            probe.availability.is_unavailable(),
+            "the probe must still report the failure"
+        );
+        let install = probe
+            .install
+            .expect("a resolved-but-broken CLI must still report its path");
+        assert_eq!(install.path, shim.display().to_string());
+        // And it is classified from where it sits, not from whether it worked.
+        assert_eq!(install.method, InstallMethod::Npm);
+    }
+
+    /// The other half: a CLI that never resolved has no path to report, and
+    /// must not invent one.
+    #[tokio::test]
+    async fn an_unresolved_cli_reports_no_install_at_all() {
+        let probe = probe_installed_cli(
+            Err(HarnessError::NotInstalled("nope".into())),
+            "ghost",
+            "GHOST_EXECUTABLE",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            probe.availability.unavailable_summary(),
+            Some("Not installed")
+        );
+        assert_eq!(probe.install, None);
     }
 
     /// A CLI that resolves but fails carries its own stderr into the hint —

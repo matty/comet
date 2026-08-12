@@ -35,12 +35,14 @@ const MAX_REF_ROWS: usize = 300;
 /// How often an open harness picker re-asks for the catalog while provider
 /// probes are still landing. Local IPC returning three small objects, so the
 /// cost is negligible next to keeping a stale row selectable.
-const HARNESS_REVALIDATE_INTERVAL: Duration = Duration::from_millis(500);
+/// Also used by the Agents settings pane, which has the same race for the same
+/// reason — see `settings::accounts::AccountsPage::poll_harness_installs`.
+pub(crate) const HARNESS_REVALIDATE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Cap on those re-asks. `HARNESS_REVALIDATE_INTERVAL * ATTEMPTS` covers the
 /// harness crate's own 10s `--version` timeout, so a probe that is merely slow
 /// is still waited out, while one that never answers cannot poll forever.
-const HARNESS_REVALIDATE_ATTEMPTS: usize = 20;
+pub(crate) const HARNESS_REVALIDATE_ATTEMPTS: usize = 20;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::errors;
@@ -210,6 +212,20 @@ fn images_allowed(model: Option<&Model>) -> bool {
 /// green while the call site drifts, which is exactly what happened when the
 /// reply gained its `{models, source}` envelope.
 fn decode_models_reply(value: serde_json::Value) -> Result<ModelCatalog, serde_json::Error> {
+    serde_json::from_value(value)
+}
+
+/// The one place the `ListHarnesses` reply is decoded, for the same reason as
+/// [`decode_models_reply`] — and now with a second consumer, the Agents
+/// settings pane, which reads the install fields off the same descriptors.
+///
+/// Two call sites here plus one there is exactly the shape that lets a reply
+/// change break one reader and not the others. `apps/ios` does not decode this
+/// reply at all (it carries a hardcoded `HarnessCatalog.swift`), so nothing
+/// outside this function is watching the wire.
+pub(crate) fn decode_harnesses_reply(
+    value: serde_json::Value,
+) -> Result<Vec<HarnessDescriptor>, serde_json::Error> {
     serde_json::from_value(value)
 }
 
@@ -910,7 +926,7 @@ impl Pickers {
                     }
                 };
                 pickers.harnesses = match result {
-                    Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
+                    Ok(value) => match decode_harnesses_reply(value) {
                         Ok(list) => Loadable::Ready(list),
                         Err(err) => {
                             Loadable::Error(errors::decode_failure(errors::Loading::Agents, &err))
@@ -1006,8 +1022,7 @@ impl Pickers {
                         // error would throw away a working catalog over a
                         // transient blip. Keep polling — it may be transient.
                         if let Ok(value) = result
-                            && let Ok(list) =
-                                serde_json::from_value::<Vec<HarnessDescriptor>>(value)
+                            && let Ok(list) = decode_harnesses_reply(value)
                         {
                             pickers.harnesses = Loadable::Ready(list);
                             cx.notify();
@@ -3081,7 +3096,11 @@ fn visible_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<H
 ///
 /// This is the revalidate-on-open trigger. It has to go false once every entry
 /// is probed, or the picker refetches on every single open forever.
-fn catalog_awaits_probes(list: &[HarnessDescriptor]) -> bool {
+///
+/// Shared with the Agents settings pane, whose install line is absent for
+/// exactly the entries this reports — `install` is populated by the same probe
+/// that fills `availability`, so "unprobed" and "no path yet" are one state.
+pub(crate) fn catalog_awaits_probes(list: &[HarnessDescriptor]) -> bool {
     list.iter().any(|d| d.availability.is_unprobed())
 }
 
@@ -3760,6 +3779,8 @@ mod tests {
             name: "n".into(),
             capabilities: comet_proto::HarnessCapabilities::default(),
             availability,
+            install: None,
+            update: None,
         };
 
         // The boot snapshot: nothing probed yet.
@@ -3815,6 +3836,8 @@ mod tests {
             name: "n".into(),
             capabilities: comet_proto::HarnessCapabilities::default(),
             availability,
+            install: None,
+            update: None,
         };
 
         // Nothing fetched yet, and a fetch in flight: both unsettled, so the
@@ -3846,6 +3869,8 @@ mod tests {
             name: "n".into(),
             capabilities: comet_proto::HarnessCapabilities::default(),
             availability,
+            install: None,
+            update: None,
         };
         let list = vec![
             with(HarnessId::ClaudeCode, HarnessAvailability::Unknown),
@@ -3986,6 +4011,8 @@ mod tests {
             name: name.into(),
             capabilities: comet_proto::HarnessCapabilities::default(),
             availability: comet_proto::HarnessAvailability::Unknown,
+            install: None,
+            update: None,
         };
         let mixed = vec![
             descriptor(HarnessId::Mock, "Mock"),

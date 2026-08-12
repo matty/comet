@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use comet_harness::{Harness, HarnessError, mock::MockHarness};
 use comet_proto::{
     AgentEvent, DiagnosticSeverity, DoneStatus, HarnessAvailability, HarnessCapabilities,
-    HarnessId, sanitize_discriminator,
+    HarnessId, HarnessInstall, HarnessProbe, HarnessUpdate, sanitize_discriminator,
 };
 
 /// What `ListHarnesses` reports per harness.
@@ -32,6 +32,21 @@ pub struct HarnessDescriptor {
     pub capabilities: HarnessCapabilities,
     #[serde(default)]
     pub availability: HarnessAvailability,
+    /// Which binary answered, and how it got there. A sibling of `availability`
+    /// for the same reason it is: discovered at run time, published
+    /// asynchronously, absent until the probe lands.
+    ///
+    /// `skip_serializing_if` keeps the descriptor byte-identical for a harness
+    /// with no CLI (the mock), so nothing that snapshots this reply changes
+    /// shape for the in-process case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<HarnessInstall>,
+    /// How current that binary is, to the extent its provider will say. A third
+    /// sibling for the same reasons as `install`, and skipped the same way so a
+    /// harness with no CLI — or a provider that publishes nothing — sends a
+    /// descriptor byte-identical to the one it sent before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<HarnessUpdate>,
 }
 
 fn describe(harness: &dyn Harness) -> HarnessDescriptor {
@@ -39,9 +54,11 @@ fn describe(harness: &dyn Harness) -> HarnessDescriptor {
         id: harness.id(),
         name: harness.display_name().to_string(),
         capabilities: harness.capabilities(),
-        // Availability is not the harness's to answer synchronously — it is
-        // overlaid from the probe cache by `descriptors()`.
+        // Neither is the harness's to answer synchronously — both are overlaid
+        // from the probe cache by `descriptors()`.
         availability: HarnessAvailability::Unknown,
+        install: None,
+        update: None,
     }
 }
 
@@ -90,7 +107,12 @@ type Factory = Box<dyn Fn() -> Result<Arc<dyn Harness>, HarnessError> + Send + S
 enum Slot {
     Ready(Arc<dyn Harness>),
     Lazy {
-        descriptor: HarnessDescriptor,
+        /// Boxed to keep the two variants a similar size. `Ready` is a fat
+        /// pointer; the descriptor grows every time a probed fact is added to
+        /// it (`availability`, then `install`, now `update`), and without this
+        /// every `Slot` in the map would be sized for the largest descriptor
+        /// any future slice adds.
+        descriptor: Box<HarnessDescriptor>,
         factory: Factory,
     },
 }
@@ -100,7 +122,11 @@ pub struct HarnessRegistry {
     order: Mutex<Vec<HarnessId>>,
     /// Probe results, overlaid onto every descriptor. Absent = never probed,
     /// which reports as `Unknown` and leaves the harness selectable.
-    availability: Mutex<HashMap<HarnessId, HarnessAvailability>>,
+    ///
+    /// One entry per harness holding both halves, never two maps: a descriptor
+    /// showing an install from one probe beside a version from another would
+    /// be a plausible-looking lie during the window between two writes.
+    probes: Mutex<HashMap<HarnessId, HarnessProbe>>,
     /// Per-boot log of unrecognized provider frames, keyed by
     /// (harness, discriminator). Bounded; counts saturate.
     diagnostics: Mutex<HashMap<HarnessId, DiagnosticsBucket>>,
@@ -117,7 +143,7 @@ impl HarnessRegistry {
         Self {
             slots: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
-            availability: Mutex::new(HashMap::new()),
+            probes: Mutex::new(HashMap::new()),
             diagnostics: Mutex::new(HashMap::new()),
         }
     }
@@ -145,7 +171,7 @@ impl HarnessRegistry {
             .insert(
                 id,
                 Slot::Lazy {
-                    descriptor,
+                    descriptor: Box::new(descriptor),
                     factory,
                 },
             )
@@ -168,15 +194,13 @@ impl HarnessRegistry {
         }
     }
 
-    fn availability(&self) -> MutexGuard<'_, HashMap<HarnessId, HarnessAvailability>> {
-        self.availability
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    fn probes(&self) -> MutexGuard<'_, HashMap<HarnessId, HarnessProbe>> {
+        self.probes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Record a probe result. Idempotent; a later probe replaces an earlier one.
-    pub fn set_availability(&self, id: HarnessId, availability: HarnessAvailability) {
-        self.availability().insert(id, availability);
+    pub fn set_probe(&self, id: HarnessId, probe: HarnessProbe) {
+        self.probes().insert(id, probe);
     }
 
     fn diagnostics_lock(&self) -> MutexGuard<'_, HashMap<HarnessId, DiagnosticsBucket>> {
@@ -252,19 +276,24 @@ impl HarnessRegistry {
     /// Catalog for `ListHarnesses` — never forces a lazy resolve.
     pub fn descriptors(&self) -> Vec<HarnessDescriptor> {
         let slots = self.slots();
-        let availability = self.availability();
+        let probes = self.probes();
         self.order()
             .iter()
             .filter_map(|id| {
                 let mut descriptor = match slots.get(id) {
                     Some(Slot::Ready(harness)) => describe(harness.as_ref()),
-                    Some(Slot::Lazy { descriptor, .. }) => descriptor.clone(),
+                    Some(Slot::Lazy { descriptor, .. }) => (**descriptor).clone(),
                     None => return None,
                 };
                 // Overlaid here rather than stored on the slot, so the probe
-                // never has to reach into a descriptor a lazy slot owns.
-                if let Some(probed) = availability.get(id) {
-                    descriptor.availability = probed.clone();
+                // never has to reach into a descriptor a lazy slot owns. All
+                // three come from the same cached probe, so the path can never
+                // be shown beside a version it was not read with, nor an
+                // update verdict beside a different binary's version.
+                if let Some(probed) = probes.get(id) {
+                    descriptor.availability = probed.availability.clone();
+                    descriptor.install = probed.install.clone();
+                    descriptor.update = probed.update.clone();
                 }
                 Some(descriptor)
             })
@@ -281,7 +310,7 @@ impl HarnessRegistry {
     ///
     /// A no-op outside a tokio runtime, which is what test callers of
     /// [`default_registry`] get; nothing depends on the probe having run.
-    pub fn spawn_availability_probes(self: &Arc<Self>) {
+    pub fn spawn_probes(self: &Arc<Self>) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -292,21 +321,30 @@ impl HarnessRegistry {
                 // Resolving a lazy slot only constructs the harness — CLI
                 // discovery still happens inside `availability()`. A slot whose
                 // factory fails is itself the reason it is unusable.
-                let availability = match registry.resolve(id) {
-                    Ok(harness) => harness.availability().await,
-                    Err(err) => {
-                        HarnessAvailability::unavailable("Not working", Some(err.to_string()))
-                    }
+                let probe = match registry.resolve(id) {
+                    Ok(harness) => harness.probe().await,
+                    Err(err) => HarnessProbe::unresolved(HarnessAvailability::unavailable(
+                        "Not working",
+                        Some(err.to_string()),
+                    )),
                 };
-                if let Some(summary) = availability.unavailable_summary() {
+                if let Some(summary) = probe.availability.unavailable_summary() {
                     tracing::info!(
                         ?id,
                         summary,
-                        hint = availability.unavailable_hint().unwrap_or("-"),
+                        hint = probe.availability.unavailable_hint().unwrap_or("-"),
+                        // A resolved-but-broken CLI logs WHICH binary failed.
+                        // Without it the log says a provider is broken without
+                        // saying which of two installs was asked.
+                        path = probe
+                            .install
+                            .as_ref()
+                            .map(|i| i.path.as_str())
+                            .unwrap_or("-"),
                         "harness unavailable"
                     );
                 }
-                registry.set_availability(id, availability);
+                registry.set_probe(id, probe);
             });
         }
     }
@@ -375,6 +413,8 @@ pub fn default_registry() -> HarnessRegistry {
             name: "Claude Code".into(),
             capabilities: comet_harness::ClaudeHarness::capabilities(),
             availability: HarnessAvailability::Unknown,
+            install: None,
+            update: None,
         },
         Box::new(|| Ok(Arc::new(comet_harness::ClaudeHarness::new()) as Arc<dyn Harness>)),
     );
@@ -386,6 +426,8 @@ pub fn default_registry() -> HarnessRegistry {
             name: "Codex".into(),
             capabilities: comet_harness::CodexHarness::capabilities(),
             availability: HarnessAvailability::Unknown,
+            install: None,
+            update: None,
         },
         Box::new(|| Ok(Arc::new(comet_harness::CodexHarness::new()) as Arc<dyn Harness>)),
     );
@@ -408,6 +450,8 @@ mod tests {
                 name: "Lazy Mock".into(),
                 capabilities: HarnessCapabilities::default(),
                 availability: HarnessAvailability::Unknown,
+                install: None,
+                update: None,
             },
             Box::new(move || {
                 counted.fetch_add(1, Ordering::SeqCst);
@@ -501,17 +545,28 @@ mod tests {
     #[test]
     fn a_probe_result_is_overlaid_onto_its_descriptor() {
         let registry = default_registry();
-        registry.set_availability(
+        registry.set_probe(
             HarnessId::Codex,
-            HarnessAvailability::unavailable(
+            HarnessProbe::unresolved(HarnessAvailability::unavailable(
                 "Not installed",
                 Some("Install codex, or set CODEX_EXECUTABLE to its path.".into()),
-            ),
+            )),
         );
-        registry.set_availability(
+        registry.set_probe(
             HarnessId::ClaudeCode,
-            HarnessAvailability::Available {
-                version: Some("1.0.30".into()),
+            HarnessProbe {
+                availability: HarnessAvailability::Available {
+                    version: Some("1.0.30".into()),
+                },
+                install: Some(HarnessInstall {
+                    path: "/Users/a/.local/bin/claude".into(),
+                    method: comet_proto::InstallMethod::Native,
+                }),
+                update: Some(HarnessUpdate {
+                    state: comet_proto::UpdateState::SelfUpdating,
+                    latest: None,
+                    checked_at: Some("2026-08-11T19:59:18.645Z".into()),
+                }),
             },
         );
 
@@ -539,6 +594,43 @@ mod tests {
         );
         // Untouched slots stay unprobed rather than inheriting a neighbour's.
         assert_eq!(by_id(HarnessId::Mock), HarnessAvailability::Unknown);
+
+        // The install rides the same overlay. Both halves come from one cached
+        // probe, so a harness cannot end up showing one and not the other.
+        let install = |id: HarnessId| {
+            registry
+                .descriptors()
+                .into_iter()
+                .find(|d| d.id == id)
+                .expect("harness in catalog")
+                .install
+        };
+        let claude = install(HarnessId::ClaudeCode).expect("the probed install must be published");
+        assert_eq!(claude.path, "/Users/a/.local/bin/claude");
+        assert_eq!(claude.method, comet_proto::InstallMethod::Native);
+        // Codex never resolved, so it has a reason but no path — and must not
+        // borrow the neighbour's.
+        assert_eq!(install(HarnessId::Codex), None);
+        assert_eq!(install(HarnessId::Mock), None);
+
+        // And so does the update state, from the same cached probe — a verdict
+        // published beside another binary's version would be a plausible lie.
+        let update = |id: HarnessId| {
+            registry
+                .descriptors()
+                .into_iter()
+                .find(|d| d.id == id)
+                .expect("harness in catalog")
+                .update
+        };
+        let claude = update(HarnessId::ClaudeCode).expect("the probed update must be published");
+        assert_eq!(claude.state, comet_proto::UpdateState::SelfUpdating);
+        assert_eq!(
+            claude.checked_at.as_deref(),
+            Some("2026-08-11T19:59:18.645Z")
+        );
+        assert_eq!(update(HarnessId::Codex), None);
+        assert_eq!(update(HarnessId::Mock), None);
     }
 
     /// The overlay must survive a lazy slot resolving, which swaps the stored
@@ -547,10 +639,21 @@ mod tests {
     #[test]
     fn availability_survives_a_lazy_resolve() {
         let registry = default_registry();
-        registry.set_availability(
+        registry.set_probe(
             HarnessId::Codex,
-            HarnessAvailability::Available {
-                version: Some("0.20.0".into()),
+            HarnessProbe {
+                availability: HarnessAvailability::Available {
+                    version: Some("0.20.0".into()),
+                },
+                install: Some(HarnessInstall {
+                    path: "/opt/homebrew/bin/codex".into(),
+                    method: comet_proto::InstallMethod::Homebrew,
+                }),
+                update: Some(HarnessUpdate {
+                    state: comet_proto::UpdateState::Current,
+                    latest: Some("0.20.0".into()),
+                    checked_at: None,
+                }),
             },
         );
         registry.resolve(HarnessId::Codex).unwrap();
@@ -566,6 +669,16 @@ mod tests {
             },
             "resolving the slot dropped the probe result"
         );
+        assert_eq!(
+            after.install.map(|i| i.path),
+            Some("/opt/homebrew/bin/codex".to_string()),
+            "resolving the slot dropped the install"
+        );
+        assert_eq!(
+            after.update.map(|u| u.state),
+            Some(comet_proto::UpdateState::Current),
+            "resolving the slot dropped the update state"
+        );
     }
 
     /// Probing must not be a precondition for anything: `default_registry()` is
@@ -573,7 +686,7 @@ mod tests {
     #[test]
     fn spawning_probes_off_runtime_is_a_no_op() {
         let registry = Arc::new(default_registry());
-        registry.spawn_availability_probes();
+        registry.spawn_probes();
         assert!(
             registry
                 .descriptors()
@@ -588,10 +701,14 @@ mod tests {
     async fn an_in_process_harness_probes_as_available() {
         let registry = Arc::new(default_registry());
         let mock = registry.resolve(HarnessId::Mock).unwrap();
+        let probe = mock.probe().await;
         assert_eq!(
-            mock.availability().await,
+            probe.availability,
             HarnessAvailability::Available { version: None }
         );
+        // No CLI means no path to name. `None` here is the honest answer, and
+        // the card must not invent one.
+        assert_eq!(probe.install, None);
     }
 
     /// `capabilities` is `#[serde(flatten)]`, so the descriptor keeps the wire
@@ -604,6 +721,8 @@ mod tests {
             name: "Codex".into(),
             capabilities: comet_harness::CodexHarness::capabilities(),
             availability: HarnessAvailability::Unknown,
+            install: None,
+            update: None,
         };
         let json = serde_json::to_value(&descriptor).unwrap();
         let object = json
@@ -624,6 +743,64 @@ mod tests {
         }
         let round: HarnessDescriptor = serde_json::from_value(json).unwrap();
         assert_eq!(round.capabilities, descriptor.capabilities);
+    }
+
+    /// The literal JSON `ListHarnesses` sends, asserted key by key rather than
+    /// round-tripped through the Rust type.
+    ///
+    /// AGENTS.md's rule about reply consumers exists because a round-trip test
+    /// stayed green through the `ListModels` reshape that broke the picker at
+    /// run time. The same trap applies here: `apps/ios` reads harnesses from a
+    /// hardcoded Swift catalog rather than this reply, and `e2e.rs` indexes it
+    /// untyped, so neither would fail on a wrong key name.
+    #[test]
+    fn the_wire_shape_of_a_probed_install() {
+        let descriptor = HarnessDescriptor {
+            id: HarnessId::ClaudeCode,
+            name: "Claude Code".into(),
+            capabilities: comet_harness::ClaudeHarness::capabilities(),
+            availability: HarnessAvailability::Available {
+                version: Some("2.1.228".into()),
+            },
+            install: Some(HarnessInstall {
+                path: r"C:\Users\a\.local\bin\claude.exe".into(),
+                method: comet_proto::InstallMethod::Native,
+            }),
+            update: Some(HarnessUpdate {
+                state: comet_proto::UpdateState::Available,
+                latest: Some("0.148.0".into()),
+                checked_at: Some("2026-08-12T00:48:08.145707800Z".into()),
+            }),
+        };
+        let json = serde_json::to_value(&descriptor).unwrap();
+        assert_eq!(json["install"]["path"], r"C:\Users\a\.local\bin\claude.exe");
+        assert_eq!(json["install"]["method"], "native");
+        assert_eq!(json["availability"]["version"], "2.1.228");
+        assert_eq!(json["update"]["state"], "available");
+        assert_eq!(json["update"]["latest"], "0.148.0");
+        assert_eq!(
+            json["update"]["checkedAt"],
+            "2026-08-12T00:48:08.145707800Z"
+        );
+
+        // A harness with no CLI omits the keys entirely rather than sending
+        // `null`, so its payload is byte-identical to what it was before these
+        // fields existed. Anything already snapshotting the mock's descriptor
+        // keeps working.
+        let cliless = HarnessDescriptor {
+            install: None,
+            update: None,
+            ..descriptor
+        };
+        let json = serde_json::to_value(&cliless).unwrap();
+        assert!(
+            json.as_object().unwrap().get("install").is_none(),
+            "an absent install must not serialize as null: {json}"
+        );
+        assert!(
+            json.as_object().unwrap().get("update").is_none(),
+            "an absent update must not serialize as null: {json}"
+        );
     }
 
     #[test]

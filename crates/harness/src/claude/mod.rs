@@ -20,6 +20,7 @@ mod catalog;
 pub(crate) mod commands;
 pub(crate) mod discovery;
 mod normalize;
+mod update;
 pub(crate) mod wire;
 
 use std::path::{Path, PathBuf};
@@ -36,8 +37,8 @@ use tokio::sync::mpsc;
 
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus,
-    HarnessAvailability, HarnessCapabilities, HarnessId, ModelCatalog, ReasoningLevel, RunRequest,
-    RuntimeMode, SteeringMode, UserInputAnswer, UserInputQuestion,
+    HarnessCapabilities, HarnessId, HarnessProbe, InstallMethod, ModelCatalog, ReasoningLevel,
+    RunRequest, RuntimeMode, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
@@ -55,29 +56,40 @@ use wire::{
 /// known install locations as a last resort. Resolved per call — cheap after
 /// the snapshot is cached.
 pub fn resolve_claude_executable() -> Option<PathBuf> {
-    crate::resolve_cli("CLAUDE_CODE_EXECUTABLE", "claude", claude_install_dirs())
+    crate::resolve_cli(
+        "CLAUDE_CODE_EXECUTABLE",
+        "claude",
+        crate::all_known_dirs(claude_install_dirs()),
+    )
 }
 
-/// Where a Claude Code CLI lands when PATH doesn't name it.
-fn claude_install_dirs() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
+/// Where a Claude Code CLI lands when PATH doesn't name it, each tagged with
+/// what finding it there means (see [`crate::KnownDir`]).
+fn claude_install_dirs() -> Vec<crate::KnownDir> {
+    let mut dirs: Vec<crate::KnownDir> = Vec::new();
     if let Some(home) = crate::home_dir() {
-        dirs.push(home.join(".claude").join("local"));
+        dirs.push((home.join(".claude").join("local"), InstallMethod::Native));
         // The native installer's per-user dir on every platform, `claude.exe`
         // included.
-        dirs.push(home.join(".local").join("bin"));
+        dirs.push((home.join(".local").join("bin"), InstallMethod::Native));
     }
     if cfg!(windows) {
-        dirs.extend(
-            crate::env_dir("LOCALAPPDATA")
-                .map(|d| d.join("Microsoft").join("WinGet").join("Links")),
-        );
+        dirs.extend(crate::env_dir("LOCALAPPDATA").map(|d| {
+            (
+                d.join("Microsoft").join("WinGet").join("Links"),
+                InstallMethod::Winget,
+            )
+        }));
         if let Some(home) = crate::home_dir() {
-            dirs.push(home.join("scoop").join("shims"));
+            dirs.push((home.join("scoop").join("shims"), InstallMethod::Scoop));
         }
     } else {
-        dirs.push(PathBuf::from("/opt/homebrew/bin"));
-        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push((PathBuf::from("/opt/homebrew/bin"), InstallMethod::Homebrew));
+        // `/usr/local/bin` is deliberately NOT tagged Homebrew. It is Intel
+        // Homebrew's prefix, a manual `cp`, and half a dozen installers'
+        // fallback all at once, so naming one of them would be a guess
+        // presented as a fact.
+        dirs.push((PathBuf::from("/usr/local/bin"), InstallMethod::Unknown));
     }
     dirs
 }
@@ -291,11 +303,20 @@ impl Harness for ClaudeHarness {
         Self::capabilities()
     }
 
-    async fn availability(&self) -> HarnessAvailability {
-        match self.resolve_executable() {
-            Ok(exe) => crate::probe_cli_version(&exe).await,
-            Err(err) => crate::unavailable_from_resolve(&err, "claude", "CLAUDE_CODE_EXECUTABLE"),
-        }
+    async fn probe(&self) -> HarnessProbe {
+        let mut probe = crate::probe_installed_cli(
+            self.resolve_executable(),
+            "claude",
+            "CLAUDE_CODE_EXECUTABLE",
+            crate::all_known_dirs(claude_install_dirs()),
+        )
+        .await;
+        // No installed version is passed, unlike Codex: there is nothing to
+        // compare it against. Claude publishes no latest version, so this
+        // reports what its updater last did and never a verdict on currency.
+        probe.update =
+            update::read_resolved_update(probe.install.as_ref(), update::claude_home().as_deref());
+        probe
     }
 
     /// The curated catalog (see [`catalog`]) unioned with whatever the live
@@ -898,6 +919,51 @@ fn updated_input_with_answers(
     }
     updated.insert("answers".into(), Value::Object(by_question));
     Value::Object(updated)
+}
+
+#[cfg(test)]
+mod install_dir_tests {
+    use super::*;
+
+    /// The real catalogue's tags, for the same reason as Codex's: the lookup
+    /// is tested elsewhere, but the label a user reads comes from these tags.
+    ///
+    /// `~/.local/bin` is where the capture found the live `claude.exe`
+    /// (`captures/2026-08-11-agent-version-install-method.md`), so this is the
+    /// entry that decides what this machine's card says.
+    #[test]
+    fn the_native_installer_dirs_are_tagged_native() {
+        let Some(home) = crate::home_dir() else {
+            return;
+        };
+        let dirs = claude_install_dirs();
+        for expected_dir in [
+            home.join(".local").join("bin"),
+            home.join(".claude").join("local"),
+        ] {
+            let tag = dirs
+                .iter()
+                .find(|(d, _)| *d == expected_dir)
+                .map(|(_, m)| *m)
+                .unwrap_or_else(|| panic!("{} must be in the catalogue", expected_dir.display()));
+            assert_eq!(tag, InstallMethod::Native, "{}", expected_dir.display());
+        }
+    }
+
+    /// `/usr/local/bin` stays a searched location with no attribution. The two
+    /// halves are a single deliberate statement, and testing only one of them
+    /// would let the other flip silently.
+    #[test]
+    #[cfg(not(windows))]
+    fn usr_local_bin_is_listed_but_unattributed() {
+        let dirs = claude_install_dirs();
+        let tag = dirs
+            .iter()
+            .find(|(d, _)| *d == std::path::Path::new("/usr/local/bin"))
+            .map(|(_, m)| *m)
+            .expect("it must still be searched");
+        assert_eq!(tag, InstallMethod::Unknown);
+    }
 }
 
 #[cfg(test)]

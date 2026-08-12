@@ -297,6 +297,43 @@ pub fn ghost_hover(theme: &Theme, s: gpui::StyleRefinement) -> gpui::StyleRefine
 /// border-red-400/20 bg-red-400/[0.06] text-red-300/90` with a leading
 /// `DangerTriangle mt-0.5 size-4`).
 pub fn error_strip(theme: &Theme, message: impl Into<SharedString>) -> gpui::Div {
+    error_strip_body(theme, div().min_w_0().child(message.into()))
+}
+
+/// [`error_strip`] with a second, quieter line **under** the message — the
+/// summary/hint pair `.agents/rules/user-facing-errors.md` asks every failure
+/// surface to render.
+///
+/// This exists because appending the hint to `error_strip` as another `.child`
+/// does not stack it. The strip is a flex ROW of `[icon][message]`, so a third
+/// child lands *beside* the message, and the `mt` meant as the gap above a
+/// second line instead drops it a few pixels below the message's baseline —
+/// which reads as a fragment knocked out of alignment rather than a hint.
+pub fn error_strip_with_hint(
+    theme: &Theme,
+    message: impl Into<SharedString>,
+    hint: impl Into<SharedString>,
+) -> gpui::Div {
+    error_strip_body(
+        theme,
+        div()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(message.into())
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted)
+                    .child(hint.into()),
+            ),
+    )
+}
+
+/// The strip's chrome, with whatever body the two constructors compose. The
+/// icon column stays `flex_none` so a wrapping message never squeezes it.
+fn error_strip_body(theme: &Theme, body: gpui::Div) -> gpui::Div {
     let red = theme.danger; // red-400
     let red_text = theme.danger_muted; // red-300
     div()
@@ -320,7 +357,7 @@ pub fn error_strip(theme: &Theme, message: impl Into<SharedString>) -> gpui::Div
                     .text_color(red_text.opacity(0.9)),
             ),
         )
-        .child(div().min_w_0().child(message.into()))
+        .child(body)
 }
 
 /// The amber warning strip (`flex items-start gap-2 border-amber-400/20
