@@ -8,11 +8,11 @@ use anyhow::{anyhow, bail};
 use crate::capture::sanitize::has_windows_reparse_point;
 use crate::capture::{CaptureConfig, CaptureOperation, CodexCaptureOperation, CodexRunScript};
 
-pub(in crate::capture) const CLAUDE_APPROVAL_COMMAND: &str = "printf capture";
-pub(in crate::capture) const CODEX_APPROVAL_COMMAND: &str = "echo capture";
-pub(in crate::capture) const APPROVAL_MARKER_NAME: &str = "capture-marker.txt";
-pub(in crate::capture) const APPROVAL_MARKER_CONTENT: &str = "capture\n";
-pub(in crate::capture) const APPROVAL_MARKER_ADD_DIFF: &str = APPROVAL_MARKER_CONTENT;
+pub(super) const CLAUDE_APPROVAL_COMMAND: &str = "printf capture";
+pub(super) const CODEX_APPROVAL_COMMAND: &str = "echo capture";
+pub(super) const APPROVAL_MARKER_NAME: &str = "capture-marker.txt";
+pub(super) const APPROVAL_MARKER_CONTENT: &str = "capture\n";
+pub(super) const APPROVAL_MARKER_ADD_DIFF: &str = APPROVAL_MARKER_CONTENT;
 
 pub fn claude_approval_prompt(cwd: &Path) -> String {
     let marker = cwd.join(APPROVAL_MARKER_NAME);
@@ -253,7 +253,7 @@ pub(in crate::capture) struct FileIdentity {
 }
 
 #[cfg(windows)]
-pub(in crate::capture) fn file_identity(path: &Path) -> anyhow::Result<FileIdentity> {
+pub(super) fn file_identity(path: &Path) -> anyhow::Result<FileIdentity> {
     let link_metadata = std::fs::symlink_metadata(path)
         .map_err(|_| anyhow!("The trusted PowerShell executable could not be inspected."))?;
     if !link_metadata.file_type().is_file()
@@ -311,7 +311,7 @@ pub(in crate::capture) fn file_identity(path: &Path) -> anyhow::Result<FileIdent
 }
 
 #[cfg(windows)]
-pub(in crate::capture) fn canonical_protected_roots<'a>(
+pub(super) fn canonical_protected_roots<'a>(
     roots: impl IntoIterator<Item = Option<&'a Path>>,
 ) -> anyhow::Result<Vec<PathBuf>> {
     let mut canonical = Vec::new();
@@ -330,7 +330,7 @@ pub(in crate::capture) fn canonical_protected_roots<'a>(
 }
 
 #[cfg(windows)]
-pub(in crate::capture) fn windows_protected_roots() -> anyhow::Result<Vec<PathBuf>> {
+pub(super) fn windows_protected_roots() -> anyhow::Result<Vec<PathBuf>> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::UI::Shell::{
@@ -380,7 +380,7 @@ pub(in crate::capture) fn windows_protected_roots() -> anyhow::Result<Vec<PathBu
 }
 
 #[cfg(windows)]
-pub(in crate::capture) fn select_trusted_powershell(
+pub(super) fn select_trusted_powershell(
     candidates: &[PathBuf],
     protected_roots: &[PathBuf],
     forbidden_roots: &[PathBuf],
