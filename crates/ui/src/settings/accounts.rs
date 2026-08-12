@@ -75,6 +75,11 @@ pub struct UpdateLine {
     /// themselves, so it is a passing fact, and colouring it would make the
     /// card nag about something that resolves on its own.
     pub needs_attention: bool,
+    /// Carries a fact the reader might act on later — today, a version to move
+    /// to. Painted at full `text_muted` rather than the path's dimmed weight,
+    /// because a version number rendered fainter than the file path beside it
+    /// inverts which of the two matters.
+    pub is_informational: bool,
     /// What to do about it, for the tooltip. Only ever set alongside
     /// `needs_attention` — the rest of the states need no action.
     pub hint: Option<String>,
@@ -130,13 +135,19 @@ fn update_line(update: Option<&HarnessUpdate>, now: DateTime<Utc>) -> Option<Upd
         Some(UpdateLine {
             text,
             needs_attention: false,
+            is_informational: false,
             hint: None,
         })
     };
     match update.state {
         // The version is the point of this line, so a state claiming one
         // without carrying it says nothing worth a row.
-        UpdateState::Available => plain(format!("Update available: {}", update.latest.as_ref()?)),
+        UpdateState::Available => Some(UpdateLine {
+            text: format!("Update available: {}", update.latest.as_ref()?),
+            needs_attention: false,
+            is_informational: true,
+            hint: None,
+        }),
         UpdateState::Current => plain(match age {
             Some(age) => format!("Up to date \u{00b7} checked {age}"),
             None => "Up to date".to_string(),
@@ -153,6 +164,7 @@ fn update_line(update: Option<&HarnessUpdate>, now: DateTime<Utc>) -> Option<Upd
                 None => "Last update failed".to_string(),
             },
             needs_attention: true,
+            is_informational: false,
             hint: Some(
                 "The CLI updates itself, and its last attempt did not finish. Run it in a \
                  terminal to see what it reports."
@@ -1848,8 +1860,25 @@ impl Render for AccountsPage {
                                                             // path's weight so
                                                             // the card reads as
                                                             // one block.
+                                                            // Three weights, by
+                                                            // what the line
+                                                            // asks of the
+                                                            // reader. A state
+                                                            // with nothing to
+                                                            // do sits at the
+                                                            // path's weight; a
+                                                            // version to move
+                                                            // to is
+                                                            // information and
+                                                            // must not be
+                                                            // dimmer than the
+                                                            // path beside it;
+                                                            // a failure is
+                                                            // amber.
                                                             let tone = if update.needs_attention {
                                                                 theme.warning_muted
+                                                            } else if update.is_informational {
+                                                                theme.text_muted
                                                             } else {
                                                                 theme.text_muted.opacity(0.6)
                                                             };
@@ -1877,12 +1906,25 @@ impl Render for AccountsPage {
                                                                 // to try is not
                                                                 // an
                                                                 // instruction.
+                                                                // `text_muted`
+                                                                // undimmed: the
+                                                                // hint is the
+                                                                // actionable
+                                                                // half, and
+                                                                // 0.2a settled
+                                                                // that opacity
+                                                                // on text a
+                                                                // user must act
+                                                                // on drops it
+                                                                // under the
+                                                                // contrast
+                                                                // floor the
+                                                                // theme test
+                                                                // guarantees.
                                                                 .children(update.hint.map(|hint| {
                                                                     div()
                                                                         .text_color(
-                                                                            theme
-                                                                                .text_muted
-                                                                                .opacity(0.6),
+                                                                            theme.text_muted,
                                                                         )
                                                                         .child(SharedString::from(
                                                                             hint,
@@ -2143,6 +2185,23 @@ mod tests {
         // Not amber: both CLIs update themselves, so this resolves on its own
         // and colouring it would make the card nag.
         assert!(!line.needs_attention);
+        // But not the path's dimmed weight either — a version number fainter
+        // than the file path beside it inverts which of the two matters.
+        assert!(line.is_informational);
+    }
+
+    /// The states with nothing to do stay at the quiet weight. Only a version
+    /// to move to is lifted, so "Up to date" cannot draw the eye first.
+    #[test]
+    fn a_settled_state_is_not_lifted_off_the_quiet_weight() {
+        for state in [UpdateState::Current, UpdateState::SelfUpdating] {
+            let line = line_for(update_at(state, Some("0.147.0"), None))
+                .expect("a settled state still has a line");
+            assert!(
+                !line.is_informational && !line.needs_attention,
+                "{state:?} should sit at the quiet weight"
+            );
+        }
     }
 
     /// A state claiming an update without carrying the version says nothing
