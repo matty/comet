@@ -173,10 +173,9 @@ fn offset_of(cursor: &str) -> usize {
 fn model_list(stdin: &mut StdinLock<'_>, first: &str) {
     let models = discovery_models();
     let mut line = first.to_string();
-    // Every real session emits this, unprompted, before the reply the client is
-    // waiting on — on every run of the 2026-08-11 capture it arrived ahead of
-    // the `initialize` result. A client that reads the next line rather than
-    // the line carrying its own id takes this as its answer.
+    // The reviewed stream emits this after initialize succeeds and before the
+    // model-list reply. A client that reads the next line rather than the line
+    // carrying its requested id takes this notification as its answer.
     emit(
         r#"{"method":"remoteControl/status/changed","params":{"status":"disabled","hostname":"fake"}}"#,
     );

@@ -259,8 +259,8 @@ async fn send(stdin: &mut tokio::process::ChildStdin, line: &str) -> Result<(), 
 /// Read until the reply to `id` arrives.
 ///
 /// Matching on the id rather than taking the next line is load-bearing: every
-/// session emits a `remoteControl/status/changed` notification, and on every
-/// run of the capture it arrived BEFORE the `initialize` result.
+/// reviewed discovery emitted `remoteControl/status/changed` after initialize
+/// succeeded but before the later `model/list` reply.
 async fn reply_to<R>(
     lines: &mut tokio::io::Lines<BufReader<R>>,
     id: u32,

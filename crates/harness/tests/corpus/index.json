@@ -7,10 +7,10 @@
       "fact": "The initialize result nests twice, models carry resolvedModel, and no modality field is present.",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "claude/2.1.228/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 2,
               "channel": "stdout"
             }
           ]
@@ -23,10 +23,10 @@
       "fact": "Provider model selectors and resolved identifiers decode onto curated model identifiers.",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "claude/2.1.228/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 2,
               "channel": "stdout"
             }
           ]
@@ -40,19 +40,19 @@
       "fact": "The model list is invariant across capture working directories while commands vary.",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/model-discovery-neutral-cwd/manifest.json",
+          "manifest": "claude/2.1.228/model-discovery-neutral-cwd/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 2,
               "channel": "stdout"
             }
           ]
         },
         {
-          "manifest": "claude/pending-observed-version/model-discovery-project-cwd/manifest.json",
+          "manifest": "claude/2.1.228/model-discovery-project-cwd/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 2,
               "channel": "stdout"
             }
           ]
@@ -66,19 +66,19 @@
       "fact": "Bare initialization omits account identity and reduces command discovery to built-ins.",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "claude/2.1.228/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 2,
               "channel": "stdout"
             }
           ]
         },
         {
-          "manifest": "claude/pending-observed-version/command-discovery/manifest.json",
+          "manifest": "claude/2.1.228/command-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 5,
               "channel": "stdout"
             }
           ]
@@ -91,10 +91,10 @@
       "fact": "The subprocess fixture preserves the captured double nesting and resolvedModel field.",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "claude/2.1.228/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 2,
               "channel": "stdout"
             }
           ]
@@ -107,10 +107,10 @@
       "fact": "The model-discovery integration fixture is a reduced form of the captured initialize reply.",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "claude/2.1.228/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 2,
               "channel": "stdout"
             }
           ]
@@ -123,10 +123,10 @@
       "fact": "Non-bare initialization discovers scoped commands from the selected working directory.",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/command-discovery/manifest.json",
+          "manifest": "claude/2.1.228/command-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 5,
               "channel": "stdout"
             }
           ]
@@ -139,10 +139,10 @@
       "fact": "Command objects include argumentHint and may include aliases.",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/command-discovery/manifest.json",
+          "manifest": "claude/2.1.228/command-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 5,
               "channel": "stdout"
             }
           ]
@@ -156,19 +156,19 @@
       "fact": "The non-bare command handshake includes project-scoped commands omitted by the bare handshake.",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "claude/2.1.228/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 2,
               "channel": "stdout"
             }
           ]
         },
         {
-          "manifest": "claude/pending-observed-version/command-discovery/manifest.json",
+          "manifest": "claude/2.1.228/command-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 5,
               "channel": "stdout"
             }
           ]
@@ -341,10 +341,10 @@
       "fact": "Cold model/list returns curated identifiers, object reasoning efforts, and explicit input modalities.",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "codex/0.147.0/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 6,
               "channel": "stdout"
             }
           ]
@@ -357,10 +357,10 @@
       "fact": "The model/list result data and nextCursor envelope decode from literal provider bytes.",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "codex/0.147.0/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 6,
               "channel": "stdout"
             }
           ]
@@ -373,10 +373,10 @@
       "fact": "model/list omits includeHidden and sends a cursor only when paging.",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "codex/0.147.0/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 5,
               "channel": "stdin"
             }
           ]
@@ -386,13 +386,21 @@
     {
       "id": "codex-model-notification-order",
       "consumer": "crates/harness/tests/fixtures/fake_codex.rs:model_list",
-      "fact": "An unsolicited notification can precede the initialize response.",
+      "fact": "After initialize succeeds, remoteControl/status/changed is interleaved before the model/list response.",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "codex/0.147.0/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 2,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 3,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 6,
               "channel": "stdout"
             }
           ]
@@ -405,10 +413,10 @@
       "fact": "Reasoning efforts are objects and the observed text-only model overrides curated image support.",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "codex/0.147.0/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 6,
               "channel": "stdout"
             }
           ]
@@ -421,10 +429,10 @@
       "fact": "The subprocess discovery fixture is a paged form of the captured live reply.",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "codex/0.147.0/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 6,
               "channel": "stdout"
             }
           ]
@@ -438,19 +446,19 @@
       "fact": "A logged-out CLI returns a successful built-in model list indistinguishable by envelope alone.",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "codex/0.147.0/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 6,
               "channel": "stdout"
             }
           ]
         },
         {
-          "manifest": "codex/pending-observed-version/model-discovery-logged-out/manifest.json",
+          "manifest": "codex/0.147.0/model-discovery-logged-out/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 6,
               "channel": "stdout"
             }
           ]
@@ -647,10 +655,10 @@
       "consumer": "crates/harness/src/claude/discovery.rs:the_captured_reply_adds_no_rows_to_the_real_catalog",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "claude/2.1.228/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 2,
               "channel": "stdout"
             }
           ]
@@ -663,10 +671,10 @@
       "consumer": "crates/harness/src/claude/discovery.rs:the_default_alias_row_is_dropped",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "claude/2.1.228/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 2,
               "channel": "stdout"
             }
           ]
@@ -679,10 +687,10 @@
       "consumer": "crates/harness/src/claude/discovery.rs:no_modality_field_means_the_provider_did_not_say",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "claude/2.1.228/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 2,
               "channel": "stdout"
             }
           ]
@@ -695,10 +703,10 @@
       "consumer": "crates/harness/src/claude/discovery.rs:effort_levels_map_to_the_ladder_and_haiku_reports_none",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "claude/2.1.228/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 2,
               "channel": "stdout"
             }
           ]
@@ -711,10 +719,10 @@
       "consumer": "crates/harness/src/claude/discovery.rs:INITIALIZE_LINE",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "claude/2.1.228/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 1,
               "channel": "stdin"
             }
           ]
@@ -727,10 +735,10 @@
       "consumer": "crates/harness/src/claude/discovery.rs:initialize_reply",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "claude/2.1.228/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 2,
               "channel": "stdout"
             }
           ]
@@ -743,10 +751,10 @@
       "consumer": "crates/harness/src/claude/commands.rs:an_empty_argument_hint_is_absent_not_blank",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/command-discovery/manifest.json",
+          "manifest": "claude/2.1.228/command-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 5,
               "channel": "stdout"
             }
           ]
@@ -759,10 +767,10 @@
       "consumer": "crates/harness/src/claude/commands.rs:a_command_without_aliases_decodes_to_an_empty_list",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/command-discovery/manifest.json",
+          "manifest": "claude/2.1.228/command-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 5,
               "channel": "stdout"
             }
           ]
@@ -855,10 +863,10 @@
       "consumer": "crates/harness/src/codex/discovery.rs:efforts_decode_from_objects_including_ultra",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "codex/0.147.0/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 6,
               "channel": "stdout"
             }
           ]
@@ -871,10 +879,10 @@
       "consumer": "crates/harness/src/codex/discovery.rs:input_modalities_split_text_only_from_image_capable",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "codex/0.147.0/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 6,
               "channel": "stdout"
             }
           ]
@@ -887,10 +895,10 @@
       "consumer": "crates/harness/tests/codex.rs:a_text_only_model_loses_the_curated_image_flag",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "codex/0.147.0/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 6,
               "channel": "stdout"
             }
           ]
@@ -903,10 +911,10 @@
       "consumer": "crates/harness/tests/codex.rs:a_logged_out_cli_is_never_asked",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/model-discovery-logged-out/manifest.json",
+          "manifest": "codex/0.147.0/model-discovery-logged-out/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 6,
               "channel": "stdout"
             }
           ]
@@ -920,19 +928,19 @@
       "comparison": true,
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/model-discovery-neutral-cwd/manifest.json",
+          "manifest": "codex/0.147.0/model-discovery-neutral-cwd/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 6,
               "channel": "stdout"
             }
           ]
         },
         {
-          "manifest": "codex/pending-observed-version/model-discovery-project-cwd/manifest.json",
+          "manifest": "codex/0.147.0/model-discovery-project-cwd/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 6,
               "channel": "stdout"
             }
           ]
@@ -945,26 +953,34 @@
       "consumer": "crates/harness/src/codex/discovery.rs:initialize_response",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "codex/0.147.0/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 2,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 3,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 6,
               "channel": "stdout"
             }
           ]
         }
       ],
-      "fact": "An unsolicited notification can arrive before the initialize result."
+      "fact": "ID-based reply matching skips the interleaved remoteControl/status/changed notification while awaiting model/list."
     },
     {
       "id": "codex-model-one-page",
       "consumer": "crates/harness/src/codex/discovery.rs:MAX_PAGES",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/model-discovery/manifest.json",
+          "manifest": "codex/0.147.0/model-discovery/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 6,
               "channel": "stdout"
             }
           ]

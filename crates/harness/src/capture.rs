@@ -987,7 +987,7 @@ fn existing_path_stays_below(corpus_root: &Path, path: &Path) -> bool {
 
 #[derive(Clone, Copy)]
 enum KnownPlaceholder {
-    Static,
+    Static(&'static str),
     Typed(&'static str),
 }
 
@@ -1033,7 +1033,7 @@ fn inspect_placeholder_text(
         let candidate = &remaining[..end];
         if marker_like(candidate) {
             match known_placeholder(candidate) {
-                Some(KnownPlaceholder::Static) => {}
+                Some(KnownPlaceholder::Static(_)) => {}
                 Some(KnownPlaceholder::Typed(kind)) => {
                     typed_uses.insert(format!("<{candidate}>"), kind.to_owned());
                 }
@@ -1054,8 +1054,16 @@ fn marker_like(candidate: &str) -> bool {
 }
 
 fn known_placeholder(candidate: &str) -> Option<KnownPlaceholder> {
-    if matches!(candidate, "CWD" | "REPO" | "HOME" | "TEMP" | "CODEX_HOME") {
-        return Some(KnownPlaceholder::Static);
+    let static_kind = match candidate {
+        "CWD" => Some("cwd_path"),
+        "REPO" => Some("repo_path"),
+        "HOME" => Some("home_path"),
+        "TEMP" => Some("temp_path"),
+        "CODEX_HOME" => Some("codex_home_path"),
+        _ => None,
+    };
+    if let Some(kind) = static_kind {
+        return Some(KnownPlaceholder::Static(kind));
     }
     const INDEXED: &[(&str, &str)] = &[
         ("CLAUDE_REQUEST_ID", "claude_request_id"),
@@ -1091,18 +1099,21 @@ fn validate_placeholder_definitions(
     manifest: &CorpusManifest,
     typed_uses: &BTreeMap<String, String>,
 ) -> Result<(), CorpusError> {
-    let mut definitions = BTreeMap::<String, String>::new();
+    let mut definitions = BTreeMap::<String, (String, bool)>::new();
     for definition in &manifest.placeholders {
         let candidate = definition
             .placeholder
             .strip_prefix('<')
             .and_then(|value| value.strip_suffix('>'));
-        let Some(KnownPlaceholder::Typed(expected_kind)) = candidate.and_then(known_placeholder)
-        else {
+        let Some(known) = candidate.and_then(known_placeholder) else {
             return Err(CorpusError::UnresolvedPlaceholder {
                 claim_id: claim.id.clone(),
                 location: "manifest",
             });
+        };
+        let (expected_kind, is_typed) = match known {
+            KnownPlaceholder::Static(kind) => (kind, false),
+            KnownPlaceholder::Typed(kind) => (kind, true),
         };
         if definition.kind != expected_kind {
             return Err(CorpusError::PlaceholderKindMismatch {
@@ -1114,7 +1125,10 @@ fn validate_placeholder_definitions(
             });
         }
         if definitions
-            .insert(definition.placeholder.clone(), definition.kind.clone())
+            .insert(
+                definition.placeholder.clone(),
+                (definition.kind.clone(), is_typed),
+            )
             .is_some()
         {
             return Err(CorpusError::DuplicatePlaceholderDefinition {
@@ -1136,7 +1150,7 @@ fn validate_placeholder_definitions(
     }
     if let Some((placeholder, _)) = definitions
         .iter()
-        .find(|(placeholder, _)| !typed_uses.contains_key(*placeholder))
+        .find(|(placeholder, (_, is_typed))| *is_typed && !typed_uses.contains_key(*placeholder))
     {
         return Err(CorpusError::UnusedPlaceholderDefinition {
             claim_id: claim.id.clone(),
@@ -2010,6 +2024,12 @@ fn semantic_kind(
         "description" if context.discovery_metadata => {
             return Some(RedactionKind::ProviderProse);
         }
+        "argumenthint"
+            if context.discovery_metadata
+                && value.as_str().is_some_and(|value| !value.is_empty()) =>
+        {
+            return Some(RedactionKind::ProviderProse);
+        }
         "description" if context.codex_catalog => {
             return Some(RedactionKind::ProviderProse);
         }
@@ -2034,7 +2054,7 @@ fn child_context(mut context: SemanticContext, key: &str) -> SemanticContext {
         "item" => Entity::Item,
         _ => Entity::None,
     };
-    if matches!(normalized.as_str(), "commands" | "agents") {
+    if matches!(normalized.as_str(), "commands" | "agents" | "models") {
         context.discovery_metadata = true;
     }
     if normalized == "data" {

@@ -176,6 +176,87 @@ fn corpus_valid_literal_schema_returns_the_exact_selected_payload() {
     );
 }
 
+/// Break caught: sanitizer-generated path definitions are part of the promoted manifest schema,
+/// so corpus validation must accept their exact static placeholder/kind pairs.
+#[test]
+fn corpus_accepts_sanitizer_generated_static_path_definitions() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "static-placeholder-roundtrip",
+        &[r#"{"type":"control_response","response":{"subtype":"success"}}"#],
+    );
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    let workspace = temp.path().join("private-workspace");
+    let workspace = workspace.to_string_lossy().into_owned();
+    capture["redaction_roots"]["cwd"] = Value::String(workspace.clone());
+    capture["command"]["cwd"] = Value::String(workspace);
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(
+        &raw,
+        &staging_dir(temp.path(), "static-placeholder-roundtrip"),
+    )
+    .unwrap();
+    let corpus = temp.path().join("corpus");
+    let scenario = corpus.join("claude/2.1.0/model-discovery");
+    std::fs::create_dir_all(&scenario).unwrap();
+    std::fs::write(
+        corpus.join("index.json"),
+        r#"{
+  "schema_version": 1,
+  "claims": [{
+    "id": "static-placeholder-roundtrip",
+    "consumer": "tests:static_placeholder_roundtrip",
+    "evidence": [{
+      "manifest": "claude/2.1.0/model-discovery/manifest.json",
+      "frames": [{"sequence": 1, "channel": "stderr"}]
+    }],
+    "fact": "Sanitized static path definitions validate after promotion."
+  }]
+}
+"#,
+    )
+    .unwrap();
+    let mut manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+    manifest["consumers"] = serde_json::json!(["tests:static_placeholder_roundtrip"]);
+    std::fs::write(
+        scenario.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(scenario.join("events.jsonl"), report.events_bytes).unwrap();
+
+    let errors = validate_corpus(&corpus);
+    assert!(errors.is_empty(), "roundtrip returned {errors:#?}");
+
+    let cwd_definition = manifest["placeholders"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|definition| definition["placeholder"] == "<CWD>")
+        .unwrap();
+    cwd_definition["kind"] = Value::String("home_path".into());
+    std::fs::write(
+        scenario.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        validate_corpus(&corpus).as_slice(),
+        [CorpusError::PlaceholderKindMismatch {
+            placeholder,
+            expected_kind,
+            actual_kind,
+            ..
+        }] if placeholder == "<CWD>"
+            && expected_kind == "cwd_path"
+            && actual_kind == "home_path"
+    ));
+}
+
 /// Break caught: accepting a future index or manifest schema under version-one assumptions can
 /// misread references while still returning a plausible provider payload.
 #[test]
@@ -720,8 +801,8 @@ fn corpus_rejects_unknown_or_unresolved_placeholder_syntax() {
     ));
 }
 
-/// Break caught: treating the pre-capture inventory as a valid corpus hides absent evidence, while
-/// failing on the first path prevents Task 5 from seeing the complete deterministic worklist.
+/// Break caught: promoting token-free evidence without shrinking the pending inventory hides the
+/// exact token-spending worklist that still needs explicit authorization.
 #[test]
 fn corpus_inventory_reports_the_exact_pending_manifest_set() {
     let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
@@ -818,7 +899,7 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
     );
 
     let errors = validate_corpus(&corpus_root);
-    assert_eq!(errors.len(), 65, "inventory errors: {errors:#?}");
+    assert_eq!(errors.len(), 29, "inventory errors: {errors:#?}");
     assert!(
         errors
             .iter()
@@ -861,47 +942,11 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
         ],
     );
     add(
-        "claude/pending-observed-version/command-discovery/manifest.json",
-        &[
-            "claude-command-absent-aliases",
-            "claude-command-discovery-behavior",
-            "claude-command-empty-hint",
-            "claude-command-nonbare-count",
-            "claude-command-reply-decoder",
-            "claude-model-bare-effects",
-        ],
-    );
-    add(
         "claude/pending-observed-version/fresh-text/manifest.json",
         &[
             "claude-routine-frame-fixture",
             "claude-routine-frame-ignore-list",
             "claude-routine-frame-integration",
-        ],
-    );
-    add(
-        "claude/pending-observed-version/model-discovery-neutral-cwd/manifest.json",
-        &["claude-model-cwd-invariance"],
-    );
-    add(
-        "claude/pending-observed-version/model-discovery-project-cwd/manifest.json",
-        &["claude-model-cwd-invariance"],
-    );
-    add(
-        "claude/pending-observed-version/model-discovery/manifest.json",
-        &[
-            "claude-command-nonbare-count",
-            "claude-model-bare-effects",
-            "claude-model-close-exit",
-            "claude-model-curated-id-decoder",
-            "claude-model-default-alias",
-            "claude-model-effort-levels",
-            "claude-model-fixture-shape",
-            "claude-model-initialize-request",
-            "claude-model-integration-shape",
-            "claude-model-no-modality",
-            "claude-model-real-catalog-merge",
-            "claude-model-reply-shape",
         ],
     );
     add(
@@ -940,29 +985,61 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "codex-routine-notification-integration",
         ],
     );
-    add(
-        "codex/pending-observed-version/model-discovery-logged-out/manifest.json",
-        &[
-            "codex-model-logged-out-fallback",
-            "codex-model-logged-out-integration",
-        ],
-    );
-    add(
-        "codex/pending-observed-version/model-discovery-neutral-cwd/manifest.json",
-        &["codex-model-cwd-invariance"],
-    );
-    add(
-        "codex/pending-observed-version/model-discovery-project-cwd/manifest.json",
-        &["codex-model-cwd-invariance"],
-    );
-    add(
-        "codex/pending-observed-version/model-discovery/manifest.json",
-        &[
+    assert_eq!(actual, expected, "pending error identity/path set changed");
+}
+
+/// Break caught: a promoted token-free selector can exist in the index while its reviewed
+/// manifest, frame, reciprocal consumer, or placeholder accounting is invalid.
+#[test]
+fn corpus_promoted_token_free_claims_are_valid() {
+    let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    let index: Value =
+        serde_json::from_slice(&std::fs::read(corpus_root.join("index.json")).unwrap()).unwrap();
+    let promoted: std::collections::BTreeSet<&str> = index["claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|claim| {
+            claim["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|evidence| {
+                    !evidence["manifest"]
+                        .as_str()
+                        .unwrap()
+                        .contains("pending-observed-version")
+                })
+        })
+        .map(|claim| claim["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        promoted,
+        std::collections::BTreeSet::from([
+            "claude-command-absent-aliases",
+            "claude-command-discovery-behavior",
+            "claude-command-empty-hint",
+            "claude-command-nonbare-count",
+            "claude-command-reply-decoder",
+            "claude-model-bare-effects",
+            "claude-model-close-exit",
+            "claude-model-curated-id-decoder",
+            "claude-model-cwd-invariance",
+            "claude-model-default-alias",
+            "claude-model-effort-levels",
+            "claude-model-fixture-shape",
+            "claude-model-initialize-request",
+            "claude-model-integration-shape",
+            "claude-model-no-modality",
+            "claude-model-real-catalog-merge",
+            "claude-model-reply-shape",
+            "codex-model-cwd-invariance",
             "codex-model-effort-objects",
             "codex-model-fixture-shape",
             "codex-model-input-modalities",
             "codex-model-integration-shape",
             "codex-model-logged-out-fallback",
+            "codex-model-logged-out-integration",
             "codex-model-notification-order",
             "codex-model-one-page",
             "codex-model-page-decoder",
@@ -970,9 +1047,89 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "codex-model-request-shape",
             "codex-model-source-notification-order",
             "codex-model-text-only-integration",
-        ],
+        ])
     );
-    assert_eq!(actual, expected, "pending error identity/path set changed");
+    let errors = validate_corpus(&corpus_root);
+    assert!(
+        errors.iter().all(|error| matches!(
+            error,
+            CorpusError::MissingManifest { claim_id, manifest }
+                if !promoted.contains(claim_id.as_str())
+                    && manifest.contains("pending-observed-version")
+        )),
+        "a promoted token-free claim is invalid: {errors:#?}"
+    );
+}
+
+/// Break caught: either ordering claim selects only the final reply, reverses the observed
+/// neighbors, or points at a cwd variant instead of the reviewed base observation.
+#[test]
+fn corpus_inventory_pins_the_observed_codex_discovery_order() {
+    let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    let index: Value =
+        serde_json::from_slice(&std::fs::read(corpus_root.join("index.json")).unwrap()).unwrap();
+    for claim_id in [
+        "codex-model-notification-order",
+        "codex-model-source-notification-order",
+    ] {
+        let claim = index["claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|claim| claim["id"] == claim_id)
+            .unwrap();
+        assert_eq!(
+            claim["evidence"],
+            serde_json::json!([{
+                "manifest": "codex/0.147.0/model-discovery/manifest.json",
+                "frames": [
+                    {"sequence": 2, "channel": "stdout"},
+                    {"sequence": 3, "channel": "stdout"},
+                    {"sequence": 6, "channel": "stdout"}
+                ]
+            }]),
+            "wrong observed selector for {claim_id}"
+        );
+    }
+}
+
+/// Break caught: selector numbers alone do not prove that the promoted neighboring frames are
+/// the initialize response, unsolicited remote-control notification, and model-list response.
+#[test]
+fn corpus_promoted_codex_ordering_frames_have_the_observed_payloads() {
+    let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    let events: Vec<Value> =
+        std::fs::read_to_string(corpus_root.join("codex/0.147.0/model-discovery/events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+    for claim_id in [
+        "codex-model-notification-order",
+        "codex-model-source-notification-order",
+    ] {
+        let payload = |sequence| {
+            let event = events
+                .iter()
+                .find(|event| event["sequence"] == sequence)
+                .unwrap_or_else(|| panic!("{claim_id}: missing promoted frame {sequence}"));
+            assert_eq!(event["channel"], "stdout", "{claim_id}: frame {sequence}");
+            serde_json::from_str::<Value>(event["payload"].as_str().unwrap()).unwrap()
+        };
+        let initialize = payload(2);
+        let notification = payload(3);
+        let model_list = payload(6);
+
+        assert_eq!(initialize["id"], 1, "{claim_id}");
+        assert!(initialize["result"].is_object(), "{claim_id}");
+        assert_eq!(
+            notification["method"], "remoteControl/status/changed",
+            "{claim_id}"
+        );
+        assert_eq!(model_list["id"], 2, "{claim_id}");
+        assert!(model_list["result"]["data"].is_array(), "{claim_id}");
+    }
 }
 
 /// Break caught: skipping any semantic branch leaves captured identifiers, human-authored
@@ -1068,7 +1225,7 @@ fn sanitizer_replaces_discovery_descriptions_as_provider_prose() {
         temp.path(),
         "discovery-provider-prose",
         &[
-            r#"{"type":"control_response","response":{"subtype":"success","response":{"commands":[{"name":"safe-command","description":"private command prose at D:\\private\\command.md","argumentHint":""}],"agents":[{"name":"safe-agent","description":"private agent prose at /private/agent.md"}]}}}"#,
+            r#"{"type":"control_response","response":{"subtype":"success","response":{"commands":[{"name":"safe-command","description":"private command prose at D:\\private\\command.md","argumentHint":"<private-path>"},{"name":"no-argument-command","description":"second private command prose","argumentHint":""}],"agents":[{"name":"safe-agent","description":"private agent prose at /private/agent.md"}],"models":[{"value":"safe-model","description":"private model prose"}]}}}"#,
             r#"{"level":"debug"}"#,
         ],
     );
@@ -1077,9 +1234,12 @@ fn sanitizer_replaces_discovery_descriptions_as_provider_prose() {
     let reply = &payloads[0]["response"]["response"];
 
     assert_eq!(reply["agents"][0]["description"], "<PROVIDER_PROSE_1>");
-    assert_eq!(reply["commands"][0]["description"], "<PROVIDER_PROSE_2>");
+    assert_eq!(reply["commands"][0]["argumentHint"], "<PROVIDER_PROSE_2>");
+    assert_eq!(reply["commands"][0]["description"], "<PROVIDER_PROSE_3>");
+    assert_eq!(reply["commands"][1]["argumentHint"], "");
+    assert_eq!(reply["models"][0]["description"], "<PROVIDER_PROSE_5>");
     let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
-    assert_eq!(manifest["redaction_counts"]["provider_prose"], 2);
+    assert_eq!(manifest["redaction_counts"]["provider_prose"], 5);
 }
 
 /// Break caught: non-bare discovery publishes local hook output, identifiers, or paths even

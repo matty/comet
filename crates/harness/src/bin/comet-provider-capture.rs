@@ -115,6 +115,13 @@ fn value(arguments: &mut impl Iterator<Item = String>, option: &str) -> Result<S
 }
 
 fn capture_config(args: Args) -> Result<CaptureConfig, String> {
+    capture_config_with_env(args, |name| std::env::var_os(name).is_some())
+}
+
+fn capture_config_with_env(
+    args: Args,
+    env_present: impl Fn(&str) -> bool,
+) -> Result<CaptureConfig, String> {
     let provider = args.provider.as_deref().unwrap_or_default();
     let scenario = args.scenario.as_deref().unwrap_or_default();
     if !supported_pair(provider, scenario) {
@@ -143,6 +150,15 @@ fn capture_config(args: Args) -> Result<CaptureConfig, String> {
             .to_owned()
     })?;
     if scenario == "model-discovery-logged-out" {
+        if ["OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"]
+            .into_iter()
+            .any(env_present)
+        {
+            return Err(
+                "Logged-out discovery cannot run with ambient Codex authentication. Start it from an environment without Codex auth variables."
+                    .into(),
+            );
+        }
         let Some(home) = args.codex_home.as_deref() else {
             return Err(
                 "Logged-out discovery needs an explicit empty --codex-home directory.".into(),
@@ -464,5 +480,33 @@ mod tests {
                 .unwrap_err()
                 .contains("explicit empty --codex-home")
         );
+    }
+
+    /// Break caught: an isolated empty CODEX_HOME is still authenticated when Codex inherits a
+    /// recognized ambient token, while removing env from the launch would break descriptor parity.
+    #[test]
+    fn logged_out_discovery_rejects_ambient_codex_auth_only_for_that_scenario() {
+        let empty_home = tempfile::tempdir().unwrap();
+        for variable in ["OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"] {
+            let logged_out = capture_config_with_env(
+                token_free_args(
+                    "codex",
+                    "model-discovery-logged-out",
+                    Some(empty_home.path().into()),
+                ),
+                |name| name == variable,
+            );
+            assert!(
+                logged_out
+                    .unwrap_err()
+                    .contains("ambient Codex authentication")
+            );
+
+            let ordinary = capture_config_with_env(
+                token_free_args("codex", "model-discovery", Some(empty_home.path().into())),
+                |name| name == variable,
+            );
+            assert!(ordinary.is_ok(), "ordinary discovery rejected {variable}");
+        }
     }
 }

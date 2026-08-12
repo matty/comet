@@ -1,0 +1,318 @@
+{
+  "captured_at_unix_ms": 1786508520785,
+  "channels": [
+    "stdin",
+    "stdout"
+  ],
+  "cli_version": "2.1.228 (Claude Code)",
+  "command": {
+    "args": [
+      "--print",
+      "--input-format",
+      "stream-json",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--bare"
+    ],
+    "configured_env": {},
+    "creation_flags": 134217728,
+    "cwd": "<CWD>",
+    "kill_on_drop": true,
+    "program": "<HOME>\\.local\\bin\\claude.exe",
+    "stderr": "Piped",
+    "stdin": "Piped",
+    "stdout": "Piped"
+  },
+  "exit_code": 0,
+  "normalized_cli_version": "2.1.228 (Claude Code)",
+  "placeholders": [
+    {
+      "kind": "claude_request_id",
+      "placeholder": "<CLAUDE_REQUEST_ID_1>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_1>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_2>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_3>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_4>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_5>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_6>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_7>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_8>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_9>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_10>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_11>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_12>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_13>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_14>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_15>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_16>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_17>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_18>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_19>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_20>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_21>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_22>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_23>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_24>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_25>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_26>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_27>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_28>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_29>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_30>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_31>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_32>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_33>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_34>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_35>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_36>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_37>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_38>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_39>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_40>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_41>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_42>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_43>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_44>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_45>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_46>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_47>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_48>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_49>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_50>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_51>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_52>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_53>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_54>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_55>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_56>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_57>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_58>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_59>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_60>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_61>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_62>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_63>"
+    },
+    {
+      "kind": "machine_id",
+      "placeholder": "<MACHINE_ID_1>"
+    },
+    {
+      "kind": "cwd_path",
+      "placeholder": "<CWD>"
+    },
+    {
+      "kind": "home_path",
+      "placeholder": "<HOME>"
+    }
+  ],
+  "platform": {
+    "arch": "x86_64",
+    "os": "windows"
+  },
+  "provider": "claude",
+  "purpose": "capture Claude model discovery from the selected project directory",
+  "redaction_counts": {
+    "claude_request_id": 2,
+    "cwd_path": 1,
+    "home_path": 1,
+    "machine_id": 1,
+    "provider_prose": 64
+  },
+  "scenario": "model-discovery-project-cwd",
+  "schema_version": 1,
+  "source": "capture.json",
+  "consumers": [
+    "crates/harness/src/claude/discovery.rs:handshake"
+  ]
+}
