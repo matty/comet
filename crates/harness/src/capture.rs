@@ -351,6 +351,12 @@ pub enum CorpusError {
         manifest: String,
         consumer: String,
     },
+    #[error("provider corpus manifest {manifest} names stale consumer {consumer:?}")]
+    ExtraManifestConsumer { manifest: String, consumer: String },
+    #[error("provider corpus manifest {manifest} repeats consumer {consumer:?}")]
+    DuplicateManifestConsumer { manifest: String, consumer: String },
+    #[error("provider corpus claim {claim_id:?} has no evidence entries")]
+    MissingEvidence { claim_id: String },
     #[error("provider corpus claim {claim_id:?} is missing events beside {manifest}")]
     MissingEvents { claim_id: String, manifest: String },
     #[error("provider corpus event line {line} for claim {claim_id:?} is invalid")]
@@ -386,6 +392,34 @@ pub enum CorpusError {
         claim_id: String,
         location: &'static str,
     },
+    #[error("provider corpus manifest {manifest} does not define used placeholder {placeholder}")]
+    MissingPlaceholderDefinition {
+        claim_id: String,
+        manifest: String,
+        placeholder: String,
+    },
+    #[error("provider corpus manifest {manifest} defines unused placeholder {placeholder}")]
+    UnusedPlaceholderDefinition {
+        claim_id: String,
+        manifest: String,
+        placeholder: String,
+    },
+    #[error("provider corpus manifest {manifest} defines placeholder {placeholder} more than once")]
+    DuplicatePlaceholderDefinition {
+        claim_id: String,
+        manifest: String,
+        placeholder: String,
+    },
+    #[error(
+        "provider corpus manifest {manifest} defines {placeholder} as {actual_kind:?}, expected {expected_kind:?}"
+    )]
+    PlaceholderKindMismatch {
+        claim_id: String,
+        manifest: String,
+        placeholder: String,
+        expected_kind: String,
+        actual_kind: String,
+    },
     #[error("provider corpus claim {claim_id:?} was not found")]
     ClaimNotFound { claim_id: String },
     #[error("provider corpus claim {claim_id:?} selects {count} frames; exactly one is required")]
@@ -402,9 +436,15 @@ struct CorpusIndex {
 struct CorpusClaim {
     id: String,
     consumer: String,
+    evidence: Vec<ClaimEvidence>,
+    #[allow(dead_code)]
+    fact: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ClaimEvidence {
     manifest: String,
     frames: Vec<ClaimFrame>,
-    fact: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -467,11 +507,29 @@ pub fn validate_corpus(corpus_root: &Path) -> Vec<CorpusError> {
         }];
     }
 
-    index
-        .claims
-        .iter()
-        .filter_map(|claim| validate_claim(corpus_root, claim).err())
-        .collect()
+    let expected_consumers = expected_manifest_consumers(&index.claims);
+    let mut errors = Vec::new();
+    for claim in &index.claims {
+        if claim.evidence.is_empty() {
+            errors.push(CorpusError::MissingEvidence {
+                claim_id: claim.id.clone(),
+            });
+            continue;
+        }
+        for evidence in &claim.evidence {
+            if let Err(error) = validate_evidence(
+                corpus_root,
+                claim,
+                evidence,
+                expected_consumers
+                    .get(&evidence.manifest)
+                    .expect("evidence contributes consumer expectations"),
+            ) {
+                errors.push(error);
+            }
+        }
+    }
+    errors
 }
 
 /// Return the provider's literal payload for a claim that references exactly one event frame.
@@ -490,21 +548,41 @@ pub fn selected_payload(corpus_root: &Path, claim_id: &str) -> Result<String, Co
         .ok_or_else(|| CorpusError::ClaimNotFound {
             claim_id: claim_id.to_owned(),
         })?;
-    if claim.frames.len() != 1 {
+    let frame_count = claim
+        .evidence
+        .iter()
+        .map(|evidence| evidence.frames.len())
+        .sum();
+    if frame_count != 1 {
         return Err(CorpusError::SelectedFrameCount {
             claim_id: claim.id.clone(),
-            count: claim.frames.len(),
+            count: frame_count,
         });
     }
-    let frame = claim.frames[0];
-    let events = validate_claim(corpus_root, claim)?;
+    let expected_consumers = expected_manifest_consumers(&index.claims);
+    let evidence = claim
+        .evidence
+        .iter()
+        .find(|evidence| !evidence.frames.is_empty())
+        .ok_or_else(|| CorpusError::MissingEvidence {
+            claim_id: claim.id.clone(),
+        })?;
+    let frame = evidence.frames[0];
+    let events = validate_evidence(
+        corpus_root,
+        claim,
+        evidence,
+        expected_consumers
+            .get(&evidence.manifest)
+            .expect("selected evidence contributes consumer expectations"),
+    )?;
     events
         .into_iter()
         .find(|event| event.sequence == frame.sequence)
         .map(|event| event.payload)
         .ok_or_else(|| CorpusError::MissingFrame {
             claim_id: claim.id.clone(),
-            manifest: claim.manifest.clone(),
+            manifest: evidence.manifest.clone(),
             sequence: frame.sequence,
         })
 }
@@ -527,20 +605,23 @@ fn read_index(corpus_root: &Path) -> Result<CorpusIndex, CorpusError> {
         return Err(CorpusError::UnsupportedIndexSchemaVersion { version });
     }
     let index: CorpusIndex =
-        serde_json::from_value(value).map_err(|source| CorpusError::InvalidIndex {
+        serde_json::from_value(value.clone()).map_err(|source| CorpusError::InvalidIndex {
             line: source.line(),
             column: source.column(),
         })?;
     debug_assert_eq!(index.schema_version, 1);
-    if let Some(claim) = index.claims.iter().find(|claim| {
-        [&claim.id, &claim.consumer, &claim.manifest, &claim.fact]
-            .into_iter()
-            .any(|value| contains_unresolved_placeholder(value.as_bytes()))
-    }) {
-        return Err(CorpusError::UnresolvedPlaceholder {
-            claim_id: claim.id.clone(),
-            location: "index",
-        });
+    let raw_claims = value
+        .get("claims")
+        .and_then(Value::as_array)
+        .ok_or(CorpusError::InvalidIndex { line: 0, column: 0 })?;
+    for (claim, raw_claim) in index.claims.iter().zip(raw_claims) {
+        let mut ignored_uses = BTreeMap::new();
+        if inspect_placeholder_value(raw_claim, &mut ignored_uses).is_err() {
+            return Err(CorpusError::UnresolvedPlaceholder {
+                claim_id: claim.id.clone(),
+                location: "index",
+            });
+        }
     }
     Ok(index)
 }
@@ -553,28 +634,46 @@ fn duplicate_claim_id(claims: &[CorpusClaim]) -> Option<String> {
         .map(|claim| claim.id.clone())
 }
 
-fn validate_claim(
+fn expected_manifest_consumers(
+    claims: &[CorpusClaim],
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    let mut expected = BTreeMap::<String, BTreeMap<String, String>>::new();
+    for claim in claims {
+        for evidence in &claim.evidence {
+            expected
+                .entry(evidence.manifest.clone())
+                .or_default()
+                .entry(claim.consumer.clone())
+                .or_insert_with(|| claim.id.clone());
+        }
+    }
+    expected
+}
+
+fn validate_evidence(
     corpus_root: &Path,
     claim: &CorpusClaim,
+    evidence: &ClaimEvidence,
+    expected_consumers: &BTreeMap<String, String>,
 ) -> Result<Vec<CaptureEvent>, CorpusError> {
-    if !is_canonical_relative_path(&claim.manifest) {
+    if !is_canonical_relative_path(&evidence.manifest) {
         return Err(CorpusError::UnsafeManifestPath {
             claim_id: claim.id.clone(),
         });
     }
-    let manifest_path = corpus_root.join(&claim.manifest);
+    let manifest_path = corpus_root.join(&evidence.manifest);
     let manifest_bytes = match std::fs::read(&manifest_path) {
         Ok(bytes) => bytes,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             return Err(CorpusError::MissingManifest {
                 claim_id: claim.id.clone(),
-                manifest: claim.manifest.clone(),
+                manifest: evidence.manifest.clone(),
             });
         }
         Err(source) => {
             return Err(CorpusError::InvalidManifest {
                 claim_id: claim.id.clone(),
-                manifest: claim.manifest.clone(),
+                manifest: evidence.manifest.clone(),
                 line: 0,
                 column: source.raw_os_error().unwrap_or_default() as usize,
             });
@@ -585,16 +684,10 @@ fn validate_claim(
             claim_id: claim.id.clone(),
         });
     }
-    if contains_unresolved_placeholder(&manifest_bytes) {
-        return Err(CorpusError::UnresolvedPlaceholder {
-            claim_id: claim.id.clone(),
-            location: "manifest",
-        });
-    }
     let manifest_value: Value =
         serde_json::from_slice(&manifest_bytes).map_err(|source| CorpusError::InvalidManifest {
             claim_id: claim.id.clone(),
-            manifest: claim.manifest.clone(),
+            manifest: evidence.manifest.clone(),
             line: source.line(),
             column: source.column(),
         })?;
@@ -603,29 +696,76 @@ fn validate_claim(
         .and_then(Value::as_u64)
         .ok_or_else(|| CorpusError::InvalidManifest {
             claim_id: claim.id.clone(),
-            manifest: claim.manifest.clone(),
+            manifest: evidence.manifest.clone(),
             line: 0,
             column: 0,
         })?;
     if version != 1 {
         return Err(CorpusError::UnsupportedManifestSchemaVersion {
             claim_id: claim.id.clone(),
-            manifest: claim.manifest.clone(),
+            manifest: evidence.manifest.clone(),
             version,
         });
     }
     let manifest: CorpusManifest =
-        serde_json::from_value(manifest_value).map_err(|source| CorpusError::InvalidManifest {
-            claim_id: claim.id.clone(),
-            manifest: claim.manifest.clone(),
-            line: source.line(),
-            column: source.column(),
+        serde_json::from_value(manifest_value.clone()).map_err(|source| {
+            CorpusError::InvalidManifest {
+                claim_id: claim.id.clone(),
+                manifest: evidence.manifest.clone(),
+                line: source.line(),
+                column: source.column(),
+            }
         })?;
-    if !manifest.consumers.contains(&claim.consumer) {
-        return Err(CorpusError::MissingManifestConsumer {
+    let mut placeholder_uses = BTreeMap::new();
+    let mut manifest_payload = manifest_value;
+    let mut ignored_definition_uses = BTreeMap::new();
+    if manifest_payload
+        .get("placeholders")
+        .is_some_and(|definitions| {
+            inspect_placeholder_value(definitions, &mut ignored_definition_uses).is_err()
+        })
+    {
+        return Err(CorpusError::UnresolvedPlaceholder {
             claim_id: claim.id.clone(),
-            manifest: claim.manifest.clone(),
-            consumer: claim.consumer.clone(),
+            location: "manifest",
+        });
+    }
+    if let Some(object) = manifest_payload.as_object_mut() {
+        object.remove("placeholders");
+    }
+    if inspect_placeholder_value(&manifest_payload, &mut placeholder_uses).is_err() {
+        return Err(CorpusError::UnresolvedPlaceholder {
+            claim_id: claim.id.clone(),
+            location: "manifest",
+        });
+    }
+    let mut actual_consumers = BTreeMap::<&str, usize>::new();
+    for consumer in &manifest.consumers {
+        let count = actual_consumers.entry(consumer).or_default();
+        *count += 1;
+        if *count > 1 {
+            return Err(CorpusError::DuplicateManifestConsumer {
+                manifest: evidence.manifest.clone(),
+                consumer: consumer.clone(),
+            });
+        }
+    }
+    for (consumer, claim_id) in expected_consumers {
+        if !actual_consumers.contains_key(consumer.as_str()) {
+            return Err(CorpusError::MissingManifestConsumer {
+                claim_id: claim_id.clone(),
+                manifest: evidence.manifest.clone(),
+                consumer: consumer.clone(),
+            });
+        }
+    }
+    if let Some(extra) = actual_consumers
+        .keys()
+        .find(|consumer| !expected_consumers.contains_key(**consumer))
+    {
+        return Err(CorpusError::ExtraManifestConsumer {
+            manifest: evidence.manifest.clone(),
+            consumer: (*extra).to_owned(),
         });
     }
 
@@ -635,7 +775,7 @@ fn validate_claim(
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             return Err(CorpusError::MissingEvents {
                 claim_id: claim.id.clone(),
-                manifest: claim.manifest.clone(),
+                manifest: evidence.manifest.clone(),
             });
         }
         Err(_) => {
@@ -650,28 +790,40 @@ fn validate_claim(
             claim_id: claim.id.clone(),
         });
     }
-    if contains_unresolved_placeholder(&events_bytes) {
-        return Err(CorpusError::UnresolvedPlaceholder {
-            claim_id: claim.id.clone(),
-            location: "events",
-        });
-    }
-
     let mut events = Vec::new();
     for (offset, line) in events_bytes.split(|byte| *byte == b'\n').enumerate() {
         if line.is_empty() {
             continue;
         }
-        let event: CaptureEvent =
+        let event_value: Value =
             serde_json::from_slice(line).map_err(|_| CorpusError::InvalidEvent {
                 claim_id: claim.id.clone(),
                 line: offset + 1,
             })?;
+        if inspect_placeholder_value(&event_value, &mut placeholder_uses).is_err() {
+            return Err(CorpusError::UnresolvedPlaceholder {
+                claim_id: claim.id.clone(),
+                location: "events",
+            });
+        }
+        let event: CaptureEvent =
+            serde_json::from_value(event_value).map_err(|_| CorpusError::InvalidEvent {
+                claim_id: claim.id.clone(),
+                line: offset + 1,
+            })?;
+        if let Ok(payload) = serde_json::from_str::<Value>(&event.payload)
+            && inspect_placeholder_value(&payload, &mut placeholder_uses).is_err()
+        {
+            return Err(CorpusError::UnresolvedPlaceholder {
+                claim_id: claim.id.clone(),
+                location: "events",
+            });
+        }
         let expected = events.len() as u64 + 1;
         if event.sequence != expected {
             return Err(CorpusError::NonContiguousEventSequence {
                 claim_id: claim.id.clone(),
-                manifest: claim.manifest.clone(),
+                manifest: evidence.manifest.clone(),
                 expected,
                 actual: event.sequence,
             });
@@ -679,11 +831,13 @@ fn validate_claim(
         events.push(event);
     }
 
-    for frame in &claim.frames {
+    validate_placeholder_definitions(claim, evidence, &manifest, &placeholder_uses)?;
+
+    for frame in &evidence.frames {
         let Some(event) = events.iter().find(|event| event.sequence == frame.sequence) else {
             return Err(CorpusError::MissingFrame {
                 claim_id: claim.id.clone(),
-                manifest: claim.manifest.clone(),
+                manifest: evidence.manifest.clone(),
                 sequence: frame.sequence,
             });
         };
@@ -720,7 +874,25 @@ fn is_canonical_relative_path(path: &str) -> bool {
             _ => String::new(),
         })
         .collect::<Vec<_>>();
-    !normalized.iter().any(String::is_empty) && normalized.join("/") == path
+    !normalized.iter().any(|component| {
+        component.is_empty()
+            || component.trim_end_matches(['.', ' ']) != component
+            || is_windows_reserved_component(component)
+    }) && normalized.join("/") == path
+}
+
+fn is_windows_reserved_component(component: &str) -> bool {
+    let stem = component
+        .split_once('.')
+        .map_or(component, |(stem, _)| stem)
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|number| {
+                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            })
 }
 
 fn existing_path_stays_below(corpus_root: &Path, path: &Path) -> bool {
@@ -733,54 +905,164 @@ fn existing_path_stays_below(corpus_root: &Path, path: &Path) -> bool {
     path.starts_with(root)
 }
 
-fn contains_unresolved_placeholder(bytes: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(bytes);
-    if text.contains("{{") || text.contains("${") || text.contains("[REDACTED]") {
-        return true;
+#[derive(Clone, Copy)]
+enum KnownPlaceholder {
+    Static,
+    Typed(&'static str),
+}
+
+fn inspect_placeholder_value(
+    value: &Value,
+    typed_uses: &mut BTreeMap<String, String>,
+) -> Result<(), ()> {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                inspect_placeholder_value(value, typed_uses)?;
+            }
+        }
+        Value::Object(object) => {
+            for (key, value) in object {
+                inspect_placeholder_text(key, typed_uses)?;
+                inspect_placeholder_value(value, typed_uses)?;
+            }
+        }
+        Value::String(text) => inspect_placeholder_text(text, typed_uses)?,
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
-    let mut remaining = text.as_ref();
+    Ok(())
+}
+
+fn inspect_placeholder_text(
+    text: &str,
+    typed_uses: &mut BTreeMap<String, String>,
+) -> Result<(), ()> {
+    if text.contains("{{") || text.contains("${") || text.contains("[REDACTED]") {
+        return Err(());
+    }
+    let mut remaining = text;
     while let Some(start) = remaining.find('<') {
         remaining = &remaining[start + 1..];
         let Some(end) = remaining.find('>') else {
-            break;
+            return if marker_like(remaining) {
+                Err(())
+            } else {
+                Ok(())
+            };
         };
         let candidate = &remaining[..end];
-        if !candidate.is_empty()
-            && candidate
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-            && !is_known_placeholder(candidate)
-        {
-            return true;
+        if marker_like(candidate) {
+            match known_placeholder(candidate) {
+                Some(KnownPlaceholder::Static) => {}
+                Some(KnownPlaceholder::Typed(kind)) => {
+                    typed_uses.insert(format!("<{candidate}>"), kind.to_owned());
+                }
+                None => return Err(()),
+            }
         }
         remaining = &remaining[end + 1..];
     }
-    false
+    Ok(())
 }
 
-fn is_known_placeholder(candidate: &str) -> bool {
+fn marker_like(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && !candidate.chars().any(char::is_whitespace)
+        && candidate
+            .bytes()
+            .any(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'-'))
+}
+
+fn known_placeholder(candidate: &str) -> Option<KnownPlaceholder> {
     if matches!(candidate, "CWD" | "REPO" | "HOME" | "TEMP") {
-        return true;
+        return Some(KnownPlaceholder::Static);
     }
-    const INDEXED: &[&str] = &[
-        "CLAUDE_REQUEST_ID",
-        "CODEX_RPC_ID",
-        "SESSION_ID",
-        "THREAD_ID",
-        "TURN_ID",
-        "TOOL_USE_ID",
-        "USER_TEXT",
-        "ASSISTANT_PROSE",
-        "ATTACHMENT_BYTES",
+    const INDEXED: &[(&str, &str)] = &[
+        ("CLAUDE_REQUEST_ID", "claude_request_id"),
+        ("CODEX_RPC_ID", "codex_rpc_id"),
+        ("SESSION_ID", "session_id"),
+        ("THREAD_ID", "thread_id"),
+        ("TURN_ID", "turn_id"),
+        ("TOOL_USE_ID", "tool_use_id"),
+        ("USER_TEXT", "user_text"),
+        ("ASSISTANT_PROSE", "assistant_prose"),
+        ("ATTACHMENT_BYTES", "attachment_bytes"),
     ];
-    INDEXED.iter().any(|prefix| {
+    INDEXED.iter().find_map(|(prefix, kind)| {
         candidate
             .strip_prefix(prefix)
             .and_then(|suffix| suffix.strip_prefix('_'))
-            .is_some_and(|number| {
-                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            .filter(|number| {
+                number
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|digit| matches!(digit, b'1'..=b'9'))
+                    && number.bytes().all(|byte| byte.is_ascii_digit())
             })
+            .map(|_| KnownPlaceholder::Typed(kind))
     })
+}
+
+fn validate_placeholder_definitions(
+    claim: &CorpusClaim,
+    evidence: &ClaimEvidence,
+    manifest: &CorpusManifest,
+    typed_uses: &BTreeMap<String, String>,
+) -> Result<(), CorpusError> {
+    let mut definitions = BTreeMap::<String, String>::new();
+    for definition in &manifest.placeholders {
+        let candidate = definition
+            .placeholder
+            .strip_prefix('<')
+            .and_then(|value| value.strip_suffix('>'));
+        let Some(KnownPlaceholder::Typed(expected_kind)) = candidate.and_then(known_placeholder)
+        else {
+            return Err(CorpusError::UnresolvedPlaceholder {
+                claim_id: claim.id.clone(),
+                location: "manifest",
+            });
+        };
+        if definition.kind != expected_kind {
+            return Err(CorpusError::PlaceholderKindMismatch {
+                claim_id: claim.id.clone(),
+                manifest: evidence.manifest.clone(),
+                placeholder: definition.placeholder.clone(),
+                expected_kind: expected_kind.to_owned(),
+                actual_kind: definition.kind.clone(),
+            });
+        }
+        if definitions
+            .insert(definition.placeholder.clone(), definition.kind.clone())
+            .is_some()
+        {
+            return Err(CorpusError::DuplicatePlaceholderDefinition {
+                claim_id: claim.id.clone(),
+                manifest: evidence.manifest.clone(),
+                placeholder: definition.placeholder.clone(),
+            });
+        }
+    }
+    if let Some((placeholder, _)) = typed_uses
+        .iter()
+        .find(|(placeholder, _)| !definitions.contains_key(*placeholder))
+    {
+        return Err(CorpusError::MissingPlaceholderDefinition {
+            claim_id: claim.id.clone(),
+            manifest: evidence.manifest.clone(),
+            placeholder: placeholder.clone(),
+        });
+    }
+    if let Some((placeholder, _)) = definitions
+        .iter()
+        .find(|(placeholder, _)| !typed_uses.contains_key(*placeholder))
+    {
+        return Err(CorpusError::UnusedPlaceholderDefinition {
+            claim_id: claim.id.clone(),
+            manifest: evidence.manifest.clone(),
+            placeholder: placeholder.clone(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

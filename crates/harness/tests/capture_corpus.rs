@@ -75,8 +75,10 @@ fn write_valid_literal_corpus(root: &Path) {
     {
       "id": "claude-model-reply",
       "consumer": "crates/harness/src/claude/discovery.rs:the_captured_reply_decodes_onto_curated_ids",
-      "manifest": "claude/2.1.227/model-discovery/manifest.json",
-      "frames": [{"sequence": 2, "channel": "stdout"}],
+      "evidence": [{
+        "manifest": "claude/2.1.227/model-discovery/manifest.json",
+        "frames": [{"sequence": 2, "channel": "stdout"}]
+      }],
       "fact": "The initialize response nests the provider model list twice."
     }
   ]
@@ -169,7 +171,8 @@ fn corpus_rejects_unknown_index_and_manifest_schema_versions_explicitly() {
             .join("claude/2.1.227/model-discovery/manifest.json"),
     )
     .unwrap()
-    .replacen(r#""schema_version": 1"#, r#""schema_version": 2"#, 1);
+    .replacen(r#""schema_version": 1"#, r#""schema_version": 2"#, 1)
+    .replacen("2.1.227 (Claude Code)", "2.1.227 <UNKNOWN-MARKER>", 1);
     overwrite(
         temp.path(),
         "claude/2.1.227/model-discovery/manifest.json",
@@ -182,6 +185,147 @@ fn corpus_rejects_unknown_index_and_manifest_schema_versions_explicitly() {
             version: 2,
             ..
         }] if claim_id == "claude-model-reply"
+    ));
+}
+
+/// Break caught: scanning serialized JSON misses escaped markers and marker-shaped keys, while a
+/// loose numeric suffix accepts placeholder ids the sanitizer can never emit.
+#[test]
+fn corpus_inspects_decoded_json_values_and_keys_with_exact_placeholder_grammar() {
+    let temp = tempfile::tempdir().unwrap();
+    let events_path = "claude/2.1.227/model-discovery/events.jsonl";
+    for marker in [
+        "\\u003cUNKNOWN-MARKER\\u003e",
+        "<SESSION_ID_0>",
+        "<SESSION_ID_01>",
+        "<SESSION_ID_-1>",
+        "${SECRET}",
+        "{{SECRET}}",
+        "[REDACTED]",
+    ] {
+        write_valid_literal_corpus(temp.path());
+        let payload = format!(r#"{{"{marker}":"safe"}}"#);
+        let encoded = serde_json::to_string(&payload).unwrap();
+        let events = format!(
+            concat!(
+                "{{\"sequence\":1,\"channel\":\"stdin\",\"payload\":\"{{\\\"request_id\\\":\\\"<CLAUDE_REQUEST_ID_1>\\\"}}\"}}\n",
+                "{{\"sequence\":2,\"channel\":\"stdout\",\"payload\":{}}}\n",
+                "{{\"sequence\":3,\"channel\":\"stderr\",\"payload\":\"safe diagnostic\"}}\n"
+            ),
+            encoded
+        );
+        overwrite(temp.path(), events_path, &events);
+        let errors = validate_corpus(temp.path());
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [CorpusError::UnresolvedPlaceholder { claim_id, location: "events" }]
+                    if claim_id == "claude-model-reply"
+            ),
+            "marker {marker:?} returned {errors:#?}"
+        );
+    }
+
+    write_valid_literal_corpus(temp.path());
+    let index_path = temp.path().join("index.json");
+    let mut index: Value = serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+    index["claims"][0]["<UNKNOWN-MARKER>"] = Value::String("ignored field".to_owned());
+    overwrite(
+        temp.path(),
+        "index.json",
+        &serde_json::to_string_pretty(&index).unwrap(),
+    );
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::UnresolvedPlaceholder { claim_id, location: "index" }]
+            if claim_id == "claude-model-reply"
+    ));
+
+    write_valid_literal_corpus(temp.path());
+    let manifest_path = "claude/2.1.227/model-discovery/manifest.json";
+    let manifest = std::fs::read_to_string(temp.path().join(manifest_path))
+        .unwrap()
+        .replace("\"kind\": \"claude_request_id\"", "\"kind\": \"${SECRET}\"");
+    overwrite(temp.path(), manifest_path, &manifest);
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::UnresolvedPlaceholder { claim_id, location: "manifest" }]
+            if claim_id == "claude-model-reply"
+    ));
+
+    write_valid_literal_corpus(temp.path());
+    let events = std::fs::read_to_string(temp.path().join(events_path))
+        .unwrap()
+        .replace("safe diagnostic", "ordinary comparison 1 < 2 > 0");
+    overwrite(temp.path(), events_path, &events);
+    assert!(validate_corpus(temp.path()).is_empty());
+}
+
+/// Break caught: accepting declarations independently from uses lets a typo, duplicate, stale
+/// definition, or kind mismatch make the sanitization accounting unauditable.
+#[test]
+fn corpus_cross_checks_typed_placeholder_definitions_against_every_use() {
+    let temp = tempfile::tempdir().unwrap();
+    let manifest_path = "claude/2.1.227/model-discovery/manifest.json";
+    let definition = r#"    {"placeholder": "<CLAUDE_REQUEST_ID_1>", "kind": "claude_request_id"}"#;
+
+    write_valid_literal_corpus(temp.path());
+    let manifest = std::fs::read_to_string(temp.path().join(manifest_path))
+        .unwrap()
+        .replace(definition, "");
+    overwrite(temp.path(), manifest_path, &manifest);
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::MissingPlaceholderDefinition { placeholder, .. }]
+            if placeholder == "<CLAUDE_REQUEST_ID_1>"
+    ));
+
+    write_valid_literal_corpus(temp.path());
+    let manifest = std::fs::read_to_string(temp.path().join(manifest_path))
+        .unwrap()
+        .replace(
+            definition,
+            concat!(
+                "    {\"placeholder\": \"<CLAUDE_REQUEST_ID_1>\", \"kind\": \"claude_request_id\"},\n",
+                "    {\"placeholder\": \"<SESSION_ID_1>\", \"kind\": \"session_id\"}"
+            ),
+        );
+    overwrite(temp.path(), manifest_path, &manifest);
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::UnusedPlaceholderDefinition { placeholder, .. }]
+            if placeholder == "<SESSION_ID_1>"
+    ));
+
+    write_valid_literal_corpus(temp.path());
+    let manifest = std::fs::read_to_string(temp.path().join(manifest_path))
+        .unwrap()
+        .replace(definition, &format!("{definition},\n{definition}"));
+    overwrite(temp.path(), manifest_path, &manifest);
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::DuplicatePlaceholderDefinition { placeholder, .. }]
+            if placeholder == "<CLAUDE_REQUEST_ID_1>"
+    ));
+
+    write_valid_literal_corpus(temp.path());
+    let manifest = std::fs::read_to_string(temp.path().join(manifest_path))
+        .unwrap()
+        .replace(
+            "\"kind\": \"claude_request_id\"",
+            "\"kind\": \"session_id\"",
+        );
+    overwrite(temp.path(), manifest_path, &manifest);
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::PlaceholderKindMismatch {
+            placeholder,
+            expected_kind,
+            actual_kind,
+            ..
+        }] if placeholder == "<CLAUDE_REQUEST_ID_1>"
+            && expected_kind == "claude_request_id"
+            && actual_kind == "session_id"
     ));
 }
 
@@ -253,7 +397,7 @@ fn corpus_requires_unique_claim_ids_and_canonical_safe_relative_paths() {
     write_valid_literal_corpus(temp.path());
     let index = std::fs::read_to_string(temp.path().join("index.json"))
         .unwrap()
-        .replacen("\n  ]", ",\n    {\"id\":\"claude-model-reply\",\"consumer\":\"duplicate\",\"manifest\":\"claude/2.1.227/model-discovery/manifest.json\",\"frames\":[{\"sequence\":2,\"channel\":\"stdout\"}],\"fact\":\"duplicate\"}\n  ]", 1);
+        .replacen("\n  ]", ",\n    {\"id\":\"claude-model-reply\",\"consumer\":\"duplicate\",\"evidence\":[{\"manifest\":\"claude/2.1.227/model-discovery/manifest.json\",\"frames\":[{\"sequence\":2,\"channel\":\"stdout\"}]}],\"fact\":\"duplicate\"}\n  ]", 1);
     overwrite(temp.path(), "index.json", &index);
     assert!(matches!(
         validate_corpus(temp.path()).as_slice(),
@@ -268,6 +412,11 @@ fn corpus_requires_unique_claim_ids_and_canonical_safe_relative_paths() {
         "claude/./2.1.227/manifest.json",
         "C:/manifest.json",
         "claude/2.1.227/model-discovery/evidence.json",
+        "claude./2.1.227/model-discovery/manifest.json",
+        "claude /2.1.227/model-discovery/manifest.json",
+        " /2.1.227/model-discovery/manifest.json",
+        "AUX/2.1.227/model-discovery/manifest.json",
+        "con.txt/2.1.227/model-discovery/manifest.json",
     ] {
         write_valid_literal_corpus(temp.path());
         let index = std::fs::read_to_string(temp.path().join("index.json"))
@@ -288,6 +437,49 @@ fn corpus_requires_unique_claim_ids_and_canonical_safe_relative_paths() {
             "{unsafe_path:?} returned {errors:#?}"
         );
     }
+}
+
+/// Break caught: flattening a comparative claim to one manifest cannot prove a fact that depends
+/// on two captures, while selected_payload must not guess among several referenced frames.
+#[test]
+fn corpus_validates_every_evidence_entry_and_counts_all_selected_frames() {
+    let temp = tempfile::tempdir().unwrap();
+    write_valid_literal_corpus(temp.path());
+    let index = std::fs::read_to_string(temp.path().join("index.json"))
+        .unwrap()
+        .replace(
+            r#""evidence": [{
+        "manifest": "claude/2.1.227/model-discovery/manifest.json",
+        "frames": [{"sequence": 2, "channel": "stdout"}]
+      }]"#,
+            r#""evidence": [
+        {
+          "manifest": "claude/2.1.227/model-discovery/manifest.json",
+          "frames": [{"sequence": 2, "channel": "stdout"}]
+        },
+        {
+          "manifest": "claude/2.1.227/command-discovery/manifest.json",
+          "frames": [{"sequence": 1, "channel": "stdin"}]
+        }
+      ]"#,
+        );
+    overwrite(temp.path(), "index.json", &index);
+
+    let errors = validate_corpus(temp.path());
+    assert!(
+        matches!(
+            errors.as_slice(),
+            [CorpusError::MissingManifest { claim_id, manifest }]
+                if claim_id == "claude-model-reply"
+                    && manifest == "claude/2.1.227/command-discovery/manifest.json"
+        ),
+        "unexpected evidence errors: {errors:#?}"
+    );
+    assert!(matches!(
+        selected_payload(temp.path(), "claude-model-reply"),
+        Err(CorpusError::SelectedFrameCount { claim_id, count: 2 })
+            if claim_id == "claude-model-reply"
+    ));
 }
 
 /// Break caught: weak referential checks can accept a claim whose evidence file, exact frame, or
@@ -339,6 +531,40 @@ fn corpus_requires_manifest_frame_and_reciprocal_consumer_references() {
         }] if claim_id == "claude-model-reply"
             && consumer.ends_with("the_captured_reply_decodes_onto_curated_ids")
     ));
+
+    write_valid_literal_corpus(temp.path());
+    let manifest_path = "claude/2.1.227/model-discovery/manifest.json";
+    let manifest = std::fs::read_to_string(temp.path().join(manifest_path))
+        .unwrap()
+        .replace(
+            "  ]\n}",
+            "    ,\"crates/harness/src/claude/discovery.rs:stale_consumer\"\n  ]\n}",
+        );
+    overwrite(temp.path(), manifest_path, &manifest);
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::ExtraManifestConsumer { manifest, consumer }]
+            if manifest.ends_with("model-discovery/manifest.json")
+                && consumer.ends_with("stale_consumer")
+    ));
+
+    write_valid_literal_corpus(temp.path());
+    let manifest = std::fs::read_to_string(temp.path().join(manifest_path))
+        .unwrap()
+        .replace(
+            "    \"crates/harness/src/claude/discovery.rs:the_captured_reply_decodes_onto_curated_ids\"",
+            concat!(
+                "    \"crates/harness/src/claude/discovery.rs:the_captured_reply_decodes_onto_curated_ids\",\n",
+                "    \"crates/harness/src/claude/discovery.rs:the_captured_reply_decodes_onto_curated_ids\""
+            ),
+        );
+    overwrite(temp.path(), manifest_path, &manifest);
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::DuplicateManifestConsumer { manifest, consumer }]
+            if manifest.ends_with("model-discovery/manifest.json")
+                && consumer.ends_with("the_captured_reply_decodes_onto_curated_ids")
+    ));
 }
 
 /// Break caught: accepting ad-hoc redaction markers lets a reviewer mistake unresolved sensitive
@@ -379,34 +605,245 @@ fn corpus_rejects_unknown_or_unresolved_placeholder_syntax() {
 #[test]
 fn corpus_inventory_reports_the_exact_pending_manifest_set() {
     let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    let index: Value =
+        serde_json::from_slice(&std::fs::read(corpus_root.join("index.json")).unwrap()).unwrap();
+    let claim_ids: std::collections::BTreeSet<&str> = index["claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|claim| claim["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        claim_ids,
+        std::collections::BTreeSet::from([
+            "claude-approval-allowed-no-update",
+            "claude-approval-deny-response-policy",
+            "claude-approval-fixture-shape",
+            "claude-approval-no-cwd",
+            "claude-approval-no-permission-update",
+            "claude-approval-tool-input-shapes",
+            "claude-approval-wire-fields",
+            "claude-approval-write-path-absolute",
+            "claude-attachment-block-order",
+            "claude-attachment-block-order-test",
+            "claude-attachment-run-order",
+            "claude-command-absent-aliases",
+            "claude-command-discovery-behavior",
+            "claude-command-empty-hint",
+            "claude-command-nonbare-count",
+            "claude-command-observed-latency",
+            "claude-command-reply-decoder",
+            "claude-model-bare-effects",
+            "claude-model-close-exit",
+            "claude-model-curated-id-decoder",
+            "claude-model-cwd-invariance",
+            "claude-model-default-alias",
+            "claude-model-effort-levels",
+            "claude-model-fixture-shape",
+            "claude-model-initialize-request",
+            "claude-model-integration-shape",
+            "claude-model-no-modality",
+            "claude-model-observed-latency",
+            "claude-model-real-catalog-merge",
+            "claude-model-reply-shape",
+            "claude-routine-frame-fixture",
+            "claude-routine-frame-ignore-list",
+            "claude-routine-frame-integration",
+            "claude-run-settings-readback",
+            "codex-approval-policy-semantics",
+            "codex-approval-request-shapes",
+            "codex-command-approval-stability",
+            "codex-command-launcher-fixture",
+            "codex-file-change-approval-join",
+            "codex-file-change-diff-shape",
+            "codex-file-change-kind-object",
+            "codex-file-change-kind-source",
+            "codex-linked-worktree-sandbox-failure",
+            "codex-model-cwd-invariance",
+            "codex-model-effort-objects",
+            "codex-model-fixture-shape",
+            "codex-model-input-modalities",
+            "codex-model-integration-shape",
+            "codex-model-logged-out-fallback",
+            "codex-model-logged-out-integration",
+            "codex-model-notification-order",
+            "codex-model-observed-latency",
+            "codex-model-one-page",
+            "codex-model-page-decoder",
+            "codex-model-reply-shape",
+            "codex-model-request-shape",
+            "codex-model-source-notification-order",
+            "codex-model-text-only-integration",
+            "codex-routine-notification-fixture",
+            "codex-routine-notification-ignore-list",
+            "codex-routine-notification-integration",
+        ])
+    );
+
     let errors = validate_corpus(&corpus_root);
-    assert_eq!(errors.len(), 36, "inventory errors: {errors:#?}");
+    assert_eq!(errors.len(), 70, "inventory errors: {errors:#?}");
     assert!(
         errors
             .iter()
             .all(|error| matches!(error, CorpusError::MissingManifest { .. })),
         "inventory produced non-missing-manifest errors: {errors:#?}"
     );
-    let manifests: std::collections::BTreeSet<&str> = errors
+    let actual: std::collections::BTreeSet<(&str, &str)> = errors
         .iter()
         .filter_map(|error| match error {
-            CorpusError::MissingManifest { manifest, .. } => Some(manifest.as_str()),
+            CorpusError::MissingManifest { claim_id, manifest } => {
+                Some((claim_id.as_str(), manifest.as_str()))
+            }
             _ => None,
         })
         .collect();
-    assert_eq!(
-        manifests,
-        std::collections::BTreeSet::from([
-            "claude/pending-observed-version/approval/manifest.json",
-            "claude/pending-observed-version/attachment/manifest.json",
-            "claude/pending-observed-version/command-discovery/manifest.json",
-            "claude/pending-observed-version/fresh-text/manifest.json",
-            "claude/pending-observed-version/model-discovery/manifest.json",
-            "codex/pending-observed-version/approval/manifest.json",
-            "codex/pending-observed-version/fresh-text/manifest.json",
-            "codex/pending-observed-version/model-discovery/manifest.json",
-        ])
+    let mut expected = std::collections::BTreeSet::new();
+    let mut add = |manifest: &'static str, claims: &[&'static str]| {
+        expected.extend(claims.iter().map(|claim| (*claim, manifest)));
+    };
+    add(
+        "claude/pending-observed-version/approval/manifest.json",
+        &[
+            "claude-approval-allowed-no-update",
+            "claude-approval-deny-response-policy",
+            "claude-approval-fixture-shape",
+            "claude-approval-no-cwd",
+            "claude-approval-no-permission-update",
+            "claude-approval-tool-input-shapes",
+            "claude-approval-wire-fields",
+            "claude-approval-write-path-absolute",
+            "claude-run-settings-readback",
+        ],
     );
+    add(
+        "claude/pending-observed-version/attachment/manifest.json",
+        &[
+            "claude-attachment-block-order",
+            "claude-attachment-block-order-test",
+            "claude-attachment-run-order",
+        ],
+    );
+    add(
+        "claude/pending-observed-version/command-discovery/manifest.json",
+        &[
+            "claude-command-absent-aliases",
+            "claude-command-discovery-behavior",
+            "claude-command-empty-hint",
+            "claude-command-nonbare-count",
+            "claude-command-observed-latency",
+            "claude-command-reply-decoder",
+            "claude-model-bare-effects",
+            "claude-model-observed-latency",
+        ],
+    );
+    add(
+        "claude/pending-observed-version/fresh-text/manifest.json",
+        &[
+            "claude-routine-frame-fixture",
+            "claude-routine-frame-ignore-list",
+            "claude-routine-frame-integration",
+        ],
+    );
+    add(
+        "claude/pending-observed-version/model-discovery-neutral-cwd/manifest.json",
+        &["claude-model-cwd-invariance"],
+    );
+    add(
+        "claude/pending-observed-version/model-discovery-project-cwd/manifest.json",
+        &["claude-model-cwd-invariance"],
+    );
+    add(
+        "claude/pending-observed-version/model-discovery/manifest.json",
+        &[
+            "claude-command-nonbare-count",
+            "claude-model-bare-effects",
+            "claude-model-close-exit",
+            "claude-model-curated-id-decoder",
+            "claude-model-default-alias",
+            "claude-model-effort-levels",
+            "claude-model-fixture-shape",
+            "claude-model-initialize-request",
+            "claude-model-integration-shape",
+            "claude-model-no-modality",
+            "claude-model-observed-latency",
+            "claude-model-real-catalog-merge",
+            "claude-model-reply-shape",
+        ],
+    );
+    add(
+        "claude/pending-observed-version/slash-command-expansion/manifest.json",
+        &["claude-command-discovery-behavior"],
+    );
+    add(
+        "codex/pending-observed-version/approval-on-request/manifest.json",
+        &["codex-approval-policy-semantics"],
+    );
+    add(
+        "codex/pending-observed-version/approval-untrusted/manifest.json",
+        &["codex-approval-policy-semantics"],
+    );
+    add(
+        "codex/pending-observed-version/approval/manifest.json",
+        &[
+            "codex-approval-request-shapes",
+            "codex-command-approval-stability",
+            "codex-command-launcher-fixture",
+            "codex-file-change-approval-join",
+            "codex-file-change-diff-shape",
+            "codex-file-change-kind-object",
+            "codex-file-change-kind-source",
+        ],
+    );
+    add(
+        "codex/pending-observed-version/fresh-text-linked-worktree-full-access/manifest.json",
+        &["codex-linked-worktree-sandbox-failure"],
+    );
+    add(
+        "codex/pending-observed-version/fresh-text-linked-worktree-workspace-write/manifest.json",
+        &["codex-linked-worktree-sandbox-failure"],
+    );
+    add(
+        "codex/pending-observed-version/fresh-text/manifest.json",
+        &[
+            "codex-routine-notification-fixture",
+            "codex-routine-notification-ignore-list",
+            "codex-routine-notification-integration",
+        ],
+    );
+    add(
+        "codex/pending-observed-version/model-discovery-logged-out/manifest.json",
+        &[
+            "codex-model-logged-out-fallback",
+            "codex-model-logged-out-integration",
+        ],
+    );
+    add(
+        "codex/pending-observed-version/model-discovery-neutral-cwd/manifest.json",
+        &["codex-model-cwd-invariance"],
+    );
+    add(
+        "codex/pending-observed-version/model-discovery-project-cwd/manifest.json",
+        &["codex-model-cwd-invariance"],
+    );
+    add(
+        "codex/pending-observed-version/model-discovery/manifest.json",
+        &[
+            "codex-model-effort-objects",
+            "codex-model-fixture-shape",
+            "codex-model-input-modalities",
+            "codex-model-integration-shape",
+            "codex-model-logged-out-fallback",
+            "codex-model-notification-order",
+            "codex-model-observed-latency",
+            "codex-model-one-page",
+            "codex-model-page-decoder",
+            "codex-model-reply-shape",
+            "codex-model-request-shape",
+            "codex-model-source-notification-order",
+            "codex-model-text-only-integration",
+        ],
+    );
+    assert_eq!(actual, expected, "pending error identity/path set changed");
 }
 
 /// Break caught: skipping any semantic branch leaves captured identifiers, human-authored
