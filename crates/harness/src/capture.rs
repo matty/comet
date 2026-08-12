@@ -2317,6 +2317,9 @@ fn child_context(mut context: SemanticContext, key: &str) -> SemanticContext {
         "thread" => Entity::Thread,
         "turn" => Entity::Turn,
         "item" => Entity::Item,
+        "turns" if !context.claude_capture && matches!(context.entity, Entity::Thread) => {
+            Entity::Turn
+        }
         "items" if !context.claude_capture && matches!(context.entity, Entity::Turn) => {
             Entity::Item
         }

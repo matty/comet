@@ -2598,6 +2598,45 @@ fn sanitizer_reuses_codex_item_ids_inside_terminal_turn_items() {
     );
 }
 
+/// Break caught: a resumed Codex thread carries historical `turns[]` with nested `items[]`;
+/// dropping entity context at either array leaks provider identifiers from the thread snapshot.
+#[test]
+fn sanitizer_types_codex_historical_turn_and_item_ids_through_nested_arrays() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-secret","turns":[{"id":"turn-secret","items":[{"id":"item-one","type":"userMessage"},{"id":"item-two","type":"agentMessage"}]}]}},"echo":{"turnId":"turn-secret","itemId":"item-two"},"unrelated":{"turns":[{"id":"stable-turn"}],"items":[{"id":"stable-item"}]}}"#;
+    let raw = write_raw_capture(temp.path(), "codex-historical-ids", &[payload]);
+    let path = raw.join("capture.json");
+    let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    capture["provider"] = Value::String("codex".into());
+    std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "codex-historical-ids")).unwrap();
+    let got = &sanitized_payloads(&report.events_bytes)[0];
+    assert_eq!(got["result"]["thread"]["turns"][0]["id"], "<TURN_ID_1>");
+    let first_item = got["result"]["thread"]["turns"][0]["items"][0]["id"]
+        .as_str()
+        .unwrap();
+    let second_item = got["result"]["thread"]["turns"][0]["items"][1]["id"]
+        .as_str()
+        .unwrap();
+    assert!(first_item.starts_with("<TOOL_USE_ID_"));
+    assert!(second_item.starts_with("<TOOL_USE_ID_"));
+    assert_ne!(first_item, second_item);
+    assert_eq!(got["echo"]["turnId"], "<TURN_ID_1>");
+    assert_eq!(got["echo"]["itemId"], second_item);
+    assert_eq!(got["unrelated"]["turns"][0]["id"], "stable-turn");
+    assert_eq!(got["unrelated"]["items"][0]["id"], "stable-item");
+
+    let claude = write_raw_capture(temp.path(), "claude-historical-ids", &[payload]);
+    let report = sanitize_dir(&claude, &staging_dir(temp.path(), "claude-historical-ids")).unwrap();
+    let got = &sanitized_payloads(&report.events_bytes)[0];
+    assert_eq!(got["result"]["thread"]["turns"][0]["id"], "turn-secret");
+    assert_eq!(
+        got["result"]["thread"]["turns"][0]["items"][0]["id"],
+        "item-one"
+    );
+}
+
 /// Break caught: exact credential names miss provider-prefixed token families, and counter-name
 /// exemptions accept opaque strings that are credentials disguised as usage metadata.
 #[test]
