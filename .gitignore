@@ -1,5 +1,6 @@
 /target
 .worktrees/
+.comet-provider-captures/
 **/*.rs.bk
 *.pdb
 .DS_Store
