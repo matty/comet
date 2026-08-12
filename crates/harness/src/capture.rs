@@ -357,6 +357,14 @@ pub enum CorpusError {
     DuplicateManifestConsumer { manifest: String, consumer: String },
     #[error("provider corpus claim {claim_id:?} has no evidence entries")]
     MissingEvidence { claim_id: String },
+    #[error(
+        "provider corpus comparative claim {claim_id:?} selects {total_frames} frames but only {distinct_observations} distinct observations; at least two are required"
+    )]
+    InsufficientComparisonEvidence {
+        claim_id: String,
+        total_frames: usize,
+        distinct_observations: usize,
+    },
     #[error("provider corpus claim {claim_id:?} is missing events beside {manifest}")]
     MissingEvents { claim_id: String, manifest: String },
     #[error("provider corpus event line {line} for claim {claim_id:?} is invalid")]
@@ -436,6 +444,8 @@ struct CorpusIndex {
 struct CorpusClaim {
     id: String,
     consumer: String,
+    #[serde(default)]
+    comparison: bool,
     evidence: Vec<ClaimEvidence>,
     #[allow(dead_code)]
     fact: String,
@@ -510,12 +520,17 @@ pub fn validate_corpus(corpus_root: &Path) -> Vec<CorpusError> {
     let expected_consumers = expected_manifest_consumers(&index.claims);
     let mut errors = Vec::new();
     for claim in &index.claims {
+        if let Err(error) = validate_comparison_frame_count(claim) {
+            errors.push(error);
+            continue;
+        }
         if claim.evidence.is_empty() {
             errors.push(CorpusError::MissingEvidence {
                 claim_id: claim.id.clone(),
             });
             continue;
         }
+        let errors_before_claim = errors.len();
         for evidence in &claim.evidence {
             if let Err(error) = validate_evidence(
                 corpus_root,
@@ -527,6 +542,11 @@ pub fn validate_corpus(corpus_root: &Path) -> Vec<CorpusError> {
             ) {
                 errors.push(error);
             }
+        }
+        if errors.len() == errors_before_claim
+            && let Err(error) = validate_distinct_comparison_observations(claim)
+        {
+            errors.push(error);
         }
     }
     errors
@@ -548,6 +568,7 @@ pub fn selected_payload(corpus_root: &Path, claim_id: &str) -> Result<String, Co
         .ok_or_else(|| CorpusError::ClaimNotFound {
             claim_id: claim_id.to_owned(),
         })?;
+    validate_comparison_frame_count(claim)?;
     let frame_count = claim
         .evidence
         .iter()
@@ -632,6 +653,50 @@ fn duplicate_claim_id(claims: &[CorpusClaim]) -> Option<String> {
         .iter()
         .find(|claim| !seen.insert(claim.id.as_str()))
         .map(|claim| claim.id.clone())
+}
+
+fn comparison_evidence_counts(claim: &CorpusClaim) -> (usize, usize) {
+    let mut total_frames = 0;
+    let mut distinct_observations = std::collections::BTreeSet::new();
+    for evidence in &claim.evidence {
+        for frame in &evidence.frames {
+            total_frames += 1;
+            distinct_observations.insert((
+                evidence.manifest.as_str(),
+                frame.sequence,
+                match frame.channel {
+                    Channel::Stdin => 0,
+                    Channel::Stdout => 1,
+                    Channel::Stderr => 2,
+                },
+            ));
+        }
+    }
+    (total_frames, distinct_observations.len())
+}
+
+fn validate_comparison_frame_count(claim: &CorpusClaim) -> Result<(), CorpusError> {
+    let (total_frames, distinct_observations) = comparison_evidence_counts(claim);
+    if claim.comparison && total_frames < 2 {
+        return Err(CorpusError::InsufficientComparisonEvidence {
+            claim_id: claim.id.clone(),
+            total_frames,
+            distinct_observations,
+        });
+    }
+    Ok(())
+}
+
+fn validate_distinct_comparison_observations(claim: &CorpusClaim) -> Result<(), CorpusError> {
+    let (total_frames, distinct_observations) = comparison_evidence_counts(claim);
+    if claim.comparison && distinct_observations < 2 {
+        return Err(CorpusError::InsufficientComparisonEvidence {
+            claim_id: claim.id.clone(),
+            total_frames,
+            distinct_observations,
+        });
+    }
+    Ok(())
 }
 
 fn expected_manifest_consumers(

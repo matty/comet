@@ -36,6 +36,7 @@
     {
       "id": "claude-model-cwd-invariance",
       "consumer": "crates/harness/src/claude/discovery.rs:handshake",
+      "comparison": true,
       "fact": "The model list is invariant across capture working directories while commands vary.",
       "evidence": [
         {
@@ -61,6 +62,7 @@
     {
       "id": "claude-model-bare-effects",
       "consumer": "crates/harness/src/claude/discovery.rs:DISCOVERY_ARGS",
+      "comparison": true,
       "fact": "Bare initialization omits account identity and reduces command discovery to built-ins.",
       "evidence": [
         {
@@ -159,6 +161,7 @@
     {
       "id": "claude-command-nonbare-count",
       "consumer": "crates/harness/tests/claude.rs:live_cli_commands_include_this_repositorys_own_skills",
+      "comparison": true,
       "fact": "The non-bare command handshake includes project-scoped commands omitted by the bare handshake.",
       "evidence": [
         {
@@ -440,6 +443,7 @@
     {
       "id": "codex-model-logged-out-fallback",
       "consumer": "crates/harness/src/codex/discovery.rs:logged_in",
+      "comparison": true,
       "fact": "A logged-out CLI returns a successful built-in model list indistinguishable by envelope alone.",
       "evidence": [
         {
@@ -497,11 +501,16 @@
     {
       "id": "codex-command-approval-stability",
       "consumer": "crates/harness/src/codex/approval.rs:the_parsed_action_is_what_makes_a_session_grant_match_again",
+      "comparison": true,
       "fact": "Repeated approvals for one action can vary in their raw launcher invocation.",
       "evidence": [
         {
           "manifest": "codex/pending-observed-version/approval/manifest.json",
           "frames": [
+            {
+              "sequence": 0,
+              "channel": "stdout"
+            },
             {
               "sequence": 0,
               "channel": "stdout"
@@ -545,6 +554,7 @@
     {
       "id": "codex-approval-policy-semantics",
       "consumer": "crates/harness/src/codex/catalog.rs:approval_policy",
+      "comparison": true,
       "fact": "Untrusted asks before commands while on-request asks after a sandbox failure.",
       "evidence": [
         {
@@ -618,6 +628,7 @@
     {
       "id": "codex-linked-worktree-sandbox-failure",
       "consumer": "crates/harness/src/codex/mod.rs:normalize_run_request",
+      "comparison": true,
       "fact": "Workspace-write fails for a slash-named linked-worktree branch while full access runs.",
       "evidence": [
         {
@@ -739,6 +750,7 @@
     {
       "id": "claude-model-observed-latency",
       "consumer": "crates/harness/src/claude/discovery.rs:DISCOVERY_TIMEOUT",
+      "comparison": true,
       "evidence": [
         {
           "manifest": "claude/pending-observed-version/model-discovery/manifest.json",
@@ -796,9 +808,19 @@
     {
       "id": "claude-command-observed-latency",
       "consumer": "crates/harness/src/claude/commands.rs:COMMAND_TIMEOUT",
+      "comparison": true,
       "evidence": [
         {
           "manifest": "claude/pending-observed-version/command-discovery/manifest.json",
+          "frames": [
+            {
+              "sequence": 0,
+              "channel": "stdout"
+            }
+          ]
+        },
+        {
+          "manifest": "claude/pending-observed-version/command-discovery-in-app/manifest.json",
           "frames": [
             {
               "sequence": 0,
@@ -956,6 +978,7 @@
     {
       "id": "codex-model-cwd-invariance",
       "consumer": "crates/harness/src/codex/discovery.rs:handshake cwd choice",
+      "comparison": true,
       "evidence": [
         {
           "manifest": "codex/pending-observed-version/model-discovery-neutral-cwd/manifest.json",
@@ -997,9 +1020,19 @@
     {
       "id": "codex-model-observed-latency",
       "consumer": "crates/harness/src/codex/discovery.rs:DISCOVERY_TIMEOUT",
+      "comparison": true,
       "evidence": [
         {
           "manifest": "codex/pending-observed-version/model-discovery/manifest.json",
+          "frames": [
+            {
+              "sequence": 0,
+              "channel": "stdout"
+            }
+          ]
+        },
+        {
+          "manifest": "codex/pending-observed-version/model-discovery-warm/manifest.json",
           "frames": [
             {
               "sequence": 0,

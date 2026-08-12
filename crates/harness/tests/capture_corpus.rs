@@ -482,6 +482,95 @@ fn corpus_validates_every_evidence_entry_and_counts_all_selected_frames() {
     ));
 }
 
+/// Break caught: a comparative claim with one readable frame cannot substantiate a difference,
+/// even though that single frame is otherwise valid evidence for a non-comparative claim.
+#[test]
+fn corpus_comparisons_require_at_least_two_observations() {
+    let temp = tempfile::tempdir().unwrap();
+    write_valid_literal_corpus(temp.path());
+    let index = std::fs::read_to_string(temp.path().join("index.json"))
+        .unwrap()
+        .replace(
+            r#""consumer": "crates/harness/src/claude/discovery.rs:the_captured_reply_decodes_onto_curated_ids","#,
+            concat!(
+                r#""consumer": "crates/harness/src/claude/discovery.rs:the_captured_reply_decodes_onto_curated_ids","#,
+                "\n      \"comparison\": true,"
+            ),
+        );
+    overwrite(temp.path(), "index.json", &index);
+
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::InsufficientComparisonEvidence {
+            claim_id,
+            total_frames: 1,
+            distinct_observations: 1,
+        }] if claim_id == "claude-model-reply"
+    ));
+}
+
+/// Break caught: copying one selector twice must not turn one captured observation into a
+/// comparison, even though both references independently resolve to a valid frame.
+#[test]
+fn corpus_comparisons_reject_duplicate_identical_frame_selectors() {
+    let temp = tempfile::tempdir().unwrap();
+    write_valid_literal_corpus(temp.path());
+    let index = std::fs::read_to_string(temp.path().join("index.json"))
+        .unwrap()
+        .replace(
+            r#""consumer": "crates/harness/src/claude/discovery.rs:the_captured_reply_decodes_onto_curated_ids","#,
+            concat!(
+                r#""consumer": "crates/harness/src/claude/discovery.rs:the_captured_reply_decodes_onto_curated_ids","#,
+                "\n      \"comparison\": true,"
+            ),
+        )
+        .replace(
+            r#""frames": [{"sequence": 2, "channel": "stdout"}]"#,
+            r#""frames": [
+          {"sequence": 2, "channel": "stdout"},
+          {"sequence": 2, "channel": "stdout"}
+        ]"#,
+        );
+    overwrite(temp.path(), "index.json", &index);
+
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::InsufficientComparisonEvidence {
+            claim_id,
+            total_frames: 2,
+            distinct_observations: 1,
+        }] if claim_id == "claude-model-reply"
+    ));
+
+    write_valid_literal_corpus(temp.path());
+    let index = std::fs::read_to_string(temp.path().join("index.json"))
+        .unwrap()
+        .replace(
+            r#""consumer": "crates/harness/src/claude/discovery.rs:the_captured_reply_decodes_onto_curated_ids","#,
+            concat!(
+                r#""consumer": "crates/harness/src/claude/discovery.rs:the_captured_reply_decodes_onto_curated_ids","#,
+                "\n      \"comparison\": true,"
+            ),
+        )
+        .replace(
+            r#""frames": [{"sequence": 2, "channel": "stdout"}]"#,
+            r#""frames": [
+          {"sequence": 2, "channel": "stdout"},
+          {"sequence": 3, "channel": "stdout"}
+        ]"#,
+        );
+    overwrite(temp.path(), "index.json", &index);
+    let events_path = "claude/2.1.227/model-discovery/events.jsonl";
+    let events = std::fs::read_to_string(temp.path().join(events_path))
+        .unwrap()
+        .replace(
+            r#"{"sequence":3,"channel":"stderr","payload":"safe diagnostic"}"#,
+            r#"{"sequence":3,"channel":"stdout","payload":"safe diagnostic"}"#,
+        );
+    overwrite(temp.path(), events_path, &events);
+    assert!(validate_corpus(temp.path()).is_empty());
+}
+
 /// Break caught: weak referential checks can accept a claim whose evidence file, exact frame, or
 /// reciprocal manifest consumer entry is missing.
 #[test]
@@ -679,9 +768,32 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "codex-routine-notification-integration",
         ])
     );
+    let comparison_claim_ids: std::collections::BTreeSet<&str> = index["claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|claim| claim["comparison"].as_bool() == Some(true))
+        .map(|claim| claim["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        comparison_claim_ids,
+        std::collections::BTreeSet::from([
+            "claude-command-nonbare-count",
+            "claude-command-observed-latency",
+            "claude-model-bare-effects",
+            "claude-model-cwd-invariance",
+            "claude-model-observed-latency",
+            "codex-approval-policy-semantics",
+            "codex-command-approval-stability",
+            "codex-linked-worktree-sandbox-failure",
+            "codex-model-cwd-invariance",
+            "codex-model-logged-out-fallback",
+            "codex-model-observed-latency",
+        ])
+    );
 
     let errors = validate_corpus(&corpus_root);
-    assert_eq!(errors.len(), 70, "inventory errors: {errors:#?}");
+    assert_eq!(errors.len(), 72, "inventory errors: {errors:#?}");
     assert!(
         errors
             .iter()
@@ -735,6 +847,10 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "claude-model-bare-effects",
             "claude-model-observed-latency",
         ],
+    );
+    add(
+        "claude/pending-observed-version/command-discovery-in-app/manifest.json",
+        &["claude-command-observed-latency"],
     );
     add(
         "claude/pending-observed-version/fresh-text/manifest.json",
@@ -842,6 +958,10 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "codex-model-source-notification-order",
             "codex-model-text-only-integration",
         ],
+    );
+    add(
+        "codex/pending-observed-version/model-discovery-warm/manifest.json",
+        &["codex-model-observed-latency"],
     );
     assert_eq!(actual, expected, "pending error identity/path set changed");
 }
