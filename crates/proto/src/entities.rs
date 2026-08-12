@@ -187,6 +187,44 @@ pub struct Session {
     pub status: SessionStatus,
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    /// How full the model's context window was at the chat's most recent
+    /// model request. Additive: a peer that predates the field draws no
+    /// gauge, which is the same thing it does before the first turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextUsage>,
+}
+
+/// A context-occupancy reading, carried only when BOTH halves are known.
+///
+/// A prompt size without a window is undrawable, and a window without a
+/// prompt says nothing, so the pair is the unit. Making the half-known state
+/// unrepresentable is deliberate: it keeps "we cannot say" a single condition
+/// at the one place that has to decide, rather than two the UI must combine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsage {
+    pub prompt_tokens: u64,
+    pub context_window: u64,
+}
+
+impl ContextUsage {
+    /// Occupancy as a 0.0–1.0 fraction, clamped.
+    ///
+    /// Clamped because the two figures come from different frames and nothing
+    /// guarantees they agree: a prompt larger than the window must read as
+    /// full, never as 130% or a wrapped-around sliver.
+    pub fn fraction(&self) -> f32 {
+        if self.context_window == 0 {
+            return 0.0;
+        }
+        (self.prompt_tokens as f32 / self.context_window as f32).clamp(0.0, 1.0)
+    }
+
+    /// Whole percent, for the tooltip. Rounds toward zero so a barely-started
+    /// context never reads "1%" before it has used a hundredth of the window.
+    pub fn percent(&self) -> u8 {
+        (self.fraction() * 100.0) as u8
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -409,6 +447,48 @@ pub enum TerminalEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session row from a peer that predates the field. Sessions decode as a
+    /// vector, so one strict field would reject every row and blank the whole
+    /// sidebar, not just the gauge — 0.1's blast-radius finding again.
+    #[test]
+    fn session_without_context_decodes() {
+        let old = r#"{"chatId":"c1","deviceId":"d1","status":"idle","startedAt":null,
+                      "updatedAt":"2026-08-12T00:00:00Z"}"#;
+        let session: Session = serde_json::from_str(old).unwrap();
+        assert_eq!(session.context, None);
+    }
+
+    /// The gauge is drawn from this fraction, so the arithmetic is pinned
+    /// rather than left to the painter.
+    #[test]
+    fn context_fraction_and_percent() {
+        let usage = ContextUsage {
+            prompt_tokens: 35_017,
+            context_window: 200_000,
+        };
+        assert!((usage.fraction() - 0.175_085).abs() < 1e-6);
+        assert_eq!(usage.percent(), 17);
+    }
+
+    /// The two figures arrive on different frames and nothing makes them
+    /// agree. A prompt past the window reads full, never 130% or a wrapped
+    /// sliver; a zero window cannot divide.
+    #[test]
+    fn context_fraction_clamps_rather_than_overflowing() {
+        let over = ContextUsage {
+            prompt_tokens: 260_000,
+            context_window: 200_000,
+        };
+        assert_eq!(over.fraction(), 1.0);
+        assert_eq!(over.percent(), 100);
+
+        let degenerate = ContextUsage {
+            prompt_tokens: 10,
+            context_window: 0,
+        };
+        assert_eq!(degenerate.fraction(), 0.0);
+    }
 
     #[test]
     fn chat_config_runtime_mode_defaults_when_absent() {

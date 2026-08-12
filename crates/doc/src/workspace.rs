@@ -437,6 +437,18 @@ impl WorkspaceDoc {
         row.insert("status", status_str(session.status))?;
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
+        // Deleted rather than skipped when absent: a row that keeps a stale
+        // reading would draw a gauge for a window nobody is filling.
+        match session.context {
+            Some(context) => {
+                row.insert("contextPromptTokens", context.prompt_tokens as i64)?;
+                row.insert("contextWindow", context.context_window as i64)?;
+            }
+            None => {
+                row.delete("contextPromptTokens")?;
+                row.delete("contextWindow")?;
+            }
+        }
         self.doc.commit();
         Ok(())
     }
@@ -680,6 +692,10 @@ struct RawSession {
     started_at: Option<i64>,
     #[serde(default)]
     updated_at: i64,
+    #[serde(default)]
+    context_prompt_tokens: Option<i64>,
+    #[serde(default)]
+    context_window: Option<i64>,
 }
 
 impl From<RawSession> for Session {
@@ -690,6 +706,19 @@ impl From<RawSession> for Session {
             status: raw.status,
             started_at: raw.started_at.map(dt),
             updated_at: dt(raw.updated_at),
+            // Both halves or neither: a row carrying only one is a row written
+            // by a peer mid-change or corrupted, and half a reading is not a
+            // gauge. Negative values cannot be token counts, so they read as
+            // absent rather than wrapping through an `as u64` cast.
+            context: match (raw.context_prompt_tokens, raw.context_window) {
+                (Some(prompt), Some(window)) if prompt >= 0 && window >= 0 => {
+                    Some(comet_proto::ContextUsage {
+                        prompt_tokens: prompt as u64,
+                        context_window: window as u64,
+                    })
+                }
+                _ => None,
+            },
         }
     }
 }
@@ -761,7 +790,31 @@ mod tests {
             status,
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
+            context: None,
         }
+    }
+
+    /// A reading survives the doc round-trip, and a row that lost one half of
+    /// it reads as no reading at all rather than half a gauge.
+    #[test]
+    fn session_context_round_trips_and_half_rows_read_as_absent() {
+        let doc = WorkspaceDoc::new();
+        let mut with_context = session("chat-ctx", "dev-1", SessionStatus::Idle);
+        with_context.context = Some(comet_proto::ContextUsage {
+            prompt_tokens: 35_017,
+            context_window: 200_000,
+        });
+        doc.upsert_session(&with_context).expect("write");
+        assert_eq!(
+            doc.read_sessions().expect("read")[0].context,
+            with_context.context
+        );
+
+        // Clearing writes the absence through rather than leaving the old
+        // figure behind for the gauge to keep drawing.
+        let cleared = session("chat-ctx", "dev-1", SessionStatus::Idle);
+        doc.upsert_session(&cleared).expect("clear");
+        assert_eq!(doc.read_sessions().expect("read")[0].context, None);
     }
 
     fn cross_sync(a: &WorkspaceDoc, b: &WorkspaceDoc) {

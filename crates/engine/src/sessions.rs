@@ -1054,8 +1054,59 @@ impl SessionsEngine {
 }
 
 impl Inner {
+    /// Record a context reading against the chat's session row.
+    ///
+    /// A window-less reading **clears** the row rather than leaving the last
+    /// one standing. The stale figure is not merely old, it is wrong: the
+    /// prompt has moved on, so the gauge would keep drawing the previous
+    /// turn's occupancy against the previous turn's limit. This is reachable
+    /// from Comet's own code, not just a provider quirk — a multi-model turn
+    /// whose windows disagree declines the window on purpose
+    /// (`claude::normalize::agreed_context_window`), and that decline arrives
+    /// here as `None`.
+    ///
+    /// A prompt with no limit still cannot be drawn, so nothing replaces it:
+    /// inventing a default limit would be a number the user acts on.
+    ///
+    /// The reading is deliberately NOT journaled. It is current occupancy, not
+    /// history, and replaying a run would otherwise resurrect a figure that
+    /// stopped being true the moment the next request went out.
+    fn record_context(&self, chat_id: &str, event: &AgentEvent) {
+        let AgentEvent::Usage {
+            prompt_tokens,
+            context_window,
+            ..
+        } = event
+        else {
+            return; // not a reading at all — a slash-command turn emits none
+        };
+        let reading = (*context_window).map(|context_window| comet_proto::ContextUsage {
+            prompt_tokens: *prompt_tokens,
+            context_window,
+        });
+        let session = {
+            let mut statuses = lock(&self.statuses);
+            let Some(entry) = statuses.get_mut(chat_id) else {
+                return; // no session row yet: nothing to hang the reading on
+            };
+            if entry.context == reading {
+                return; // nothing changed; skip the broadcast and the doc write
+            }
+            entry.context = reading;
+            let session = entry.clone();
+            let mut list: Vec<Session> = statuses.values().cloned().collect();
+            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            self.sessions_tx.send_replace(list);
+            session
+        };
+        if let Some(ws) = self.workspace() {
+            ws.record_session(&session);
+        }
+    }
+
     /// Journal + broadcast one event (the two unconditional legs of the pipeline).
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
+        self.record_context(chat_id, event);
         let seq = match self.journal.append(chat_id, event) {
             Ok(seq) => seq,
             Err(err) => {
@@ -1115,6 +1166,9 @@ impl Inner {
                     status,
                     started_at: None,
                     updated_at: now,
+                    // Unknown until the first model request answers: neither
+                    // provider publishes a window before then.
+                    context: None,
                 });
             entry.status = status;
             entry.updated_at = now;
@@ -2079,6 +2133,85 @@ mod tests {
             new.approval.try_recv(),
             Err(oneshot::error::TryRecvError::Closed)
         ));
+    }
+
+    /// A reading is only worth keeping when the provider named the window it
+    /// is measured against, and it must not resurrect after the row is gone.
+    #[test]
+    fn context_is_recorded_only_when_the_window_is_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = engine(dir.path());
+        let context_of = |chat: &str| {
+            lock(&sessions.inner.statuses)
+                .get(chat)
+                .and_then(|s| s.context)
+        };
+
+        // No session row yet: nothing to hang a reading on, and inventing one
+        // would put a gauge on a chat that has never run.
+        sessions.inner.record_context(
+            "chat-1",
+            &AgentEvent::Usage {
+                prompt_tokens: 10,
+                output_tokens: 1,
+                context_window: Some(200_000),
+            },
+        );
+        assert_eq!(context_of("chat-1"), None);
+
+        sessions
+            .inner
+            .set_status("chat-1", SessionStatus::Working, true);
+
+        // A window-less reading is undrawable, so it is dropped rather than
+        // stored against an invented limit.
+        sessions.inner.record_context(
+            "chat-1",
+            &AgentEvent::Usage {
+                prompt_tokens: 17_268,
+                output_tokens: 48,
+                context_window: None,
+            },
+        );
+        assert_eq!(context_of("chat-1"), None);
+
+        sessions.inner.record_context(
+            "chat-1",
+            &AgentEvent::Usage {
+                prompt_tokens: 35_017,
+                output_tokens: 26,
+                context_window: Some(200_000),
+            },
+        );
+        assert_eq!(
+            context_of("chat-1"),
+            Some(comet_proto::ContextUsage {
+                prompt_tokens: 35_017,
+                context_window: 200_000,
+            })
+        );
+
+        // A later status transition must not wipe it: occupancy outlives the
+        // turn that measured it, and the next turn is what replaces it.
+        sessions
+            .inner
+            .set_status("chat-1", SessionStatus::Idle, false);
+        assert!(context_of("chat-1").is_some());
+
+        // A window-less reading AFTER a good one clears it. Leaving the old
+        // pair standing would draw the previous turn's occupancy against the
+        // previous turn's limit while the prompt has already moved on — and
+        // this is reachable from Comet's own decline path, not just a
+        // provider quirk (PR #52 review, Macroscope).
+        sessions.inner.record_context(
+            "chat-1",
+            &AgentEvent::Usage {
+                prompt_tokens: 120_000,
+                output_tokens: 12,
+                context_window: None,
+            },
+        );
+        assert_eq!(context_of("chat-1"), None);
     }
 
     fn session_started(cwd: &str, runtime_mode: RuntimeMode) -> AgentEvent {

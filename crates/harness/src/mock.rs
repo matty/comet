@@ -379,6 +379,23 @@ impl Harness for MockHarness {
         let error_event = mock_error.then(|| AgentEvent::Error {
             message: "Claude usage limit reached — try again after the limit resets.".into(),
         });
+        // Dev/testing knob: `COMET_MOCK_CONTEXT=<percent>` emits a context
+        // reading before the terminal Done, which is the only way to put the
+        // composer's context gauge on screen without driving a real CLI and
+        // filling a real window. `0` suppresses it, which is also what a
+        // provider that publishes no window looks like.
+        let context_event = std::env::var("COMET_MOCK_CONTEXT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|percent| *percent > 0)
+            .map(|percent| {
+                const WINDOW: u64 = 200_000;
+                AgentEvent::Usage {
+                    prompt_tokens: WINDOW * percent.min(100) / 100,
+                    output_tokens: 128,
+                    context_window: Some(WINDOW),
+                }
+            });
         // Dev/testing knob: `COMET_MOCK_CODE=1` appends rust + ts code blocks
         // (keywords, strings, numbers, comments) plus inline code — for
         // syntax-palette and inline-code styling checks against the reference.
@@ -471,6 +488,7 @@ impl Harness for MockHarness {
             .chain(table_event)
             .chain(mend_event)
             .chain(error_event)
+            .chain(context_event)
             .chain(tail.iter().cloned())
             .map(Ok)
             .collect();

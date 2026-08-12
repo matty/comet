@@ -269,16 +269,35 @@ pub(crate) struct ResultFrame {
     pub errors: Vec<Value>,
     #[serde(default)]
     pub usage: UsageBody,
+    #[serde(default, rename = "modelUsage")]
+    pub model_usage: std::collections::BTreeMap<String, ModelUsageBody>,
     #[serde(default)]
     pub session_id: Option<String>,
 }
 
+/// `input_tokens` here is the CACHE-EXCLUSIVE remainder — Anthropic's own
+/// prompt-caching docs state the prompt size is the sum of all three. Reading
+/// `input_tokens` alone reports single digits for a 35,000-token prompt.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct UsageBody {
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+}
+
+/// One `modelUsage` entry. The map is keyed by resolved model id and carries
+/// the only context-window figure the CLI publishes; the field is on the wire
+/// but in no documented field list, so treat its absence as ordinary.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ModelUsageBody {
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 /// A CLI→client control request (`can_use_tool` is the one we act on).

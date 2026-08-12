@@ -1033,7 +1033,10 @@ fn happy(turn_line: &str, thread_line: &str, tid: &str) {
     // Unknown notification methods must be tolerated.
     emit(r#"{"method":"some/unknownNotification","params":{"x":1}}"#);
     emit(
-        r#"{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"last":{"inputTokens":42,"outputTokens":7}}}}"#,
+        // `total` differs from `last` and the window is present, as on the
+        // real wire — a fixture carrying only `last` cannot catch a reader
+        // that takes the cumulative figure and draws it against the window.
+        r#"{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"inputTokens":900,"outputTokens":90},"last":{"inputTokens":42,"outputTokens":7},"modelContextWindow":258400}}}"#,
     );
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
 }

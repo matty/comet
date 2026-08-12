@@ -195,9 +195,13 @@ async fn happy_path_normalizes_events_and_filters_subagents() {
     // Informational rate-limit frames stay quiet.
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
 
+    // 10 uncached + 34,932 cache-read + 75 cache-written. Asserting the sum
+    // rather than `input_tokens` is the point: the CLI reports the prompt in
+    // three parts and only their total is the occupancy.
     assert!(events.contains(&AgentEvent::Usage {
-        input_tokens: 10,
-        output_tokens: 20
+        prompt_tokens: 35_017,
+        output_tokens: 20,
+        context_window: Some(200_000),
     }));
     assert_eq!(
         events.last(),

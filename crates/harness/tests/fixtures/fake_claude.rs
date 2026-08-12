@@ -259,7 +259,11 @@ fn happy() {
     // Informational rate-limit status: stays quiet.
     emit(r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#);
     emit(
-        r#"{"type":"result","subtype":"success","result":"done!","errors":[],"usage":{"input_tokens":10,"output_tokens":20},"session_id":"sess-1","total_cost_usd":0.01}"#,
+        // Shaped like a real `result` frame, not a minimal one: the cache
+        // fields carry almost the whole prompt and `modelUsage` is the only
+        // place the context window appears. A fixture without them let the
+        // adapter report single-digit prompts for months.
+        r#"{"type":"result","subtype":"success","result":"done!","errors":[],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":34932,"cache_creation_input_tokens":75},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":10,"outputTokens":20,"contextWindow":200000}},"session_id":"sess-1","total_cost_usd":0.01}"#,
     );
 }
 
