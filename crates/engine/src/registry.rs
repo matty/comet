@@ -107,7 +107,12 @@ type Factory = Box<dyn Fn() -> Result<Arc<dyn Harness>, HarnessError> + Send + S
 enum Slot {
     Ready(Arc<dyn Harness>),
     Lazy {
-        descriptor: HarnessDescriptor,
+        /// Boxed to keep the two variants a similar size. `Ready` is a fat
+        /// pointer; the descriptor grows every time a probed fact is added to
+        /// it (`availability`, then `install`, now `update`), and without this
+        /// every `Slot` in the map would be sized for the largest descriptor
+        /// any future slice adds.
+        descriptor: Box<HarnessDescriptor>,
         factory: Factory,
     },
 }
@@ -166,7 +171,7 @@ impl HarnessRegistry {
             .insert(
                 id,
                 Slot::Lazy {
-                    descriptor,
+                    descriptor: Box::new(descriptor),
                     factory,
                 },
             )
@@ -277,7 +282,7 @@ impl HarnessRegistry {
             .filter_map(|id| {
                 let mut descriptor = match slots.get(id) {
                     Some(Slot::Ready(harness)) => describe(harness.as_ref()),
-                    Some(Slot::Lazy { descriptor, .. }) => descriptor.clone(),
+                    Some(Slot::Lazy { descriptor, .. }) => (**descriptor).clone(),
                     None => return None,
                 };
                 // Overlaid here rather than stored on the slot, so the probe
