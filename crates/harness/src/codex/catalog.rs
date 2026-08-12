@@ -73,11 +73,11 @@ pub(crate) fn sandbox_policy_value(sandbox: SandboxLevel) -> serde_json::Value {
 /// `thread/start`'s and `turn/start`'s `approvalPolicy`: when the server stops
 /// to ask.
 ///
-/// **`untrusted` and `on-request` are not two settings on one dial** — captured
-/// 2026-08-10, and worth knowing before reading either name as a severity:
+/// **`untrusted` and `on-request` are not two settings on one dial.** In the
+/// current protocol they control different approval phases:
 ///
-/// - `untrusted` asks **before every command**, with no `reason`. One turn asked
-///   four times for two commands, because each retry is a fresh request.
+/// - `untrusted` can run bounded commands under the read-only sandbox and ask
+///   the user when the turn reaches a file change.
 /// - `on-request` asks **only after a sandboxed attempt has already failed**,
 ///   carrying a `reason` that says so. The user sees a failed command in the
 ///   transcript first, then a card offering to run it unsandboxed.
@@ -271,9 +271,9 @@ mod tests {
     }
 
     /// Every mode maps to a policy literal `AskForApproval` accepts. The pair
-    /// that matters is the middle two: they share `on-request`, which asks only
-    /// after a sandboxed attempt fails, while `ApprovalRequired` takes
-    /// `untrusted`, which asks before every command.
+    /// that matters is the middle two: they share `on-request`, which can ask
+    /// after a sandboxed attempt fails, while `ApprovalRequired` uses
+    /// `untrusted` with the user reviewer and a read-only sandbox.
     #[test]
     fn every_runtime_mode_maps_to_a_schema_approval_policy() {
         for (mode, want) in [

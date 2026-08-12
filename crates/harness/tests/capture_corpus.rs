@@ -898,12 +898,9 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "claude-routine-frame-integration",
             "codex-approval-policy-semantics",
             "codex-approval-request-shapes",
-            "codex-command-approval-stability",
-            "codex-command-launcher-fixture",
             "codex-file-change-approval-join",
-            "codex-file-change-diff-shape",
-            "codex-file-change-kind-object",
-            "codex-file-change-kind-source",
+            "codex-file-add-raw-content",
+            "codex-file-change-kind-shape",
             "codex-model-cwd-invariance",
             "codex-model-effort-objects",
             "codex-model-fixture-shape",
@@ -937,14 +934,13 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "claude-model-bare-effects",
             "claude-model-cwd-invariance",
             "codex-approval-policy-semantics",
-            "codex-command-approval-stability",
             "codex-model-cwd-invariance",
             "codex-model-logged-out-fallback",
         ])
     );
 
     let errors = validate_corpus(&corpus_root);
-    assert_eq!(errors.len(), 9, "inventory errors: {errors:#?}");
+    assert_eq!(errors.len(), 6, "inventory errors: {errors:#?}");
     assert!(
         errors
             .iter()
@@ -976,12 +972,9 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
         "codex/pending-observed-version/approval/manifest.json",
         &[
             "codex-approval-request-shapes",
-            "codex-command-approval-stability",
-            "codex-command-launcher-fixture",
             "codex-file-change-approval-join",
-            "codex-file-change-diff-shape",
-            "codex-file-change-kind-object",
-            "codex-file-change-kind-source",
+            "codex-file-add-raw-content",
+            "codex-file-change-kind-shape",
         ],
     );
     assert_eq!(actual, expected, "pending error identity/path set changed");
@@ -2114,6 +2107,47 @@ fn sanitizer_replaces_the_captured_approval_target() {
                 entry["placeholder"] == "<APPROVAL_TARGET>"
                     && entry["kind"] == "approval_target_path"
             })
+    );
+}
+
+/// Break caught: the reviewed Codex approval wrapper contains an absolute trusted executable
+/// path, so successful raw evidence must sample that path as provenance before sanitization.
+#[test]
+fn sanitizer_replaces_the_captured_trusted_powershell_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let executable = r"C:\Program Files\WindowsApps\PowerShell\pwsh.exe";
+    let payload = serde_json::json!({
+        "method": "item/started",
+        "params": {
+            "item": {
+                "type": "commandExecution",
+                "command": format!(r#""{executable}" -Command 'echo capture'"#)
+            }
+        }
+    })
+    .to_string();
+    let raw = write_raw_capture(temp.path(), "trusted-powershell", &[&payload]);
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    capture["redaction_roots"]["trusted_powershell"] = Value::String(executable.into());
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "trusted-powershell")).unwrap();
+    let payloads = sanitized_payloads(&report.events_bytes);
+    assert_eq!(
+        payloads[0]["params"]["item"]["command"],
+        r#""<TRUSTED_POWERSHELL>" -Command 'echo capture'"#
+    );
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+    assert_eq!(manifest["redaction_counts"]["trusted_powershell_path"], 1);
+    assert!(
+        manifest["placeholders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["placeholder"] == "<TRUSTED_POWERSHELL>"
+                && entry["kind"] == "trusted_powershell_path")
     );
 }
 

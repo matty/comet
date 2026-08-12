@@ -444,7 +444,7 @@
     {
       "id": "codex-approval-request-shapes",
       "consumer": "crates/harness/src/codex/approval.rs:approval_request",
-      "fact": "Command and file-change approvals use the captured requestApproval envelopes.",
+      "fact": "File-change approvals use the captured requestApproval envelope with item identity and an optional reason.",
       "evidence": [
         {
           "manifest": "codex/pending-observed-version/approval/manifest.json",
@@ -474,30 +474,9 @@
       ]
     },
     {
-      "id": "codex-command-approval-stability",
-      "consumer": "crates/harness/src/codex/approval.rs:the_parsed_action_is_what_makes_a_session_grant_match_again",
-      "comparison": true,
-      "fact": "Repeated approvals for one action can vary in their raw launcher invocation.",
-      "evidence": [
-        {
-          "manifest": "codex/pending-observed-version/approval/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdout"
-            },
-            {
-              "sequence": 0,
-              "channel": "stdout"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "id": "codex-file-change-diff-shape",
-      "consumer": "crates/harness/src/codex/approval.rs:unified_diff_counts",
-      "fact": "Codex update diffs are headerless and hunked.",
+      "id": "codex-file-add-raw-content",
+      "consumer": "crates/harness/src/codex/approval.rs:summarize_changes add raw content",
+      "fact": "A Codex added-file diff is the raw new-file content rather than a unified hunk.",
       "evidence": [
         {
           "manifest": "codex/pending-observed-version/approval/manifest.json",
@@ -511,9 +490,9 @@
       ]
     },
     {
-      "id": "codex-file-change-kind-object",
+      "id": "codex-file-change-kind-shape",
       "consumer": "crates/harness/src/codex/normalize.rs:a_file_changes_kind_is_an_object_on_the_wire",
-      "fact": "A file-change kind is an object with a type discriminator rather than a string.",
+      "fact": "A captured file-change kind is an object with a type discriminator rather than a bare string.",
       "evidence": [
         {
           "manifest": "codex/pending-observed-version/approval/manifest.json",
@@ -530,7 +509,7 @@
       "id": "codex-approval-policy-semantics",
       "consumer": "crates/harness/src/codex/catalog.rs:approval_policy",
       "comparison": true,
-      "fact": "Approval-required asks before commands while on-request asks after a sandbox failure.",
+      "fact": "Approval-required runs the bounded command phase under untrusted/user/read-only and then asks for the file add, while on-request asks only after a workspace-write sandbox failure.",
       "evidence": [
         {
           "manifest": "codex/pending-observed-version/approval/manifest.json",
@@ -929,38 +908,6 @@
         }
       ],
       "fact": "The live server answered the captured model list in one page."
-    },
-    {
-      "id": "codex-file-change-kind-source",
-      "consumer": "crates/harness/src/codex/normalize.rs:map_item fileChange kind",
-      "evidence": [
-        {
-          "manifest": "codex/pending-observed-version/approval/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdout"
-            }
-          ]
-        }
-      ],
-      "fact": "Captured file-change kinds are discriminator objects, not bare strings."
-    },
-    {
-      "id": "codex-command-launcher-fixture",
-      "consumer": "crates/harness/tests/fixtures/fake_codex.rs:approval command launcher",
-      "evidence": [
-        {
-          "manifest": "codex/pending-observed-version/approval/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdout"
-            }
-          ]
-        }
-      ],
-      "fact": "The raw launcher invocation and parsed command action differ in live approval requests."
     }
   ]
 }
