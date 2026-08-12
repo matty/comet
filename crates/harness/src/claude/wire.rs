@@ -207,6 +207,8 @@ pub(crate) struct MessageFrame {
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct MessageBody {
+    #[serde(default)]
+    pub role: String,
     /// Either a plain string or an array of content blocks.
     #[serde(default)]
     pub content: Value,
@@ -293,6 +295,8 @@ pub(crate) struct ControlRequestBody {
     pub tool_name: String,
     #[serde(default)]
     pub input: Value,
+    #[serde(default)]
+    pub tool_use_id: String,
     /// The CLI's own one-line rendering of the request ("hello.txt", "Write
     /// \"one\" to a.txt"). Provider prose.
     ///
@@ -565,12 +569,13 @@ mod tests {
         };
         assert_eq!(req.request.subtype, "can_use_tool");
         assert_eq!(req.request.tool_name, "Bash");
+        assert_eq!(req.request.tool_use_id, "toolu_01NA3M");
         assert_eq!(
             req.request.description.as_deref(),
             Some("Write \"one\" to a.txt")
         );
-        // blocked_path, tool_use_id, permission_suggestions and display_name are all
-        // present on this captured frame and all deliberately undecoded. Nothing
+        // blocked_path, permission_suggestions and display_name are all
+        // present on this captured frame and deliberately undecoded. Nothing
         // reads them, and serde ignores unknown keys — so the frame parses either
         // way and declaring them would buy availability nothing consumes.
     }

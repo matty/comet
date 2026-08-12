@@ -870,7 +870,6 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
         claim_ids,
         std::collections::BTreeSet::from([
             "claude-approval-fixture-shape",
-            "claude-approval-no-cwd",
             "claude-approval-tool-input-shapes",
             "claude-approval-wire-fields",
             "claude-approval-write-path-absolute",
@@ -945,7 +944,7 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
     );
 
     let errors = validate_corpus(&corpus_root);
-    assert_eq!(errors.len(), 17, "inventory errors: {errors:#?}");
+    assert_eq!(errors.len(), 16, "inventory errors: {errors:#?}");
     assert!(
         errors
             .iter()
@@ -969,7 +968,6 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
         "claude/pending-observed-version/approval/manifest.json",
         &[
             "claude-approval-fixture-shape",
-            "claude-approval-no-cwd",
             "claude-approval-tool-input-shapes",
             "claude-approval-wire-fields",
             "claude-approval-write-path-absolute",

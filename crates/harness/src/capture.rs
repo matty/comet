@@ -221,7 +221,7 @@ const APPROVAL_MARKER_ADD_DIFF: &str = APPROVAL_MARKER_CONTENT;
 pub fn claude_approval_prompt(cwd: &Path) -> String {
     let marker = cwd.join(APPROVAL_MARKER_NAME);
     format!(
-        "Use Bash exactly once with input {{\"command\":{}}}. Then use Write exactly once with input {{\"file_path\":{},\"content\":{}}}.",
+        "Use Bash exactly once with input {{\"command\":{}}}. Wait for it to finish successfully. Then use Write exactly once with input {{\"file_path\":{},\"content\":{}}}.",
         serde_json::to_string(CLAUDE_APPROVAL_COMMAND).expect("static command serializes"),
         serde_json::to_string(&marker.display().to_string()).expect("path serializes"),
         serde_json::to_string(APPROVAL_MARKER_CONTENT).expect("static content serializes"),
@@ -2635,66 +2635,158 @@ fn validate_on_request_preflight(
 #[derive(Default)]
 struct ClaudeApprovalState {
     request_ids: BTreeSet<String>,
-    approved: u8,
+    bash_tool_id: Option<String>,
+    bash_succeeded: bool,
+    write_tool_id: Option<String>,
+    write_input: Option<Value>,
+    write_approved: bool,
 }
 
-fn validate_claude_approval_request(
-    value: &Value,
+fn validate_claude_marker_input(input: &Value, cwd: &Path) -> anyhow::Result<()> {
+    let expected_path = cwd.join(APPROVAL_MARKER_NAME);
+    let expected = json!({
+        "file_path": expected_path.display().to_string(),
+        "content": APPROVAL_MARKER_CONTENT,
+    });
+    if input != &expected {
+        bail!("Claude Write approval request did not match the exact bounded marker.");
+    }
+    let canonical_cwd = std::fs::canonicalize(cwd)
+        .map_err(|_| anyhow!("Claude Write approval request cwd could not be validated."))?;
+    let canonical_parent = expected_path
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .ok_or_else(|| {
+            anyhow!("Claude Write approval request marker parent could not be validated.")
+        })?;
+    if canonical_parent != canonical_cwd {
+        bail!("Claude Write approval request escaped the configured cwd.");
+    }
+    Ok(())
+}
+
+fn strict_claude_approval_block(
+    message: &crate::claude::wire::MessageFrame,
+    is_candidate: impl Fn(&Value) -> bool,
+) -> anyhow::Result<Option<crate::claude::wire::ContentBlock>> {
+    let Some(raw_blocks) = message.message.content.as_array() else {
+        if is_candidate(&message.message.content) {
+            bail!("Claude approval capture observed malformed approval message content.");
+        }
+        return Ok(None);
+    };
+    if !raw_blocks.iter().any(&is_candidate) {
+        return Ok(None);
+    }
+    if raw_blocks.len() != 1 {
+        bail!("Claude approval capture observed extra approval message content.");
+    }
+    serde_json::from_value(raw_blocks[0].clone())
+        .map(Some)
+        .map_err(|_| anyhow!("Claude approval capture observed a malformed approval block."))
+}
+
+fn observe_claude_approval_frame(
+    frame: &crate::claude::wire::Frame,
     cwd: &Path,
     state: &mut ClaudeApprovalState,
-) -> anyhow::Result<Value> {
-    let request_id = value["request_id"]
-        .as_str()
-        .filter(|id| !id.trim().is_empty())
-        .ok_or_else(|| anyhow!("Claude approval request had no nonempty request identifier."))?;
-    if !state.request_ids.insert(request_id.to_owned()) {
-        bail!("Claude approval request repeated a request identifier.");
-    }
-    let request = &value["request"];
-    if request["subtype"] != "can_use_tool" {
-        bail!("Claude approval request had an unexpected subtype.");
-    }
-    let expected_tool = match state.approved {
-        0 => "Bash",
-        1 => "Write",
-        _ => bail!("Claude approval request exceeded the bounded tool sequence."),
-    };
-    if request["tool_name"] != expected_tool {
-        bail!("Claude approval request used an unexpected tool or order.");
-    }
-    let input = request["input"].clone();
-    match expected_tool {
-        "Bash" => {
-            if input != json!({"command": CLAUDE_APPROVAL_COMMAND}) {
-                bail!("Claude Bash approval request did not match the exact harmless command.");
+) -> anyhow::Result<Option<(String, Value)>> {
+    use crate::claude::wire::Frame;
+
+    match frame {
+        Frame::Assistant(message) => {
+            let Some(block) = strict_claude_approval_block(message, |block| {
+                matches!(block["name"].as_str(), Some("Bash" | "Write"))
+                    || (block["type"] == "tool_use"
+                        && (block["input"].get("command").is_some()
+                            || block["input"].get("file_path").is_some()))
+            })?
+            else {
+                return Ok(None);
+            };
+            if block.kind != "tool_use" || (block.name != "Bash" && block.name != "Write") {
+                bail!("Claude approval capture observed a malformed bounded tool use.");
+            }
+            if message.parent_tool_use_id.is_some()
+                || message.message.role != "assistant"
+                || block.id.trim().is_empty()
+            {
+                bail!("Claude approval capture observed a malformed bounded tool use.");
+            }
+            if block.name == "Bash" {
+                if block.input != json!({"command": CLAUDE_APPROVAL_COMMAND}) {
+                    bail!("Claude approval capture observed an unexpected Bash command.");
+                }
+                match state.bash_tool_id.as_deref() {
+                    Some(id) if id != block.id => {
+                        bail!("Claude approval capture observed duplicate Bash tool uses.")
+                    }
+                    None => state.bash_tool_id = Some(block.id.clone()),
+                    _ => {}
+                }
+            } else {
+                if !state.bash_succeeded {
+                    bail!("Claude approval capture observed Write before successful Bash.");
+                }
+                validate_claude_marker_input(&block.input, cwd)?;
+                match state.write_tool_id.as_deref() {
+                    Some(_) => {
+                        bail!("Claude approval capture observed duplicate Write tool uses.")
+                    }
+                    None => {
+                        state.write_tool_id = Some(block.id.clone());
+                        state.write_input = Some(block.input.clone());
+                    }
+                }
             }
         }
-        "Write" => {
-            let expected_path = cwd.join(APPROVAL_MARKER_NAME);
-            let expected = json!({
-                "file_path": expected_path.display().to_string(),
-                "content": APPROVAL_MARKER_CONTENT,
-            });
-            if input != expected {
-                bail!("Claude Write approval request did not match the exact bounded marker.");
+        Frame::User(message) => {
+            let Some(bash_id) = state.bash_tool_id.as_deref() else {
+                return Ok(None);
+            };
+            let Some(block) = strict_claude_approval_block(message, |block| {
+                block["tool_use_id"] == bash_id
+                    || (block["type"] == "tool_result" && block["tool_use_id"] == bash_id)
+            })?
+            else {
+                return Ok(None);
+            };
+            if message.parent_tool_use_id.is_some()
+                || message.message.role != "user"
+                || block.kind != "tool_result"
+                || block.tool_use_id != bash_id
+                || block.is_error != Some(false)
+            {
+                bail!("Claude approval capture did not observe a successful Bash result.");
             }
-            let canonical_cwd = std::fs::canonicalize(cwd).map_err(|_| {
-                anyhow!("Claude Write approval request cwd could not be validated.")
-            })?;
-            let canonical_parent = expected_path
-                .parent()
-                .and_then(|parent| std::fs::canonicalize(parent).ok())
-                .ok_or_else(|| {
-                    anyhow!("Claude Write approval request marker parent could not be validated.")
-                })?;
-            if canonical_parent != canonical_cwd {
-                bail!("Claude Write approval request escaped the configured cwd.");
-            }
+            state.bash_succeeded = true;
         }
-        _ => unreachable!("bounded tool allowlist"),
+        Frame::ControlRequest(control) => {
+            if control.request_id.trim().is_empty() {
+                bail!("Claude approval request had no nonempty request identifier.");
+            }
+            if !state.request_ids.insert(control.request_id.clone()) {
+                bail!("Claude approval request repeated a request identifier.");
+            }
+            if control.request.subtype != "can_use_tool"
+                || control.request.tool_name != "Write"
+                || !state.bash_succeeded
+                || state.write_approved
+                || state.write_tool_id.as_deref() != Some(control.request.tool_use_id.as_str())
+                || state.write_input.as_ref() != Some(&control.request.input)
+            {
+                bail!("Claude approval request used an unexpected tool or order.");
+            }
+            validate_claude_marker_input(&control.request.input, cwd)?;
+            state.write_approved = true;
+            return Ok(Some((
+                control.request_id.clone(),
+                control.request.input.clone(),
+            )));
+        }
+        _ => {}
     }
-    state.approved += 1;
-    Ok(input)
+    Ok(None)
 }
 
 #[derive(Default)]
@@ -3176,35 +3268,41 @@ impl RecordingSession {
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
-            if value["type"] == "control_request" && matches!(script, ClaudeRunScript::Approval) {
-                let original_input = validate_claude_approval_request(
-                    &value,
-                    Path::new(&request.cwd),
-                    &mut approval,
-                )?;
-                let request_id = value["request_id"]
-                    .as_str()
-                    .expect("validated approval request id");
-                let response = json!({
-                    "type": "control_response",
-                    "response": {
-                        "subtype": "success",
-                        "request_id": request_id,
+            if matches!(script, ClaudeRunScript::Approval) {
+                let frame = crate::claude::wire::parse_frame(&line)
+                    .map_err(|_| anyhow!("Claude approval capture received malformed JSON."))?;
+                if value["type"] == "control_response"
+                    && approval.bash_tool_id.is_some()
+                    && !approval.bash_succeeded
+                {
+                    bail!("Claude approval capture observed an approval response for Bash.");
+                }
+                if let Some((request_id, original_input)) =
+                    observe_claude_approval_frame(&frame, Path::new(&request.cwd), &mut approval)?
+                {
+                    let response = json!({
+                        "type": "control_response",
                         "response": {
-                            "behavior": "allow",
-                            "updatedInput": original_input,
+                            "subtype": "success",
+                            "request_id": request_id,
+                            "response": {
+                                "behavior": "allow",
+                                "updatedInput": original_input,
+                            },
                         },
-                    },
-                });
-                self.write_line(&response.to_string()).await?;
+                    });
+                    self.write_line(&response.to_string()).await?;
+                }
             }
             if value["type"] == "result" {
                 if value["subtype"] != "success" {
                     bail!("Claude ended the capture without a successful terminal result.");
                 }
-                if matches!(script, ClaudeRunScript::Approval) && approval.approved != 2 {
+                if matches!(script, ClaudeRunScript::Approval)
+                    && (!approval.bash_succeeded || !approval.write_approved)
+                {
                     bail!(
-                        "Claude approval capture did not request exactly one Bash and one Write approval."
+                        "Claude approval capture did not observe the exact successful Bash and bounded Write approval."
                     );
                 }
                 if matches!(script, ClaudeRunScript::Resume)
@@ -4681,7 +4779,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_approval_requires_bash_and_write_before_success() {
+    async fn claude_approval_requires_observed_bash_then_one_write_approval() {
         let raw = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let request = RunRequest {
@@ -4705,7 +4803,7 @@ mod tests {
             .skip(1)
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(replies.len(), 2);
+        assert_eq!(replies.len(), 1);
         assert!(replies.iter().all(|reply| {
             reply["response"]["response"]["behavior"] == "allow"
                 && reply["response"]["response"]["updatedInput"].is_object()
@@ -4737,11 +4835,102 @@ mod tests {
             .await;
             assert_eq!(
                 stdin.len(),
-                if prompt.ends_with("write") { 2 } else { 1 },
-                "an unsafe control request received an allow response: {stdin:?}"
+                1,
+                "an unsafe request received an allow response: {stdin:?}"
             );
             assert!(error.contains("approval request"), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn claude_approval_rejects_deviations_from_the_observed_safe_contract() {
+        for (scenario, expected_replies) in [
+            ("missing-bash", 0),
+            ("write-before-bash", 0),
+            ("failed-bash", 0),
+            ("wrong-bash", 0),
+            ("duplicate-bash", 0),
+            ("bash-control-response", 0),
+            ("bash-malformed-extra", 0),
+            ("bash-leading-text", 0),
+            ("bash-trailing-text", 0),
+            ("write-malformed-extra", 0),
+            ("write-leading-text", 0),
+            ("write-trailing-text", 0),
+            ("user-malformed-extra", 0),
+            ("user-leading-text", 0),
+            ("user-trailing-text", 0),
+            ("malformed-candidate", 0),
+            ("missing-write", 0),
+            ("duplicate-write", 1),
+            ("missing-request-id", 0),
+            ("duplicate-request-id", 1),
+            ("extra-tool", 0),
+        ] {
+            let raw = tempfile::tempdir().unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            let request = RunRequest {
+                prompt: format!("scenario:capture-approval-{scenario}"),
+                cwd: cwd.path().display().to_string(),
+                ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
+            };
+            let (error, stdin) = failed_session_stdin(config(
+                "claude-approval-deviation",
+                fixture_path("fake-claude"),
+                CaptureOperation::Claude(ClaudeCaptureOperation::Run {
+                    request,
+                    script: ClaudeRunScript::Approval,
+                }),
+                raw.path(),
+            ))
+            .await;
+            let expected_error = match scenario {
+                "bash-malformed-extra"
+                | "bash-leading-text"
+                | "bash-trailing-text"
+                | "write-malformed-extra"
+                | "write-leading-text"
+                | "write-trailing-text"
+                | "user-malformed-extra"
+                | "user-leading-text"
+                | "user-trailing-text" => "extra approval message content",
+                "malformed-candidate" => "malformed approval block",
+                _ => "Claude approval",
+            };
+            assert!(error.contains(expected_error), "{scenario}: {error}");
+            assert_eq!(
+                stdin.len().saturating_sub(1),
+                expected_replies,
+                "{scenario} received an unsafe response: {stdin:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_approval_tolerates_a_repeated_snapshot_of_the_same_bash_tool() {
+        let raw = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let request = RunRequest {
+            prompt: "scenario:capture-approval-bash-snapshot-duplicate".into(),
+            cwd: cwd.path().display().to_string(),
+            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
+        };
+        let capture = record(config(
+            "claude-approval-snapshot",
+            fixture_path("fake-claude"),
+            CaptureOperation::Claude(ClaudeCaptureOperation::Run {
+                request,
+                script: ClaudeRunScript::Approval,
+            }),
+            raw.path(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            channel_payloads(&capture, Channel::Stdin).len(),
+            2,
+            "only the Write request receives a reply"
+        );
     }
 
     /// Break caught: a fail-closed approval deviation is discarded after a paid provider run,
@@ -4798,7 +4987,7 @@ mod tests {
                     .as_str()
                     .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
                     .is_some_and(|payload| {
-                        payload["response"]["request_id"] == "good-bash"
+                        payload["response"]["request_id"] == "good-write"
                             && payload["response"]["response"]["behavior"] == "allow"
                     })
         }));

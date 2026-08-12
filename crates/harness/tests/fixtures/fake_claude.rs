@@ -166,6 +166,50 @@ fn main() {
         capture_destructive_command(&mut stdin);
     } else if first.contains("scenario:capture-approval-unexpected-second") {
         capture_unexpected_second(&mut stdin);
+    } else if first.contains("scenario:capture-approval-write-before-bash") {
+        capture_write_before_bash(&mut stdin);
+    } else if first.contains("scenario:capture-approval-missing-bash") {
+        capture_missing_bash(&mut stdin);
+    } else if first.contains("scenario:capture-approval-failed-bash") {
+        capture_failed_bash(&mut stdin);
+    } else if first.contains("scenario:capture-approval-wrong-bash") {
+        capture_wrong_bash(&mut stdin);
+    } else if first.contains("scenario:capture-approval-duplicate-bash") {
+        capture_duplicate_bash(&mut stdin);
+    } else if first.contains("scenario:capture-approval-bash-snapshot-duplicate") {
+        capture_bash_snapshot_duplicate(&mut stdin);
+    } else if first.contains("scenario:capture-approval-bash-control-response") {
+        capture_bash_control_response(&mut stdin);
+    } else if first.contains("scenario:capture-approval-bash-malformed-extra") {
+        capture_bash_content_deviation(&mut stdin, "malformed-extra");
+    } else if first.contains("scenario:capture-approval-bash-leading-text") {
+        capture_bash_content_deviation(&mut stdin, "leading-text");
+    } else if first.contains("scenario:capture-approval-bash-trailing-text") {
+        capture_bash_content_deviation(&mut stdin, "trailing-text");
+    } else if first.contains("scenario:capture-approval-write-malformed-extra") {
+        capture_write_content_deviation(&mut stdin, "malformed-extra");
+    } else if first.contains("scenario:capture-approval-write-leading-text") {
+        capture_write_content_deviation(&mut stdin, "leading-text");
+    } else if first.contains("scenario:capture-approval-write-trailing-text") {
+        capture_write_content_deviation(&mut stdin, "trailing-text");
+    } else if first.contains("scenario:capture-approval-user-malformed-extra") {
+        capture_user_content_deviation(&mut stdin, "malformed-extra");
+    } else if first.contains("scenario:capture-approval-user-leading-text") {
+        capture_user_content_deviation(&mut stdin, "leading-text");
+    } else if first.contains("scenario:capture-approval-user-trailing-text") {
+        capture_user_content_deviation(&mut stdin, "trailing-text");
+    } else if first.contains("scenario:capture-approval-malformed-candidate") {
+        capture_malformed_candidate(&mut stdin);
+    } else if first.contains("scenario:capture-approval-missing-write") {
+        capture_missing_write();
+    } else if first.contains("scenario:capture-approval-duplicate-write") {
+        capture_duplicate_write(&mut stdin);
+    } else if first.contains("scenario:capture-approval-missing-request-id") {
+        capture_missing_request_id(&mut stdin);
+    } else if first.contains("scenario:capture-approval-duplicate-request-id") {
+        capture_duplicate_request_id(&mut stdin);
+    } else if first.contains("scenario:capture-approval-extra-tool") {
+        capture_extra_tool(&mut stdin);
     } else if first.contains("scenario:capture-approval-destructive-write") {
         capture_destructive_write(&mut stdin);
     } else if first.contains("scenario:capture-approval") {
@@ -370,47 +414,87 @@ fn approval(stdin: &mut StdinLock<'_>) {
 }
 
 fn capture_approval(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit_write_request("fake-write", "toolu_write");
+    expect_write_allow(stdin, "fake-write");
     emit(
-        r#"{"type":"control_request","request_id":"fake-bash","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"printf capture"},"description":"print capture","tool_use_id":"toolu_bash"}}"#,
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-1"}"#,
     );
-    let bash: serde_json::Value =
-        serde_json::from_str(&read_line(stdin)).expect("a Bash control response");
-    if bash["response"]["response"]["behavior"] != "allow"
-        || bash["response"]["response"]["updatedInput"]
-            != serde_json::json!({"command": "printf capture"})
-    {
-        exit(1);
-    }
+}
+
+fn emit_bash_neighborhood(id: &str, command: &str, is_error: bool, output: &str) {
+    emit(
+        &serde_json::json!({
+            "type": "assistant",
+            "parent_tool_use_id": null,
+            "message": {"role":"assistant","content": [{
+                "type": "tool_use",
+                "id": id,
+                "name": "Bash",
+                "input": {"command": command},
+            }]},
+        })
+        .to_string(),
+    );
+    emit(
+        &serde_json::json!({
+            "type": "user",
+            "parent_tool_use_id": null,
+            "message": {"role":"user","content": [{
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": output,
+                "is_error": is_error,
+            }]},
+        })
+        .to_string(),
+    );
+}
+
+fn emit_write_request(request_id: &str, tool_use_id: &str) {
     let marker = std::env::current_dir()
         .expect("fixture cwd")
         .join("capture-marker.txt")
         .display()
         .to_string();
+    let input = serde_json::json!({"file_path": marker, "content": "capture\n"});
+    emit(
+        &serde_json::json!({
+            "type": "assistant",
+            "parent_tool_use_id": null,
+            "message": {"role":"assistant","content": [{
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": "Write",
+                "input": input,
+            }]},
+        })
+        .to_string(),
+    );
     emit(
         &serde_json::json!({
             "type": "control_request",
-            "request_id": "fake-write",
+            "request_id": request_id,
             "request": {
                 "subtype": "can_use_tool",
                 "tool_name": "Write",
-                "input": {"file_path": marker, "content": "capture\n"},
+                "input": input,
                 "description": "capture-marker.txt",
-                "tool_use_id": "toolu_fake",
+                "tool_use_id": tool_use_id,
             },
         })
         .to_string(),
     );
+}
+
+fn expect_write_allow(stdin: &mut StdinLock<'_>, request_id: &str) {
     let write: serde_json::Value =
         serde_json::from_str(&read_line(stdin)).expect("a Write control response");
     if write["response"]["response"]["behavior"] != "allow"
-        || write["response"]["response"]["updatedInput"]
-            != serde_json::json!({"file_path": marker, "content": "capture\n"})
+        || write["response"]["request_id"] != request_id
     {
         exit(1);
     }
-    emit(
-        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-1"}"#,
-    );
 }
 
 fn capture_destructive_command(stdin: &mut StdinLock<'_>) {
@@ -424,10 +508,10 @@ fn capture_destructive_command(stdin: &mut StdinLock<'_>) {
 }
 
 fn capture_destructive_write(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
     emit(
-        r#"{"type":"control_request","request_id":"good-bash","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"printf capture"},"description":"print capture","tool_use_id":"toolu_bash"}}"#,
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bad","name":"Write","input":{"file_path":"/outside-cwd/destructive.txt","content":"overwrite"}}]}}"#,
     );
-    let _ = read_line(stdin);
     emit(
         r#"{"type":"control_request","request_id":"bad-write","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"/outside-cwd/destructive.txt","content":"overwrite"},"description":"destructive","tool_use_id":"toolu_bad"}}"#,
     );
@@ -438,12 +522,213 @@ fn capture_destructive_write(stdin: &mut StdinLock<'_>) {
 }
 
 fn capture_unexpected_second(stdin: &mut StdinLock<'_>) {
-    emit(
-        r#"{"type":"control_request","request_id":"good-bash","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"printf capture"},"description":"print capture","tool_use_id":"toolu_bash"}}"#,
-    );
-    let _ = read_line(stdin);
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit_write_request("good-write", "toolu_write");
+    expect_write_allow(stdin, "good-write");
     emit(
         r#"{"type":"control_request","request_id":"bad-read","request":{"subtype":"can_use_tool","tool_name":"Read","input":{"file_path":"capture-marker.txt"},"description":"unexpected","tool_use_id":"toolu_bad"}}"#,
+    );
+    let _ = read_line(stdin);
+}
+
+fn capture_write_before_bash(stdin: &mut StdinLock<'_>) {
+    emit_write_request("early-write", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_missing_bash(stdin: &mut StdinLock<'_>) {
+    emit_write_request("missing-bash-write", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_failed_bash(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", true, "capture");
+    emit_write_request("failed-bash-write", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_wrong_bash(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf wrong", false, "wrong");
+    emit_write_request("wrong-bash-write", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_duplicate_bash(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash-1", "printf capture", false, "capture");
+    emit_bash_neighborhood("toolu_bash-2", "printf capture", false, "capture");
+    emit_write_request("duplicate-bash-write", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_bash_snapshot_duplicate(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit_write_request("snapshot-write", "toolu_write");
+    expect_write_allow(stdin, "snapshot-write");
+    emit(
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-snapshot"}"#,
+    );
+}
+
+fn capture_bash_control_response(stdin: &mut StdinLock<'_>) {
+    emit(
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"printf capture"}}]}}"#,
+    );
+    emit(
+        r#"{"type":"control_response","response":{"subtype":"success","request_id":"bash-request","response":{"behavior":"allow"}}}"#,
+    );
+    emit(
+        r#"{"type":"user","parent_tool_use_id":null,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bash","content":"capture","is_error":false}]}}"#,
+    );
+    emit_write_request("write-after-bash-response", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_bash_content_deviation(stdin: &mut StdinLock<'_>, shape: &str) {
+    let tool = serde_json::json!({
+        "type": "tool_use",
+        "id": "toolu_bash",
+        "name": "Bash",
+        "input": {"command": "printf capture"},
+    });
+    let malformed = serde_json::json!({"type":"tool_use","name":42});
+    let text = serde_json::json!({"type":"text","text":"provider prose"});
+    let content = match shape {
+        "malformed-extra" => vec![tool, malformed],
+        "leading-text" => vec![text, tool],
+        "trailing-text" => vec![tool, text],
+        _ => unreachable!(),
+    };
+    emit(
+        &serde_json::json!({
+            "type":"assistant",
+            "parent_tool_use_id":null,
+            "message":{"role":"assistant","content":content},
+        })
+        .to_string(),
+    );
+    emit_write_request("write-after-bad-bash", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_user_content_deviation(stdin: &mut StdinLock<'_>, shape: &str) {
+    emit(
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"printf capture"}}]}}"#,
+    );
+    let result = serde_json::json!({
+        "type":"tool_result",
+        "tool_use_id":"toolu_bash",
+        "content":"capture",
+        "is_error":false,
+    });
+    let malformed =
+        serde_json::json!({"type":"tool_result","tool_use_id":"toolu_bash","is_error":"false"});
+    let text = serde_json::json!({"type":"text","text":"provider prose"});
+    let content = match shape {
+        "malformed-extra" => vec![result, malformed],
+        "leading-text" => vec![text, result],
+        "trailing-text" => vec![result, text],
+        _ => unreachable!(),
+    };
+    emit(
+        &serde_json::json!({
+            "type":"user",
+            "parent_tool_use_id":null,
+            "message":{"role":"user","content":content},
+        })
+        .to_string(),
+    );
+    emit_write_request("write-after-bad-result", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_write_content_deviation(stdin: &mut StdinLock<'_>, shape: &str) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    let marker = std::env::current_dir()
+        .expect("fixture cwd")
+        .join("capture-marker.txt")
+        .display()
+        .to_string();
+    let input = serde_json::json!({"file_path":marker,"content":"capture\n"});
+    let tool = serde_json::json!({
+        "type":"tool_use",
+        "id":"toolu_write",
+        "name":"Write",
+        "input":input,
+    });
+    let malformed = serde_json::json!({"type":"tool_use","name":42});
+    let text = serde_json::json!({"type":"text","text":"provider prose"});
+    let content = match shape {
+        "malformed-extra" => vec![tool, malformed],
+        "leading-text" => vec![text, tool],
+        "trailing-text" => vec![tool, text],
+        _ => unreachable!(),
+    };
+    emit(
+        &serde_json::json!({
+            "type":"assistant",
+            "parent_tool_use_id":null,
+            "message":{"role":"assistant","content":content},
+        })
+        .to_string(),
+    );
+    emit(
+        &serde_json::json!({
+            "type":"control_request",
+            "request_id":"write-after-bad-content",
+            "request":{
+                "subtype":"can_use_tool",
+                "tool_name":"Write",
+                "input":input,
+                "tool_use_id":"toolu_write",
+            },
+        })
+        .to_string(),
+    );
+    let _ = read_line(stdin);
+}
+
+fn capture_malformed_candidate(stdin: &mut StdinLock<'_>) {
+    emit(
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":[],"name":"Bash","input":{"command":"printf capture"}}]}}"#,
+    );
+    emit_write_request("write-after-malformed-candidate", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_missing_write() {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit(
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-missing-write"}"#,
+    );
+}
+
+fn capture_duplicate_write(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit_write_request("write-1", "toolu_write-1");
+    expect_write_allow(stdin, "write-1");
+    emit_write_request("write-2", "toolu_write-1");
+    let _ = read_line(stdin);
+}
+
+fn capture_missing_request_id(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit_write_request("", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_duplicate_request_id(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit_write_request("same-request", "toolu_write");
+    expect_write_allow(stdin, "same-request");
+    emit_write_request("same-request", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_extra_tool(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit(
+        r#"{"type":"control_request","request_id":"extra-read","request":{"subtype":"can_use_tool","tool_name":"Read","input":{"file_path":"capture-marker.txt"},"description":"unexpected","tool_use_id":"toolu_extra"}}"#,
     );
     let _ = read_line(stdin);
 }

@@ -264,22 +264,6 @@
       ]
     },
     {
-      "id": "claude-approval-no-cwd",
-      "consumer": "crates/harness/src/claude/approval.rs:bash_is_a_command_and_carries_no_directory_it_was_not_given",
-      "fact": "A Bash approval request carries no working directory.",
-      "evidence": [
-        {
-          "manifest": "claude/pending-observed-version/approval/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdout"
-            }
-          ]
-        }
-      ]
-    },
-    {
       "id": "claude-approval-wire-fields",
       "consumer": "crates/harness/src/claude/wire.rs:a_can_use_tool_request_decodes_the_fields_a_card_needs",
       "fact": "A can_use_tool request carries request id, tool, input, description, and additional ignored fields.",
