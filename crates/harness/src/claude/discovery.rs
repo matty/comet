@@ -25,12 +25,9 @@ use comet_proto::ReasoningLevel;
 
 use crate::discovery::{DiscoveredModel, Discovery, DiscoveryFailure, program_path};
 
-/// Matches `PROBE_TIMEOUT`. With `--bare` the observed answer is under a
-/// second, and the wait is paid once per boot by a caller that already has a
-/// spinner and a Cancel (2.1's `Loadable` slot). Ten seconds is therefore a
-/// long way past a healthy answer — but see `DISCOVERY_ARGS`: a spawn that
-/// runs the user's hooks blew through it, and the margin is what makes a slow
-/// machine degrade to the built-in list rather than a slow one hang.
+/// Matches `PROBE_TIMEOUT`. The wait is paid once per boot behind a cancellable
+/// loading surface. Keeping it bounded makes a wedged CLI fall back to the
+/// built-in list instead of leaving the picker waiting indefinitely.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The spawn arguments for a session that will never run a turn: the
@@ -40,16 +37,14 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// **`--bare` is load-bearing, not tidiness.** It skips hooks, LSP, plugin
 /// sync, auto-memory and CLAUDE.md discovery. Without it the user's
-/// `SessionStart` hooks run in a session that will never prompt: measured in
-/// the real app on Windows, that was 7.1s of startup plus 3.5s of hook before
-/// the reply, i.e. **10.6s — past this timeout**, and the picker fell back to
-/// the built-in list. With `--bare` the same machine answers in 0.7s with a
-/// byte-identical model list.
+/// `SessionStart` hooks run in a session that will never prompt. Avoiding that
+/// unrelated work keeps the bounded discovery path focused on its model-list
+/// request and preserves the built-in fallback when the CLI is unhealthy.
 ///
 /// Two consequences worth knowing. `account` degrades to
 /// `{"tokenSource":"none"}` because OAuth and keychain are never read — fine
 /// here, since nothing reads `account`, and it keeps the user's email off the
-/// wire entirely. And `commands` shrinks to the built-ins (42 vs 66 observed),
+/// wire entirely. And `commands` shrinks to the built-ins,
 /// because user and project skills are not discovered: **slice 2.4 cannot read
 /// the command list from this spawn.**
 ///

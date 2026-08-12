@@ -29,6 +29,9 @@ fn write_raw_capture(root: &Path, name: &str, events: &[&str]) -> PathBuf {
         "directory": "ignored-raw-directory",
         "provider": "claude",
         "cli_version": "2.1.0 (Claude Code)",
+        "captured_at_unix_ms": 1786464000123i64,
+        "scenario": "model-discovery",
+        "purpose": "capture Claude's token-free model initialize reply",
         "platform": {"os": "windows", "arch": "x86_64"},
         "redaction_roots": {"cwd": null, "repo": null, "home": null, "temp": null},
         "command": {
@@ -64,6 +67,27 @@ fn sanitized_payloads(events_bytes: &[u8]) -> Vec<Value> {
         .collect()
 }
 
+/// Break caught: a promoted artifact cannot be reproduced or audited when sanitization drops the
+/// logical scenario, its purpose, or the one capture-time sample recorded with the raw evidence.
+#[test]
+fn sanitizer_manifest_preserves_structured_capture_provenance() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "capture-provenance",
+        &[r#"{"type":"control_response","response":{"subtype":"success"}}"#],
+    );
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "capture-provenance")).unwrap();
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+
+    assert_eq!(manifest["captured_at_unix_ms"], 1786464000123i64);
+    assert_eq!(manifest["scenario"], "model-discovery");
+    assert_eq!(
+        manifest["purpose"],
+        "capture Claude's token-free model initialize reply"
+    );
+}
+
 fn write_valid_literal_corpus(root: &Path) {
     let scenario = root.join("claude/2.1.227/model-discovery");
     std::fs::create_dir_all(&scenario).unwrap();
@@ -94,6 +118,9 @@ fn write_valid_literal_corpus(root: &Path) {
   "provider": "claude",
   "cli_version": "2.1.227 (Claude Code)",
   "normalized_cli_version": "2.1.227 (Claude Code)",
+  "captured_at_unix_ms": 1786464000123,
+  "scenario": "model-discovery",
+  "purpose": "capture Claude's token-free model initialize reply",
   "platform": {"os": "windows", "arch": "x86_64"},
   "command": {
     "program": "claude",
@@ -724,7 +751,6 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "claude-command-discovery-behavior",
             "claude-command-empty-hint",
             "claude-command-nonbare-count",
-            "claude-command-observed-latency",
             "claude-command-reply-decoder",
             "claude-model-bare-effects",
             "claude-model-close-exit",
@@ -736,7 +762,6 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "claude-model-initialize-request",
             "claude-model-integration-shape",
             "claude-model-no-modality",
-            "claude-model-observed-latency",
             "claude-model-real-catalog-merge",
             "claude-model-reply-shape",
             "claude-routine-frame-fixture",
@@ -760,7 +785,6 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "codex-model-logged-out-fallback",
             "codex-model-logged-out-integration",
             "codex-model-notification-order",
-            "codex-model-observed-latency",
             "codex-model-one-page",
             "codex-model-page-decoder",
             "codex-model-reply-shape",
@@ -783,21 +807,18 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
         comparison_claim_ids,
         std::collections::BTreeSet::from([
             "claude-command-nonbare-count",
-            "claude-command-observed-latency",
             "claude-model-bare-effects",
             "claude-model-cwd-invariance",
-            "claude-model-observed-latency",
             "codex-approval-policy-semantics",
             "codex-command-approval-stability",
             "codex-linked-worktree-sandbox-failure",
             "codex-model-cwd-invariance",
             "codex-model-logged-out-fallback",
-            "codex-model-observed-latency",
         ])
     );
 
     let errors = validate_corpus(&corpus_root);
-    assert_eq!(errors.len(), 72, "inventory errors: {errors:#?}");
+    assert_eq!(errors.len(), 65, "inventory errors: {errors:#?}");
     assert!(
         errors
             .iter()
@@ -846,15 +867,9 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "claude-command-discovery-behavior",
             "claude-command-empty-hint",
             "claude-command-nonbare-count",
-            "claude-command-observed-latency",
             "claude-command-reply-decoder",
             "claude-model-bare-effects",
-            "claude-model-observed-latency",
         ],
-    );
-    add(
-        "claude/pending-observed-version/command-discovery-in-app/manifest.json",
-        &["claude-command-observed-latency"],
     );
     add(
         "claude/pending-observed-version/fresh-text/manifest.json",
@@ -885,14 +900,9 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "claude-model-initialize-request",
             "claude-model-integration-shape",
             "claude-model-no-modality",
-            "claude-model-observed-latency",
             "claude-model-real-catalog-merge",
             "claude-model-reply-shape",
         ],
-    );
-    add(
-        "claude/pending-observed-version/slash-command-expansion/manifest.json",
-        &["claude-command-discovery-behavior"],
     );
     add(
         "codex/pending-observed-version/approval-on-request/manifest.json",
@@ -954,7 +964,6 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "codex-model-integration-shape",
             "codex-model-logged-out-fallback",
             "codex-model-notification-order",
-            "codex-model-observed-latency",
             "codex-model-one-page",
             "codex-model-page-decoder",
             "codex-model-reply-shape",
@@ -962,10 +971,6 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "codex-model-source-notification-order",
             "codex-model-text-only-integration",
         ],
-    );
-    add(
-        "codex/pending-observed-version/model-discovery-warm/manifest.json",
-        &["codex-model-observed-latency"],
     );
     assert_eq!(actual, expected, "pending error identity/path set changed");
 }
@@ -1052,6 +1057,101 @@ fn sanitizer_replaces_semantic_values_with_typed_placeholders() {
             "sanitized output leaked {leaked}"
         );
     }
+}
+
+/// Break caught: Claude discovery can embed locally authored command and agent descriptions,
+/// including machine paths, even though those prose fields are irrelevant to corpus claims.
+#[test]
+fn sanitizer_replaces_discovery_descriptions_as_provider_prose() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "discovery-provider-prose",
+        &[
+            r#"{"type":"control_response","response":{"subtype":"success","response":{"commands":[{"name":"safe-command","description":"private command prose at D:\\private\\command.md","argumentHint":""}],"agents":[{"name":"safe-agent","description":"private agent prose at /private/agent.md"}]}}}"#,
+            r#"{"level":"debug"}"#,
+        ],
+    );
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "discovery-provider-prose")).unwrap();
+    let payloads = sanitized_payloads(&report.events_bytes);
+    let reply = &payloads[0]["response"]["response"];
+
+    assert_eq!(reply["agents"][0]["description"], "<PROVIDER_PROSE_1>");
+    assert_eq!(reply["commands"][0]["description"], "<PROVIDER_PROSE_2>");
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+    assert_eq!(manifest["redaction_counts"]["provider_prose"], 2);
+}
+
+/// Break caught: non-bare discovery publishes local hook output, identifiers, or paths even
+/// though hook lifecycle frames are needed only as neighboring protocol evidence.
+#[test]
+fn sanitizer_replaces_hook_output_and_identifiers() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "hook-output",
+        &[
+            r#"{"type":"system","subtype":"hook_response","hook_id":"hook-private","uuid":"uuid-private","pid":4812,"session_id":"session-private","output":"local hook output D:\\private\\hook.txt","stdout":"local hook output D:\\private\\hook.txt","stderr":""}"#,
+            r#"{"level":"debug"}"#,
+        ],
+    );
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "hook-output")).unwrap();
+    let payload = &sanitized_payloads(&report.events_bytes)[0];
+
+    assert_eq!(payload["hook_id"], "<TOOL_USE_ID_1>");
+    assert_eq!(payload["uuid"], "<MACHINE_ID_2>");
+    assert_eq!(payload["pid"], "<MACHINE_ID_1>");
+    assert_eq!(payload["session_id"], "<SESSION_ID_1>");
+    assert_eq!(payload["output"], "<PROVIDER_PROSE_1>");
+    assert_eq!(payload["stdout"], "<PROVIDER_PROSE_1>");
+}
+
+/// Break caught: free-form provider stderr can reveal ambient account/auth configuration even
+/// when it contains no credential value, and has no literal corpus consumer.
+#[test]
+fn sanitizer_replaces_free_form_provider_stderr() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "provider-stderr",
+        &[r#"{"type":"control_response"}"#, "ambient account warning"],
+    );
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "provider-stderr")).unwrap();
+    let lines: Vec<Value> = std::str::from_utf8(&report.events_bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[1]["payload"], "<PROVIDER_PROSE_1>");
+}
+
+/// Break caught: Codex initialize/model-list metadata can publish the local server name and
+/// provider-authored catalog/Nux prose, including paths emitted by a logged-out CLI.
+#[test]
+fn sanitizer_replaces_codex_server_name_and_catalog_prose() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "codex-discovery-prose",
+        &[
+            r#"{"method":"account/login/completed","params":{"serverName":"private-host","installationId":"private-installation"}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"data":[{"id":"model","description":"private model prose","availabilityNux":{"message":"private Nux path D:\\private\\nux.md"}}]}}"#,
+            r#"{"level":"debug"}"#,
+        ],
+    );
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "codex-discovery-prose")).unwrap();
+    let payloads = sanitized_payloads(&report.events_bytes);
+
+    assert_eq!(payloads[0]["params"]["installationId"], "<MACHINE_ID_1>");
+    assert_eq!(payloads[0]["params"]["serverName"], "<MACHINE_ID_2>");
+    assert_eq!(
+        payloads[1]["result"]["data"][0]["description"],
+        "<PROVIDER_PROSE_2>"
+    );
+    assert_eq!(
+        payloads[1]["result"]["data"][0]["availabilityNux"]["message"],
+        "<PROVIDER_PROSE_1>"
+    );
 }
 
 /// Break caught: treating every bare `id` as structural lets actual Codex thread, turn, and item
@@ -1220,6 +1320,29 @@ fn sanitizer_replaces_allowlisted_paths_in_values_and_embedded_text() {
             .unwrap()
             .contains(&cwd.display().to_string())
     );
+}
+
+/// Break caught: isolated logged-out discovery cannot be sanitized because its explicitly
+/// configured CODEX_HOME is not one of the raw evidence's captured redaction roots.
+#[test]
+fn sanitizer_replaces_the_captured_codex_home() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(temp.path(), "codex-home", &[r#"{"level":"debug"}"#]);
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    capture["redaction_roots"]["codex_home"] = Value::String(r"D:\isolated-codex-home".into());
+    capture["command"]["configured_env"]["CODEX_HOME"] =
+        Value::String(r"D:\isolated-codex-home".into());
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "codex-home")).unwrap();
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+    assert_eq!(
+        manifest["command"]["configured_env"]["CODEX_HOME"],
+        "<CODEX_HOME>"
+    );
+    assert_eq!(manifest["redaction_counts"]["codex_home_path"], 1);
 }
 
 /// Break caught: global value replacement can turn a protocol discriminator into a placeholder
@@ -1673,7 +1796,12 @@ fn sanitizer_manifest_accounts_for_placeholder_definitions_and_counts() {
     assert_eq!(manifest["schema_version"], 1);
     assert_eq!(manifest["source"], "capture.json");
     assert_eq!(manifest["provider"], "claude");
-    assert!(manifest.get("scenario").is_none());
+    assert_eq!(manifest["captured_at_unix_ms"], 1786464000123i64);
+    assert_eq!(manifest["scenario"], "model-discovery");
+    assert_eq!(
+        manifest["purpose"],
+        "capture Claude's token-free model initialize reply"
+    );
     assert_eq!(manifest["redaction_counts"]["session_id"], 2);
     assert_eq!(manifest["redaction_counts"]["user_text"], 2);
     assert_eq!(

@@ -148,6 +148,9 @@ pub struct CaptureEvent {
 #[derive(Clone, Debug)]
 pub enum ClaudeCaptureOperation {
     ModelDiscovery,
+    ModelDiscoveryAt {
+        cwd: PathBuf,
+    },
     CommandDiscovery {
         cwd: PathBuf,
     },
@@ -168,6 +171,9 @@ pub enum ClaudeRunScript {
 #[derive(Clone, Debug)]
 pub enum CodexCaptureOperation {
     ModelDiscovery,
+    ModelDiscoveryAt {
+        cwd: PathBuf,
+    },
     Run {
         request: RunRequest,
         script: CodexRunScript,
@@ -217,6 +223,8 @@ pub struct RedactionRoots {
     pub repo: Option<String>,
     pub home: Option<String>,
     pub temp: Option<String>,
+    #[serde(default)]
+    pub codex_home: Option<String>,
 }
 
 impl RedactionRoots {
@@ -232,6 +240,7 @@ impl RedactionRoots {
             repo,
             home: crate::home_dir().map(|path| path.to_string_lossy().into_owned()),
             temp: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+            codex_home: command.configured_env.get("CODEX_HOME").cloned(),
         }
     }
 }
@@ -241,6 +250,9 @@ pub struct RawCapture {
     pub directory: PathBuf,
     pub provider: Provider,
     pub cli_version: String,
+    pub captured_at_unix_ms: i64,
+    pub scenario: String,
+    pub purpose: String,
     pub platform: PlatformMetadata,
     pub redaction_roots: RedactionRoots,
     pub command: CommandSnapshot,
@@ -471,6 +483,9 @@ struct CorpusManifest {
     provider: Provider,
     cli_version: String,
     normalized_cli_version: String,
+    captured_at_unix_ms: i64,
+    scenario: String,
+    purpose: String,
     platform: PlatformMetadata,
     command: CorpusCommand,
     channels: Vec<Channel>,
@@ -1039,7 +1054,7 @@ fn marker_like(candidate: &str) -> bool {
 }
 
 fn known_placeholder(candidate: &str) -> Option<KnownPlaceholder> {
-    if matches!(candidate, "CWD" | "REPO" | "HOME" | "TEMP") {
+    if matches!(candidate, "CWD" | "REPO" | "HOME" | "TEMP" | "CODEX_HOME") {
         return Some(KnownPlaceholder::Static);
     }
     const INDEXED: &[(&str, &str)] = &[
@@ -1051,6 +1066,8 @@ fn known_placeholder(candidate: &str) -> Option<KnownPlaceholder> {
         ("TOOL_USE_ID", "tool_use_id"),
         ("USER_TEXT", "user_text"),
         ("ASSISTANT_PROSE", "assistant_prose"),
+        ("PROVIDER_PROSE", "provider_prose"),
+        ("MACHINE_ID", "machine_id"),
         ("ATTACHMENT_BYTES", "attachment_bytes"),
     ];
     INDEXED.iter().find_map(|(prefix, kind)| {
@@ -1140,6 +1157,8 @@ enum RedactionKind {
     ToolUseId,
     UserText,
     AssistantProse,
+    ProviderProse,
+    MachineId,
     AttachmentBytes,
 }
 
@@ -1154,6 +1173,8 @@ impl RedactionKind {
             Self::ToolUseId => "TOOL_USE_ID",
             Self::UserText => "USER_TEXT",
             Self::AssistantProse => "ASSISTANT_PROSE",
+            Self::ProviderProse => "PROVIDER_PROSE",
+            Self::MachineId => "MACHINE_ID",
             Self::AttachmentBytes => "ATTACHMENT_BYTES",
         }
     }
@@ -1168,6 +1189,8 @@ impl RedactionKind {
             Self::ToolUseId => "tool_use_id",
             Self::UserText => "user_text",
             Self::AssistantProse => "assistant_prose",
+            Self::ProviderProse => "provider_prose",
+            Self::MachineId => "machine_id",
             Self::AttachmentBytes => "attachment_bytes",
         }
     }
@@ -1206,6 +1229,9 @@ struct SemanticContext {
     speaker: Speaker,
     codex_turn_input: bool,
     codex_assistant_prose: bool,
+    discovery_metadata: bool,
+    codex_catalog: bool,
+    availability_nux: bool,
     entity: Entity,
 }
 
@@ -1251,8 +1277,13 @@ pub fn sanitize_dir(
         }
     }
     for payload in &payloads {
-        if let Payload::Json(value) = payload {
-            redactor.collect_semantics(value, SemanticContext::default());
+        match payload {
+            Payload::Json(value) => {
+                redactor.collect_semantics(value, SemanticContext::default());
+            }
+            Payload::Text(text) => {
+                redactor.register(RedactionKind::ProviderProse, &Value::String(text.clone()));
+            }
         }
     }
 
@@ -1287,6 +1318,10 @@ pub fn sanitize_dir(
     redactor.sanitize_paths_and_validate(&mut cli_version, "cli_version")?;
     let mut normalized_cli_version = capture.cli_version.trim().to_owned();
     redactor.sanitize_paths_and_validate(&mut normalized_cli_version, "normalized_cli_version")?;
+    let mut scenario = capture.scenario.clone();
+    redactor.sanitize_paths_and_validate(&mut scenario, "scenario")?;
+    let mut purpose = capture.purpose.clone();
+    redactor.sanitize_paths_and_validate(&mut purpose, "purpose")?;
     let mut platform = serde_json::to_value(&capture.platform)
         .map_err(|source| SanitizationError::EncodeOutput { source })?;
     redactor.sanitize_nonsemantic_value(&mut platform, "platform")?;
@@ -1302,6 +1337,9 @@ pub fn sanitize_dir(
         "provider": capture.provider,
         "cli_version": cli_version,
         "normalized_cli_version": normalized_cli_version,
+        "captured_at_unix_ms": capture.captured_at_unix_ms,
+        "scenario": scenario,
+        "purpose": purpose,
         "platform": platform,
         "command": command,
         "channels": channels,
@@ -1603,6 +1641,11 @@ impl Redactor {
             capture.redaction_roots.temp.as_deref(),
             "<TEMP>",
             "temp_path",
+        );
+        redactor.add_path(
+            capture.redaction_roots.codex_home.as_deref(),
+            "<CODEX_HOME>",
+            "codex_home_path",
         );
         redactor
     }
@@ -1916,6 +1959,10 @@ fn semantic_kind(
         "tooluseid" | "parenttooluseid" | "itemid" => {
             return Some(RedactionKind::ToolUseId);
         }
+        "hookid" => return Some(RedactionKind::ToolUseId),
+        "uuid" | "pid" | "servername" | "installationid" => {
+            return Some(RedactionKind::MachineId);
+        }
         "id" if object.contains_key("jsonrpc") => return Some(RedactionKind::CodexRpcId),
         "id" if matches!(context.entity, Entity::Thread) => {
             return Some(RedactionKind::ThreadId);
@@ -1960,18 +2007,42 @@ fn semantic_kind(
         "result" if object.get("type").and_then(Value::as_str) == Some("result") => {
             return Some(RedactionKind::AssistantProse);
         }
+        "description" if context.discovery_metadata => {
+            return Some(RedactionKind::ProviderProse);
+        }
+        "description" if context.codex_catalog => {
+            return Some(RedactionKind::ProviderProse);
+        }
+        "message" if context.availability_nux => {
+            return Some(RedactionKind::ProviderProse);
+        }
+        "output" | "stdout" | "stderr"
+            if object.get("subtype").and_then(Value::as_str) == Some("hook_response") =>
+        {
+            return Some(RedactionKind::ProviderProse);
+        }
         _ => {}
     }
     None
 }
 
 fn child_context(mut context: SemanticContext, key: &str) -> SemanticContext {
-    context.entity = match normalize_field(key).as_str() {
+    let normalized = normalize_field(key);
+    context.entity = match normalized.as_str() {
         "thread" => Entity::Thread,
         "turn" => Entity::Turn,
         "item" => Entity::Item,
         _ => Entity::None,
     };
+    if matches!(normalized.as_str(), "commands" | "agents") {
+        context.discovery_metadata = true;
+    }
+    if normalized == "data" {
+        context.codex_catalog = true;
+    }
+    if normalized == "availabilitynux" {
+        context.availability_nux = true;
+    }
     context
 }
 
@@ -2204,6 +2275,9 @@ struct RecordingSession {
     timeout: Duration,
     directory: PathBuf,
     cli_version: String,
+    captured_at_unix_ms: i64,
+    scenario: String,
+    purpose: String,
     command: CommandSnapshot,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
@@ -2229,6 +2303,15 @@ impl RecordingSession {
         let launch = select_launch(&config, &executable)?;
         let command = CommandSnapshot::from_launch(&launch);
         let cli_version = probe_version(&executable).await;
+        let captured_at_unix_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| {
+                    anyhow!("The system clock is before the Unix epoch. Correct it and retry.")
+                })?
+                .as_millis(),
+        )
+        .map_err(|_| anyhow!("The system clock is outside the supported capture range."))?;
         let directory = config.raw_root.join(format!(
             "{}-{}-{}",
             provider_name(provider),
@@ -2301,6 +2384,9 @@ impl RecordingSession {
             timeout: config.timeout,
             directory,
             cli_version,
+            captured_at_unix_ms,
+            scenario: config.scenario.name.into(),
+            purpose: config.scenario.purpose.into(),
             command,
             child: Some(child),
             stdin: Some(stdin),
@@ -2344,6 +2430,9 @@ impl RecordingSession {
             directory: self.directory.clone(),
             provider: self.provider,
             cli_version: self.cli_version.clone(),
+            captured_at_unix_ms: self.captured_at_unix_ms,
+            scenario: self.scenario.clone(),
+            purpose: self.purpose.clone(),
             platform: PlatformMetadata {
                 os: std::env::consts::OS.into(),
                 arch: std::env::consts::ARCH.into(),
@@ -2360,13 +2449,15 @@ impl RecordingSession {
     async fn drive(&mut self, operation: CaptureOperation) -> anyhow::Result<()> {
         match operation {
             CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery)
+            | CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscoveryAt { .. })
             | CaptureOperation::Claude(ClaudeCaptureOperation::CommandDiscovery { .. }) => {
                 self.claude_initialize().await
             }
             CaptureOperation::Claude(ClaudeCaptureOperation::Run { request, script }) => {
                 self.claude_run(request, script).await
             }
-            CaptureOperation::Codex(CodexCaptureOperation::ModelDiscovery) => {
+            CaptureOperation::Codex(CodexCaptureOperation::ModelDiscovery)
+            | CaptureOperation::Codex(CodexCaptureOperation::ModelDiscoveryAt { .. }) => {
                 self.codex_model_discovery().await
             }
             CaptureOperation::Codex(CodexCaptureOperation::Run { request, script }) => {
@@ -2696,6 +2787,9 @@ fn select_launch(
         CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery) => Ok(
             crate::claude::discovery::model_discovery_launch(executable, &std::env::temp_dir()),
         ),
+        CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscoveryAt { cwd }) => Ok(
+            crate::claude::discovery::model_discovery_launch(executable, cwd),
+        ),
         CaptureOperation::Claude(ClaudeCaptureOperation::CommandDiscovery { cwd }) => Ok(
             crate::claude::commands::command_discovery_launch(executable, cwd),
         ),
@@ -2715,6 +2809,19 @@ fn select_launch(
                 executable,
                 &home,
                 &std::env::temp_dir(),
+            ))
+        }
+        CaptureOperation::Codex(CodexCaptureOperation::ModelDiscoveryAt { cwd }) => {
+            let home = config
+                .codex_home
+                .clone()
+                .or_else(crate::codex::discovery::codex_home)
+                .ok_or_else(|| {
+                    anyhow!("Codex home could not be found. Pass --codex-home and try again.")
+                })?;
+            let home = absolute_from_parent(home)?;
+            Ok(crate::codex::discovery::discovery_launch(
+                executable, &home, cwd,
             ))
         }
         CaptureOperation::Codex(CodexCaptureOperation::Run { request, .. }) => {
@@ -3534,6 +3641,9 @@ mod tests {
                 .unwrap();
         assert_eq!(persisted["platform"]["os"], std::env::consts::OS);
         assert_eq!(persisted["platform"]["arch"], std::env::consts::ARCH);
+        assert_eq!(persisted["scenario"], "claude-platform");
+        assert_eq!(persisted["purpose"], "local recorder test");
+        assert!(persisted["captured_at_unix_ms"].as_i64().is_some());
         assert_eq!(
             persisted["redaction_roots"]["cwd"],
             json!(capture.command.cwd)

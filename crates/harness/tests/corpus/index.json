@@ -120,19 +120,10 @@
     {
       "id": "claude-command-discovery-behavior",
       "consumer": "crates/harness/src/claude/commands.rs:module capture facts",
-      "fact": "Non-bare initialization discovers scoped commands and the CLI expands slash commands itself.",
+      "fact": "Non-bare initialization discovers scoped commands from the selected working directory.",
       "evidence": [
         {
           "manifest": "claude/pending-observed-version/command-discovery/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdout"
-            }
-          ]
-        },
-        {
-          "manifest": "claude/pending-observed-version/slash-command-expansion/manifest.json",
           "frames": [
             {
               "sequence": 0,
@@ -748,32 +739,6 @@
       "fact": "Closing stdin after initialize is followed by a successful provider exit."
     },
     {
-      "id": "claude-model-observed-latency",
-      "consumer": "crates/harness/src/claude/discovery.rs:DISCOVERY_TIMEOUT",
-      "comparison": true,
-      "evidence": [
-        {
-          "manifest": "claude/pending-observed-version/model-discovery/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdout"
-            }
-          ]
-        },
-        {
-          "manifest": "claude/pending-observed-version/command-discovery/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdout"
-            }
-          ]
-        }
-      ],
-      "fact": "Bare discovery answered faster than the non-bare hook-running handshake in the cited captures."
-    },
-    {
       "id": "claude-command-empty-hint",
       "consumer": "crates/harness/src/claude/commands.rs:an_empty_argument_hint_is_absent_not_blank",
       "evidence": [
@@ -804,32 +769,6 @@
         }
       ],
       "fact": "Captured command entries may omit aliases."
-    },
-    {
-      "id": "claude-command-observed-latency",
-      "consumer": "crates/harness/src/claude/commands.rs:COMMAND_TIMEOUT",
-      "comparison": true,
-      "evidence": [
-        {
-          "manifest": "claude/pending-observed-version/command-discovery/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdout"
-            }
-          ]
-        },
-        {
-          "manifest": "claude/pending-observed-version/command-discovery-in-app/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdout"
-            }
-          ]
-        }
-      ],
-      "fact": "The cited non-bare command handshakes had materially different terminal and in-app durations."
     },
     {
       "id": "claude-attachment-run-order",
@@ -1016,32 +955,6 @@
         }
       ],
       "fact": "An unsolicited notification can arrive before the initialize result."
-    },
-    {
-      "id": "codex-model-observed-latency",
-      "consumer": "crates/harness/src/codex/discovery.rs:DISCOVERY_TIMEOUT",
-      "comparison": true,
-      "evidence": [
-        {
-          "manifest": "codex/pending-observed-version/model-discovery/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdout"
-            }
-          ]
-        },
-        {
-          "manifest": "codex/pending-observed-version/model-discovery-warm/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdout"
-            }
-          ]
-        }
-      ],
-      "fact": "The cited cold and warm model-list captures establish the discovery timeout margin."
     },
     {
       "id": "codex-model-one-page",

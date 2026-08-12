@@ -2,20 +2,12 @@
 //! `discovery.rs`, read for `commands` instead of `models`, in the chat's own
 //! directory.
 //!
-//! Captured against Claude Code 2.1.227 on 2026-08-11
-//! (`captures/2026-08-11-slash-command-expansion.md`). Three facts from that
-//! capture shape this file:
+//! The capture corpus records the non-bare initialize reply used here. Two
+//! facts from that reply shape this file:
 //!
-//! 1. **The CLI expands `/name` itself** in comet's exact non-interactive
-//!    spawn, so the menu this feeds is autocomplete and nothing more — comet
-//!    never has to read a command's body or substitute anything.
+//! 1. Commands are scoped to the selected working directory.
 //! 2. **It cannot reuse the model discovery's spawn**, because that one passes
-//!    `--bare`, which skips user and project skill discovery (42 commands
-//!    against 67). Debt row D32.
-//! 3. **An unrecognized command fails silently-successfully** — `Unknown
-//!    command: /x` arrives as ordinary assistant text with `is_error: false`
-//!    and no model call — so a stale list cannot be detected after the fact.
-//!    Correctness has to live in this list being right.
+//!    `--bare`, which skips user and project skill discovery. Debt row D32.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -28,12 +20,10 @@ use crate::discovery::DiscoveryFailure;
 
 /// Twice the model discovery's timeout, deliberately.
 ///
-/// This spawn is the one without `--bare`, so it runs the user's `SessionStart`
-/// hooks — and the same non-bare handshake measured **1.4s from a terminal and
-/// 10.6s from inside the running app** on this machine (captures 2026-08-11 and
-/// 2.2's rendered check). Ten seconds is the number that already failed there
-/// once, and the wait is paid at most once per directory per boot, behind a
-/// popup that is showing a skeleton and can be dismissed.
+/// This spawn is the one without `--bare`, so it can run the user's
+/// `SessionStart` hooks. The bounded wait is paid at most once per directory
+/// per boot behind a dismissible loading surface, then fails into the existing
+/// unavailable-command fallback instead of waiting forever.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// `DISCOVERY_ARGS` **without `--bare`**. That single difference is the whole

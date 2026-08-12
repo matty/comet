@@ -26,10 +26,9 @@ use comet_proto::ReasoningLevel;
 use crate::discovery::{DiscoveredModel, Discovery, DiscoveryFailure, program_path};
 
 /// Matches `claude/discovery.rs`'s `DISCOVERY_TIMEOUT` and `PROBE_TIMEOUT`.
-/// The worst cold path measured was 4.0s — first spawn of the session plus a
-/// network fetch of the model list — against ~0.15s warm, so ten seconds is a
-/// long way past a healthy answer and still degrades a wedged CLI to the
-/// built-in list rather than hanging the picker.
+/// Model discovery may include process startup and a remote catalog fetch, so
+/// the wait allows both while remaining bounded. A wedged CLI still degrades
+/// to the built-in list rather than hanging the picker.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A ceiling on the paging loop. The live server answers in one page and only
