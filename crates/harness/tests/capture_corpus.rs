@@ -177,6 +177,25 @@ fn corpus_valid_literal_schema_returns_the_exact_selected_payload() {
     );
 }
 
+/// Break caught: Git's Windows checkout turns trailing blank LF records into CRLF records, and a
+/// validator that skips only zero-length slices tries to decode the remaining `\r` as JSON.
+#[test]
+fn corpus_accepts_crlf_blank_records_from_windows_checkouts() {
+    let temp = tempfile::tempdir().unwrap();
+    write_valid_literal_corpus(temp.path());
+    let events_path = temp
+        .path()
+        .join("claude/2.1.227/model-discovery/events.jsonl");
+    let events = std::fs::read_to_string(&events_path)
+        .unwrap()
+        .replace('\n', "\r\n");
+    std::fs::write(&events_path, format!("{events}\r\n\r\n")).unwrap();
+
+    let errors = validate_corpus(temp.path());
+
+    assert!(errors.is_empty(), "CRLF corpus returned {errors:#?}");
+}
+
 /// Break caught: sanitizer-generated path definitions are part of the promoted manifest schema,
 /// so corpus validation must accept their exact static placeholder/kind pairs.
 #[test]
