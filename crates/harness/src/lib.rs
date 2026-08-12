@@ -1009,6 +1009,15 @@ mod install_classification_tests {
     /// assert it actually appends them.
     #[test]
     fn all_known_dirs_includes_the_version_managers() {
+        // Every path this returns is derived from the environment, so one with
+        // none of those variables set legitimately yields nothing and the
+        // length assertion below would blame the append. Fail on the
+        // precondition instead, naming the actual cause.
+        assert!(
+            !node_version_manager_bins().is_empty(),
+            "no version-manager dir is derivable here \
+             (HOME/USERPROFILE, FNM_DIR, APPDATA and LOCALAPPDATA all unset)"
+        );
         let install_only = vec![(PathBuf::from("/tmp/example"), InstallMethod::Native)];
         let combined = all_known_dirs(install_only.clone());
         assert!(
