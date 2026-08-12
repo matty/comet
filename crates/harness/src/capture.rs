@@ -966,6 +966,7 @@ fn validate_evidence(
     }
     let mut events = Vec::new();
     for (offset, line) in events_bytes.split(|byte| *byte == b'\n').enumerate() {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
             continue;
         }
@@ -1356,6 +1357,7 @@ struct SemanticContext {
     speaker: Speaker,
     codex_turn_input: bool,
     codex_assistant_prose: bool,
+    codex_assistant_prose_array: bool,
     discovery_metadata: bool,
     codex_catalog: bool,
     codex_root_notification: CodexNotification,
@@ -1859,6 +1861,10 @@ impl Redactor {
     }
 
     fn collect_semantics(&mut self, value: &Value, context: SemanticContext) {
+        if context.codex_assistant_prose_array && value.is_string() {
+            self.register(RedactionKind::AssistantProse, value);
+            return;
+        }
         match value {
             Value::Array(values) => {
                 for value in values {
@@ -1899,6 +1905,9 @@ impl Redactor {
         context: SemanticContext,
         location: &str,
     ) -> Result<(), SanitizationError> {
+        if context.codex_assistant_prose_array && value.is_string() {
+            self.replace_semantic(RedactionKind::AssistantProse, value);
+        }
         match value {
             Value::Array(values) => {
                 for (index, value) in values.iter_mut().enumerate() {
@@ -2148,7 +2157,11 @@ fn object_context(
         Some("assistant") => Speaker::Assistant,
         _ => context.speaker,
     };
-    if object.get("method").and_then(Value::as_str) == Some("turn/start") {
+    if object
+        .get("method")
+        .and_then(Value::as_str)
+        .is_some_and(|method| matches!(method, "turn/start" | "turn/steer"))
+    {
         context.codex_turn_input = true;
     }
     if context.json_root && !context.claude_capture {
@@ -2210,7 +2223,7 @@ fn semantic_kind(
         "requestid" => return Some(RedactionKind::ClaudeRequestId),
         "sessionid" => return Some(RedactionKind::SessionId),
         "threadid" => return Some(RedactionKind::ThreadId),
-        "turnid" => return Some(RedactionKind::TurnId),
+        "turnid" | "expectedturnid" => return Some(RedactionKind::TurnId),
         "tooluseid" | "parenttooluseid" | "itemid" => {
             return Some(RedactionKind::ToolUseId);
         }
@@ -2219,6 +2232,13 @@ fn semantic_kind(
             return Some(RedactionKind::MachineId);
         }
         "id" if object.contains_key("jsonrpc") => return Some(RedactionKind::CodexRpcId),
+        "id" if !context.claude_capture
+            && context.json_root
+            && !object.contains_key("method")
+            && (object.contains_key("result") || object.contains_key("error")) =>
+        {
+            return Some(RedactionKind::CodexRpcId);
+        }
         "id" if matches!(context.entity, Entity::Thread) => {
             return Some(RedactionKind::ThreadId);
         }
@@ -2353,6 +2373,12 @@ fn child_context(mut context: SemanticContext, key: &str) -> SemanticContext {
     }
     if normalized == "input" && context.claude_tool_use {
         context.claude_tool_input = true;
+    }
+    if !context.claude_capture
+        && normalized == "summary"
+        && matches!(context.speaker, Speaker::Assistant)
+    {
+        context.codex_assistant_prose_array = true;
     }
     context
 }
@@ -2964,20 +2990,33 @@ fn observe_codex_approval_routine_item(
     )?;
     let item = &value["params"]["item"];
     let kind = item["type"].as_str().unwrap_or_default();
-    let keys: &[&str] = match kind {
-        "userMessage" => &["type", "id", "clientId", "content"],
-        "reasoning" => &["type", "id", "summary", "content"],
-        "agentMessage" => &["type", "id", "text", "phase", "memoryCitation"],
+    match kind {
+        "userMessage" => require_keys_with_optional(
+            item,
+            &["type", "id", "content"],
+            &["clientId"],
+            "routine item",
+        )?,
+        "reasoning" => {
+            require_exact_keys(item, &["type", "id", "summary", "content"], "routine item")?
+        }
+        "agentMessage" => require_exact_keys(
+            item,
+            &["type", "id", "text", "phase", "memoryCitation"],
+            "routine item",
+        )?,
         _ => bail!("Codex approval capture observed an unreviewed item type."),
-    };
-    require_exact_keys(item, keys, "routine item")?;
+    }
     let id = item["id"]
         .as_str()
         .filter(|id| !id.is_empty())
         .ok_or_else(|| anyhow!("Codex approval routine item had no nonempty identifier."))?;
     match kind {
         "userMessage" => {
-            if item["clientId"].as_str().is_none() || !item["content"].is_array() {
+            let invalid_client_id = item
+                .get("clientId")
+                .is_some_and(|client_id| !client_id.is_null() && !client_id.is_string());
+            if invalid_client_id || !item["content"].is_array() {
                 bail!("Codex approval user-message item had an unexpected value shape.");
             }
         }
@@ -3017,7 +3056,11 @@ fn observe_codex_approval_routine_item(
             bail!("Codex approval routine item completion did not join its start.");
         };
         let preserved = match kind {
-            "userMessage" => started == *item,
+            "userMessage" => {
+                started["type"] == item["type"]
+                    && started["id"] == item["id"]
+                    && started["content"] == item["content"]
+            }
             "reasoning" => {
                 started["type"] == item["type"]
                     && started["id"] == item["id"]
@@ -3473,6 +3516,28 @@ fn require_exact_keys(value: &Value, expected: &[&str], label: &str) -> anyhow::
     let actual: BTreeSet<_> = object.keys().map(String::as_str).collect();
     let expected: BTreeSet<_> = expected.iter().copied().collect();
     if actual != expected {
+        bail!("Codex {label} had unexpected or missing fields.");
+    }
+    Ok(())
+}
+
+fn require_keys_with_optional(
+    value: &Value,
+    required: &[&str],
+    optional: &[&str],
+    label: &str,
+) -> anyhow::Result<()> {
+    let Some(object) = value.as_object() else {
+        bail!("Codex {label} was not an object.");
+    };
+    let actual: BTreeSet<_> = object.keys().map(String::as_str).collect();
+    let required: BTreeSet<_> = required.iter().copied().collect();
+    let allowed: BTreeSet<_> = required
+        .iter()
+        .copied()
+        .chain(optional.iter().copied())
+        .collect();
+    if !required.is_subset(&actual) || !actual.is_subset(&allowed) {
         bail!("Codex {label} had unexpected or missing fields.");
     }
     Ok(())
@@ -6072,6 +6137,135 @@ mod tests {
             error
                 .to_string()
                 .contains("rejected the requested thread resume")
+        );
+    }
+
+    fn routine_item_event(method: &str, item: Value) -> Value {
+        let timing = if method == "item/started" {
+            "startedAtMs"
+        } else {
+            "completedAtMs"
+        };
+        let mut params = json!({
+            "item": item,
+            "threadId": "th-1",
+            "turnId": "t-1",
+        });
+        params[timing] = json!(1);
+        json!({"method": method, "params": params, "emittedAtMs": 1})
+    }
+
+    fn approval_state_for_routine_item() -> super::CodexApprovalState {
+        super::CodexApprovalState {
+            thread_id: Some("th-1".into()),
+            turn_id: Some("t-1".into()),
+            ..super::CodexApprovalState::default()
+        }
+    }
+
+    /// Break caught: Codex's generated `UserMessageThreadItem` schema makes `clientId`
+    /// optional and nullable, but the capture driver rejects both wire shapes before approval.
+    #[test]
+    fn codex_approval_user_message_client_id_matches_generated_schema() {
+        for client_id in [None, Some(Value::Null), Some(json!("client-1"))] {
+            let mut item = json!({
+                "type": "userMessage",
+                "id": "u1",
+                "content": [{"type": "text", "text": "bounded prompt"}],
+            });
+            if let Some(client_id) = client_id {
+                item["clientId"] = client_id;
+            }
+            let mut state = approval_state_for_routine_item();
+            super::observe_codex_approval_routine_item(
+                &routine_item_event("item/started", item.clone()),
+                "item/started",
+                &mut state,
+            )
+            .unwrap();
+            super::observe_codex_approval_routine_item(
+                &routine_item_event("item/completed", item),
+                "item/completed",
+                &mut state,
+            )
+            .unwrap();
+            assert!(state.routine_items.is_empty());
+        }
+    }
+
+    /// Break caught: treating absent metadata as an identity value makes an otherwise matching
+    /// user-message start/completion pair fail when Codex supplies `clientId` only later.
+    #[test]
+    fn codex_approval_user_message_client_id_does_not_control_the_item_join() {
+        let started = json!({
+            "type": "userMessage",
+            "id": "u1",
+            "content": [{"type": "text", "text": "bounded prompt"}],
+        });
+        let completed = json!({
+            "type": "userMessage",
+            "id": "u1",
+            "clientId": "client-1",
+            "content": [{"type": "text", "text": "bounded prompt"}],
+        });
+        let mut state = approval_state_for_routine_item();
+
+        super::observe_codex_approval_routine_item(
+            &routine_item_event("item/started", started),
+            "item/started",
+            &mut state,
+        )
+        .unwrap();
+        super::observe_codex_approval_routine_item(
+            &routine_item_event("item/completed", completed),
+            "item/completed",
+            &mut state,
+        )
+        .unwrap();
+
+        assert!(state.routine_items.is_empty());
+    }
+
+    /// Break caught: making `clientId` optional accidentally permits unreviewed JSON kinds or
+    /// turns the optional-key allowance into an open-ended item shape.
+    #[test]
+    fn codex_approval_user_message_rejects_invalid_client_id_and_unknown_fields() {
+        for invalid in [json!(true), json!(1), json!([]), json!({})] {
+            let item = json!({
+                "type": "userMessage",
+                "id": "u1",
+                "clientId": invalid,
+                "content": [],
+            });
+            let mut state = approval_state_for_routine_item();
+            let error = super::observe_codex_approval_routine_item(
+                &routine_item_event("item/started", item),
+                "item/started",
+                &mut state,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("unexpected value shape"),
+                "{error}"
+            );
+        }
+
+        let item = json!({
+            "type": "userMessage",
+            "id": "u1",
+            "content": [],
+            "unreviewed": true,
+        });
+        let mut state = approval_state_for_routine_item();
+        let error = super::observe_codex_approval_routine_item(
+            &routine_item_event("item/started", item),
+            "item/started",
+            &mut state,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unexpected or missing fields"),
+            "{error}"
         );
     }
 

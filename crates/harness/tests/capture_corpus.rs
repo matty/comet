@@ -67,6 +67,37 @@ fn sanitized_payloads(events_bytes: &[u8]) -> Vec<Value> {
         .collect()
 }
 
+fn claim_payloads(corpus_root: &Path, claim_id: &str) -> Vec<(String, Value)> {
+    let index: Value =
+        serde_json::from_slice(&std::fs::read(corpus_root.join("index.json")).unwrap()).unwrap();
+    let claim = index["claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|claim| claim["id"] == claim_id)
+        .unwrap_or_else(|| panic!("missing residual claim {claim_id}"));
+    let mut payloads = Vec::new();
+    for evidence in claim["evidence"].as_array().unwrap() {
+        let manifest = evidence["manifest"].as_str().unwrap();
+        let events_path = corpus_root.join(manifest).with_file_name("events.jsonl");
+        let events: Vec<Value> = std::fs::read_to_string(events_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for frame in evidence["frames"].as_array().unwrap() {
+            let sequence = frame["sequence"].as_u64().unwrap();
+            let event = events
+                .iter()
+                .find(|event| event["sequence"] == sequence)
+                .unwrap_or_else(|| panic!("{claim_id}: missing frame {sequence}"));
+            let payload = serde_json::from_str(event["payload"].as_str().unwrap()).unwrap();
+            payloads.push((event["channel"].as_str().unwrap().to_owned(), payload));
+        }
+    }
+    payloads
+}
+
 /// Break caught: a promoted artifact cannot be reproduced or audited when sanitization drops the
 /// logical scenario, its purpose, or the one capture-time sample recorded with the raw evidence.
 #[test]
@@ -175,6 +206,25 @@ fn corpus_valid_literal_schema_returns_the_exact_selected_payload() {
         selected_payload(temp.path(), "claude-model-reply").unwrap(),
         r#"{"type":"control_response","request_id":"<CLAUDE_REQUEST_ID_1>","models":[{"value":"sonnet"}]}"#
     );
+}
+
+/// Break caught: Git's Windows checkout turns trailing blank LF records into CRLF records, and a
+/// validator that skips only zero-length slices tries to decode the remaining `\r` as JSON.
+#[test]
+fn corpus_accepts_crlf_blank_records_from_windows_checkouts() {
+    let temp = tempfile::tempdir().unwrap();
+    write_valid_literal_corpus(temp.path());
+    let events_path = temp
+        .path()
+        .join("claude/2.1.227/model-discovery/events.jsonl");
+    let events = std::fs::read_to_string(&events_path)
+        .unwrap()
+        .replace('\n', "\r\n");
+    std::fs::write(&events_path, format!("{events}\r\n\r\n")).unwrap();
+
+    let errors = validate_corpus(temp.path());
+
+    assert!(errors.is_empty(), "CRLF corpus returned {errors:#?}");
 }
 
 /// Break caught: sanitizer-generated path definitions are part of the promoted manifest schema,
@@ -913,6 +963,7 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "codex-routine-notification-fixture",
             "codex-routine-notification-ignore-list",
             "codex-routine-notification-integration",
+            "codex-steer-reply-before-completion",
         ])
     );
     let comparison_claim_ids: std::collections::BTreeSet<&str> = index["claims"]
@@ -1033,6 +1084,7 @@ fn corpus_promoted_token_free_claims_are_valid() {
             "codex-routine-notification-fixture",
             "codex-routine-notification-ignore-list",
             "codex-routine-notification-integration",
+            "codex-steer-reply-before-completion",
         ])
     );
     let errors = validate_corpus(&corpus_root);
@@ -1122,6 +1174,31 @@ fn corpus_promoted_codex_ordering_frames_have_the_observed_payloads() {
         assert_eq!(model_list["id"], 2, "{claim_id}");
         assert!(model_list["result"]["data"].is_array(), "{claim_id}");
     }
+}
+
+/// Break caught: a valid three-frame selector can point at unrelated neighboring notifications
+/// without proving the steer request, its matching success reply, and the same turn's completion.
+#[test]
+fn corpus_promoted_codex_steer_frames_have_the_observed_payloads() {
+    let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    let steer = claim_payloads(&corpus_root, "codex-steer-reply-before-completion");
+
+    assert_eq!(steer.len(), 3);
+    assert_eq!(steer[0].0, "stdin");
+    assert_eq!(steer[0].1["method"], "turn/steer");
+    assert_eq!(steer[1].0, "stdout");
+    assert_eq!(steer[1].1["id"], steer[0].1["id"]);
+    assert!(steer[1].1["result"].is_object());
+    assert_eq!(
+        steer[1].1["result"]["turnId"],
+        steer[0].1["params"]["expectedTurnId"]
+    );
+    assert_eq!(steer[2].0, "stdout");
+    assert_eq!(steer[2].1["method"], "turn/completed");
+    assert_eq!(
+        steer[2].1["params"]["turn"]["id"],
+        steer[0].1["params"]["expectedTurnId"]
+    );
 }
 
 /// Break caught: skipping any semantic branch leaves captured identifiers, human-authored
@@ -1453,6 +1530,120 @@ fn sanitizer_redacts_nested_codex_thread_turn_and_every_item_id() {
     ] {
         assert!(!output.contains(leaked));
     }
+}
+
+/// Break caught: `turn/steer` carries the active turn under `expectedTurnId`, so recognizing only
+/// the ordinary `turnId` spelling publishes a provider-generated identifier and breaks the join.
+#[test]
+fn sanitizer_redacts_codex_steer_expected_turn_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "codex-steer-turn-id",
+        &[
+            r#"{"method":"turn/started","params":{"turn":{"id":"turn-secret"}}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"turn/steer","params":{"expectedTurnId":"turn-secret","input":[]}}"#,
+        ],
+    );
+    let path = raw.join("capture.json");
+    let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    capture["provider"] = Value::String("codex".into());
+    std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "codex-steer-turn-id")).unwrap();
+    let payloads = sanitized_payloads(&report.events_bytes);
+
+    assert_eq!(payloads[0]["params"]["turn"]["id"], "<TURN_ID_1>");
+    assert_eq!(payloads[1]["params"]["expectedTurnId"], "<TURN_ID_1>");
+    assert!(
+        !String::from_utf8(report.events_bytes)
+            .unwrap()
+            .contains("turn-secret")
+    );
+}
+
+/// Break caught: Codex app-server replies can omit `jsonrpc`, so recognizing request IDs only on
+/// objects with that field leaves the numeric reply ID raw and destroys the request/reply join.
+#[test]
+fn sanitizer_reuses_codex_rpc_ids_in_root_replies_without_jsonrpc() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "codex-root-reply-id",
+        &[
+            r#"{"jsonrpc":"2.0","id":4,"method":"turn/steer","params":{}}"#,
+            r#"{"id":4,"result":{"turnId":"turn-secret"}}"#,
+        ],
+    );
+    let path = raw.join("capture.json");
+    let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    capture["provider"] = Value::String("codex".into());
+    std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "codex-root-reply-id")).unwrap();
+    let payloads = sanitized_payloads(&report.events_bytes);
+
+    assert_eq!(payloads[0]["id"], "<CODEX_RPC_ID_1>");
+    assert_eq!(payloads[1]["id"], "<CODEX_RPC_ID_1>");
+}
+
+/// Break caught: steer input is user-authored turn input just like `turn/start` input, but a
+/// method-specific context check leaves the bounded steering message in published evidence.
+#[test]
+fn sanitizer_redacts_codex_steer_input_as_user_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "codex-steer-input",
+        &[
+            r#"{"jsonrpc":"2.0","id":4,"method":"turn/steer","params":{"input":[{"type":"text","text":"private steering message"}]}}"#,
+        ],
+    );
+    let path = raw.join("capture.json");
+    let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    capture["provider"] = Value::String("codex".into());
+    std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "codex-steer-input")).unwrap();
+    let payload = &sanitized_payloads(&report.events_bytes)[0];
+
+    assert_eq!(payload["params"]["input"][0]["text"], "<USER_TEXT_1>");
+    assert!(
+        !String::from_utf8(report.events_bytes)
+            .unwrap()
+            .contains("private steering message")
+    );
+}
+
+/// Break caught: a completed Codex reasoning item stores assistant prose as strings inside its
+/// `summary` array, where key-based scalar classification no longer has the `summary` field name.
+#[test]
+fn sanitizer_redacts_codex_reasoning_summary_array_prose() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "codex-reasoning-summary",
+        &[
+            r#"{"method":"item/completed","params":{"item":{"id":"reasoning-id","type":"reasoning","summary":["private reasoning summary"],"content":[]}}}"#,
+        ],
+    );
+    let path = raw.join("capture.json");
+    let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    capture["provider"] = Value::String("codex".into());
+    std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "codex-reasoning-summary")).unwrap();
+    let payload = &sanitized_payloads(&report.events_bytes)[0];
+
+    assert_eq!(
+        payload["params"]["item"]["summary"][0],
+        "<ASSISTANT_PROSE_1>"
+    );
+    assert!(
+        !String::from_utf8(report.events_bytes)
+            .unwrap()
+            .contains("private reasoning summary")
+    );
 }
 
 /// Break caught: accepting non-JSON structured-channel frames makes user and assistant content

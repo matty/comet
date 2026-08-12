@@ -432,7 +432,8 @@ fn emit_observed_command_prefix() {
         json!({"type":"reasoning","id":"r1","summary":["bounded summary"],"content":[]});
     emit(&json!({"method":"item/started","params":{"item":routine_start,"threadId":"th-1","turnId":"t-1","startedAtMs":1},"emittedAtMs":1}).to_string());
     emit(&json!({"method":"item/completed","params":{"item":routine_complete,"threadId":"th-1","turnId":"t-1","completedAtMs":1},"emittedAtMs":1}).to_string());
-    let user = json!({"type":"userMessage","id":"u1","clientId":"client-1","content":[{"type":"text","text":"bounded prompt"}]});
+    let user =
+        json!({"type":"userMessage","id":"u1","content":[{"type":"text","text":"bounded prompt"}]});
     emit(&json!({"method":"item/started","params":{"item":user,"threadId":"th-1","turnId":"t-1","startedAtMs":1},"emittedAtMs":1}).to_string());
     emit(&json!({"method":"item/completed","params":{"item":user,"threadId":"th-1","turnId":"t-1","completedAtMs":1},"emittedAtMs":1}).to_string());
     let message_start = json!({"type":"agentMessage","id":"a1","text":"","phase":"commentary","memoryCitation":null});
