@@ -67,6 +67,37 @@ fn sanitized_payloads(events_bytes: &[u8]) -> Vec<Value> {
         .collect()
 }
 
+fn claim_payloads(corpus_root: &Path, claim_id: &str) -> Vec<(String, Value)> {
+    let index: Value =
+        serde_json::from_slice(&std::fs::read(corpus_root.join("index.json")).unwrap()).unwrap();
+    let claim = index["claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|claim| claim["id"] == claim_id)
+        .unwrap_or_else(|| panic!("missing residual claim {claim_id}"));
+    let mut payloads = Vec::new();
+    for evidence in claim["evidence"].as_array().unwrap() {
+        let manifest = evidence["manifest"].as_str().unwrap();
+        let events_path = corpus_root.join(manifest).with_file_name("events.jsonl");
+        let events: Vec<Value> = std::fs::read_to_string(events_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for frame in evidence["frames"].as_array().unwrap() {
+            let sequence = frame["sequence"].as_u64().unwrap();
+            let event = events
+                .iter()
+                .find(|event| event["sequence"] == sequence)
+                .unwrap_or_else(|| panic!("{claim_id}: missing frame {sequence}"));
+            let payload = serde_json::from_str(event["payload"].as_str().unwrap()).unwrap();
+            payloads.push((event["channel"].as_str().unwrap().to_owned(), payload));
+        }
+    }
+    payloads
+}
+
 /// Break caught: a promoted artifact cannot be reproduced or audited when sanitization drops the
 /// logical scenario, its purpose, or the one capture-time sample recorded with the raw evidence.
 #[test]
@@ -1143,6 +1174,31 @@ fn corpus_promoted_codex_ordering_frames_have_the_observed_payloads() {
         assert_eq!(model_list["id"], 2, "{claim_id}");
         assert!(model_list["result"]["data"].is_array(), "{claim_id}");
     }
+}
+
+/// Break caught: a valid three-frame selector can point at unrelated neighboring notifications
+/// without proving the steer request, its matching success reply, and the same turn's completion.
+#[test]
+fn corpus_promoted_codex_steer_frames_have_the_observed_payloads() {
+    let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    let steer = claim_payloads(&corpus_root, "codex-steer-reply-before-completion");
+
+    assert_eq!(steer.len(), 3);
+    assert_eq!(steer[0].0, "stdin");
+    assert_eq!(steer[0].1["method"], "turn/steer");
+    assert_eq!(steer[1].0, "stdout");
+    assert_eq!(steer[1].1["id"], steer[0].1["id"]);
+    assert!(steer[1].1["result"].is_object());
+    assert_eq!(
+        steer[1].1["result"]["turnId"],
+        steer[0].1["params"]["expectedTurnId"]
+    );
+    assert_eq!(steer[2].0, "stdout");
+    assert_eq!(steer[2].1["method"], "turn/completed");
+    assert_eq!(
+        steer[2].1["params"]["turn"]["id"],
+        steer[0].1["params"]["expectedTurnId"]
+    );
 }
 
 /// Break caught: skipping any semantic branch leaves captured identifiers, human-authored
