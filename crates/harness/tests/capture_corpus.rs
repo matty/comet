@@ -1522,6 +1522,156 @@ fn sanitizer_replaces_allowlisted_paths_in_values_and_embedded_text() {
     );
 }
 
+/// Break caught: Claude encodes the cwd into the basename beneath `memory_paths`, so replacing
+/// only the literal HOME prefix leaves machine-specific workspace identity in reviewed evidence.
+#[test]
+fn sanitizer_replaces_every_nonempty_claude_memory_path_as_typed_local_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = r"D:\capture-home";
+    let cwd = r"C:\private workspace\project";
+    let first_encoded_slug = "C--private-workspace-project";
+    let second_encoded_slug = "Z--another-opaque-workspace";
+    let payload = serde_json::json!({
+        "type": "system",
+        "subtype": "init",
+        "memory_paths": {
+            "auto": format!(r"{home}\.claude\projects\{first_encoded_slug}\memory\"),
+            "nested": {
+                "unknown_future_scope": format!(
+                    r"{home}\.claude\projects\{second_encoded_slug}\memory\"
+                )
+            },
+            "disabled": ""
+        }
+    })
+    .to_string();
+    let raw = write_raw_capture(temp.path(), "claude-memory-paths", &[&payload]);
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    capture["redaction_roots"]["cwd"] = Value::String(cwd.into());
+    capture["redaction_roots"]["home"] = Value::String(home.into());
+    capture["command"]["cwd"] = Value::String(cwd.into());
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "claude-memory-paths")).unwrap();
+    let payload = &sanitized_payloads(&report.events_bytes)[0];
+    assert_eq!(
+        payload["memory_paths"],
+        serde_json::json!({
+            "auto": "<CLAUDE_MEMORY_PATH_1>",
+            "nested": {"unknown_future_scope": "<CLAUDE_MEMORY_PATH_2>"},
+            "disabled": ""
+        })
+    );
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+    assert_eq!(manifest["redaction_counts"]["claude_memory_path"], 2);
+    assert!(
+        manifest["placeholders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|definition| definition["kind"] == "claude_memory_path")
+            .map(|definition| definition["placeholder"].as_str().unwrap())
+            .eq(["<CLAUDE_MEMORY_PATH_1>", "<CLAUDE_MEMORY_PATH_2>"])
+    );
+    let sanitized = String::from_utf8(report.events_bytes).unwrap();
+    for private_component in [home, cwd, first_encoded_slug, second_encoded_slug] {
+        assert!(!sanitized.contains(private_component));
+    }
+}
+
+/// Break caught: Claude assistant message IDs are provider-generated correlators, and leaving
+/// them literal exposes run identity even when session, request, and tool IDs are typed correctly.
+#[test]
+fn sanitizer_types_claude_assistant_message_ids_by_shape_and_reuses_placeholders() {
+    let temp = tempfile::tempdir().unwrap();
+    let first_message_id = "opaque-provider-message-alpha";
+    let second_message_id = "future-format-message-beta";
+    let raw = write_raw_capture(
+        temp.path(),
+        "claude-message-ids",
+        &[
+            &serde_json::json!({
+                "type": "stream_event",
+                "request_id": "request-private",
+                "session_id": "session-private",
+                "event": {
+                    "type": "message_start",
+                    "message": {
+                        "type": "message",
+                        "role": "assistant",
+                        "id": first_message_id,
+                        "content": [{"type": "tool_use", "id": "tool-private"}]
+                    }
+                }
+            })
+            .to_string(),
+            &serde_json::json!({
+                "type": "assistant",
+                "message": {"type": "message", "role": "assistant", "id": first_message_id}
+            })
+            .to_string(),
+            &serde_json::json!({
+                "type": "assistant",
+                "message": {"type": "message", "role": "assistant", "id": second_message_id}
+            })
+            .to_string(),
+            r#"{"type":"assistant","message":{"type":"message","role":"assistant","id":null}}"#,
+            r#"{"type":"metadata","id":"safe-unrelated-literal"}"#,
+        ],
+    );
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "claude-message-ids")).unwrap();
+    let payloads = sanitized_payloads(&report.events_bytes);
+    assert_eq!(
+        payloads[0]["event"]["message"]["id"],
+        "<CLAUDE_MESSAGE_ID_1>"
+    );
+    assert_eq!(payloads[1]["message"]["id"], "<CLAUDE_MESSAGE_ID_1>");
+    assert_eq!(payloads[2]["message"]["id"], "<CLAUDE_MESSAGE_ID_2>");
+    assert_eq!(payloads[3]["message"]["id"], Value::Null);
+    assert_eq!(payloads[4]["id"], "safe-unrelated-literal");
+    assert_eq!(payloads[0]["request_id"], "<CLAUDE_REQUEST_ID_1>");
+    assert_eq!(payloads[0]["session_id"], "<SESSION_ID_1>");
+    assert_eq!(
+        payloads[0]["event"]["message"]["content"][0]["id"],
+        "<TOOL_USE_ID_1>"
+    );
+
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+    assert_eq!(manifest["redaction_counts"]["claude_message_id"], 3);
+    assert!(
+        manifest["placeholders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|definition| definition["kind"] == "claude_message_id")
+            .map(|definition| definition["placeholder"].as_str().unwrap())
+            .eq(["<CLAUDE_MESSAGE_ID_1>", "<CLAUDE_MESSAGE_ID_2>"])
+    );
+
+    let capture_path = raw.join("capture.json");
+    let mut non_claude_capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    non_claude_capture["provider"] = Value::String("codex".into());
+    std::fs::write(
+        &capture_path,
+        serde_json::to_vec_pretty(&non_claude_capture).unwrap(),
+    )
+    .unwrap();
+    let non_claude = sanitize_dir(
+        &raw,
+        &staging_dir(temp.path(), "codex-message-shaped-object"),
+    )
+    .unwrap();
+    assert_eq!(
+        sanitized_payloads(&non_claude.events_bytes)[0]["event"]["message"]["id"],
+        first_message_id,
+        "a message-shaped object is not a Claude message ID outside Claude evidence"
+    );
+}
+
 /// Break caught: isolated logged-out discovery cannot be sanitized because its explicitly
 /// configured CODEX_HOME is not one of the raw evidence's captured redaction roots.
 #[test]

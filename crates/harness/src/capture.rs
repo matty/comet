@@ -1136,6 +1136,8 @@ fn known_placeholder(candidate: &str) -> Option<KnownPlaceholder> {
         ("PROVIDER_PROSE", "provider_prose"),
         ("MACHINE_ID", "machine_id"),
         ("ATTACHMENT_BYTES", "attachment_bytes"),
+        ("CLAUDE_MEMORY_PATH", "claude_memory_path"),
+        ("CLAUDE_MESSAGE_ID", "claude_message_id"),
     ];
     INDEXED.iter().find_map(|(prefix, kind)| {
         candidate
@@ -1229,6 +1231,8 @@ enum RedactionKind {
     ProviderProse,
     MachineId,
     AttachmentBytes,
+    ClaudeMemoryPath,
+    ClaudeMessageId,
 }
 
 impl RedactionKind {
@@ -1245,6 +1249,8 @@ impl RedactionKind {
             Self::ProviderProse => "PROVIDER_PROSE",
             Self::MachineId => "MACHINE_ID",
             Self::AttachmentBytes => "ATTACHMENT_BYTES",
+            Self::ClaudeMemoryPath => "CLAUDE_MEMORY_PATH",
+            Self::ClaudeMessageId => "CLAUDE_MESSAGE_ID",
         }
     }
 
@@ -1261,6 +1267,8 @@ impl RedactionKind {
             Self::ProviderProse => "provider_prose",
             Self::MachineId => "machine_id",
             Self::AttachmentBytes => "attachment_bytes",
+            Self::ClaudeMemoryPath => "claude_memory_path",
+            Self::ClaudeMessageId => "claude_message_id",
         }
     }
 }
@@ -1295,12 +1303,14 @@ enum Speaker {
 
 #[derive(Clone, Copy, Default)]
 struct SemanticContext {
+    claude_capture: bool,
     speaker: Speaker,
     codex_turn_input: bool,
     codex_assistant_prose: bool,
     discovery_metadata: bool,
     codex_catalog: bool,
     availability_nux: bool,
+    claude_memory_paths: bool,
     entity: Entity,
 }
 
@@ -1330,6 +1340,10 @@ pub fn sanitize_dir(
     let capture: RawCapture = serde_json::from_slice(&bytes)
         .map_err(|source| SanitizationError::InvalidRaw { source })?;
     let mut redactor = Redactor::new(&capture);
+    let semantic_context = SemanticContext {
+        claude_capture: capture.provider == Provider::Claude,
+        ..SemanticContext::default()
+    };
 
     let mut payloads = Vec::with_capacity(capture.events.len());
     for event in &capture.events {
@@ -1348,7 +1362,7 @@ pub fn sanitize_dir(
     for payload in &payloads {
         match payload {
             Payload::Json(value) => {
-                redactor.collect_semantics(value, SemanticContext::default());
+                redactor.collect_semantics(value, semantic_context);
             }
             Payload::Text(text) => {
                 redactor.register(RedactionKind::ProviderProse, &Value::String(text.clone()));
@@ -1364,7 +1378,7 @@ pub fn sanitize_dir(
     for (event, payload) in capture.events.iter().zip(&mut payloads) {
         let payload = match payload {
             Payload::Json(value) => {
-                redactor.sanitize_json(value, SemanticContext::default(), "event.payload")?;
+                redactor.sanitize_json(value, semantic_context, "event.payload")?;
                 serde_json::to_string(value)
                     .map_err(|source| SanitizationError::EncodeOutput { source })?
             }
@@ -2024,6 +2038,9 @@ fn semantic_kind(
     if !matches!(value, Value::String(_) | Value::Number(_)) {
         return None;
     }
+    if context.claude_memory_paths && value.as_str().is_some_and(|value| !value.is_empty()) {
+        return Some(RedactionKind::ClaudeMemoryPath);
+    }
     let normalized = normalize_field(key);
     match normalized.as_str() {
         "requestid" => return Some(RedactionKind::ClaudeRequestId),
@@ -2044,6 +2061,12 @@ fn semantic_kind(
         "id" if matches!(context.entity, Entity::Turn) => return Some(RedactionKind::TurnId),
         "id" if matches!(context.entity, Entity::Item) => {
             return Some(RedactionKind::ToolUseId);
+        }
+        "id" if context.claude_capture
+            && object.get("type").and_then(Value::as_str) == Some("message")
+            && object.get("role").and_then(Value::as_str) == Some("assistant") =>
+        {
+            return Some(RedactionKind::ClaudeMessageId);
         }
         "id" if object.get("type").and_then(Value::as_str) == Some("tool_use") => {
             return Some(RedactionKind::ToolUseId);
@@ -2122,6 +2145,9 @@ fn child_context(mut context: SemanticContext, key: &str) -> SemanticContext {
     }
     if normalized == "availabilitynux" {
         context.availability_nux = true;
+    }
+    if normalized == "memorypaths" {
+        context.claude_memory_paths = true;
     }
     context
 }
