@@ -206,10 +206,17 @@ pub struct CaptureConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlatformMetadata {
+    pub os: String,
+    pub arch: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RawCapture {
     pub directory: PathBuf,
     pub provider: Provider,
     pub cli_version: String,
+    pub platform: PlatformMetadata,
     pub command: CommandSnapshot,
     pub events: Vec<CaptureEvent>,
     pub exit_code: Option<i32>,
@@ -241,10 +248,17 @@ struct RecordingSession {
     stdout_lines: mpsc::UnboundedReceiver<String>,
     readers: Vec<tokio::task::JoinHandle<()>>,
     events: Arc<Mutex<Vec<CaptureEvent>>>,
+    #[cfg(test)]
+    reap_notice: Option<std::sync::mpsc::SyncSender<u32>>,
 }
 
 impl RecordingSession {
-    async fn start(config: CaptureConfig) -> anyhow::Result<Self> {
+    async fn start(mut config: CaptureConfig) -> anyhow::Result<Self> {
+        if let CaptureOperation::Codex(CodexCaptureOperation::Run { request, .. }) =
+            &mut config.scenario.operation
+        {
+            *request = crate::codex::normalize_run_request(request.clone());
+        }
         let provider = match &config.scenario.operation {
             CaptureOperation::Claude(_) => Provider::Claude,
             CaptureOperation::Codex(_) => Provider::Codex,
@@ -331,6 +345,8 @@ impl RecordingSession {
             stdout_lines,
             readers: vec![stdout_reader, stderr_reader],
             events,
+            #[cfg(test)]
+            reap_notice: None,
         })
     }
 
@@ -366,6 +382,10 @@ impl RecordingSession {
             directory: self.directory.clone(),
             provider: self.provider,
             cli_version: self.cli_version.clone(),
+            platform: PlatformMetadata {
+                os: std::env::consts::OS.into(),
+                arch: std::env::consts::ARCH.into(),
+            },
             command: self.command.clone(),
             events: self.events.lock().expect("capture event lock").clone(),
             exit_code,
@@ -664,10 +684,33 @@ impl Drop for RecordingSession {
             return;
         };
         let _ = child.start_kill();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let _ = tokio::time::timeout(CLEANUP_TIMEOUT, child.wait()).await;
+        #[cfg(test)]
+        let pid = child.id();
+        #[cfg(test)]
+        let notice = self.reap_notice.take();
+        let spawn = std::thread::Builder::new()
+            .name("comet-capture-reaper".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                let reaped = runtime.is_ok_and(|runtime| {
+                    runtime.block_on(async {
+                        matches!(
+                            tokio::time::timeout(CLEANUP_TIMEOUT, child.wait()).await,
+                            Ok(Ok(_))
+                        )
+                    })
+                });
+                #[cfg(test)]
+                if reaped && let (Some(pid), Some(notice)) = (pid, notice) {
+                    let _ = notice.send(pid);
+                }
+                #[cfg(not(test))]
+                let _ = reaped;
             });
+        if let Err(err) = spawn {
+            tracing::warn!(%err, "capture drop reaper thread could not start");
         }
     }
 }
@@ -1343,6 +1386,29 @@ mod tests {
         assert_eq!(capture.exit_code, Some(0));
     }
 
+    /// Break caught: raw evidence cannot identify the OS/architecture that produced its
+    /// provider frames, or persists prose instead of independently queryable fields.
+    #[tokio::test]
+    async fn recorder_persists_structured_host_platform() {
+        let raw = tempfile::tempdir().unwrap();
+        let capture = record(config(
+            "claude-platform",
+            fixture_path("fake-claude"),
+            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
+            raw.path(),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(capture.platform.os, std::env::consts::OS);
+        assert_eq!(capture.platform.arch, std::env::consts::ARCH);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(capture.directory.join("capture.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["platform"]["os"], std::env::consts::OS);
+        assert_eq!(persisted["platform"]["arch"], std::env::consts::ARCH);
+    }
+
     /// Break caught: stopping after the first Codex page, failing to serialize an opaque cursor,
     /// or omitting either half of the initialize handshake from the raw stdin record.
     #[tokio::test]
@@ -1440,6 +1506,85 @@ mod tests {
         assert_eq!(capture.exit_code, Some(0));
     }
 
+    /// Break caught: capture skips the production request normalization that works around
+    /// Codex's malformed workspace-write mount for linked slash-branch worktrees.
+    #[tokio::test]
+    async fn recorder_codex_run_preserves_production_linked_worktree_parameters() {
+        let raw = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let admin = tempfile::tempdir().unwrap();
+        std::fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}", admin.path().display()),
+        )
+        .unwrap();
+        std::fs::write(
+            admin.path().join("HEAD"),
+            "ref: refs/heads/feature/capture\n",
+        )
+        .unwrap();
+        let mut request = RunRequest {
+            prompt: "scenario:fail".into(),
+            model: Some("gpt-5.6-luna".into()),
+            reasoning: Some(ReasoningLevel::Low),
+            cwd: worktree.path().display().to_string(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
+        };
+        request
+            .model_options
+            .insert("serviceTier".into(), json!("fast"));
+
+        let capture = record(config(
+            "codex-linked-worktree",
+            fixture_path("fake-codex"),
+            CaptureOperation::Codex(CodexCaptureOperation::Run {
+                request,
+                script: CodexRunScript::FreshText,
+            }),
+            raw.path(),
+        ))
+        .await
+        .unwrap();
+
+        let stdin: Vec<serde_json::Value> = channel_payloads(&capture, Channel::Stdin)
+            .into_iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let thread = stdin
+            .iter()
+            .find(|line| line["method"] == "thread/start")
+            .unwrap();
+        assert_eq!(
+            thread["params"],
+            json!({
+                "cwd": worktree.path().display().to_string(),
+                "approvalPolicy": "untrusted",
+                "sandbox": "danger-full-access",
+                "approvalsReviewer": "user",
+                "model": "gpt-5.6-luna",
+                "serviceTier": "fast",
+            })
+        );
+        let turn = stdin
+            .iter()
+            .find(|line| line["method"] == "turn/start")
+            .unwrap();
+        assert_eq!(
+            turn["params"],
+            json!({
+                "threadId": "th-1",
+                "input": [{"type": "text", "text": "scenario:fail"}],
+                "approvalPolicy": "untrusted",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+                "summary": "auto",
+                "model": "gpt-5.6-luna",
+                "effort": "low",
+                "serviceTier": "fast",
+            })
+        );
+    }
+
     /// Break caught: the hard-timeout branch returns before killing and reaping the child.
     #[tokio::test]
     async fn recorder_timeout_kills_and_reaps_the_child() {
@@ -1463,6 +1608,44 @@ mod tests {
         let pid = session.child_id().expect("spawned child id");
         let error = session.finish().await.unwrap_err();
         assert!(error.to_string().contains("timed out"));
+        assert!(!process_is_live(pid), "provider child {pid} remains live");
+    }
+
+    /// Break caught: drop delegates `wait()` to the originating Tokio runtime, whose shutdown
+    /// cancels the task before the killed child is reaped.
+    #[test]
+    fn recorder_drop_reaper_survives_originating_runtime_shutdown() {
+        let raw = tempfile::tempdir().unwrap();
+        let request = RunRequest {
+            prompt: "scenario:interrupt".into(),
+            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
+        };
+        let config = config(
+            "claude-drop",
+            fixture_path("fake-claude"),
+            CaptureOperation::Claude(ClaudeCaptureOperation::Run {
+                request,
+                script: ClaudeRunScript::FreshText,
+            }),
+            raw.path(),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut session = runtime.block_on(RecordingSession::start(config)).unwrap();
+        let pid = session.child_id().expect("spawned child id");
+        let (reaped_tx, reaped_rx) = std::sync::mpsc::sync_channel(1);
+        session.reap_notice = Some(reaped_tx);
+
+        runtime.block_on(async move { drop(session) });
+        drop(runtime);
+
+        assert_eq!(
+            reaped_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(pid),
+            "drop reaper did not finish after its originating runtime shut down"
+        );
         assert!(!process_is_live(pid), "provider child {pid} remains live");
     }
 

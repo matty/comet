@@ -129,6 +129,40 @@ fn worktree_on_slashed_branch(cwd: &str) -> bool {
         .is_some_and(|branch| branch.contains('/'))
 }
 
+/// Apply the request rewrites that must precede both launch and wire setup.
+pub(crate) fn normalize_run_request(mut request: RunRequest) -> RunRequest {
+    // Codex ≤0.144.x: the workspace-write sandbox derives a MALFORMED
+    // worktree mount when the checked-out branch name contains '/'
+    // (verified against the real CLI: `wing/x` in a linked worktree kills
+    // every command before it starts; `wing-x` is fine; explicit
+    // writableRoots don't suppress the broken derivation; full access
+    // works). Escalate that exact shape instead of shipping a session
+    // where nothing can run.
+    if request.sandbox == comet_proto::SandboxLevel::WorkspaceWrite
+        && worktree_on_slashed_branch(&request.cwd)
+    {
+        tracing::warn!(
+            cwd = %request.cwd,
+            "codex sandbox escalated to danger-full-access: linked worktree on a \
+             slash-named branch trips codex's worktree-mount derivation"
+        );
+        // `runtime_mode` is read further down — by `approvals_reviewer`
+        // on `thread/start`, and by the `RuntimeMode::FullAccess` check
+        // below — so this escalation matters to more than the sandbox.
+        // It raises only `sandbox` and deliberately leaves `runtime_mode`
+        // as the caller set it, so the reviewer keeps reflecting what the
+        // caller asked for rather than what this CLI-bug workaround
+        // forced. On a full-access request the pair stays coherent by
+        // coincidence; on any other mode it does not — the request now
+        // runs with a danger-full-access sandbox under a mode that did
+        // not ask for one. Whoever next derives Codex's approval *policy*
+        // from `runtime_mode` still has to decide whether escalating the
+        // sandbox here should escalate the policy too.
+        request.sandbox = comet_proto::SandboxLevel::DangerFullAccess;
+    }
+    request
+}
+
 /// Describe the exact process launch used for a Codex run.
 pub(crate) fn run_launch(exe: &Path, request: &RunRequest) -> crate::capture::LaunchDescriptor {
     let mut configured_env = std::collections::BTreeMap::new();
@@ -320,39 +354,11 @@ impl Harness for CodexHarness {
 
     async fn run(
         &self,
-        mut request: RunRequest,
+        request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        // Codex ≤0.144.x: the workspace-write sandbox derives a MALFORMED
-        // worktree mount when the checked-out branch name contains '/'
-        // (verified against the real CLI: `wing/x` in a linked worktree kills
-        // every command before it starts; `wing-x` is fine; explicit
-        // writableRoots don't suppress the broken derivation; full access
-        // works). Escalate that exact shape instead of shipping a session
-        // where nothing can run.
-        if request.sandbox == comet_proto::SandboxLevel::WorkspaceWrite
-            && worktree_on_slashed_branch(&request.cwd)
-        {
-            tracing::warn!(
-                cwd = %request.cwd,
-                "codex sandbox escalated to danger-full-access: linked worktree on a \
-                 slash-named branch trips codex's worktree-mount derivation"
-            );
-            // `runtime_mode` is read further down — by `approvals_reviewer`
-            // on `thread/start`, and by the `RuntimeMode::FullAccess` check
-            // below — so this escalation matters to more than the sandbox.
-            // It raises only `sandbox` and deliberately leaves `runtime_mode`
-            // as the caller set it, so the reviewer keeps reflecting what the
-            // caller asked for rather than what this CLI-bug workaround
-            // forced. On a full-access request the pair stays coherent by
-            // coincidence; on any other mode it does not — the request now
-            // runs with a danger-full-access sandbox under a mode that did
-            // not ask for one. Whoever next derives Codex's approval *policy*
-            // from `runtime_mode` still has to decide whether escalating the
-            // sandbox here should escalate the policy too.
-            request.sandbox = comet_proto::SandboxLevel::DangerFullAccess;
-        }
+        let request = normalize_run_request(request);
         let mut cmd = build_run_command(&exe, &request);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
