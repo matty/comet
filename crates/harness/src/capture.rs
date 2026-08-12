@@ -216,7 +216,7 @@ const CLAUDE_APPROVAL_COMMAND: &str = "printf capture";
 const CODEX_APPROVAL_COMMAND: &str = "echo capture";
 const APPROVAL_MARKER_NAME: &str = "capture-marker.txt";
 const APPROVAL_MARKER_CONTENT: &str = "capture\n";
-const APPROVAL_MARKER_DIFF: &str = "@@ -0,0 +1 @@\n+capture\n";
+const APPROVAL_MARKER_ADD_DIFF: &str = APPROVAL_MARKER_CONTENT;
 
 pub fn claude_approval_prompt(cwd: &Path) -> String {
     let marker = cwd.join(APPROVAL_MARKER_NAME);
@@ -2598,6 +2598,44 @@ fn validate_command_action(params: &Value, expected_command: &str) -> anyhow::Re
     Ok(())
 }
 
+fn validate_codex_raw_launcher(raw: &str) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        let executable = [
+            " -NoProfile -Command 'echo capture'",
+            " -Command 'echo capture'",
+        ]
+        .into_iter()
+        .find_map(|suffix| raw.strip_suffix(suffix))
+        .ok_or_else(|| {
+            anyhow!("Codex command approval request used an unexpected raw launcher.")
+        })?;
+        let executable = executable
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .filter(|value| !value.contains('"'))
+            .ok_or_else(|| {
+                anyhow!("Codex command approval request used an unexpected raw launcher.")
+            })?;
+        let known_name = executable.eq_ignore_ascii_case("pwsh.exe");
+        let known_absolute =
+            executable.eq_ignore_ascii_case(r"C:\Program Files\PowerShell\7\pwsh.exe");
+        if !known_name && !known_absolute {
+            bail!("Codex command approval request used an unexpected raw launcher.");
+        }
+    }
+    #[cfg(not(windows))]
+    if !matches!(
+        raw,
+        "/bin/sh -lc 'echo capture'"
+            | "/bin/bash -lc 'echo capture'"
+            | "/bin/zsh -lc 'echo capture'"
+    ) {
+        bail!("Codex command approval request used an unexpected raw launcher.");
+    }
+    Ok(())
+}
+
 fn validate_marker_change(item: &Value, cwd: &Path) -> anyhow::Result<()> {
     if item["type"] != "fileChange" || item["status"] != "inProgress" {
         bail!("Codex file-change approval request did not join an active file change.");
@@ -2612,7 +2650,7 @@ fn validate_marker_change(item: &Value, cwd: &Path) -> anyhow::Result<()> {
     let expected_path = cwd.join(APPROVAL_MARKER_NAME);
     if change["path"].as_str() != Some(expected_path.to_string_lossy().as_ref())
         || change["kind"] != json!({"type": "add"})
-        || change["diff"] != APPROVAL_MARKER_DIFF
+        || change["diff"] != APPROVAL_MARKER_ADD_DIFF
     {
         bail!("Codex file-change approval request did not match the exact bounded marker add.");
     }
@@ -2639,10 +2677,11 @@ fn validate_codex_approval_request(
     let (_, item_id) = codex_approval_ids(value, &mut state.request_ids, &mut state.item_ids)?;
     match method {
         "item/commandExecution/requestApproval" if state.command_approvals < 3 => {
-            if value["params"]["command"] != CODEX_APPROVAL_COMMAND {
-                bail!("Codex command approval request did not match the exact harmless command.");
-            }
             validate_command_action(&value["params"], CODEX_APPROVAL_COMMAND)?;
+            let raw = value["params"]["command"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Codex command approval request had no raw launcher."))?;
+            validate_codex_raw_launcher(raw)?;
             state.command_approvals += 1;
         }
         "item/fileChange/requestApproval"
@@ -3169,8 +3208,7 @@ impl RecordingSession {
             if matches!(
                 script,
                 CodexRunScript::Approval | CodexRunScript::ApprovalOnRequest
-            ) && value.get("id").is_some()
-                && method.ends_with("/requestApproval")
+            ) && method.ends_with("/requestApproval")
             {
                 if matches!(script, CodexRunScript::Approval) {
                     validate_codex_approval_request(
@@ -3616,6 +3654,7 @@ fn rpc_request(id: u64, method: &str, params: Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -4588,7 +4627,7 @@ mod tests {
             cwd: std::env::temp_dir().display().to_string(),
             ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
         };
-        record(config(
+        let capture = record(config(
             "codex-approval",
             fixture_path("fake-codex"),
             CaptureOperation::Codex(CodexCaptureOperation::Run {
@@ -4599,6 +4638,91 @@ mod tests {
         ))
         .await
         .unwrap();
+        let approvals: Vec<serde_json::Value> = channel_payloads(&capture, Channel::Stdout)
+            .into_iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .filter(|value: &serde_json::Value| {
+                value["method"] == "item/commandExecution/requestApproval"
+            })
+            .collect();
+        assert_eq!(approvals.len(), 3);
+        assert_eq!(
+            approvals
+                .iter()
+                .filter_map(|value| value["params"]["command"].as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3,
+            "the fixture must preserve raw-launcher variation"
+        );
+        assert!(approvals.iter().all(|value| {
+            value["params"]["commandActions"]
+                == json!([{"type": "unknown", "command": super::CODEX_APPROVAL_COMMAND}])
+        }));
+    }
+
+    #[test]
+    fn codex_approval_raw_launcher_allowlist_is_finite() {
+        #[cfg(windows)]
+        let accepted = [
+            r#""pwsh.exe" -Command 'echo capture'"#,
+            r#""C:\Program Files\PowerShell\7\pwsh.exe" -Command 'echo capture'"#,
+            r#""pwsh.exe" -NoProfile -Command 'echo capture'"#,
+        ];
+        #[cfg(not(windows))]
+        let accepted = [
+            "/bin/sh -lc 'echo capture'",
+            "/bin/bash -lc 'echo capture'",
+            "/bin/zsh -lc 'echo capture'",
+        ];
+        for launcher in accepted {
+            assert!(
+                super::validate_codex_raw_launcher(launcher).is_ok(),
+                "rejected bounded launcher: {launcher:?}"
+            );
+        }
+        for launcher in [
+            "echo capture",
+            r#""C:\hostile\pwsh.exe" -Command 'echo capture'"#,
+            r#""pwsh.exe" -Command 'echo capture && whoami'"#,
+            r#""pwsh.exe" -Command 'echo capture > marker'"#,
+        ] {
+            assert!(
+                super::validate_codex_raw_launcher(launcher).is_err(),
+                "accepted unbounded launcher: {launcher:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_approval_rejects_missing_or_invalid_rpc_ids_before_accepting() {
+        for prompt in [
+            "scenario:capture-approval-missing-id",
+            "scenario:capture-approval-invalid-id",
+        ] {
+            let raw = tempfile::tempdir().unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            let request = RunRequest {
+                prompt: prompt.into(),
+                cwd: cwd.path().display().to_string(),
+                ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
+            };
+            let (error, stdin) = failed_session_stdin(config(
+                "codex-approval-invalid-id",
+                fixture_path("fake-codex"),
+                CaptureOperation::Codex(CodexCaptureOperation::Run {
+                    request,
+                    script: CodexRunScript::Approval,
+                }),
+                raw.path(),
+            ))
+            .await;
+            assert!(
+                stdin.iter().all(|line| !line.contains("\"decision\"")),
+                "invalid approval ID received accept: {stdin:?}"
+            );
+            assert!(error.contains("approval request"), "{error}");
+        }
     }
 
     #[tokio::test]
