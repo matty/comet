@@ -223,7 +223,7 @@ fn capture_config_with_env(
                     ClaudeRunScript::FreshText,
                 ),
                 "approval" => (
-                    "Use Bash to print the word capture, then use Write to create capture-marker.txt inside the working directory.".to_owned(),
+                    comet_harness::capture::claude_approval_prompt(&cwd),
                     ClaudeRunScript::Approval,
                 ),
                 "resume" => (
@@ -299,11 +299,13 @@ fn capture_config_with_env(
                     CodexRunScript::FreshText,
                 ),
                 "approval" => (
-                    "Run the same harmless print command three separate times, then make one small file change inside the working directory.".to_owned(),
+                    comet_harness::capture::codex_approval_prompt(&cwd),
                     CodexRunScript::Approval,
                 ),
                 "approval-on-request" => (
-                    approval_on_request_prompt(approval_target.as_deref().expect("validated target")),
+                    comet_harness::capture::approval_on_request_prompt(
+                        approval_target.as_deref().expect("validated target"),
+                    ),
                     CodexRunScript::ApprovalOnRequest,
                 ),
                 "resume" => (
@@ -496,30 +498,6 @@ fn validate_approval_target(
         return Err("--approval-target must be empty.".into());
     }
     Ok(target)
-}
-
-fn approval_on_request_prompt(target: &std::path::Path) -> String {
-    #[cfg(windows)]
-    let command = {
-        let path = target
-            .join("approval-marker.txt")
-            .display()
-            .to_string()
-            .replace('\'', "''");
-        format!(
-            "powershell.exe -NoProfile -Command \"Set-Content -LiteralPath '{path}' -Value 'capture' -NoNewline\""
-        )
-    };
-    #[cfg(not(windows))]
-    let command = {
-        let path = target
-            .join("approval-marker.txt")
-            .display()
-            .to_string()
-            .replace('\'', "'\\''");
-        format!("printf %s capture > '{path}'")
-    };
-    format!("Run this exact command once and report success: {command}")
 }
 
 fn exit_with(message: &str) -> ! {
@@ -719,7 +697,7 @@ mod tests {
         } else {
             "/capture targets/O'Brien"
         });
-        let prompt = approval_on_request_prompt(&target);
+        let prompt = comet_harness::capture::approval_on_request_prompt(&target);
         assert!(prompt.contains("approval-marker.txt"));
         if cfg!(windows) {
             assert!(

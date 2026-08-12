@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -210,6 +210,61 @@ pub struct CaptureConfig {
     pub approval_target: Option<PathBuf>,
     pub raw_root: PathBuf,
     pub timeout: Duration,
+}
+
+const CLAUDE_APPROVAL_COMMAND: &str = "printf capture";
+const CODEX_APPROVAL_COMMAND: &str = "echo capture";
+const APPROVAL_MARKER_NAME: &str = "capture-marker.txt";
+const APPROVAL_MARKER_CONTENT: &str = "capture\n";
+const APPROVAL_MARKER_DIFF: &str = "@@ -0,0 +1 @@\n+capture\n";
+
+pub fn claude_approval_prompt(cwd: &Path) -> String {
+    let marker = cwd.join(APPROVAL_MARKER_NAME);
+    format!(
+        "Use Bash exactly once with input {{\"command\":{}}}. Then use Write exactly once with input {{\"file_path\":{},\"content\":{}}}.",
+        serde_json::to_string(CLAUDE_APPROVAL_COMMAND).expect("static command serializes"),
+        serde_json::to_string(&marker.display().to_string()).expect("path serializes"),
+        serde_json::to_string(APPROVAL_MARKER_CONTENT).expect("static content serializes"),
+    )
+}
+
+pub fn codex_approval_prompt(cwd: &Path) -> String {
+    let marker = cwd.join(APPROVAL_MARKER_NAME);
+    format!(
+        "Run the exact command {} three separate times, then add exactly one file at {} containing exactly capture followed by one newline.",
+        serde_json::to_string(CODEX_APPROVAL_COMMAND).expect("static command serializes"),
+        serde_json::to_string(&marker.display().to_string()).expect("path serializes"),
+    )
+}
+
+pub fn approval_marker_command(target: &Path) -> String {
+    #[cfg(windows)]
+    {
+        let path = target
+            .join("approval-marker.txt")
+            .display()
+            .to_string()
+            .replace('\'', "''");
+        format!(
+            "powershell.exe -NoProfile -Command \"Set-Content -LiteralPath '{path}' -Value 'capture' -NoNewline\""
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let path = target
+            .join("approval-marker.txt")
+            .display()
+            .to_string()
+            .replace('\'', "'\\''");
+        format!("printf %s capture > '{path}'")
+    }
+}
+
+pub fn approval_on_request_prompt(target: &Path) -> String {
+    format!(
+        "Run this exact command once and report success: {}",
+        approval_marker_command(target)
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2290,6 +2345,388 @@ fn is_staging_output(output: &Path) -> bool {
     })
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    canonical: PathBuf,
+    #[cfg(windows)]
+    volume_serial_number: u32,
+    #[cfg(windows)]
+    file_index: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn directory_identity(path: &Path) -> anyhow::Result<DirectoryIdentity> {
+    let link_metadata = std::fs::symlink_metadata(path).map_err(|_| {
+        anyhow!("Codex on-request approval target must remain an accessible empty directory.")
+    })?;
+    if link_metadata.file_type().is_symlink() {
+        bail!("Codex on-request approval target must not be a symbolic link.");
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| {
+        anyhow!("Codex on-request approval target must remain an accessible empty directory.")
+    })?;
+    let metadata = std::fs::metadata(&canonical).map_err(|_| {
+        anyhow!("Codex on-request approval target must remain an accessible empty directory.")
+    })?;
+    if !metadata.is_dir() {
+        bail!("Codex on-request approval target must remain an empty directory.");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
+        };
+        let wide: Vec<u16> = canonical.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: `wide` is a live, NUL-terminated UTF-16 path for this call.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            bail!("Codex on-request approval target identity could not be opened.");
+        }
+        // SAFETY: ownership of the newly opened handle transfers to `File`.
+        let file = unsafe { std::fs::File::from_raw_handle(handle) };
+        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        // SAFETY: the live file handle and writable output pointer are valid for this call.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+            bail!("Codex on-request approval target identity could not be read.");
+        }
+        // SAFETY: the successful call initialized the whole structure.
+        let info = unsafe { info.assume_init() };
+        Ok(DirectoryIdentity {
+            canonical,
+            volume_serial_number: info.dwVolumeSerialNumber,
+            file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        })
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(DirectoryIdentity {
+            canonical,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+fn require_empty_approval_target(
+    target: &Path,
+    expected_identity: Option<&DirectoryIdentity>,
+) -> anyhow::Result<DirectoryIdentity> {
+    let identity = directory_identity(target)?;
+    if expected_identity.is_some_and(|expected| expected != &identity) {
+        bail!("Codex on-request approval target changed identity before approval.");
+    }
+    let mut entries = std::fs::read_dir(target).map_err(|_| {
+        anyhow!("Codex on-request approval target must remain an accessible empty directory.")
+    })?;
+    if entries.next().is_some() {
+        bail!("Codex on-request approval target must remain empty before approval.");
+    }
+    Ok(identity)
+}
+
+fn validate_on_request_preflight(
+    config: &CaptureConfig,
+) -> anyhow::Result<Option<DirectoryIdentity>> {
+    let CaptureOperation::Codex(CodexCaptureOperation::Run { request, script }) =
+        &config.scenario.operation
+    else {
+        return Ok(None);
+    };
+    if !matches!(script, CodexRunScript::ApprovalOnRequest) {
+        return Ok(None);
+    }
+    if request.runtime_mode != comet_proto::RuntimeMode::AutoAcceptEdits
+        || request.sandbox != comet_proto::SandboxLevel::WorkspaceWrite
+    {
+        bail!("Codex on-request capture requires workspace-write/on-request runtime settings.");
+    }
+    let cwd = Path::new(&request.cwd);
+    let cwd = std::fs::canonicalize(cwd).map_err(|_| {
+        anyhow!("Codex on-request capture requires an accessible non-repository cwd.")
+    })?;
+    if repository_root(&cwd).is_some() {
+        bail!("Codex on-request capture requires a non-repository, non-worktree cwd.");
+    }
+    let target = config
+        .approval_target
+        .as_deref()
+        .ok_or_else(|| anyhow!("Codex on-request capture requires a validated approval target."))?;
+    let identity = directory_identity(target)?;
+    if identity.canonical.starts_with(&cwd) || cwd.starts_with(&identity.canonical) {
+        bail!("Codex on-request approval target must remain isolated from the cwd.");
+    }
+    let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    if identity.canonical.starts_with(temp) {
+        bail!("Codex on-request approval target must remain outside the system temporary tree.");
+    }
+    if target.join(".git").is_file() {
+        bail!("Codex on-request approval target must not be a linked worktree.");
+    }
+    require_empty_approval_target(target, Some(&identity))?;
+    Ok(Some(identity))
+}
+
+#[derive(Default)]
+struct ClaudeApprovalState {
+    request_ids: BTreeSet<String>,
+    approved: u8,
+}
+
+fn validate_claude_approval_request(
+    value: &Value,
+    cwd: &Path,
+    state: &mut ClaudeApprovalState,
+) -> anyhow::Result<Value> {
+    let request_id = value["request_id"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| anyhow!("Claude approval request had no nonempty request identifier."))?;
+    if !state.request_ids.insert(request_id.to_owned()) {
+        bail!("Claude approval request repeated a request identifier.");
+    }
+    let request = &value["request"];
+    if request["subtype"] != "can_use_tool" {
+        bail!("Claude approval request had an unexpected subtype.");
+    }
+    let expected_tool = match state.approved {
+        0 => "Bash",
+        1 => "Write",
+        _ => bail!("Claude approval request exceeded the bounded tool sequence."),
+    };
+    if request["tool_name"] != expected_tool {
+        bail!("Claude approval request used an unexpected tool or order.");
+    }
+    let input = request["input"].clone();
+    match expected_tool {
+        "Bash" => {
+            if input != json!({"command": CLAUDE_APPROVAL_COMMAND}) {
+                bail!("Claude Bash approval request did not match the exact harmless command.");
+            }
+        }
+        "Write" => {
+            let expected_path = cwd.join(APPROVAL_MARKER_NAME);
+            let expected = json!({
+                "file_path": expected_path.display().to_string(),
+                "content": APPROVAL_MARKER_CONTENT,
+            });
+            if input != expected {
+                bail!("Claude Write approval request did not match the exact bounded marker.");
+            }
+            let canonical_cwd = std::fs::canonicalize(cwd).map_err(|_| {
+                anyhow!("Claude Write approval request cwd could not be validated.")
+            })?;
+            let canonical_parent = expected_path
+                .parent()
+                .and_then(|parent| std::fs::canonicalize(parent).ok())
+                .ok_or_else(|| {
+                    anyhow!("Claude Write approval request marker parent could not be validated.")
+                })?;
+            if canonical_parent != canonical_cwd {
+                bail!("Claude Write approval request escaped the configured cwd.");
+            }
+        }
+        _ => unreachable!("bounded tool allowlist"),
+    }
+    state.approved += 1;
+    Ok(input)
+}
+
+#[derive(Default)]
+struct CodexApprovalState {
+    request_ids: BTreeSet<u64>,
+    item_ids: BTreeSet<String>,
+    command_approvals: u8,
+    file_change_approvals: u8,
+    file_items: BTreeMap<String, Value>,
+}
+
+#[derive(Default)]
+struct CodexOnRequestState {
+    request_ids: BTreeSet<u64>,
+    failed_item_id: Option<String>,
+    stage: u8,
+}
+
+fn codex_approval_ids(
+    value: &Value,
+    request_ids: &mut BTreeSet<u64>,
+    item_ids: &mut BTreeSet<String>,
+) -> anyhow::Result<(u64, String)> {
+    let request_id = value["id"].as_u64().filter(|id| *id != 0).ok_or_else(|| {
+        anyhow!("Codex approval request had no valid numeric request identifier.")
+    })?;
+    if !request_ids.insert(request_id) {
+        bail!("Codex approval request repeated a request identifier.");
+    }
+    let item_id = value["params"]["itemId"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| anyhow!("Codex approval request had no nonempty item identifier."))?
+        .to_owned();
+    if !item_ids.insert(item_id.clone()) {
+        bail!("Codex approval request repeated an item identifier.");
+    }
+    Ok((request_id, item_id))
+}
+
+fn validate_command_action(params: &Value, expected_command: &str) -> anyhow::Result<()> {
+    let actions = params["commandActions"]
+        .as_array()
+        .ok_or_else(|| anyhow!("Codex command approval request had no bounded command action."))?;
+    let expected = json!({"type": "unknown", "command": expected_command});
+    if actions.len() != 1 || actions[0] != expected {
+        bail!("Codex command approval request used an unexpected command action.");
+    }
+    Ok(())
+}
+
+fn validate_marker_change(item: &Value, cwd: &Path) -> anyhow::Result<()> {
+    if item["type"] != "fileChange" || item["status"] != "inProgress" {
+        bail!("Codex file-change approval request did not join an active file change.");
+    }
+    let changes = item["changes"]
+        .as_array()
+        .ok_or_else(|| anyhow!("Codex file-change approval request had no bounded change."))?;
+    if changes.len() != 1 {
+        bail!("Codex file-change approval request had an unexpected number of changes.");
+    }
+    let change = &changes[0];
+    let expected_path = cwd.join(APPROVAL_MARKER_NAME);
+    if change["path"].as_str() != Some(expected_path.to_string_lossy().as_ref())
+        || change["kind"] != json!({"type": "add"})
+        || change["diff"] != APPROVAL_MARKER_DIFF
+    {
+        bail!("Codex file-change approval request did not match the exact bounded marker add.");
+    }
+    let canonical_cwd = std::fs::canonicalize(cwd)
+        .map_err(|_| anyhow!("Codex file-change approval request cwd could not be validated."))?;
+    let canonical_parent = expected_path
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .ok_or_else(|| {
+            anyhow!("Codex file-change approval request marker parent could not be validated.")
+        })?;
+    if canonical_parent != canonical_cwd {
+        bail!("Codex file-change approval request escaped the configured cwd.");
+    }
+    Ok(())
+}
+
+fn validate_codex_approval_request(
+    value: &Value,
+    method: &str,
+    cwd: &Path,
+    state: &mut CodexApprovalState,
+) -> anyhow::Result<()> {
+    let (_, item_id) = codex_approval_ids(value, &mut state.request_ids, &mut state.item_ids)?;
+    match method {
+        "item/commandExecution/requestApproval" if state.command_approvals < 3 => {
+            if value["params"]["command"] != CODEX_APPROVAL_COMMAND {
+                bail!("Codex command approval request did not match the exact harmless command.");
+            }
+            validate_command_action(&value["params"], CODEX_APPROVAL_COMMAND)?;
+            state.command_approvals += 1;
+        }
+        "item/fileChange/requestApproval"
+            if state.command_approvals == 3 && state.file_change_approvals == 0 =>
+        {
+            let item = state.file_items.get(&item_id).ok_or_else(|| {
+                anyhow!("Codex file-change approval request did not join a preceding item/started.")
+            })?;
+            validate_marker_change(item, cwd)?;
+            state.file_change_approvals = 1;
+        }
+        _ => bail!("Codex approval request had an unexpected method, order, or count."),
+    }
+    Ok(())
+}
+
+fn validate_on_request_item(
+    value: &Value,
+    expected_command: &str,
+    state: &mut CodexOnRequestState,
+) -> anyhow::Result<()> {
+    let item = &value["params"]["item"];
+    if item["type"] != "commandExecution" || item["command"] != expected_command {
+        bail!(
+            "Codex on-request approval request command item did not match the exact bounded command."
+        );
+    }
+    let item_id = item["id"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| anyhow!("Codex on-request command item had no nonempty identifier."))?;
+    let exit_code = item["exitCode"].as_i64();
+    match state.stage {
+        0 if item["status"] == "failed" && exit_code.is_some_and(|code| code != 0) => {
+            state.failed_item_id = Some(item_id.to_owned());
+            state.stage = 1;
+        }
+        2 if item["status"] == "completed"
+            && exit_code == Some(0)
+            && state.failed_item_id.as_deref() == Some(item_id) =>
+        {
+            state.stage = 3;
+        }
+        _ => bail!("Codex on-request command events arrived out of order or changed identity."),
+    }
+    Ok(())
+}
+
+fn validate_codex_on_request_approval(
+    value: &Value,
+    method: &str,
+    expected_command: &str,
+    state: &mut CodexOnRequestState,
+) -> anyhow::Result<()> {
+    if method != "item/commandExecution/requestApproval" {
+        bail!("Codex on-request approval request had an unexpected method.");
+    }
+    if state.stage != 1 {
+        bail!("Codex on-request approval request arrived before the sandbox failure.");
+    }
+    let request_id = value["id"]
+        .as_u64()
+        .filter(|id| *id != 0)
+        .ok_or_else(|| anyhow!("Codex on-request approval request had no valid identifier."))?;
+    if !state.request_ids.insert(request_id) {
+        bail!("Codex on-request approval request repeated its request identifier.");
+    }
+    if value["params"]["itemId"].as_str() != state.failed_item_id.as_deref()
+        || value["params"]["command"] != expected_command
+    {
+        bail!("Codex on-request approval request changed the failed command or item.");
+    }
+    validate_command_action(&value["params"], expected_command)?;
+    let reason = value["params"]["reason"]
+        .as_str()
+        .or_else(|| value["params"]["failureReason"].as_str())
+        .unwrap_or_default();
+    if reason.trim().is_empty() {
+        bail!("Codex on-request approval request had no sandbox-failure reason.");
+    }
+    state.stage = 2;
+    Ok(())
+}
+
 /// A live capture owns its child until a terminal frame or hard timeout.
 ///
 /// The type remains private to the module; tests reach it only to retain the
@@ -2305,6 +2742,7 @@ struct RecordingSession {
     purpose: String,
     command: CommandSnapshot,
     approval_target: Option<PathBuf>,
+    approval_target_identity: Option<DirectoryIdentity>,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout_lines: mpsc::UnboundedReceiver<String>,
@@ -2316,10 +2754,20 @@ struct RecordingSession {
 
 impl RecordingSession {
     async fn start(mut config: CaptureConfig) -> anyhow::Result<Self> {
-        if let CaptureOperation::Codex(CodexCaptureOperation::Run { request, .. }) =
+        let approval_target_identity = validate_on_request_preflight(&config)?;
+        if let CaptureOperation::Codex(CodexCaptureOperation::Run { request, script }) =
             &mut config.scenario.operation
         {
+            let approval_on_request = matches!(*script, CodexRunScript::ApprovalOnRequest);
             *request = crate::codex::normalize_run_request(request.clone());
+            if approval_on_request
+                && (request.runtime_mode != comet_proto::RuntimeMode::AutoAcceptEdits
+                    || request.sandbox != comet_proto::SandboxLevel::WorkspaceWrite)
+            {
+                bail!(
+                    "Codex on-request capture must remain workspace-write/on-request after production normalization."
+                );
+            }
         }
         let provider = match &config.scenario.operation {
             CaptureOperation::Claude(_) => Provider::Claude,
@@ -2350,6 +2798,11 @@ impl RecordingSession {
                 "Raw capture storage could not be created. Check --raw-root permissions and try again."
             )
         })?;
+
+        let spawn_identity = validate_on_request_preflight(&config)?;
+        if spawn_identity != approval_target_identity {
+            bail!("Codex on-request approval target changed identity before provider spawn.");
+        }
 
         let mut child = launch.command().spawn().map_err(|err| {
             tracing::debug!(provider = provider_name(provider), cli = %executable.display(), %err, "capture provider spawn failed");
@@ -2415,6 +2868,7 @@ impl RecordingSession {
             purpose: config.scenario.purpose.into(),
             command,
             approval_target: config.approval_target,
+            approval_target_identity,
             child: Some(child),
             stdin: Some(stdin),
             stdout_lines,
@@ -2516,21 +2970,20 @@ impl RecordingSession {
     ) -> anyhow::Result<()> {
         let line = claude_user_line(&request, script).await?;
         self.write_line(&line).await?;
-        let mut approval_tools = std::collections::BTreeSet::new();
+        let mut approval = ClaudeApprovalState::default();
         while let Some(line) = self.next_stdout().await? {
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
             if value["type"] == "control_request" && matches!(script, ClaudeRunScript::Approval) {
+                let original_input = validate_claude_approval_request(
+                    &value,
+                    Path::new(&request.cwd),
+                    &mut approval,
+                )?;
                 let request_id = value["request_id"]
                     .as_str()
-                    .or_else(|| value["response"]["request_id"].as_str())
-                    .unwrap_or_default();
-                let tool = value["request"]["tool_name"].as_str().unwrap_or_default();
-                if matches!(tool, "Bash" | "Write") {
-                    approval_tools.insert(tool.to_owned());
-                }
-                let original_input = value["request"]["input"].clone();
+                    .expect("validated approval request id");
                 let response = json!({
                     "type": "control_response",
                     "response": {
@@ -2548,11 +3001,10 @@ impl RecordingSession {
                 if value["subtype"] != "success" {
                     bail!("Claude ended the capture without a successful terminal result.");
                 }
-                if matches!(script, ClaudeRunScript::Approval)
-                    && approval_tools
-                        != std::collections::BTreeSet::from(["Bash".to_owned(), "Write".to_owned()])
-                {
-                    bail!("Claude approval capture did not request both Bash and Write approval.");
+                if matches!(script, ClaudeRunScript::Approval) && approval.approved != 2 {
+                    bail!(
+                        "Claude approval capture did not request exactly one Bash and one Write approval."
+                    );
                 }
                 if matches!(script, ClaudeRunScript::Resume)
                     && value["session_id"].as_str() != request.resume.as_deref()
@@ -2639,10 +3091,17 @@ impl RecordingSession {
         let mut scripted_action_sent = false;
         let mut scripted_reply_ok = false;
         let mut scripted_request_id = None;
-        let mut approval_methods = std::collections::BTreeSet::new();
-        let mut command_approvals = 0_u8;
-        let mut file_change_approvals = 0_u8;
-        let mut on_request_stage = 0_u8;
+        let mut approval = CodexApprovalState::default();
+        let mut on_request = CodexOnRequestState::default();
+        let expected_on_request_command = if matches!(script, CodexRunScript::ApprovalOnRequest) {
+            Some(approval_marker_command(
+                self.approval_target.as_deref().ok_or_else(|| {
+                    anyhow!("Codex on-request capture has no validated approval target.")
+                })?,
+            ))
+        } else {
+            None
+        };
         while let Some(line) = self.next_stdout().await? {
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
@@ -2650,6 +3109,22 @@ impl RecordingSession {
             let method = value["method"].as_str().unwrap_or_default();
             if method == "turn/started" {
                 active_turn = value["params"]["turn"]["id"].as_str().map(str::to_owned);
+            }
+            if matches!(script, CodexRunScript::Approval)
+                && method == "item/started"
+                && value["params"]["item"]["type"] == "fileChange"
+            {
+                let item = &value["params"]["item"];
+                let item_id = item["id"]
+                    .as_str()
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or_else(|| {
+                        anyhow!("Codex file-change item preceding approval had no identifier.")
+                    })?
+                    .to_owned();
+                if approval.file_items.insert(item_id, item.clone()).is_some() {
+                    bail!("Codex file-change approval request repeated its preceding item.");
+                }
             }
             if !scripted_action_sent {
                 match script {
@@ -2698,27 +3173,25 @@ impl RecordingSession {
                 && method.ends_with("/requestApproval")
             {
                 if matches!(script, CodexRunScript::Approval) {
-                    approval_methods.insert(method.to_owned());
-                    if method == "item/commandExecution/requestApproval" {
-                        command_approvals = command_approvals.saturating_add(1);
-                    } else if method == "item/fileChange/requestApproval" {
-                        file_change_approvals = file_change_approvals.saturating_add(1);
-                    }
+                    validate_codex_approval_request(
+                        &value,
+                        method,
+                        Path::new(&request.cwd),
+                        &mut approval,
+                    )?;
                 } else {
-                    if method != "item/commandExecution/requestApproval" {
-                        bail!("Codex on-request scenario emitted a non-command approval request.");
-                    }
-                    if on_request_stage != 1 {
-                        bail!("Codex on-request approval arrived before the sandbox failure.");
-                    }
-                    let reason = value["params"]["reason"]
-                        .as_str()
-                        .or_else(|| value["params"]["failureReason"].as_str())
-                        .unwrap_or_default();
-                    if reason.trim().is_empty() {
-                        bail!("Codex on-request approval did not include a failure reason.");
-                    }
-                    on_request_stage = 2;
+                    validate_codex_on_request_approval(
+                        &value,
+                        method,
+                        expected_on_request_command
+                            .as_deref()
+                            .expect("on-request command configured"),
+                        &mut on_request,
+                    )?;
+                    let target = self.approval_target.as_deref().ok_or_else(|| {
+                        anyhow!("Codex on-request capture has no validated approval target.")
+                    })?;
+                    require_empty_approval_target(target, self.approval_target_identity.as_ref())?;
                 }
                 self.write_line(
                     &json!({
@@ -2734,24 +3207,20 @@ impl RecordingSession {
                 && method == "item/completed"
                 && value["params"]["item"]["type"] == "commandExecution"
             {
-                let exit_code = value["params"]["item"]["exitCode"].as_i64();
-                match (on_request_stage, exit_code) {
-                    (0, Some(code)) if code != 0 => on_request_stage = 1,
-                    (2, Some(0)) => on_request_stage = 3,
-                    _ => bail!("Codex on-request command events arrived out of order."),
-                }
+                validate_on_request_item(
+                    &value,
+                    expected_on_request_command
+                        .as_deref()
+                        .expect("on-request command configured"),
+                    &mut on_request,
+                )?;
             }
             if matches!(method, "turn/completed" | "turn/failed" | "turn/aborted") {
                 match script {
                     CodexRunScript::Approval => {
-                        let required = std::collections::BTreeSet::from([
-                            "item/commandExecution/requestApproval".to_owned(),
-                            "item/fileChange/requestApproval".to_owned(),
-                        ]);
                         if method != "turn/completed"
-                            || !required.is_subset(&approval_methods)
-                            || command_approvals < 3
-                            || file_change_approvals < 1
+                            || approval.command_approvals != 3
+                            || approval.file_change_approvals != 1
                         {
                             bail!(
                                 "Codex approval capture did not complete after three command and one file-change approvals."
@@ -2759,7 +3228,7 @@ impl RecordingSession {
                         }
                     }
                     CodexRunScript::ApprovalOnRequest => {
-                        if method != "turn/completed" || on_request_stage != 3 {
+                        if method != "turn/completed" || on_request.stage != 3 {
                             bail!(
                                 "Codex on-request approval did not complete the required failure, approval, retry sequence."
                             );
@@ -3647,6 +4116,18 @@ mod tests {
             .join(format!("{name}{suffix}"))
     }
 
+    fn isolated_tempdir(prefix: &str) -> tempfile::TempDir {
+        let current = std::env::current_dir().expect("current test directory");
+        let parent = current
+            .ancestors()
+            .find(|path| super::repository_root(path).is_none())
+            .expect("an ancestor outside the repository");
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(parent)
+            .expect("isolated test directory")
+    }
+
     fn config(
         name: &'static str,
         executable: PathBuf,
@@ -3674,6 +4155,33 @@ mod tests {
             .filter(|event| event.channel == channel)
             .map(|event| event.payload.as_str())
             .collect()
+    }
+
+    async fn failed_session_stdin(config: CaptureConfig) -> (String, Vec<String>) {
+        let mut session = RecordingSession::start(config).await.unwrap();
+        let result = session.finish().await;
+        let stdin = session
+            .events
+            .lock()
+            .expect("capture event lock")
+            .iter()
+            .filter(|event| event.channel == Channel::Stdin)
+            .map(|event| event.payload.clone())
+            .collect();
+        (
+            result
+                .expect_err("unsafe scenario must fail before approval")
+                .to_string(),
+            stdin,
+        )
+    }
+
+    fn contains_response_id(lines: &[String], id: u64) -> bool {
+        lines.iter().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .is_some_and(|value| value["id"].as_u64() == Some(id))
+        })
     }
 
     /// Break caught: selecting command discovery's non-bare launch for model discovery,
@@ -3940,8 +4448,10 @@ mod tests {
     #[tokio::test]
     async fn claude_approval_requires_bash_and_write_before_success() {
         let raw = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
         let request = RunRequest {
             prompt: "scenario:capture-approval".into(),
+            cwd: cwd.path().display().to_string(),
             ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
         };
         let capture = record(config(
@@ -3965,6 +4475,38 @@ mod tests {
             reply["response"]["response"]["behavior"] == "allow"
                 && reply["response"]["response"]["updatedInput"].is_object()
         }));
+    }
+
+    #[tokio::test]
+    async fn claude_approval_rejects_destructive_requests_before_replying() {
+        for prompt in [
+            "scenario:capture-approval-destructive-command",
+            "scenario:capture-approval-destructive-write",
+        ] {
+            let raw = tempfile::tempdir().unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            let request = RunRequest {
+                prompt: prompt.into(),
+                cwd: cwd.path().display().to_string(),
+                ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
+            };
+            let (error, stdin) = failed_session_stdin(config(
+                "claude-approval-adversarial",
+                fixture_path("fake-claude"),
+                CaptureOperation::Claude(ClaudeCaptureOperation::Run {
+                    request,
+                    script: ClaudeRunScript::Approval,
+                }),
+                raw.path(),
+            ))
+            .await;
+            assert_eq!(
+                stdin.len(),
+                if prompt.ends_with("write") { 2 } else { 1 },
+                "an unsafe control request received an allow response: {stdin:?}"
+            );
+            assert!(error.contains("approval request"), "{error}");
+        }
     }
 
     #[tokio::test]
@@ -4060,12 +4602,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_approval_rejects_destructive_requests_before_accepting() {
+        for (prompt, rejected_id) in [
+            ("scenario:capture-approval-destructive-command", 451),
+            ("scenario:capture-approval-destructive-file", 464),
+        ] {
+            let raw = tempfile::tempdir().unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            let request = RunRequest {
+                prompt: prompt.into(),
+                cwd: cwd.path().display().to_string(),
+                ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
+            };
+            let (error, stdin) = failed_session_stdin(config(
+                "codex-approval-adversarial",
+                fixture_path("fake-codex"),
+                CaptureOperation::Codex(CodexCaptureOperation::Run {
+                    request,
+                    script: CodexRunScript::Approval,
+                }),
+                raw.path(),
+            ))
+            .await;
+            assert!(
+                !contains_response_id(&stdin, rejected_id),
+                "unsafe approval {rejected_id} received accept: {stdin:?}"
+            );
+            assert!(error.contains("approval request"), "{error}");
+        }
+    }
+
+    #[tokio::test]
     async fn codex_on_request_requires_ordered_failure_approval_retry_and_marker() {
         let raw = tempfile::tempdir().unwrap();
-        let target = tempfile::tempdir().unwrap();
+        let cwd = isolated_tempdir("comet-onrequest-cwd-");
+        let target = isolated_tempdir("comet-onrequest-target-");
         let request = RunRequest {
             prompt: format!("scenario:capture-onrequest:{}", target.path().display()),
-            cwd: std::env::current_dir().unwrap().display().to_string(),
+            cwd: cwd.path().display().to_string(),
             ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
         };
         let mut config = config(
@@ -4088,10 +4662,11 @@ mod tests {
     #[tokio::test]
     async fn codex_on_request_rejects_approval_before_sandbox_failure() {
         let raw = tempfile::tempdir().unwrap();
-        let target = tempfile::tempdir().unwrap();
+        let cwd = isolated_tempdir("comet-onrequest-cwd-");
+        let target = isolated_tempdir("comet-onrequest-target-");
         let request = RunRequest {
             prompt: "scenario:capture-onrequest-out-of-order".into(),
-            cwd: std::env::current_dir().unwrap().display().to_string(),
+            cwd: cwd.path().display().to_string(),
             ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
         };
         let mut config = config(
@@ -4106,6 +4681,133 @@ mod tests {
         config.approval_target = Some(target.path().into());
         let error = record(config).await.unwrap_err();
         assert!(error.to_string().contains("before the sandbox failure"));
+    }
+
+    #[tokio::test]
+    async fn codex_on_request_rejects_a_destructive_command_before_accepting() {
+        let raw = tempfile::tempdir().unwrap();
+        let cwd = isolated_tempdir("comet-onrequest-cwd-");
+        let target = isolated_tempdir("comet-onrequest-target-");
+        let request = RunRequest {
+            prompt: "scenario:capture-onrequest-destructive".into(),
+            cwd: cwd.path().display().to_string(),
+            ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
+        };
+        let mut capture_config = config(
+            "codex-approval-on-request-adversarial",
+            fixture_path("fake-codex"),
+            CaptureOperation::Codex(CodexCaptureOperation::Run {
+                request,
+                script: CodexRunScript::ApprovalOnRequest,
+            }),
+            raw.path(),
+        );
+        capture_config.approval_target = Some(target.path().into());
+        let (error, stdin) = failed_session_stdin(capture_config).await;
+        assert!(
+            !contains_response_id(&stdin, 471),
+            "unsafe on-request command received accept: {stdin:?}"
+        );
+        assert!(error.contains("approval request"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn codex_on_request_preflight_rejects_repository_and_linked_worktree_cwds() {
+        for linked in [false, true] {
+            let raw = tempfile::tempdir().unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            if linked {
+                std::fs::write(cwd.path().join(".git"), "gitdir: unused").unwrap();
+            } else {
+                std::fs::create_dir(cwd.path().join(".git")).unwrap();
+            }
+            let target = isolated_tempdir("comet-onrequest-target-");
+            let request = RunRequest {
+                prompt: "scenario:capture-onrequest-destructive".into(),
+                cwd: cwd.path().display().to_string(),
+                ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
+            };
+            let mut capture_config = config(
+                "codex-approval-on-request-repository",
+                fixture_path("fake-codex"),
+                CaptureOperation::Codex(CodexCaptureOperation::Run {
+                    request,
+                    script: CodexRunScript::ApprovalOnRequest,
+                }),
+                raw.path(),
+            );
+            capture_config.approval_target = Some(target.path().into());
+            let error = match RecordingSession::start(capture_config).await {
+                Ok(_) => panic!("repository cwd must fail before spawn"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("non-repository"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_on_request_preflight_rechecks_target_emptiness_before_spawn() {
+        let raw = tempfile::tempdir().unwrap();
+        let cwd = isolated_tempdir("comet-onrequest-cwd-");
+        let target = isolated_tempdir("comet-onrequest-target-");
+        std::fs::write(target.path().join("appeared-after-config.txt"), "hostile").unwrap();
+        let request = RunRequest {
+            prompt: "scenario:capture-onrequest-destructive".into(),
+            cwd: cwd.path().display().to_string(),
+            ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
+        };
+        let mut capture_config = config(
+            "codex-approval-on-request-raced-before-spawn",
+            fixture_path("fake-codex"),
+            CaptureOperation::Codex(CodexCaptureOperation::Run {
+                request,
+                script: CodexRunScript::ApprovalOnRequest,
+            }),
+            raw.path(),
+        );
+        capture_config.approval_target = Some(target.path().into());
+        let error = match RecordingSession::start(capture_config).await {
+            Ok(_) => panic!("nonempty target must fail before spawn"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("empty"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn codex_on_request_rechecks_target_immediately_before_accepting() {
+        for race in ["target", "marker", "identity"] {
+            let raw = tempfile::tempdir().unwrap();
+            let cwd = isolated_tempdir("comet-onrequest-cwd-");
+            let target = isolated_tempdir("comet-onrequest-target-");
+            let prompt = format!(
+                "scenario:capture-onrequest-{race}-race:{}",
+                target.path().display()
+            );
+            let request = RunRequest {
+                prompt,
+                cwd: cwd.path().display().to_string(),
+                ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
+            };
+            let mut capture_config = config(
+                "codex-approval-on-request-target-race",
+                fixture_path("fake-codex"),
+                CaptureOperation::Codex(CodexCaptureOperation::Run {
+                    request,
+                    script: CodexRunScript::ApprovalOnRequest,
+                }),
+                raw.path(),
+            );
+            capture_config.approval_target = Some(target.path().into());
+            let (error, stdin) = failed_session_stdin(capture_config).await;
+            if race == "identity" {
+                std::fs::remove_dir(format!("{}.original", target.path().display())).unwrap();
+            }
+            assert!(
+                !contains_response_id(&stdin, 481),
+                "raced target received accept: {stdin:?}"
+            );
+            assert!(error.contains("approval target"), "{error}");
+        }
     }
 
     #[tokio::test]

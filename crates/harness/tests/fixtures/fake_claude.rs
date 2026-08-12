@@ -162,6 +162,10 @@ fn main() {
         notices();
     } else if first.contains("scenario:diagnostics") {
         diagnostics();
+    } else if first.contains("scenario:capture-approval-destructive-command") {
+        capture_destructive_command(&mut stdin);
+    } else if first.contains("scenario:capture-approval-destructive-write") {
+        capture_destructive_write(&mut stdin);
     } else if first.contains("scenario:capture-approval") {
         capture_approval(&mut stdin);
     } else if first.contains("scenario:approval") {
@@ -375,25 +379,59 @@ fn capture_approval(stdin: &mut StdinLock<'_>) {
     {
         exit(1);
     }
+    let marker = std::env::current_dir()
+        .expect("fixture cwd")
+        .join("capture-marker.txt")
+        .display()
+        .to_string();
     emit(
-        &r#"{"type":"control_request","request_id":"fake-write","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"__PATH__","content":"hi\n"},"description":"a.txt","tool_use_id":"toolu_fake"}}"#
-            .replace("__PATH__", WRITE_TARGET_JSON),
+        &serde_json::json!({
+            "type": "control_request",
+            "request_id": "fake-write",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Write",
+                "input": {"file_path": marker, "content": "capture\n"},
+                "description": "capture-marker.txt",
+                "tool_use_id": "toolu_fake",
+            },
+        })
+        .to_string(),
     );
     let write: serde_json::Value =
         serde_json::from_str(&read_line(stdin)).expect("a Write control response");
-    let expected = if cfg!(windows) {
-        r"C:\comet-fake-fixture\a.txt"
-    } else {
-        "/comet-fake-fixture/a.txt"
-    };
     if write["response"]["response"]["behavior"] != "allow"
         || write["response"]["response"]["updatedInput"]
-            != serde_json::json!({"file_path": expected, "content": "hi\n"})
+            != serde_json::json!({"file_path": marker, "content": "capture\n"})
     {
         exit(1);
     }
     emit(
         r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-1"}"#,
+    );
+}
+
+fn capture_destructive_command(stdin: &mut StdinLock<'_>) {
+    emit(
+        r#"{"type":"control_request","request_id":"bad-bash","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm -rf /"},"description":"destructive","tool_use_id":"toolu_bad"}}"#,
+    );
+    let _ = read_line(stdin);
+    emit(
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-bad"}"#,
+    );
+}
+
+fn capture_destructive_write(stdin: &mut StdinLock<'_>) {
+    emit(
+        r#"{"type":"control_request","request_id":"good-bash","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"printf capture"},"description":"print capture","tool_use_id":"toolu_bash"}}"#,
+    );
+    let _ = read_line(stdin);
+    emit(
+        r#"{"type":"control_request","request_id":"bad-write","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"/outside-cwd/destructive.txt","content":"overwrite"},"description":"destructive","tool_use_id":"toolu_bad"}}"#,
+    );
+    let _ = read_line(stdin);
+    emit(
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-bad"}"#,
     );
 }
 
