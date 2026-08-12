@@ -5944,7 +5944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_resume_and_zero_approval_cannot_be_relabelled_success() {
+    async fn strict_resume_cannot_be_relabelled_success() {
         let raw = tempfile::tempdir().unwrap();
         let claude_request = RunRequest {
             prompt: "scenario:happy".into(),
@@ -5963,7 +5963,12 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("different session identifier"));
+    }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn zero_approval_cannot_be_relabelled_success() {
+        let raw = tempfile::tempdir().unwrap();
         let codex_request = RunRequest {
             prompt: "scenario:capture-fresh".into(),
             cwd: std::env::temp_dir().display().to_string(),
@@ -6197,6 +6202,7 @@ mod tests {
         assert!(error.to_string().contains("safe Unix launcher"), "{error}");
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn codex_approval_rejects_missing_or_invalid_rpc_ids_before_accepting() {
         for prompt in [
@@ -6283,6 +6289,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn codex_approval_rejects_destructive_requests_before_accepting() {
         for (prompt, rejected_id) in [
@@ -6614,6 +6621,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn codex_approval_cwd_identity_and_marker_are_rechecked() {
         let parent = tempfile::tempdir().unwrap();
