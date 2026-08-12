@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -230,6 +230,758 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Record one explicitly selected provider script into ignored raw storage.
 pub async fn record(config: CaptureConfig) -> anyhow::Result<RawCapture> {
     RecordingSession::start(config).await?.finish().await
+}
+
+#[derive(Clone, Debug)]
+pub struct SanitizationReport {
+    pub events_path: PathBuf,
+    pub manifest_path: PathBuf,
+    pub events_bytes: Vec<u8>,
+    pub manifest_bytes: Vec<u8>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SanitizationError {
+    #[error("raw capture could not be read")]
+    ReadRaw {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("raw capture is not valid capture JSON")]
+    InvalidRaw {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("staging output must be below .comet-provider-captures/staging")]
+    UnsafeOutputDirectory,
+    #[error("capture contains an unrecognized absolute path at {location}")]
+    UnrecognizedAbsolutePath { location: String },
+    #[error("capture contains a secret-like field at {location}")]
+    SecretLikeField { location: String },
+    #[error("capture contains a secret-like value at {location}")]
+    SecretLikeValue { location: String },
+    #[error("capture channel contains unparseable structured JSON at sequence {sequence}")]
+    UnparseableStructuredPayload { sequence: u64 },
+    #[error("sanitized capture could not be written")]
+    WriteOutput {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("sanitized capture could not be encoded")]
+    EncodeOutput {
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RedactionKind {
+    ClaudeRequestId,
+    CodexRpcId,
+    SessionId,
+    ThreadId,
+    TurnId,
+    ToolUseId,
+    UserText,
+    AssistantProse,
+    AttachmentBytes,
+}
+
+impl RedactionKind {
+    fn placeholder_name(self) -> &'static str {
+        match self {
+            Self::ClaudeRequestId => "CLAUDE_REQUEST_ID",
+            Self::CodexRpcId => "CODEX_RPC_ID",
+            Self::SessionId => "SESSION_ID",
+            Self::ThreadId => "THREAD_ID",
+            Self::TurnId => "TURN_ID",
+            Self::ToolUseId => "TOOL_USE_ID",
+            Self::UserText => "USER_TEXT",
+            Self::AssistantProse => "ASSISTANT_PROSE",
+            Self::AttachmentBytes => "ATTACHMENT_BYTES",
+        }
+    }
+
+    fn manifest_name(self) -> &'static str {
+        match self {
+            Self::ClaudeRequestId => "claude_request_id",
+            Self::CodexRpcId => "codex_rpc_id",
+            Self::SessionId => "session_id",
+            Self::ThreadId => "thread_id",
+            Self::TurnId => "turn_id",
+            Self::ToolUseId => "tool_use_id",
+            Self::UserText => "user_text",
+            Self::AssistantProse => "assistant_prose",
+            Self::AttachmentBytes => "attachment_bytes",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SemanticValue {
+    original: Value,
+    placeholder: String,
+}
+
+#[derive(Default)]
+struct Redactor {
+    semantics: BTreeMap<RedactionKind, Vec<SemanticValue>>,
+    counts: BTreeMap<String, u64>,
+    paths: Vec<PathRedaction>,
+}
+
+#[derive(Clone)]
+struct PathRedaction {
+    values: Vec<String>,
+    placeholder: &'static str,
+    kind: &'static str,
+}
+
+#[derive(Clone, Copy, Default)]
+enum Speaker {
+    #[default]
+    Unknown,
+    User,
+    Assistant,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SemanticContext {
+    speaker: Speaker,
+    codex_turn_input: bool,
+    codex_assistant_prose: bool,
+}
+
+/// Convert one raw capture into reviewable staging artifacts.
+///
+/// All transformation and validation happens in memory. A rejected capture never creates its
+/// output directory, and errors identify only the value's structural location.
+pub fn sanitize_dir(
+    raw_dir: &Path,
+    output_dir: &Path,
+) -> Result<SanitizationReport, SanitizationError> {
+    if !is_staging_output(output_dir) {
+        return Err(SanitizationError::UnsafeOutputDirectory);
+    }
+
+    let bytes = std::fs::read(raw_dir.join("capture.json"))
+        .map_err(|source| SanitizationError::ReadRaw { source })?;
+    let capture: RawCapture = serde_json::from_slice(&bytes)
+        .map_err(|source| SanitizationError::InvalidRaw { source })?;
+    let mut redactor = Redactor::new(&capture);
+
+    let mut payloads = Vec::with_capacity(capture.events.len());
+    for event in &capture.events {
+        match serde_json::from_str::<Value>(&event.payload) {
+            Ok(payload) => payloads.push(Payload::Json(payload)),
+            Err(_) if event.channel == Channel::Stderr => {
+                payloads.push(Payload::Text(event.payload.clone()))
+            }
+            Err(_) => {
+                return Err(SanitizationError::UnparseableStructuredPayload {
+                    sequence: event.sequence,
+                });
+            }
+        }
+    }
+    for payload in &payloads {
+        if let Payload::Json(value) = payload {
+            redactor.collect_semantics(value, SemanticContext::default());
+        }
+    }
+
+    let mut command = serde_json::to_value(&capture.command)
+        .map_err(|source| SanitizationError::EncodeOutput { source })?;
+    redactor.sanitize_nonsemantic_value(&mut command, "command")?;
+
+    let mut events_bytes = Vec::new();
+    for (event, payload) in capture.events.iter().zip(&mut payloads) {
+        let payload = match payload {
+            Payload::Json(value) => {
+                redactor.sanitize_json(value, SemanticContext::default(), "event.payload")?;
+                serde_json::to_string(value)
+                    .map_err(|source| SanitizationError::EncodeOutput { source })?
+            }
+            Payload::Text(text) => {
+                redactor.sanitize_string(text, "event.payload")?;
+                text.clone()
+            }
+        };
+        let line = SanitizedEvent {
+            sequence: event.sequence,
+            channel: event.channel,
+            payload,
+        };
+        serde_json::to_writer(&mut events_bytes, &line)
+            .map_err(|source| SanitizationError::EncodeOutput { source })?;
+        events_bytes.push(b'\n');
+    }
+
+    let mut cli_version = capture.cli_version.clone();
+    redactor.sanitize_paths_and_validate(&mut cli_version, "cli_version")?;
+    let mut normalized_cli_version = capture.cli_version.trim().to_owned();
+    redactor.sanitize_paths_and_validate(&mut normalized_cli_version, "normalized_cli_version")?;
+    let mut platform = serde_json::to_value(&capture.platform)
+        .map_err(|source| SanitizationError::EncodeOutput { source })?;
+    redactor.sanitize_nonsemantic_value(&mut platform, "platform")?;
+    let channels: Vec<Channel> = capture.events.iter().fold(Vec::new(), |mut seen, event| {
+        if !seen.contains(&event.channel) {
+            seen.push(event.channel);
+        }
+        seen
+    });
+    let mut scenario = raw_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("capture")
+        .to_owned();
+    redactor.sanitize_paths_and_validate(&mut scenario, "scenario")?;
+    let manifest = json!({
+        "schema_version": 1,
+        "provider": capture.provider,
+        "cli_version": cli_version,
+        "normalized_cli_version": normalized_cli_version,
+        "platform": platform,
+        "scenario": scenario,
+        "command": command,
+        "channels": channels,
+        "exit_code": capture.exit_code,
+        "placeholders": redactor.placeholder_definitions(),
+        "redaction_counts": redactor.counts,
+    });
+    let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|source| SanitizationError::EncodeOutput { source })?;
+    manifest_bytes.push(b'\n');
+
+    std::fs::create_dir_all(output_dir)
+        .map_err(|source| SanitizationError::WriteOutput { source })?;
+    let events_path = output_dir.join("events.jsonl");
+    let manifest_path = output_dir.join("manifest.json");
+    std::fs::write(&events_path, &events_bytes)
+        .map_err(|source| SanitizationError::WriteOutput { source })?;
+    std::fs::write(&manifest_path, &manifest_bytes)
+        .map_err(|source| SanitizationError::WriteOutput { source })?;
+
+    Ok(SanitizationReport {
+        events_path,
+        manifest_path,
+        events_bytes,
+        manifest_bytes,
+    })
+}
+
+#[derive(Serialize)]
+struct SanitizedEvent {
+    sequence: u64,
+    channel: Channel,
+    payload: String,
+}
+
+enum Payload {
+    Json(Value),
+    Text(String),
+}
+
+impl Redactor {
+    fn new(capture: &RawCapture) -> Self {
+        let mut redactor = Self::default();
+        redactor.add_path(capture.command.cwd.as_deref(), "<CWD>", "cwd_path");
+        if let Some(cwd) = capture.command.cwd.as_deref().map(Path::new)
+            && let Some(repo) = repository_root(cwd)
+        {
+            redactor.add_path(repo.to_str(), "<REPO>", "repo_path");
+        }
+        redactor.add_path(
+            crate::home_dir().as_deref().and_then(Path::to_str),
+            "<HOME>",
+            "home_path",
+        );
+        let temp_dir = std::env::temp_dir();
+        redactor.add_path(temp_dir.to_str(), "<TEMP>", "temp_path");
+        redactor
+    }
+
+    fn add_path(&mut self, value: Option<&str>, placeholder: &'static str, kind: &'static str) {
+        let Some(value) = value.filter(|value| !value.is_empty()) else {
+            return;
+        };
+        if self
+            .paths
+            .iter()
+            .any(|redaction| redaction.values.iter().any(|known| known == value))
+        {
+            return;
+        }
+        let mut values = vec![value.to_owned()];
+        let slash = value.replace('\\', "/");
+        let backslash = value.replace('/', "\\");
+        for variant in [slash, backslash] {
+            if !values.contains(&variant) {
+                values.push(variant);
+            }
+        }
+        for variant in values.clone() {
+            if is_drive_absolute(&variant) {
+                values.push(format!(r"\\?\{variant}"));
+                values.push(format!("//?/{variant}"));
+            }
+        }
+        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        self.paths.push(PathRedaction {
+            values,
+            placeholder,
+            kind,
+        });
+        self.paths
+            .sort_by_key(|path| std::cmp::Reverse(path.values.first().map_or(0, String::len)));
+    }
+
+    fn collect_semantics(&mut self, value: &Value, context: SemanticContext) {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    self.collect_semantics(value, context);
+                }
+            }
+            Value::Object(object) => {
+                let context = object_context(object, context);
+                for (key, value) in object {
+                    if let Some(kind) = semantic_kind(object, key, value, context) {
+                        self.register(kind, value);
+                    } else {
+                        self.collect_semantics(value, context);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn register(&mut self, kind: RedactionKind, original: &Value) {
+        if !matches!(original, Value::String(_) | Value::Number(_)) {
+            return;
+        }
+        let values = self.semantics.entry(kind).or_default();
+        if values.iter().any(|value| value.original == *original) {
+            return;
+        }
+        values.push(SemanticValue {
+            original: original.clone(),
+            placeholder: format!("<{}_{}>", kind.placeholder_name(), values.len() + 1),
+        });
+    }
+
+    fn sanitize_json(
+        &mut self,
+        value: &mut Value,
+        context: SemanticContext,
+        location: &str,
+    ) -> Result<(), SanitizationError> {
+        match value {
+            Value::Array(values) => {
+                for (index, value) in values.iter_mut().enumerate() {
+                    self.sanitize_json(value, context, &format!("{location}[{index}]"))?;
+                }
+            }
+            Value::Object(object) => {
+                let context = object_context(object, context);
+                let keys: Vec<String> = object.keys().cloned().collect();
+                for key in keys {
+                    let child_location = format!("{location}.{key}");
+                    if is_secret_field(&key) {
+                        return Err(SanitizationError::SecretLikeField {
+                            location: child_location,
+                        });
+                    }
+                    let kind = semantic_kind(object, &key, &object[&key], context);
+                    let child = object.get_mut(&key).expect("key came from object");
+                    if let Some(kind) = kind {
+                        self.replace_semantic(kind, child);
+                    } else if is_protocol_discriminator(&key) {
+                        if let Value::String(text) = child {
+                            self.sanitize_paths_and_validate(text, &child_location)?;
+                        }
+                    } else {
+                        self.sanitize_json(child, context, &child_location)?;
+                    }
+                }
+            }
+            Value::String(text) => self.sanitize_string(text, location)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn sanitize_nonsemantic_value(
+        &mut self,
+        value: &mut Value,
+        location: &str,
+    ) -> Result<(), SanitizationError> {
+        match value {
+            Value::Array(values) => {
+                for (index, value) in values.iter_mut().enumerate() {
+                    self.sanitize_nonsemantic_value(value, &format!("{location}[{index}]"))?;
+                }
+            }
+            Value::Object(object) => {
+                for (key, value) in object {
+                    let child_location = format!("{location}.{key}");
+                    if is_secret_field(key) {
+                        return Err(SanitizationError::SecretLikeField {
+                            location: child_location,
+                        });
+                    }
+                    self.sanitize_nonsemantic_value(value, &child_location)?;
+                }
+            }
+            Value::String(text) => self.sanitize_paths_and_validate(text, location)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn replace_semantic(&mut self, kind: RedactionKind, value: &mut Value) {
+        let Some(replacement) = self
+            .semantics
+            .get(&kind)
+            .and_then(|values| values.iter().find(|known| known.original == *value))
+            .map(|known| known.placeholder.clone())
+        else {
+            return;
+        };
+        *value = Value::String(replacement);
+        *self
+            .counts
+            .entry(kind.manifest_name().to_owned())
+            .or_default() += 1;
+    }
+
+    fn sanitize_string(
+        &mut self,
+        text: &mut String,
+        location: &str,
+    ) -> Result<(), SanitizationError> {
+        let replacements: Vec<(RedactionKind, String, String)> = self
+            .semantics
+            .iter()
+            .flat_map(|(kind, values)| {
+                values.iter().filter_map(move |value| {
+                    value
+                        .original
+                        .as_str()
+                        .map(|original| (*kind, original.to_owned(), value.placeholder.clone()))
+                })
+            })
+            .filter(|(_, original, _)| !original.is_empty())
+            .collect();
+        for (kind, original, placeholder) in replacements {
+            let occurrences = text.matches(&original).count() as u64;
+            if occurrences != 0 {
+                *text = text.replace(&original, &placeholder);
+                *self
+                    .counts
+                    .entry(kind.manifest_name().to_owned())
+                    .or_default() += occurrences;
+            }
+        }
+        self.sanitize_paths_and_validate(text, location)
+    }
+
+    fn sanitize_paths_and_validate(
+        &mut self,
+        text: &mut String,
+        location: &str,
+    ) -> Result<(), SanitizationError> {
+        for path in self.paths.clone() {
+            let mut occurrences = 0;
+            for value in path.values {
+                let found = replace_path_occurrences(text, &value, path.placeholder);
+                if found != 0 {
+                    occurrences += found;
+                }
+            }
+            if occurrences != 0 {
+                *self.counts.entry(path.kind.to_owned()).or_default() += occurrences;
+            }
+        }
+        if contains_absolute_path(text) {
+            return Err(SanitizationError::UnrecognizedAbsolutePath {
+                location: location.to_owned(),
+            });
+        }
+        if contains_secret_value(text) {
+            return Err(SanitizationError::SecretLikeValue {
+                location: location.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn placeholder_definitions(&self) -> Vec<Value> {
+        let mut definitions = Vec::new();
+        for (kind, values) in &self.semantics {
+            for value in values {
+                definitions.push(json!({
+                    "placeholder": value.placeholder,
+                    "kind": kind.manifest_name(),
+                }));
+            }
+        }
+        for path in &self.paths {
+            if self.counts.contains_key(path.kind) {
+                definitions.push(json!({
+                    "placeholder": path.placeholder,
+                    "kind": path.kind,
+                }));
+            }
+        }
+        definitions
+    }
+}
+
+fn object_context(
+    object: &serde_json::Map<String, Value>,
+    mut context: SemanticContext,
+) -> SemanticContext {
+    let marker = object
+        .get("role")
+        .or_else(|| object.get("type"))
+        .and_then(Value::as_str);
+    context.speaker = match marker {
+        Some("user") => Speaker::User,
+        Some("assistant") => Speaker::Assistant,
+        _ => context.speaker,
+    };
+    if object.get("method").and_then(Value::as_str) == Some("turn/start") {
+        context.codex_turn_input = true;
+    }
+    if object
+        .get("method")
+        .and_then(Value::as_str)
+        .is_some_and(|method| {
+            method.starts_with("item/agentMessage/")
+                || method.starts_with("item/reasoning/")
+                || method.starts_with("item/plan/")
+        })
+    {
+        context.codex_assistant_prose = true;
+    }
+    context.speaker = match marker {
+        Some("userMessage" | "user_message") => Speaker::User,
+        Some("agentMessage" | "agent_message" | "reasoning") => Speaker::Assistant,
+        _ => context.speaker,
+    };
+    context
+}
+
+fn semantic_kind(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    value: &Value,
+    context: SemanticContext,
+) -> Option<RedactionKind> {
+    if !matches!(value, Value::String(_) | Value::Number(_)) {
+        return None;
+    }
+    let normalized = normalize_field(key);
+    match normalized.as_str() {
+        "requestid" => return Some(RedactionKind::ClaudeRequestId),
+        "sessionid" => return Some(RedactionKind::SessionId),
+        "threadid" => return Some(RedactionKind::ThreadId),
+        "turnid" => return Some(RedactionKind::TurnId),
+        "tooluseid" | "parenttooluseid" | "itemid" => {
+            return Some(RedactionKind::ToolUseId);
+        }
+        "id" if object.contains_key("jsonrpc") => return Some(RedactionKind::CodexRpcId),
+        "id" if object.get("type").and_then(Value::as_str) == Some("tool_use") => {
+            return Some(RedactionKind::ToolUseId);
+        }
+        "id" if object
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(is_tool_item_type) =>
+        {
+            return Some(RedactionKind::ToolUseId);
+        }
+        "data" if object.get("type").and_then(Value::as_str) == Some("base64") => {
+            return Some(RedactionKind::AttachmentBytes);
+        }
+        "prompt" => return Some(RedactionKind::UserText),
+        "content" | "text" if matches!(context.speaker, Speaker::User) => {
+            return Some(RedactionKind::UserText);
+        }
+        "content" | "text" if matches!(context.speaker, Speaker::Assistant) => {
+            return Some(RedactionKind::AssistantProse);
+        }
+        "text"
+            if context.codex_turn_input
+                && object.get("type").and_then(Value::as_str) == Some("text") =>
+        {
+            return Some(RedactionKind::UserText);
+        }
+        "text" if object.get("type").and_then(Value::as_str) == Some("text_delta") => {
+            return Some(RedactionKind::AssistantProse);
+        }
+        "delta" | "textdelta" if context.codex_assistant_prose => {
+            return Some(RedactionKind::AssistantProse);
+        }
+        "thinking" => return Some(RedactionKind::AssistantProse),
+        "result" if object.get("type").and_then(Value::as_str) == Some("result") => {
+            return Some(RedactionKind::AssistantProse);
+        }
+        _ => {}
+    }
+    None
+}
+
+fn is_tool_item_type(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "commandExecution"
+            | "command_execution"
+            | "fileChange"
+            | "file_change"
+            | "mcpToolCall"
+            | "mcp_tool_call"
+            | "webSearch"
+            | "web_search"
+            | "dynamicToolCall"
+            | "dynamic_tool_call"
+    )
+}
+
+fn normalize_field(field: &str) -> String {
+    field
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_protocol_discriminator(field: &str) -> bool {
+    matches!(
+        normalize_field(field).as_str(),
+        "type"
+            | "subtype"
+            | "method"
+            | "role"
+            | "jsonrpc"
+            | "name"
+            | "status"
+            | "kind"
+            | "channel"
+            | "level"
+    )
+}
+
+fn is_secret_field(field: &str) -> bool {
+    matches!(
+        normalize_field(field).as_str(),
+        "authorization"
+            | "proxyauthorization"
+            | "apikey"
+            | "openaiapikey"
+            | "anthropicapikey"
+            | "accesstoken"
+            | "authtoken"
+            | "credential"
+            | "credentials"
+            | "password"
+            | "secret"
+    )
+}
+
+fn contains_secret_value(value: &str) -> bool {
+    let uppercase = value.to_ascii_uppercase();
+    if uppercase.contains("-----BEGIN ") && uppercase.contains(" PRIVATE KEY-----") {
+        return true;
+    }
+    ["sk-ant-", "sk-proj-", "xoxb-", "ghp_", "github_pat_"]
+        .iter()
+        .any(|prefix| value.contains(prefix))
+        || value
+            .match_indices("sk-")
+            .any(|(index, _)| index == 0 || !value.as_bytes()[index - 1].is_ascii_alphanumeric())
+}
+
+fn replace_path_occurrences(text: &mut String, path: &str, placeholder: &str) -> u64 {
+    let mut count = 0;
+    let mut cursor = 0;
+    while let Some(relative) = text[cursor..].find(path) {
+        let start = cursor + relative;
+        let end = start + path.len();
+        let ends_at_path_boundary = end == text.len()
+            || text[end..]
+                .chars()
+                .next()
+                .is_some_and(|character| matches!(character, '/' | '\\'));
+        if ends_at_path_boundary {
+            text.replace_range(start..end, placeholder);
+            cursor = start + placeholder.len();
+            count += 1;
+        } else {
+            cursor = end;
+        }
+    }
+    count
+}
+
+fn contains_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    for index in 0..bytes.len() {
+        if index + 2 < bytes.len()
+            && bytes[index].is_ascii_alphabetic()
+            && bytes[index + 1] == b':'
+            && matches!(bytes[index + 2], b'/' | b'\\')
+            && (index == 0 || !bytes[index - 1].is_ascii_alphanumeric())
+        {
+            return true;
+        }
+        if index + 1 < bytes.len() && bytes[index] == b'\\' && bytes[index + 1] == b'\\' {
+            return true;
+        }
+        if bytes[index] == b'/'
+            && bytes.get(index + 1).is_some_and(|next| {
+                !next.is_ascii_whitespace() && !matches!(*next, b'/' | b'>' | b'}' | b']')
+            })
+            && (index == 0
+                || (!bytes[index - 1].is_ascii_alphanumeric()
+                    && !matches!(bytes[index - 1], b':' | b'/' | b'>')))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_drive_absolute(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+fn repository_root(start: &Path) -> Option<&Path> {
+    start
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+}
+
+fn is_staging_output(output: &Path) -> bool {
+    if output
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let components: Vec<_> = output
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect();
+    components.windows(2).any(|pair| {
+        pair[0] == ".comet-provider-captures" && pair[1].eq_ignore_ascii_case("staging")
+    })
 }
 
 /// A live capture owns its child until a terminal frame or hard timeout.
