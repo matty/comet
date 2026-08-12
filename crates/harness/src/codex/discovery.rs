@@ -15,7 +15,6 @@
 //!    absent-case default has no live producer and is fixture-tested by hand.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -165,32 +164,43 @@ pub(crate) async fn discover(
     }
 }
 
-async fn handshake(exe: &Path, home: &Path) -> Result<Discovery, DiscoveryFailure> {
-    let exe = &program_path(exe);
-    let mut cmd = Command::new(exe);
-    cmd.arg("app-server");
-    crate::compose_child_path(&mut cmd, exe);
-    // The child is told the same home the login check just read `auth.json`
-    // from. Left to the ambient environment, the two can be different homes —
-    // the check passes against one account's credentials while the CLI answers
-    // from another's, or from the logged-out fallback list, and the result is
-    // still labelled live.
-    cmd.env("CODEX_HOME", home);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        // The timeout arm drops this future; without kill_on_drop the child
-        // outlives the discovery and we leak an app-server per attempt.
-        .kill_on_drop(true)
-        // No project settings are wanted for a session with no turn, and the
-        // capture found the model list identical across working directories.
-        .current_dir(std::env::temp_dir());
-    #[cfg(windows)]
-    {
-        // CREATE_NO_WINDOW, as in `probe_cli_version`: the shims are console
-        // apps and would flash a window on every boot otherwise.
-        cmd.creation_flags(0x0800_0000);
+/// Describe the exact short-lived launch used for Codex model discovery.
+pub(crate) fn discovery_launch(
+    exe: &Path,
+    codex_home: &Path,
+    cwd: &Path,
+) -> crate::capture::LaunchDescriptor {
+    let exe = program_path(exe);
+    let mut configured_env = std::collections::BTreeMap::new();
+    if let Some(path) = crate::child_path(&exe) {
+        configured_env.insert("PATH".into(), path);
     }
+    // The child is told the same home the login check just read `auth.json`
+    // from. Left to the ambient environment, the two can be different homes.
+    configured_env.insert("CODEX_HOME".into(), codex_home.into());
+    crate::capture::LaunchDescriptor {
+        program: exe,
+        args: vec!["app-server".into()],
+        cwd: Some(cwd.into()),
+        configured_env,
+        stdin: crate::capture::StdioMode::Piped,
+        stdout: crate::capture::StdioMode::Piped,
+        stderr: crate::capture::StdioMode::Piped,
+        kill_on_drop: true,
+        #[cfg(windows)]
+        creation_flags: 0x0800_0000,
+    }
+}
+
+/// Build the exact short-lived command used for Codex model discovery.
+pub(crate) fn build_codex_discovery_command(exe: &Path, codex_home: &Path, cwd: &Path) -> Command {
+    discovery_launch(exe, codex_home, cwd).command()
+}
+
+async fn handshake(exe: &Path, home: &Path) -> Result<Discovery, DiscoveryFailure> {
+    // No project settings are wanted for a session with no turn, and the
+    // capture found the model list identical across working directories.
+    let mut cmd = build_codex_discovery_command(exe, home, &std::env::temp_dir());
 
     let mut child = cmd.spawn().map_err(|err| {
         tracing::debug!(cli = %exe.display(), %err, "codex discovery spawn failed");
@@ -198,6 +208,8 @@ async fn handshake(exe: &Path, home: &Path) -> Result<Discovery, DiscoveryFailur
     })?;
     let mut stdin = child.stdin.take().ok_or(DiscoveryFailure::Unreachable)?;
     let stdout = child.stdout.take().ok_or(DiscoveryFailure::Unreachable)?;
+    let stderr = child.stderr.take().ok_or(DiscoveryFailure::Unreachable)?;
+    crate::drain_discovery_stderr(stderr, "codex");
     let mut lines = BufReader::new(stdout).lines();
 
     send(&mut stdin, &initialize_line()).await?;

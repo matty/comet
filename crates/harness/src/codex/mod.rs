@@ -28,13 +28,12 @@
 
 mod approval;
 mod catalog;
-mod discovery;
+pub(crate) mod discovery;
 mod normalize;
 mod rpc;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -128,6 +127,31 @@ fn worktree_on_slashed_branch(cwd: &str) -> bool {
     head.trim()
         .strip_prefix("ref: refs/heads/")
         .is_some_and(|branch| branch.contains('/'))
+}
+
+/// Describe the exact process launch used for a Codex run.
+pub(crate) fn run_launch(exe: &Path, request: &RunRequest) -> crate::capture::LaunchDescriptor {
+    let mut configured_env = std::collections::BTreeMap::new();
+    if let Some(path) = crate::child_path(exe) {
+        configured_env.insert("PATH".into(), path);
+    }
+    crate::capture::LaunchDescriptor {
+        program: exe.into(),
+        args: vec!["app-server".into()],
+        cwd: (!request.cwd.is_empty()).then(|| request.cwd.clone().into()),
+        configured_env,
+        stdin: crate::capture::StdioMode::Piped,
+        stdout: crate::capture::StdioMode::Piped,
+        stderr: crate::capture::StdioMode::Piped,
+        kill_on_drop: true,
+        #[cfg(windows)]
+        creation_flags: 0,
+    }
+}
+
+/// Build the exact process command used for a Codex run.
+pub(crate) fn build_run_command(exe: &Path, request: &RunRequest) -> Command {
+    run_launch(exe, request).command()
 }
 
 /// The Codex harness. Construct with [`CodexHarness::new`]; tests point it at a
@@ -329,16 +353,7 @@ impl Harness for CodexHarness {
             // sandbox here should escalate the policy too.
             request.sandbox = comet_proto::SandboxLevel::DangerFullAccess;
         }
-        let mut cmd = Command::new(&exe);
-        cmd.arg("app-server");
-        crate::compose_child_path(&mut cmd, &exe);
-        if !request.cwd.is_empty() {
-            cmd.current_dir(&request.cwd);
-        }
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        let mut cmd = build_run_command(&exe, &request);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())

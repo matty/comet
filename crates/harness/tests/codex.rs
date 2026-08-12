@@ -931,6 +931,16 @@ async fn every_runtime_mode_reaches_the_wire_as_its_approval_policy() {
 // Live discovery (slice 2.3)
 // ---------------------------------------------------------------------------
 
+/// Discovery must drain piped stderr before it fills. The fake writes one MiB
+/// there before reading stdin, so an undrained command never reaches model/list.
+#[tokio::test]
+async fn model_discovery_drains_stderr() {
+    tokio::time::timeout(Duration::from_secs(5), harness().models())
+        .await
+        .expect("a full stderr pipe must not block model discovery")
+        .expect("models");
+}
+
 /// The slice's deliverable: a real spawn, a real `initialize` + `model/list`
 /// round trip, and a merged catalog that says it is live. The fixture answers
 /// shaped exactly as codex-cli 0.147.0 did in the 2026-08-11 capture, and pages

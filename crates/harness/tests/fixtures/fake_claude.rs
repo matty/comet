@@ -21,6 +21,17 @@ fn emit(line: &str) {
     let _ = out.flush();
 }
 
+/// Exceed any ordinary pipe capacity before answering discovery. A caller that
+/// pipes stderr without draining it blocks here and never reads the reply.
+fn fill_stderr() {
+    let chunk = [b'x'; 8192];
+    let mut stderr = std::io::stderr().lock();
+    for _ in 0..128 {
+        stderr.write_all(&chunk).expect("write discovery stderr");
+    }
+    stderr.flush().expect("flush discovery stderr");
+}
+
 /// `read -r line || exit 1`: EOF is a hard failure, not an empty line.
 fn read_line(stdin: &mut StdinLock<'_>) -> String {
     let mut buf = String::new();
@@ -109,6 +120,9 @@ fn command_reply() -> String {
 
 fn main() {
     check_permission_mode();
+    if !std::env::args().any(|arg| arg == "--permission-mode") {
+        fill_stderr();
+    }
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
     let first = read_line(&mut stdin);

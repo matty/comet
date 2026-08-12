@@ -649,6 +649,25 @@ async fn unclaimed_frames_surface_as_diagnostics_and_ignored_frames_stay_silent(
     ));
 }
 
+/// Both initialize paths must drain the piped stderr before it fills. The fake
+/// writes one MiB there before reading stdin, so either undrained path wedges.
+#[tokio::test]
+async fn initialize_discovery_drains_stderr_for_models_and_commands() {
+    let harness = harness();
+    let cwd = std::env::temp_dir().join("comet-noisy-command-discovery");
+    std::fs::create_dir_all(&cwd).expect("command cwd");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        harness.models().await.expect("models");
+        harness
+            .commands(&cwd.display().to_string())
+            .await
+            .expect("commands");
+    })
+    .await
+    .expect("a full stderr pipe must not block either initialize path");
+}
+
 /// The slice's deliverable: a real spawn, a real handshake round-trip, and a
 /// merged catalog that says it is live. The fixture answers `initialize`
 /// shaped exactly as Claude Code 2.1.227 did in the 2026-08-11 capture.

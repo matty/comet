@@ -15,7 +15,6 @@
 //! provider-agnostic and unchanged.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -91,42 +90,55 @@ async fn handshake(exe: &Path, curated_ids: &[String]) -> Result<Discovery, Disc
     // Any directory would do for models — the capture found the model list
     // identical across cwds while `commands` varied — and a neutral one avoids
     // loading a project's own settings for a session with no turn.
-    let line = initialize_reply(exe, DISCOVERY_ARGS, &std::env::temp_dir()).await?;
+    let launch = model_discovery_launch(exe, &std::env::temp_dir());
+    let line = initialize_reply(launch).await?;
     let borrowed: Vec<&str> = curated_ids.iter().map(String::as_str).collect();
     discovery_from_reply(&line, &borrowed)
 }
 
-/// Spawn a short-lived CLI in `cwd`, send one `initialize`, and hand back the
-/// raw `control_response` line.
-///
-/// Shared with the command discovery in `commands.rs`, which differs from this
-/// one only in its arguments (no `--bare`), its directory (the chat's, not a
-/// neutral one) and what it reads off the reply. Keeping the spawn in one place
-/// is what stops the two drifting on the details that have already cost this
-/// phase three fixes — `program_path`, `kill_on_drop`, `CREATE_NO_WINDOW`, and
-/// reading *past* the hook frames rather than taking the first line.
-pub(super) async fn initialize_reply(
+/// Describe a Claude initialize handshake without choosing its purpose.
+pub(crate) fn claude_initialize_launch(
     exe: &Path,
     args: &[&str],
     cwd: &Path,
-) -> Result<String, DiscoveryFailure> {
-    let exe = &program_path(exe);
-    let mut cmd = Command::new(exe);
-    crate::compose_child_path(&mut cmd, exe);
-    cmd.args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        // The timeout arm drops this future; without kill_on_drop the child
-        // outlives the discovery and we leak a CLI per attempt.
-        .kill_on_drop(true)
-        .current_dir(cwd);
-    #[cfg(windows)]
-    {
-        // CREATE_NO_WINDOW, as in `probe_cli_version`: the `.cmd` shims are
-        // console apps and would flash a window on every boot otherwise.
-        cmd.creation_flags(0x0800_0000);
+) -> crate::capture::LaunchDescriptor {
+    let exe = program_path(exe);
+    let mut configured_env = std::collections::BTreeMap::new();
+    if let Some(path) = crate::child_path(&exe) {
+        configured_env.insert("PATH".into(), path);
     }
+    crate::capture::LaunchDescriptor {
+        program: exe,
+        args: args.iter().map(Into::into).collect(),
+        cwd: Some(cwd.into()),
+        configured_env,
+        stdin: crate::capture::StdioMode::Piped,
+        stdout: crate::capture::StdioMode::Piped,
+        stderr: crate::capture::StdioMode::Piped,
+        kill_on_drop: true,
+        #[cfg(windows)]
+        creation_flags: 0x0800_0000,
+    }
+}
+
+/// Select the exact launch used for Claude model discovery.
+pub(crate) fn model_discovery_launch(exe: &Path, cwd: &Path) -> crate::capture::LaunchDescriptor {
+    claude_initialize_launch(exe, DISCOVERY_ARGS, cwd)
+}
+
+/// Build the exact short-lived command used for Claude initialize handshakes.
+#[allow(dead_code)] // Preserved for capture drivers that materialize a chosen launch.
+pub(crate) fn build_claude_initialize_command(exe: &Path, args: &[&str], cwd: &Path) -> Command {
+    claude_initialize_launch(exe, args, cwd).command()
+}
+
+/// Spawn a selected short-lived Claude initialize launch, send one initialize,
+/// and hand back the raw `control_response` line.
+pub(super) async fn initialize_reply(
+    launch: crate::capture::LaunchDescriptor,
+) -> Result<String, DiscoveryFailure> {
+    let exe = launch.program.clone();
+    let mut cmd = launch.command();
 
     let mut child = cmd.spawn().map_err(|err| {
         tracing::debug!(cli = %exe.display(), %err, "claude discovery spawn failed");
@@ -134,6 +146,8 @@ pub(super) async fn initialize_reply(
     })?;
     let mut stdin = child.stdin.take().ok_or(DiscoveryFailure::Unreachable)?;
     let stdout = child.stdout.take().ok_or(DiscoveryFailure::Unreachable)?;
+    let stderr = child.stderr.take().ok_or(DiscoveryFailure::Unreachable)?;
+    crate::drain_discovery_stderr(stderr, "claude");
 
     stdin
         .write_all(format!("{INITIALIZE_LINE}\n").as_bytes())

@@ -65,8 +65,13 @@ pub(crate) async fn discover_commands(
 }
 
 async fn read_commands(exe: &Path, cwd: &Path) -> Result<Vec<AgentCommand>, DiscoveryFailure> {
-    let line = super::discovery::initialize_reply(exe, COMMAND_ARGS, cwd).await?;
+    let line = super::discovery::initialize_reply(command_discovery_launch(exe, cwd)).await?;
     commands_from_reply(&line)
+}
+
+/// Select the exact launch used for Claude command discovery.
+pub(crate) fn command_discovery_launch(exe: &Path, cwd: &Path) -> crate::capture::LaunchDescriptor {
+    super::discovery::claude_initialize_launch(exe, COMMAND_ARGS, cwd)
 }
 
 #[derive(Deserialize)]
