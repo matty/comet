@@ -163,6 +163,79 @@ pub(crate) fn normalize_run_request(mut request: RunRequest) -> RunRequest {
     request
 }
 
+/// Build the provider-owned parameters for starting a new Codex thread.
+pub(crate) fn thread_start_params(request: &RunRequest) -> Value {
+    // Approval policy is derived, not pinned. ApprovalRequired intentionally
+    // maps to `untrusted`; AutoAcceptEdits and Auto map to `on-request` now
+    // that provider approvals reach Comet's approval surface (D13).
+    let mut params = serde_json::Map::new();
+    params.insert("cwd".into(), request.cwd.clone().into());
+    params.insert(
+        "approvalPolicy".into(),
+        approval_policy(request.runtime_mode).into(),
+    );
+    params.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
+    params.insert(
+        "approvalsReviewer".into(),
+        approvals_reviewer(request.runtime_mode).into(),
+    );
+    if let Some(model) = &request.model {
+        params.insert("model".into(), model.clone().into());
+    }
+    // Service tier rides thread-start and every turn (mirrors the Codex IDE
+    // client). "default" means Standard — omit it entirely.
+    if let Some(tier) = service_tier(request) {
+        params.insert("serviceTier".into(), tier.into());
+    }
+    Value::Object(params)
+}
+
+/// Build the provider-owned parameters for resuming a Codex thread.
+pub(crate) fn thread_resume_params(request: &RunRequest, thread_id: &str) -> Value {
+    let Value::Object(mut params) = thread_start_params(request) else {
+        unreachable!("thread parameters are always a JSON object")
+    };
+    params.insert("threadId".into(), thread_id.into());
+    Value::Object(params)
+}
+
+/// Build the provider-owned parameters for starting a Codex turn.
+pub(crate) fn turn_start_params(request: &RunRequest, thread_id: &str, text: &str) -> Value {
+    let mut params = serde_json::Map::new();
+    params.insert("threadId".into(), thread_id.into());
+    params.insert("input".into(), json!([{ "type": "text", "text": text }]));
+    params.insert(
+        "approvalPolicy".into(),
+        approval_policy(request.runtime_mode).into(),
+    );
+    params.insert(
+        "sandboxPolicy".into(),
+        sandbox_policy_value(request.sandbox),
+    );
+    // Reasoning summaries stream (`item/reasoning/summaryTextDelta`) only
+    // when asked for — without this codex "thinks" in silence for minutes:
+    // nothing renders and the UI's 45s staleness gate flips Working off.
+    params.insert("summary".into(), "auto".into());
+    if let Some(model) = &request.model {
+        params.insert("model".into(), model.clone().into());
+    }
+    if let Some(effort) = to_effort(request.reasoning) {
+        params.insert("effort".into(), effort.into());
+    }
+    if let Some(tier) = service_tier(request) {
+        params.insert("serviceTier".into(), tier.into());
+    }
+    Value::Object(params)
+}
+
+fn service_tier(request: &RunRequest) -> Option<&str> {
+    request
+        .model_options
+        .get("serviceTier")
+        .and_then(Value::as_str)
+        .filter(|tier| *tier != "default")
+}
+
 /// Describe the exact process launch used for a Codex run.
 pub(crate) fn run_launch(exe: &Path, request: &RunRequest) -> crate::capture::LaunchDescriptor {
     let mut configured_env = std::collections::BTreeMap::new();
@@ -526,47 +599,6 @@ async fn run_session(session: Session) {
     } = controls;
     let request_approval = Arc::new(request_approval);
 
-    // ---- wire params ------------------------------------------------------
-    // Derived, not pinned. The pin existed because an approval Codex raised had
-    // nowhere honest to go — it round-tripped through a synthesized yes/no
-    // question and surfaced as a generic prompt, which is why "on-request"
-    // read as "asking me for approval at every step". Approvals now reach the
-    // approval surface, so the mode can mean what it says.
-    //
-    // The user report was accurate about `untrusted`, and that is the mode
-    // `ApprovalRequired` maps to: captured live, it asks before every command,
-    // three times for the same command in one turn. `on-request` — where
-    // `AutoAcceptEdits` and `Auto` land — asks only after a sandboxed attempt
-    // has already failed. See `catalog::approval_policy`.
-    let approval_policy = approval_policy(request.runtime_mode);
-    let effort = to_effort(request.reasoning);
-    // Service tier rides thread-start and every turn (mirrors the Codex IDE
-    // client). "default" means Standard — omit it entirely.
-    let service_tier = request
-        .model_options
-        .get("serviceTier")
-        .and_then(Value::as_str)
-        .filter(|t| *t != "default")
-        .map(str::to_owned);
-
-    let start_params = {
-        let mut p = serde_json::Map::new();
-        p.insert("cwd".into(), Value::String(request.cwd.clone()));
-        p.insert("approvalPolicy".into(), approval_policy.into());
-        p.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
-        p.insert(
-            "approvalsReviewer".into(),
-            approvals_reviewer(request.runtime_mode).into(),
-        );
-        if let Some(model) = &request.model {
-            p.insert("model".into(), Value::String(model.clone()));
-        }
-        if let Some(tier) = &service_tier {
-            p.insert("serviceTier".into(), Value::String(tier.clone()));
-        }
-        p
-    };
-
     // ---- handshake + thread + first turn (interruptible) ------------------
     let setup = async {
         client
@@ -585,9 +617,10 @@ async fn run_session(session: Session) {
         client.notify("initialized", None);
 
         let thread = if let Some(resume) = &request.resume {
-            let mut p = start_params.clone();
-            p.insert("threadId".into(), Value::String(resume.clone()));
-            match client.request("thread/resume", Value::Object(p)).await {
+            match client
+                .request("thread/resume", thread_resume_params(&request, resume))
+                .await
+            {
                 Ok(thread) => thread,
                 // A missing/foreign rollout falls back to a fresh thread.
                 Err(e) => {
@@ -596,13 +629,13 @@ async fn run_session(session: Session) {
                         "thread/resume failed (starting fresh): {e}"
                     );
                     client
-                        .request("thread/start", Value::Object(start_params.clone()))
+                        .request("thread/start", thread_start_params(&request))
                         .await?
                 }
             }
         } else {
             client
-                .request("thread/start", Value::Object(start_params.clone()))
+                .request("thread/start", thread_start_params(&request))
                 .await?
         };
         let thread_id = thread["thread"]["id"].as_str().unwrap_or("").to_owned();
@@ -638,32 +671,6 @@ async fn run_session(session: Session) {
         }
     };
 
-    let turn_params = |text: &str| -> Value {
-        let mut p = serde_json::Map::new();
-        p.insert("threadId".into(), Value::String(thread_id.clone()));
-        p.insert("input".into(), json!([{ "type": "text", "text": text }]));
-        p.insert("approvalPolicy".into(), approval_policy.into());
-        p.insert(
-            "sandboxPolicy".into(),
-            sandbox_policy_value(request.sandbox),
-        );
-        // Reasoning summaries stream (`item/reasoning/summaryTextDelta`) only
-        // when asked for — without this codex "thinks" in silence for minutes:
-        // nothing renders and the UI's 45s staleness gate flips Working off
-        // (user report: "not streaming, doesn't say it's working").
-        p.insert("summary".into(), "auto".into());
-        if let Some(model) = &request.model {
-            p.insert("model".into(), Value::String(model.clone()));
-        }
-        if let Some(effort) = effort {
-            p.insert("effort".into(), effort.into());
-        }
-        if let Some(tier) = &service_tier {
-            p.insert("serviceTier".into(), Value::String(tier.clone()));
-        }
-        Value::Object(p)
-    };
-
     let mut assistant_message_id = new_message_id();
     if !send(
         &event_tx,
@@ -684,7 +691,12 @@ async fn run_session(session: Session) {
     }
 
     let mut router = TurnRouter::default();
-    match start_turn(&client, turn_params(&request.prompt)).await {
+    match start_turn(
+        &client,
+        turn_start_params(&request, &thread_id, &request.prompt),
+    )
+    .await
+    {
         Ok(id) => router.adopt_started(id),
         Err(e) => {
             let _ = event_tx
@@ -841,7 +853,7 @@ async fn run_session(session: Session) {
                         if let Some(text) = queued_steers.pop_front() {
                             if !steer_as_new_turn(
                                 &client,
-                                turn_params(&text),
+                                turn_start_params(&request, &thread_id, &text),
                                 &mut router,
                                 &event_tx,
                                 &mut assistant_message_id,
@@ -1029,7 +1041,7 @@ async fn run_session(session: Session) {
                                     queued_steers.push_back(text);
                                 } else if !steer_as_new_turn(
                                     &client,
-                                    turn_params(&text),
+                                    turn_start_params(&request, &thread_id, &text),
                                     &mut router,
                                     &event_tx,
                                     &mut assistant_message_id,
@@ -1043,7 +1055,7 @@ async fn run_session(session: Session) {
                         }
                     } else if !steer_as_new_turn(
                         &client,
-                        turn_params(&text),
+                        turn_start_params(&request, &thread_id, &text),
                         &mut router,
                         &event_tx,
                         &mut assistant_message_id,

@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::mpsc;
 
-use comet_proto::{ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel};
+use comet_proto::RunRequest;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum StdioMode {
@@ -488,13 +488,23 @@ impl RecordingSession {
         next_id += 1;
         self.write_line(CODEX_INITIALIZED_LINE).await?;
 
-        let (method, thread_params) = codex_thread_request(&request, script);
+        let (method, thread_params) = if matches!(script, CodexRunScript::Resume) {
+            (
+                "thread/resume",
+                crate::codex::thread_resume_params(
+                    &request,
+                    request.resume.as_deref().unwrap_or_default(),
+                ),
+            )
+        } else {
+            ("thread/start", crate::codex::thread_start_params(&request))
+        };
         self.write_line(&rpc_request(next_id, method, thread_params))
             .await?;
         let mut thread_reply = self.codex_reply(next_id).await?;
         next_id += 1;
         if thread_reply.get("error").is_some() && method == "thread/resume" {
-            let (_, params) = codex_thread_request(&request, CodexRunScript::FreshText);
+            let params = crate::codex::thread_start_params(&request);
             self.write_line(&rpc_request(next_id, "thread/start", params))
                 .await?;
             thread_reply = self.codex_reply(next_id).await?;
@@ -510,7 +520,7 @@ impl RecordingSession {
         self.write_line(&rpc_request(
             next_id,
             "turn/start",
-            codex_turn_params(&request, &thread_id),
+            crate::codex::turn_start_params(&request, &thread_id, &request.prompt),
         ))
         .await?;
         next_id += 1;
@@ -933,115 +943,6 @@ fn codex_model_list_line(id: u64, cursor: Option<&str>) -> String {
 
 fn rpc_request(id: u64, method: &str, params: Value) -> String {
     json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string()
-}
-
-fn codex_thread_request(request: &RunRequest, script: CodexRunScript) -> (&'static str, Value) {
-    let mut params = serde_json::Map::new();
-    params.insert("cwd".into(), request.cwd.clone().into());
-    params.insert(
-        "approvalPolicy".into(),
-        codex_approval_policy(request.runtime_mode).into(),
-    );
-    params.insert("sandbox".into(), codex_sandbox_mode(request.sandbox).into());
-    params.insert(
-        "approvalsReviewer".into(),
-        if request.runtime_mode == RuntimeMode::Auto {
-            "auto_review"
-        } else {
-            "user"
-        }
-        .into(),
-    );
-    if let Some(model) = &request.model {
-        params.insert("model".into(), model.clone().into());
-    }
-    if let Some(tier) = request
-        .model_options
-        .get("serviceTier")
-        .and_then(Value::as_str)
-        .filter(|tier| *tier != "default")
-    {
-        params.insert("serviceTier".into(), tier.into());
-    }
-    if matches!(script, CodexRunScript::Resume) {
-        params.insert(
-            "threadId".into(),
-            request.resume.clone().unwrap_or_default().into(),
-        );
-        ("thread/resume", Value::Object(params))
-    } else {
-        ("thread/start", Value::Object(params))
-    }
-}
-
-fn codex_turn_params(request: &RunRequest, thread_id: &str) -> Value {
-    let mut params = serde_json::Map::new();
-    params.insert("threadId".into(), thread_id.into());
-    params.insert(
-        "input".into(),
-        json!([{"type": "text", "text": request.prompt}]),
-    );
-    params.insert(
-        "approvalPolicy".into(),
-        codex_approval_policy(request.runtime_mode).into(),
-    );
-    let mut sandbox = serde_json::Map::new();
-    sandbox.insert("type".into(), codex_sandbox_policy(request.sandbox).into());
-    if request.sandbox == SandboxLevel::WorkspaceWrite {
-        sandbox.insert("networkAccess".into(), true.into());
-    }
-    params.insert("sandboxPolicy".into(), Value::Object(sandbox));
-    params.insert("summary".into(), "auto".into());
-    if let Some(model) = &request.model {
-        params.insert("model".into(), model.clone().into());
-    }
-    if let Some(effort) = codex_effort(request.reasoning) {
-        params.insert("effort".into(), effort.into());
-    }
-    if let Some(tier) = request
-        .model_options
-        .get("serviceTier")
-        .and_then(Value::as_str)
-        .filter(|tier| *tier != "default")
-    {
-        params.insert("serviceTier".into(), tier.into());
-    }
-    Value::Object(params)
-}
-
-fn codex_effort(level: Option<ReasoningLevel>) -> Option<&'static str> {
-    Some(match level? {
-        ReasoningLevel::Minimal | ReasoningLevel::Low => "low",
-        ReasoningLevel::Medium => "medium",
-        ReasoningLevel::High => "high",
-        ReasoningLevel::XHigh | ReasoningLevel::Ultracode | ReasoningLevel::Ultrathink => "xhigh",
-        ReasoningLevel::Max => "max",
-        ReasoningLevel::Ultra => "ultra",
-    })
-}
-
-fn codex_approval_policy(mode: RuntimeMode) -> &'static str {
-    match mode {
-        RuntimeMode::ApprovalRequired => "untrusted",
-        RuntimeMode::AutoAcceptEdits | RuntimeMode::Auto => "on-request",
-        RuntimeMode::FullAccess => "never",
-    }
-}
-
-fn codex_sandbox_mode(level: SandboxLevel) -> &'static str {
-    match level {
-        SandboxLevel::ReadOnly => "read-only",
-        SandboxLevel::WorkspaceWrite => "workspace-write",
-        SandboxLevel::DangerFullAccess => "danger-full-access",
-    }
-}
-
-fn codex_sandbox_policy(level: SandboxLevel) -> &'static str {
-    match level {
-        SandboxLevel::ReadOnly => "readOnly",
-        SandboxLevel::WorkspaceWrite => "workspaceWrite",
-        SandboxLevel::DangerFullAccess => "dangerFullAccess",
-    }
 }
 
 #[cfg(test)]
@@ -1534,6 +1435,7 @@ mod tests {
         request
             .model_options
             .insert("serviceTier".into(), json!("fast"));
+        let provider_request = crate::codex::normalize_run_request(request.clone());
 
         let capture = record(config(
             "codex-linked-worktree",
@@ -1555,8 +1457,21 @@ mod tests {
             .iter()
             .find(|line| line["method"] == "thread/start")
             .unwrap();
+        let expected_thread = json!({
+            "cwd": worktree.path().display().to_string(),
+            "approvalPolicy": "untrusted",
+            "sandbox": "danger-full-access",
+            "approvalsReviewer": "user",
+            "model": "gpt-5.6-luna",
+            "serviceTier": "fast",
+        });
+        assert_eq!(thread["params"], expected_thread);
         assert_eq!(
-            thread["params"],
+            crate::codex::thread_start_params(&provider_request),
+            expected_thread
+        );
+        assert_eq!(
+            crate::codex::thread_resume_params(&provider_request, "resume-thread"),
             json!({
                 "cwd": worktree.path().display().to_string(),
                 "approvalPolicy": "untrusted",
@@ -1564,24 +1479,27 @@ mod tests {
                 "approvalsReviewer": "user",
                 "model": "gpt-5.6-luna",
                 "serviceTier": "fast",
+                "threadId": "resume-thread",
             })
         );
         let turn = stdin
             .iter()
             .find(|line| line["method"] == "turn/start")
             .unwrap();
+        let expected_turn = json!({
+            "threadId": "th-1",
+            "input": [{"type": "text", "text": "scenario:fail"}],
+            "approvalPolicy": "untrusted",
+            "sandboxPolicy": {"type": "dangerFullAccess"},
+            "summary": "auto",
+            "model": "gpt-5.6-luna",
+            "effort": "low",
+            "serviceTier": "fast",
+        });
+        assert_eq!(turn["params"], expected_turn);
         assert_eq!(
-            turn["params"],
-            json!({
-                "threadId": "th-1",
-                "input": [{"type": "text", "text": "scenario:fail"}],
-                "approvalPolicy": "untrusted",
-                "sandboxPolicy": {"type": "dangerFullAccess"},
-                "summary": "auto",
-                "model": "gpt-5.6-luna",
-                "effort": "low",
-                "serviceTier": "fast",
-            })
+            crate::codex::turn_start_params(&provider_request, "th-1", "scenario:fail"),
+            expected_turn
         );
     }
 
