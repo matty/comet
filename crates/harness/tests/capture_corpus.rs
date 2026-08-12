@@ -2369,6 +2369,240 @@ fn sanitizer_rejects_opaque_credential_fields_but_keeps_token_counters() {
     );
 }
 
+/// Break caught: Codex's documented token-usage notification wraps numeric counters in a
+/// `tokenUsage` object, which an otherwise-correct credential family check mistakes for a token.
+#[test]
+fn sanitizer_accepts_only_the_codex_token_usage_notification_object() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-secret","turnId":"turn-secret","tokenUsage":{"total":{"inputTokens":20,"outputTokens":3},"last":{"inputTokens":10,"cachedInputTokens":4,"outputTokens":3,"reasoningOutputTokens":0,"totalTokens":13},"modelContextWindow":200000}}}"#;
+    let raw = write_raw_capture(temp.path(), "codex-token-usage", &[payload]);
+    let path = raw.join("capture.json");
+    let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    capture["provider"] = Value::String("codex".into());
+    std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "codex-token-usage")).unwrap();
+    let got = sanitized_payloads(&report.events_bytes);
+    assert_eq!(got[0]["params"]["threadId"], "<THREAD_ID_1>");
+    assert_eq!(got[0]["params"]["turnId"], "<TURN_ID_1>");
+    assert_eq!(got[0]["params"]["tokenUsage"]["last"]["inputTokens"], 10);
+
+    for (name, provider, method) in [
+        (
+            "claude-token-usage-object",
+            "claude",
+            "thread/tokenUsage/updated",
+        ),
+        ("codex-wrong-method-token-usage", "codex", "thread/other"),
+    ] {
+        let raw = write_raw_capture(temp.path(), name, &[payload]);
+        let path = raw.join("capture.json");
+        let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        capture["provider"] = Value::String(provider.into());
+        let mut value: Value = capture["events"][0]["payload"]
+            .as_str()
+            .and_then(|payload| serde_json::from_str(payload).ok())
+            .unwrap();
+        value["method"] = Value::String(method.into());
+        capture["events"][0]["payload"] = Value::String(value.to_string());
+        std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+        assert!(matches!(
+            sanitize_dir(&raw, &staging_dir(temp.path(), name)),
+            Err(SanitizationError::SecretLikeField { .. })
+        ));
+    }
+
+    for (name, payload) in [
+        (
+            "codex-root-token-usage",
+            r#"{"method":"thread/tokenUsage/updated","tokenUsage":{"total":{"inputTokens":20}},"params":{"threadId":"thread-secret","turnId":"turn-secret"}}"#,
+        ),
+        (
+            "codex-nested-token-usage",
+            r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-secret","turnId":"turn-secret","wrapper":{"tokenUsage":{"total":{"inputTokens":20}}}}}"#,
+        ),
+        (
+            "codex-scalar-token-usage",
+            r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-secret","turnId":"turn-secret","tokenUsage":"opaque-secret"}}"#,
+        ),
+        (
+            "codex-token-usage-nested-credential",
+            r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-secret","turnId":"turn-secret","tokenUsage":{"total":{"inputTokens":20,"accessToken":"opaque-secret"}}}}"#,
+        ),
+        (
+            "codex-token-usage-nonnumeric-counter",
+            r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-secret","turnId":"turn-secret","tokenUsage":{"total":{"inputTokens":"opaque-secret"}}}}"#,
+        ),
+    ] {
+        let raw = write_raw_capture(temp.path(), name, &[payload]);
+        let path = raw.join("capture.json");
+        let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        capture["provider"] = Value::String("codex".into());
+        std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+        assert!(matches!(
+            sanitize_dir(&raw, &staging_dir(temp.path(), name)),
+            Err(SanitizationError::SecretLikeField { .. })
+        ));
+    }
+}
+
+/// Break caught: local MCP configuration names are opaque machine metadata, but only in the
+/// direct params of Codex's startup-status notification; ordinary protocol `name` fields remain.
+#[test]
+fn sanitizer_redacts_only_direct_codex_mcp_startup_server_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "codex-mcp-server-name",
+        &[
+            r#"{"method":"mcpServer/startupStatus/updated","params":{"name":"local-server-name","status":"starting","error":null}}"#,
+            r#"{"method":"mcpServer/startupStatus/updated","params":{"name":"local-server-name","status":"failed","failureReason":null}}"#,
+            r#"{"method":"unrelated","params":{"name":"stable-protocol-name","status":"ready"}}"#,
+        ],
+    );
+    let path = raw.join("capture.json");
+    let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    capture["provider"] = Value::String("codex".into());
+    std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "codex-mcp-server-name")).unwrap();
+    let payloads = sanitized_payloads(&report.events_bytes);
+    assert_eq!(payloads[0]["params"]["name"], "<CODEX_MCP_SERVER_NAME_1>");
+    assert_eq!(payloads[1]["params"]["name"], "<CODEX_MCP_SERVER_NAME_1>");
+    assert_eq!(payloads[0]["params"]["status"], "starting");
+    assert!(payloads[0]["params"]["error"].is_null());
+    assert_eq!(payloads[1]["params"]["status"], "failed");
+    assert!(payloads[1]["params"]["failureReason"].is_null());
+    assert_eq!(payloads[2]["params"]["name"], "stable-protocol-name");
+
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+    assert_eq!(manifest["redaction_counts"]["codex_mcp_server_name"], 2);
+    let definitions = manifest["placeholders"].as_array().unwrap();
+    assert_eq!(
+        definitions
+            .iter()
+            .filter(|definition| definition["kind"] == "codex_mcp_server_name")
+            .count(),
+        1
+    );
+
+    for (name, provider, payload) in [
+        (
+            "claude-mcp-server-name",
+            "claude",
+            r#"{"method":"mcpServer/startupStatus/updated","params":{"name":"local-server-name","status":"starting"}}"#,
+        ),
+        (
+            "codex-wrong-method-server-name",
+            "codex",
+            r#"{"method":"unrelated","params":{"name":"stable-protocol-name","status":"ready"}}"#,
+        ),
+        (
+            "codex-root-server-name",
+            "codex",
+            r#"{"method":"mcpServer/startupStatus/updated","name":"stable-protocol-name","params":{"status":"starting"}}"#,
+        ),
+        (
+            "codex-nested-server-name",
+            "codex",
+            r#"{"method":"mcpServer/startupStatus/updated","params":{"detail":{"name":"stable-protocol-name"},"status":"starting"}}"#,
+        ),
+    ] {
+        let raw = write_raw_capture(temp.path(), name, &[payload]);
+        let path = raw.join("capture.json");
+        let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        capture["provider"] = Value::String(provider.into());
+        std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+        let report = sanitize_dir(&raw, &staging_dir(temp.path(), name)).unwrap();
+        assert_eq!(
+            sanitized_payloads(&report.events_bytes)[0]
+                .pointer(if name == "codex-root-server-name" {
+                    "/name"
+                } else if name == "codex-nested-server-name" {
+                    "/params/detail/name"
+                } else {
+                    "/params/name"
+                })
+                .and_then(Value::as_str),
+            Some(if name == "claude-mcp-server-name" {
+                "local-server-name"
+            } else {
+                "stable-protocol-name"
+            })
+        );
+    }
+}
+
+/// Break caught: Codex thread records embed the thread identifier in a local history path, so
+/// replacing only the home prefix leaves a machine-local identifier suffix in reviewed evidence.
+#[test]
+fn sanitizer_redacts_direct_codex_thread_paths_as_typed_local_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "codex-thread-path",
+        &[
+            r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-secret","path":"C:\\Users\\private\\.codex\\sessions\\thread-secret","preview":""}}}"#,
+            r#"{"method":"thread/started","params":{"thread":{"id":"thread-secret","path":"C:\\Users\\private\\.codex\\sessions\\thread-secret","preview":""}}}"#,
+            r#"{"method":"unrelated","params":{"path":"stable/protocol/path"}}"#,
+        ],
+    );
+    let path = raw.join("capture.json");
+    let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    capture["provider"] = Value::String("codex".into());
+    std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "codex-thread-path")).unwrap();
+    let payloads = sanitized_payloads(&report.events_bytes);
+    assert_eq!(
+        payloads[0]["result"]["thread"]["path"],
+        "<CODEX_THREAD_PATH_1>"
+    );
+    assert_eq!(
+        payloads[1]["params"]["thread"]["path"],
+        "<CODEX_THREAD_PATH_1>"
+    );
+    assert_eq!(payloads[2]["params"]["path"], "stable/protocol/path");
+    assert!(
+        !std::str::from_utf8(&report.events_bytes)
+            .unwrap()
+            .contains("thread-secret")
+    );
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+    assert_eq!(manifest["redaction_counts"]["codex_thread_path"], 2);
+}
+
+/// Break caught: terminal Codex turns repeat item IDs inside `turn.items[]`; losing item context
+/// at that array leaks the raw identifier and breaks joins with the preceding item notification.
+#[test]
+fn sanitizer_reuses_codex_item_ids_inside_terminal_turn_items() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "codex-terminal-item-id",
+        &[
+            r#"{"method":"item/started","params":{"item":{"id":"item-secret","type":"agentMessage"}}}"#,
+            r#"{"method":"turn/completed","params":{"threadId":"thread-secret","turn":{"id":"turn-secret","items":[{"id":"item-secret","type":"agentMessage"}],"status":"completed"}}}"#,
+        ],
+    );
+    let path = raw.join("capture.json");
+    let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    capture["provider"] = Value::String("codex".into());
+    std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "codex-terminal-item-id")).unwrap();
+    let payloads = sanitized_payloads(&report.events_bytes);
+    assert_eq!(payloads[0]["params"]["item"]["id"], "<TOOL_USE_ID_1>");
+    assert_eq!(
+        payloads[1]["params"]["turn"]["items"][0]["id"],
+        "<TOOL_USE_ID_1>"
+    );
+    assert!(
+        !std::str::from_utf8(&report.events_bytes)
+            .unwrap()
+            .contains("item-secret")
+    );
+}
+
 /// Break caught: exact credential names miss provider-prefixed token families, and counter-name
 /// exemptions accept opaque strings that are credentials disguised as usage metadata.
 #[test]

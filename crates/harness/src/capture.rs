@@ -1166,6 +1166,8 @@ fn known_placeholder(candidate: &str) -> Option<KnownPlaceholder> {
         ("CLAUDE_MEMORY_PATH", "claude_memory_path"),
         ("CLAUDE_MESSAGE_ID", "claude_message_id"),
         ("CLAUDE_THINKING_SIGNATURE", "claude_thinking_signature"),
+        ("CODEX_MCP_SERVER_NAME", "codex_mcp_server_name"),
+        ("CODEX_THREAD_PATH", "codex_thread_path"),
     ];
     INDEXED.iter().find_map(|(prefix, kind)| {
         candidate
@@ -1262,6 +1264,8 @@ enum RedactionKind {
     ClaudeMemoryPath,
     ClaudeMessageId,
     ClaudeThinkingSignature,
+    CodexMcpServerName,
+    CodexThreadPath,
 }
 
 impl RedactionKind {
@@ -1281,6 +1285,8 @@ impl RedactionKind {
             Self::ClaudeMemoryPath => "CLAUDE_MEMORY_PATH",
             Self::ClaudeMessageId => "CLAUDE_MESSAGE_ID",
             Self::ClaudeThinkingSignature => "CLAUDE_THINKING_SIGNATURE",
+            Self::CodexMcpServerName => "CODEX_MCP_SERVER_NAME",
+            Self::CodexThreadPath => "CODEX_THREAD_PATH",
         }
     }
 
@@ -1300,6 +1306,8 @@ impl RedactionKind {
             Self::ClaudeMemoryPath => "claude_memory_path",
             Self::ClaudeMessageId => "claude_message_id",
             Self::ClaudeThinkingSignature => "claude_thinking_signature",
+            Self::CodexMcpServerName => "codex_mcp_server_name",
+            Self::CodexThreadPath => "codex_thread_path",
         }
     }
 }
@@ -1335,16 +1343,27 @@ enum Speaker {
 #[derive(Clone, Copy, Default)]
 struct SemanticContext {
     claude_capture: bool,
+    json_root: bool,
     speaker: Speaker,
     codex_turn_input: bool,
     codex_assistant_prose: bool,
     discovery_metadata: bool,
     codex_catalog: bool,
+    codex_root_notification: CodexNotification,
+    codex_direct_params: CodexNotification,
     availability_nux: bool,
     claude_memory_paths: bool,
     claude_tool_use: bool,
     claude_tool_input: bool,
     entity: Entity,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum CodexNotification {
+    #[default]
+    None,
+    TokenUsage,
+    McpStartupStatus,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1384,6 +1403,7 @@ pub fn sanitize_dir(
     let mut redactor = Redactor::new(&capture);
     let semantic_context = SemanticContext {
         claude_capture: capture.provider == Provider::Claude,
+        json_root: true,
         ..SemanticContext::default()
     };
 
@@ -1828,7 +1848,7 @@ impl Redactor {
         match value {
             Value::Array(values) => {
                 for value in values {
-                    self.collect_semantics(value, context);
+                    self.collect_semantics(value, descendant_context(context));
                 }
             }
             Value::Object(object) => {
@@ -1868,7 +1888,11 @@ impl Redactor {
         match value {
             Value::Array(values) => {
                 for (index, value) in values.iter_mut().enumerate() {
-                    self.sanitize_json(value, context, &format!("{location}[{index}]"))?;
+                    self.sanitize_json(
+                        value,
+                        descendant_context(context),
+                        &format!("{location}[{index}]"),
+                    )?;
                 }
             }
             Value::Object(object) => {
@@ -1877,7 +1901,9 @@ impl Redactor {
                 for (index, key) in keys.into_iter().enumerate() {
                     let child_location = format!("{location}.object[{index}]");
                     self.validate_key(&key, &child_location)?;
-                    if is_secret_field(&key, &object[&key]) {
+                    if is_secret_field(&key, &object[&key])
+                        && !is_codex_token_usage_object(&key, &object[&key], context)
+                    {
                         return Err(SanitizationError::SecretLikeField {
                             location: child_location,
                         });
@@ -2111,6 +2137,13 @@ fn object_context(
     if object.get("method").and_then(Value::as_str) == Some("turn/start") {
         context.codex_turn_input = true;
     }
+    if context.json_root && !context.claude_capture {
+        context.codex_root_notification = match object.get("method").and_then(Value::as_str) {
+            Some("thread/tokenUsage/updated") => CodexNotification::TokenUsage,
+            Some("mcpServer/startupStatus/updated") => CodexNotification::McpStartupStatus,
+            _ => CodexNotification::None,
+        };
+    }
     if object
         .get("method")
         .and_then(Value::as_str)
@@ -2146,6 +2179,19 @@ fn semantic_kind(
         return Some(RedactionKind::ClaudeMemoryPath);
     }
     let normalized = normalize_field(key);
+    if context.codex_direct_params == CodexNotification::McpStartupStatus
+        && normalized == "name"
+        && value.as_str().is_some_and(|value| !value.is_empty())
+    {
+        return Some(RedactionKind::CodexMcpServerName);
+    }
+    if !context.claude_capture
+        && matches!(context.entity, Entity::Thread)
+        && normalized == "path"
+        && value.as_str().is_some_and(|value| !value.is_empty())
+    {
+        return Some(RedactionKind::CodexThreadPath);
+    }
     match normalized.as_str() {
         "requestid" => return Some(RedactionKind::ClaudeRequestId),
         "sessionid" => return Some(RedactionKind::SessionId),
@@ -2260,10 +2306,20 @@ fn semantic_kind(
 
 fn child_context(mut context: SemanticContext, key: &str) -> SemanticContext {
     let normalized = normalize_field(key);
+    context.codex_direct_params = if context.json_root && normalized == "params" {
+        context.codex_root_notification
+    } else {
+        CodexNotification::None
+    };
+    context.codex_root_notification = CodexNotification::None;
+    context.json_root = false;
     context.entity = match normalized.as_str() {
         "thread" => Entity::Thread,
         "turn" => Entity::Turn,
         "item" => Entity::Item,
+        "items" if !context.claude_capture && matches!(context.entity, Entity::Turn) => {
+            Entity::Item
+        }
         _ => Entity::None,
     };
     if matches!(normalized.as_str(), "commands" | "agents" | "models") {
@@ -2281,6 +2337,13 @@ fn child_context(mut context: SemanticContext, key: &str) -> SemanticContext {
     if normalized == "input" && context.claude_tool_use {
         context.claude_tool_input = true;
     }
+    context
+}
+
+fn descendant_context(mut context: SemanticContext) -> SemanticContext {
+    context.json_root = false;
+    context.codex_root_notification = CodexNotification::None;
+    context.codex_direct_params = CodexNotification::None;
     context
 }
 
@@ -2353,6 +2416,12 @@ fn is_secret_field(field: &str, value: &Value) -> bool {
         .iter()
         .any(|family| normalized.ends_with(family))
         || normalized == "secret"
+}
+
+fn is_codex_token_usage_object(field: &str, value: &Value, context: SemanticContext) -> bool {
+    context.codex_direct_params == CodexNotification::TokenUsage
+        && normalize_field(field) == "tokenusage"
+        && value.is_object()
 }
 
 fn is_token_counter_field(field: &str) -> bool {
