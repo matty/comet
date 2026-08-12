@@ -31,6 +31,7 @@ mod catalog;
 mod discovery;
 mod normalize;
 mod rpc;
+mod update;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -48,8 +49,8 @@ use tokio::sync::mpsc;
 
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus,
-    HarnessCapabilities, HarnessId, HarnessProbe, InstallMethod, ModelCatalog, RunRequest,
-    RuntimeMode, SteeringMode,
+    HarnessAvailability, HarnessCapabilities, HarnessId, HarnessProbe, InstallMethod, ModelCatalog,
+    RunRequest, RuntimeMode, SteeringMode,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
@@ -276,13 +277,28 @@ impl Harness for CodexHarness {
     }
 
     async fn probe(&self) -> HarnessProbe {
-        crate::probe_installed_cli(
+        let mut probe = crate::probe_installed_cli(
             self.resolve_executable(),
             "codex",
             "CODEX_EXECUTABLE",
             crate::all_known_dirs(codex_install_dirs()),
         )
-        .await
+        .await;
+        // Read against the version this same pass just probed, so the verdict
+        // can never describe a different binary than the one named beside it.
+        // A blocking read is deliberate: it is ~100 bytes of local file, and
+        // `probe` already runs in the engine's background boot task behind a
+        // subprocess spawn that costs orders of magnitude more.
+        let installed = match &probe.availability {
+            HarnessAvailability::Available { version } => version.as_deref(),
+            _ => None,
+        };
+        probe.update = update::read_resolved_update(
+            probe.install.as_ref(),
+            self.codex_home().as_deref(),
+            installed,
+        );
+        probe
     }
 
     /// The curated catalog (see [`catalog`]) unioned with whatever a

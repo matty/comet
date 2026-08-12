@@ -649,6 +649,54 @@ pub(crate) fn parse_cli_version(output: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Compare two dotted-numeric versions, or decline to.
+///
+/// **String comparison is the bug this exists to prevent**: lexically
+/// `"0.9.0" > "0.147.0"`, which would report a year-old CLI as newer than the
+/// one that supersedes it. Components are compared numerically, and a missing
+/// component counts as zero so `1.2` and `1.2.0` are equal.
+///
+/// `None` means "cannot say" — either side having no parseable leading
+/// component, which happens with a nightly tag or a git describe string. The
+/// caller must render nothing rather than guessing, because both guesses are
+/// wrong in a way the user would act on: "up to date" hides a real update, and
+/// "update available" sends them to reinstall what they already have.
+///
+/// Non-numeric suffixes are truncated per component, so `0.148.0-rc1` compares
+/// as `0.148.0`. A pre-release therefore reads as equal to its release, which
+/// is the conservative direction: it cannot manufacture an update that is not
+/// there.
+pub(crate) fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    fn components(v: &str) -> Vec<u64> {
+        v.split('.')
+            .map(|part| {
+                let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse::<u64>().unwrap_or(0)
+            })
+            .collect()
+    }
+    // A version whose FIRST component is unparseable carries no usable order.
+    // Later components degrading to zero is fine; a leading one is not.
+    let parseable = |v: &str| {
+        v.split('.')
+            .next()
+            .is_some_and(|first| first.starts_with(|c: char| c.is_ascii_digit()))
+    };
+    if !parseable(a) || !parseable(b) {
+        return None;
+    }
+    let (left, right) = (components(a), components(b));
+    let width = left.len().max(right.len());
+    for i in 0..width {
+        let l = left.get(i).copied().unwrap_or(0);
+        let r = right.get(i).copied().unwrap_or(0);
+        if l != r {
+            return Some(l.cmp(&r));
+        }
+    }
+    Some(std::cmp::Ordering::Equal)
+}
+
 /// Rolling tail of a child's stderr, shared between the reader task and the
 /// crash-message composer: an unexpected exit surfaces "<name> exited
 /// unexpectedly (<status>): <last stderr lines>" instead of a bare shrug —
@@ -1065,6 +1113,41 @@ mod probe_tests {
         // A bare integer is not a version; requiring the dot avoids reporting
         // "2" from prose like "codex 2 beta".
         assert_eq!(parse_cli_version("codex 2 beta\n"), None);
+    }
+
+    /// The whole reason this is not `a < b` on strings. Both of these are real
+    /// codex-cli versions and the lexical order is the wrong way round.
+    #[test]
+    fn versions_compare_numerically_not_lexically() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            compare_versions("0.147.0", "0.9.0"),
+            Some(Ordering::Greater),
+            "0.147.0 supersedes 0.9.0; a string sort says the opposite"
+        );
+        assert_eq!(
+            compare_versions("2.1.228", "2.1.228"),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(compare_versions("2.1.227", "2.1.228"), Some(Ordering::Less));
+        // Differing component counts: the missing one is zero, not "smaller".
+        assert_eq!(compare_versions("1.2", "1.2.0"), Some(Ordering::Equal));
+        assert_eq!(compare_versions("1.2.1", "1.2"), Some(Ordering::Greater));
+    }
+
+    /// A version with no numeric lead is not orderable, and guessing either way
+    /// misleads: "up to date" hides a real update, "update available" sends the
+    /// user to reinstall what they have.
+    #[test]
+    fn an_unorderable_version_declines_to_compare() {
+        assert_eq!(compare_versions("nightly", "0.147.0"), None);
+        assert_eq!(compare_versions("0.147.0", "main-4a2077e"), None);
+        // A pre-release truncates to its release rather than inventing an
+        // ordering between them.
+        assert_eq!(
+            compare_versions("0.148.0-rc1", "0.148.0"),
+            Some(std::cmp::Ordering::Equal)
+        );
     }
 
     /// Windows resolves these CLIs to `.cmd` shims when they come from npm —
