@@ -4,11 +4,12 @@ use std::path::Path;
 use anyhow::{anyhow, bail};
 use serde_json::{Value, json};
 
+#[cfg(windows)]
+use super::common::file_identity;
 #[cfg(all(test, not(windows)))]
 use super::common::resolve_trusted_powershell;
 use super::common::{
     APPROVAL_MARKER_ADD_DIFF, APPROVAL_MARKER_NAME, CODEX_APPROVAL_COMMAND, FileIdentity,
-    file_identity,
 };
 #[cfg(test)]
 use super::common::{APPROVAL_MARKER_CONTENT, validate_ordinary_approval_cwd};
