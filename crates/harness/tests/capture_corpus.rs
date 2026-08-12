@@ -1244,6 +1244,103 @@ fn sanitizer_replaces_semantic_values_with_typed_placeholders() {
     }
 }
 
+/// Break caught: assistant-prose inheritance rewrites a bounded tool input even though the same
+/// object is repeated in the approval request and allow response, destroying the captured join.
+#[test]
+fn sanitizer_preserves_claude_tool_input_semantics_across_approval_frames() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = serde_json::json!({
+        "content": "capture\n",
+        "file_path": r"C:\captured-cwd\capture-marker.txt",
+        "metadata": {
+            "session_id": "nested-session-secret",
+            "note": r"C:\captured-cwd\private-note.txt"
+        }
+    });
+    let events = [
+        serde_json::json!({
+            "type":"assistant",
+            "message":{"role":"assistant","content":[
+                {"type":"text","text":"private assistant answer"},
+                {"type":"tool_use","id":"tool-write","name":"Write","input":input}
+            ]}
+        })
+        .to_string(),
+        serde_json::json!({
+            "type":"control_request",
+            "request_id":"request-write",
+            "request":{"subtype":"can_use_tool","tool_name":"Write","tool_use_id":"tool-write","input":input}
+        })
+        .to_string(),
+        serde_json::json!({
+            "type":"control_response",
+            "response":{"request_id":"request-write","response":{"behavior":"allow","updatedInput":input}}
+        })
+        .to_string(),
+        serde_json::json!({
+            "type":"assistant",
+            "message":{"role":"assistant","content":[{
+                "type":"other","input":{"content":"unrelated assistant prose"}
+            }]}
+        })
+        .to_string(),
+    ];
+    let refs: Vec<_> = events.iter().map(String::as_str).collect();
+    let raw = write_raw_capture(temp.path(), "claude-tool-input", &refs);
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    capture["redaction_roots"]["cwd"] = Value::String(r"C:\captured-cwd".into());
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "claude-tool-input")).unwrap();
+    let payloads = sanitized_payloads(&report.events_bytes);
+    let tool_input = &payloads[0]["message"]["content"][1]["input"];
+    assert_eq!(tool_input, &payloads[1]["request"]["input"]);
+    assert_eq!(
+        tool_input,
+        &payloads[2]["response"]["response"]["updatedInput"]
+    );
+    assert_eq!(tool_input["content"], "capture\n");
+    assert_eq!(tool_input["file_path"], r"<CWD>\capture-marker.txt");
+    assert_eq!(tool_input["metadata"]["session_id"], "<SESSION_ID_1>");
+    assert_eq!(tool_input["metadata"]["note"], r"<CWD>\private-note.txt");
+    assert_eq!(
+        payloads[0]["message"]["content"][0]["text"],
+        "<ASSISTANT_PROSE_1>"
+    );
+    assert_eq!(
+        payloads[3]["message"]["content"][0]["input"]["content"],
+        "<ASSISTANT_PROSE_2>"
+    );
+
+    let codex_raw = write_raw_capture(
+        temp.path(),
+        "codex-tool-like-input",
+        &[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"content":"codex private prose"}}]}}"#,
+        ],
+    );
+    let codex_path = codex_raw.join("capture.json");
+    let mut codex_capture: Value =
+        serde_json::from_slice(&std::fs::read(&codex_path).unwrap()).unwrap();
+    codex_capture["provider"] = Value::String("codex".into());
+    std::fs::write(
+        &codex_path,
+        serde_json::to_vec_pretty(&codex_capture).unwrap(),
+    )
+    .unwrap();
+    let codex = sanitize_dir(
+        &codex_raw,
+        &staging_dir(temp.path(), "codex-tool-like-input"),
+    )
+    .unwrap();
+    assert_eq!(
+        sanitized_payloads(&codex.events_bytes)[0]["message"]["content"][0]["input"]["content"],
+        "<ASSISTANT_PROSE_1>"
+    );
+}
+
 /// Break caught: Claude discovery can embed locally authored command and agent descriptions,
 /// including machine paths, even though those prose fields are irrelevant to corpus claims.
 #[test]

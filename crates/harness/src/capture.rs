@@ -1342,6 +1342,8 @@ struct SemanticContext {
     codex_catalog: bool,
     availability_nux: bool,
     claude_memory_paths: bool,
+    claude_tool_use: bool,
+    claude_tool_input: bool,
     entity: Entity,
 }
 
@@ -2125,6 +2127,9 @@ fn object_context(
         Some("agentMessage" | "agent_message" | "reasoning") => Speaker::Assistant,
         _ => context.speaker,
     };
+    if context.claude_capture && object.get("type").and_then(Value::as_str) == Some("tool_use") {
+        context.claude_tool_use = true;
+    }
     context
 }
 
@@ -2194,7 +2199,9 @@ fn semantic_kind(
         "content" | "text" if matches!(context.speaker, Speaker::User) => {
             return Some(RedactionKind::UserText);
         }
-        "content" | "text" if matches!(context.speaker, Speaker::Assistant) => {
+        "content" | "text"
+            if matches!(context.speaker, Speaker::Assistant) && !context.claude_tool_input =>
+        {
             return Some(RedactionKind::AssistantProse);
         }
         "text"
@@ -2270,6 +2277,9 @@ fn child_context(mut context: SemanticContext, key: &str) -> SemanticContext {
     }
     if normalized == "memorypaths" {
         context.claude_memory_paths = true;
+    }
+    if normalized == "input" && context.claude_tool_use {
+        context.claude_tool_input = true;
     }
     context
 }
