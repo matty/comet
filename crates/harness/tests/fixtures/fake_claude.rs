@@ -164,6 +164,8 @@ fn main() {
         diagnostics();
     } else if first.contains("scenario:capture-approval-destructive-command") {
         capture_destructive_command(&mut stdin);
+    } else if first.contains("scenario:capture-approval-unexpected-second") {
+        capture_unexpected_second(&mut stdin);
     } else if first.contains("scenario:capture-approval-destructive-write") {
         capture_destructive_write(&mut stdin);
     } else if first.contains("scenario:capture-approval") {
@@ -433,6 +435,17 @@ fn capture_destructive_write(stdin: &mut StdinLock<'_>) {
     emit(
         r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-bad"}"#,
     );
+}
+
+fn capture_unexpected_second(stdin: &mut StdinLock<'_>) {
+    emit(
+        r#"{"type":"control_request","request_id":"good-bash","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"printf capture"},"description":"print capture","tool_use_id":"toolu_bash"}}"#,
+    );
+    let _ = read_line(stdin);
+    emit(
+        r#"{"type":"control_request","request_id":"bad-read","request":{"subtype":"can_use_tool","tool_name":"Read","input":{"file_path":"capture-marker.txt"},"description":"unexpected","tool_use_id":"toolu_bad"}}"#,
+    );
+    let _ = read_line(stdin);
 }
 
 fn diagnostics() {

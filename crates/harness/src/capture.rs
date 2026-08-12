@@ -319,6 +319,29 @@ pub struct RawCapture {
     pub exit_code: Option<i32>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PartialFailureClass {
+    DriverError,
+    Timeout,
+    ProcessError,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PartialOutcome {
+    Incomplete,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PartialRawCapture {
+    schema_version: u64,
+    outcome: PartialOutcome,
+    failure_class: PartialFailureClass,
+    #[serde(flatten)]
+    capture: RawCapture,
+}
+
 const CLAUDE_INITIALIZE_LINE: &str = r#"{"type":"control_request","request_id":"comet-discovery-1","request":{"subtype":"initialize"}}"#;
 const CODEX_INITIALIZED_LINE: &str = r#"{"jsonrpc":"2.0","method":"initialized"}"#;
 const READER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -349,6 +372,8 @@ pub enum SanitizationError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("incomplete capture evidence cannot be sanitized or promoted")]
+    IncompleteCapture,
     #[error("staging output must be below .comet-provider-captures/staging")]
     UnsafeOutputDirectory,
     #[error("capture contains an unrecognized absolute path at {location}")]
@@ -1341,8 +1366,17 @@ pub fn sanitize_dir(
         return Err(SanitizationError::UnsafeOutputDirectory);
     }
 
-    let bytes = std::fs::read(raw_dir.join("capture.json"))
-        .map_err(|source| SanitizationError::ReadRaw { source })?;
+    let capture_path = raw_dir.join("capture.json");
+    let partial_path = raw_dir.join("partial-capture.json");
+    if partial_path.exists() {
+        let bytes =
+            std::fs::read(partial_path).map_err(|source| SanitizationError::ReadRaw { source })?;
+        let _: PartialRawCapture = serde_json::from_slice(&bytes)
+            .map_err(|source| SanitizationError::InvalidRaw { source })?;
+        return Err(SanitizationError::IncompleteCapture);
+    }
+    let bytes =
+        std::fs::read(capture_path).map_err(|source| SanitizationError::ReadRaw { source })?;
     let capture: RawCapture = serde_json::from_slice(&bytes)
         .map_err(|source| SanitizationError::InvalidRaw { source })?;
     let mut redactor = Redactor::new(&capture);
@@ -2887,6 +2921,8 @@ struct RecordingSession {
     events: Arc<Mutex<Vec<CaptureEvent>>>,
     #[cfg(test)]
     reap_notice: Option<std::sync::mpsc::SyncSender<u32>>,
+    #[cfg(test)]
+    wait_error_once: bool,
 }
 
 impl RecordingSession {
@@ -3013,6 +3049,8 @@ impl RecordingSession {
             events,
             #[cfg(test)]
             reap_notice: None,
+            #[cfg(test)]
+            wait_error_once: false,
         })
     }
 
@@ -3023,8 +3061,10 @@ impl RecordingSession {
 
     async fn finish(&mut self) -> anyhow::Result<RawCapture> {
         let operation = self.operation.clone();
+        let mut drive_completed = false;
         let outcome = tokio::time::timeout(self.timeout, async {
             self.drive(operation).await?;
+            drive_completed = true;
             self.stdin.take();
             self.wait_for_exit().await
         })
@@ -3033,10 +3073,18 @@ impl RecordingSession {
             Ok(Ok(exit_code)) => exit_code,
             Ok(Err(err)) => {
                 self.terminate_and_reap().await;
+                let failure_class = if drive_completed {
+                    PartialFailureClass::ProcessError
+                } else {
+                    PartialFailureClass::DriverError
+                };
+                self.persist_partial_after_failure(failure_class).await;
                 return Err(err);
             }
             Err(_) => {
                 self.terminate_and_reap().await;
+                self.persist_partial_after_failure(PartialFailureClass::Timeout)
+                    .await;
                 bail!(
                     "Capture timed out after {} seconds. The provider was stopped; retry with --timeout-seconds up to 300.",
                     self.timeout.as_secs_f64()
@@ -3044,7 +3092,13 @@ impl RecordingSession {
             }
         };
         self.finish_readers().await;
-        let capture = RawCapture {
+        let capture = self.raw_capture(exit_code);
+        persist_raw_capture(&capture).await?;
+        Ok(capture)
+    }
+
+    fn raw_capture(&self, exit_code: Option<i32>) -> RawCapture {
+        RawCapture {
             directory: self.directory.clone(),
             provider: self.provider,
             cli_version: self.cli_version.clone(),
@@ -3062,9 +3116,19 @@ impl RecordingSession {
             command: self.command.clone(),
             events: self.events.lock().expect("capture event lock").clone(),
             exit_code,
+        }
+    }
+
+    async fn persist_partial_after_failure(&self, failure_class: PartialFailureClass) {
+        let partial = PartialRawCapture {
+            schema_version: 1,
+            outcome: PartialOutcome::Incomplete,
+            failure_class,
+            capture: self.raw_capture(None),
         };
-        persist_raw_capture(&capture).await?;
-        Ok(capture)
+        if let Err(err) = persist_partial_raw_capture(&partial).await {
+            tracing::debug!(%err, "partial raw capture persistence failed");
+        }
     }
 
     async fn drive(&mut self, operation: CaptureOperation) -> anyhow::Result<()> {
@@ -3461,6 +3525,10 @@ impl RecordingSession {
     }
 
     async fn wait_for_exit(&mut self) -> anyhow::Result<Option<i32>> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.wait_error_once) {
+            bail!("The provider ended but its exit status could not be read. Retry the capture.");
+        }
         let Some(child) = self.child.as_mut() else {
             return Ok(None);
         };
@@ -3471,7 +3539,6 @@ impl RecordingSession {
             }
             Ok(Err(err)) => {
                 tracing::debug!(provider = provider_name(self.provider), %err, "capture child wait failed");
-                self.child.take();
                 bail!(
                     "The provider ended but its exit status could not be read. Retry the capture."
                 )
@@ -3487,22 +3554,21 @@ impl RecordingSession {
 
     async fn terminate_and_reap(&mut self) {
         self.stdin.take();
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        if let Err(err) = child.start_kill() {
-            tracing::debug!(provider = provider_name(self.provider), %err, "capture child kill failed");
-        }
-        match tokio::time::timeout(CLEANUP_TIMEOUT, child.wait()).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(err)) => {
-                tracing::debug!(provider = provider_name(self.provider), %err, "capture child reap failed");
+        if let Some(mut child) = self.child.take() {
+            if let Err(err) = child.start_kill() {
+                tracing::debug!(provider = provider_name(self.provider), %err, "capture child kill failed");
             }
-            Err(_) => {
-                tracing::warn!(
-                    provider = provider_name(self.provider),
-                    "capture child reap timed out"
-                );
+            match tokio::time::timeout(CLEANUP_TIMEOUT, child.wait()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    tracing::debug!(provider = provider_name(self.provider), %err, "capture child reap failed");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        provider = provider_name(self.provider),
+                        "capture child reap timed out"
+                    );
+                }
             }
         }
         self.finish_readers().await;
@@ -3709,6 +3775,36 @@ async fn persist_raw_capture(capture: &RawCapture) -> anyhow::Result<()> {
     })
 }
 
+async fn persist_partial_raw_capture(capture: &PartialRawCapture) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(capture)
+        .map_err(|_| anyhow!("partial raw evidence could not be prepared"))?;
+    let directory = capture.capture.directory.clone();
+    tokio::task::spawn_blocking(move || persist_immutable_bytes(&directory, &bytes))
+        .await
+        .map_err(|_| anyhow!("partial raw evidence writer stopped"))??;
+    Ok(())
+}
+
+fn persist_immutable_bytes(directory: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let temporary = directory.join(".partial-capture.json.tmp");
+    let destination = directory.join("partial-capture.json");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::hard_link(&temporary, &destination)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&temporary);
+    result
+}
+
 async fn claude_user_line(request: &RunRequest, script: ClaudeRunScript) -> anyhow::Result<String> {
     let images = crate::claude::load_image_blocks(&request.attachments).await;
     if matches!(script, ClaudeRunScript::Attachment) && images.is_empty() {
@@ -3756,20 +3852,21 @@ mod tests {
     #[cfg(windows)]
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
     use comet_proto::{ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel};
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
-        CaptureConfig, CaptureOperation, CaptureScenario, Channel, ClaudeCaptureOperation,
-        ClaudeRunScript, CodexCaptureOperation, CodexRunScript, CommandSnapshot, LaunchDescriptor,
-        Provider, PublicationLock, RecordingSession, StdioMode, publish_staging_pair_with,
-        publish_staging_pair_with_commit, record,
+        APPROVAL_MARKER_NAME, CaptureConfig, CaptureOperation, CaptureScenario, Channel,
+        ClaudeCaptureOperation, ClaudeRunScript, CodexCaptureOperation, CodexRunScript,
+        CommandSnapshot, LaunchDescriptor, Provider, PublicationLock, RecordingSession, StdioMode,
+        persist_immutable_bytes, publish_staging_pair_with, publish_staging_pair_with_commit,
+        record, sanitize_dir,
     };
 
     /// Break caught: writing events directly into the destination before manifest creation can
@@ -4336,7 +4433,6 @@ mod tests {
         ))
         .await
         .unwrap();
-
         assert_eq!(capture.provider, Provider::Claude);
         assert!(capture.command.args.iter().any(|arg| arg == "--bare"));
         assert!(
@@ -4646,6 +4742,209 @@ mod tests {
             );
             assert!(error.contains("approval request"), "{error}");
         }
+    }
+
+    /// Break caught: a fail-closed approval deviation is discarded after a paid provider run,
+    /// leaving no reviewable transcript even though the child was safely stopped before reply.
+    #[tokio::test]
+    async fn recorder_quarantines_partial_approval_evidence_after_cleanup() {
+        let raw = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let request = RunRequest {
+            prompt: "scenario:capture-approval-unexpected-second".into(),
+            cwd: cwd.path().display().to_string(),
+            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
+        };
+        let mut session = RecordingSession::start(config(
+            "claude-approval-partial",
+            fixture_path("fake-claude"),
+            CaptureOperation::Claude(ClaudeCaptureOperation::Run {
+                request,
+                script: ClaudeRunScript::Approval,
+            }),
+            raw.path(),
+        ))
+        .await
+        .unwrap();
+        let pid = session.child_id().expect("spawned child id");
+        let directory = session.directory.clone();
+
+        let error = session.finish().await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Claude approval request used an unexpected tool or order."
+        );
+        assert!(!process_is_live(pid), "provider child {pid} remains live");
+        assert!(!cwd.path().join(APPROVAL_MARKER_NAME).exists());
+        assert!(!directory.join("capture.json").exists());
+        let partial_path = directory.join("partial-capture.json");
+        let partial: Value =
+            serde_json::from_slice(&std::fs::read(&partial_path).expect("partial raw evidence"))
+                .unwrap();
+        assert_eq!(partial["schema_version"], 1);
+        assert_eq!(partial["outcome"], "incomplete");
+        assert_eq!(partial["failure_class"], "driver_error");
+        let events = partial["events"].as_array().unwrap();
+        assert!(events.iter().any(|event| {
+            event["channel"] == "stdout"
+                && event["payload"].as_str().is_some_and(|payload| {
+                    payload.contains("bad-read") && payload.contains("capture-marker.txt")
+                })
+        }));
+        assert!(events.iter().any(|event| {
+            event["channel"] == "stdin"
+                && event["payload"]
+                    .as_str()
+                    .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+                    .is_some_and(|payload| {
+                        payload["response"]["request_id"] == "good-bash"
+                            && payload["response"]["response"]["behavior"] == "allow"
+                    })
+        }));
+        assert!(!events.iter().any(|event| {
+            event["channel"] == "stdin"
+                && event["payload"]
+                    .as_str()
+                    .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+                    .is_some_and(|payload| payload["response"]["request_id"] == "bad-read")
+        }));
+
+        let staging = raw
+            .path()
+            .join(".comet-provider-captures/staging/incomplete");
+        let sanitize_error = sanitize_dir(&directory, &staging).unwrap_err();
+        assert!(
+            matches!(&sanitize_error, super::SanitizationError::IncompleteCapture),
+            "unexpected sanitizer error: {sanitize_error}"
+        );
+        assert!(!staging.exists());
+    }
+
+    /// Break caught: a directory containing a successful-looking `capture.json` can bypass the
+    /// quarantine marker and publish incomplete evidence.
+    #[tokio::test]
+    async fn sanitizer_rejects_partial_capture_even_beside_complete_shaped_raw() {
+        let raw = tempfile::tempdir().unwrap();
+        let mut capture = record(config(
+            "claude-model-discovery",
+            fixture_path("fake-claude"),
+            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
+            raw.path(),
+        ))
+        .await
+        .unwrap();
+        capture.command.program = "fake-claude".into();
+        std::fs::write(
+            capture.directory.join("capture.json"),
+            serde_json::to_vec_pretty(&capture).unwrap(),
+        )
+        .unwrap();
+        let partial = super::PartialRawCapture {
+            schema_version: 1,
+            outcome: super::PartialOutcome::Incomplete,
+            failure_class: super::PartialFailureClass::DriverError,
+            capture: capture.clone(),
+        };
+        std::fs::write(
+            capture.directory.join("partial-capture.json"),
+            serde_json::to_vec_pretty(&partial).unwrap(),
+        )
+        .unwrap();
+        let staging = raw.path().join(".comet-provider-captures/staging/mixed");
+
+        let error = sanitize_dir(&capture.directory, &staging).unwrap_err();
+
+        assert!(
+            matches!(&error, super::SanitizationError::IncompleteCapture),
+            "partial evidence bypassed explicit rejection: {error:?}"
+        );
+        assert!(!staging.exists());
+    }
+
+    /// Break caught: retrying persistence can overwrite the first failure transcript or expose a
+    /// half-written JSON document under its final name.
+    #[test]
+    fn partial_capture_publication_is_atomic_and_immutable() {
+        let directory = tempfile::Builder::new()
+            .prefix("comet partial evidence ' ")
+            .tempdir()
+            .unwrap();
+        persist_immutable_bytes(directory.path(), br#"{"first":true}"#).unwrap();
+        let destination = directory.path().join("partial-capture.json");
+        assert_eq!(std::fs::read(&destination).unwrap(), br#"{"first":true}"#);
+        assert!(!directory.path().join(".partial-capture.json.tmp").exists());
+
+        let error = persist_immutable_bytes(directory.path(), br#"{"second":true}"#).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(destination).unwrap(), br#"{"first":true}"#);
+        assert!(!directory.path().join(".partial-capture.json.tmp").exists());
+    }
+
+    /// Break caught: setup/probe/spawn errors manufacture an incomplete provider transcript even
+    /// though no provider process and therefore no observed protocol frame existed.
+    #[tokio::test]
+    async fn recorder_failure_before_spawn_creates_no_partial_capture() {
+        let raw = tempfile::tempdir().unwrap();
+        let missing = raw.path().join("missing-provider-executable");
+        let result = record(config(
+            "claude-pre-spawn-failure",
+            missing,
+            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
+            raw.path(),
+        ))
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("could not be started")
+        );
+        assert!(!find_named_file(raw.path(), "partial-capture.json"));
+    }
+
+    /// Break caught: failure to quarantine evidence replaces the safe protocol error with a raw
+    /// storage error that may disclose a local path or provider value.
+    #[tokio::test]
+    async fn partial_persistence_failure_preserves_the_original_safe_error() {
+        let raw = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let request = RunRequest {
+            prompt: "scenario:capture-approval-unexpected-second".into(),
+            cwd: cwd.path().display().to_string(),
+            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
+        };
+        let mut session = RecordingSession::start(config(
+            "claude-partial-write-failure",
+            fixture_path("fake-claude"),
+            CaptureOperation::Claude(ClaudeCaptureOperation::Run {
+                request,
+                script: ClaudeRunScript::Approval,
+            }),
+            raw.path(),
+        ))
+        .await
+        .unwrap();
+        let partial_path = session.directory.join("partial-capture.json");
+        std::fs::write(&partial_path, b"existing quarantine").unwrap();
+
+        let error = session.finish().await.unwrap_err().to_string();
+
+        assert_eq!(
+            error,
+            "Claude approval request used an unexpected tool or order."
+        );
+        assert!(!error.contains(&session.directory.display().to_string()));
+        assert_eq!(std::fs::read(partial_path).unwrap(), b"existing quarantine");
+    }
+
+    fn find_named_file(root: &Path, name: &str) -> bool {
+        std::fs::read_dir(root).is_ok_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                entry.file_name() == name
+                    || (entry.path().is_dir() && find_named_file(&entry.path(), name))
+            })
+        })
     }
 
     #[tokio::test]
@@ -5232,6 +5531,103 @@ mod tests {
         let error = session.finish().await.unwrap_err();
         assert!(error.to_string().contains("timed out"));
         assert!(!process_is_live(pid), "provider child {pid} remains live");
+    }
+
+    /// Break caught: an error path with no retained child returns before pending pipe readers are
+    /// drained, so the partial snapshot races and can omit the provider's final observed frame.
+    #[tokio::test]
+    async fn cleanup_without_a_child_drains_readers_before_partial_snapshot() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let reader_events = Arc::clone(&events);
+        let reader_started = Arc::new(AtomicBool::new(false));
+        let task_started = Arc::clone(&reader_started);
+        let reader = tokio::spawn(async move {
+            task_started.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            super::push_event(
+                &reader_events,
+                Channel::Stdout,
+                "late observed frame".into(),
+            );
+        });
+        while !reader_started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let (_stdout_tx, stdout_lines) = tokio::sync::mpsc::unbounded_channel();
+        let raw = tempfile::tempdir().unwrap();
+        let mut session = RecordingSession {
+            provider: Provider::Claude,
+            operation: CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
+            timeout: Duration::from_secs(1),
+            directory: raw.path().into(),
+            cli_version: "fixture".into(),
+            captured_at_unix_ms: 1,
+            scenario: "pending-reader".into(),
+            purpose: "prove cleanup ordering".into(),
+            command: CommandSnapshot {
+                program: "fake-claude".into(),
+                args: Vec::new(),
+                cwd: None,
+                configured_env: Default::default(),
+                stdin: StdioMode::Piped,
+                stdout: StdioMode::Piped,
+                stderr: StdioMode::Piped,
+                kill_on_drop: true,
+                #[cfg(windows)]
+                creation_flags: 0,
+            },
+            approval_target: None,
+            approval_target_identity: None,
+            child: None,
+            stdin: None,
+            stdout_lines,
+            readers: vec![reader],
+            events,
+            reap_notice: None,
+            wait_error_once: false,
+        };
+
+        session.terminate_and_reap().await;
+        let capture = session.raw_capture(None);
+
+        assert!(session.readers.is_empty(), "pending reader was not joined");
+        assert_eq!(capture.events.len(), 1);
+        assert_eq!(capture.events[0].payload, "late observed frame");
+    }
+
+    /// Break caught: a child-wait I/O error discards the only child handle before the outer
+    /// failure cleanup can attempt kill/reap and finalize the partial transcript.
+    #[tokio::test]
+    async fn wait_error_retains_child_for_cleanup_and_quarantine() {
+        let raw = tempfile::tempdir().unwrap();
+        let mut session = RecordingSession::start(config(
+            "claude-wait-error",
+            fixture_path("fake-claude"),
+            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
+            raw.path(),
+        ))
+        .await
+        .unwrap();
+        let pid = session.child_id().expect("spawned child id");
+        let directory = session.directory.clone();
+        session.wait_error_once = true;
+
+        let error = session.finish().await.unwrap_err();
+
+        assert!(error.to_string().contains("exit status could not be read"));
+        assert!(session.child.is_none(), "cleanup retained the child handle");
+        assert!(!process_is_live(pid), "provider child {pid} remains live");
+        let partial: Value = serde_json::from_slice(
+            &std::fs::read(directory.join("partial-capture.json"))
+                .expect("wait-error partial evidence"),
+        )
+        .unwrap();
+        assert_eq!(partial["failure_class"], "process_error");
+        assert!(
+            partial["events"]
+                .as_array()
+                .is_some_and(|events| { events.iter().any(|event| event["channel"] == "stdout") })
+        );
     }
 
     /// Break caught: drop delegates `wait()` to the originating Tokio runtime, whose shutdown
