@@ -513,11 +513,125 @@ pub struct HarnessInstall {
     pub method: InstallMethod,
 }
 
+/// How current the installed CLI is, to the extent the provider will say.
+///
+/// The variants exist to keep two genuinely different answers apart, because
+/// only one provider can give the stronger one. Codex publishes the latest
+/// version it knows of, so Comet can compare and say [`Current`] or
+/// [`Available`]. Claude publishes only what its own last update *attempt* did,
+/// so the most Comet can honestly report is [`SelfUpdating`] — never "up to
+/// date", which would be a claim about a version nobody here has seen.
+///
+/// Collapsing those into one "ok" variant is the mistake this type exists to
+/// prevent: it would let the card tell a user Claude is current at the moment
+/// its auto-updater has quietly been failing for a week.
+///
+/// [`Unknown`] is the default and the catch-all, for the same all-or-nothing
+/// decode reason spelled out on [`InstallMethod`] — this rides in the same
+/// `Vec<HarnessDescriptor>`. Adding a variant therefore needs no
+/// `PROTOCOL_VERSION` bump.
+///
+/// [`Current`]: UpdateState::Current
+/// [`Available`]: UpdateState::Available
+/// [`SelfUpdating`]: UpdateState::SelfUpdating
+/// [`Unknown`]: UpdateState::Unknown
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UpdateState {
+    /// A real comparison against a published latest version said the installed
+    /// one is not behind. Only claimable when [`HarnessUpdate::latest`] is set.
+    Current,
+    /// A newer version exists; [`HarnessUpdate::latest`] names it.
+    Available,
+    /// The CLI keeps itself updated and its last attempt succeeded, but it does
+    /// not publish what the latest version is. Deliberately weaker than
+    /// [`Current`]: it says the mechanism is working, not that the binary is
+    /// newest.
+    ///
+    /// [`Current`]: UpdateState::Current
+    SelfUpdating,
+    /// The CLI's own last update attempt failed. The one state here a user can
+    /// act on, and the reason this slice reads the attempt record at all — it
+    /// is exactly when self-updating has stopped working silently.
+    UpdateFailed,
+    /// Nothing readable: no state file, unparseable contents, or a provider
+    /// that publishes neither. Renders no line rather than an empty one.
+    #[default]
+    Unknown,
+}
+
+impl UpdateState {
+    /// The wire spelling, matching what `Serialize` emits.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Available => "available",
+            Self::SelfUpdating => "selfUpdating",
+            Self::UpdateFailed => "updateFailed",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Anything unrecognized becomes [`Unknown`] rather than an error. See the
+    /// type's own doc for why that is not laziness.
+    ///
+    /// [`Unknown`]: UpdateState::Unknown
+    pub fn from_wire(raw: &str) -> Self {
+        match raw {
+            "current" => Self::Current,
+            "available" => Self::Available,
+            "selfUpdating" => Self::SelfUpdating,
+            "updateFailed" => Self::UpdateFailed,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for UpdateState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::from_wire(&raw))
+    }
+}
+
+/// What the provider itself says about how current its CLI is.
+///
+/// Read from the state file each CLI already maintains for its own updater —
+/// never by spawning one. Both providers' `update` subcommands check *and
+/// install* in a single shot with no dry-run flag, so asking them the question
+/// is indistinguishable from telling them to act on it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessUpdate {
+    #[serde(default)]
+    pub state: UpdateState,
+    /// The newest version the provider knows of. Set only when the provider
+    /// publishes one, which today means Codex alone — it is never inferred from
+    /// an install method, a registry, or a changelog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+    /// When the provider last did the thing this state describes, as it wrote
+    /// it. Its meaning follows `state` rather than being fixed: a check time
+    /// for [`Current`]/[`Available`], an update-attempt time for
+    /// [`SelfUpdating`]/[`UpdateFailed`]. The card's copy differs per state for
+    /// exactly that reason, so the two never render as the same sentence.
+    ///
+    /// [`Current`]: UpdateState::Current
+    /// [`Available`]: UpdateState::Available
+    /// [`SelfUpdating`]: UpdateState::SelfUpdating
+    /// [`UpdateFailed`]: UpdateState::UpdateFailed
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<String>,
+}
+
 /// What one resolve-and-probe pass learned about a provider's CLI.
 ///
-/// Deliberately **not** a wire type: `HarnessDescriptor` publishes the two
+/// Deliberately **not** a wire type: `HarnessDescriptor` publishes the three
 /// halves as siblings, matching how they are consumed. This exists so the pass
-/// that produces them cannot produce one without the other — a path shown
+/// that produces them cannot produce one without the others — a path shown
 /// beside a version it was not probed with would be worse than showing
 /// neither.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -525,6 +639,10 @@ pub struct HarnessProbe {
     pub availability: HarnessAvailability,
     /// Absent only when resolution never yielded a path at all.
     pub install: Option<HarnessInstall>,
+    /// Absent when the provider publishes no update state, or its state file is
+    /// missing or unreadable. Independent of `install`: a CLI can resolve and
+    /// still say nothing about updates.
+    pub update: Option<HarnessUpdate>,
 }
 
 impl HarnessProbe {
@@ -534,6 +652,7 @@ impl HarnessProbe {
         Self {
             availability,
             install: None,
+            update: None,
         }
     }
 }
@@ -626,6 +745,91 @@ mod install_tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), labels.len(), "two methods share a label");
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    /// Same blast-radius rule as `InstallMethod`, and the same direction: a
+    /// newer peer sending a state this build predates must not blank the whole
+    /// harness vector. The siblings still arrive, so the card can fall back to
+    /// the version and path it already had.
+    #[test]
+    fn an_unknown_state_degrades_instead_of_failing_the_batch() {
+        let decoded: HarnessUpdate = serde_json::from_str(
+            r#"{"state":"rollbackPending","latest":"0.148.0","checkedAt":"2026-08-12T00:48:08Z"}"#,
+        )
+        .expect("an unrecognized state must not fail the decode");
+        assert_eq!(decoded.state, UpdateState::Unknown);
+        assert_eq!(decoded.latest.as_deref(), Some("0.148.0"));
+    }
+
+    /// An older engine sends no update block at all — the field is absent, not
+    /// null, which is what `skip_serializing_if` produces on the wire.
+    #[test]
+    fn an_absent_update_block_reads_as_none() {
+        #[derive(Deserialize)]
+        struct Carrier {
+            #[serde(default)]
+            update: Option<HarnessUpdate>,
+        }
+        let decoded: Carrier = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(decoded.update.is_none());
+    }
+
+    /// A state with neither sibling is legal: `SelfUpdating` with no timestamp
+    /// is what a Claude install that has never updated looks like.
+    #[test]
+    fn a_bare_state_decodes_with_empty_siblings() {
+        let decoded: HarnessUpdate = serde_json::from_str(r#"{"state":"selfUpdating"}"#).unwrap();
+        assert_eq!(decoded.state, UpdateState::SelfUpdating);
+        assert_eq!(decoded.latest, None);
+        assert_eq!(decoded.checked_at, None);
+    }
+
+    /// `as_wire_str` and the derived `Serialize` must not drift — `from_wire` is
+    /// written against the strings the derive emits, so a `rename_all` change
+    /// that altered one would break decoding in a way no round-trip through the
+    /// Rust type alone would catch. `selfUpdating` is the variant that would
+    /// actually break: it is the only multi-word one.
+    #[test]
+    fn every_state_round_trips_through_its_wire_spelling() {
+        for state in [
+            UpdateState::Current,
+            UpdateState::Available,
+            UpdateState::SelfUpdating,
+            UpdateState::UpdateFailed,
+            UpdateState::Unknown,
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(
+                json,
+                format!(r#""{}""#, state.as_wire_str()),
+                "the derive and as_wire_str disagree"
+            );
+            assert_eq!(
+                UpdateState::from_wire(state.as_wire_str()),
+                state,
+                "{} did not decode back",
+                state.as_wire_str()
+            );
+        }
+    }
+
+    /// The absent case a peer actually sends: `latest` and `checkedAt` are
+    /// skipped rather than nulled, so a `SelfUpdating` block is two keys
+    /// shorter than an `Available` one and an older decoder sees no `null`.
+    #[test]
+    fn empty_siblings_are_omitted_from_the_wire() {
+        let json = serde_json::to_string(&HarnessUpdate {
+            state: UpdateState::SelfUpdating,
+            latest: None,
+            checked_at: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"state":"selfUpdating"}"#);
     }
 }
 

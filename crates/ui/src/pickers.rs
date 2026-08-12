@@ -3780,6 +3780,7 @@ mod tests {
             capabilities: comet_proto::HarnessCapabilities::default(),
             availability,
             install: None,
+            update: None,
         };
 
         // The boot snapshot: nothing probed yet.
@@ -3836,6 +3837,7 @@ mod tests {
             capabilities: comet_proto::HarnessCapabilities::default(),
             availability,
             install: None,
+            update: None,
         };
 
         // Nothing fetched yet, and a fetch in flight: both unsettled, so the
@@ -3868,6 +3870,7 @@ mod tests {
             capabilities: comet_proto::HarnessCapabilities::default(),
             availability,
             install: None,
+            update: None,
         };
         let list = vec![
             with(HarnessId::ClaudeCode, HarnessAvailability::Unknown),
@@ -4009,6 +4012,7 @@ mod tests {
             capabilities: comet_proto::HarnessCapabilities::default(),
             availability: comet_proto::HarnessAvailability::Unknown,
             install: None,
+            update: None,
         };
         let mixed = vec![
             descriptor(HarnessId::Mock, "Mock"),
