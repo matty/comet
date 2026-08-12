@@ -896,11 +896,6 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "claude-routine-frame-fixture",
             "claude-routine-frame-ignore-list",
             "claude-routine-frame-integration",
-            "codex-approval-policy-semantics",
-            "codex-approval-request-shapes",
-            "codex-file-change-approval-join",
-            "codex-file-add-raw-content",
-            "codex-file-change-kind-shape",
             "codex-model-cwd-invariance",
             "codex-model-effort-objects",
             "codex-model-fixture-shape",
@@ -933,51 +928,13 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "claude-command-nonbare-count",
             "claude-model-bare-effects",
             "claude-model-cwd-invariance",
-            "codex-approval-policy-semantics",
             "codex-model-cwd-invariance",
             "codex-model-logged-out-fallback",
         ])
     );
 
     let errors = validate_corpus(&corpus_root);
-    assert_eq!(errors.len(), 6, "inventory errors: {errors:#?}");
-    assert!(
-        errors
-            .iter()
-            .all(|error| matches!(error, CorpusError::MissingManifest { .. })),
-        "inventory produced non-missing-manifest errors: {errors:#?}"
-    );
-    let actual: std::collections::BTreeSet<(&str, &str)> = errors
-        .iter()
-        .filter_map(|error| match error {
-            CorpusError::MissingManifest { claim_id, manifest } => {
-                Some((claim_id.as_str(), manifest.as_str()))
-            }
-            _ => None,
-        })
-        .collect();
-    let mut expected = std::collections::BTreeSet::new();
-    let mut add = |manifest: &'static str, claims: &[&'static str]| {
-        expected.extend(claims.iter().map(|claim| (*claim, manifest)));
-    };
-    add(
-        "codex/pending-observed-version/approval-on-request/manifest.json",
-        &["codex-approval-policy-semantics"],
-    );
-    add(
-        "codex/pending-observed-version/approval/manifest.json",
-        &["codex-approval-policy-semantics"],
-    );
-    add(
-        "codex/pending-observed-version/approval/manifest.json",
-        &[
-            "codex-approval-request-shapes",
-            "codex-file-change-approval-join",
-            "codex-file-add-raw-content",
-            "codex-file-change-kind-shape",
-        ],
-    );
-    assert_eq!(actual, expected, "pending error identity/path set changed");
+    assert!(errors.is_empty(), "inventory errors: {errors:#?}");
 }
 
 /// Break caught: a promoted token-free selector can exist in the index while its reviewed
