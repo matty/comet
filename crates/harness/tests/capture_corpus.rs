@@ -683,6 +683,25 @@ fn sanitizer_output_is_independent_of_raw_directory_name_and_location() {
     assert!(!manifest.contains(&second_raw.display().to_string()));
 }
 
+/// Break caught: mapping lock contention to a generic write error gives callers no bounded retry
+/// signal, while deleting a pre-existing lock would silently steal another publisher's ownership.
+#[test]
+fn sanitizer_reports_busy_without_stealing_an_existing_publication_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(temp.path(), "busy-capture", &[r#"{"level":"debug"}"#]);
+    let output = staging_dir(temp.path(), "private-destination-name");
+    let parent = output.parent().unwrap();
+    std::fs::create_dir_all(parent).unwrap();
+    let lock = parent.join(".private-destination-name.publish.lock");
+    std::fs::write(&lock, b"owned elsewhere").unwrap();
+
+    let error = sanitize_dir(&raw, &output).unwrap_err();
+    assert!(matches!(error, SanitizationError::PublicationBusy { .. }));
+    assert!(!error.to_string().contains("private-destination-name"));
+    assert_eq!(std::fs::read(&lock).unwrap(), b"owned elsewhere");
+    assert!(!output.exists());
+}
+
 /// Break caught: deriving repository/home/temp roots during sanitization makes identical raw bytes
 /// produce different artifacts when the checkout or host environment changes after capture.
 #[test]

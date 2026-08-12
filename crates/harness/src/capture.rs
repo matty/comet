@@ -295,6 +295,16 @@ pub enum SanitizationError {
         #[source]
         source: std::io::Error,
     },
+    #[error("sanitized staging destination is busy; retry after the other publisher finishes")]
+    PublicationBusy {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("sanitized staging destination already contains different evidence")]
+    PublicationConflict {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("sanitized capture could not be encoded")]
     EncodeOutput {
         #[source]
@@ -487,8 +497,13 @@ pub fn sanitize_dir(
 
     let events_path = output_dir.join("events.jsonl");
     let manifest_path = output_dir.join("manifest.json");
-    publish_staging_pair_with(output_dir, &events_bytes, &manifest_bytes, |_| Ok(()))
-        .map_err(|source| SanitizationError::WriteOutput { source })?;
+    publish_staging_pair_with(output_dir, &events_bytes, &manifest_bytes, |_| Ok(())).map_err(
+        |source| match source.kind() {
+            std::io::ErrorKind::WouldBlock => SanitizationError::PublicationBusy { source },
+            std::io::ErrorKind::AlreadyExists => SanitizationError::PublicationConflict { source },
+            _ => SanitizationError::WriteOutput { source },
+        },
+    )?;
 
     Ok(SanitizationReport {
         events_path,
@@ -534,51 +549,154 @@ where
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("capture");
-    let temporary_prefix = format!(".{output_name}.sanitize-");
-    let temporary = parent.join(format!("{temporary_prefix}{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&temporary)?;
+    let publication_lock = PublicationLock::acquire(parent, output_name)?;
+    let result = (|| {
+        let temporary_prefix = format!(".{output_name}.sanitize-");
+        let temporary = parent.join(format!("{temporary_prefix}{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&temporary)?;
 
-    let prepared = (|| {
-        write_synced(&temporary.join("events.jsonl"), events)?;
-        after_events(&temporary)?;
-        write_synced(&temporary.join("manifest.json"), manifest)?;
+        let prepared = (|| {
+            write_synced(&temporary.join("events.jsonl"), events)?;
+            after_events(&temporary)?;
+            write_synced(&temporary.join("manifest.json"), manifest)?;
+            Ok(())
+        })();
+        if let Err(error) = prepared {
+            let _ = remove_verified_generated_dir(&temporary, parent, &temporary_prefix);
+            return Err(error);
+        }
+
+        if output_dir.exists() {
+            let identical = match destination_is_exact_pair(output_dir, events, manifest) {
+                Ok(identical) => identical,
+                Err(error) => {
+                    let _ = remove_verified_generated_dir(&temporary, parent, &temporary_prefix);
+                    return Err(error);
+                }
+            };
+            remove_verified_generated_dir(&temporary, parent, &temporary_prefix)?;
+            if identical {
+                return Ok(());
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "sanitized staging destination already contains different evidence",
+            ));
+        }
+
+        if let Err(error) = commit(&temporary, output_dir) {
+            let _ = remove_verified_generated_dir(&temporary, parent, &temporary_prefix);
+            return Err(error);
+        }
         Ok(())
     })();
-    if let Err(error) = prepared {
-        let _ = remove_verified_generated_dir(&temporary, parent, &temporary_prefix);
-        return Err(error);
+    match publication_lock.release() {
+        Ok(()) => result,
+        Err(error) => Err(error),
+    }
+}
+
+fn destination_is_exact_pair(
+    output_dir: &Path,
+    expected_events: &[u8],
+    expected_manifest: &[u8],
+) -> std::io::Result<bool> {
+    let directory_metadata = std::fs::symlink_metadata(output_dir)?;
+    if !directory_metadata.file_type().is_dir()
+        || directory_metadata.file_type().is_symlink()
+        || has_windows_reparse_point(&directory_metadata)
+    {
+        return Ok(false);
     }
 
-    if output_dir.exists() {
-        let existing_events = match std::fs::read(output_dir.join("events.jsonl")) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                let _ = remove_verified_generated_dir(&temporary, parent, &temporary_prefix);
-                return Err(error);
-            }
-        };
-        let existing_manifest = match std::fs::read(output_dir.join("manifest.json")) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                let _ = remove_verified_generated_dir(&temporary, parent, &temporary_prefix);
-                return Err(error);
-            }
-        };
-        remove_verified_generated_dir(&temporary, parent, &temporary_prefix)?;
-        if existing_events == events && existing_manifest == manifest {
-            return Ok(());
+    let mut events_match = false;
+    let mut manifest_match = false;
+    let mut entry_count = 0;
+    for entry in std::fs::read_dir(output_dir)? {
+        let entry = entry?;
+        entry_count += 1;
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || has_windows_reparse_point(&metadata)
+        {
+            return Ok(false);
         }
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "sanitized staging destination already contains different evidence",
-        ));
+        if entry.file_name() == "events.jsonl" {
+            events_match = std::fs::read(entry.path())? == expected_events;
+        } else if entry.file_name() == "manifest.json" {
+            manifest_match = std::fs::read(entry.path())? == expected_manifest;
+        } else {
+            return Ok(false);
+        }
+    }
+    Ok(entry_count == 2 && events_match && manifest_match)
+}
+
+#[cfg(windows)]
+fn has_windows_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn has_windows_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+struct PublicationLock {
+    _file: std::fs::File,
+    path: PathBuf,
+    parent: PathBuf,
+    name: String,
+    owner: String,
+}
+
+impl PublicationLock {
+    fn acquire(parent: &Path, output_name: &str) -> std::io::Result<Self> {
+        let parent = std::fs::canonicalize(parent)?;
+        let name = format!(".{output_name}.publish.lock");
+        let path = parent.join(&name);
+        if path.parent() != Some(parent.as_path()) || path.file_name() != Some(name.as_ref()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "refusing to create an unverified publication lock",
+            ));
+        }
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "sanitized staging destination is busy",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let owner = uuid::Uuid::new_v4().to_string();
+        {
+            use std::io::Write as _;
+            file.write_all(owner.as_bytes())?;
+            file.sync_all()?;
+        }
+        Ok(Self {
+            _file: file,
+            path,
+            parent,
+            name,
+            owner,
+        })
     }
 
-    if let Err(error) = commit(&temporary, output_dir) {
-        let _ = remove_verified_generated_dir(&temporary, parent, &temporary_prefix);
-        return Err(error);
+    fn release(self) -> std::io::Result<()> {
+        remove_verified_generated_file(&self.path, &self.parent, &self.name, self.owner.as_bytes())
     }
-    Ok(())
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -610,6 +728,31 @@ fn remove_verified_generated_dir(
         ));
     }
     std::fs::remove_dir_all(resolved_generated)
+}
+
+fn remove_verified_generated_file(
+    generated: &Path,
+    parent: &Path,
+    expected_name: &str,
+    expected_contents: &[u8],
+) -> std::io::Result<()> {
+    let resolved_parent = std::fs::canonicalize(parent)?;
+    let resolved_generated = std::fs::canonicalize(generated)?;
+    let metadata = std::fs::symlink_metadata(generated)?;
+    let valid_name = resolved_generated.file_name() == Some(expected_name.as_ref());
+    if resolved_generated.parent() != Some(resolved_parent.as_path())
+        || !valid_name
+        || !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || has_windows_reparse_point(&metadata)
+        || std::fs::read(generated)? != expected_contents
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to clean an unverified publication lock",
+        ));
+    }
+    std::fs::remove_file(resolved_generated)
 }
 
 #[derive(Serialize)]
@@ -1950,6 +2093,10 @@ fn rpc_request(id: u64, method: &str, params: Value) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::Duration;
 
     use comet_proto::{ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel};
@@ -1958,7 +2105,7 @@ mod tests {
     use super::{
         CaptureConfig, CaptureOperation, CaptureScenario, Channel, ClaudeCaptureOperation,
         ClaudeRunScript, CodexCaptureOperation, CodexRunScript, CommandSnapshot, LaunchDescriptor,
-        Provider, RecordingSession, StdioMode, publish_staging_pair_with,
+        Provider, PublicationLock, RecordingSession, StdioMode, publish_staging_pair_with,
         publish_staging_pair_with_commit, record,
     };
 
@@ -2064,6 +2211,42 @@ mod tests {
         assert_eq!(siblings, [std::ffi::OsString::from("scenario")]);
     }
 
+    /// Break caught: comparing only the expected file bytes accepts a destination containing
+    /// unreviewed extra entries as though it were the exact immutable evidence pair.
+    #[test]
+    fn staging_pair_publish_rejects_identical_pair_with_extra_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join(".comet-provider-captures/staging");
+        let destination = parent.join("scenario");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("events.jsonl"), b"same events").unwrap();
+        std::fs::write(destination.join("manifest.json"), b"same manifest").unwrap();
+        std::fs::write(destination.join("unreviewed.txt"), b"must remain untouched").unwrap();
+
+        let error =
+            publish_staging_pair_with(&destination, b"same events", b"same manifest", |_| Ok(()))
+                .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(destination.join("events.jsonl")).unwrap(),
+            b"same events"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("manifest.json")).unwrap(),
+            b"same manifest"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("unreviewed.txt")).unwrap(),
+            b"must remain untouched"
+        );
+        let siblings: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(siblings, [std::ffi::OsString::from("scenario")]);
+    }
+
     /// Break caught: a failed final rename can leave a generated sibling or a partially visible
     /// destination, especially because directory replacement differs across platforms.
     #[test]
@@ -2084,6 +2267,95 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert!(!destination.exists());
         assert_eq!(std::fs::read_dir(parent).unwrap().count(), 0);
+    }
+
+    /// Break caught: checking destination existence without serializing publishers lets a second
+    /// sanitizer enter preparation and publish while the first is paused before commit.
+    #[test]
+    fn staging_pair_publish_serializes_concurrent_publishers() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join(".comet-provider-captures/staging");
+        let destination = parent.join("scenario");
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let first_destination = destination.clone();
+        let first = thread::spawn(move || {
+            publish_staging_pair_with(
+                &first_destination,
+                b"concurrent events",
+                b"concurrent manifest",
+                |_| {
+                    first_entered_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+        });
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let second_hook_ran = Arc::new(AtomicBool::new(false));
+        let second_hook_flag = Arc::clone(&second_hook_ran);
+        let second_destination = destination.clone();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second = thread::spawn(move || {
+            let result = publish_staging_pair_with(
+                &second_destination,
+                b"concurrent events",
+                b"concurrent manifest",
+                |_| {
+                    second_hook_flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            );
+            second_done_tx.send(result).unwrap();
+        });
+        let second_result = second_done_rx.recv_timeout(Duration::from_secs(2));
+        release_first_tx.send(()).unwrap();
+        let first_result = first.join().unwrap();
+        second.join().unwrap();
+
+        let second_error = second_result
+            .expect("a contending publisher must fail without waiting")
+            .unwrap_err();
+        assert!(matches!(
+            second_error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::AlreadyExists
+        ));
+        assert!(!second_error.to_string().contains("scenario"));
+        assert!(!second_hook_ran.load(Ordering::SeqCst));
+        first_result.unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("events.jsonl")).unwrap(),
+            b"concurrent events"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("manifest.json")).unwrap(),
+            b"concurrent manifest"
+        );
+        let siblings: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(siblings, [std::ffi::OsString::from("scenario")]);
+    }
+
+    /// Break caught: cleanup keyed only by lock pathname can delete a replacement lock that the
+    /// publisher did not acquire, stealing ownership from a non-cooperating actor.
+    #[test]
+    fn publication_lock_cleanup_refuses_changed_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join(".comet-provider-captures/staging");
+        std::fs::create_dir_all(&parent).unwrap();
+        let lock = PublicationLock::acquire(&parent, "scenario").unwrap();
+        let path = parent.join(".scenario.publish.lock");
+        std::fs::write(&path, b"replacement owner").unwrap();
+
+        let error = lock.release().unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement owner");
     }
 
     fn contract_request() -> RunRequest {
