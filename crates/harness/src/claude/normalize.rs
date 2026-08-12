@@ -29,6 +29,52 @@ fn assistant_error_text(code: &str) -> String {
     }
 }
 
+/// A `result` frame's usage → a context-occupancy reading, or `None` when the
+/// turn made no model request at all.
+///
+/// **The prompt size is the sum of the three input figures**, not
+/// `input_tokens`: that field is the cache-exclusive remainder, and Anthropic's
+/// prompt-caching documentation states the prompt is
+/// `input + cache_creation + cache_read`. Captured live, a turn whose real
+/// prompt was ~35,000 tokens reported `input_tokens: 10`.
+///
+/// **A zero prompt means no request happened** — a slash command such as
+/// `/context` or `/compact` runs locally and reports `0/0/0`. Emitting that as
+/// a reading would paint an empty gauge over a session with 35k in it, so the
+/// turn produces no event and the last real reading stands.
+fn usage_event(
+    usage: &super::wire::UsageBody,
+    model_usage: &std::collections::BTreeMap<String, super::wire::ModelUsageBody>,
+) -> Option<AgentEvent> {
+    let prompt_tokens = usage
+        .input_tokens
+        .saturating_add(usage.cache_read_input_tokens)
+        .saturating_add(usage.cache_creation_input_tokens);
+    if prompt_tokens == 0 {
+        return None;
+    }
+    Some(AgentEvent::Usage {
+        prompt_tokens,
+        output_tokens: usage.output_tokens,
+        context_window: agreed_context_window(model_usage),
+    })
+}
+
+/// The window every model in the breakdown agrees on, or `None`.
+///
+/// `modelUsage` is keyed by resolved model id and a turn that ran subagents
+/// carries several. Picking one of two disagreeing windows would draw a gauge
+/// against a limit that isn't the one being consumed, so this declines instead
+/// — the same rule 3.2's `compare_versions` follows, and for the same reason:
+/// both guesses are wrong in a way the user acts on.
+fn agreed_context_window(
+    model_usage: &std::collections::BTreeMap<String, super::wire::ModelUsageBody>,
+) -> Option<u64> {
+    let mut windows = model_usage.values().filter_map(|m| m.context_window);
+    let first = windows.next()?;
+    windows.all(|w| w == first).then_some(first)
+}
+
 /// Which claude.ai usage window a `rate_limit_event` refers to.
 fn rate_window_label(kind: &str) -> &'static str {
     match kind {
@@ -382,10 +428,7 @@ impl Normalizer {
                 if let Some(id) = &f.session_id {
                     self.session_id = Some(id.clone());
                 }
-                let usage = AgentEvent::Usage {
-                    input_tokens: f.usage.input_tokens,
-                    output_tokens: f.usage.output_tokens,
-                };
+                let usage = usage_event(&f.usage, &f.model_usage);
                 let done = if f.subtype == "success" {
                     AgentEvent::Done {
                         status: if interrupted {
@@ -447,7 +490,10 @@ impl Normalizer {
                         session_id: f.session_id,
                     }
                 };
-                vec![usage, done]
+                match usage {
+                    Some(usage) => vec![usage, done],
+                    None => vec![done],
+                }
             }
 
             // Recognized, deliberately dropped — the middle tier. Nothing to
@@ -522,11 +568,71 @@ mod tests {
         ));
     }
 
+    /// A `result` frame emits `[usage, done]` when the turn made a model
+    /// request and `[done]` alone when it made none, so take the last event
+    /// rather than a fixed index.
     fn result_done(raw: &str) -> AgentEvent {
         let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
         let events = Normalizer::new(RuntimeMode::default()).normalize(frame, false);
-        assert_eq!(events.len(), 2, "usage + done");
-        events.into_iter().nth(1).expect("done event")
+        events.into_iter().next_back().expect("done event")
+    }
+
+    fn result_usage(raw: &str) -> Option<AgentEvent> {
+        let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
+        Normalizer::new(RuntimeMode::default())
+            .normalize(frame, false)
+            .into_iter()
+            .find(|e| matches!(e, AgentEvent::Usage { .. }))
+    }
+
+    /// The literal frame Claude Code 2.1.228 sent on 2026-08-12, third turn of
+    /// `run1-claude-3turns.jsonl`. Asserting against the raw JSON rather than a
+    /// constructed `UsageBody` is the point: `input_tokens` alone is 10 here,
+    /// and a test that round-tripped through the Rust type would stay green
+    /// through exactly the bug this slice fixes.
+    #[test]
+    fn usage_sums_the_cache_fields_from_a_captured_frame() {
+        let raw = r#"{"type":"result","subtype":"success","result":"DONE","errors":[],
+            "usage":{"input_tokens":10,"output_tokens":26,"cache_read_input_tokens":34932,
+                     "cache_creation_input_tokens":75},
+            "modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":38,"outputTokens":326,
+                          "contextWindow":200000,"maxOutputTokens":32000}}}"#;
+        assert_eq!(
+            result_usage(raw),
+            Some(AgentEvent::Usage {
+                prompt_tokens: 35_017,
+                output_tokens: 26,
+                context_window: Some(200_000),
+            })
+        );
+    }
+
+    /// `/context` and `/compact` run locally and report zeroes. Emitting that
+    /// as a reading would blank a gauge over a session with 35k in it.
+    #[test]
+    fn a_slash_command_turn_reports_no_usage() {
+        let raw = r#"{"type":"result","subtype":"success","result":"Context Usage","errors":[],
+            "usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,
+                     "cache_creation_input_tokens":0}}"#;
+        assert_eq!(result_usage(raw), None);
+    }
+
+    /// Two models in one turn with different windows: there is no honest
+    /// single limit to draw against, so decline rather than pick one.
+    #[test]
+    fn disagreeing_windows_decline_rather_than_guess() {
+        let raw = r#"{"type":"result","subtype":"success","result":"ok","errors":[],
+            "usage":{"input_tokens":5,"output_tokens":1,"cache_read_input_tokens":100,
+                     "cache_creation_input_tokens":0},
+            "modelUsage":{"claude-haiku-4-5-20251001":{"contextWindow":200000},
+                          "claude-opus-4-8":{"contextWindow":1000000}}}"#;
+        assert!(matches!(
+            result_usage(raw),
+            Some(AgentEvent::Usage {
+                context_window: None,
+                ..
+            })
+        ));
     }
 
     #[test]

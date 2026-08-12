@@ -1301,11 +1301,29 @@ pub enum AgentEvent {
         id: String,
         is_error: bool,
     },
-    /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
+    /// A live context-occupancy reading. Never persisted to docs — it is the
+    /// *current* occupancy, not history, and `doc::parts` drops it deliberately.
+    ///
+    /// **`prompt_tokens` is the last request's prompt size, cache INCLUSIVE**,
+    /// normalized by the adapters so the field means one thing. The providers
+    /// disagree at source and the disagreement is invisible: Claude's
+    /// `input_tokens` *excludes* cache (it read 10 for a ~35,000-token prompt),
+    /// while Codex's `inputTokens` includes it. Captured 2026-08-12 —
+    /// `captures/2026-08-12-token-context-usage.md`.
+    ///
+    /// Cumulative totals are a different quantity and must not be drawn against
+    /// the window: Codex's `total` passed 41% of the window after three trivial
+    /// turns.
     #[serde(rename_all = "camelCase")]
     Usage {
-        input_tokens: u64,
+        prompt_tokens: u64,
         output_tokens: u64,
+        /// `None` is "the provider did not say", never a default. Codex
+        /// declares it optional upstream; Claude's is undocumented.
+        /// Serde already treats a missing `Option` as `None`; the test pins
+        /// that as a contract so a future change to a bare `u64` fails loudly
+        /// rather than rejecting every frame from a provider that omits it.
+        context_window: Option<u64>,
     },
     Error {
         message: String,
@@ -1432,6 +1450,41 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    /// `prompt_tokens` is the last request's prompt size, cache-inclusive, and
+    /// it means the same thing on both providers only because the adapters
+    /// converge it — Claude reports the parts separately, Codex reports one
+    /// inclusive number. The round-trip pins the wire names the UI decodes.
+    #[test]
+    fn usage_round_trips_with_a_window() {
+        let ev = AgentEvent::Usage {
+            prompt_tokens: 35_017,
+            output_tokens: 26,
+            context_window: Some(200_000),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"promptTokens\":35017"), "{json}");
+        assert!(json.contains("\"contextWindow\":200000"), "{json}");
+        assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    /// An absent window is "the provider did not say", never a number. Codex
+    /// declares `modelContextWindow` optional upstream and Claude's
+    /// `contextWindow` appears in no published field list, so the absent arm
+    /// is reachable in production and must decode rather than fail the batch.
+    #[test]
+    fn usage_without_a_window_decodes_to_none() {
+        let ev: AgentEvent =
+            serde_json::from_str(r#"{"type":"usage","promptTokens":42,"outputTokens":7}"#).unwrap();
+        assert_eq!(
+            ev,
+            AgentEvent::Usage {
+                prompt_tokens: 42,
+                output_tokens: 7,
+                context_window: None,
+            }
+        );
     }
 
     #[test]

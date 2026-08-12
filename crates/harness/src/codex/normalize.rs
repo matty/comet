@@ -63,17 +63,34 @@ pub(crate) fn turn_error_message(params: &Value) -> Option<String> {
 }
 
 /// `thread/tokenUsage/updated` → a [`AgentEvent::Usage`] snapshot of the LAST
-/// turn's tokens (held by the session loop, emitted before `Done`).
+/// model request (held by the session loop, emitted before `Done`).
+///
+/// **`last`, never `total`.** The upstream struct documents `total` as
+/// cumulative across every turn on the thread; captured live it passed 41% of
+/// the window after three trivial turns, so drawing it against the window would
+/// report a nearly-full context on a nearly-empty conversation.
+///
+/// `inputTokens` is already cache-inclusive here — `totalTokens` equals
+/// `inputTokens + outputTokens`, so `cachedInputTokens` is a subset of it, not
+/// a sibling. That is the opposite of Claude's convention, which is why the
+/// two adapters converge on one meaning rather than passing their own through.
+///
+/// `modelContextWindow` is `Option<i64>` in the upstream protocol (with a
+/// standing TODO to stop being one). Absent is "not said": the caller draws
+/// nothing rather than assuming a size.
 pub(crate) fn usage_event(params: &Value) -> Option<AgentEvent> {
-    let last = field(params, &["tokenUsage", "token_usage"])?.get("last")?;
+    let usage = field(params, &["tokenUsage", "token_usage"])?;
+    let last = usage.get("last")?;
     let count = |keys: &[&str]| {
         field(last, keys)
             .and_then(Value::as_u64)
             .unwrap_or_default()
     };
     Some(AgentEvent::Usage {
-        input_tokens: count(&["inputTokens", "input_tokens"]),
+        prompt_tokens: count(&["inputTokens", "input_tokens"]),
         output_tokens: count(&["outputTokens", "output_tokens"]),
+        context_window: field(usage, &["modelContextWindow", "model_context_window"])
+            .and_then(Value::as_u64),
     })
 }
 
@@ -590,20 +607,68 @@ mod tests {
     #[test]
     fn usage_reads_last_snapshot_under_both_spellings() {
         assert_eq!(
-            usage_event(&json!({"tokenUsage": {"last": {"inputTokens": 42, "outputTokens": 7}}})),
+            usage_event(
+                &json!({"tokenUsage": {"last": {"inputTokens": 42, "outputTokens": 7}, "modelContextWindow": 258400}})
+            ),
             Some(AgentEvent::Usage {
-                input_tokens: 42,
-                output_tokens: 7
+                prompt_tokens: 42,
+                output_tokens: 7,
+                context_window: Some(258_400),
             })
         );
         assert_eq!(
-            usage_event(&json!({"token_usage": {"last": {"input_tokens": 1, "output_tokens": 2}}})),
+            usage_event(
+                &json!({"token_usage": {"last": {"input_tokens": 1, "output_tokens": 2}, "model_context_window": 400}})
+            ),
             Some(AgentEvent::Usage {
-                input_tokens: 1,
-                output_tokens: 2
+                prompt_tokens: 1,
+                output_tokens: 2,
+                context_window: Some(400),
             })
         );
         assert_eq!(usage_event(&json!({})), None);
+    }
+
+    /// The literal frame `codex app-server` sent on 2026-08-12, third turn of
+    /// `run4-codex-3turns.jsonl`. `total` is nearly six times `last` here, so a
+    /// reader that took the wrong one would draw a gauge six times too full.
+    #[test]
+    fn usage_takes_last_not_total_from_a_captured_frame() {
+        let frame = json!({
+            "threadId": "019ff7a7-2b9a-7040-b240-25a5d6d4b040",
+            "turnId": "019ff7a7-3b2c-7a11-9c02-1f0b6d0c4e77",
+            "tokenUsage": {
+                "total": {"totalTokens": 105355, "inputTokens": 103919, "cachedInputTokens": 87968,
+                          "cacheWriteInputTokens": 0, "outputTokens": 1436, "reasoningOutputTokens": 1189},
+                "last": {"totalTokens": 17316, "inputTokens": 17268, "cachedInputTokens": 16256,
+                         "cacheWriteInputTokens": 0, "outputTokens": 48, "reasoningOutputTokens": 41},
+                "modelContextWindow": 258400
+            }
+        });
+        assert_eq!(
+            usage_event(&frame),
+            Some(AgentEvent::Usage {
+                prompt_tokens: 17_268,
+                output_tokens: 48,
+                context_window: Some(258_400),
+            })
+        );
+    }
+
+    /// `modelContextWindow` is `Option<i64>` upstream. Every frame in the
+    /// capture carried it, so this absent case only ever runs because a test
+    /// constructs it — the exact trap `.agents/rules/optional-wire-fields.md`
+    /// describes.
+    #[test]
+    fn usage_without_a_context_window_reports_none() {
+        assert_eq!(
+            usage_event(&json!({"tokenUsage": {"last": {"inputTokens": 9, "outputTokens": 1}}})),
+            Some(AgentEvent::Usage {
+                prompt_tokens: 9,
+                output_tokens: 1,
+                context_window: None,
+            })
+        );
     }
 
     #[test]
