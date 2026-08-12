@@ -3171,6 +3171,7 @@ struct FileIdentity {
     file_index: u64,
 }
 
+#[cfg(windows)]
 fn file_identity(path: &Path) -> anyhow::Result<FileIdentity> {
     let link_metadata = std::fs::symlink_metadata(path)
         .map_err(|_| anyhow!("The trusted PowerShell executable could not be inspected."))?;
@@ -4750,7 +4751,6 @@ fn rpc_request(id: u64, method: &str, params: Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(windows)]
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
