@@ -28,6 +28,7 @@ fn write_raw_capture(root: &Path, name: &str, events: &[&str]) -> PathBuf {
         "provider": "claude",
         "cli_version": "2.1.0 (Claude Code)",
         "platform": {"os": "windows", "arch": "x86_64"},
+        "redaction_roots": {"cwd": null, "repo": null, "home": null, "temp": null},
         "command": {
             "program": "claude",
             "args": ["--print"],
@@ -145,6 +146,42 @@ fn sanitizer_replaces_semantic_values_with_typed_placeholders() {
     }
 }
 
+/// Break caught: treating every bare `id` as structural lets actual Codex thread, turn, and item
+/// objects retain provider-generated identifiers when those IDs are nested below named entities.
+#[test]
+fn sanitizer_redacts_nested_codex_thread_turn_and_every_item_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "nested-codex-ids",
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"result":{"thread":{"id":"thread-secret"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"turn":{"id":"turn-secret"}}}"#,
+            r#"{"method":"item/started","params":{"item":{"id":"message-secret","type":"agentMessage"}}}"#,
+            r#"{"method":"item/completed","params":{"item":{"id":"todo-secret","type":"todoList","items":[]}}}"#,
+            r#"{"method":"item/started","params":{"item":{"id":"compaction-secret","type":"contextCompaction"}}}"#,
+        ],
+    );
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "nested-codex-ids")).unwrap();
+    let payloads = sanitized_payloads(&report.events_bytes);
+    assert_eq!(payloads[0]["result"]["thread"]["id"], "<THREAD_ID_1>");
+    assert_eq!(payloads[1]["result"]["turn"]["id"], "<TURN_ID_1>");
+    assert_eq!(payloads[2]["params"]["item"]["id"], "<TOOL_USE_ID_1>");
+    assert_eq!(payloads[3]["params"]["item"]["id"], "<TOOL_USE_ID_2>");
+    assert_eq!(payloads[4]["params"]["item"]["id"], "<TOOL_USE_ID_3>");
+    let output = String::from_utf8(report.events_bytes).unwrap();
+    for leaked in [
+        "thread-secret",
+        "turn-secret",
+        "message-secret",
+        "todo-secret",
+        "compaction-secret",
+    ] {
+        assert!(!output.contains(leaked));
+    }
+}
+
 /// Break caught: accepting non-JSON structured-channel frames makes user and assistant content
 /// impossible to classify, so a raw line can bypass semantic redaction entirely.
 #[test]
@@ -251,6 +288,12 @@ fn sanitizer_replaces_allowlisted_paths_in_values_and_embedded_text() {
     let mut capture: Value =
         serde_json::from_slice(&std::fs::read(raw.join("capture.json")).unwrap()).unwrap();
     capture["command"]["cwd"] = Value::String(cwd.display().to_string());
+    capture["redaction_roots"] = serde_json::json!({
+        "cwd": cwd,
+        "repo": repo,
+        "home": home,
+        "temp": system_temp
+    });
     std::fs::write(
         raw.join("capture.json"),
         serde_json::to_vec_pretty(&capture).unwrap(),
@@ -333,6 +376,7 @@ fn sanitizer_does_not_allow_path_prefix_collisions() {
     let mut capture: Value =
         serde_json::from_slice(&std::fs::read(raw.join("capture.json")).unwrap()).unwrap();
     capture["command"]["cwd"] = Value::String(cwd.display().to_string());
+    capture["redaction_roots"]["cwd"] = Value::String(cwd.display().to_string());
     std::fs::write(
         raw.join("capture.json"),
         serde_json::to_vec_pretty(&capture).unwrap(),
@@ -344,6 +388,44 @@ fn sanitizer_does_not_allow_path_prefix_collisions() {
         error,
         SanitizationError::UnrecognizedAbsolutePath { .. }
     ));
+}
+
+/// Break caught: textual prefix replacement can bless an allowed root followed by `..`, and a
+/// detector that recognizes only backslash UNC paths misses the equivalent forward-slash form.
+#[test]
+fn sanitizer_rejects_allowlist_traversal_and_forward_slash_unc_paths() {
+    for (name, path) in [
+        (
+            "allowlist-traversal",
+            r"D:\allowed\repo\..\private\secret.txt",
+        ),
+        ("forward-unc", "//server/share/private/secret.txt"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let raw = write_raw_capture(
+            temp.path(),
+            name,
+            &[&format!(
+                r#"{{"path":{}}}"#,
+                serde_json::to_string(path).unwrap()
+            )],
+        );
+        let mut capture: Value =
+            serde_json::from_slice(&std::fs::read(raw.join("capture.json")).unwrap()).unwrap();
+        capture["command"]["cwd"] = Value::String(r"D:\allowed\repo".into());
+        capture["redaction_roots"]["cwd"] = Value::String(r"D:\allowed\repo".into());
+        std::fs::write(
+            raw.join("capture.json"),
+            serde_json::to_vec_pretty(&capture).unwrap(),
+        )
+        .unwrap();
+
+        let error = sanitize_dir(&raw, &staging_dir(temp.path(), name)).unwrap_err();
+        assert!(
+            matches!(error, SanitizationError::UnrecognizedAbsolutePath { .. }),
+            "{name} returned {error:?}"
+        );
+    }
 }
 
 /// Break caught: treating credential-bearing field names or recognizable token/key material as
@@ -382,6 +464,77 @@ fn sanitizer_rejects_secret_fields_provider_tokens_and_private_keys() {
         assert!(!error.to_string().contains("secretvalue"));
         assert!(!error.to_string().contains("definitely-not-for-review"));
     }
+}
+
+/// Break caught: validating only JSON values lets sensitive object keys through, while building
+/// an error location from an untrusted key repeats the secret in diagnostics.
+#[test]
+fn sanitizer_rejects_sensitive_object_keys_without_echoing_them() {
+    for (name, raw_key) in [
+        ("secret-key-name", "sk-proj-key-name-secret"),
+        ("absolute-path-key", r"D:\private\key-name-secret"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = serde_json::json!({raw_key: "opaque"}).to_string();
+        let raw = write_raw_capture(temp.path(), name, &[&payload]);
+        let output = staging_dir(temp.path(), name);
+
+        let error = sanitize_dir(&raw, &output).unwrap_err();
+        let display = error.to_string();
+        assert!(matches!(
+            error,
+            SanitizationError::SecretLikeValue { .. }
+                | SanitizationError::UnrecognizedAbsolutePath { .. }
+        ));
+        assert!(!display.contains(raw_key));
+        assert!(!display.contains("key-name-secret"));
+        assert!(!output.exists());
+    }
+}
+
+/// Break caught: credential fields with opaque values bypass prefix scanning, while an overbroad
+/// `token` name rule would incorrectly reject ordinary numeric usage counters.
+#[test]
+fn sanitizer_rejects_opaque_credential_fields_but_keeps_token_counters() {
+    for field in [
+        "token",
+        "refreshToken",
+        "sessionToken",
+        "clientSecret",
+        "privateKey",
+        "authorization",
+        "apiKey",
+        "anthropicApiKey",
+        "openai_api_key",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = serde_json::json!({field: "opaque-value"}).to_string();
+        let raw = write_raw_capture(temp.path(), field, &[&payload]);
+        let error = sanitize_dir(&raw, &staging_dir(temp.path(), field)).unwrap_err();
+        assert!(
+            matches!(error, SanitizationError::SecretLikeField { .. }),
+            "{field} returned {error:?}"
+        );
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "token-counters",
+        &[
+            r#"{"usage":{"input_tokens":10,"outputTokens":20,"max_tokens":30,"totalTokenCount":60}}"#,
+        ],
+    );
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "token-counters")).unwrap();
+    assert_eq!(
+        sanitized_payloads(&report.events_bytes)[0]["usage"],
+        serde_json::json!({
+            "input_tokens": 10,
+            "outputTokens": 20,
+            "max_tokens": 30,
+            "totalTokenCount": 60
+        })
+    );
 }
 
 /// Break caught: scanning for credentials before semantic replacement rejects safe redaction of
@@ -425,6 +578,49 @@ fn sanitizer_is_byte_deterministic_and_uses_encounter_order() {
     let payloads = sanitized_payloads(&first.events_bytes);
     assert_eq!(payloads[0]["message"]["content"], "<USER_TEXT_1>");
     assert_eq!(payloads[1]["message"]["content"], "<USER_TEXT_2>");
+}
+
+/// Break caught: deriving repository/home/temp roots during sanitization makes identical raw bytes
+/// produce different artifacts when the checkout or host environment changes after capture.
+#[test]
+fn sanitizer_uses_only_captured_redaction_roots_after_filesystem_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("captured-repo");
+    let cwd = repo.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "captured-roots",
+        &[&format!(
+            r#"{{"note":{}}}"#,
+            serde_json::to_string(&format!("repo {}\\Cargo.toml", repo.display())).unwrap()
+        )],
+    );
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(raw.join("capture.json")).unwrap()).unwrap();
+    capture["command"]["cwd"] = Value::String(cwd.display().to_string());
+    capture["redaction_roots"] = serde_json::json!({
+        "cwd": cwd,
+        "repo": repo,
+        "home": r"C:\captured-home",
+        "temp": r"C:\captured-temp"
+    });
+    std::fs::write(
+        raw.join("capture.json"),
+        serde_json::to_vec_pretty(&capture).unwrap(),
+    )
+    .unwrap();
+
+    let first = sanitize_dir(&raw, &staging_dir(temp.path(), "captured-roots-first")).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let second = sanitize_dir(&raw, &staging_dir(temp.path(), "captured-roots-second")).unwrap();
+
+    assert_eq!(first.events_bytes, second.events_bytes);
+    assert_eq!(first.manifest_bytes, second.manifest_bytes);
+    assert_eq!(
+        sanitized_payloads(&first.events_bytes)[0]["note"],
+        "repo <REPO>\\Cargo.toml"
+    );
 }
 
 /// Break caught: manifest accounting can silently omit a redaction category or count definitions

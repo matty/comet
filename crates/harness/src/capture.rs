@@ -212,11 +212,37 @@ pub struct PlatformMetadata {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RedactionRoots {
+    pub cwd: Option<String>,
+    pub repo: Option<String>,
+    pub home: Option<String>,
+    pub temp: Option<String>,
+}
+
+impl RedactionRoots {
+    fn capture(command: &CommandSnapshot) -> Self {
+        let cwd = command.cwd.clone();
+        let repo = cwd
+            .as_deref()
+            .map(Path::new)
+            .and_then(repository_root)
+            .map(|path| path.to_string_lossy().into_owned());
+        Self {
+            cwd,
+            repo,
+            home: crate::home_dir().map(|path| path.to_string_lossy().into_owned()),
+            temp: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RawCapture {
     pub directory: PathBuf,
     pub provider: Provider,
     pub cli_version: String,
     pub platform: PlatformMetadata,
+    pub redaction_roots: RedactionRoots,
     pub command: CommandSnapshot,
     pub events: Vec<CaptureEvent>,
     pub exit_code: Option<i32>,
@@ -350,6 +376,16 @@ struct SemanticContext {
     speaker: Speaker,
     codex_turn_input: bool,
     codex_assistant_prose: bool,
+    entity: Entity,
+}
+
+#[derive(Clone, Copy, Default)]
+enum Entity {
+    #[default]
+    None,
+    Thread,
+    Turn,
+    Item,
 }
 
 /// Convert one raw capture into reviewable staging artifacts.
@@ -453,13 +489,9 @@ pub fn sanitize_dir(
         .map_err(|source| SanitizationError::EncodeOutput { source })?;
     manifest_bytes.push(b'\n');
 
-    std::fs::create_dir_all(output_dir)
-        .map_err(|source| SanitizationError::WriteOutput { source })?;
     let events_path = output_dir.join("events.jsonl");
     let manifest_path = output_dir.join("manifest.json");
-    std::fs::write(&events_path, &events_bytes)
-        .map_err(|source| SanitizationError::WriteOutput { source })?;
-    std::fs::write(&manifest_path, &manifest_bytes)
+    publish_staging_pair_with(output_dir, &events_bytes, &manifest_bytes, |_| Ok(()))
         .map_err(|source| SanitizationError::WriteOutput { source })?;
 
     Ok(SanitizationReport {
@@ -468,6 +500,95 @@ pub fn sanitize_dir(
         events_bytes,
         manifest_bytes,
     })
+}
+
+fn publish_staging_pair_with<F>(
+    output_dir: &Path,
+    events: &[u8],
+    manifest: &[u8],
+    after_events: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
+    let parent = output_dir.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "staging destination has no parent",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let output_name = output_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("capture");
+    let temporary_prefix = format!(".{output_name}.sanitize-");
+    let temporary = parent.join(format!("{temporary_prefix}{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&temporary)?;
+
+    let prepared = (|| {
+        write_synced(&temporary.join("events.jsonl"), events)?;
+        after_events(&temporary)?;
+        write_synced(&temporary.join("manifest.json"), manifest)?;
+        Ok(())
+    })();
+    if let Err(error) = prepared {
+        let _ = remove_verified_generated_dir(&temporary, parent, &temporary_prefix);
+        return Err(error);
+    }
+
+    if !output_dir.exists() {
+        if let Err(error) = std::fs::rename(&temporary, output_dir) {
+            let _ = remove_verified_generated_dir(&temporary, parent, &temporary_prefix);
+            return Err(error);
+        }
+        return Ok(());
+    }
+
+    let backup_prefix = format!(".{output_name}.previous-");
+    let backup = parent.join(format!("{backup_prefix}{}", uuid::Uuid::new_v4()));
+    if let Err(error) = std::fs::rename(output_dir, &backup) {
+        let _ = remove_verified_generated_dir(&temporary, parent, &temporary_prefix);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temporary, output_dir) {
+        let _ = std::fs::rename(&backup, output_dir);
+        let _ = remove_verified_generated_dir(&temporary, parent, &temporary_prefix);
+        return Err(error);
+    }
+    let _ = remove_verified_generated_dir(&backup, parent, &backup_prefix);
+    Ok(())
+}
+
+fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+fn remove_verified_generated_dir(
+    generated: &Path,
+    parent: &Path,
+    expected_prefix: &str,
+) -> std::io::Result<()> {
+    let resolved_parent = std::fs::canonicalize(parent)?;
+    let resolved_generated = std::fs::canonicalize(generated)?;
+    let valid_name = resolved_generated
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(expected_prefix));
+    if resolved_generated.parent() != Some(resolved_parent.as_path()) || !valid_name {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to clean an unverified staging sibling",
+        ));
+    }
+    std::fs::remove_dir_all(resolved_generated)
 }
 
 #[derive(Serialize)]
@@ -485,19 +606,22 @@ enum Payload {
 impl Redactor {
     fn new(capture: &RawCapture) -> Self {
         let mut redactor = Self::default();
-        redactor.add_path(capture.command.cwd.as_deref(), "<CWD>", "cwd_path");
-        if let Some(cwd) = capture.command.cwd.as_deref().map(Path::new)
-            && let Some(repo) = repository_root(cwd)
-        {
-            redactor.add_path(repo.to_str(), "<REPO>", "repo_path");
-        }
+        redactor.add_path(capture.redaction_roots.cwd.as_deref(), "<CWD>", "cwd_path");
         redactor.add_path(
-            crate::home_dir().as_deref().and_then(Path::to_str),
+            capture.redaction_roots.repo.as_deref(),
+            "<REPO>",
+            "repo_path",
+        );
+        redactor.add_path(
+            capture.redaction_roots.home.as_deref(),
             "<HOME>",
             "home_path",
         );
-        let temp_dir = std::env::temp_dir();
-        redactor.add_path(temp_dir.to_str(), "<TEMP>", "temp_path");
+        redactor.add_path(
+            capture.redaction_roots.temp.as_deref(),
+            "<TEMP>",
+            "temp_path",
+        );
         redactor
     }
 
@@ -549,7 +673,7 @@ impl Redactor {
                     if let Some(kind) = semantic_kind(object, key, value, context) {
                         self.register(kind, value);
                     } else {
-                        self.collect_semantics(value, context);
+                        self.collect_semantics(value, child_context(context, key));
                     }
                 }
             }
@@ -586,8 +710,9 @@ impl Redactor {
             Value::Object(object) => {
                 let context = object_context(object, context);
                 let keys: Vec<String> = object.keys().cloned().collect();
-                for key in keys {
-                    let child_location = format!("{location}.{key}");
+                for (index, key) in keys.into_iter().enumerate() {
+                    let child_location = format!("{location}.object[{index}]");
+                    self.validate_key(&key, &child_location)?;
                     if is_secret_field(&key) {
                         return Err(SanitizationError::SecretLikeField {
                             location: child_location,
@@ -602,7 +727,7 @@ impl Redactor {
                             self.sanitize_paths_and_validate(text, &child_location)?;
                         }
                     } else {
-                        self.sanitize_json(child, context, &child_location)?;
+                        self.sanitize_json(child, child_context(context, &key), &child_location)?;
                     }
                 }
             }
@@ -624,8 +749,9 @@ impl Redactor {
                 }
             }
             Value::Object(object) => {
-                for (key, value) in object {
-                    let child_location = format!("{location}.{key}");
+                for (index, (key, value)) in object.iter_mut().enumerate() {
+                    let child_location = format!("{location}.object[{index}]");
+                    self.validate_key(key, &child_location)?;
                     if is_secret_field(key) {
                         return Err(SanitizationError::SecretLikeField {
                             location: child_location,
@@ -638,6 +764,11 @@ impl Redactor {
             _ => {}
         }
         Ok(())
+    }
+
+    fn validate_key(&mut self, key: &str, location: &str) -> Result<(), SanitizationError> {
+        let mut key = key.to_owned();
+        self.sanitize_paths_and_validate(&mut key, location)
     }
 
     fn replace_semantic(&mut self, kind: RedactionKind, value: &mut Value) {
@@ -695,6 +826,11 @@ impl Redactor {
         for path in self.paths.clone() {
             let mut occurrences = 0;
             for value in path.values {
+                if path_occurrence_escapes_root(text, &value) {
+                    return Err(SanitizationError::UnrecognizedAbsolutePath {
+                        location: location.to_owned(),
+                    });
+                }
                 let found = replace_path_occurrences(text, &value, path.placeholder);
                 if found != 0 {
                     occurrences += found;
@@ -793,6 +929,13 @@ fn semantic_kind(
             return Some(RedactionKind::ToolUseId);
         }
         "id" if object.contains_key("jsonrpc") => return Some(RedactionKind::CodexRpcId),
+        "id" if matches!(context.entity, Entity::Thread) => {
+            return Some(RedactionKind::ThreadId);
+        }
+        "id" if matches!(context.entity, Entity::Turn) => return Some(RedactionKind::TurnId),
+        "id" if matches!(context.entity, Entity::Item) => {
+            return Some(RedactionKind::ToolUseId);
+        }
         "id" if object.get("type").and_then(Value::as_str) == Some("tool_use") => {
             return Some(RedactionKind::ToolUseId);
         }
@@ -832,6 +975,16 @@ fn semantic_kind(
         _ => {}
     }
     None
+}
+
+fn child_context(mut context: SemanticContext, key: &str) -> SemanticContext {
+    context.entity = match normalize_field(key).as_str() {
+        "thread" => Entity::Thread,
+        "turn" => Entity::Turn,
+        "item" => Entity::Item,
+        _ => Entity::None,
+    };
+    context
 }
 
 fn is_tool_item_type(item_type: &str) -> bool {
@@ -882,8 +1035,19 @@ fn is_secret_field(field: &str) -> bool {
             | "apikey"
             | "openaiapikey"
             | "anthropicapikey"
+            | "token"
             | "accesstoken"
             | "authtoken"
+            | "bearertoken"
+            | "idtoken"
+            | "oauthtoken"
+            | "personalaccesstoken"
+            | "refreshtoken"
+            | "sessiontoken"
+            | "clientsecret"
+            | "privatekey"
+            | "secretkey"
+            | "signingkey"
             | "credential"
             | "credentials"
             | "password"
@@ -926,6 +1090,33 @@ fn replace_path_occurrences(text: &mut String, path: &str, placeholder: &str) ->
     count
 }
 
+fn path_occurrence_escapes_root(text: &str, root: &str) -> bool {
+    let mut cursor = 0;
+    while let Some(relative) = text[cursor..].find(root) {
+        let end = cursor + relative + root.len();
+        let tail = &text[end..];
+        if tail.starts_with(['/', '\\']) {
+            let path_tail = tail
+                .split(|character: char| {
+                    character.is_whitespace() || matches!(character, '"' | '\'' | '<' | '>' | '|')
+                })
+                .next()
+                .unwrap_or(tail);
+            let mut depth = 0usize;
+            for component in path_tail.split(['/', '\\']).filter(|part| !part.is_empty()) {
+                match component {
+                    "." => {}
+                    ".." if depth == 0 => return true,
+                    ".." => depth -= 1,
+                    _ => depth += 1,
+                }
+            }
+        }
+        cursor = end;
+    }
+    false
+}
+
 fn contains_absolute_path(value: &str) -> bool {
     let bytes = value.as_bytes();
     for index in 0..bytes.len() {
@@ -938,6 +1129,13 @@ fn contains_absolute_path(value: &str) -> bool {
             return true;
         }
         if index + 1 < bytes.len() && bytes[index] == b'\\' && bytes[index + 1] == b'\\' {
+            return true;
+        }
+        if index + 1 < bytes.len()
+            && bytes[index] == b'/'
+            && bytes[index + 1] == b'/'
+            && (index == 0 || !matches!(bytes[index - 1], b':' | b'/'))
+        {
             return true;
         }
         if bytes[index] == b'/'
@@ -1138,6 +1336,7 @@ impl RecordingSession {
                 os: std::env::consts::OS.into(),
                 arch: std::env::consts::ARCH.into(),
             },
+            redaction_roots: RedactionRoots::capture(&self.command),
             command: self.command.clone(),
             events: self.events.lock().expect("capture event lock").clone(),
             exit_code,
@@ -1708,8 +1907,40 @@ mod tests {
     use super::{
         CaptureConfig, CaptureOperation, CaptureScenario, Channel, ClaudeCaptureOperation,
         ClaudeRunScript, CodexCaptureOperation, CodexRunScript, CommandSnapshot, LaunchDescriptor,
-        Provider, RecordingSession, StdioMode, record,
+        Provider, RecordingSession, StdioMode, publish_staging_pair_with, record,
     };
+
+    /// Break caught: writing events directly into the destination before manifest creation can
+    /// leave a mixed or half-written pair and destroy a previously reviewable staging artifact.
+    #[test]
+    fn staging_pair_publish_preserves_existing_destination_on_second_write_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join(".comet-provider-captures/staging");
+        let destination = parent.join("scenario");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("events.jsonl"), b"old events").unwrap();
+        std::fs::write(destination.join("manifest.json"), b"old manifest").unwrap();
+
+        let error = publish_staging_pair_with(&destination, b"new events", b"new manifest", |_| {
+            Err(std::io::Error::other("injected second-write failure"))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            std::fs::read(destination.join("events.jsonl")).unwrap(),
+            b"old events"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("manifest.json")).unwrap(),
+            b"old manifest"
+        );
+        let siblings: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(siblings, [std::ffi::OsString::from("scenario")]);
+    }
 
     fn contract_request() -> RunRequest {
         let mut request = RunRequest {
@@ -2055,11 +2286,24 @@ mod tests {
 
         assert_eq!(capture.platform.os, std::env::consts::OS);
         assert_eq!(capture.platform.arch, std::env::consts::ARCH);
+        assert_eq!(capture.redaction_roots.cwd, capture.command.cwd);
+        assert_eq!(
+            capture.redaction_roots.home,
+            crate::home_dir().map(|path| path.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            capture.redaction_roots.temp,
+            Some(std::env::temp_dir().to_string_lossy().into_owned())
+        );
         let persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(capture.directory.join("capture.json")).unwrap())
                 .unwrap();
         assert_eq!(persisted["platform"]["os"], std::env::consts::OS);
         assert_eq!(persisted["platform"]["arch"], std::env::consts::ARCH);
+        assert_eq!(
+            persisted["redaction_roots"]["cwd"],
+            json!(capture.command.cwd)
+        );
     }
 
     /// Break caught: stopping after the first Codex page, failing to serialize an opaque cursor,
