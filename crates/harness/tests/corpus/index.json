@@ -317,10 +317,10 @@
       "fact": "Stream-json accepts image content blocks before text in a user frame.",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/attachment/manifest.json",
+          "manifest": "claude/2.1.228/attachment/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 1,
               "channel": "stdin"
             }
           ]
@@ -749,10 +749,10 @@
       "consumer": "crates/harness/src/claude/mod.rs:run attachment stdin construction",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/attachment/manifest.json",
+          "manifest": "claude/2.1.228/attachment/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 1,
               "channel": "stdin"
             }
           ]
@@ -765,10 +765,10 @@
       "consumer": "crates/harness/src/claude/wire.rs:user_line_with_images_is_blocks_then_text",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/attachment/manifest.json",
+          "manifest": "claude/2.1.228/attachment/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 1,
               "channel": "stdin"
             }
           ]

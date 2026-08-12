@@ -1140,6 +1140,7 @@ fn known_placeholder(candidate: &str) -> Option<KnownPlaceholder> {
         ("ATTACHMENT_BYTES", "attachment_bytes"),
         ("CLAUDE_MEMORY_PATH", "claude_memory_path"),
         ("CLAUDE_MESSAGE_ID", "claude_message_id"),
+        ("CLAUDE_THINKING_SIGNATURE", "claude_thinking_signature"),
     ];
     INDEXED.iter().find_map(|(prefix, kind)| {
         candidate
