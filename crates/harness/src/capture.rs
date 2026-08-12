@@ -554,6 +554,7 @@ pub fn validate_corpus(corpus_root: &Path) -> Vec<CorpusError> {
 
 /// Return the provider's literal payload for a claim that references exactly one event frame.
 /// The payload is never decoded into or reserialized through a Comet wire type.
+/// Corpus-wide comparison policy does not change this exact-one-frame selection contract.
 pub fn selected_payload(corpus_root: &Path, claim_id: &str) -> Result<String, CorpusError> {
     let index = read_index(corpus_root)?;
     if let Some(duplicate) = duplicate_claim_id(&index.claims) {
@@ -568,7 +569,6 @@ pub fn selected_payload(corpus_root: &Path, claim_id: &str) -> Result<String, Co
         .ok_or_else(|| CorpusError::ClaimNotFound {
             claim_id: claim_id.to_owned(),
         })?;
-    validate_comparison_frame_count(claim)?;
     let frame_count = claim
         .evidence
         .iter()

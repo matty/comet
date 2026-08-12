@@ -482,10 +482,10 @@ fn corpus_validates_every_evidence_entry_and_counts_all_selected_frames() {
     ));
 }
 
-/// Break caught: a comparative claim with one readable frame cannot substantiate a difference,
-/// even though that single frame is otherwise valid evidence for a non-comparative claim.
+/// Break caught: corpus comparison policy must reject an unsubstantiated claim without changing
+/// the separate exact-one-frame contract that returns its literal provider payload.
 #[test]
-fn corpus_comparisons_require_at_least_two_observations() {
+fn corpus_comparison_policy_does_not_change_single_payload_selection() {
     let temp = tempfile::tempdir().unwrap();
     write_valid_literal_corpus(temp.path());
     let index = std::fs::read_to_string(temp.path().join("index.json"))
@@ -507,6 +507,10 @@ fn corpus_comparisons_require_at_least_two_observations() {
             distinct_observations: 1,
         }] if claim_id == "claude-model-reply"
     ));
+    assert_eq!(
+        selected_payload(temp.path(), "claude-model-reply").unwrap(),
+        r#"{"type":"control_response","request_id":"<CLAUDE_REQUEST_ID_1>","models":[{"value":"sonnet"}]}"#
+    );
 }
 
 /// Break caught: copying one selector twice must not turn one captured observation into a
