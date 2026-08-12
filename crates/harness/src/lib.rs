@@ -300,6 +300,9 @@ pub(crate) async fn probe_installed_cli(
     HarnessProbe {
         availability: probe_cli_version(&exe).await,
         install: Some(install),
+        // Filled by the per-provider update readers; a provider that publishes
+        // no state leaves this `None` and simply renders one line less.
+        update: None,
     }
 }
 
