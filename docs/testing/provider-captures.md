@@ -86,7 +86,13 @@ restore it, and rerun green. Finish with the repository gate from `AGENTS.md`.
 
 ## Provider contradictions
 
-A live contradiction stops capture. Preserve successful raw evidence or an ignored quarantined
-partial, record only non-sensitive structural facts, and do not relax a safety contract, fabricate
-a frame, change global account state, or retry without fresh authority. The resolution is an
-explicit design update, removal of an unsupported claim, or a documented deferral.
+A live contradiction stops retries and promotion for that scenario. Preserve its ignored
+`partial-capture.json`, record only non-sensitive structural facts, and do not relax a safety
+contract, fabricate a compatible frame, change global account state, or retry without a new design
+and fresh authorization.
+
+Before starting another scenario, decide whether the contradiction invalidates a contract that
+scenario shares. If it does, stop the shared group. If it does not, the independent scenario may
+run, sanitize, and promote on its own evidence. One failed scenario must not erase provenance for
+another. The resolution is an explicit design update, removal of an unsupported claim, or a
+documented deferral.
