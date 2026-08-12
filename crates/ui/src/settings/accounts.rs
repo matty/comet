@@ -649,6 +649,13 @@ impl AccountsPage {
     ///
     /// [`HARNESS_REVALIDATE_ATTEMPTS`]: crate::pickers::HARNESS_REVALIDATE_ATTEMPTS
     fn poll_harness_installs(&mut self, cx: &mut Context<Self>) {
+        // Drop any poll left over from an earlier load FIRST, so every exit
+        // below cancels it rather than only the one that reassigns. A poll
+        // holds the `engine` it captured at spawn and writes straight into
+        // `page.harnesses`, and `set_selected_device` calls `load` too — so a
+        // survivor can paint the previous machine's catalog over the one this
+        // load just settled.
+        self.harness_poll_task = None;
         if !crate::pickers::catalog_awaits_probes(&self.harnesses) {
             return;
         }
