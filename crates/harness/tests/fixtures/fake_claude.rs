@@ -444,14 +444,12 @@ fn diagnostics() {
     // Ignored tier — every one of these is routine on a healthy session
     // (capture-confirmed) and must produce NOTHING.
     emit(r#"{"type":"system","subtype":"status","status":"requesting","session_id":"sess-d"}"#);
-    emit(r#"{"type":"system","subtype":"thinking_tokens","tokens":123,"session_id":"sess-d"}"#);
     emit(
         r#"{"type":"system","subtype":"hook_started","hook":"SessionStart","session_id":"sess-d"}"#,
     );
     emit(
         r#"{"type":"system","subtype":"hook_response","hook":"SessionStart","session_id":"sess-d"}"#,
     );
-    emit(r#"{"type":"tool_progress","tool_use_id":"t1","progress":0.5,"session_id":"sess-d"}"#);
     // Unknown tier: an unclaimed system subtype and an unknown top-level type.
     emit(
         r#"{"type":"system","subtype":"someFutureSubtype","payload":"do-not-carry","session_id":"sess-d"}"#,

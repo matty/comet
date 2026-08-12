@@ -181,10 +181,18 @@
       "fact": "Healthy runs emit the routine frame variants assigned to the ignored tier.",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/fresh-text/manifest.json",
+          "manifest": "claude/2.1.228/fresh-text/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 3,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 4,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 6,
               "channel": "stdout"
             }
           ]
@@ -197,10 +205,18 @@
       "fact": "The diagnostic fixture emits the capture-confirmed routine Claude frame set.",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/fresh-text/manifest.json",
+          "manifest": "claude/2.1.228/fresh-text/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 3,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 4,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 6,
               "channel": "stdout"
             }
           ]
@@ -213,10 +229,18 @@
       "fact": "Capture-confirmed routine Claude frames produce no diagnostic event.",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/fresh-text/manifest.json",
+          "manifest": "claude/2.1.228/fresh-text/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 3,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 4,
+              "channel": "stdout"
+            },
+            {
+              "sequence": 6,
               "channel": "stdout"
             }
           ]

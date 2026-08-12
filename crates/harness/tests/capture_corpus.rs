@@ -945,7 +945,7 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
     );
 
     let errors = validate_corpus(&corpus_root);
-    assert_eq!(errors.len(), 23, "inventory errors: {errors:#?}");
+    assert_eq!(errors.len(), 20, "inventory errors: {errors:#?}");
     assert!(
         errors
             .iter()
@@ -981,14 +981,6 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "claude-attachment-block-order",
             "claude-attachment-block-order-test",
             "claude-attachment-run-order",
-        ],
-    );
-    add(
-        "claude/pending-observed-version/fresh-text/manifest.json",
-        &[
-            "claude-routine-frame-fixture",
-            "claude-routine-frame-ignore-list",
-            "claude-routine-frame-integration",
         ],
     );
     add(
@@ -1067,6 +1059,9 @@ fn corpus_promoted_token_free_claims_are_valid() {
             "claude-model-no-modality",
             "claude-model-real-catalog-merge",
             "claude-model-reply-shape",
+            "claude-routine-frame-fixture",
+            "claude-routine-frame-ignore-list",
+            "claude-routine-frame-integration",
             "codex-model-cwd-invariance",
             "codex-model-effort-objects",
             "codex-model-fixture-shape",

@@ -62,8 +62,8 @@ pub(crate) const NOTICE_SUBTYPES: &[&str] = &[
 /// its count — it is a maintenance obligation, not a fact about the frame,
 /// and reading only this repository will not resolve which slice that is;
 /// any other reason names why no surface wants the frame at all. ★ = confirmed firing
-/// on a real Claude Code 2.1.226 capture (2026-08-08); the rest are named by
-/// sdk.d.ts 0.3.195. Deliberately NOT here, so a diagnostic fires:
+/// in the reviewed healthy-run corpus; the rest are named by sdk.d.ts 0.3.195.
+/// Deliberately NOT here, so a diagnostic fires:
 /// local_command_output, model_refusal_no_fallback, mirror_error,
 /// elicitation_complete, files_persisted, plugin_install, worker_shutting_down.
 pub(crate) const IGNORED_FRAMES: &[(&str, &str)] = &[
@@ -78,8 +78,8 @@ pub(crate) const IGNORED_FRAMES: &[(&str, &str)] = &[
     ("prompt_suggestion", "opt-in"),
     ("auth_status", "auth-transient"),
     // system subtypes
-    ("system/status", "transient"),          // ★ one per API request
-    ("system/thinking_tokens", "heartbeat"), // ★ whenever reasoning is on
+    ("system/status", "transient"), // ★ one per API request
+    ("system/thinking_tokens", "heartbeat"),
     ("system/session_state_changed", "turn-state"),
     ("system/hook_started", "4.2"), // ★ one per session with hooks
     ("system/hook_progress", "4.2"),
@@ -527,8 +527,7 @@ mod tests {
         ));
     }
 
-    /// The frames a REAL healthy session emits (Claude Code 2.1.226 capture,
-    /// 2026-08-08). One diagnostic from any of these puts a lie on the
+    /// The frames in the reviewed healthy-run corpus. One diagnostic from any of these puts a lie on the
     /// settings card — "hidden when zero" is only honest with this tier.
     #[test]
     fn the_ignore_list_covers_every_capture_confirmed_routine_frame() {
@@ -538,26 +537,12 @@ mod tests {
                 "transient",
             ),
             (
-                r#"{"type":"system","subtype":"thinking_tokens","tokens":42}"#,
-                "heartbeat",
-            ),
-            (
                 r#"{"type":"system","subtype":"hook_started","hook":"SessionStart"}"#,
                 "4.2",
             ),
             (
                 r#"{"type":"system","subtype":"hook_response","hook":"SessionStart"}"#,
                 "4.2",
-            ),
-            (
-                r#"{"type":"control_response","response":{}}"#,
-                "reply-channel",
-            ),
-            (r#"{"type":"keep_alive"}"#, "transport-ping"),
-            (r#"{"type":"tool_progress","tool_use_id":"t1"}"#, "liveness"),
-            (
-                r#"{"type":"system","subtype":"memory_recall","content":"x"}"#,
-                "memory",
             ),
         ] {
             match parse_frame(raw).expect("parses") {
