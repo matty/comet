@@ -18,7 +18,7 @@ mod catalog;
 pub(crate) mod commands;
 pub(crate) mod discovery;
 mod normalize;
-mod wire;
+pub(crate) mod wire;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -239,8 +239,8 @@ impl ClaudeHarness {
                 RuntimeMode::Auto,
                 RuntimeMode::FullAccess,
             ],
-            // `deny_response(message)` puts the note on the wire, and 1.6's
-            // capture saw the model read it back.
+            // `deny_response(message)` puts the user's note on the provider
+            // wire, so the adapter can truthfully advertise this capability.
             carries_deny_note: true,
         }
     }
@@ -462,7 +462,7 @@ fn image_media_type(path: &std::path::Path, bytes: &[u8]) -> Option<&'static str
 /// Load `RunRequest::attachments` into inline image blocks, best-effort: an
 /// unreadable, oversized, or unsupported file is skipped — its path ref still
 /// rides the prompt text — never fatal to the run.
-async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
+pub(crate) async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
     use base64::Engine as _;
     let mut blocks = Vec::new();
     for path in paths {
@@ -745,9 +745,7 @@ fn handle_control_request(
         // that reply leaves the CLI waiting on an answer that never comes.
         // Comet applies the same reply to every unclaimed subtype (~52
         // others), which the SDK does not specify. The reply shape is
-        // written blind — none of the nine 2026-08-10 capture runs against
-        // Claude Code 2.1.226 produced one of these, so it is checked
-        // against the typings, not a live frame.
+        // derived from the SDK typings rather than a captured live frame.
         //
         // If one of the non-dialog subtypes ever does fire, the safer generic
         // reply is a `control_response` with `subtype: "error"` (an
@@ -756,9 +754,8 @@ fn handle_control_request(
         // `{behavior:"cancelled"}` claims a permission answer the caller may
         // not have asked for. Exposure is near zero today — Comet does no
         // initialize handshake and declares no SDK hooks or SDK MCP servers,
-        // which is why the capture runs saw none — so the reply that IS
-        // specified for the one reachable kind stays until a live frame says
-        // otherwise.
+        // so the reply that IS specified for the one reachable kind stays
+        // until reproducible protocol evidence says otherwise.
         tracing::warn!(
             target: "comet_harness::claude",
             request = %serde_json::json!({
@@ -1073,7 +1070,7 @@ mod control_request_tests {
             sent["response"]["response"]
                 .get("updatedPermissions")
                 .is_none(),
-            "capture 2026-08-10: updatedPermissions writes to the user's repo and does not work"
+            "session grants are engine-owned and must not become provider permission updates"
         );
     }
 
@@ -1097,9 +1094,7 @@ mod control_request_tests {
     #[tokio::test]
     async fn allow_for_session_is_answered_allow_and_sends_no_permission_update() {
         // The engine remembers the session grant (Task 1). The CLI is told plain
-        // "allow" — capture runs 7-9: every updatedPermissions shape either
-        // persisted a rule to the user's repo, failed to silence the next call,
-        // or both.
+        // "allow" without delegating persistence to provider configuration.
         let (request_input, stdin_tx, mut stdin_rx) = bridge();
         handle_control_request(
             frame("can_use_tool", "Write"),

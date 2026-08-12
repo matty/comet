@@ -20,11 +20,14 @@ Scenarios:
   claude: model-discovery, model-discovery-neutral-cwd, model-discovery-project-cwd,
           command-discovery, fresh-text, approval, resume, attachment
   codex:  model-discovery, model-discovery-neutral-cwd, model-discovery-project-cwd,
-          model-discovery-logged-out, fresh-text, approval, resume, steer, interruption
+          model-discovery-logged-out, fresh-text, approval, approval-on-request, resume, steer,
+          interruption
 
 Options:
   --executable <PATH>              Override the provider executable
   --codex-home <PATH>              Override CODEX_HOME for Codex discovery
+  --cwd <DIR>                      Existing working directory for the scenario
+  --approval-target <DIR>          Empty external target for Codex on-request approval
   --raw-root <PATH>                Raw output root [default: .comet-provider-captures/raw]
   --timeout-seconds <SECONDS>      Hard timeout, from 1 through 300
   --acknowledge-token-spend        Required for scenarios that can call a model
@@ -39,6 +42,8 @@ struct Args {
     scenario: Option<String>,
     executable: Option<PathBuf>,
     codex_home: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    approval_target: Option<PathBuf>,
     raw_root: Option<PathBuf>,
     timeout_seconds: Option<u64>,
     acknowledge_token_spend: bool,
@@ -81,6 +86,10 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--acknowledge-token-spend" => parsed.acknowledge_token_spend = true,
             "--executable" => parsed.executable = Some(value(&mut arguments, &argument)?.into()),
             "--codex-home" => parsed.codex_home = Some(value(&mut arguments, &argument)?.into()),
+            "--cwd" => parsed.cwd = Some(value(&mut arguments, &argument)?.into()),
+            "--approval-target" => {
+                parsed.approval_target = Some(value(&mut arguments, &argument)?.into())
+            }
             "--raw-root" => parsed.raw_root = Some(value(&mut arguments, &argument)?.into()),
             "--timeout-seconds" => {
                 let raw = value(&mut arguments, &argument)?;
@@ -133,6 +142,9 @@ fn capture_config_with_env(
         });
     }
     let discovery = is_discovery_pair(provider, scenario);
+    if scenario != "approval-on-request" && args.approval_target.is_some() {
+        return Err("--approval-target is only valid for codex approval-on-request.".into());
+    }
     if !discovery && !args.acknowledge_token_spend {
         return Err(
             "This scenario can spend provider tokens. Re-run with --acknowledge-token-spend after checking the selected provider and scenario."
@@ -145,10 +157,18 @@ fn capture_config_with_env(
     if !(1..=300).contains(&timeout_seconds) {
         return Err("--timeout-seconds must be from 1 through 300.".into());
     }
-    let cwd = std::env::current_dir().map_err(|_| {
-        "The current directory could not be read. Start the command from an accessible directory."
-            .to_owned()
-    })?;
+    let cwd = resolve_existing_directory(args.cwd.as_deref(), "--cwd")?;
+    let approval_target = if scenario == "approval-on-request" {
+        Some(validate_approval_target(
+            args.approval_target.as_deref().ok_or_else(|| {
+                "The approval-on-request scenario needs --approval-target with an empty external directory."
+                    .to_owned()
+            })?,
+            &cwd,
+        )?)
+    } else {
+        None
+    };
     if scenario == "model-discovery-logged-out" {
         if ["OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"]
             .into_iter()
@@ -199,24 +219,25 @@ fn capture_config_with_env(
         ("claude", name @ ("fresh-text" | "approval" | "resume" | "attachment")) => {
             let (prompt, script) = match name {
                 "fresh-text" => (
-                    "Reply with the single word capture.",
+                    "Reply with the single word capture.".to_owned(),
                     ClaudeRunScript::FreshText,
                 ),
                 "approval" => (
-                    "Use the shell to print the single word capture.",
+                    "Use Bash to print the word capture, then use Write to create capture-marker.txt inside the working directory.".to_owned(),
                     ClaudeRunScript::Approval,
                 ),
                 "resume" => (
-                    "Reply with the single word resumed.",
+                    "Reply with the single word resumed.".to_owned(),
                     ClaudeRunScript::Resume,
                 ),
                 "attachment" => (
-                    "Describe the attached image in one short sentence.",
+                    "Describe the attached image in one short sentence.".to_owned(),
                     ClaudeRunScript::Attachment,
                 ),
                 _ => unreachable!(),
             };
-            let mut request = cheap_claude_request(prompt, cwd);
+            let mode = claude_runtime_mode(script);
+            let mut request = cheap_claude_request(&prompt, cwd, mode);
             if matches!(script, ClaudeRunScript::Resume) {
                 request.resume = Some(args.resume_id.clone().ok_or_else(|| {
                     "The resume scenario needs --resume-id with a Claude session id.".to_owned()
@@ -263,31 +284,44 @@ fn capture_config_with_env(
             purpose: "capture Codex model discovery with an isolated empty Codex home",
             operation: CaptureOperation::Codex(CodexCaptureOperation::ModelDiscovery),
         },
-        ("codex", name @ ("fresh-text" | "approval" | "resume" | "steer" | "interruption")) => {
+        (
+            "codex",
+            name @ ("fresh-text"
+            | "approval"
+            | "approval-on-request"
+            | "resume"
+            | "steer"
+            | "interruption"),
+        ) => {
             let (prompt, script) = match name {
                 "fresh-text" => (
-                    "Reply with the single word capture.",
+                    "Reply with the single word capture.".to_owned(),
                     CodexRunScript::FreshText,
                 ),
                 "approval" => (
-                    "Use the shell to print the single word capture.",
+                    "Run the same harmless print command three separate times, then make one small file change inside the working directory.".to_owned(),
                     CodexRunScript::Approval,
                 ),
+                "approval-on-request" => (
+                    approval_on_request_prompt(approval_target.as_deref().expect("validated target")),
+                    CodexRunScript::ApprovalOnRequest,
+                ),
                 "resume" => (
-                    "Reply with the single word resumed.",
+                    "Reply with the single word resumed.".to_owned(),
                     CodexRunScript::Resume,
                 ),
                 "steer" => (
-                    "Begin a short response, then accept the follow-up instruction.",
+                    "Begin a short response, then accept the follow-up instruction.".to_owned(),
                     CodexRunScript::Steer,
                 ),
                 "interruption" => (
-                    "Count upward slowly and keep working until interrupted.",
+                    "Count upward slowly and keep working until interrupted.".to_owned(),
                     CodexRunScript::Interruption,
                 ),
                 _ => unreachable!(),
             };
-            let mut request = cheap_codex_request(prompt, cwd);
+            let mode = codex_runtime_mode(script);
+            let mut request = cheap_codex_request(&prompt, cwd, mode);
             if matches!(script, CodexRunScript::Resume) {
                 request.resume = Some(args.resume_id.clone().ok_or_else(|| {
                     "The resume scenario needs --resume-id with a Codex thread id.".to_owned()
@@ -306,6 +340,7 @@ fn capture_config_with_env(
         scenario,
         executable: args.executable,
         codex_home: args.codex_home,
+        approval_target,
         raw_root: args
             .raw_root
             .unwrap_or_else(|| PathBuf::from(".comet-provider-captures").join("raw")),
@@ -334,6 +369,7 @@ fn supported_pair(provider: &str, scenario: &str) -> bool {
                 | "model-discovery-logged-out"
                 | "fresh-text"
                 | "approval"
+                | "approval-on-request"
                 | "resume"
                 | "steer"
                 | "interruption"
@@ -364,6 +400,7 @@ fn canonical_scenario_name(name: &str) -> &'static str {
     match name {
         "fresh-text" => "fresh-text",
         "approval" => "approval",
+        "approval-on-request" => "approval-on-request",
         "resume" => "resume",
         "attachment" => "attachment",
         "steer" => "steer",
@@ -372,24 +409,117 @@ fn canonical_scenario_name(name: &str) -> &'static str {
     }
 }
 
-fn cheap_claude_request(prompt: &str, cwd: PathBuf) -> RunRequest {
+fn cheap_claude_request(prompt: &str, cwd: PathBuf, mode: RuntimeMode) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
         model: Some("claude-haiku-4-5-20251001".into()),
         reasoning: Some(ReasoningLevel::Low),
         cwd: cwd.display().to_string(),
-        ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
+        ..RunRequest::for_session(mode)
     }
 }
 
-fn cheap_codex_request(prompt: &str, cwd: PathBuf) -> RunRequest {
+fn claude_runtime_mode(script: ClaudeRunScript) -> RuntimeMode {
+    if matches!(script, ClaudeRunScript::Approval) {
+        RuntimeMode::ApprovalRequired
+    } else {
+        RuntimeMode::AutoAcceptEdits
+    }
+}
+
+fn codex_runtime_mode(script: CodexRunScript) -> RuntimeMode {
+    if matches!(script, CodexRunScript::Approval) {
+        RuntimeMode::ApprovalRequired
+    } else {
+        RuntimeMode::AutoAcceptEdits
+    }
+}
+
+fn cheap_codex_request(prompt: &str, cwd: PathBuf, mode: RuntimeMode) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
         model: Some("gpt-5.6-luna".into()),
         reasoning: Some(ReasoningLevel::Low),
         cwd: cwd.display().to_string(),
-        ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
+        ..RunRequest::for_session(mode)
     }
+}
+
+fn resolve_existing_directory(
+    path: Option<&std::path::Path>,
+    option: &str,
+) -> Result<PathBuf, String> {
+    let path = match path {
+        Some(path) => path.to_owned(),
+        None => std::env::current_dir().map_err(|_| {
+            "The current directory could not be read. Start the command from an accessible directory."
+                .to_owned()
+        })?,
+    };
+    let absolute = std::path::absolute(&path)
+        .map_err(|_| format!("{option} must name an existing directory."))?;
+    if !absolute.is_dir() {
+        return Err(format!("{option} must name an existing directory."));
+    }
+    Ok(absolute)
+}
+
+fn validate_approval_target(
+    path: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Result<PathBuf, String> {
+    let target = resolve_existing_directory(Some(path), "--approval-target")?;
+    let canonical_target = target
+        .canonicalize()
+        .map_err(|_| "--approval-target must be an accessible empty directory.".to_owned())?;
+    let canonical_cwd = cwd
+        .canonicalize()
+        .map_err(|_| "--cwd must name an existing directory.".to_owned())?;
+    if canonical_target.starts_with(&canonical_cwd) || canonical_cwd.starts_with(&canonical_target)
+    {
+        return Err("--approval-target must be outside --cwd.".into());
+    }
+    let temp = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    if canonical_target.starts_with(&temp) {
+        return Err(
+            "--approval-target must be outside the system temporary directory tree.".into(),
+        );
+    }
+    if target.join(".git").is_file() {
+        return Err("--approval-target must not be a linked worktree.".into());
+    }
+    let mut entries = std::fs::read_dir(&target)
+        .map_err(|_| "--approval-target must be an accessible empty directory.".to_owned())?;
+    if entries.next().is_some() {
+        return Err("--approval-target must be empty.".into());
+    }
+    Ok(target)
+}
+
+fn approval_on_request_prompt(target: &std::path::Path) -> String {
+    #[cfg(windows)]
+    let command = {
+        let path = target
+            .join("approval-marker.txt")
+            .display()
+            .to_string()
+            .replace('\'', "''");
+        format!(
+            "powershell.exe -NoProfile -Command \"Set-Content -LiteralPath '{path}' -Value 'capture' -NoNewline\""
+        )
+    };
+    #[cfg(not(windows))]
+    let command = {
+        let path = target
+            .join("approval-marker.txt")
+            .display()
+            .to_string()
+            .replace('\'', "'\\''");
+        format!("printf %s capture > '{path}'")
+    };
+    format!("Run this exact command once and report success: {command}")
 }
 
 fn exit_with(message: &str) -> ! {
@@ -507,6 +637,98 @@ mod tests {
                 |name| name == variable,
             );
             assert!(ordinary.is_ok(), "ordinary discovery rejected {variable}");
+        }
+    }
+
+    #[test]
+    fn cwd_is_resolved_to_an_existing_absolute_directory() {
+        let mut args = token_free_args("claude", "model-discovery-project-cwd", None);
+        args.cwd = Some(PathBuf::from("."));
+        let config = capture_config(args).unwrap();
+        let CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscoveryAt { cwd }) =
+            config.scenario.operation
+        else {
+            panic!("wrong operation");
+        };
+        assert!(cwd.is_absolute());
+        assert!(cwd.is_dir());
+        #[cfg(windows)]
+        assert!(!cwd.as_os_str().to_string_lossy().starts_with(r"\\?\"));
+    }
+
+    #[test]
+    fn scenario_names_own_their_runtime_modes() {
+        assert_eq!(
+            codex_runtime_mode(CodexRunScript::ApprovalOnRequest),
+            RuntimeMode::AutoAcceptEdits
+        );
+        for (provider, scenario, expected) in [
+            ("claude", "fresh-text", RuntimeMode::AutoAcceptEdits),
+            ("claude", "approval", RuntimeMode::ApprovalRequired),
+            ("claude", "resume", RuntimeMode::AutoAcceptEdits),
+            ("claude", "attachment", RuntimeMode::AutoAcceptEdits),
+            ("codex", "fresh-text", RuntimeMode::AutoAcceptEdits),
+            ("codex", "approval", RuntimeMode::ApprovalRequired),
+            ("codex", "resume", RuntimeMode::AutoAcceptEdits),
+            ("codex", "steer", RuntimeMode::AutoAcceptEdits),
+            ("codex", "interruption", RuntimeMode::AutoAcceptEdits),
+        ] {
+            let mut args = token_free_args(provider, scenario, None);
+            args.acknowledge_token_spend = true;
+            args.resume_id = Some("resume-id".into());
+            args.attachment = Some(PathBuf::from("image.png"));
+            let config = capture_config(args).unwrap();
+            let mode = match config.scenario.operation {
+                CaptureOperation::Claude(ClaudeCaptureOperation::Run { request, .. })
+                | CaptureOperation::Codex(CodexCaptureOperation::Run { request, .. }) => {
+                    request.runtime_mode
+                }
+                _ => panic!("{provider}/{scenario} did not configure a run"),
+            };
+            assert_eq!(mode, expected, "{provider}/{scenario}");
+        }
+    }
+
+    #[test]
+    fn on_request_requires_a_bounded_external_empty_target() {
+        assert!(!supported_pair("claude", "approval-on-request"));
+        let mut unused = token_free_args("codex", "model-discovery", None);
+        unused.approval_target = Some(PathBuf::from("."));
+        assert!(capture_config(unused).unwrap_err().contains("only valid"));
+        let mut args = token_free_args("codex", "approval-on-request", None);
+        args.acknowledge_token_spend = true;
+        assert!(
+            capture_config(args)
+                .unwrap_err()
+                .contains("--approval-target")
+        );
+
+        let cwd = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir_in(cwd.path()).unwrap();
+        let mut args = token_free_args("codex", "approval-on-request", None);
+        args.acknowledge_token_spend = true;
+        args.cwd = Some(cwd.path().into());
+        args.approval_target = Some(target.path().into());
+        assert!(capture_config(args).unwrap_err().contains("outside --cwd"));
+    }
+
+    #[test]
+    fn on_request_command_quotes_a_target_with_spaces_and_quotes() {
+        let target = PathBuf::from(if cfg!(windows) {
+            r"C:\capture targets\O'Brien"
+        } else {
+            "/capture targets/O'Brien"
+        });
+        let prompt = approval_on_request_prompt(&target);
+        assert!(prompt.contains("approval-marker.txt"));
+        if cfg!(windows) {
+            assert!(
+                prompt
+                    .contains("-LiteralPath 'C:\\capture targets\\O''Brien\\approval-marker.txt'")
+            );
+            assert!(!prompt.contains("cmd.exe /C"));
+        } else {
+            assert!(prompt.contains("'/capture targets/O'\\''Brien/approval-marker.txt'"));
         }
     }
 }

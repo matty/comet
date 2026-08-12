@@ -289,7 +289,15 @@ fn main() {
 
     // NOTE: steer-race before steer — the first match wins, and "scenario:steer"
     // is a prefix of "scenario:steer-race".
-    if turn_line.contains("scenario:happy") {
+    if turn_line.contains("scenario:capture-onrequest-out-of-order") {
+        capture_on_request_out_of_order(&mut stdin, &tid);
+    } else if turn_line.contains("scenario:capture-onrequest:") {
+        capture_on_request(&mut stdin, &turn_line, &tid);
+    } else if turn_line.contains("scenario:capture-approval") {
+        capture_approval(&mut stdin, &tid);
+    } else if turn_line.contains("scenario:capture-fresh") {
+        simple_completed(&tid);
+    } else if turn_line.contains("scenario:happy") {
         happy(&turn_line, &thread_line, &tid);
     } else if turn_line.contains("scenario:steer-race") {
         steer_race(&mut stdin, &tid);
@@ -318,6 +326,88 @@ fn main() {
     } else {
         fail_turn(&tid, "unknown scenario");
     }
+}
+
+fn simple_completed(tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+}
+
+fn capture_approval(stdin: &mut StdinLock<'_>, tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    for id in 301..=303 {
+        emit(&format!(
+            r#"{{"id":{id},"method":"item/commandExecution/requestApproval","params":{{"itemId":"c{id}","command":"printf capture"}}}}"#
+        ));
+        let reply = read_line(stdin);
+        if !(reply.contains(&format!(r#""id":{id}"#)) && reply.contains(r#""decision":"accept""#)) {
+            fail_turn(tid, "capture command approval not accepted");
+            return;
+        }
+    }
+    emit(
+        r#"{"method":"item/started","params":{"item":{"type":"fileChange","id":"f-capture","status":"inProgress","changes":[{"path":"capture-marker.txt","kind":{"type":"add"},"diff":"@@ -0,0 +1 @@\n+capture\n"}]}}}"#,
+    );
+    emit(
+        r#"{"id":304,"method":"item/fileChange/requestApproval","params":{"itemId":"f-capture","reason":"create capture marker"}}"#,
+    );
+    let reply = read_line(stdin);
+    if !(reply.contains(r#""id":304"#) && reply.contains(r#""decision":"accept""#)) {
+        fail_turn(tid, "capture file approval not accepted");
+        return;
+    }
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+}
+
+fn capture_on_request(stdin: &mut StdinLock<'_>, turn_line: &str, tid: &str) {
+    let turn: serde_json::Value = serde_json::from_str(turn_line).expect("turn JSON");
+    let text = turn["params"]["input"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    let target = text
+        .strip_prefix("scenario:capture-onrequest:")
+        .unwrap_or_default();
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(
+        r#"{"method":"item/completed","params":{"item":{"id":"sandboxed","type":"commandExecution","status":"failed","exitCode":1}}}"#,
+    );
+    emit(
+        r#"{"id":401,"method":"item/commandExecution/requestApproval","params":{"itemId":"sandboxed","command":"write marker","reason":"sandbox denied the external target"}}"#,
+    );
+    let reply = read_line(stdin);
+    if !(reply.contains(r#""id":401"#) && reply.contains(r#""decision":"accept""#)) {
+        fail_turn(tid, "on-request approval not accepted");
+        return;
+    }
+    emit(
+        r#"{"method":"item/completed","params":{"item":{"id":"retry","type":"commandExecution","status":"completed","exitCode":0}}}"#,
+    );
+    std::fs::write(
+        std::path::Path::new(target).join("approval-marker.txt"),
+        "capture",
+    )
+    .expect("write capture marker");
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+}
+
+fn capture_on_request_out_of_order(stdin: &mut StdinLock<'_>, tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(
+        r#"{"id":402,"method":"item/commandExecution/requestApproval","params":{"itemId":"early","command":"write marker","reason":"sandbox denied target"}}"#,
+    );
+    let _ = read_line(stdin);
 }
 
 fn happy(turn_line: &str, thread_line: &str, tid: &str) {
@@ -470,7 +560,8 @@ fn steer(stdin: &mut StdinLock<'_>, tid: &str) {
     let sid = rid(&steer_line);
     if steer_line.contains(r#""method":"turn/steer""#)
         && steer_line.contains(r#""expectedTurnId":"t-1""#)
-        && steer_line.contains("redirect please")
+        && (steer_line.contains("redirect please")
+            || steer_line.contains("Capture steering message."))
     {
         emit(&format!(r#"{{"id":{sid},"result":{{}}}}"#));
         emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"steered"}}"#);

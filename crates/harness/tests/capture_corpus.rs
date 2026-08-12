@@ -869,11 +869,8 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
     assert_eq!(
         claim_ids,
         std::collections::BTreeSet::from([
-            "claude-approval-allowed-no-update",
-            "claude-approval-deny-response-policy",
             "claude-approval-fixture-shape",
             "claude-approval-no-cwd",
-            "claude-approval-no-permission-update",
             "claude-approval-tool-input-shapes",
             "claude-approval-wire-fields",
             "claude-approval-write-path-absolute",
@@ -900,7 +897,6 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "claude-routine-frame-fixture",
             "claude-routine-frame-ignore-list",
             "claude-routine-frame-integration",
-            "claude-run-settings-readback",
             "codex-approval-policy-semantics",
             "codex-approval-request-shapes",
             "codex-command-approval-stability",
@@ -909,7 +905,6 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "codex-file-change-diff-shape",
             "codex-file-change-kind-object",
             "codex-file-change-kind-source",
-            "codex-linked-worktree-sandbox-failure",
             "codex-model-cwd-invariance",
             "codex-model-effort-objects",
             "codex-model-fixture-shape",
@@ -944,14 +939,13 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "claude-model-cwd-invariance",
             "codex-approval-policy-semantics",
             "codex-command-approval-stability",
-            "codex-linked-worktree-sandbox-failure",
             "codex-model-cwd-invariance",
             "codex-model-logged-out-fallback",
         ])
     );
 
     let errors = validate_corpus(&corpus_root);
-    assert_eq!(errors.len(), 29, "inventory errors: {errors:#?}");
+    assert_eq!(errors.len(), 23, "inventory errors: {errors:#?}");
     assert!(
         errors
             .iter()
@@ -974,15 +968,11 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
     add(
         "claude/pending-observed-version/approval/manifest.json",
         &[
-            "claude-approval-allowed-no-update",
-            "claude-approval-deny-response-policy",
             "claude-approval-fixture-shape",
             "claude-approval-no-cwd",
-            "claude-approval-no-permission-update",
             "claude-approval-tool-input-shapes",
             "claude-approval-wire-fields",
             "claude-approval-write-path-absolute",
-            "claude-run-settings-readback",
         ],
     );
     add(
@@ -1006,7 +996,7 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
         &["codex-approval-policy-semantics"],
     );
     add(
-        "codex/pending-observed-version/approval-untrusted/manifest.json",
+        "codex/pending-observed-version/approval/manifest.json",
         &["codex-approval-policy-semantics"],
     );
     add(
@@ -1020,14 +1010,6 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "codex-file-change-kind-object",
             "codex-file-change-kind-source",
         ],
-    );
-    add(
-        "codex/pending-observed-version/fresh-text-linked-worktree-full-access/manifest.json",
-        &["codex-linked-worktree-sandbox-failure"],
-    );
-    add(
-        "codex/pending-observed-version/fresh-text-linked-worktree-workspace-write/manifest.json",
-        &["codex-linked-worktree-sandbox-failure"],
     );
     add(
         "codex/pending-observed-version/fresh-text/manifest.json",
@@ -1561,6 +1543,41 @@ fn sanitizer_replaces_the_captured_codex_home() {
         "<CODEX_HOME>"
     );
     assert_eq!(manifest["redaction_counts"]["codex_home_path"], 1);
+}
+
+#[test]
+fn sanitizer_replaces_the_captured_approval_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = r"D:\bounded approval target";
+    let payload = format!(
+        r#"{{"method":"item/commandExecution/requestApproval","params":{{"command":{}}}}}"#,
+        serde_json::to_string(&format!("write {target}\\approval-marker.txt")).unwrap()
+    );
+    let raw = write_raw_capture(temp.path(), "approval-target", &[&payload]);
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    capture["redaction_roots"]["approval_target"] = Value::String(target.into());
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "approval-target")).unwrap();
+    let payloads = sanitized_payloads(&report.events_bytes);
+    assert_eq!(
+        payloads[0]["params"]["command"],
+        "write <APPROVAL_TARGET>\\approval-marker.txt"
+    );
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+    assert_eq!(manifest["redaction_counts"]["approval_target_path"], 1);
+    assert!(
+        manifest["placeholders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["placeholder"] == "<APPROVAL_TARGET>"
+                    && entry["kind"] == "approval_target_path"
+            })
+    );
 }
 
 /// Break caught: global value replacement can turn a protocol discriminator into a placeholder

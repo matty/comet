@@ -144,7 +144,11 @@ fn main() {
         exit(0);
     }
 
-    if first.contains("scenario:happy") {
+    if first.contains("scenario:attachment") {
+        emit(
+            r#"{"type":"result","subtype":"success","result":"image","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-attachment"}"#,
+        );
+    } else if first.contains("scenario:happy") {
         happy();
     } else if first.contains("scenario:askuser") {
         askuser(&mut stdin);
@@ -158,6 +162,8 @@ fn main() {
         notices();
     } else if first.contains("scenario:diagnostics") {
         diagnostics();
+    } else if first.contains("scenario:capture-approval") {
+        capture_approval(&mut stdin);
     } else if first.contains("scenario:approval") {
         approval(&mut stdin);
     } else {
@@ -352,6 +358,40 @@ fn approval(stdin: &mut StdinLock<'_>) {
     emit(&format!(
         r#"{{"type":"stream_event","parent_tool_use_id":null,"event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"told: {behavior}"}}}}}}"#
     ));
+    emit(
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-1"}"#,
+    );
+}
+
+fn capture_approval(stdin: &mut StdinLock<'_>) {
+    emit(
+        r#"{"type":"control_request","request_id":"fake-bash","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"printf capture"},"description":"print capture","tool_use_id":"toolu_bash"}}"#,
+    );
+    let bash: serde_json::Value =
+        serde_json::from_str(&read_line(stdin)).expect("a Bash control response");
+    if bash["response"]["response"]["behavior"] != "allow"
+        || bash["response"]["response"]["updatedInput"]
+            != serde_json::json!({"command": "printf capture"})
+    {
+        exit(1);
+    }
+    emit(
+        &r#"{"type":"control_request","request_id":"fake-write","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"__PATH__","content":"hi\n"},"description":"a.txt","tool_use_id":"toolu_fake"}}"#
+            .replace("__PATH__", WRITE_TARGET_JSON),
+    );
+    let write: serde_json::Value =
+        serde_json::from_str(&read_line(stdin)).expect("a Write control response");
+    let expected = if cfg!(windows) {
+        r"C:\comet-fake-fixture\a.txt"
+    } else {
+        "/comet-fake-fixture/a.txt"
+    };
+    if write["response"]["response"]["behavior"] != "allow"
+        || write["response"]["response"]["updatedInput"]
+            != serde_json::json!({"file_path": expected, "content": "hi\n"})
+    {
+        exit(1);
+    }
     emit(
         r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-1"}"#,
     );

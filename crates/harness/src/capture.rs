@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail};
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -184,6 +183,7 @@ pub enum CodexCaptureOperation {
 pub enum CodexRunScript {
     FreshText,
     Approval,
+    ApprovalOnRequest,
     Resume,
     Steer,
     Interruption,
@@ -207,6 +207,7 @@ pub struct CaptureConfig {
     pub scenario: CaptureScenario,
     pub executable: Option<PathBuf>,
     pub codex_home: Option<PathBuf>,
+    pub approval_target: Option<PathBuf>,
     pub raw_root: PathBuf,
     pub timeout: Duration,
 }
@@ -225,10 +226,12 @@ pub struct RedactionRoots {
     pub temp: Option<String>,
     #[serde(default)]
     pub codex_home: Option<String>,
+    #[serde(default)]
+    pub approval_target: Option<String>,
 }
 
 impl RedactionRoots {
-    fn capture(command: &CommandSnapshot) -> Self {
+    fn capture(command: &CommandSnapshot, approval_target: Option<&Path>) -> Self {
         let cwd = command.cwd.clone();
         let repo = cwd
             .as_deref()
@@ -241,6 +244,7 @@ impl RedactionRoots {
             home: crate::home_dir().map(|path| path.to_string_lossy().into_owned()),
             temp: Some(std::env::temp_dir().to_string_lossy().into_owned()),
             codex_home: command.configured_env.get("CODEX_HOME").cloned(),
+            approval_target: approval_target.map(|path| path.to_string_lossy().into_owned()),
         }
     }
 }
@@ -1059,6 +1063,7 @@ fn known_placeholder(candidate: &str) -> Option<KnownPlaceholder> {
         "HOME" => Some("home_path"),
         "TEMP" => Some("temp_path"),
         "CODEX_HOME" => Some("codex_home_path"),
+        "APPROVAL_TARGET" => Some("approval_target_path"),
         _ => None,
     };
     if let Some(kind) = static_kind {
@@ -1655,6 +1660,11 @@ impl Redactor {
             capture.redaction_roots.codex_home.as_deref(),
             "<CODEX_HOME>",
             "codex_home_path",
+        );
+        redactor.add_path(
+            capture.redaction_roots.approval_target.as_deref(),
+            "<APPROVAL_TARGET>",
+            "approval_target_path",
         );
         redactor
     }
@@ -2294,6 +2304,7 @@ struct RecordingSession {
     scenario: String,
     purpose: String,
     command: CommandSnapshot,
+    approval_target: Option<PathBuf>,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout_lines: mpsc::UnboundedReceiver<String>,
@@ -2403,6 +2414,7 @@ impl RecordingSession {
             scenario: config.scenario.name.into(),
             purpose: config.scenario.purpose.into(),
             command,
+            approval_target: config.approval_target,
             child: Some(child),
             stdin: Some(stdin),
             stdout_lines,
@@ -2452,7 +2464,10 @@ impl RecordingSession {
                 os: std::env::consts::OS.into(),
                 arch: std::env::consts::ARCH.into(),
             },
-            redaction_roots: RedactionRoots::capture(&self.command),
+            redaction_roots: RedactionRoots::capture(
+                &self.command,
+                self.approval_target.as_deref(),
+            ),
             command: self.command.clone(),
             events: self.events.lock().expect("capture event lock").clone(),
             exit_code,
@@ -2501,6 +2516,7 @@ impl RecordingSession {
     ) -> anyhow::Result<()> {
         let line = claude_user_line(&request, script).await?;
         self.write_line(&line).await?;
+        let mut approval_tools = std::collections::BTreeSet::new();
         while let Some(line) = self.next_stdout().await? {
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
@@ -2510,17 +2526,39 @@ impl RecordingSession {
                     .as_str()
                     .or_else(|| value["response"]["request_id"].as_str())
                     .unwrap_or_default();
+                let tool = value["request"]["tool_name"].as_str().unwrap_or_default();
+                if matches!(tool, "Bash" | "Write") {
+                    approval_tools.insert(tool.to_owned());
+                }
+                let original_input = value["request"]["input"].clone();
                 let response = json!({
                     "type": "control_response",
                     "response": {
                         "subtype": "success",
                         "request_id": request_id,
-                        "response": { "behavior": "allow" },
+                        "response": {
+                            "behavior": "allow",
+                            "updatedInput": original_input,
+                        },
                     },
                 });
                 self.write_line(&response.to_string()).await?;
             }
             if value["type"] == "result" {
+                if value["subtype"] != "success" {
+                    bail!("Claude ended the capture without a successful terminal result.");
+                }
+                if matches!(script, ClaudeRunScript::Approval)
+                    && approval_tools
+                        != std::collections::BTreeSet::from(["Bash".to_owned(), "Write".to_owned()])
+                {
+                    bail!("Claude approval capture did not request both Bash and Write approval.");
+                }
+                if matches!(script, ClaudeRunScript::Resume)
+                    && value["session_id"].as_str() != request.resume.as_deref()
+                {
+                    bail!("Claude resume capture returned a different session identifier.");
+                }
                 return Ok(());
             }
         }
@@ -2570,14 +2608,12 @@ impl RecordingSession {
         };
         self.write_line(&rpc_request(next_id, method, thread_params))
             .await?;
-        let mut thread_reply = self.codex_reply(next_id).await?;
+        let thread_reply = self.codex_reply(next_id).await?;
         next_id += 1;
         if thread_reply.get("error").is_some() && method == "thread/resume" {
-            let params = crate::codex::thread_start_params(&request);
-            self.write_line(&rpc_request(next_id, "thread/start", params))
-                .await?;
-            thread_reply = self.codex_reply(next_id).await?;
-            next_id += 1;
+            bail!(
+                "Codex rejected the requested thread resume; no fresh-thread fallback was recorded."
+            );
         }
         let thread_id = thread_reply["result"]["thread"]["id"]
             .as_str()
@@ -2585,6 +2621,11 @@ impl RecordingSession {
             .to_owned();
         if thread_id.is_empty() {
             return protocol_stopped("Codex", "thread identifier");
+        }
+        if matches!(script, CodexRunScript::Resume)
+            && request.resume.as_deref() != Some(thread_id.as_str())
+        {
+            bail!("Codex resume capture returned a different thread identifier.");
         }
         self.write_line(&rpc_request(
             next_id,
@@ -2596,6 +2637,12 @@ impl RecordingSession {
 
         let mut active_turn = None;
         let mut scripted_action_sent = false;
+        let mut scripted_reply_ok = false;
+        let mut scripted_request_id = None;
+        let mut approval_methods = std::collections::BTreeSet::new();
+        let mut command_approvals = 0_u8;
+        let mut file_change_approvals = 0_u8;
+        let mut on_request_stage = 0_u8;
         while let Some(line) = self.next_stdout().await? {
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
@@ -2607,24 +2654,29 @@ impl RecordingSession {
             if !scripted_action_sent {
                 match script {
                     CodexRunScript::Steer if active_turn.is_some() => {
+                        scripted_request_id = Some(next_id);
                         self.write_line(&rpc_request(
                             next_id,
                             "turn/steer",
-                            json!({
-                                "threadId": thread_id,
-                                "expectedTurnId": active_turn,
-                                "input": [{"type": "text", "text": "Capture steering message."}],
-                            }),
+                            crate::codex::turn_steer_params(
+                                &thread_id,
+                                active_turn.as_deref().unwrap_or_default(),
+                                "Capture steering message.",
+                            ),
                         ))
                         .await?;
                         next_id += 1;
                         scripted_action_sent = true;
                     }
                     CodexRunScript::Interruption if active_turn.is_some() => {
+                        scripted_request_id = Some(next_id);
                         self.write_line(&rpc_request(
                             next_id,
                             "turn/interrupt",
-                            json!({"threadId": thread_id, "turnId": active_turn}),
+                            crate::codex::turn_interrupt_params(
+                                &thread_id,
+                                active_turn.as_deref().unwrap_or_default(),
+                            ),
                         ))
                         .await?;
                         next_id += 1;
@@ -2633,10 +2685,41 @@ impl RecordingSession {
                     _ => {}
                 }
             }
-            if matches!(script, CodexRunScript::Approval)
-                && value.get("id").is_some()
+            if value["id"].as_u64() == scripted_request_id {
+                if value.get("error").is_some() {
+                    bail!("Codex rejected the scripted steer or interruption request.");
+                }
+                scripted_reply_ok = true;
+            }
+            if matches!(
+                script,
+                CodexRunScript::Approval | CodexRunScript::ApprovalOnRequest
+            ) && value.get("id").is_some()
                 && method.ends_with("/requestApproval")
             {
+                if matches!(script, CodexRunScript::Approval) {
+                    approval_methods.insert(method.to_owned());
+                    if method == "item/commandExecution/requestApproval" {
+                        command_approvals = command_approvals.saturating_add(1);
+                    } else if method == "item/fileChange/requestApproval" {
+                        file_change_approvals = file_change_approvals.saturating_add(1);
+                    }
+                } else {
+                    if method != "item/commandExecution/requestApproval" {
+                        bail!("Codex on-request scenario emitted a non-command approval request.");
+                    }
+                    if on_request_stage != 1 {
+                        bail!("Codex on-request approval arrived before the sandbox failure.");
+                    }
+                    let reason = value["params"]["reason"]
+                        .as_str()
+                        .or_else(|| value["params"]["failureReason"].as_str())
+                        .unwrap_or_default();
+                    if reason.trim().is_empty() {
+                        bail!("Codex on-request approval did not include a failure reason.");
+                    }
+                    on_request_stage = 2;
+                }
                 self.write_line(
                     &json!({
                         "jsonrpc": "2.0",
@@ -2647,7 +2730,83 @@ impl RecordingSession {
                 )
                 .await?;
             }
+            if matches!(script, CodexRunScript::ApprovalOnRequest)
+                && method == "item/completed"
+                && value["params"]["item"]["type"] == "commandExecution"
+            {
+                let exit_code = value["params"]["item"]["exitCode"].as_i64();
+                match (on_request_stage, exit_code) {
+                    (0, Some(code)) if code != 0 => on_request_stage = 1,
+                    (2, Some(0)) => on_request_stage = 3,
+                    _ => bail!("Codex on-request command events arrived out of order."),
+                }
+            }
             if matches!(method, "turn/completed" | "turn/failed" | "turn/aborted") {
+                match script {
+                    CodexRunScript::Approval => {
+                        let required = std::collections::BTreeSet::from([
+                            "item/commandExecution/requestApproval".to_owned(),
+                            "item/fileChange/requestApproval".to_owned(),
+                        ]);
+                        if method != "turn/completed"
+                            || !required.is_subset(&approval_methods)
+                            || command_approvals < 3
+                            || file_change_approvals < 1
+                        {
+                            bail!(
+                                "Codex approval capture did not complete after three command and one file-change approvals."
+                            );
+                        }
+                    }
+                    CodexRunScript::ApprovalOnRequest => {
+                        if method != "turn/completed" || on_request_stage != 3 {
+                            bail!(
+                                "Codex on-request approval did not complete the required failure, approval, retry sequence."
+                            );
+                        }
+                        let target = self.approval_target.as_deref().ok_or_else(|| {
+                            anyhow!("Codex on-request capture has no validated approval target.")
+                        })?;
+                        let marker = tokio::fs::read_to_string(target.join("approval-marker.txt"))
+                            .await
+                            .map_err(|_| {
+                                anyhow!(
+                                    "Codex on-request capture did not create its bounded marker."
+                                )
+                            })?;
+                        if marker != "capture" {
+                            bail!(
+                                "Codex on-request capture marker did not contain the expected value."
+                            );
+                        }
+                    }
+                    CodexRunScript::Steer => {
+                        if method != "turn/completed"
+                            || !scripted_action_sent
+                            || !scripted_reply_ok
+                            || value["params"]["turn"]["id"].as_str() != active_turn.as_deref()
+                        {
+                            bail!(
+                                "Codex steer capture did not receive a successful steer reply before completion."
+                            );
+                        }
+                    }
+                    CodexRunScript::Interruption => {
+                        if method != "turn/aborted"
+                            || !scripted_action_sent
+                            || !scripted_reply_ok
+                            || value["params"]["turn"]["id"].as_str() != active_turn.as_deref()
+                        {
+                            bail!(
+                                "Codex interruption capture did not receive a successful interrupt reply and aborted terminal event."
+                            );
+                        }
+                    }
+                    _ if method != "turn/completed" => {
+                        bail!("Codex capture ended without a successful terminal turn.");
+                    }
+                    _ => {}
+                }
                 return Ok(());
             }
         }
@@ -2945,60 +3104,16 @@ async fn persist_raw_capture(capture: &RawCapture) -> anyhow::Result<()> {
 }
 
 async fn claude_user_line(request: &RunRequest, script: ClaudeRunScript) -> anyhow::Result<String> {
-    if !matches!(script, ClaudeRunScript::Attachment) || request.attachments.is_empty() {
-        return Ok(json!({
-            "type": "user",
-            "message": {"role": "user", "content": request.prompt},
-            "parent_tool_use_id": Value::Null,
-        })
-        .to_string());
+    let images = crate::claude::load_image_blocks(&request.attachments).await;
+    if matches!(script, ClaudeRunScript::Attachment) && images.is_empty() {
+        bail!(
+            "The selected attachment could not be inlined. Use a supported image under 5 MiB and retry."
+        );
     }
-    let mut blocks = Vec::new();
-    for path in &request.attachments {
-        let bytes = tokio::fs::read(path).await.map_err(|err| {
-            tracing::debug!(path, %err, "capture attachment read failed");
-            anyhow!(
-                "An attachment could not be read. Check the attachment path and retry the capture."
-            )
-        })?;
-        let media_type = image_media_type(std::path::Path::new(path), &bytes).ok_or_else(|| {
-            anyhow!("An attachment format is not supported. Use PNG, JPEG, GIF, or WebP and retry.")
-        })?;
-        blocks.push(json!({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": media_type,
-                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-            },
-        }));
-    }
-    blocks.push(json!({"type": "text", "text": request.prompt}));
-    Ok(json!({
-        "type": "user",
-        "message": {"role": "user", "content": blocks},
-        "parent_tool_use_id": Value::Null,
-    })
-    .to_string())
-}
-
-fn image_media_type(path: &std::path::Path, bytes: &[u8]) -> Option<&'static str> {
-    match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("png") => Some("image/png"),
-        Some("jpg" | "jpeg") => Some("image/jpeg"),
-        Some("gif") => Some("image/gif"),
-        Some("webp") => Some("image/webp"),
-        _ if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => Some("image/png"),
-        _ if bytes.starts_with(&[0xff, 0xd8, 0xff]) => Some("image/jpeg"),
-        _ if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") => Some("image/gif"),
-        _ if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") => Some("image/webp"),
-        _ => None,
-    }
+    Ok(crate::claude::wire::user_message_line_with_images(
+        &request.prompt,
+        &images,
+    ))
 }
 
 fn codex_initialize_line() -> String {
@@ -3546,6 +3661,7 @@ mod tests {
             },
             executable: Some(executable),
             codex_home: None,
+            approval_target: None,
             raw_root: raw_root.into(),
             timeout: Duration::from_secs(5),
         }
@@ -3725,13 +3841,72 @@ mod tests {
         assert_eq!(capture.exit_code, Some(0));
     }
 
+    #[tokio::test]
+    async fn capture_attachment_line_uses_the_production_image_helpers() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("tiny.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
+        let request = RunRequest {
+            prompt: "describe".into(),
+            attachments: vec![image.display().to_string()],
+            ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
+        };
+        let production_images = crate::claude::load_image_blocks(&request.attachments).await;
+        assert_eq!(
+            super::claude_user_line(&request, ClaudeRunScript::Attachment)
+                .await
+                .unwrap(),
+            crate::claude::wire::user_message_line_with_images(&request.prompt, &production_images)
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_attachment_capture_requires_inline_image_before_text() {
+        let raw = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let image = files.path().join("tiny.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
+        let request = RunRequest {
+            prompt: "scenario:attachment".into(),
+            attachments: vec![image.display().to_string()],
+            ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
+        };
+        let capture = record(config(
+            "claude-attachment",
+            fixture_path("fake-claude"),
+            CaptureOperation::Claude(ClaudeCaptureOperation::Run {
+                request,
+                script: ClaudeRunScript::Attachment,
+            }),
+            raw.path(),
+        ))
+        .await
+        .unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(channel_payloads(&capture, Channel::Stdin)[0]).unwrap();
+        assert_eq!(first["message"]["content"][0]["type"], "image");
+        assert_eq!(first["message"]["content"][1]["type"], "text");
+    }
+
+    #[test]
+    fn capture_steer_and_interrupt_params_match_production_helpers() {
+        assert_eq!(
+            crate::codex::turn_steer_params("thread", "turn", "Capture steering message."),
+            json!({"threadId":"thread","expectedTurnId":"turn","input":[{"type":"text","text":"Capture steering message."}]})
+        );
+        assert_eq!(
+            crate::codex::turn_interrupt_params("thread", "turn"),
+            json!({"threadId":"thread","turnId":"turn"})
+        );
+    }
+
     /// Break caught: the Codex run driver skips a handshake stage, loses the concrete run script,
     /// or waits forever after the provider's terminal turn notification.
     #[tokio::test]
     async fn recorder_codex_run_records_the_explicit_script() {
         let raw = tempfile::tempdir().unwrap();
         let request = RunRequest {
-            prompt: "scenario:fail".into(),
+            prompt: "scenario:capture-fresh".into(),
             model: Some("gpt-5.6-luna".into()),
             cwd: std::env::temp_dir().display().to_string(),
             sandbox: SandboxLevel::WorkspaceWrite,
@@ -3762,6 +3937,204 @@ mod tests {
         assert_eq!(capture.exit_code, Some(0));
     }
 
+    #[tokio::test]
+    async fn claude_approval_requires_bash_and_write_before_success() {
+        let raw = tempfile::tempdir().unwrap();
+        let request = RunRequest {
+            prompt: "scenario:capture-approval".into(),
+            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
+        };
+        let capture = record(config(
+            "claude-approval",
+            fixture_path("fake-claude"),
+            CaptureOperation::Claude(ClaudeCaptureOperation::Run {
+                request,
+                script: ClaudeRunScript::Approval,
+            }),
+            raw.path(),
+        ))
+        .await
+        .unwrap();
+        let replies: Vec<serde_json::Value> = channel_payloads(&capture, Channel::Stdin)
+            .into_iter()
+            .skip(1)
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 2);
+        assert!(replies.iter().all(|reply| {
+            reply["response"]["response"]["behavior"] == "allow"
+                && reply["response"]["response"]["updatedInput"].is_object()
+        }));
+    }
+
+    #[tokio::test]
+    async fn strict_resume_and_zero_approval_cannot_be_relabelled_success() {
+        let raw = tempfile::tempdir().unwrap();
+        let claude_request = RunRequest {
+            prompt: "scenario:happy".into(),
+            resume: Some("different-session".into()),
+            ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
+        };
+        let error = record(config(
+            "claude-resume",
+            fixture_path("fake-claude"),
+            CaptureOperation::Claude(ClaudeCaptureOperation::Run {
+                request: claude_request,
+                script: ClaudeRunScript::Resume,
+            }),
+            raw.path(),
+        ))
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("different session identifier"));
+
+        let codex_request = RunRequest {
+            prompt: "scenario:capture-fresh".into(),
+            cwd: std::env::temp_dir().display().to_string(),
+            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
+        };
+        let error = record(config(
+            "codex-approval",
+            fixture_path("fake-codex"),
+            CaptureOperation::Codex(CodexCaptureOperation::Run {
+                request: codex_request,
+                script: CodexRunScript::Approval,
+            }),
+            raw.path(),
+        ))
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("three command and one file-change approvals")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_resume_never_falls_back_to_a_fresh_thread() {
+        let raw = tempfile::tempdir().unwrap();
+        let request = RunRequest {
+            prompt: "scenario:resumed".into(),
+            resume: Some("resume-fail".into()),
+            cwd: std::env::temp_dir().display().to_string(),
+            ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
+        };
+        let error = record(config(
+            "codex-resume",
+            fixture_path("fake-codex"),
+            CaptureOperation::Codex(CodexCaptureOperation::Run {
+                request,
+                script: CodexRunScript::Resume,
+            }),
+            raw.path(),
+        ))
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("rejected the requested thread resume")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_approval_requires_three_commands_and_a_file_change() {
+        let raw = tempfile::tempdir().unwrap();
+        let request = RunRequest {
+            prompt: "scenario:capture-approval".into(),
+            cwd: std::env::temp_dir().display().to_string(),
+            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
+        };
+        record(config(
+            "codex-approval",
+            fixture_path("fake-codex"),
+            CaptureOperation::Codex(CodexCaptureOperation::Run {
+                request,
+                script: CodexRunScript::Approval,
+            }),
+            raw.path(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_on_request_requires_ordered_failure_approval_retry_and_marker() {
+        let raw = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let request = RunRequest {
+            prompt: format!("scenario:capture-onrequest:{}", target.path().display()),
+            cwd: std::env::current_dir().unwrap().display().to_string(),
+            ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
+        };
+        let mut config = config(
+            "codex-approval-on-request",
+            fixture_path("fake-codex"),
+            CaptureOperation::Codex(CodexCaptureOperation::Run {
+                request,
+                script: CodexRunScript::ApprovalOnRequest,
+            }),
+            raw.path(),
+        );
+        config.approval_target = Some(target.path().into());
+        let capture = record(config).await.unwrap();
+        assert_eq!(
+            capture.redaction_roots.approval_target.as_deref(),
+            Some(target.path().to_string_lossy().as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_on_request_rejects_approval_before_sandbox_failure() {
+        let raw = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let request = RunRequest {
+            prompt: "scenario:capture-onrequest-out-of-order".into(),
+            cwd: std::env::current_dir().unwrap().display().to_string(),
+            ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
+        };
+        let mut config = config(
+            "codex-approval-on-request",
+            fixture_path("fake-codex"),
+            CaptureOperation::Codex(CodexCaptureOperation::Run {
+                request,
+                script: CodexRunScript::ApprovalOnRequest,
+            }),
+            raw.path(),
+        );
+        config.approval_target = Some(target.path().into());
+        let error = record(config).await.unwrap_err();
+        assert!(error.to_string().contains("before the sandbox failure"));
+    }
+
+    #[tokio::test]
+    async fn codex_steer_and_interrupt_require_successful_protocol_neighborhoods() {
+        for (name, prompt, script) in [
+            ("codex-steer", "scenario:steer", CodexRunScript::Steer),
+            (
+                "codex-interruption",
+                "scenario:interrupt",
+                CodexRunScript::Interruption,
+            ),
+        ] {
+            let raw = tempfile::tempdir().unwrap();
+            let request = RunRequest {
+                prompt: prompt.into(),
+                cwd: std::env::temp_dir().display().to_string(),
+                ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
+            };
+            record(config(
+                name,
+                fixture_path("fake-codex"),
+                CaptureOperation::Codex(CodexCaptureOperation::Run { request, script }),
+                raw.path(),
+            ))
+            .await
+            .unwrap();
+        }
+    }
+
     /// Break caught: capture skips the production request normalization that works around
     /// Codex's malformed workspace-write mount for linked slash-branch worktrees.
     #[tokio::test]
@@ -3780,7 +4153,7 @@ mod tests {
         )
         .unwrap();
         let mut request = RunRequest {
-            prompt: "scenario:fail".into(),
+            prompt: "scenario:capture-fresh".into(),
             model: Some("gpt-5.6-luna".into()),
             reasoning: Some(ReasoningLevel::Low),
             cwd: worktree.path().display().to_string(),
@@ -3843,7 +4216,7 @@ mod tests {
             .unwrap();
         let expected_turn = json!({
             "threadId": "th-1",
-            "input": [{"type": "text", "text": "scenario:fail"}],
+            "input": [{"type": "text", "text": "scenario:capture-fresh"}],
             "approvalPolicy": "untrusted",
             "sandboxPolicy": {"type": "dangerFullAccess"},
             "summary": "auto",
@@ -3853,7 +4226,7 @@ mod tests {
         });
         assert_eq!(turn["params"], expected_turn);
         assert_eq!(
-            crate::codex::turn_start_params(&provider_request, "th-1", "scenario:fail"),
+            crate::codex::turn_start_params(&provider_request, "th-1", "scenario:capture-fresh"),
             expected_turn
         );
     }

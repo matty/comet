@@ -176,22 +176,6 @@
       ]
     },
     {
-      "id": "claude-run-settings-readback",
-      "consumer": "crates/harness/src/claude/mod.rs:capabilities",
-      "fact": "A Claude run reads back deny-response note content.",
-      "evidence": [
-        {
-          "manifest": "claude/pending-observed-version/approval/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdout"
-            }
-          ]
-        }
-      ]
-    },
-    {
       "id": "claude-routine-frame-ignore-list",
       "consumer": "crates/harness/src/claude/wire.rs:the_ignore_list_covers_every_capture_confirmed_routine_frame",
       "fact": "Healthy runs emit the routine frame variants assigned to the ignored tier.",
@@ -282,22 +266,6 @@
             {
               "sequence": 0,
               "channel": "stdout"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "id": "claude-approval-no-permission-update",
-      "consumer": "crates/harness/src/claude/mod.rs:allow_for_session_is_answered_allow_and_sends_no_permission_update",
-      "fact": "Approval replies omit updatedPermissions because observed variants persisted or failed to grant session-only access.",
-      "evidence": [
-        {
-          "manifest": "claude/pending-observed-version/approval/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdin"
             }
           ]
         }
@@ -554,10 +522,10 @@
       "id": "codex-approval-policy-semantics",
       "consumer": "crates/harness/src/codex/catalog.rs:approval_policy",
       "comparison": true,
-      "fact": "Untrusted asks before commands while on-request asks after a sandbox failure.",
+      "fact": "Approval-required asks before commands while on-request asks after a sandbox failure.",
       "evidence": [
         {
-          "manifest": "codex/pending-observed-version/approval-untrusted/manifest.json",
+          "manifest": "codex/pending-observed-version/approval/manifest.json",
           "frames": [
             {
               "sequence": 0,
@@ -615,32 +583,6 @@
       "evidence": [
         {
           "manifest": "codex/pending-observed-version/fresh-text/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdout"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "id": "codex-linked-worktree-sandbox-failure",
-      "consumer": "crates/harness/src/codex/mod.rs:normalize_run_request",
-      "comparison": true,
-      "fact": "Workspace-write fails for a slash-named linked-worktree branch while full access runs.",
-      "evidence": [
-        {
-          "manifest": "codex/pending-observed-version/fresh-text-linked-worktree-workspace-write/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdout"
-            }
-          ]
-        },
-        {
-          "manifest": "codex/pending-observed-version/fresh-text-linked-worktree-full-access/manifest.json",
           "frames": [
             {
               "sequence": 0,
@@ -825,38 +767,6 @@
         }
       ],
       "fact": "Captured Write requests carry an absolute file_path and no cwd."
-    },
-    {
-      "id": "claude-approval-deny-response-policy",
-      "consumer": "crates/harness/src/claude/wire.rs:deny_response",
-      "evidence": [
-        {
-          "manifest": "claude/pending-observed-version/approval/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdin"
-            }
-          ]
-        }
-      ],
-      "fact": "Observed updatedPermissions variants were unsuitable for session-only grants and are omitted."
-    },
-    {
-      "id": "claude-approval-allowed-no-update",
-      "consumer": "crates/harness/src/claude/mod.rs:an_allowed_tool_is_answered_allow_with_its_input_intact",
-      "evidence": [
-        {
-          "manifest": "claude/pending-observed-version/approval/manifest.json",
-          "frames": [
-            {
-              "sequence": 0,
-              "channel": "stdin"
-            }
-          ]
-        }
-      ],
-      "fact": "A captured allow response preserves updatedInput and omits updatedPermissions."
     },
     {
       "id": "codex-model-effort-objects",

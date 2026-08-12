@@ -131,13 +131,11 @@ fn worktree_on_slashed_branch(cwd: &str) -> bool {
 
 /// Apply the request rewrites that must precede both launch and wire setup.
 pub(crate) fn normalize_run_request(mut request: RunRequest) -> RunRequest {
-    // Codex ≤0.144.x: the workspace-write sandbox derives a MALFORMED
-    // worktree mount when the checked-out branch name contains '/'
-    // (verified against the real CLI: `wing/x` in a linked worktree kills
-    // every command before it starts; `wing-x` is fine; explicit
-    // writableRoots don't suppress the broken derivation; full access
-    // works). Escalate that exact shape instead of shipping a session
-    // where nothing can run.
+    // Historical Codex ≤0.144.x compatibility policy (DEBT.md D13): a
+    // workspace-write sandbox could derive a malformed mount for a linked
+    // worktree whose branch contains '/'. Escalate that exact shape instead
+    // of shipping a session where commands cannot run. This is maintained as
+    // compatibility behavior, not as a claim about the currently captured CLI.
     if request.sandbox == comet_proto::SandboxLevel::WorkspaceWrite
         && worktree_on_slashed_branch(&request.cwd)
     {
@@ -226,6 +224,18 @@ pub(crate) fn turn_start_params(request: &RunRequest, thread_id: &str, text: &st
         params.insert("serviceTier".into(), tier.into());
     }
     Value::Object(params)
+}
+
+pub(crate) fn turn_steer_params(thread_id: &str, turn_id: &str, text: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "expectedTurnId": turn_id,
+        "input": [{"type": "text", "text": text}],
+    })
+}
+
+pub(crate) fn turn_interrupt_params(thread_id: &str, turn_id: &str) -> Value {
+    json!({"threadId": thread_id, "turnId": turn_id})
 }
 
 fn service_tier(request: &RunRequest) -> Option<&str> {
@@ -1004,11 +1014,7 @@ async fn run_session(session: Session) {
                 Some(msg) => {
                     let text = msg.prompt;
                     if let Some(expected) = router.active.clone() {
-                        let steer_params = json!({
-                            "threadId": thread_id,
-                            "expectedTurnId": expected,
-                            "input": [{ "type": "text", "text": text }],
-                        });
+                        let steer_params = turn_steer_params(&thread_id, &expected, &text);
                         match client.request("turn/steer", steer_params).await {
                             Ok(_) => {
                                 let (prev, next) = rotate(&mut assistant_message_id);
@@ -1085,7 +1091,7 @@ async fn run_session(session: Session) {
                     let thread = thread_id.clone();
                     tokio::spawn(async move {
                         if let Err(e) = client
-                            .request("turn/interrupt", json!({ "threadId": thread, "turnId": turn }))
+                            .request("turn/interrupt", turn_interrupt_params(&thread, &turn))
                             .await
                         {
                             tracing::debug!(

@@ -405,10 +405,9 @@ pub(crate) fn control_response_line(request_id: &str, response: Value) -> String
 /// `can_use_tool` deny payload. `message` is what the model is told, and is
 /// the user's own note when they wrote one.
 ///
-/// No `updatedPermissions` is ever sent, on this arm or the allow arm:
-/// capture 2026-08-10 (runs 7-9) showed every shape either wrote a permanent
-/// rule into the user's repository, failed to silence the next request, or
-/// both. Comet owns session grants — see `comet_engine::approvals`.
+/// No `updatedPermissions` is sent on either arm: Comet owns session grants
+/// and must not persist them into provider or repository configuration. See
+/// `comet_engine::approvals`.
 pub(crate) fn deny_response(message: String) -> Value {
     json!({ "behavior": "deny", "message": message })
 }
@@ -420,9 +419,8 @@ pub(crate) fn allow_response(updated_input: Value) -> Value {
 
 /// The reply sdk.d.ts requires for a dialog kind the host does not recognize.
 /// Leaving it unanswered leaves the CLI waiting on a reply that never comes.
-/// Written blind: none of the nine 2026-08-10 capture runs against Claude
-/// Code 2.1.226 produced a non-`can_use_tool` control request, so this shape
-/// is unverified against a live frame — only against the SDK's typings.
+/// This shape is derived from the SDK typings and remains unverified against
+/// a reproducible live frame.
 pub(crate) fn cancelled_response() -> Value {
     json!({ "behavior": "cancelled" })
 }
