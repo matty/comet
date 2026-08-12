@@ -944,7 +944,7 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
     );
 
     let errors = validate_corpus(&corpus_root);
-    assert_eq!(errors.len(), 16, "inventory errors: {errors:#?}");
+    assert_eq!(errors.len(), 12, "inventory errors: {errors:#?}");
     assert!(
         errors
             .iter()
@@ -964,15 +964,6 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
     let mut add = |manifest: &'static str, claims: &[&'static str]| {
         expected.extend(claims.iter().map(|claim| (*claim, manifest)));
     };
-    add(
-        "claude/pending-observed-version/approval/manifest.json",
-        &[
-            "claude-approval-fixture-shape",
-            "claude-approval-tool-input-shapes",
-            "claude-approval-wire-fields",
-            "claude-approval-write-path-absolute",
-        ],
-    );
     add(
         "codex/pending-observed-version/approval-on-request/manifest.json",
         &["codex-approval-policy-semantics"],
@@ -1032,6 +1023,10 @@ fn corpus_promoted_token_free_claims_are_valid() {
     assert_eq!(
         promoted,
         std::collections::BTreeSet::from([
+            "claude-approval-fixture-shape",
+            "claude-approval-tool-input-shapes",
+            "claude-approval-wire-fields",
+            "claude-approval-write-path-absolute",
             "claude-attachment-block-order",
             "claude-attachment-block-order-test",
             "claude-attachment-run-order",

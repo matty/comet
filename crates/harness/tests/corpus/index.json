@@ -253,10 +253,10 @@
       "fact": "Claude can_use_tool requests use the captured tool names and input fields.",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/approval/manifest.json",
+          "manifest": "claude/2.1.228/approval/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 102,
               "channel": "stdout"
             }
           ]
@@ -269,10 +269,10 @@
       "fact": "A can_use_tool request carries request id, tool, input, description, and additional ignored fields.",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/approval/manifest.json",
+          "manifest": "claude/2.1.228/approval/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 102,
               "channel": "stdout"
             }
           ]
@@ -285,10 +285,10 @@
       "fact": "The approval fixture uses the captured control_request envelope.",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/approval/manifest.json",
+          "manifest": "claude/2.1.228/approval/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 102,
               "channel": "stdout"
             }
           ]
@@ -765,10 +765,10 @@
       "consumer": "crates/harness/src/claude/approval.rs:write_operation",
       "evidence": [
         {
-          "manifest": "claude/pending-observed-version/approval/manifest.json",
+          "manifest": "claude/2.1.228/approval/manifest.json",
           "frames": [
             {
-              "sequence": 0,
+              "sequence": 102,
               "channel": "stdout"
             }
           ]
