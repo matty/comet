@@ -136,9 +136,10 @@ fn write_valid_literal_corpus(root: &Path) {
   "channels": ["stdin", "stdout", "stderr"],
   "exit_code": 0,
   "placeholders": [
+    {"placeholder": "<TEMP>", "kind": "temp_path"},
     {"placeholder": "<CLAUDE_REQUEST_ID_1>", "kind": "claude_request_id"}
   ],
-  "redaction_counts": {"claude_request_id": 2},
+  "redaction_counts": {"claude_request_id": 2, "temp_path": 1},
   "consumers": [
     "crates/harness/src/claude/discovery.rs:the_captured_reply_decodes_onto_curated_ids"
   ]
@@ -254,6 +255,57 @@ fn corpus_accepts_sanitizer_generated_static_path_definitions() {
         }] if placeholder == "<CWD>"
             && expected_kind == "cwd_path"
             && actual_kind == "home_path"
+    ));
+}
+
+/// Break caught: a static path marker in promoted evidence can outlive its manifest accounting,
+/// leaving reviewers unable to tell which path family the sanitizer replaced.
+#[test]
+fn corpus_requires_a_definition_for_every_used_static_placeholder() {
+    let temp = tempfile::tempdir().unwrap();
+    write_valid_literal_corpus(temp.path());
+    let manifest_path = "claude/2.1.227/model-discovery/manifest.json";
+    let manifest = std::fs::read_to_string(temp.path().join(manifest_path))
+        .unwrap()
+        .replace(
+            concat!(
+                "    {\"placeholder\": \"<TEMP>\", \"kind\": \"temp_path\"},",
+                "\n"
+            ),
+            "",
+        );
+    overwrite(temp.path(), manifest_path, &manifest);
+
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::MissingPlaceholderDefinition { placeholder, .. }]
+            if placeholder == "<TEMP>"
+    ));
+}
+
+/// Break caught: a static path definition with no matching promoted marker can falsely claim a
+/// path was sanitized even though the evidence contains no auditable occurrence.
+#[test]
+fn corpus_rejects_an_unused_static_placeholder_definition() {
+    let temp = tempfile::tempdir().unwrap();
+    write_valid_literal_corpus(temp.path());
+    let manifest_path = "claude/2.1.227/model-discovery/manifest.json";
+    let manifest = std::fs::read_to_string(temp.path().join(manifest_path))
+        .unwrap()
+        .replace(
+            r#"    {"placeholder": "<TEMP>", "kind": "temp_path"},"#,
+            concat!(
+                r#"    {"placeholder": "<TEMP>", "kind": "temp_path"},"#,
+                "\n",
+                r#"    {"placeholder": "<HOME>", "kind": "home_path"},"#
+            ),
+        );
+    overwrite(temp.path(), manifest_path, &manifest);
+
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::UnusedPlaceholderDefinition { placeholder, .. }]
+            if placeholder == "<HOME>"
     ));
 }
 
@@ -380,7 +432,7 @@ fn corpus_cross_checks_typed_placeholder_definitions_against_every_use() {
     write_valid_literal_corpus(temp.path());
     let manifest = std::fs::read_to_string(temp.path().join(manifest_path))
         .unwrap()
-        .replace(definition, "");
+        .replace(&format!(",\n{definition}"), "");
     overwrite(temp.path(), manifest_path, &manifest);
     assert!(matches!(
         validate_corpus(temp.path()).as_slice(),
@@ -1090,6 +1142,12 @@ fn corpus_inventory_pins_the_observed_codex_discovery_order() {
             }]),
             "wrong observed selector for {claim_id}"
         );
+        if claim_id == "codex-model-source-notification-order" {
+            assert_eq!(
+                claim["consumer"], "crates/harness/src/codex/discovery.rs:reply_to",
+                "ordering rationale must name the actual reply matcher"
+            );
+        }
     }
 }
 

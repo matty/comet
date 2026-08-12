@@ -993,21 +993,21 @@ enum KnownPlaceholder {
 
 fn inspect_placeholder_value(
     value: &Value,
-    typed_uses: &mut BTreeMap<String, String>,
+    placeholder_uses: &mut BTreeMap<String, String>,
 ) -> Result<(), ()> {
     match value {
         Value::Array(values) => {
             for value in values {
-                inspect_placeholder_value(value, typed_uses)?;
+                inspect_placeholder_value(value, placeholder_uses)?;
             }
         }
         Value::Object(object) => {
             for (key, value) in object {
-                inspect_placeholder_text(key, typed_uses)?;
-                inspect_placeholder_value(value, typed_uses)?;
+                inspect_placeholder_text(key, placeholder_uses)?;
+                inspect_placeholder_value(value, placeholder_uses)?;
             }
         }
-        Value::String(text) => inspect_placeholder_text(text, typed_uses)?,
+        Value::String(text) => inspect_placeholder_text(text, placeholder_uses)?,
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
     Ok(())
@@ -1015,7 +1015,7 @@ fn inspect_placeholder_value(
 
 fn inspect_placeholder_text(
     text: &str,
-    typed_uses: &mut BTreeMap<String, String>,
+    placeholder_uses: &mut BTreeMap<String, String>,
 ) -> Result<(), ()> {
     if text.contains("{{") || text.contains("${") || text.contains("[REDACTED]") {
         return Err(());
@@ -1033,9 +1033,8 @@ fn inspect_placeholder_text(
         let candidate = &remaining[..end];
         if marker_like(candidate) {
             match known_placeholder(candidate) {
-                Some(KnownPlaceholder::Static(_)) => {}
-                Some(KnownPlaceholder::Typed(kind)) => {
-                    typed_uses.insert(format!("<{candidate}>"), kind.to_owned());
+                Some(KnownPlaceholder::Static(kind) | KnownPlaceholder::Typed(kind)) => {
+                    placeholder_uses.insert(format!("<{candidate}>"), kind.to_owned());
                 }
                 None => return Err(()),
             }
@@ -1097,9 +1096,9 @@ fn validate_placeholder_definitions(
     claim: &CorpusClaim,
     evidence: &ClaimEvidence,
     manifest: &CorpusManifest,
-    typed_uses: &BTreeMap<String, String>,
+    placeholder_uses: &BTreeMap<String, String>,
 ) -> Result<(), CorpusError> {
-    let mut definitions = BTreeMap::<String, (String, bool)>::new();
+    let mut definitions = BTreeMap::<String, String>::new();
     for definition in &manifest.placeholders {
         let candidate = definition
             .placeholder
@@ -1111,9 +1110,8 @@ fn validate_placeholder_definitions(
                 location: "manifest",
             });
         };
-        let (expected_kind, is_typed) = match known {
-            KnownPlaceholder::Static(kind) => (kind, false),
-            KnownPlaceholder::Typed(kind) => (kind, true),
+        let expected_kind = match known {
+            KnownPlaceholder::Static(kind) | KnownPlaceholder::Typed(kind) => kind,
         };
         if definition.kind != expected_kind {
             return Err(CorpusError::PlaceholderKindMismatch {
@@ -1125,10 +1123,7 @@ fn validate_placeholder_definitions(
             });
         }
         if definitions
-            .insert(
-                definition.placeholder.clone(),
-                (definition.kind.clone(), is_typed),
-            )
+            .insert(definition.placeholder.clone(), definition.kind.clone())
             .is_some()
         {
             return Err(CorpusError::DuplicatePlaceholderDefinition {
@@ -1138,7 +1133,7 @@ fn validate_placeholder_definitions(
             });
         }
     }
-    if let Some((placeholder, _)) = typed_uses
+    if let Some((placeholder, _)) = placeholder_uses
         .iter()
         .find(|(placeholder, _)| !definitions.contains_key(*placeholder))
     {
@@ -1150,7 +1145,7 @@ fn validate_placeholder_definitions(
     }
     if let Some((placeholder, _)) = definitions
         .iter()
-        .find(|(placeholder, (_, is_typed))| *is_typed && !typed_uses.contains_key(*placeholder))
+        .find(|(placeholder, _)| !placeholder_uses.contains_key(*placeholder))
     {
         return Err(CorpusError::UnusedPlaceholderDefinition {
             claim_id: claim.id.clone(),

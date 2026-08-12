@@ -950,7 +950,7 @@
     },
     {
       "id": "codex-model-source-notification-order",
-      "consumer": "crates/harness/src/codex/discovery.rs:initialize_response",
+      "consumer": "crates/harness/src/codex/discovery.rs:reply_to",
       "evidence": [
         {
           "manifest": "codex/0.147.0/model-discovery/manifest.json",

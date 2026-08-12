@@ -136,7 +136,7 @@
     "crates/harness/src/codex/discovery.rs:efforts_decode_from_objects_including_ultra",
     "crates/harness/src/codex/discovery.rs:input_modalities_split_text_only_from_image_capable",
     "crates/harness/tests/codex.rs:a_text_only_model_loses_the_curated_image_flag",
-    "crates/harness/src/codex/discovery.rs:initialize_response",
+    "crates/harness/src/codex/discovery.rs:reply_to",
     "crates/harness/src/codex/discovery.rs:MAX_PAGES"
   ]
 }
