@@ -4,6 +4,10 @@
 //! split three ways — [`Frame::Ignored`] (recognized, deliberately dropped)
 //! or [`Frame::Unknown`] (a diagnostic) — so a newer CLI never breaks parsing
 //! and nothing vanishes silently (spec: docs/research/harness.md).
+//!
+//! Corpus claims: `claude-routine-frame-ignore-list`,
+//! `claude-approval-wire-fields`, `claude-attachment-block-order`, and
+//! `claude-attachment-block-order-test`.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -442,6 +446,15 @@ pub(crate) fn interrupt_request_line(request_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::selected_payload;
+
+    fn corpus_payload(claim_id: &str) -> String {
+        selected_payload(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
+            claim_id,
+        )
+        .expect("reviewed corpus frame")
+    }
 
     #[test]
     fn parses_known_and_unknown_frames() {
@@ -471,6 +484,15 @@ mod tests {
 
     #[test]
     fn user_line_with_images_is_blocks_then_text() {
+        let captured = corpus_payload("claude-attachment-block-order-test");
+        let captured: Value = serde_json::from_str(&captured).expect("captured stdin JSON");
+        let captured_content = captured["message"]["content"]
+            .as_array()
+            .expect("captured block content");
+        assert_eq!(captured_content.len(), 2);
+        assert_eq!(captured_content[0]["type"], "image");
+        assert_eq!(captured_content[1]["type"], "text");
+
         let line = user_message_line_with_images(
             "what is this?",
             &[ImageBlock {
@@ -558,24 +580,19 @@ mod tests {
 
     #[test]
     fn a_can_use_tool_request_decodes_the_fields_a_card_needs() {
-        // Captured verbatim from Claude Code 2.1.226, 2026-08-10.
-        let line = r#"{"type":"control_request","request_id":"c012205e","request":{
-            "subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash",
-            "input":{"command":"echo one > a.txt","description":"Write \"one\" to a.txt"},
-            "description":"Write \"one\" to a.txt",
-            "blocked_path":"C:\\work\\a.txt","tool_use_id":"toolu_01NA3M"}}"#;
-        let Frame::ControlRequest(req) = parse_frame(line).unwrap() else {
+        let line = corpus_payload("claude-approval-wire-fields");
+        let Frame::ControlRequest(req) = parse_frame(&line).unwrap() else {
             panic!("expected a control request");
         };
         assert_eq!(req.request.subtype, "can_use_tool");
-        assert_eq!(req.request.tool_name, "Bash");
-        assert_eq!(req.request.tool_use_id, "toolu_01NA3M");
+        assert_eq!(req.request.tool_name, "Write");
+        assert_eq!(req.request.tool_use_id, "<TOOL_USE_ID_4>");
         assert_eq!(
             req.request.description.as_deref(),
-            Some("Write \"one\" to a.txt")
+            Some("capture-marker.txt")
         );
-        // blocked_path, permission_suggestions and display_name are all
-        // present on this captured frame and deliberately undecoded. Nothing
+        // permission_suggestions and display_name are present on this captured frame and
+        // deliberately undecoded. Nothing
         // reads them, and serde ignores unknown keys — so the frame parses either
         // way and declaring them would buy availability nothing consumes.
     }

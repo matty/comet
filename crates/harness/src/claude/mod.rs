@@ -12,6 +12,8 @@
 //!   any time; the CLI applies them at its own step boundary.
 //! - Interrupt: cancelling [`RunControls::interrupt`] sends the protocol-level
 //!   interrupt control request, then escalates to SIGTERM and SIGKILL.
+//!
+//! Corpus claim `claude-attachment-run-order` pins attachment stdin ordering.
 
 mod approval;
 mod catalog;

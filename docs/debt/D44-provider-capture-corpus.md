@@ -20,3 +20,18 @@ placeholders; captured assistant prose should not become a brittle assertion.
 The corpus is test evidence, not a promise to replay every session byte for byte.
 The native fake executables remain responsible for interactive timing, control
 round-trips and process lifecycle.
+
+## Partial result, 2026-08-12
+
+The repository now carries a sanitized, versioned corpus and an exact reciprocal
+claim index. Every retained capture-derived claim is backed by a promoted literal
+frame, and unsupported Codex approval claims were removed after two bounded live
+attempts contradicted the proposed capture contract. The operator procedure is
+[`docs/testing/provider-captures.md`](../testing/provider-captures.md).
+
+D44 remains open because the plan's all-twelve-scenarios acceptance criterion is
+not met. Codex ordinary approval remains unreproducible in the bounded scenario;
+Codex on-request, steer, and interruption were not launched after the approved
+stop boundary. No more live runs belong to this task. A future explicitly owned
+slice may capture those residual scenario artifacts under fresh authorization,
+but must not restore the removed claims without real supporting evidence.

@@ -319,7 +319,7 @@
     "crates/harness/tests/fixtures/fake_claude.rs:INITIALIZE_REPLY",
     "crates/harness/tests/claude.rs:models_come_back_live_and_merged",
     "crates/harness/tests/claude.rs:live_cli_commands_include_this_repositorys_own_skills",
-    "crates/harness/src/claude/discovery.rs:the_captured_reply_adds_no_rows_to_the_real_catalog",
+    "crates/harness/src/claude/discovery.rs:the_captured_reply_deduplicates_aliases_and_keeps_a_live_only_row",
     "crates/harness/src/claude/discovery.rs:the_default_alias_row_is_dropped",
     "crates/harness/src/claude/discovery.rs:no_modality_field_means_the_provider_did_not_say",
     "crates/harness/src/claude/discovery.rs:effort_levels_map_to_the_ladder_and_haiku_reports_none",

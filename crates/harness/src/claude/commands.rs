@@ -8,6 +8,10 @@
 //! 1. Commands are scoped to the selected working directory.
 //! 2. **It cannot reuse the model discovery's spawn**, because that one passes
 //!    `--bare`, which skips user and project skill discovery. Debt row D32.
+//!
+//! Corpus claims: `claude-command-discovery-behavior`,
+//! `claude-command-reply-decoder`, `claude-command-empty-hint`, and
+//! `claude-command-absent-aliases`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -143,33 +147,37 @@ pub(crate) fn commands_from_reply(line: &str) -> Result<Vec<AgentCommand>, Disco
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::selected_payload;
 
-    /// The literal frame Claude Code 2.1.227 sent on 2026-08-11, from
-    /// `captures/2026-08-11-slash-command-expansion/run1-init-nonbare.jsonl`,
-    /// trimmed to five of its 64 commands: one plain, one with an argument
-    /// hint, one with an alias, one project-scoped skill, and one whose
-    /// `argumentHint` is the empty string the CLI actually sends.
-    ///
-    /// Pinned as the CLI's own bytes rather than round-tripped through our own
-    /// types on purpose — a round-trip test cannot catch the reply moving under
-    /// us, which is how 2.1 shipped a runtime-broken picker (AGENTS.md,
-    /// "Changing what an RPC method answers with").
-    const CAPTURED_REPLY: &str = r#"{"type":"control_response","response":{"subtype":"success","request_id":"init-1","response":{"commands":[{"name":"comet-probe","description":"Probe whether a slash command expands in a stream-json session (project)","argumentHint":"token"},{"name":"debug","description":"Enable debug logging for this session and help diagnose issues","argumentHint":"[issue description]"},{"name":"code-review","description":"Review the current diff for correctness bugs.","argumentHint":"[low|medium|high] [--fix]","aliases":["review"]},{"name":"gpui-ui","description":"Comet's conventions for gpui UI code in crates/ui (project)","argumentHint":""},{"name":"init","description":"Initialize a new CLAUDE.md file with codebase documentation","argumentHint":""}],"agents":[{"name":"Explore"}],"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-5","displayName":"Sonnet"}],"account":{"email":"user@example.test"},"pid":1234}}}"#;
+    fn corpus_payload(claim_id: &str) -> String {
+        selected_payload(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
+            claim_id,
+        )
+        .expect("reviewed corpus frame")
+    }
 
     #[test]
     fn the_captured_reply_decodes_every_command() {
-        let commands = commands_from_reply(CAPTURED_REPLY).expect("decodes");
+        let payload = corpus_payload("claude-command-reply-decoder");
+        let commands = commands_from_reply(&payload).expect("decodes");
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names.len(), 57, "the literal provider list is complete");
         assert_eq!(
-            names,
-            vec!["comet-probe", "debug", "code-review", "gpui-ui", "init"],
-            "the provider's own order is kept"
+            &names[..5],
+            [
+                "find-skills",
+                "commit-pr",
+                "gpui-ui",
+                "sync-upstream",
+                "verify"
+            ]
         );
-        assert_eq!(
-            commands[1].argument_hint.as_deref(),
-            Some("[issue description]")
-        );
-        assert_eq!(commands[2].aliases, vec!["review".to_string()]);
+        let brainstorming = commands
+            .iter()
+            .find(|c| c.name == "superpowers:brainstorming")
+            .unwrap();
+        assert_eq!(brainstorming.aliases, vec!["brainstorming".to_string()]);
     }
 
     /// `argumentHint: ""` is what the CLI sends for a command that takes no
@@ -177,16 +185,18 @@ mod tests {
     /// render an empty hint slot on most rows in the menu.
     #[test]
     fn an_empty_argument_hint_is_absent_not_blank() {
-        let commands = commands_from_reply(CAPTURED_REPLY).unwrap();
-        assert_eq!(commands[3].argument_hint, None);
-        assert_eq!(commands[4].argument_hint, None);
+        let payload = corpus_payload("claude-command-empty-hint");
+        let commands = commands_from_reply(&payload).unwrap();
+        assert_eq!(commands[0].argument_hint, None);
+        assert_eq!(commands[1].argument_hint, None);
     }
 
     /// Aliases are optional on the wire — most commands carry none — and the
     /// absent case must be an empty list rather than a decode failure.
     #[test]
     fn a_command_without_aliases_decodes_to_an_empty_list() {
-        let commands = commands_from_reply(CAPTURED_REPLY).unwrap();
+        let payload = corpus_payload("claude-command-absent-aliases");
+        let commands = commands_from_reply(&payload).unwrap();
         assert!(commands[0].aliases.is_empty());
     }
 

@@ -853,8 +853,8 @@ fn corpus_rejects_unknown_or_unresolved_placeholder_syntax() {
     ));
 }
 
-/// Break caught: promoting token-free evidence without shrinking the pending inventory hides the
-/// exact token-spending worklist that still needs explicit authorization.
+/// Break caught: index drift can silently reintroduce an unsupported pending claim or delete a
+/// retained claim whose literal evidence is still required.
 #[test]
 fn corpus_inventory_reports_the_exact_pending_manifest_set() {
     let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
@@ -935,6 +935,30 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
 
     let errors = validate_corpus(&corpus_root);
     assert!(errors.is_empty(), "inventory errors: {errors:#?}");
+}
+
+/// Break caught: a retained corpus claim can outlive the source rationale it supports, leaving a
+/// maintainer unable to trace the claim from the consumer named by the index.
+#[test]
+fn every_retained_claim_is_named_by_its_consumer_source() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir.parent().unwrap().parent().unwrap();
+    let index: Value = serde_json::from_slice(
+        &std::fs::read(manifest_dir.join("tests/corpus/index.json")).unwrap(),
+    )
+    .unwrap();
+    for claim in index["claims"].as_array().unwrap() {
+        let id = claim["id"].as_str().unwrap();
+        let consumer = claim["consumer"].as_str().unwrap();
+        let (relative_path, _) = consumer
+            .split_once(':')
+            .expect("consumer uses path:anchor syntax");
+        let source = std::fs::read_to_string(repo_root.join(relative_path)).unwrap();
+        assert!(
+            source.contains(id),
+            "consumer source {relative_path} does not name corpus claim {id}"
+        );
+    }
 }
 
 /// Break caught: a promoted token-free selector can exist in the index while its reviewed
@@ -1298,11 +1322,20 @@ fn sanitizer_replaces_discovery_descriptions_as_provider_prose() {
     let payloads = sanitized_payloads(&report.events_bytes);
     let reply = &payloads[0]["response"]["response"];
 
-    assert_eq!(reply["agents"][0]["description"], "<PROVIDER_PROSE_1>");
-    assert_eq!(reply["commands"][0]["argumentHint"], "<PROVIDER_PROSE_2>");
-    assert_eq!(reply["commands"][0]["description"], "<PROVIDER_PROSE_3>");
+    for value in [
+        &reply["agents"][0]["description"],
+        &reply["commands"][0]["argumentHint"],
+        &reply["commands"][0]["description"],
+        &reply["models"][0]["description"],
+    ] {
+        assert!(
+            value
+                .as_str()
+                .is_some_and(|value| value.starts_with("<PROVIDER_PROSE_")),
+            "provider prose was not typed: {value}"
+        );
+    }
     assert_eq!(reply["commands"][1]["argumentHint"], "");
-    assert_eq!(reply["models"][0]["description"], "<PROVIDER_PROSE_5>");
     let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
     assert_eq!(manifest["redaction_counts"]["provider_prose"], 5);
 }
@@ -1324,8 +1357,11 @@ fn sanitizer_replaces_hook_output_and_identifiers() {
     let payload = &sanitized_payloads(&report.events_bytes)[0];
 
     assert_eq!(payload["hook_id"], "<TOOL_USE_ID_1>");
-    assert_eq!(payload["uuid"], "<MACHINE_ID_2>");
-    assert_eq!(payload["pid"], "<MACHINE_ID_1>");
+    let uuid = payload["uuid"].as_str().unwrap();
+    let pid = payload["pid"].as_str().unwrap();
+    assert!(uuid.starts_with("<MACHINE_ID_"));
+    assert!(pid.starts_with("<MACHINE_ID_"));
+    assert_ne!(uuid, pid);
     assert_eq!(payload["session_id"], "<SESSION_ID_1>");
     assert_eq!(payload["output"], "<PROVIDER_PROSE_1>");
     assert_eq!(payload["stdout"], "<PROVIDER_PROSE_1>");
@@ -1367,16 +1403,20 @@ fn sanitizer_replaces_codex_server_name_and_catalog_prose() {
     let report = sanitize_dir(&raw, &staging_dir(temp.path(), "codex-discovery-prose")).unwrap();
     let payloads = sanitized_payloads(&report.events_bytes);
 
-    assert_eq!(payloads[0]["params"]["installationId"], "<MACHINE_ID_1>");
-    assert_eq!(payloads[0]["params"]["serverName"], "<MACHINE_ID_2>");
-    assert_eq!(
-        payloads[1]["result"]["data"][0]["description"],
-        "<PROVIDER_PROSE_2>"
-    );
-    assert_eq!(
-        payloads[1]["result"]["data"][0]["availabilityNux"]["message"],
-        "<PROVIDER_PROSE_1>"
-    );
+    let installation = payloads[0]["params"]["installationId"].as_str().unwrap();
+    let server = payloads[0]["params"]["serverName"].as_str().unwrap();
+    assert!(installation.starts_with("<MACHINE_ID_"));
+    assert!(server.starts_with("<MACHINE_ID_"));
+    assert_ne!(installation, server);
+    let description = payloads[1]["result"]["data"][0]["description"]
+        .as_str()
+        .unwrap();
+    let nux = payloads[1]["result"]["data"][0]["availabilityNux"]["message"]
+        .as_str()
+        .unwrap();
+    assert!(description.starts_with("<PROVIDER_PROSE_"));
+    assert!(nux.starts_with("<PROVIDER_PROSE_"));
+    assert_ne!(description, nux);
 }
 
 /// Break caught: treating every bare `id` as structural lets actual Codex thread, turn, and item

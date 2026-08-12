@@ -1,8 +1,8 @@
 //! Claude's live model discovery: reading one `initialize` control response.
 //!
-//! Captured against Claude Code 2.1.227 on 2026-08-11
-//! (`captures/2026-08-11-claude-initialize-handshake.md`). Three facts from
-//! that capture shape this file, and none of them is in sdk.d.ts 0.3.195:
+//! Reviewed evidence is indexed in `tests/corpus/index.json` by the
+//! `claude-model-*` claims. Three facts from that corpus shape this file, and
+//! none of them is in sdk.d.ts 0.3.195:
 //!
 //! 1. The reply nests twice: `control_response.response.response`.
 //! 2. Each model carries an undocumented `resolvedModel`, and it is the only
@@ -13,6 +13,12 @@
 //! Canonicalization lives in this file rather than in the shared merge because
 //! `resolvedModel` is a Claude field; `crate::discovery` stays
 //! provider-agnostic and unchanged.
+//!
+//! Corpus claims: `claude-model-reply-shape`, `claude-model-curated-id-decoder`,
+//! `claude-model-cwd-invariance`, `claude-model-bare-effects`,
+//! `claude-model-real-catalog-merge`, `claude-model-default-alias`,
+//! `claude-model-no-modality`, `claude-model-effort-levels`,
+//! `claude-model-initialize-request`, and `claude-model-close-exit`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -306,18 +312,17 @@ pub(crate) fn discovery_from_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::selected_payload;
     use crate::claude::catalog::static_models;
     use comet_proto::ReasoningLevel;
 
-    /// The literal frame Claude Code 2.1.227 sent on 2026-08-11, from
-    /// `captures/2026-08-11-claude-initialize-handshake/run2-close.jsonl`, with
-    /// only the `account` block replaced (it carries a real email).
-    ///
-    /// Pinned as the CLI's own bytes rather than round-tripped through our own
-    /// types on purpose: a round-trip test cannot catch the reply moving under
-    /// us, which is exactly how 2.1 shipped a runtime-broken picker (AGENTS.md,
-    /// "Changing what an RPC method answers with").
-    const CAPTURED_REPLY: &str = r#"{"type":"control_response","response":{"subtype":"success","request_id":"init-1","response":{"commands":[{"name":"verify","description":"Run the gate. (project)","argumentHint":""}],"agents":[{"name":"Explore"}],"output_style":"default","available_output_styles":["default","Explanatory"],"models":[{"value":"default","resolvedModel":"claude-opus-5[1m]","displayName":"Default (recommended)","description":"Opus 5 with 1M context","supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max"],"supportsAdaptiveThinking":true,"supportsFastMode":true,"supportsAutoMode":true},{"value":"opus[1m]","resolvedModel":"claude-opus-5[1m]","displayName":"Opus (1M context)","description":"Opus 5 with 1M context","supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max"],"supportsAdaptiveThinking":true,"supportsFastMode":true,"supportsAutoMode":true},{"value":"claude-fable-5[1m]","resolvedModel":"claude-fable-5","displayName":"Fable","description":"Fable 5","supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max"],"supportsAdaptiveThinking":true,"supportsAutoMode":true},{"value":"sonnet","resolvedModel":"claude-sonnet-5","displayName":"Sonnet","description":"Sonnet 5","supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max"],"supportsAdaptiveThinking":true,"supportsAutoMode":true},{"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001","displayName":"Haiku","description":"Haiku 4.5"}],"account":{"email":"user@example.test","organization":"Example","subscriptionType":"Claude Max","apiProvider":"firstParty"},"pid":1234,"current_permission_mode":"acceptEdits","remote_control_auto_enable":false,"remote_control_auto_on_by_default":false,"ide_rc_auto_enable_gate":false,"fast_mode_state":"off","fast_mode_disabled_reason":null}}}"#;
+    fn corpus_payload(claim_id: &str) -> String {
+        selected_payload(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
+            claim_id,
+        )
+        .expect("reviewed corpus frame")
+    }
 
     fn curated_ids() -> Vec<String> {
         static_models().into_iter().map(|m| m.id).collect()
@@ -333,12 +338,13 @@ mod tests {
     /// rejects the live CLI.
     ///
     /// The ids are the CURATED ones, because Claude's own spellings never match
-    /// them literally (capture, 2026-08-11) and every consumer downstream — the
+    /// them literally (`claude-model-curated-id-decoder`) and every consumer downstream — the
     /// merge, the picker, `--model` — speaks curated.
     #[test]
     fn the_captured_reply_decodes_onto_curated_ids() {
         let owned = curated_ids();
-        let discovery = discovery_from_reply(CAPTURED_REPLY, &borrowed(&owned)).expect("decodes");
+        let payload = corpus_payload("claude-model-curated-id-decoder");
+        let discovery = discovery_from_reply(&payload, &borrowed(&owned)).expect("decodes");
         let ids: Vec<&str> = discovery.models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -346,9 +352,10 @@ mod tests {
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
-                "claude-haiku-4-5"
+                "claude-haiku-4-5",
+                "gpt-5.6-sol"
             ],
-            "aliases canonicalized, `default` dropped"
+            "aliases canonicalized, `default` dropped, live-only selector retained"
         );
         assert_eq!(
             discovery.models[2].label, "Sonnet",
@@ -360,9 +367,10 @@ mod tests {
     /// shared merge is unchanged from 2.1 — if the adapter did not
     /// canonicalize, this is where eleven rows would show up.
     #[test]
-    fn the_captured_reply_adds_no_rows_to_the_real_catalog() {
+    fn the_captured_reply_deduplicates_aliases_and_keeps_a_live_only_row() {
         let owned = curated_ids();
-        let discovery = discovery_from_reply(CAPTURED_REPLY, &borrowed(&owned)).unwrap();
+        let payload = corpus_payload("claude-model-real-catalog-merge");
+        let discovery = discovery_from_reply(&payload, &borrowed(&owned)).unwrap();
         let merged = crate::discovery::merge(static_models(), &discovery);
         let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
@@ -374,8 +382,9 @@ mod tests {
                 "claude-opus-4-7",
                 "claude-sonnet-5",
                 "claude-haiku-4-5",
+                "gpt-5.6-sol",
             ],
-            "six curated rows, no duplicates and nothing deleted"
+            "six curated rows, no alias duplicates, and the live-only row remains"
         );
         assert_eq!(merged[4].label, "Sonnet 5", "curated label still wins");
     }
@@ -387,7 +396,8 @@ mod tests {
     #[test]
     fn the_default_alias_row_is_dropped() {
         let owned = curated_ids();
-        let discovery = discovery_from_reply(CAPTURED_REPLY, &borrowed(&owned)).unwrap();
+        let payload = corpus_payload("claude-model-default-alias");
+        let discovery = discovery_from_reply(&payload, &borrowed(&owned)).unwrap();
         assert!(discovery.models.iter().all(|m| m.id != "default"));
         assert!(
             discovery
@@ -427,14 +437,16 @@ mod tests {
     #[test]
     fn no_modality_field_means_the_provider_did_not_say() {
         let owned = curated_ids();
-        let discovery = discovery_from_reply(CAPTURED_REPLY, &borrowed(&owned)).unwrap();
+        let payload = corpus_payload("claude-model-no-modality");
+        let discovery = discovery_from_reply(&payload, &borrowed(&owned)).unwrap();
         assert!(discovery.models.iter().all(|m| m.accepts_images.is_none()));
     }
 
     #[test]
     fn effort_levels_map_to_the_ladder_and_haiku_reports_none() {
         let owned = curated_ids();
-        let discovery = discovery_from_reply(CAPTURED_REPLY, &borrowed(&owned)).unwrap();
+        let payload = corpus_payload("claude-model-effort-levels");
+        let discovery = discovery_from_reply(&payload, &borrowed(&owned)).unwrap();
         assert_eq!(
             discovery.models[2].reasoning_levels,
             vec![
@@ -445,7 +457,11 @@ mod tests {
                 ReasoningLevel::Max
             ]
         );
-        let haiku = discovery.models.last().unwrap();
+        let haiku = discovery
+            .models
+            .iter()
+            .find(|model| model.id == "claude-haiku-4-5")
+            .unwrap();
         assert!(
             haiku.reasoning_levels.is_empty(),
             "no supportedEffortLevels key at all"

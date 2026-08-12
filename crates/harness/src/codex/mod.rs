@@ -732,7 +732,7 @@ async fn run_session(session: Session) {
     // Token usage is held until the turn ends, emitted just before Done.
     let mut pending_usage: Option<AgentEvent> = None;
     // `item/fileChange/requestApproval` carries no path and no diff — only an
-    // `itemId` (captured 2026-08-10; the generated schema agrees). The detail is
+    // `itemId` in the generated schema. The detail is
     // on the `item/started` that precedes it, so it is held here until the
     // request that needs it arrives, and dropped when the item completes.
     let mut file_changes: HashMap<String, Value> = HashMap::new();

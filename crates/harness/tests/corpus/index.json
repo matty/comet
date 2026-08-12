@@ -515,7 +515,7 @@
     },
     {
       "id": "claude-model-real-catalog-merge",
-      "consumer": "crates/harness/src/claude/discovery.rs:the_captured_reply_adds_no_rows_to_the_real_catalog",
+      "consumer": "crates/harness/src/claude/discovery.rs:the_captured_reply_deduplicates_aliases_and_keeps_a_live_only_row",
       "evidence": [
         {
           "manifest": "claude/2.1.228/model-discovery/manifest.json",
@@ -527,7 +527,7 @@
           ]
         }
       ],
-      "fact": "Captured aliases merge without adding rows to the curated catalog."
+      "fact": "Captured aliases do not duplicate curated rows while a live-only selector remains available."
     },
     {
       "id": "claude-model-default-alias",

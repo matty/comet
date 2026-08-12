@@ -5476,11 +5476,15 @@ mod tests {
         .await
         .unwrap();
 
+        let writes = channel_payloads(&capture, Channel::Stdin);
+        assert_eq!(writes.len(), 1);
         assert_eq!(
-            channel_payloads(&capture, Channel::Stdin),
-            [
-                r#"{"message":{"content":"scenario:happy","role":"user"},"parent_tool_use_id":null,"type":"user"}"#
-            ]
+            serde_json::from_str::<Value>(writes[0]).unwrap(),
+            json!({
+                "type": "user",
+                "message": {"role": "user", "content": "scenario:happy"},
+                "parent_tool_use_id": null,
+            })
         );
         assert_eq!(capture.exit_code, Some(0));
     }

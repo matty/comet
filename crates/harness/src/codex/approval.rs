@@ -1,8 +1,7 @@
 //! A Codex `requestApproval` server request → Comet's [`ApprovalRequest`], and
 //! a user's [`ApprovalDecision`] → the decision literal the app-server takes.
 //!
-//! Shapes are from a live capture (2026-08-10, codex-cli 0.147.0) plus the
-//! generated schema in `t3code/packages/effect-codex-app-server`. An
+//! Shapes follow the generated schema in `t3code/packages/effect-codex-app-server`. An
 //! unrecognized method is NOT an error — it becomes `Unknown` with Comet copy,
 //! because the alternatives are dropping the request (the turn wedges) or
 //! accepting it unasked.

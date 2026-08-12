@@ -1,9 +1,13 @@
 //! Codex's live model discovery: a short-lived `codex app-server` paging
 //! `model/list`.
 //!
-//! Captured against codex-cli 0.147.0 on 2026-08-11
-//! (`captures/2026-08-11-codex-model-list.md`). Four facts from that capture
-//! shape this file:
+//! Reviewed evidence is indexed in `tests/corpus/index.json` by the
+//! `codex-model-*` claims. Four facts from that corpus shape this file:
+//! `codex-model-reply-shape`, `codex-model-page-decoder`,
+//! `codex-model-request-shape`, `codex-model-logged-out-fallback`,
+//! `codex-model-effort-objects`, `codex-model-input-modalities`,
+//! `codex-model-cwd-invariance`, `codex-model-source-notification-order`, and
+//! `codex-model-one-page` name the retained evidence.
 //!
 //! 1. `model/list` answers cold, before any thread exists — but only after the
 //!    `initialize` handshake, which is why this spawn repeats `run`'s.
@@ -97,8 +101,8 @@ pub(crate) fn codex_home() -> Option<PathBuf> {
 ///
 /// A logged-out `codex` does not fail `model/list` — it answers, in 14ms,
 /// with a five-model list baked into the binary that contains a model the
-/// account cannot use and misses three it has (capture
-/// `2026-08-11-codex-model-list.md`, run 6). The envelope is identical to a
+/// account cannot use and misses three it has (`codex-model-logged-out-fallback`).
+/// The envelope is identical to a
 /// real answer, so "the call succeeded" cannot mean the list is the account's.
 ///
 /// API-key auth lives INSIDE `auth.json` (`agent_accounts.rs:1409` reads
@@ -396,23 +400,25 @@ pub(crate) fn page_from_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::selected_payload;
 
-    /// The literal reply codex-cli 0.147.0 sent on 2026-08-11, from
-    /// `captures/2026-08-11-codex-model-list/run1-cold.jsonl`, with the five
-    /// middle models elided — the first and last are the two that matter, and
-    /// nothing else in the envelope differs.
-    ///
-    /// Pinned as the server's own bytes rather than round-tripped through our
-    /// own types on purpose: a round-trip test cannot catch the reply moving
-    /// under us (AGENTS.md, "Changing what an RPC method answers with").
-    const CAPTURED_PAGE: &str = r#"{"id":2,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-sol","upgrade":null,"upgradeInfo":null,"availabilityNux":null,"displayName":"GPT-5.6-Sol","description":"Latest frontier agentic coding model.","modelSpecialty":null,"hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Fast responses with lighter reasoning"},{"reasoningEffort":"medium","description":"Balances speed and reasoning depth for everyday tasks"},{"reasoningEffort":"high","description":"Greater reasoning depth for complex problems"},{"reasoningEffort":"xhigh","description":"Extra high reasoning depth for complex problems"},{"reasoningEffort":"max","description":"Maximum reasoning depth for the hardest problems"},{"reasoningEffort":"ultra","description":"Maximum reasoning with automatic task delegation"}],"defaultReasoningEffort":"low","inputModalities":["text","image"],"supportsPersonality":false,"additionalSpeedTiers":["fast"],"serviceTiers":[{"id":"priority","name":"Fast","description":"1.5x speed, increased usage"}],"defaultServiceTier":null,"isDefault":true},{"id":"gpt-5.3-codex-spark","model":"gpt-5.3-codex-spark","upgrade":null,"upgradeInfo":null,"availabilityNux":null,"displayName":"GPT-5.3-Codex-Spark","description":"Ultra-fast coding model.","modelSpecialty":null,"hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Fast responses with lighter reasoning"},{"reasoningEffort":"medium","description":"Balances speed and reasoning depth for everyday tasks"},{"reasoningEffort":"high","description":"Greater reasoning depth for complex problems"},{"reasoningEffort":"xhigh","description":"Extra high reasoning depth for complex problems"}],"defaultReasoningEffort":"high","inputModalities":["text"],"supportsPersonality":true,"additionalSpeedTiers":[],"serviceTiers":[],"defaultServiceTier":null,"isDefault":false}],"nextCursor":null}}"#;
+    fn corpus_payload(claim_id: &str) -> String {
+        selected_payload(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
+            claim_id,
+        )
+        .expect("reviewed corpus frame")
+    }
 
     #[test]
     fn the_captured_reply_decodes_onto_curated_ids() {
-        let (models, next) = page_from_reply(CAPTURED_PAGE).expect("captured reply decodes");
+        let payload = corpus_payload("codex-model-page-decoder");
+        let (models, next) = page_from_reply(&payload).expect("captured reply decodes");
         assert_eq!(next, None, "an explicit null cursor ends the paging");
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["gpt-5.6-sol", "gpt-5.3-codex-spark"]);
+        assert_eq!(ids.len(), 7);
+        assert_eq!(ids.first(), Some(&"gpt-5.6-sol"));
+        assert_eq!(ids.last(), Some(&"gpt-5.3-codex-spark"));
         assert_eq!(models[0].label, "GPT-5.6-Sol");
     }
 
@@ -420,7 +426,8 @@ mod tests {
     /// level rather than one Comet layers on.
     #[test]
     fn efforts_decode_from_objects_including_ultra() {
-        let (models, _) = page_from_reply(CAPTURED_PAGE).expect("decodes");
+        let payload = corpus_payload("codex-model-effort-objects");
+        let (models, _) = page_from_reply(&payload).expect("decodes");
         assert_eq!(
             models[0].reasoning_levels,
             vec![
@@ -438,10 +445,19 @@ mod tests {
     /// contradicts the curated catalog today.
     #[test]
     fn input_modalities_split_text_only_from_image_capable() {
-        let (models, _) = page_from_reply(CAPTURED_PAGE).expect("decodes");
-        assert_eq!(models[0].accepts_images, Some(true));
+        let payload = corpus_payload("codex-model-input-modalities");
+        let (models, _) = page_from_reply(&payload).expect("decodes");
+        let sol = models
+            .iter()
+            .find(|model| model.id == "gpt-5.6-sol")
+            .unwrap();
+        let spark = models
+            .iter()
+            .find(|model| model.id == "gpt-5.3-codex-spark")
+            .unwrap();
+        assert_eq!(sol.accepts_images, Some(true));
         assert_eq!(
-            models[1].accepts_images,
+            spark.accepts_images,
             Some(false),
             "gpt-5.3-codex-spark reports text only"
         );
@@ -503,6 +519,12 @@ mod tests {
     /// one to send.
     #[test]
     fn the_request_line_asks_for_exactly_what_the_capture_asked_for() {
+        let captured = corpus_payload("codex-model-request-shape");
+        let captured: serde_json::Value = serde_json::from_str(&captured).unwrap();
+        let generated: serde_json::Value = serde_json::from_str(&model_list_line(2, None)).unwrap();
+        assert_eq!(generated["method"], captured["method"]);
+        assert_eq!(generated["params"], captured["params"]);
+        assert_eq!(generated["jsonrpc"], captured["jsonrpc"]);
         assert!(!model_list_line(2, None).contains("includeHidden"));
         assert!(!model_list_line(2, None).contains("cursor"));
         assert!(model_list_line(3, Some("2")).contains(r#""cursor":"2""#));

@@ -1,7 +1,8 @@
 //! Claude's `can_use_tool` request → Comet's `ApprovalRequest`.
 //!
-//! Tool names and input shapes are from a live capture (2026-08-10, CLI
-//! 2.1.226) plus the tool set in sdk.d.ts. An unrecognized tool is NOT an
+//! Tool names and input shapes are pinned by `claude-approval-tool-input-shapes`
+//! and `claude-approval-write-path-absolute` in the capture corpus, plus the
+//! tool set in sdk.d.ts. An unrecognized tool is NOT an
 //! error — it becomes `Unknown` with Comet copy, because the alternative is
 //! either dropping the request (the agent hangs) or auto-allowing it.
 
