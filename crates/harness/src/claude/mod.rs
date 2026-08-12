@@ -18,6 +18,7 @@ mod catalog;
 mod commands;
 mod discovery;
 mod normalize;
+mod update;
 mod wire;
 
 use std::path::PathBuf;
@@ -290,13 +291,19 @@ impl Harness for ClaudeHarness {
     }
 
     async fn probe(&self) -> HarnessProbe {
-        crate::probe_installed_cli(
+        let mut probe = crate::probe_installed_cli(
             self.resolve_executable(),
             "claude",
             "CLAUDE_CODE_EXECUTABLE",
             crate::all_known_dirs(claude_install_dirs()),
         )
-        .await
+        .await;
+        // No installed version is passed, unlike Codex: there is nothing to
+        // compare it against. Claude publishes no latest version, so this
+        // reports what its updater last did and never a verdict on currency.
+        probe.update =
+            update::read_resolved_update(probe.install.as_ref(), update::claude_home().as_deref());
+        probe
     }
 
     /// The curated catalog (see [`catalog`]) unioned with whatever the live
