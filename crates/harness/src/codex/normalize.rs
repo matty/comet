@@ -7,6 +7,9 @@
 //! item type inside an otherwise-claimed notification that Comet does not
 //! understand becomes an Unknown diagnostic (see `map_item`'s `other` arm),
 //! counted and journaled rather than dropped silently.
+//!
+//! Corpus claim `codex-routine-notification-ignore-list` pins the reviewed
+//! healthy-run methods in the ignored tier.
 
 use comet_proto::{AgentEvent, NoticeKind, NoticeSeverity, TodoItem, ToolCall};
 use serde_json::Value;
@@ -151,8 +154,8 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                 .iter()
                 .map(|c| {
                     // `kind` is an OBJECT on the wire — `{"type":"add"}`,
-                    // `{"type":"update","move_path":null}` (codex-cli 0.147.0,
-                    // captured 2026-08-10). Reading it only as a string answered
+                    // `{"type":"update","move_path":null}` in the generated schema.
+                    // Reading it only as a string answered
                     // `None` for every change and fell through to "update", so a
                     // file the agent created rendered as an edit. The bare-string
                     // arm is kept for an older peer; unknown kinds still degrade
@@ -535,8 +538,8 @@ mod tests {
 
     #[test]
     fn a_file_changes_kind_is_an_object_on_the_wire() {
-        // codex-cli 0.147.0 sends `{"type":"add"}` / `{"type":"update","move_path":null}`,
-        // never a bare string (capture 2026-08-10). Reading it as a string
+        // The generated schema sends `{"type":"add"}` / `{"type":"update","move_path":null}`,
+        // never a bare string. Reading it as a string
         // answered `None` and fell back to "update", so every file the agent
         // CREATED rendered as an edit, and every delete did too.
         let add = map_item(

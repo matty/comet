@@ -1,5 +1,9 @@
 //! CodexHarness integration tests against the fake app server in
 //! `tests/fixtures/fake_codex.rs` (no real `codex` binary involved).
+//!
+//! Corpus consumers: `codex-model-integration-shape`,
+//! `codex-routine-notification-integration`, `codex-model-text-only-integration`,
+//! and `codex-model-logged-out-integration`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -931,9 +935,19 @@ async fn every_runtime_mode_reaches_the_wire_as_its_approval_policy() {
 // Live discovery (slice 2.3)
 // ---------------------------------------------------------------------------
 
+/// Discovery must drain piped stderr before it fills. The fake writes one MiB
+/// there before reading stdin, so an undrained command never reaches model/list.
+#[tokio::test]
+async fn model_discovery_drains_stderr() {
+    tokio::time::timeout(Duration::from_secs(5), harness().models())
+        .await
+        .expect("a full stderr pipe must not block model discovery")
+        .expect("models");
+}
+
 /// The slice's deliverable: a real spawn, a real `initialize` + `model/list`
 /// round trip, and a merged catalog that says it is live. The fixture answers
-/// shaped exactly as codex-cli 0.147.0 did in the 2026-08-11 capture, and pages
+/// shaped as pinned by `codex-model-integration-shape`, and pages
 /// by default — the real server returns all seven models in one page and would
 /// never exercise the loop.
 #[tokio::test]
@@ -1162,8 +1176,8 @@ async fn an_opaque_cursor_survives_the_next_request() {
 
 /// A logged-out `codex` answers `model/list` **successfully**, with a
 /// hardcoded five-model list that does not match the account: it contains a
-/// model the account cannot use and misses three it has (capture
-/// `2026-08-11-codex-model-list.md`, run 6). Nothing in the envelope says so,
+/// model the account cannot use and misses three it has
+/// (`codex-model-logged-out-integration`). Nothing in the envelope says so,
 /// so the only defence is not to ask.
 ///
 /// The fixture here is the good one — it would answer `Live`. Getting the

@@ -1,5 +1,8 @@
 //! ClaudeHarness integration tests against the fake CLI in
 //! `tests/fixtures/fake_claude.rs` (no real `claude` binary involved).
+//!
+//! Corpus consumers: `claude-model-integration-shape`,
+//! `claude-command-nonbare-count`, and `claude-routine-frame-integration`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -631,8 +634,7 @@ async fn unclaimed_frames_surface_as_diagnostics_and_ignored_frames_stay_silent(
             assert!(!summary.contains("do-not-carry"), "{summary}");
         }
     }
-    // The Ignored tier (status, thinking_tokens, the hook pair,
-    // tool_progress — all capture-confirmed routine) produced nothing, no
+    // The capture-confirmed Ignored tier (status and the hook pair) produced nothing, no
     // Error fired, and the run still ends cleanly.
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
     assert!(
@@ -649,9 +651,28 @@ async fn unclaimed_frames_surface_as_diagnostics_and_ignored_frames_stay_silent(
     ));
 }
 
+/// Both initialize paths must drain the piped stderr before it fills. The fake
+/// writes one MiB there before reading stdin, so either undrained path wedges.
+#[tokio::test]
+async fn initialize_discovery_drains_stderr_for_models_and_commands() {
+    let harness = harness();
+    let cwd = std::env::temp_dir().join("comet-noisy-command-discovery");
+    std::fs::create_dir_all(&cwd).expect("command cwd");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        harness.models().await.expect("models");
+        harness
+            .commands(&cwd.display().to_string())
+            .await
+            .expect("commands");
+    })
+    .await
+    .expect("a full stderr pipe must not block either initialize path");
+}
+
 /// The slice's deliverable: a real spawn, a real handshake round-trip, and a
 /// merged catalog that says it is live. The fixture answers `initialize`
-/// shaped exactly as Claude Code 2.1.227 did in the 2026-08-11 capture.
+/// shaped as pinned by `claude-model-integration-shape`.
 #[tokio::test]
 async fn models_come_back_live_and_merged() {
     let catalog = harness().models().await.expect("models");
@@ -841,7 +862,7 @@ async fn live_cli_discovery_lands_on_curated_ids() {
 ///
 /// It asserts a project-scoped command specifically, because that is what the
 /// non-bare spawn buys: with `--bare` the same call answers with built-ins only
-/// (42 against 67 in the 2026-08-11 capture) and every other assertion here
+/// (the differing lists are pinned by `claude-command-nonbare-count`) and every other assertion here
 /// would still pass.
 /// Run with: `cargo test -p comet-harness --test claude -- --ignored`
 #[tokio::test]

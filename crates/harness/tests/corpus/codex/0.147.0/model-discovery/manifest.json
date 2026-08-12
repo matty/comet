@@ -1,0 +1,142 @@
+{
+  "captured_at_unix_ms": 1786508806735,
+  "channels": [
+    "stdin",
+    "stdout"
+  ],
+  "cli_version": "codex-cli 0.147.0",
+  "command": {
+    "args": [
+      "app-server"
+    ],
+    "configured_env": {
+      "CODEX_HOME": "<CODEX_HOME>"
+    },
+    "creation_flags": 134217728,
+    "cwd": "<CWD>",
+    "kill_on_drop": true,
+    "program": "<HOME>\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe",
+    "stderr": "Piped",
+    "stdin": "Piped",
+    "stdout": "Piped"
+  },
+  "exit_code": 0,
+  "normalized_cli_version": "codex-cli 0.147.0",
+  "placeholders": [
+    {
+      "kind": "codex_rpc_id",
+      "placeholder": "<CODEX_RPC_ID_1>"
+    },
+    {
+      "kind": "codex_rpc_id",
+      "placeholder": "<CODEX_RPC_ID_2>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_1>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_2>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_3>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_4>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_5>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_6>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_7>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_8>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_9>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_10>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_11>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_12>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_13>"
+    },
+    {
+      "kind": "provider_prose",
+      "placeholder": "<PROVIDER_PROSE_14>"
+    },
+    {
+      "kind": "machine_id",
+      "placeholder": "<MACHINE_ID_1>"
+    },
+    {
+      "kind": "machine_id",
+      "placeholder": "<MACHINE_ID_2>"
+    },
+    {
+      "kind": "cwd_path",
+      "placeholder": "<CWD>"
+    },
+    {
+      "kind": "codex_home_path",
+      "placeholder": "<CODEX_HOME>"
+    },
+    {
+      "kind": "home_path",
+      "placeholder": "<HOME>"
+    }
+  ],
+  "platform": {
+    "arch": "x86_64",
+    "os": "windows"
+  },
+  "provider": "codex",
+  "purpose": "capture Codex initialize and paged model/list replies",
+  "redaction_counts": {
+    "codex_home_path": 2,
+    "codex_rpc_id": 2,
+    "cwd_path": 1,
+    "home_path": 1,
+    "machine_id": 2,
+    "provider_prose": 45
+  },
+  "scenario": "model-discovery",
+  "schema_version": 1,
+  "source": "capture.json",
+  "consumers": [
+    "crates/harness/src/codex/discovery.rs:module capture facts",
+    "crates/harness/src/codex/discovery.rs:the_captured_reply_decodes_onto_curated_ids",
+    "crates/harness/src/codex/discovery.rs:the_request_line_asks_for_exactly_what_the_capture_asked_for",
+    "crates/harness/tests/fixtures/fake_codex.rs:model_list",
+    "crates/harness/tests/fixtures/fake_codex.rs:discovery_models",
+    "crates/harness/tests/codex.rs:models_come_back_live_and_merged",
+    "crates/harness/src/codex/discovery.rs:logged_in",
+    "crates/harness/src/codex/discovery.rs:efforts_decode_from_objects_including_ultra",
+    "crates/harness/src/codex/discovery.rs:input_modalities_split_text_only_from_image_capable",
+    "crates/harness/tests/codex.rs:a_text_only_model_loses_the_curated_image_flag",
+    "crates/harness/src/codex/discovery.rs:reply_to",
+    "crates/harness/src/codex/discovery.rs:MAX_PAGES"
+  ]
+}

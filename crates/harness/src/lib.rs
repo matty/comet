@@ -132,6 +132,7 @@ pub trait Harness: Send + Sync {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError>;
 }
 
+pub mod capture;
 pub mod claude;
 pub mod codex;
 pub mod discovery;
@@ -543,7 +544,7 @@ pub(crate) fn node_version_manager_bins() -> Vec<KnownDir> {
 /// are `#!/usr/bin/env node` scripts whose `node` lives beside them in the
 /// version manager's bin dir, and the CLIs themselves shell out to tools
 /// (git, rg, node) that a GUI/service launch's own PATH may lack.
-pub(crate) fn compose_child_path(cmd: &mut tokio::process::Command, exe: &std::path::Path) {
+pub(crate) fn child_path(exe: &std::path::Path) -> Option<std::ffi::OsString> {
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
     if let Some(dir) = exe.parent().filter(|d| !d.as_os_str().is_empty()) {
         paths.push(dir.to_path_buf());
@@ -556,8 +557,12 @@ pub(crate) fn compose_child_path(cmd: &mut tokio::process::Command, exe: &std::p
     }
     let mut seen = std::collections::HashSet::new();
     paths.retain(|p| !p.as_os_str().is_empty() && seen.insert(p.clone()));
-    if let Ok(joined) = std::env::join_paths(paths) {
-        cmd.env("PATH", joined);
+    std::env::join_paths(paths).ok()
+}
+
+pub(crate) fn compose_child_path(cmd: &mut tokio::process::Command, exe: &std::path::Path) {
+    if let Some(path) = child_path(exe) {
+        cmd.env("PATH", path);
     }
 }
 
@@ -647,6 +652,21 @@ pub(crate) fn parse_cli_version(output: &str) -> Option<String> {
         })
         .find(|token| token.contains('.') && token.starts_with(|c: char| c.is_ascii_digit()))
         .map(str::to_owned)
+}
+
+/// Drain discovery stderr without retaining provider output. `tokio::io::copy`
+/// uses a fixed-size buffer, so a noisy provider cannot grow memory or block on
+/// a full pipe while production waits for its protocol reply.
+pub(crate) fn drain_discovery_stderr(
+    mut stderr: tokio::process::ChildStderr,
+    provider: &'static str,
+) {
+    tokio::spawn(async move {
+        let mut sink = tokio::io::sink();
+        if let Err(err) = tokio::io::copy(&mut stderr, &mut sink).await {
+            tracing::debug!(%provider, %err, "discovery stderr drain failed");
+        }
+    });
 }
 
 /// Compare two dotted-numeric versions, or decline to.

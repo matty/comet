@@ -1,9 +1,13 @@
 //! Codex's live model discovery: a short-lived `codex app-server` paging
 //! `model/list`.
 //!
-//! Captured against codex-cli 0.147.0 on 2026-08-11
-//! (`captures/2026-08-11-codex-model-list.md`). Four facts from that capture
-//! shape this file:
+//! Reviewed evidence is indexed in `tests/corpus/index.json` by the
+//! `codex-model-*` claims. Four facts from that corpus shape this file:
+//! `codex-model-reply-shape`, `codex-model-page-decoder`,
+//! `codex-model-request-shape`, `codex-model-logged-out-fallback`,
+//! `codex-model-effort-objects`, `codex-model-input-modalities`,
+//! `codex-model-cwd-invariance`, `codex-model-source-notification-order`, and
+//! `codex-model-one-page` name the retained evidence.
 //!
 //! 1. `model/list` answers cold, before any thread exists — but only after the
 //!    `initialize` handshake, which is why this spawn repeats `run`'s.
@@ -15,7 +19,6 @@
 //!    absent-case default has no live producer and is fixture-tested by hand.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -27,10 +30,9 @@ use comet_proto::ReasoningLevel;
 use crate::discovery::{DiscoveredModel, Discovery, DiscoveryFailure, program_path};
 
 /// Matches `claude/discovery.rs`'s `DISCOVERY_TIMEOUT` and `PROBE_TIMEOUT`.
-/// The worst cold path measured was 4.0s — first spawn of the session plus a
-/// network fetch of the model list — against ~0.15s warm, so ten seconds is a
-/// long way past a healthy answer and still degrades a wedged CLI to the
-/// built-in list rather than hanging the picker.
+/// Model discovery may include process startup and a remote catalog fetch, so
+/// the wait allows both while remaining bounded. A wedged CLI still degrades
+/// to the built-in list rather than hanging the picker.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A ceiling on the paging loop. The live server answers in one page and only
@@ -99,8 +101,8 @@ pub(crate) fn codex_home() -> Option<PathBuf> {
 ///
 /// A logged-out `codex` does not fail `model/list` — it answers, in 14ms,
 /// with a five-model list baked into the binary that contains a model the
-/// account cannot use and misses three it has (capture
-/// `2026-08-11-codex-model-list.md`, run 6). The envelope is identical to a
+/// account cannot use and misses three it has (`codex-model-logged-out-fallback`).
+/// The envelope is identical to a
 /// real answer, so "the call succeeded" cannot mean the list is the account's.
 ///
 /// API-key auth lives INSIDE `auth.json` (`agent_accounts.rs:1409` reads
@@ -165,32 +167,43 @@ pub(crate) async fn discover(
     }
 }
 
-async fn handshake(exe: &Path, home: &Path) -> Result<Discovery, DiscoveryFailure> {
-    let exe = &program_path(exe);
-    let mut cmd = Command::new(exe);
-    cmd.arg("app-server");
-    crate::compose_child_path(&mut cmd, exe);
-    // The child is told the same home the login check just read `auth.json`
-    // from. Left to the ambient environment, the two can be different homes —
-    // the check passes against one account's credentials while the CLI answers
-    // from another's, or from the logged-out fallback list, and the result is
-    // still labelled live.
-    cmd.env("CODEX_HOME", home);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        // The timeout arm drops this future; without kill_on_drop the child
-        // outlives the discovery and we leak an app-server per attempt.
-        .kill_on_drop(true)
-        // No project settings are wanted for a session with no turn, and the
-        // capture found the model list identical across working directories.
-        .current_dir(std::env::temp_dir());
-    #[cfg(windows)]
-    {
-        // CREATE_NO_WINDOW, as in `probe_cli_version`: the shims are console
-        // apps and would flash a window on every boot otherwise.
-        cmd.creation_flags(0x0800_0000);
+/// Describe the exact short-lived launch used for Codex model discovery.
+pub(crate) fn discovery_launch(
+    exe: &Path,
+    codex_home: &Path,
+    cwd: &Path,
+) -> crate::capture::LaunchDescriptor {
+    let exe = program_path(exe);
+    let mut configured_env = std::collections::BTreeMap::new();
+    if let Some(path) = crate::child_path(&exe) {
+        configured_env.insert("PATH".into(), path);
     }
+    // The child is told the same home the login check just read `auth.json`
+    // from. Left to the ambient environment, the two can be different homes.
+    configured_env.insert("CODEX_HOME".into(), codex_home.into());
+    crate::capture::LaunchDescriptor {
+        program: exe,
+        args: vec!["app-server".into()],
+        cwd: Some(cwd.into()),
+        configured_env,
+        stdin: crate::capture::StdioMode::Piped,
+        stdout: crate::capture::StdioMode::Piped,
+        stderr: crate::capture::StdioMode::Piped,
+        kill_on_drop: true,
+        #[cfg(windows)]
+        creation_flags: 0x0800_0000,
+    }
+}
+
+/// Build the exact short-lived command used for Codex model discovery.
+pub(crate) fn build_codex_discovery_command(exe: &Path, codex_home: &Path, cwd: &Path) -> Command {
+    discovery_launch(exe, codex_home, cwd).command()
+}
+
+async fn handshake(exe: &Path, home: &Path) -> Result<Discovery, DiscoveryFailure> {
+    // No project settings are wanted for a session with no turn, and the
+    // capture found the model list identical across working directories.
+    let mut cmd = build_codex_discovery_command(exe, home, &std::env::temp_dir());
 
     let mut child = cmd.spawn().map_err(|err| {
         tracing::debug!(cli = %exe.display(), %err, "codex discovery spawn failed");
@@ -198,6 +211,8 @@ async fn handshake(exe: &Path, home: &Path) -> Result<Discovery, DiscoveryFailur
     })?;
     let mut stdin = child.stdin.take().ok_or(DiscoveryFailure::Unreachable)?;
     let stdout = child.stdout.take().ok_or(DiscoveryFailure::Unreachable)?;
+    let stderr = child.stderr.take().ok_or(DiscoveryFailure::Unreachable)?;
+    crate::drain_discovery_stderr(stderr, "codex");
     let mut lines = BufReader::new(stdout).lines();
 
     send(&mut stdin, &initialize_line()).await?;
@@ -248,8 +263,8 @@ async fn send(stdin: &mut tokio::process::ChildStdin, line: &str) -> Result<(), 
 /// Read until the reply to `id` arrives.
 ///
 /// Matching on the id rather than taking the next line is load-bearing: every
-/// session emits a `remoteControl/status/changed` notification, and on every
-/// run of the capture it arrived BEFORE the `initialize` result.
+/// reviewed discovery emitted `remoteControl/status/changed` after initialize
+/// succeeded but before the later `model/list` reply.
 async fn reply_to<R>(
     lines: &mut tokio::io::Lines<BufReader<R>>,
     id: u32,
@@ -385,23 +400,25 @@ pub(crate) fn page_from_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::selected_payload;
 
-    /// The literal reply codex-cli 0.147.0 sent on 2026-08-11, from
-    /// `captures/2026-08-11-codex-model-list/run1-cold.jsonl`, with the five
-    /// middle models elided — the first and last are the two that matter, and
-    /// nothing else in the envelope differs.
-    ///
-    /// Pinned as the server's own bytes rather than round-tripped through our
-    /// own types on purpose: a round-trip test cannot catch the reply moving
-    /// under us (AGENTS.md, "Changing what an RPC method answers with").
-    const CAPTURED_PAGE: &str = r#"{"id":2,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-sol","upgrade":null,"upgradeInfo":null,"availabilityNux":null,"displayName":"GPT-5.6-Sol","description":"Latest frontier agentic coding model.","modelSpecialty":null,"hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Fast responses with lighter reasoning"},{"reasoningEffort":"medium","description":"Balances speed and reasoning depth for everyday tasks"},{"reasoningEffort":"high","description":"Greater reasoning depth for complex problems"},{"reasoningEffort":"xhigh","description":"Extra high reasoning depth for complex problems"},{"reasoningEffort":"max","description":"Maximum reasoning depth for the hardest problems"},{"reasoningEffort":"ultra","description":"Maximum reasoning with automatic task delegation"}],"defaultReasoningEffort":"low","inputModalities":["text","image"],"supportsPersonality":false,"additionalSpeedTiers":["fast"],"serviceTiers":[{"id":"priority","name":"Fast","description":"1.5x speed, increased usage"}],"defaultServiceTier":null,"isDefault":true},{"id":"gpt-5.3-codex-spark","model":"gpt-5.3-codex-spark","upgrade":null,"upgradeInfo":null,"availabilityNux":null,"displayName":"GPT-5.3-Codex-Spark","description":"Ultra-fast coding model.","modelSpecialty":null,"hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Fast responses with lighter reasoning"},{"reasoningEffort":"medium","description":"Balances speed and reasoning depth for everyday tasks"},{"reasoningEffort":"high","description":"Greater reasoning depth for complex problems"},{"reasoningEffort":"xhigh","description":"Extra high reasoning depth for complex problems"}],"defaultReasoningEffort":"high","inputModalities":["text"],"supportsPersonality":true,"additionalSpeedTiers":[],"serviceTiers":[],"defaultServiceTier":null,"isDefault":false}],"nextCursor":null}}"#;
+    fn corpus_payload(claim_id: &str) -> String {
+        selected_payload(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
+            claim_id,
+        )
+        .expect("reviewed corpus frame")
+    }
 
     #[test]
     fn the_captured_reply_decodes_onto_curated_ids() {
-        let (models, next) = page_from_reply(CAPTURED_PAGE).expect("captured reply decodes");
+        let payload = corpus_payload("codex-model-page-decoder");
+        let (models, next) = page_from_reply(&payload).expect("captured reply decodes");
         assert_eq!(next, None, "an explicit null cursor ends the paging");
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["gpt-5.6-sol", "gpt-5.3-codex-spark"]);
+        assert_eq!(ids.len(), 7);
+        assert_eq!(ids.first(), Some(&"gpt-5.6-sol"));
+        assert_eq!(ids.last(), Some(&"gpt-5.3-codex-spark"));
         assert_eq!(models[0].label, "GPT-5.6-Sol");
     }
 
@@ -409,7 +426,8 @@ mod tests {
     /// level rather than one Comet layers on.
     #[test]
     fn efforts_decode_from_objects_including_ultra() {
-        let (models, _) = page_from_reply(CAPTURED_PAGE).expect("decodes");
+        let payload = corpus_payload("codex-model-effort-objects");
+        let (models, _) = page_from_reply(&payload).expect("decodes");
         assert_eq!(
             models[0].reasoning_levels,
             vec![
@@ -427,10 +445,19 @@ mod tests {
     /// contradicts the curated catalog today.
     #[test]
     fn input_modalities_split_text_only_from_image_capable() {
-        let (models, _) = page_from_reply(CAPTURED_PAGE).expect("decodes");
-        assert_eq!(models[0].accepts_images, Some(true));
+        let payload = corpus_payload("codex-model-input-modalities");
+        let (models, _) = page_from_reply(&payload).expect("decodes");
+        let sol = models
+            .iter()
+            .find(|model| model.id == "gpt-5.6-sol")
+            .unwrap();
+        let spark = models
+            .iter()
+            .find(|model| model.id == "gpt-5.3-codex-spark")
+            .unwrap();
+        assert_eq!(sol.accepts_images, Some(true));
         assert_eq!(
-            models[1].accepts_images,
+            spark.accepts_images,
             Some(false),
             "gpt-5.3-codex-spark reports text only"
         );
@@ -492,6 +519,12 @@ mod tests {
     /// one to send.
     #[test]
     fn the_request_line_asks_for_exactly_what_the_capture_asked_for() {
+        let captured = corpus_payload("codex-model-request-shape");
+        let captured: serde_json::Value = serde_json::from_str(&captured).unwrap();
+        let generated: serde_json::Value = serde_json::from_str(&model_list_line(2, None)).unwrap();
+        assert_eq!(generated["method"], captured["method"]);
+        assert_eq!(generated["params"], captured["params"]);
+        assert_eq!(generated["jsonrpc"], captured["jsonrpc"]);
         assert!(!model_list_line(2, None).contains("includeHidden"));
         assert!(!model_list_line(2, None).contains("cursor"));
         assert!(model_list_line(3, Some("2")).contains(r#""cursor":"2""#));

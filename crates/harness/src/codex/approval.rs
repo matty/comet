@@ -1,8 +1,7 @@
 //! A Codex `requestApproval` server request → Comet's [`ApprovalRequest`], and
 //! a user's [`ApprovalDecision`] → the decision literal the app-server takes.
 //!
-//! Shapes are from a live capture (2026-08-10, codex-cli 0.147.0) plus the
-//! generated schema in `t3code/packages/effect-codex-app-server`. An
+//! Shapes follow the generated schema in `t3code/packages/effect-codex-app-server`. An
 //! unrecognized method is NOT an error — it becomes `Unknown` with Comet copy,
 //! because the alternatives are dropping the request (the turn wedges) or
 //! accepting it unasked.
@@ -56,14 +55,11 @@ pub(crate) fn approval_request(
 
 /// What to put on the card, and therefore what a session grant is keyed on.
 ///
-/// **Deliberately the parsed action, not the raw `command`.** The raw field is
-/// the full launcher invocation — on Windows, ~100 characters of pwsh path
-/// before the interesting part — and it is not stable across identical
-/// requests: one captured turn asked three times for the same command and the
-/// third invocation had gained a `-NoProfile` flag. Keying a session grant on
-/// that would make "Allow for this session" match nothing on the very next
-/// request, which is the failure `approval_signature` already excludes volatile
-/// fields to avoid.
+/// **Deliberately the parsed action, not the raw `command`.** The schema gives
+/// the parsed action as the stable user-facing operation while the raw field is
+/// a launcher invocation. Session grants key on the operation rather than
+/// process-launch details, matching `approval_signature`'s exclusion of other
+/// volatile fields.
 ///
 /// More than one parsed action falls back to the raw command: joining them
 /// would assert a sequencing relationship the wire does not state, and the raw
@@ -207,9 +203,8 @@ fn line_count(text: &str) -> u32 {
 ///
 /// A diff with no `@@` at all is not a unified diff; rather than report nothing
 /// for a shape this has not seen, it falls back to counting every `+`/`-` line.
-/// Codex's own update diffs are headerless and hunked
-/// (`"@@ -1 +1,2 @@\n one\n+two\n"`, captured), so the preamble is normally
-/// empty and neither rule has anything to do.
+/// Headerless hunked updates naturally have no preamble, so neither exclusion
+/// rule has anything to do in that shape.
 fn unified_diff_counts(diff: &str) -> (u32, u32) {
     let mut added = 0;
     let mut removed = 0;
@@ -293,10 +288,8 @@ mod tests {
 
     #[test]
     fn the_parsed_action_is_what_makes_a_session_grant_match_again() {
-        // Captured: the same command asked three times in one turn, and the
-        // third invocation had gained `-NoProfile`. Keyed on the raw command
-        // these are three different actions and a session grant matches none of
-        // them; keyed on the parsed action they are one.
+        // Launcher details are transport metadata. The parsed action is the
+        // schema-level identity used for a repeatable session grant.
         let first = json!({
             "command": "\"pwsh.exe\" -Command 'echo one > a.txt'",
             "commandActions": [{"type": "unknown", "command": "echo one > a.txt"}],

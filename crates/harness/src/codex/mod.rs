@@ -28,14 +28,13 @@
 
 mod approval;
 mod catalog;
-mod discovery;
+pub(crate) mod discovery;
 mod normalize;
 mod rpc;
 mod update;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -141,6 +140,148 @@ fn worktree_on_slashed_branch(cwd: &str) -> bool {
     head.trim()
         .strip_prefix("ref: refs/heads/")
         .is_some_and(|branch| branch.contains('/'))
+}
+
+/// Apply the request rewrites that must precede both launch and wire setup.
+pub(crate) fn normalize_run_request(mut request: RunRequest) -> RunRequest {
+    // Historical Codex ≤0.144.x compatibility policy (DEBT.md D13): a
+    // workspace-write sandbox could derive a malformed mount for a linked
+    // worktree whose branch contains '/'. Escalate that exact shape instead
+    // of shipping a session where commands cannot run. This is maintained as
+    // compatibility behavior, not as a claim about the currently captured CLI.
+    if request.sandbox == comet_proto::SandboxLevel::WorkspaceWrite
+        && worktree_on_slashed_branch(&request.cwd)
+    {
+        tracing::warn!(
+            cwd = %request.cwd,
+            "codex sandbox escalated to danger-full-access: linked worktree on a \
+             slash-named branch trips codex's worktree-mount derivation"
+        );
+        // `runtime_mode` is read further down — by `approvals_reviewer`
+        // on `thread/start`, and by the `RuntimeMode::FullAccess` check
+        // below — so this escalation matters to more than the sandbox.
+        // It raises only `sandbox` and deliberately leaves `runtime_mode`
+        // as the caller set it, so the reviewer keeps reflecting what the
+        // caller asked for rather than what this CLI-bug workaround
+        // forced. On a full-access request the pair stays coherent by
+        // coincidence; on any other mode it does not — the request now
+        // runs with a danger-full-access sandbox under a mode that did
+        // not ask for one. Whoever next derives Codex's approval *policy*
+        // from `runtime_mode` still has to decide whether escalating the
+        // sandbox here should escalate the policy too.
+        request.sandbox = comet_proto::SandboxLevel::DangerFullAccess;
+    }
+    request
+}
+
+/// Build the provider-owned parameters for starting a new Codex thread.
+pub(crate) fn thread_start_params(request: &RunRequest) -> Value {
+    // Approval policy is derived, not pinned. ApprovalRequired intentionally
+    // maps to `untrusted`; AutoAcceptEdits and Auto map to `on-request` now
+    // that provider approvals reach Comet's approval surface (D13).
+    let mut params = serde_json::Map::new();
+    params.insert("cwd".into(), request.cwd.clone().into());
+    params.insert(
+        "approvalPolicy".into(),
+        approval_policy(request.runtime_mode).into(),
+    );
+    params.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
+    params.insert(
+        "approvalsReviewer".into(),
+        approvals_reviewer(request.runtime_mode).into(),
+    );
+    if let Some(model) = &request.model {
+        params.insert("model".into(), model.clone().into());
+    }
+    // Service tier rides thread-start and every turn (mirrors the Codex IDE
+    // client). "default" means Standard — omit it entirely.
+    if let Some(tier) = service_tier(request) {
+        params.insert("serviceTier".into(), tier.into());
+    }
+    Value::Object(params)
+}
+
+/// Build the provider-owned parameters for resuming a Codex thread.
+pub(crate) fn thread_resume_params(request: &RunRequest, thread_id: &str) -> Value {
+    let Value::Object(mut params) = thread_start_params(request) else {
+        unreachable!("thread parameters are always a JSON object")
+    };
+    params.insert("threadId".into(), thread_id.into());
+    Value::Object(params)
+}
+
+/// Build the provider-owned parameters for starting a Codex turn.
+pub(crate) fn turn_start_params(request: &RunRequest, thread_id: &str, text: &str) -> Value {
+    let mut params = serde_json::Map::new();
+    params.insert("threadId".into(), thread_id.into());
+    params.insert("input".into(), json!([{ "type": "text", "text": text }]));
+    params.insert(
+        "approvalPolicy".into(),
+        approval_policy(request.runtime_mode).into(),
+    );
+    params.insert(
+        "sandboxPolicy".into(),
+        sandbox_policy_value(request.sandbox),
+    );
+    // Reasoning summaries stream (`item/reasoning/summaryTextDelta`) only
+    // when asked for — without this codex "thinks" in silence for minutes:
+    // nothing renders and the UI's 45s staleness gate flips Working off.
+    params.insert("summary".into(), "auto".into());
+    if let Some(model) = &request.model {
+        params.insert("model".into(), model.clone().into());
+    }
+    if let Some(effort) = to_effort(request.reasoning) {
+        params.insert("effort".into(), effort.into());
+    }
+    if let Some(tier) = service_tier(request) {
+        params.insert("serviceTier".into(), tier.into());
+    }
+    Value::Object(params)
+}
+
+pub(crate) fn turn_steer_params(thread_id: &str, turn_id: &str, text: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "expectedTurnId": turn_id,
+        "input": [{"type": "text", "text": text}],
+    })
+}
+
+pub(crate) fn turn_interrupt_params(thread_id: &str, turn_id: &str) -> Value {
+    json!({"threadId": thread_id, "turnId": turn_id})
+}
+
+fn service_tier(request: &RunRequest) -> Option<&str> {
+    request
+        .model_options
+        .get("serviceTier")
+        .and_then(Value::as_str)
+        .filter(|tier| *tier != "default")
+}
+
+/// Describe the exact process launch used for a Codex run.
+pub(crate) fn run_launch(exe: &Path, request: &RunRequest) -> crate::capture::LaunchDescriptor {
+    let mut configured_env = std::collections::BTreeMap::new();
+    if let Some(path) = crate::child_path(exe) {
+        configured_env.insert("PATH".into(), path);
+    }
+    crate::capture::LaunchDescriptor {
+        program: exe.into(),
+        args: vec!["app-server".into()],
+        cwd: (!request.cwd.is_empty()).then(|| request.cwd.clone().into()),
+        configured_env,
+        stdin: crate::capture::StdioMode::Piped,
+        stdout: crate::capture::StdioMode::Piped,
+        stderr: crate::capture::StdioMode::Piped,
+        kill_on_drop: true,
+        #[cfg(windows)]
+        creation_flags: 0,
+    }
+}
+
+/// Build the exact process command used for a Codex run.
+pub(crate) fn build_run_command(exe: &Path, request: &RunRequest) -> Command {
+    run_launch(exe, request).command()
 }
 
 /// The Codex harness. Construct with [`CodexHarness::new`]; tests point it at a
@@ -327,49 +468,12 @@ impl Harness for CodexHarness {
 
     async fn run(
         &self,
-        mut request: RunRequest,
+        request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        // Codex ≤0.144.x: the workspace-write sandbox derives a MALFORMED
-        // worktree mount when the checked-out branch name contains '/'
-        // (verified against the real CLI: `wing/x` in a linked worktree kills
-        // every command before it starts; `wing-x` is fine; explicit
-        // writableRoots don't suppress the broken derivation; full access
-        // works). Escalate that exact shape instead of shipping a session
-        // where nothing can run.
-        if request.sandbox == comet_proto::SandboxLevel::WorkspaceWrite
-            && worktree_on_slashed_branch(&request.cwd)
-        {
-            tracing::warn!(
-                cwd = %request.cwd,
-                "codex sandbox escalated to danger-full-access: linked worktree on a \
-                 slash-named branch trips codex's worktree-mount derivation"
-            );
-            // `runtime_mode` is read further down — by `approvals_reviewer`
-            // on `thread/start`, and by the `RuntimeMode::FullAccess` check
-            // below — so this escalation matters to more than the sandbox.
-            // It raises only `sandbox` and deliberately leaves `runtime_mode`
-            // as the caller set it, so the reviewer keeps reflecting what the
-            // caller asked for rather than what this CLI-bug workaround
-            // forced. On a full-access request the pair stays coherent by
-            // coincidence; on any other mode it does not — the request now
-            // runs with a danger-full-access sandbox under a mode that did
-            // not ask for one. Whoever next derives Codex's approval *policy*
-            // from `runtime_mode` still has to decide whether escalating the
-            // sandbox here should escalate the policy too.
-            request.sandbox = comet_proto::SandboxLevel::DangerFullAccess;
-        }
-        let mut cmd = Command::new(&exe);
-        cmd.arg("app-server");
-        crate::compose_child_path(&mut cmd, &exe);
-        if !request.cwd.is_empty() {
-            cmd.current_dir(&request.cwd);
-        }
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        let request = normalize_run_request(request);
+        let mut cmd = build_run_command(&exe, &request);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
@@ -536,47 +640,6 @@ async fn run_session(session: Session) {
     } = controls;
     let request_approval = Arc::new(request_approval);
 
-    // ---- wire params ------------------------------------------------------
-    // Derived, not pinned. The pin existed because an approval Codex raised had
-    // nowhere honest to go — it round-tripped through a synthesized yes/no
-    // question and surfaced as a generic prompt, which is why "on-request"
-    // read as "asking me for approval at every step". Approvals now reach the
-    // approval surface, so the mode can mean what it says.
-    //
-    // The user report was accurate about `untrusted`, and that is the mode
-    // `ApprovalRequired` maps to: captured live, it asks before every command,
-    // three times for the same command in one turn. `on-request` — where
-    // `AutoAcceptEdits` and `Auto` land — asks only after a sandboxed attempt
-    // has already failed. See `catalog::approval_policy`.
-    let approval_policy = approval_policy(request.runtime_mode);
-    let effort = to_effort(request.reasoning);
-    // Service tier rides thread-start and every turn (mirrors the Codex IDE
-    // client). "default" means Standard — omit it entirely.
-    let service_tier = request
-        .model_options
-        .get("serviceTier")
-        .and_then(Value::as_str)
-        .filter(|t| *t != "default")
-        .map(str::to_owned);
-
-    let start_params = {
-        let mut p = serde_json::Map::new();
-        p.insert("cwd".into(), Value::String(request.cwd.clone()));
-        p.insert("approvalPolicy".into(), approval_policy.into());
-        p.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
-        p.insert(
-            "approvalsReviewer".into(),
-            approvals_reviewer(request.runtime_mode).into(),
-        );
-        if let Some(model) = &request.model {
-            p.insert("model".into(), Value::String(model.clone()));
-        }
-        if let Some(tier) = &service_tier {
-            p.insert("serviceTier".into(), Value::String(tier.clone()));
-        }
-        p
-    };
-
     // ---- handshake + thread + first turn (interruptible) ------------------
     let setup = async {
         client
@@ -595,9 +658,10 @@ async fn run_session(session: Session) {
         client.notify("initialized", None);
 
         let thread = if let Some(resume) = &request.resume {
-            let mut p = start_params.clone();
-            p.insert("threadId".into(), Value::String(resume.clone()));
-            match client.request("thread/resume", Value::Object(p)).await {
+            match client
+                .request("thread/resume", thread_resume_params(&request, resume))
+                .await
+            {
                 Ok(thread) => thread,
                 // A missing/foreign rollout falls back to a fresh thread.
                 Err(e) => {
@@ -606,13 +670,13 @@ async fn run_session(session: Session) {
                         "thread/resume failed (starting fresh): {e}"
                     );
                     client
-                        .request("thread/start", Value::Object(start_params.clone()))
+                        .request("thread/start", thread_start_params(&request))
                         .await?
                 }
             }
         } else {
             client
-                .request("thread/start", Value::Object(start_params.clone()))
+                .request("thread/start", thread_start_params(&request))
                 .await?
         };
         let thread_id = thread["thread"]["id"].as_str().unwrap_or("").to_owned();
@@ -648,32 +712,6 @@ async fn run_session(session: Session) {
         }
     };
 
-    let turn_params = |text: &str| -> Value {
-        let mut p = serde_json::Map::new();
-        p.insert("threadId".into(), Value::String(thread_id.clone()));
-        p.insert("input".into(), json!([{ "type": "text", "text": text }]));
-        p.insert("approvalPolicy".into(), approval_policy.into());
-        p.insert(
-            "sandboxPolicy".into(),
-            sandbox_policy_value(request.sandbox),
-        );
-        // Reasoning summaries stream (`item/reasoning/summaryTextDelta`) only
-        // when asked for — without this codex "thinks" in silence for minutes:
-        // nothing renders and the UI's 45s staleness gate flips Working off
-        // (user report: "not streaming, doesn't say it's working").
-        p.insert("summary".into(), "auto".into());
-        if let Some(model) = &request.model {
-            p.insert("model".into(), Value::String(model.clone()));
-        }
-        if let Some(effort) = effort {
-            p.insert("effort".into(), effort.into());
-        }
-        if let Some(tier) = &service_tier {
-            p.insert("serviceTier".into(), Value::String(tier.clone()));
-        }
-        Value::Object(p)
-    };
-
     let mut assistant_message_id = new_message_id();
     if !send(
         &event_tx,
@@ -694,7 +732,12 @@ async fn run_session(session: Session) {
     }
 
     let mut router = TurnRouter::default();
-    match start_turn(&client, turn_params(&request.prompt)).await {
+    match start_turn(
+        &client,
+        turn_start_params(&request, &thread_id, &request.prompt),
+    )
+    .await
+    {
         Ok(id) => router.adopt_started(id),
         Err(e) => {
             let _ = event_tx
@@ -720,7 +763,7 @@ async fn run_session(session: Session) {
     // Token usage is held until the turn ends, emitted just before Done.
     let mut pending_usage: Option<AgentEvent> = None;
     // `item/fileChange/requestApproval` carries no path and no diff — only an
-    // `itemId` (captured 2026-08-10; the generated schema agrees). The detail is
+    // `itemId` in the generated schema. The detail is
     // on the `item/started` that precedes it, so it is held here until the
     // request that needs it arrives, and dropped when the item completes.
     let mut file_changes: HashMap<String, Value> = HashMap::new();
@@ -851,7 +894,7 @@ async fn run_session(session: Session) {
                         if let Some(text) = queued_steers.pop_front() {
                             if !steer_as_new_turn(
                                 &client,
-                                turn_params(&text),
+                                turn_start_params(&request, &thread_id, &text),
                                 &mut router,
                                 &event_tx,
                                 &mut assistant_message_id,
@@ -1002,11 +1045,7 @@ async fn run_session(session: Session) {
                 Some(msg) => {
                     let text = msg.prompt;
                     if let Some(expected) = router.active.clone() {
-                        let steer_params = json!({
-                            "threadId": thread_id,
-                            "expectedTurnId": expected,
-                            "input": [{ "type": "text", "text": text }],
-                        });
+                        let steer_params = turn_steer_params(&thread_id, &expected, &text);
                         match client.request("turn/steer", steer_params).await {
                             Ok(_) => {
                                 let (prev, next) = rotate(&mut assistant_message_id);
@@ -1039,7 +1078,7 @@ async fn run_session(session: Session) {
                                     queued_steers.push_back(text);
                                 } else if !steer_as_new_turn(
                                     &client,
-                                    turn_params(&text),
+                                    turn_start_params(&request, &thread_id, &text),
                                     &mut router,
                                     &event_tx,
                                     &mut assistant_message_id,
@@ -1053,7 +1092,7 @@ async fn run_session(session: Session) {
                         }
                     } else if !steer_as_new_turn(
                         &client,
-                        turn_params(&text),
+                        turn_start_params(&request, &thread_id, &text),
                         &mut router,
                         &event_tx,
                         &mut assistant_message_id,
@@ -1083,7 +1122,7 @@ async fn run_session(session: Session) {
                     let thread = thread_id.clone();
                     tokio::spawn(async move {
                         if let Err(e) = client
-                            .request("turn/interrupt", json!({ "threadId": thread, "turnId": turn }))
+                            .request("turn/interrupt", turn_interrupt_params(&thread, &turn))
                             .await
                         {
                             tracing::debug!(

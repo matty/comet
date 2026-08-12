@@ -1,7 +1,8 @@
 //! Claude's `can_use_tool` request → Comet's `ApprovalRequest`.
 //!
-//! Tool names and input shapes are from a live capture (2026-08-10, CLI
-//! 2.1.226) plus the tool set in sdk.d.ts. An unrecognized tool is NOT an
+//! Tool names and input shapes are pinned by `claude-approval-tool-input-shapes`
+//! and `claude-approval-write-path-absolute` in the capture corpus, plus the
+//! tool set in sdk.d.ts. An unrecognized tool is NOT an
 //! error — it becomes `Unknown` with Comet copy, because the alternative is
 //! either dropping the request (the agent hangs) or auto-allowing it.
 
@@ -32,8 +33,8 @@ pub(crate) fn approval_request(
 
     match body.tool_name.as_str() {
         "Bash" => match str_field("command") {
-            // The request carries no working directory (captured); reporting
-            // one Comet inferred would be an assertion the provider never made.
+            // This wire schema has no working-directory field. The adapter
+            // must not invent one from unrelated run state.
             Some(command) => ApprovalRequest::Command { command, cwd: None },
             None => unknown(&body.tool_name),
         },
@@ -141,6 +142,7 @@ mod tests {
             subtype: "can_use_tool".into(),
             tool_name: tool.into(),
             input,
+            tool_use_id: String::new(),
             description: Some("provider prose that must not reach the card".into()),
         }
     }
@@ -282,10 +284,9 @@ mod tests {
     }
 
     #[test]
-    fn bash_is_a_command_and_carries_no_directory_it_was_not_given() {
-        // The CLI does not report a cwd on the request (captured). Inventing
-        // one — the run's cwd, say — would put a directory on the card that
-        // the provider never asserted.
+    fn bash_command_schema_does_not_invent_a_directory() {
+        // Keep the adapter limited to fields present in ControlRequestBody;
+        // run state is not evidence about the command's working directory.
         let got = approval_request(
             &body("Bash", json!({"command": "cargo test"})),
             nothing_exists,

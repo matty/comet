@@ -12,17 +12,18 @@
 //!   any time; the CLI applies them at its own step boundary.
 //! - Interrupt: cancelling [`RunControls::interrupt`] sends the protocol-level
 //!   interrupt control request, then escalates to SIGTERM and SIGKILL.
+//!
+//! Corpus claim `claude-attachment-run-order` pins attachment stdin ordering.
 
 mod approval;
 mod catalog;
-mod commands;
-mod discovery;
+pub(crate) mod commands;
+pub(crate) mod discovery;
 mod normalize;
 mod update;
-mod wire;
+pub(crate) mod wire;
 
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -101,6 +102,97 @@ fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
     }
 }
 
+/// Describe the exact process launch used for a Claude run.
+pub(crate) fn run_launch(exe: &Path, request: &RunRequest) -> crate::capture::LaunchDescriptor {
+    let mut args: Vec<std::ffi::OsString> = [
+        "--print",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        // Route permission prompts to the stdio control channel so
+        // `can_use_tool` (and AskUserQuestion in particular) reaches us.
+        "--permission-prompt-tool",
+        "stdio",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    // The 1M context window is selected via a model-id suffix
+    // (`sonnet[1m]`), exactly how the CLI itself does it; fast mode and
+    // always-on thinking are settings overrides.
+    if let Some(model) = &request.model {
+        let one_m = request
+            .model_options
+            .get("contextWindow")
+            .and_then(Value::as_str)
+            == Some("1m");
+        args.push("--model".into());
+        args.push(if one_m {
+            format!("{model}[1m]").into()
+        } else {
+            model.into()
+        });
+    }
+    if let Some(effort) = to_effort(request.reasoning, request.model.as_deref()) {
+        args.extend(["--effort".into(), effort.into()]);
+    }
+    // `default` is the CLI's unadvertised alias for the mode it now lists
+    // as `manual`; both ask before each tool call. Keep `default` because it
+    // is accepted by every CLI version comet resolves, and `manual` is not.
+    let (permission_mode, skip_permissions) = match request.runtime_mode {
+        RuntimeMode::ApprovalRequired => ("default", false),
+        RuntimeMode::AutoAcceptEdits => ("acceptEdits", false),
+        RuntimeMode::Auto => ("auto", false),
+        RuntimeMode::FullAccess => ("bypassPermissions", true),
+    };
+    args.extend(["--permission-mode".into(), permission_mode.into()]);
+    if skip_permissions {
+        args.push("--dangerously-skip-permissions".into());
+    }
+    if let Some(resume) = &request.resume {
+        args.push(format!("--resume={resume}").into());
+    }
+    let mut settings = serde_json::Map::new();
+    if option_is_on(&request.model_options, "fastMode") {
+        settings.insert("fastMode".into(), Value::Bool(true));
+    }
+    if option_is_on(&request.model_options, "thinking") {
+        settings.insert("alwaysThinkingEnabled".into(), Value::Bool(true));
+    }
+    if request.reasoning == Some(ReasoningLevel::Ultracode) {
+        settings.insert("ultracode".into(), Value::Bool(true));
+    }
+    if !settings.is_empty() {
+        args.push("--settings".into());
+        args.push(Value::Object(settings).to_string().into());
+    }
+
+    let mut configured_env = std::collections::BTreeMap::new();
+    if let Some(path) = crate::child_path(exe) {
+        configured_env.insert("PATH".into(), path);
+    }
+    crate::capture::LaunchDescriptor {
+        program: exe.into(),
+        args,
+        cwd: (!request.cwd.is_empty()).then(|| request.cwd.clone().into()),
+        configured_env,
+        stdin: crate::capture::StdioMode::Piped,
+        stdout: crate::capture::StdioMode::Piped,
+        stderr: crate::capture::StdioMode::Piped,
+        kill_on_drop: true,
+        #[cfg(windows)]
+        creation_flags: 0,
+    }
+}
+
+/// Build the exact process command used for a Claude run.
+pub(crate) fn build_run_command(exe: &Path, request: &RunRequest) -> Command {
+    run_launch(exe, request).command()
+}
+
 /// The Claude Code harness. Construct with [`ClaudeHarness::new`]; tests point
 /// it at a fake CLI with [`ClaudeHarness::with_executable`].
 pub struct ClaudeHarness {
@@ -161,8 +253,8 @@ impl ClaudeHarness {
                 RuntimeMode::Auto,
                 RuntimeMode::FullAccess,
             ],
-            // `deny_response(message)` puts the note on the wire, and 1.6's
-            // capture saw the model read it back.
+            // `deny_response(message)` puts the user's note on the provider
+            // wire, so the adapter can truthfully advertise this capability.
             carries_deny_note: true,
         }
     }
@@ -196,85 +288,6 @@ impl ClaudeHarness {
                 "CLAUDE_CODE_EXECUTABLE",
             ))
         })
-    }
-
-    fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
-        let mut cmd = Command::new(exe);
-        crate::compose_child_path(&mut cmd, exe);
-        cmd.args([
-            "--print",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-            // Route permission prompts to the stdio control channel so
-            // `can_use_tool` (and AskUserQuestion in particular) reaches us.
-            "--permission-prompt-tool",
-            "stdio",
-        ]);
-        // The 1M context window is selected via a model-id suffix
-        // (`sonnet[1m]`), exactly how the CLI itself does it; fast mode and
-        // always-on thinking are settings overrides.
-        if let Some(model) = &request.model {
-            let one_m = request
-                .model_options
-                .get("contextWindow")
-                .and_then(Value::as_str)
-                == Some("1m");
-            cmd.arg("--model");
-            cmd.arg(if one_m {
-                format!("{model}[1m]")
-            } else {
-                model.clone()
-            });
-        }
-        if let Some(effort) = to_effort(request.reasoning, request.model.as_deref()) {
-            cmd.args(["--effort", effort]);
-        }
-        // `default` is the CLI's unadvertised alias for the mode it now lists
-        // as `manual`; both ask before each tool call. Keep `default` — it is
-        // accepted by every CLI version comet resolves, and `manual` is not.
-        // Captured against the installed Claude Code 2.1.226: `--permission-mode
-        // --help` advertises exactly `acceptEdits`, `auto`, `bypassPermissions`,
-        // `manual`, `dontAsk`, `plan`, and that binary also accepts the
-        // unadvertised `default` (`--permission-mode bogus` exits 1 instead).
-        let (permission_mode, skip_permissions) = match request.runtime_mode {
-            RuntimeMode::ApprovalRequired => ("default", false),
-            RuntimeMode::AutoAcceptEdits => ("acceptEdits", false),
-            RuntimeMode::Auto => ("auto", false),
-            RuntimeMode::FullAccess => ("bypassPermissions", true),
-        };
-        cmd.args(["--permission-mode", permission_mode]);
-        if skip_permissions {
-            cmd.arg("--dangerously-skip-permissions");
-        }
-        if let Some(resume) = &request.resume {
-            cmd.arg(format!("--resume={resume}"));
-        }
-        let mut settings = serde_json::Map::new();
-        if option_is_on(&request.model_options, "fastMode") {
-            settings.insert("fastMode".into(), Value::Bool(true));
-        }
-        if option_is_on(&request.model_options, "thinking") {
-            settings.insert("alwaysThinkingEnabled".into(), Value::Bool(true));
-        }
-        if request.reasoning == Some(ReasoningLevel::Ultracode) {
-            settings.insert("ultracode".into(), Value::Bool(true));
-        }
-        if !settings.is_empty() {
-            cmd.arg("--settings");
-            cmd.arg(Value::Object(settings).to_string());
-        }
-        if !request.cwd.is_empty() {
-            cmd.current_dir(&request.cwd);
-        }
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        cmd
     }
 }
 
@@ -353,7 +366,7 @@ impl Harness for ClaudeHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        let mut cmd = self.build_command(&exe, &request);
+        let mut cmd = build_run_command(&exe, &request);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
@@ -472,7 +485,7 @@ fn image_media_type(path: &std::path::Path, bytes: &[u8]) -> Option<&'static str
 /// Load `RunRequest::attachments` into inline image blocks, best-effort: an
 /// unreadable, oversized, or unsupported file is skipped — its path ref still
 /// rides the prompt text — never fatal to the run.
-async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
+pub(crate) async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
     use base64::Engine as _;
     let mut blocks = Vec::new();
     for path in paths {
@@ -755,9 +768,7 @@ fn handle_control_request(
         // that reply leaves the CLI waiting on an answer that never comes.
         // Comet applies the same reply to every unclaimed subtype (~52
         // others), which the SDK does not specify. The reply shape is
-        // written blind — none of the nine 2026-08-10 capture runs against
-        // Claude Code 2.1.226 produced one of these, so it is checked
-        // against the typings, not a live frame.
+        // derived from the SDK typings rather than a captured live frame.
         //
         // If one of the non-dialog subtypes ever does fire, the safer generic
         // reply is a `control_response` with `subtype: "error"` (an
@@ -766,9 +777,8 @@ fn handle_control_request(
         // `{behavior:"cancelled"}` claims a permission answer the caller may
         // not have asked for. Exposure is near zero today — Comet does no
         // initialize handshake and declares no SDK hooks or SDK MCP servers,
-        // which is why the capture runs saw none — so the reply that IS
-        // specified for the one reachable kind stays until a live frame says
-        // otherwise.
+        // so the reply that IS specified for the one reachable kind stays
+        // until reproducible protocol evidence says otherwise.
         tracing::warn!(
             target: "comet_harness::claude",
             request = %serde_json::json!({
@@ -1128,7 +1138,7 @@ mod control_request_tests {
             sent["response"]["response"]
                 .get("updatedPermissions")
                 .is_none(),
-            "capture 2026-08-10: updatedPermissions writes to the user's repo and does not work"
+            "session grants are engine-owned and must not become provider permission updates"
         );
     }
 
@@ -1152,9 +1162,7 @@ mod control_request_tests {
     #[tokio::test]
     async fn allow_for_session_is_answered_allow_and_sends_no_permission_update() {
         // The engine remembers the session grant (Task 1). The CLI is told plain
-        // "allow" — capture runs 7-9: every updatedPermissions shape either
-        // persisted a rule to the user's repo, failed to silence the next call,
-        // or both.
+        // "allow" without delegating persistence to provider configuration.
         let (request_input, stdin_tx, mut stdin_rx) = bridge();
         handle_control_request(
             frame("can_use_tool", "Write"),
@@ -1235,8 +1243,7 @@ mod command_tests {
     }
 
     fn args_of(request: &RunRequest) -> Vec<String> {
-        ClaudeHarness::new()
-            .build_command(&PathBuf::from("claude"), request)
+        build_run_command(Path::new("claude"), request)
             .as_std()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())

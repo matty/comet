@@ -1,8 +1,8 @@
 //! Claude's live model discovery: reading one `initialize` control response.
 //!
-//! Captured against Claude Code 2.1.227 on 2026-08-11
-//! (`captures/2026-08-11-claude-initialize-handshake.md`). Three facts from
-//! that capture shape this file, and none of them is in sdk.d.ts 0.3.195:
+//! Reviewed evidence is indexed in `tests/corpus/index.json` by the
+//! `claude-model-*` claims. Three facts from that corpus shape this file, and
+//! none of them is in sdk.d.ts 0.3.195:
 //!
 //! 1. The reply nests twice: `control_response.response.response`.
 //! 2. Each model carries an undocumented `resolvedModel`, and it is the only
@@ -13,9 +13,14 @@
 //! Canonicalization lives in this file rather than in the shared merge because
 //! `resolvedModel` is a Claude field; `crate::discovery` stays
 //! provider-agnostic and unchanged.
+//!
+//! Corpus claims: `claude-model-reply-shape`, `claude-model-curated-id-decoder`,
+//! `claude-model-cwd-invariance`, `claude-model-bare-effects`,
+//! `claude-model-real-catalog-merge`, `claude-model-default-alias`,
+//! `claude-model-no-modality`, `claude-model-effort-levels`,
+//! `claude-model-initialize-request`, and `claude-model-close-exit`.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -26,12 +31,9 @@ use comet_proto::ReasoningLevel;
 
 use crate::discovery::{DiscoveredModel, Discovery, DiscoveryFailure, program_path};
 
-/// Matches `PROBE_TIMEOUT`. With `--bare` the observed answer is under a
-/// second, and the wait is paid once per boot by a caller that already has a
-/// spinner and a Cancel (2.1's `Loadable` slot). Ten seconds is therefore a
-/// long way past a healthy answer — but see `DISCOVERY_ARGS`: a spawn that
-/// runs the user's hooks blew through it, and the margin is what makes a slow
-/// machine degrade to the built-in list rather than a slow one hang.
+/// Matches `PROBE_TIMEOUT`. The wait is paid once per boot behind a cancellable
+/// loading surface. Keeping it bounded makes a wedged CLI fall back to the
+/// built-in list instead of leaving the picker waiting indefinitely.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The spawn arguments for a session that will never run a turn: the
@@ -41,16 +43,14 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// **`--bare` is load-bearing, not tidiness.** It skips hooks, LSP, plugin
 /// sync, auto-memory and CLAUDE.md discovery. Without it the user's
-/// `SessionStart` hooks run in a session that will never prompt: measured in
-/// the real app on Windows, that was 7.1s of startup plus 3.5s of hook before
-/// the reply, i.e. **10.6s — past this timeout**, and the picker fell back to
-/// the built-in list. With `--bare` the same machine answers in 0.7s with a
-/// byte-identical model list.
+/// `SessionStart` hooks run in a session that will never prompt. Avoiding that
+/// unrelated work keeps the bounded discovery path focused on its model-list
+/// request and preserves the built-in fallback when the CLI is unhealthy.
 ///
 /// Two consequences worth knowing. `account` degrades to
 /// `{"tokenSource":"none"}` because OAuth and keychain are never read — fine
 /// here, since nothing reads `account`, and it keeps the user's email off the
-/// wire entirely. And `commands` shrinks to the built-ins (42 vs 66 observed),
+/// wire entirely. And `commands` shrinks to the built-ins,
 /// because user and project skills are not discovered: **slice 2.4 cannot read
 /// the command list from this spawn.**
 ///
@@ -91,42 +91,55 @@ async fn handshake(exe: &Path, curated_ids: &[String]) -> Result<Discovery, Disc
     // Any directory would do for models — the capture found the model list
     // identical across cwds while `commands` varied — and a neutral one avoids
     // loading a project's own settings for a session with no turn.
-    let line = initialize_reply(exe, DISCOVERY_ARGS, &std::env::temp_dir()).await?;
+    let launch = model_discovery_launch(exe, &std::env::temp_dir());
+    let line = initialize_reply(launch).await?;
     let borrowed: Vec<&str> = curated_ids.iter().map(String::as_str).collect();
     discovery_from_reply(&line, &borrowed)
 }
 
-/// Spawn a short-lived CLI in `cwd`, send one `initialize`, and hand back the
-/// raw `control_response` line.
-///
-/// Shared with the command discovery in `commands.rs`, which differs from this
-/// one only in its arguments (no `--bare`), its directory (the chat's, not a
-/// neutral one) and what it reads off the reply. Keeping the spawn in one place
-/// is what stops the two drifting on the details that have already cost this
-/// phase three fixes — `program_path`, `kill_on_drop`, `CREATE_NO_WINDOW`, and
-/// reading *past* the hook frames rather than taking the first line.
-pub(super) async fn initialize_reply(
+/// Describe a Claude initialize handshake without choosing its purpose.
+pub(crate) fn claude_initialize_launch(
     exe: &Path,
     args: &[&str],
     cwd: &Path,
-) -> Result<String, DiscoveryFailure> {
-    let exe = &program_path(exe);
-    let mut cmd = Command::new(exe);
-    crate::compose_child_path(&mut cmd, exe);
-    cmd.args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        // The timeout arm drops this future; without kill_on_drop the child
-        // outlives the discovery and we leak a CLI per attempt.
-        .kill_on_drop(true)
-        .current_dir(cwd);
-    #[cfg(windows)]
-    {
-        // CREATE_NO_WINDOW, as in `probe_cli_version`: the `.cmd` shims are
-        // console apps and would flash a window on every boot otherwise.
-        cmd.creation_flags(0x0800_0000);
+) -> crate::capture::LaunchDescriptor {
+    let exe = program_path(exe);
+    let mut configured_env = std::collections::BTreeMap::new();
+    if let Some(path) = crate::child_path(&exe) {
+        configured_env.insert("PATH".into(), path);
     }
+    crate::capture::LaunchDescriptor {
+        program: exe,
+        args: args.iter().map(Into::into).collect(),
+        cwd: Some(cwd.into()),
+        configured_env,
+        stdin: crate::capture::StdioMode::Piped,
+        stdout: crate::capture::StdioMode::Piped,
+        stderr: crate::capture::StdioMode::Piped,
+        kill_on_drop: true,
+        #[cfg(windows)]
+        creation_flags: 0x0800_0000,
+    }
+}
+
+/// Select the exact launch used for Claude model discovery.
+pub(crate) fn model_discovery_launch(exe: &Path, cwd: &Path) -> crate::capture::LaunchDescriptor {
+    claude_initialize_launch(exe, DISCOVERY_ARGS, cwd)
+}
+
+/// Build the exact short-lived command used for Claude initialize handshakes.
+#[allow(dead_code)] // Preserved for capture drivers that materialize a chosen launch.
+pub(crate) fn build_claude_initialize_command(exe: &Path, args: &[&str], cwd: &Path) -> Command {
+    claude_initialize_launch(exe, args, cwd).command()
+}
+
+/// Spawn a selected short-lived Claude initialize launch, send one initialize,
+/// and hand back the raw `control_response` line.
+pub(super) async fn initialize_reply(
+    launch: crate::capture::LaunchDescriptor,
+) -> Result<String, DiscoveryFailure> {
+    let exe = launch.program.clone();
+    let mut cmd = launch.command();
 
     let mut child = cmd.spawn().map_err(|err| {
         tracing::debug!(cli = %exe.display(), %err, "claude discovery spawn failed");
@@ -134,6 +147,8 @@ pub(super) async fn initialize_reply(
     })?;
     let mut stdin = child.stdin.take().ok_or(DiscoveryFailure::Unreachable)?;
     let stdout = child.stdout.take().ok_or(DiscoveryFailure::Unreachable)?;
+    let stderr = child.stderr.take().ok_or(DiscoveryFailure::Unreachable)?;
+    crate::drain_discovery_stderr(stderr, "claude");
 
     stdin
         .write_all(format!("{INITIALIZE_LINE}\n").as_bytes())
@@ -297,18 +312,17 @@ pub(crate) fn discovery_from_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::selected_payload;
     use crate::claude::catalog::static_models;
     use comet_proto::ReasoningLevel;
 
-    /// The literal frame Claude Code 2.1.227 sent on 2026-08-11, from
-    /// `captures/2026-08-11-claude-initialize-handshake/run2-close.jsonl`, with
-    /// only the `account` block replaced (it carries a real email).
-    ///
-    /// Pinned as the CLI's own bytes rather than round-tripped through our own
-    /// types on purpose: a round-trip test cannot catch the reply moving under
-    /// us, which is exactly how 2.1 shipped a runtime-broken picker (AGENTS.md,
-    /// "Changing what an RPC method answers with").
-    const CAPTURED_REPLY: &str = r#"{"type":"control_response","response":{"subtype":"success","request_id":"init-1","response":{"commands":[{"name":"verify","description":"Run the gate. (project)","argumentHint":""}],"agents":[{"name":"Explore"}],"output_style":"default","available_output_styles":["default","Explanatory"],"models":[{"value":"default","resolvedModel":"claude-opus-5[1m]","displayName":"Default (recommended)","description":"Opus 5 with 1M context","supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max"],"supportsAdaptiveThinking":true,"supportsFastMode":true,"supportsAutoMode":true},{"value":"opus[1m]","resolvedModel":"claude-opus-5[1m]","displayName":"Opus (1M context)","description":"Opus 5 with 1M context","supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max"],"supportsAdaptiveThinking":true,"supportsFastMode":true,"supportsAutoMode":true},{"value":"claude-fable-5[1m]","resolvedModel":"claude-fable-5","displayName":"Fable","description":"Fable 5","supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max"],"supportsAdaptiveThinking":true,"supportsAutoMode":true},{"value":"sonnet","resolvedModel":"claude-sonnet-5","displayName":"Sonnet","description":"Sonnet 5","supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max"],"supportsAdaptiveThinking":true,"supportsAutoMode":true},{"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001","displayName":"Haiku","description":"Haiku 4.5"}],"account":{"email":"user@example.test","organization":"Example","subscriptionType":"Claude Max","apiProvider":"firstParty"},"pid":1234,"current_permission_mode":"acceptEdits","remote_control_auto_enable":false,"remote_control_auto_on_by_default":false,"ide_rc_auto_enable_gate":false,"fast_mode_state":"off","fast_mode_disabled_reason":null}}}"#;
+    fn corpus_payload(claim_id: &str) -> String {
+        selected_payload(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
+            claim_id,
+        )
+        .expect("reviewed corpus frame")
+    }
 
     fn curated_ids() -> Vec<String> {
         static_models().into_iter().map(|m| m.id).collect()
@@ -324,12 +338,13 @@ mod tests {
     /// rejects the live CLI.
     ///
     /// The ids are the CURATED ones, because Claude's own spellings never match
-    /// them literally (capture, 2026-08-11) and every consumer downstream — the
+    /// them literally (`claude-model-curated-id-decoder`) and every consumer downstream — the
     /// merge, the picker, `--model` — speaks curated.
     #[test]
     fn the_captured_reply_decodes_onto_curated_ids() {
         let owned = curated_ids();
-        let discovery = discovery_from_reply(CAPTURED_REPLY, &borrowed(&owned)).expect("decodes");
+        let payload = corpus_payload("claude-model-curated-id-decoder");
+        let discovery = discovery_from_reply(&payload, &borrowed(&owned)).expect("decodes");
         let ids: Vec<&str> = discovery.models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -337,9 +352,10 @@ mod tests {
                 "claude-opus-5",
                 "claude-fable-5",
                 "claude-sonnet-5",
-                "claude-haiku-4-5"
+                "claude-haiku-4-5",
+                "gpt-5.6-sol"
             ],
-            "aliases canonicalized, `default` dropped"
+            "aliases canonicalized, `default` dropped, live-only selector retained"
         );
         assert_eq!(
             discovery.models[2].label, "Sonnet",
@@ -351,9 +367,10 @@ mod tests {
     /// shared merge is unchanged from 2.1 — if the adapter did not
     /// canonicalize, this is where eleven rows would show up.
     #[test]
-    fn the_captured_reply_adds_no_rows_to_the_real_catalog() {
+    fn the_captured_reply_deduplicates_aliases_and_keeps_a_live_only_row() {
         let owned = curated_ids();
-        let discovery = discovery_from_reply(CAPTURED_REPLY, &borrowed(&owned)).unwrap();
+        let payload = corpus_payload("claude-model-real-catalog-merge");
+        let discovery = discovery_from_reply(&payload, &borrowed(&owned)).unwrap();
         let merged = crate::discovery::merge(static_models(), &discovery);
         let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
@@ -365,8 +382,9 @@ mod tests {
                 "claude-opus-4-7",
                 "claude-sonnet-5",
                 "claude-haiku-4-5",
+                "gpt-5.6-sol",
             ],
-            "six curated rows, no duplicates and nothing deleted"
+            "six curated rows, no alias duplicates, and the live-only row remains"
         );
         assert_eq!(merged[4].label, "Sonnet 5", "curated label still wins");
     }
@@ -378,7 +396,8 @@ mod tests {
     #[test]
     fn the_default_alias_row_is_dropped() {
         let owned = curated_ids();
-        let discovery = discovery_from_reply(CAPTURED_REPLY, &borrowed(&owned)).unwrap();
+        let payload = corpus_payload("claude-model-default-alias");
+        let discovery = discovery_from_reply(&payload, &borrowed(&owned)).unwrap();
         assert!(discovery.models.iter().all(|m| m.id != "default"));
         assert!(
             discovery
@@ -418,14 +437,16 @@ mod tests {
     #[test]
     fn no_modality_field_means_the_provider_did_not_say() {
         let owned = curated_ids();
-        let discovery = discovery_from_reply(CAPTURED_REPLY, &borrowed(&owned)).unwrap();
+        let payload = corpus_payload("claude-model-no-modality");
+        let discovery = discovery_from_reply(&payload, &borrowed(&owned)).unwrap();
         assert!(discovery.models.iter().all(|m| m.accepts_images.is_none()));
     }
 
     #[test]
     fn effort_levels_map_to_the_ladder_and_haiku_reports_none() {
         let owned = curated_ids();
-        let discovery = discovery_from_reply(CAPTURED_REPLY, &borrowed(&owned)).unwrap();
+        let payload = corpus_payload("claude-model-effort-levels");
+        let discovery = discovery_from_reply(&payload, &borrowed(&owned)).unwrap();
         assert_eq!(
             discovery.models[2].reasoning_levels,
             vec![
@@ -436,7 +457,11 @@ mod tests {
                 ReasoningLevel::Max
             ]
         );
-        let haiku = discovery.models.last().unwrap();
+        let haiku = discovery
+            .models
+            .iter()
+            .find(|model| model.id == "claude-haiku-4-5")
+            .unwrap();
         assert!(
             haiku.reasoning_levels.is_empty(),
             "no supportedEffortLevels key at all"

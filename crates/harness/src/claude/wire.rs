@@ -4,6 +4,10 @@
 //! split three ways — [`Frame::Ignored`] (recognized, deliberately dropped)
 //! or [`Frame::Unknown`] (a diagnostic) — so a newer CLI never breaks parsing
 //! and nothing vanishes silently (spec: docs/research/harness.md).
+//!
+//! Corpus claims: `claude-routine-frame-ignore-list`,
+//! `claude-approval-wire-fields`, `claude-attachment-block-order`, and
+//! `claude-attachment-block-order-test`.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -62,8 +66,8 @@ pub(crate) const NOTICE_SUBTYPES: &[&str] = &[
 /// its count — it is a maintenance obligation, not a fact about the frame,
 /// and reading only this repository will not resolve which slice that is;
 /// any other reason names why no surface wants the frame at all. ★ = confirmed firing
-/// on a real Claude Code 2.1.226 capture (2026-08-08); the rest are named by
-/// sdk.d.ts 0.3.195. Deliberately NOT here, so a diagnostic fires:
+/// in the reviewed healthy-run corpus; the rest are named by sdk.d.ts 0.3.195.
+/// Deliberately NOT here, so a diagnostic fires:
 /// local_command_output, model_refusal_no_fallback, mirror_error,
 /// elicitation_complete, files_persisted, plugin_install, worker_shutting_down.
 pub(crate) const IGNORED_FRAMES: &[(&str, &str)] = &[
@@ -78,8 +82,8 @@ pub(crate) const IGNORED_FRAMES: &[(&str, &str)] = &[
     ("prompt_suggestion", "opt-in"),
     ("auth_status", "auth-transient"),
     // system subtypes
-    ("system/status", "transient"),          // ★ one per API request
-    ("system/thinking_tokens", "heartbeat"), // ★ whenever reasoning is on
+    ("system/status", "transient"), // ★ one per API request
+    ("system/thinking_tokens", "heartbeat"),
     ("system/session_state_changed", "turn-state"),
     ("system/hook_started", "4.2"), // ★ one per session with hooks
     ("system/hook_progress", "4.2"),
@@ -207,6 +211,8 @@ pub(crate) struct MessageFrame {
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct MessageBody {
+    #[serde(default)]
+    pub role: String,
     /// Either a plain string or an array of content blocks.
     #[serde(default)]
     pub content: Value,
@@ -293,6 +299,8 @@ pub(crate) struct ControlRequestBody {
     pub tool_name: String,
     #[serde(default)]
     pub input: Value,
+    #[serde(default)]
+    pub tool_use_id: String,
     /// The CLI's own one-line rendering of the request ("hello.txt", "Write
     /// \"one\" to a.txt"). Provider prose.
     ///
@@ -405,10 +413,9 @@ pub(crate) fn control_response_line(request_id: &str, response: Value) -> String
 /// `can_use_tool` deny payload. `message` is what the model is told, and is
 /// the user's own note when they wrote one.
 ///
-/// No `updatedPermissions` is ever sent, on this arm or the allow arm:
-/// capture 2026-08-10 (runs 7-9) showed every shape either wrote a permanent
-/// rule into the user's repository, failed to silence the next request, or
-/// both. Comet owns session grants — see `comet_engine::approvals`.
+/// No `updatedPermissions` is sent on either arm: Comet owns session grants
+/// and must not persist them into provider or repository configuration. See
+/// `comet_engine::approvals`.
 pub(crate) fn deny_response(message: String) -> Value {
     json!({ "behavior": "deny", "message": message })
 }
@@ -420,9 +427,8 @@ pub(crate) fn allow_response(updated_input: Value) -> Value {
 
 /// The reply sdk.d.ts requires for a dialog kind the host does not recognize.
 /// Leaving it unanswered leaves the CLI waiting on a reply that never comes.
-/// Written blind: none of the nine 2026-08-10 capture runs against Claude
-/// Code 2.1.226 produced a non-`can_use_tool` control request, so this shape
-/// is unverified against a live frame — only against the SDK's typings.
+/// This shape is derived from the SDK typings and remains unverified against
+/// a reproducible live frame.
 pub(crate) fn cancelled_response() -> Value {
     json!({ "behavior": "cancelled" })
 }
@@ -440,6 +446,15 @@ pub(crate) fn interrupt_request_line(request_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::selected_payload;
+
+    fn corpus_payload(claim_id: &str) -> String {
+        selected_payload(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
+            claim_id,
+        )
+        .expect("reviewed corpus frame")
+    }
 
     #[test]
     fn parses_known_and_unknown_frames() {
@@ -469,6 +484,15 @@ mod tests {
 
     #[test]
     fn user_line_with_images_is_blocks_then_text() {
+        let captured = corpus_payload("claude-attachment-block-order-test");
+        let captured: Value = serde_json::from_str(&captured).expect("captured stdin JSON");
+        let captured_content = captured["message"]["content"]
+            .as_array()
+            .expect("captured block content");
+        assert_eq!(captured_content.len(), 2);
+        assert_eq!(captured_content[0]["type"], "image");
+        assert_eq!(captured_content[1]["type"], "text");
+
         let line = user_message_line_with_images(
             "what is this?",
             &[ImageBlock {
@@ -529,8 +553,7 @@ mod tests {
         ));
     }
 
-    /// The frames a REAL healthy session emits (Claude Code 2.1.226 capture,
-    /// 2026-08-08). One diagnostic from any of these puts a lie on the
+    /// The frames in the reviewed healthy-run corpus. One diagnostic from any of these puts a lie on the
     /// settings card — "hidden when zero" is only honest with this tier.
     #[test]
     fn the_ignore_list_covers_every_capture_confirmed_routine_frame() {
@@ -540,26 +563,12 @@ mod tests {
                 "transient",
             ),
             (
-                r#"{"type":"system","subtype":"thinking_tokens","tokens":42}"#,
-                "heartbeat",
-            ),
-            (
                 r#"{"type":"system","subtype":"hook_started","hook":"SessionStart"}"#,
                 "4.2",
             ),
             (
                 r#"{"type":"system","subtype":"hook_response","hook":"SessionStart"}"#,
                 "4.2",
-            ),
-            (
-                r#"{"type":"control_response","response":{}}"#,
-                "reply-channel",
-            ),
-            (r#"{"type":"keep_alive"}"#, "transport-ping"),
-            (r#"{"type":"tool_progress","tool_use_id":"t1"}"#, "liveness"),
-            (
-                r#"{"type":"system","subtype":"memory_recall","content":"x"}"#,
-                "memory",
             ),
         ] {
             match parse_frame(raw).expect("parses") {
@@ -571,23 +580,19 @@ mod tests {
 
     #[test]
     fn a_can_use_tool_request_decodes_the_fields_a_card_needs() {
-        // Captured verbatim from Claude Code 2.1.226, 2026-08-10.
-        let line = r#"{"type":"control_request","request_id":"c012205e","request":{
-            "subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash",
-            "input":{"command":"echo one > a.txt","description":"Write \"one\" to a.txt"},
-            "description":"Write \"one\" to a.txt",
-            "blocked_path":"C:\\work\\a.txt","tool_use_id":"toolu_01NA3M"}}"#;
-        let Frame::ControlRequest(req) = parse_frame(line).unwrap() else {
+        let line = corpus_payload("claude-approval-wire-fields");
+        let Frame::ControlRequest(req) = parse_frame(&line).unwrap() else {
             panic!("expected a control request");
         };
         assert_eq!(req.request.subtype, "can_use_tool");
-        assert_eq!(req.request.tool_name, "Bash");
+        assert_eq!(req.request.tool_name, "Write");
+        assert_eq!(req.request.tool_use_id, "<TOOL_USE_ID_4>");
         assert_eq!(
             req.request.description.as_deref(),
-            Some("Write \"one\" to a.txt")
+            Some("capture-marker.txt")
         );
-        // blocked_path, tool_use_id, permission_suggestions and display_name are all
-        // present on this captured frame and all deliberately undecoded. Nothing
+        // permission_suggestions and display_name are present on this captured frame and
+        // deliberately undecoded. Nothing
         // reads them, and serde ignores unknown keys — so the frame parses either
         // way and declaring them would buy availability nothing consumes.
     }

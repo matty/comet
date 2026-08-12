@@ -8,6 +8,9 @@
 //! Rust rather than `#!/bin/sh` because Windows cannot spawn a shell script:
 //! the harness hands the path straight to `CreateProcess`, which rejects a
 //! non-PE image with "%1 is not a valid Win32 application" (os error 193).
+//!
+//! Corpus-backed contracts: `claude-model-fixture-shape`,
+//! `claude-routine-frame-fixture`, and `claude-approval-fixture-shape`.
 
 use std::io::{BufRead, StdinLock, Write};
 use std::process::exit;
@@ -19,6 +22,17 @@ fn emit(line: &str) {
     let mut out = std::io::stdout();
     let _ = writeln!(out, "{line}");
     let _ = out.flush();
+}
+
+/// Exceed any ordinary pipe capacity before answering discovery. A caller that
+/// pipes stderr without draining it blocks here and never reads the reply.
+fn fill_stderr() {
+    let chunk = [b'x'; 8192];
+    let mut stderr = std::io::stderr().lock();
+    for _ in 0..128 {
+        stderr.write_all(&chunk).expect("write discovery stderr");
+    }
+    stderr.flush().expect("flush discovery stderr");
 }
 
 /// `read -r line || exit 1`: EOF is a hard failure, not an empty line.
@@ -82,7 +96,7 @@ fn check_permission_mode() {
 }
 
 /// Shaped exactly like Claude Code 2.1.227's answer, including the double
-/// nesting and `resolvedModel` — see the 2026-08-11 initialize capture. Two
+/// nesting and `resolvedModel` pinned by `claude-model-fixture-shape`. Two
 /// models are enough to prove the merge; the full five are pinned in
 /// `claude/discovery.rs`'s unit test.
 const INITIALIZE_REPLY: &str = r#"{"type":"control_response","response":{"subtype":"success","request_id":"comet-discovery-1","response":{"commands":[],"agents":[],"output_style":"default","available_output_styles":["default"],"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-5","displayName":"Sonnet","description":"Sonnet 5","supportsEffort":true,"supportedEffortLevels":["low","high"]},{"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001","displayName":"Haiku","description":"Haiku 4.5"}],"account":{"email":"user@example.test","organization":"Example","subscriptionType":"Claude Max","apiProvider":"firstParty"},"pid":1234,"current_permission_mode":"acceptEdits"}}}"#;
@@ -109,6 +123,9 @@ fn command_reply() -> String {
 
 fn main() {
     check_permission_mode();
+    if !std::env::args().any(|arg| arg == "--permission-mode") {
+        fill_stderr();
+    }
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
     let first = read_line(&mut stdin);
@@ -130,7 +147,11 @@ fn main() {
         exit(0);
     }
 
-    if first.contains("scenario:happy") {
+    if first.contains("scenario:attachment") {
+        emit(
+            r#"{"type":"result","subtype":"success","result":"image","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-attachment"}"#,
+        );
+    } else if first.contains("scenario:happy") {
         happy();
     } else if first.contains("scenario:askuser") {
         askuser(&mut stdin);
@@ -144,6 +165,58 @@ fn main() {
         notices();
     } else if first.contains("scenario:diagnostics") {
         diagnostics();
+    } else if first.contains("scenario:capture-approval-destructive-command") {
+        capture_destructive_command(&mut stdin);
+    } else if first.contains("scenario:capture-approval-unexpected-second") {
+        capture_unexpected_second(&mut stdin);
+    } else if first.contains("scenario:capture-approval-write-before-bash") {
+        capture_write_before_bash(&mut stdin);
+    } else if first.contains("scenario:capture-approval-missing-bash") {
+        capture_missing_bash(&mut stdin);
+    } else if first.contains("scenario:capture-approval-failed-bash") {
+        capture_failed_bash(&mut stdin);
+    } else if first.contains("scenario:capture-approval-wrong-bash") {
+        capture_wrong_bash(&mut stdin);
+    } else if first.contains("scenario:capture-approval-duplicate-bash") {
+        capture_duplicate_bash(&mut stdin);
+    } else if first.contains("scenario:capture-approval-bash-snapshot-duplicate") {
+        capture_bash_snapshot_duplicate(&mut stdin);
+    } else if first.contains("scenario:capture-approval-bash-control-response") {
+        capture_bash_control_response(&mut stdin);
+    } else if first.contains("scenario:capture-approval-bash-malformed-extra") {
+        capture_bash_content_deviation(&mut stdin, "malformed-extra");
+    } else if first.contains("scenario:capture-approval-bash-leading-text") {
+        capture_bash_content_deviation(&mut stdin, "leading-text");
+    } else if first.contains("scenario:capture-approval-bash-trailing-text") {
+        capture_bash_content_deviation(&mut stdin, "trailing-text");
+    } else if first.contains("scenario:capture-approval-write-malformed-extra") {
+        capture_write_content_deviation(&mut stdin, "malformed-extra");
+    } else if first.contains("scenario:capture-approval-write-leading-text") {
+        capture_write_content_deviation(&mut stdin, "leading-text");
+    } else if first.contains("scenario:capture-approval-write-trailing-text") {
+        capture_write_content_deviation(&mut stdin, "trailing-text");
+    } else if first.contains("scenario:capture-approval-user-malformed-extra") {
+        capture_user_content_deviation(&mut stdin, "malformed-extra");
+    } else if first.contains("scenario:capture-approval-user-leading-text") {
+        capture_user_content_deviation(&mut stdin, "leading-text");
+    } else if first.contains("scenario:capture-approval-user-trailing-text") {
+        capture_user_content_deviation(&mut stdin, "trailing-text");
+    } else if first.contains("scenario:capture-approval-malformed-candidate") {
+        capture_malformed_candidate(&mut stdin);
+    } else if first.contains("scenario:capture-approval-missing-write") {
+        capture_missing_write();
+    } else if first.contains("scenario:capture-approval-duplicate-write") {
+        capture_duplicate_write(&mut stdin);
+    } else if first.contains("scenario:capture-approval-missing-request-id") {
+        capture_missing_request_id(&mut stdin);
+    } else if first.contains("scenario:capture-approval-duplicate-request-id") {
+        capture_duplicate_request_id(&mut stdin);
+    } else if first.contains("scenario:capture-approval-extra-tool") {
+        capture_extra_tool(&mut stdin);
+    } else if first.contains("scenario:capture-approval-destructive-write") {
+        capture_destructive_write(&mut stdin);
+    } else if first.contains("scenario:capture-approval") {
+        capture_approval(&mut stdin);
     } else if first.contains("scenario:approval") {
         approval(&mut stdin);
     } else {
@@ -316,8 +389,8 @@ const WRITE_TARGET_JSON: &str = if cfg!(windows) {
 };
 
 /// Requests permission for a Write, then reports what it was told. The
-/// `control_request` frame shape is copied from a live capture (2026-08-10,
-/// CLI 2.1.226), with only the path swapped for one this machine can be
+/// `control_request` frame shape follows `claude-approval-fixture-shape`, with
+/// only the path swapped for one this machine can be
 /// trusted not to have. The reply is echoed as a `stream_event` text delta
 /// rather than a full `assistant` message: `normalize.rs`'s `Frame::Assistant`
 /// arm only turns `tool_use` blocks into events and drops a bare text block, so
@@ -343,6 +416,326 @@ fn approval(stdin: &mut StdinLock<'_>) {
     );
 }
 
+fn capture_approval(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit_write_request("fake-write", "toolu_write");
+    expect_write_allow(stdin, "fake-write");
+    emit(
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-1"}"#,
+    );
+}
+
+fn emit_bash_neighborhood(id: &str, command: &str, is_error: bool, output: &str) {
+    emit(
+        &serde_json::json!({
+            "type": "assistant",
+            "parent_tool_use_id": null,
+            "message": {"role":"assistant","content": [{
+                "type": "tool_use",
+                "id": id,
+                "name": "Bash",
+                "input": {"command": command},
+            }]},
+        })
+        .to_string(),
+    );
+    emit(
+        &serde_json::json!({
+            "type": "user",
+            "parent_tool_use_id": null,
+            "message": {"role":"user","content": [{
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": output,
+                "is_error": is_error,
+            }]},
+        })
+        .to_string(),
+    );
+}
+
+fn emit_write_request(request_id: &str, tool_use_id: &str) {
+    let marker = std::env::current_dir()
+        .expect("fixture cwd")
+        .join("capture-marker.txt")
+        .display()
+        .to_string();
+    let input = serde_json::json!({"file_path": marker, "content": "capture\n"});
+    emit(
+        &serde_json::json!({
+            "type": "assistant",
+            "parent_tool_use_id": null,
+            "message": {"role":"assistant","content": [{
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": "Write",
+                "input": input,
+            }]},
+        })
+        .to_string(),
+    );
+    emit(
+        &serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Write",
+                "input": input,
+                "description": "capture-marker.txt",
+                "tool_use_id": tool_use_id,
+            },
+        })
+        .to_string(),
+    );
+}
+
+fn expect_write_allow(stdin: &mut StdinLock<'_>, request_id: &str) {
+    let write: serde_json::Value =
+        serde_json::from_str(&read_line(stdin)).expect("a Write control response");
+    if write["response"]["response"]["behavior"] != "allow"
+        || write["response"]["request_id"] != request_id
+    {
+        exit(1);
+    }
+}
+
+fn capture_destructive_command(stdin: &mut StdinLock<'_>) {
+    emit(
+        r#"{"type":"control_request","request_id":"bad-bash","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm -rf /"},"description":"destructive","tool_use_id":"toolu_bad"}}"#,
+    );
+    let _ = read_line(stdin);
+    emit(
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-bad"}"#,
+    );
+}
+
+fn capture_destructive_write(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit(
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bad","name":"Write","input":{"file_path":"/outside-cwd/destructive.txt","content":"overwrite"}}]}}"#,
+    );
+    emit(
+        r#"{"type":"control_request","request_id":"bad-write","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"/outside-cwd/destructive.txt","content":"overwrite"},"description":"destructive","tool_use_id":"toolu_bad"}}"#,
+    );
+    let _ = read_line(stdin);
+    emit(
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-bad"}"#,
+    );
+}
+
+fn capture_unexpected_second(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit_write_request("good-write", "toolu_write");
+    expect_write_allow(stdin, "good-write");
+    emit(
+        r#"{"type":"control_request","request_id":"bad-read","request":{"subtype":"can_use_tool","tool_name":"Read","input":{"file_path":"capture-marker.txt"},"description":"unexpected","tool_use_id":"toolu_bad"}}"#,
+    );
+    let _ = read_line(stdin);
+}
+
+fn capture_write_before_bash(stdin: &mut StdinLock<'_>) {
+    emit_write_request("early-write", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_missing_bash(stdin: &mut StdinLock<'_>) {
+    emit_write_request("missing-bash-write", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_failed_bash(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", true, "capture");
+    emit_write_request("failed-bash-write", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_wrong_bash(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf wrong", false, "wrong");
+    emit_write_request("wrong-bash-write", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_duplicate_bash(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash-1", "printf capture", false, "capture");
+    emit_bash_neighborhood("toolu_bash-2", "printf capture", false, "capture");
+    emit_write_request("duplicate-bash-write", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_bash_snapshot_duplicate(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit_write_request("snapshot-write", "toolu_write");
+    expect_write_allow(stdin, "snapshot-write");
+    emit(
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-snapshot"}"#,
+    );
+}
+
+fn capture_bash_control_response(stdin: &mut StdinLock<'_>) {
+    emit(
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"printf capture"}}]}}"#,
+    );
+    emit(
+        r#"{"type":"control_response","response":{"subtype":"success","request_id":"bash-request","response":{"behavior":"allow"}}}"#,
+    );
+    emit(
+        r#"{"type":"user","parent_tool_use_id":null,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bash","content":"capture","is_error":false}]}}"#,
+    );
+    emit_write_request("write-after-bash-response", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_bash_content_deviation(stdin: &mut StdinLock<'_>, shape: &str) {
+    let tool = serde_json::json!({
+        "type": "tool_use",
+        "id": "toolu_bash",
+        "name": "Bash",
+        "input": {"command": "printf capture"},
+    });
+    let malformed = serde_json::json!({"type":"tool_use","name":42});
+    let text = serde_json::json!({"type":"text","text":"provider prose"});
+    let content = match shape {
+        "malformed-extra" => vec![tool, malformed],
+        "leading-text" => vec![text, tool],
+        "trailing-text" => vec![tool, text],
+        _ => unreachable!(),
+    };
+    emit(
+        &serde_json::json!({
+            "type":"assistant",
+            "parent_tool_use_id":null,
+            "message":{"role":"assistant","content":content},
+        })
+        .to_string(),
+    );
+    emit_write_request("write-after-bad-bash", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_user_content_deviation(stdin: &mut StdinLock<'_>, shape: &str) {
+    emit(
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"printf capture"}}]}}"#,
+    );
+    let result = serde_json::json!({
+        "type":"tool_result",
+        "tool_use_id":"toolu_bash",
+        "content":"capture",
+        "is_error":false,
+    });
+    let malformed =
+        serde_json::json!({"type":"tool_result","tool_use_id":"toolu_bash","is_error":"false"});
+    let text = serde_json::json!({"type":"text","text":"provider prose"});
+    let content = match shape {
+        "malformed-extra" => vec![result, malformed],
+        "leading-text" => vec![text, result],
+        "trailing-text" => vec![result, text],
+        _ => unreachable!(),
+    };
+    emit(
+        &serde_json::json!({
+            "type":"user",
+            "parent_tool_use_id":null,
+            "message":{"role":"user","content":content},
+        })
+        .to_string(),
+    );
+    emit_write_request("write-after-bad-result", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_write_content_deviation(stdin: &mut StdinLock<'_>, shape: &str) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    let marker = std::env::current_dir()
+        .expect("fixture cwd")
+        .join("capture-marker.txt")
+        .display()
+        .to_string();
+    let input = serde_json::json!({"file_path":marker,"content":"capture\n"});
+    let tool = serde_json::json!({
+        "type":"tool_use",
+        "id":"toolu_write",
+        "name":"Write",
+        "input":input,
+    });
+    let malformed = serde_json::json!({"type":"tool_use","name":42});
+    let text = serde_json::json!({"type":"text","text":"provider prose"});
+    let content = match shape {
+        "malformed-extra" => vec![tool, malformed],
+        "leading-text" => vec![text, tool],
+        "trailing-text" => vec![tool, text],
+        _ => unreachable!(),
+    };
+    emit(
+        &serde_json::json!({
+            "type":"assistant",
+            "parent_tool_use_id":null,
+            "message":{"role":"assistant","content":content},
+        })
+        .to_string(),
+    );
+    emit(
+        &serde_json::json!({
+            "type":"control_request",
+            "request_id":"write-after-bad-content",
+            "request":{
+                "subtype":"can_use_tool",
+                "tool_name":"Write",
+                "input":input,
+                "tool_use_id":"toolu_write",
+            },
+        })
+        .to_string(),
+    );
+    let _ = read_line(stdin);
+}
+
+fn capture_malformed_candidate(stdin: &mut StdinLock<'_>) {
+    emit(
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":[],"name":"Bash","input":{"command":"printf capture"}}]}}"#,
+    );
+    emit_write_request("write-after-malformed-candidate", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_missing_write() {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit(
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-missing-write"}"#,
+    );
+}
+
+fn capture_duplicate_write(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit_write_request("write-1", "toolu_write-1");
+    expect_write_allow(stdin, "write-1");
+    emit_write_request("write-2", "toolu_write-1");
+    let _ = read_line(stdin);
+}
+
+fn capture_missing_request_id(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit_write_request("", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_duplicate_request_id(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit_write_request("same-request", "toolu_write");
+    expect_write_allow(stdin, "same-request");
+    emit_write_request("same-request", "toolu_write");
+    let _ = read_line(stdin);
+}
+
+fn capture_extra_tool(stdin: &mut StdinLock<'_>) {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
+    emit(
+        r#"{"type":"control_request","request_id":"extra-read","request":{"subtype":"can_use_tool","tool_name":"Read","input":{"file_path":"capture-marker.txt"},"description":"unexpected","tool_use_id":"toolu_extra"}}"#,
+    );
+    let _ = read_line(stdin);
+}
+
 fn diagnostics() {
     emit(
         r#"{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-d"}"#,
@@ -352,14 +745,12 @@ fn diagnostics() {
     // Ignored tier — every one of these is routine on a healthy session
     // (capture-confirmed) and must produce NOTHING.
     emit(r#"{"type":"system","subtype":"status","status":"requesting","session_id":"sess-d"}"#);
-    emit(r#"{"type":"system","subtype":"thinking_tokens","tokens":123,"session_id":"sess-d"}"#);
     emit(
         r#"{"type":"system","subtype":"hook_started","hook":"SessionStart","session_id":"sess-d"}"#,
     );
     emit(
         r#"{"type":"system","subtype":"hook_response","hook":"SessionStart","session_id":"sess-d"}"#,
     );
-    emit(r#"{"type":"tool_progress","tool_use_id":"t1","progress":0.5,"session_id":"sess-d"}"#);
     // Unknown tier: an unclaimed system subtype and an unknown top-level type.
     emit(
         r#"{"type":"system","subtype":"someFutureSubtype","payload":"do-not-carry","session_id":"sess-d"}"#,

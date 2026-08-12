@@ -7,6 +7,9 @@
 //! Rust rather than `#!/bin/sh` because Windows cannot spawn a shell script:
 //! the harness hands the path straight to `CreateProcess`, which rejects a
 //! non-PE image with "%1 is not a valid Win32 application" (os error 193).
+//!
+//! Corpus-backed contracts: `codex-model-notification-order`,
+//! `codex-model-fixture-shape`, and `codex-routine-notification-fixture`.
 
 use std::io::{BufRead, StdinLock, Write};
 use std::process::exit;
@@ -14,12 +17,25 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use comet_harness::capture::approval_marker_command;
+
 /// One JSON-RPC line. Rust's stdout is line-buffered even on a pipe, so each
 /// line reaches the harness before the fixture blocks on its next read.
 fn emit(line: &str) {
     let mut out = std::io::stdout();
     let _ = writeln!(out, "{line}");
     let _ = out.flush();
+}
+
+/// Exceed any ordinary pipe capacity before answering discovery. A caller that
+/// pipes stderr without draining it blocks here and never reads the reply.
+fn fill_stderr() {
+    let chunk = [b'x'; 8192];
+    let mut stderr = std::io::stderr().lock();
+    for _ in 0..128 {
+        stderr.write_all(&chunk).expect("write discovery stderr");
+    }
+    stderr.flush().expect("flush discovery stderr");
 }
 
 /// `read -r line || exit 1`: EOF is a hard failure, not an empty line.
@@ -64,8 +80,7 @@ fn model_entry(
     levels: &[&str],
     modalities: Option<&[&str]>,
 ) -> Value {
-    // Objects, not strings — the shape the real server answers with (capture
-    // `2026-08-11-codex-model-list.md`), and the one the phase spec's field
+    // Objects, not strings, as pinned by `codex-model-fixture-shape`, and the one the phase spec's field
     // summary gets wrong.
     let efforts: Vec<Value> = levels
         .iter()
@@ -162,10 +177,9 @@ fn offset_of(cursor: &str) -> usize {
 fn model_list(stdin: &mut StdinLock<'_>, first: &str) {
     let models = discovery_models();
     let mut line = first.to_string();
-    // Every real session emits this, unprompted, before the reply the client is
-    // waiting on — on every run of the 2026-08-11 capture it arrived ahead of
-    // the `initialize` result. A client that reads the next line rather than
-    // the line carrying its own id takes this as its answer.
+    // The reviewed stream emits this after initialize succeeds and before the
+    // model-list reply. A client that reads the next line rather than the line
+    // carrying its requested id takes this notification as its answer.
     emit(
         r#"{"method":"remoteControl/status/changed","params":{"status":"disabled","hostname":"fake"}}"#,
     );
@@ -207,6 +221,9 @@ fn model_list(stdin: &mut StdinLock<'_>, first: &str) {
 }
 
 fn main() {
+    if std::env::var_os("CODEX_HOME").is_some() {
+        fill_stderr();
+    }
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
 
@@ -276,7 +293,49 @@ fn main() {
 
     // NOTE: steer-race before steer — the first match wins, and "scenario:steer"
     // is a prefix of "scenario:steer-race".
-    if turn_line.contains("scenario:happy") {
+    if turn_line.contains("scenario:capture-onrequest-identity-race:") {
+        capture_on_request_target_race(&mut stdin, &turn_line, &tid, "identity");
+    } else if turn_line.contains("scenario:capture-onrequest-target-race:") {
+        capture_on_request_target_race(&mut stdin, &turn_line, &tid, "target");
+    } else if turn_line.contains("scenario:capture-onrequest-marker-race:") {
+        capture_on_request_target_race(&mut stdin, &turn_line, &tid, "marker");
+    } else if turn_line.contains("scenario:capture-onrequest-destructive") {
+        capture_on_request_destructive(&mut stdin, &tid);
+    } else if turn_line.contains("scenario:capture-onrequest-out-of-order") {
+        capture_on_request_out_of_order(&mut stdin, &tid);
+    } else if turn_line.contains("scenario:capture-onrequest-zero:") {
+        capture_on_request(&mut stdin, &turn_line, &tid, json!(0), true);
+    } else if let Some(rest) = turn_line
+        .split("scenario:capture-onrequest-invalid-")
+        .nth(1)
+    {
+        let mode = rest.split(':').next().unwrap_or_default();
+        capture_on_request_invalid_id(&mut stdin, &turn_line, &tid, mode);
+    } else if turn_line.contains("scenario:capture-approval-destructive-command") {
+        capture_approval_destructive_command(&mut stdin, &tid);
+    } else if turn_line.contains("scenario:capture-approval-destructive-file") {
+        capture_approval_destructive_file(&mut stdin, &tid);
+    } else if turn_line.contains("scenario:capture-approval-missing-id") {
+        capture_approval_bad_id(&mut stdin, &tid, false);
+    } else if turn_line.contains("scenario:capture-approval-invalid-id") {
+        capture_approval_bad_id(&mut stdin, &tid, true);
+    } else if turn_line.contains("scenario:capture-approval-later-command") {
+        capture_approval_with_later_command(&mut stdin, &tid);
+    } else if let Some(rest) = turn_line
+        .split("scenario:capture-approval-deviation:")
+        .nth(1)
+    {
+        let mode = rest.split('"').next().unwrap_or_default();
+        capture_approval_deviation(&mut stdin, &tid, mode);
+    } else if turn_line.contains("scenario:capture-approval-single-launcher") {
+        capture_approval(&mut stdin, &tid);
+    } else if turn_line.contains("scenario:capture-onrequest:") {
+        capture_on_request(&mut stdin, &turn_line, &tid, json!(401), false);
+    } else if turn_line.contains("scenario:capture-approval") {
+        capture_approval(&mut stdin, &tid);
+    } else if turn_line.contains("scenario:capture-fresh") {
+        simple_completed(&tid);
+    } else if turn_line.contains("scenario:happy") {
         happy(&turn_line, &thread_line, &tid);
     } else if turn_line.contains("scenario:steer-race") {
         steer_race(&mut stdin, &tid);
@@ -305,6 +364,590 @@ fn main() {
     } else {
         fail_turn(&tid, "unknown scenario");
     }
+}
+
+fn simple_completed(tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+}
+
+fn approval_launcher() -> String {
+    let path = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|dir| dir.join("pwsh.exe"))
+        .find(|path| path.is_file())
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .expect("trusted pwsh on fixture PATH");
+    format!(r#""{}" -Command 'echo capture'"#, path.display())
+}
+
+fn command_item(id: &str, status: &str, exit_code: Option<i64>) -> serde_json::Value {
+    let item = json!({
+        "id": id,
+        "type": "commandExecution",
+        "pluginId": null,
+        "scriptPath": null,
+        "command": approval_launcher(),
+        "cwd": std::env::current_dir().expect("fixture cwd"),
+        "processId": null,
+        "source": null,
+        "status": status,
+        "commandActions": [{"type": "unknown", "command": "echo capture"}],
+        "aggregatedOutput": "",
+        "exitCode": exit_code,
+        "durationMs": null,
+    });
+    item
+}
+
+fn emit_command(method: &str, id: &str, status: &str, exit_code: Option<i64>) {
+    let timing = if method == "item/started" {
+        "startedAtMs"
+    } else {
+        "completedAtMs"
+    };
+    let mut params = json!({
+        "item": command_item(id, status, exit_code),
+        "threadId": "th-1",
+        "turnId": "t-1",
+    });
+    params[timing] = json!(1);
+    emit(&json!({"method": method, "params": params, "emittedAtMs": 1}).to_string());
+}
+
+fn emit_observed_command_prefix() {
+    for id in ["c1", "c2", "c3"] {
+        emit_command("item/started", id, "inProgress", None);
+    }
+    for id in ["c3", "c1"] {
+        emit_command("item/completed", id, "failed", Some(-1));
+    }
+    emit(r#"{"method":"account/updated","params":{}}"#);
+    let routine_start = json!({"type":"reasoning","id":"r1","summary":[],"content":[]});
+    let routine_complete =
+        json!({"type":"reasoning","id":"r1","summary":["bounded summary"],"content":[]});
+    emit(&json!({"method":"item/started","params":{"item":routine_start,"threadId":"th-1","turnId":"t-1","startedAtMs":1},"emittedAtMs":1}).to_string());
+    emit(&json!({"method":"item/completed","params":{"item":routine_complete,"threadId":"th-1","turnId":"t-1","completedAtMs":1},"emittedAtMs":1}).to_string());
+    let user = json!({"type":"userMessage","id":"u1","clientId":"client-1","content":[{"type":"text","text":"bounded prompt"}]});
+    emit(&json!({"method":"item/started","params":{"item":user,"threadId":"th-1","turnId":"t-1","startedAtMs":1},"emittedAtMs":1}).to_string());
+    emit(&json!({"method":"item/completed","params":{"item":user,"threadId":"th-1","turnId":"t-1","completedAtMs":1},"emittedAtMs":1}).to_string());
+    let message_start = json!({"type":"agentMessage","id":"a1","text":"","phase":"commentary","memoryCitation":null});
+    let message_complete = json!({"type":"agentMessage","id":"a1","text":"bounded response","phase":"commentary","memoryCitation":null});
+    emit(&json!({"method":"item/started","params":{"item":message_start,"threadId":"th-1","turnId":"t-1","startedAtMs":1},"emittedAtMs":1}).to_string());
+    emit(&json!({"method":"item/completed","params":{"item":message_complete,"threadId":"th-1","turnId":"t-1","completedAtMs":1},"emittedAtMs":1}).to_string());
+    emit_command("item/started", "c4", "inProgress", None);
+    emit_command("item/completed", "c4", "failed", Some(-1));
+    emit_command("item/started", "c5", "inProgress", None);
+    emit_command("item/completed", "c5", "failed", Some(-1));
+}
+
+fn emit_file_start(id: &str) {
+    let marker = std::env::current_dir()
+        .expect("fixture cwd")
+        .join("capture-marker.txt");
+    emit(&json!({"method":"item/started","params":{"item":{"type":"fileChange","id":id,"status":"inProgress","changes":[{"path":marker,"kind":{"type":"add"},"diff":"capture\n"}]},"threadId":"th-1","turnId":"t-1","startedAtMs":1},"emittedAtMs":1}).to_string());
+}
+
+fn emit_file_approval(id: serde_json::Value, item_id: &str) {
+    emit(&json!({"id":id,"method":"item/fileChange/requestApproval","params":{"threadId":"th-1","turnId":"t-1","itemId":item_id,"startedAtMs":1,"reason":null,"grantRoot":null}}).to_string());
+}
+
+fn emit_approval_turn_started() {
+    emit(&json!({"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"t-1","items":[],"itemsView":"notLoaded","status":"inProgress","error":null,"startedAt":1,"completedAt":null,"durationMs":null}},"emittedAtMs":1}).to_string());
+}
+
+fn emit_approval_terminal(method: &str) {
+    let status = if method == "turn/completed" {
+        "completed"
+    } else {
+        "failed"
+    };
+    emit(&json!({"method":method,"params":{"threadId":"th-1","turn":{"id":"t-1","items":[],"itemsView":"summary","status":status,"error":if method == "turn/completed" { Value::Null } else { json!({"message":"failed"}) },"startedAt":1,"completedAt":2,"durationMs":1}},"emittedAtMs":2}).to_string());
+}
+
+fn capture_approval_deviation(stdin: &mut StdinLock<'_>, tid: &str, mode: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit_approval_turn_started();
+    match mode {
+        "second-turn-start" => {
+            emit_approval_turn_started();
+            emit_observed_command_prefix();
+            emit_file_start("f1");
+            emit_file_approval(json!(0), "f1");
+        }
+        "missing-thread" => {
+            emit(&json!({"method":"item/started","params":{"item":command_item("c1","inProgress",None),"turnId":"t-1","startedAtMs":1}}).to_string());
+        }
+        "wrong-thread" => {
+            emit(&json!({"method":"item/started","params":{"item":command_item("c1","inProgress",None),"threadId":"wrong","turnId":"t-1","startedAtMs":1}}).to_string());
+        }
+        "missing-turn" => {
+            emit(&json!({"method":"item/started","params":{"item":command_item("c1","inProgress",None),"threadId":"th-1","startedAtMs":1}}).to_string());
+        }
+        "wrong-turn" => {
+            let params = json!({"item":command_item("c1","inProgress",None),"threadId":"th-1","turnId":"wrong","startedAtMs":1});
+            emit(&json!({"method":"item/started","params":params}).to_string());
+        }
+        "hidden-action" => emit(&json!({"method":"item/started","params":{"item":{"type":"mysteryAction","id":"hidden"},"threadId":"th-1","turnId":"t-1","startedAtMs":1}}).to_string()),
+        "file-extra-key" => {
+            emit_observed_command_prefix();
+            let marker = std::env::current_dir().unwrap().join("capture-marker.txt");
+            emit(&json!({"method":"item/started","params":{"item":{"type":"fileChange","id":"f1","status":"inProgress","changes":[{"path":marker,"kind":{"type":"add"},"diff":"capture\n","extra":true}]},"threadId":"th-1","turnId":"t-1","startedAtMs":1}}).to_string());
+        }
+        "file-missing-key" => {
+            emit_observed_command_prefix();
+            let marker = std::env::current_dir().unwrap().join("capture-marker.txt");
+            emit(&json!({"method":"item/started","params":{"item":{"type":"fileChange","id":"f1","status":"inProgress","changes":[{"path":marker,"kind":{"type":"add"}}]},"threadId":"th-1","turnId":"t-1","startedAtMs":1}}).to_string());
+        }
+        "file-missing-thread" | "file-wrong-thread" | "file-missing-turn" | "file-wrong-turn" => {
+            emit_observed_command_prefix();
+            let marker = std::env::current_dir().unwrap().join("capture-marker.txt");
+            let mut params = json!({"item":{"type":"fileChange","id":"f1","status":"inProgress","changes":[{"path":marker,"kind":{"type":"add"},"diff":"capture\n"}]},"threadId":"th-1","turnId":"t-1","startedAtMs":1});
+            match mode {
+                "file-missing-thread" => { params.as_object_mut().unwrap().remove("threadId"); }
+                "file-wrong-thread" => params["threadId"] = json!("wrong"),
+                "file-missing-turn" => { params.as_object_mut().unwrap().remove("turnId"); }
+                "file-wrong-turn" => params["turnId"] = json!("wrong"),
+                _ => unreachable!(),
+            }
+            emit(&json!({"method":"item/started","params":params}).to_string());
+        }
+        "request-extra-key" => {
+            emit_observed_command_prefix(); emit_file_start("f1");
+            emit(&json!({"id":0,"method":"item/fileChange/requestApproval","params":{"threadId":"th-1","turnId":"t-1","itemId":"f1","startedAtMs":1,"reason":null,"grantRoot":null,"extra":true}}).to_string());
+        }
+        "request-missing-key" | "request-missing-thread" | "request-wrong-thread" | "request-missing-turn" | "request-wrong-turn" => {
+            emit_observed_command_prefix(); emit_file_start("f1");
+            let mut params = json!({"threadId":"th-1","turnId":"t-1","itemId":"f1","startedAtMs":1,"reason":null,"grantRoot":null});
+            match mode {
+                "request-missing-key" => { params.as_object_mut().unwrap().remove("reason"); }
+                "request-missing-thread" => { params.as_object_mut().unwrap().remove("threadId"); }
+                "request-wrong-thread" => params["threadId"] = json!("wrong"),
+                "request-missing-turn" => { params.as_object_mut().unwrap().remove("turnId"); }
+                "request-wrong-turn" => params["turnId"] = json!("wrong"),
+                _ => unreachable!(),
+            }
+            emit(&json!({"id":0,"method":"item/fileChange/requestApproval","params":params}).to_string());
+        }
+        "routine-mismatch" => {
+            let started = json!({"type":"reasoning","id":"r1","summary":[],"content":[]});
+            let completed = json!({"type":"reasoning","id":"r1","summary":["changed"],"content":["changed invariant"]});
+            emit(&json!({"method":"item/started","params":{"item":started,"threadId":"th-1","turnId":"t-1","startedAtMs":1},"emittedAtMs":1}).to_string());
+            emit(&json!({"method":"item/completed","params":{"item":completed,"threadId":"th-1","turnId":"t-1","completedAtMs":1},"emittedAtMs":1}).to_string());
+        }
+        "routine-type-change" | "routine-id-change" | "routine-completion-without-start" => {
+            let started = json!({"type":"reasoning","id":"r1","summary":[],"content":[]});
+            if mode != "routine-completion-without-start" {
+                emit(&json!({"method":"item/started","params":{"item":started,"threadId":"th-1","turnId":"t-1","startedAtMs":1},"emittedAtMs":1}).to_string());
+            }
+            let completed = match mode {
+                "routine-type-change" => json!({"type":"agentMessage","id":"r1","text":"done","phase":"commentary","memoryCitation":null}),
+                "routine-id-change" => json!({"type":"reasoning","id":"r2","summary":["done"],"content":[]}),
+                _ => json!({"type":"reasoning","id":"r1","summary":["done"],"content":[]}),
+            };
+            emit(&json!({"method":"item/completed","params":{"item":completed,"threadId":"th-1","turnId":"t-1","completedAtMs":1},"emittedAtMs":1}).to_string());
+        }
+        "marker-preapproval" => {
+            emit_observed_command_prefix(); emit_file_start("f1");
+            std::fs::write("capture-marker.txt", "capture\n").unwrap();
+            emit_file_approval(json!(0), "f1");
+        }
+        "cwd-replaced" => {
+            emit_observed_command_prefix(); emit_file_start("f1");
+            let cwd = std::env::current_dir().unwrap();
+            let parent = cwd.parent().unwrap().to_owned();
+            let backup = parent.join("replaced-capture-cwd");
+            std::env::set_current_dir(&parent).unwrap();
+            std::fs::rename(&cwd, &backup).unwrap();
+            std::fs::create_dir(&cwd).unwrap();
+            emit_file_approval(json!(0), "f1");
+        }
+        "wrong-order" => emit_command("item/completed", "c1", "failed", Some(-1)),
+        "duplicate-start" => {
+            emit_command("item/started", "c1", "inProgress", None);
+            emit_command("item/started", "c1", "inProgress", None);
+        }
+        "wrong-completion-id" => {
+            for id in ["c1", "c2", "c3"] {
+                emit_command("item/started", id, "inProgress", None);
+            }
+            emit_command("item/completed", "other", "failed", Some(-1));
+        }
+        "wrong-status" => {
+            for id in ["c1", "c2", "c3"] {
+                emit_command("item/started", id, "inProgress", None);
+            }
+            emit_command("item/completed", "c3", "completed", Some(0));
+        }
+        "wrong-exit" => {
+            for id in ["c1", "c2", "c3"] {
+                emit_command("item/started", id, "inProgress", None);
+            }
+            emit_command("item/completed", "c3", "failed", Some(1));
+        }
+        "wrong-fields" => {
+            for id in ["c1", "c2", "c3"] {
+                emit_command("item/started", id, "inProgress", None);
+            }
+            let mut item = command_item("c3", "failed", Some(-1));
+            item["cwd"] = json!("C:\\outside");
+            emit(&json!({"method":"item/completed","params":{"item":item,"threadId":"th-1","turnId":"t-1","completedAtMs":1}}).to_string());
+        }
+        "command-approval" => emit(
+            r#"{"id":55,"method":"item/commandExecution/requestApproval","params":{"itemId":"c1"}}"#,
+        ),
+        "missing-completion" => {
+            for id in ["c1", "c2", "c3"] {
+                emit_command("item/started", id, "inProgress", None);
+            }
+            for id in ["c3", "c1"] {
+                emit_command("item/completed", id, "failed", Some(-1));
+            }
+            emit_command("item/started", "c4", "inProgress", None);
+            emit_command("item/completed", "c4", "failed", Some(-1));
+            emit_command("item/started", "c5", "inProgress", None);
+            emit_file_start("f1");
+            emit(
+                r#"{"id":0,"method":"item/fileChange/requestApproval","params":{"threadId":"th-1","turnId":"t-1","itemId":"f1","startedAtMs":1,"reason":null,"grantRoot":null}}"#,
+            );
+        }
+        "extra-file" => {
+            emit_observed_command_prefix();
+            emit_file_start("f1");
+            emit_file_start("f2");
+        }
+        "extra-approval" => {
+            emit_observed_command_prefix();
+            emit_file_start("f1");
+            emit(
+                r#"{"id":0,"method":"item/fileChange/requestApproval","params":{"threadId":"th-1","turnId":"t-1","itemId":"f1","startedAtMs":1,"reason":null,"grantRoot":null}}"#,
+            );
+            let _ = read_line(stdin);
+            emit(
+                r#"{"id":1,"method":"item/fileChange/requestApproval","params":{"threadId":"th-1","turnId":"t-1","itemId":"f1","startedAtMs":1,"reason":null,"grantRoot":null}}"#,
+            );
+        }
+        "marker-missing" | "marker-wrong" | "marker-link" | "terminal-failed" | "terminal-mismatch" | "terminal-missing-thread" | "terminal-wrong-thread" | "terminal-missing-turn" => {
+            emit_observed_command_prefix();
+            emit_file_start("f1");
+            emit(
+                r#"{"id":0,"method":"item/fileChange/requestApproval","params":{"threadId":"th-1","turnId":"t-1","itemId":"f1","startedAtMs":1,"reason":null,"grantRoot":null}}"#,
+            );
+            let _ = read_line(stdin);
+            if mode == "marker-wrong" {
+                std::fs::write("capture-marker.txt", "wrong\n").unwrap();
+            } else if mode == "marker-link" {
+                let target = std::env::current_dir().unwrap().join("linked-marker-target");
+                std::fs::create_dir(&target).unwrap();
+                #[cfg(windows)]
+                {
+                    let status = std::process::Command::new("cmd.exe")
+                        .args(["/D", "/C", "mklink", "/J", "capture-marker.txt"])
+                        .arg(&target)
+                        .status()
+                        .unwrap();
+                    assert!(status.success());
+                }
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&target, "capture-marker.txt").unwrap();
+            }
+            if matches!(mode, "marker-missing" | "marker-wrong" | "marker-link") {
+                emit_approval_terminal("turn/completed");
+            } else {
+            let terminal = if mode == "terminal-failed" {
+                json!({"method":"turn/failed","params":{"threadId":"th-1","turn":{"id":"t-1","items":[],"itemsView":"summary","status":"failed","error":{"message":"failed"},"startedAt":1,"completedAt":2,"durationMs":1}},"emittedAtMs":2})
+            } else if mode == "terminal-mismatch" {
+                json!({"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"wrong","items":[],"itemsView":"summary","status":"completed","error":null,"startedAt":1,"completedAt":2,"durationMs":1}},"emittedAtMs":2})
+            } else if mode == "terminal-missing-thread" {
+                json!({"method":"turn/completed","params":{"turn":{"id":"t-1","items":[],"itemsView":"summary","status":"completed","error":null,"startedAt":1,"completedAt":2,"durationMs":1}},"emittedAtMs":2})
+            } else if mode == "terminal-wrong-thread" {
+                json!({"method":"turn/completed","params":{"threadId":"wrong","turn":{"id":"t-1","items":[],"itemsView":"summary","status":"completed","error":null,"startedAt":1,"completedAt":2,"durationMs":1}},"emittedAtMs":2})
+            } else if mode == "terminal-missing-turn" {
+                json!({"method":"turn/completed","params":{"threadId":"th-1","turn":{}},"emittedAtMs":2})
+            } else {
+                unreachable!()
+            };
+            emit(&terminal.to_string());
+            }
+        }
+        "hidden-after" => {
+            emit_observed_command_prefix(); emit_file_start("f1"); emit_file_approval(json!(0), "f1");
+            let _ = read_line(stdin);
+            emit(&json!({"method":"item/started","params":{"item":{"type":"mysteryAction","id":"hidden"},"threadId":"th-1","turnId":"t-1","startedAtMs":1}}).to_string());
+        }
+        _ => emit(r#"{"method":"turn/failed","params":{"turn":{"id":"t-1"}}}"#),
+    }
+    let _ = read_line(stdin);
+}
+
+fn capture_approval(stdin: &mut StdinLock<'_>, tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit_approval_turn_started();
+    emit_observed_command_prefix();
+    emit_file_start("f-capture");
+    emit_file_approval(json!(0), "f-capture");
+    let reply = read_line(stdin);
+    if !(reply.contains(r#""id":0"#) && reply.contains(r#""decision":"accept""#)) {
+        fail_turn(tid, "capture file approval not accepted");
+        return;
+    }
+    std::fs::write("capture-marker.txt", "capture\n").expect("fixture marker");
+    emit_approval_terminal("turn/completed");
+}
+
+fn capture_approval_with_later_command(stdin: &mut StdinLock<'_>, tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit_approval_turn_started();
+    emit_observed_command_prefix();
+    emit_file_start("f-capture");
+    emit_file_approval(json!(0), "f-capture");
+    let reply = read_line(stdin);
+    if !reply.contains(r#""decision":"accept""#) {
+        return;
+    }
+    emit_command("item/started", "late", "inProgress", None);
+    let _ = read_line(stdin);
+}
+
+fn capture_approval_bad_id(stdin: &mut StdinLock<'_>, tid: &str, invalid: bool) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit_approval_turn_started();
+    emit_observed_command_prefix();
+    emit_file_start("bad-id");
+    if invalid {
+        emit_file_approval(json!("bad"), "bad-id");
+    } else {
+        emit(
+            r#"{"method":"item/fileChange/requestApproval","params":{"threadId":"th-1","turnId":"t-1","itemId":"bad-id","startedAtMs":1,"reason":null,"grantRoot":null}}"#,
+        );
+    }
+    let _ = read_line(stdin);
+}
+
+fn capture_approval_destructive_command(stdin: &mut StdinLock<'_>, tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit_approval_turn_started();
+    let mut item = command_item("bad-command", "inProgress", None);
+    item["commandActions"] = json!([{"type":"unknown","command":"remove everything"}]);
+    emit(&json!({"method":"item/started","params":{"item":item,"threadId":"th-1","turnId":"t-1","startedAtMs":1},"emittedAtMs":1}).to_string());
+    let _ = read_line(stdin);
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+}
+
+fn capture_approval_destructive_file(stdin: &mut StdinLock<'_>, tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit_approval_turn_started();
+    emit_observed_command_prefix();
+    emit(
+        r#"{"method":"item/started","params":{"item":{"type":"fileChange","id":"bad-file","status":"inProgress","changes":[{"path":"../outside.txt","kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-safe\n+destroyed\n"}]},"threadId":"th-1","turnId":"t-1","startedAtMs":1},"emittedAtMs":1}"#,
+    );
+    emit(
+        r#"{"id":464,"method":"item/fileChange/requestApproval","params":{"itemId":"bad-file","reason":"overwrite outside cwd"}}"#,
+    );
+    let _ = read_line(stdin);
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+}
+
+fn capture_on_request(
+    stdin: &mut StdinLock<'_>,
+    turn_line: &str,
+    tid: &str,
+    request_id: Value,
+    duplicate: bool,
+) {
+    let turn: serde_json::Value = serde_json::from_str(turn_line).expect("turn JSON");
+    let text = turn["params"]["input"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    let target = text
+        .strip_prefix("scenario:capture-onrequest:")
+        .or_else(|| text.strip_prefix("scenario:capture-onrequest-zero:"))
+        .unwrap_or_default();
+    let command = approval_marker_command(std::path::Path::new(target));
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(
+        &json!({"method":"item/completed","params":{"item":{
+            "id":"sandboxed","type":"commandExecution","command":command,
+            "status":"failed","exitCode":1
+        }}})
+        .to_string(),
+    );
+    emit(
+        &json!({"id":request_id,"method":"item/commandExecution/requestApproval","params":{
+            "itemId":"sandboxed","command":command,
+            "commandActions":[{"type":"unknown","command":command}],
+            "reason":"sandbox denied the external target"
+        }})
+        .to_string(),
+    );
+    let reply = read_line(stdin);
+    let replied_id = serde_json::from_str::<Value>(&reply)
+        .ok()
+        .map(|value| value["id"].clone());
+    if replied_id != Some(request_id.clone()) || !reply.contains(r#""decision":"accept""#) {
+        fail_turn(tid, "on-request approval not accepted");
+        return;
+    }
+    if duplicate {
+        emit(&json!({"id":request_id,"method":"item/commandExecution/requestApproval","params":{"itemId":"sandboxed","command":command,"commandActions":[{"type":"unknown","command":command}],"reason":"sandbox denied the external target"}}).to_string());
+        let _ = read_line(stdin);
+        return;
+    }
+    emit(
+        &json!({"method":"item/completed","params":{"item":{
+            "id":"sandboxed","type":"commandExecution","command":command,
+            "status":"completed","exitCode":0
+        }}})
+        .to_string(),
+    );
+    std::fs::write(
+        std::path::Path::new(target).join("approval-marker.txt"),
+        "capture",
+    )
+    .expect("write capture marker");
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+}
+
+fn capture_on_request_invalid_id(
+    stdin: &mut StdinLock<'_>,
+    turn_line: &str,
+    tid: &str,
+    mode: &str,
+) {
+    let turn: Value = serde_json::from_str(turn_line).expect("turn JSON");
+    let text = turn["params"]["input"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    let prefix = format!("scenario:capture-onrequest-invalid-{mode}:");
+    let target = text.strip_prefix(&prefix).unwrap_or_default();
+    let command = approval_marker_command(std::path::Path::new(target));
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(
+        &json!({"method":"item/completed","params":{"item":{
+            "id":"sandboxed","type":"commandExecution","command":command,
+            "status":"failed","exitCode":1
+        }}})
+        .to_string(),
+    );
+    let mut request = json!({"id":0,"method":"item/commandExecution/requestApproval","params":{
+        "itemId":"sandboxed","command":command,
+        "commandActions":[{"type":"unknown","command":command}],
+        "reason":"sandbox denied the external target"
+    }});
+    match mode {
+        "missing" => {
+            request.as_object_mut().unwrap().remove("id");
+        }
+        "null" => request["id"] = Value::Null,
+        "string" => request["id"] = json!("0"),
+        "negative" => request["id"] = json!(-1),
+        "fraction" => request["id"] = json!(0.5),
+        "bool" => request["id"] = json!(true),
+        "object" => request["id"] = json!({}),
+        "array" => request["id"] = json!([]),
+        _ => exit(3),
+    }
+    emit(&request.to_string());
+    let _ = read_line(stdin);
+}
+
+fn capture_on_request_out_of_order(stdin: &mut StdinLock<'_>, tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(
+        r#"{"id":402,"method":"item/commandExecution/requestApproval","params":{"itemId":"early","command":"write marker","reason":"sandbox denied target"}}"#,
+    );
+    let _ = read_line(stdin);
+}
+
+fn capture_on_request_destructive(stdin: &mut StdinLock<'_>, tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(
+        r#"{"method":"item/completed","params":{"item":{"id":"sandboxed-bad","type":"commandExecution","command":"rm -rf /","status":"failed","exitCode":1}}}"#,
+    );
+    emit(
+        r#"{"id":471,"method":"item/commandExecution/requestApproval","params":{"itemId":"sandboxed-bad","command":"rm -rf /","reason":"sandbox denied destructive command"}}"#,
+    );
+    let _ = read_line(stdin);
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+}
+
+fn capture_on_request_target_race(
+    stdin: &mut StdinLock<'_>,
+    turn_line: &str,
+    tid: &str,
+    race: &str,
+) {
+    let turn: serde_json::Value = serde_json::from_str(turn_line).expect("turn JSON");
+    let text = turn["params"]["input"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    let prefix = match race {
+        "marker" => "scenario:capture-onrequest-marker-race:",
+        "identity" => "scenario:capture-onrequest-identity-race:",
+        _ => "scenario:capture-onrequest-target-race:",
+    };
+    let target = text.strip_prefix(prefix).unwrap_or_default();
+    let command = approval_marker_command(std::path::Path::new(target));
+    if race == "identity" {
+        let original = format!("{target}.original");
+        std::fs::rename(target, &original).expect("move original target");
+        std::fs::create_dir(target).expect("replace target directory");
+    } else {
+        let raced_path = std::path::Path::new(target).join(if race == "marker" {
+            "approval-marker.txt"
+        } else {
+            "unexpected.txt"
+        });
+        std::fs::write(raced_path, "hostile").expect("create raced target entry");
+    }
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(
+        &json!({"method":"item/completed","params":{"item":{
+            "id":"sandboxed","type":"commandExecution","command":command,
+            "status":"failed","exitCode":1
+        }}})
+        .to_string(),
+    );
+    emit(
+        &json!({"id":481,"method":"item/commandExecution/requestApproval","params":{
+            "itemId":"sandboxed","command":command,
+            "commandActions":[{"type":"unknown","command":command}],
+            "reason":"sandbox denied target"
+        }})
+        .to_string(),
+    );
+    let _ = read_line(stdin);
 }
 
 fn happy(turn_line: &str, thread_line: &str, tid: &str) {
@@ -457,7 +1100,8 @@ fn steer(stdin: &mut StdinLock<'_>, tid: &str) {
     let sid = rid(&steer_line);
     if steer_line.contains(r#""method":"turn/steer""#)
         && steer_line.contains(r#""expectedTurnId":"t-1""#)
-        && steer_line.contains("redirect please")
+        && (steer_line.contains("redirect please")
+            || steer_line.contains("Capture steering message."))
     {
         emit(&format!(r#"{{"id":{sid},"result":{{}}}}"#));
         emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"steered"}}"#);
