@@ -312,6 +312,477 @@ pub enum SanitizationError {
     },
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum CorpusError {
+    #[error("provider corpus index could not be read ({kind:?})")]
+    IndexRead { kind: std::io::ErrorKind },
+    #[error("provider corpus index is not valid schema JSON at line {line}, column {column}")]
+    InvalidIndex { line: usize, column: usize },
+    #[error("provider corpus index schema version {version} is unsupported; expected version 1")]
+    UnsupportedIndexSchemaVersion { version: u64 },
+    #[error("provider corpus claim id {claim_id:?} is duplicated")]
+    DuplicateClaimId { claim_id: String },
+    #[error("provider corpus claim {claim_id:?} has a non-canonical or unsafe manifest path")]
+    UnsafeManifestPath { claim_id: String },
+    #[error("provider corpus claim {claim_id:?} is missing manifest {manifest}")]
+    MissingManifest { claim_id: String, manifest: String },
+    #[error(
+        "provider corpus manifest {manifest} for claim {claim_id:?} is invalid at line {line}, column {column}"
+    )]
+    InvalidManifest {
+        claim_id: String,
+        manifest: String,
+        line: usize,
+        column: usize,
+    },
+    #[error(
+        "provider corpus manifest {manifest} for claim {claim_id:?} uses unsupported schema version {version}; expected version 1"
+    )]
+    UnsupportedManifestSchemaVersion {
+        claim_id: String,
+        manifest: String,
+        version: u64,
+    },
+    #[error(
+        "provider corpus manifest {manifest} does not name consumer {consumer:?} for claim {claim_id:?}"
+    )]
+    MissingManifestConsumer {
+        claim_id: String,
+        manifest: String,
+        consumer: String,
+    },
+    #[error("provider corpus claim {claim_id:?} is missing events beside {manifest}")]
+    MissingEvents { claim_id: String, manifest: String },
+    #[error("provider corpus event line {line} for claim {claim_id:?} is invalid")]
+    InvalidEvent { claim_id: String, line: usize },
+    #[error(
+        "provider corpus events for claim {claim_id:?} expected sequence {expected}, found {actual}"
+    )]
+    NonContiguousEventSequence {
+        claim_id: String,
+        manifest: String,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("provider corpus claim {claim_id:?} references missing frame {sequence} in {manifest}")]
+    MissingFrame {
+        claim_id: String,
+        manifest: String,
+        sequence: u64,
+    },
+    #[error(
+        "provider corpus claim {claim_id:?} frame {sequence} expects {expected:?}, found {actual:?}"
+    )]
+    FrameChannelMismatch {
+        claim_id: String,
+        sequence: u64,
+        expected: Channel,
+        actual: Channel,
+    },
+    #[error(
+        "provider corpus claim {claim_id:?} contains unresolved placeholder syntax at {location}"
+    )]
+    UnresolvedPlaceholder {
+        claim_id: String,
+        location: &'static str,
+    },
+    #[error("provider corpus claim {claim_id:?} was not found")]
+    ClaimNotFound { claim_id: String },
+    #[error("provider corpus claim {claim_id:?} selects {count} frames; exactly one is required")]
+    SelectedFrameCount { claim_id: String, count: usize },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CorpusIndex {
+    schema_version: u64,
+    claims: Vec<CorpusClaim>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CorpusClaim {
+    id: String,
+    consumer: String,
+    manifest: String,
+    frames: Vec<ClaimFrame>,
+    fact: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct ClaimFrame {
+    sequence: u64,
+    channel: Channel,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct CorpusManifest {
+    schema_version: u64,
+    source: String,
+    provider: Provider,
+    cli_version: String,
+    normalized_cli_version: String,
+    platform: PlatformMetadata,
+    command: CorpusCommand,
+    channels: Vec<Channel>,
+    exit_code: Option<i32>,
+    placeholders: Vec<PlaceholderDefinition>,
+    redaction_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    consumers: Vec<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct CorpusCommand {
+    program: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    configured_env: BTreeMap<String, String>,
+    stdin: StdioMode,
+    stdout: StdioMode,
+    stderr: StdioMode,
+    kill_on_drop: bool,
+    #[serde(default)]
+    creation_flags: Option<u32>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct PlaceholderDefinition {
+    placeholder: String,
+    kind: String,
+}
+
+/// Validate every claim in a checked-in provider corpus without stopping at the first absent
+/// evidence file. Index-shape errors are global; artifact errors are returned once per claim.
+pub fn validate_corpus(corpus_root: &Path) -> Vec<CorpusError> {
+    let index = match read_index(corpus_root) {
+        Ok(index) => index,
+        Err(error) => return vec![error],
+    };
+
+    if let Some(duplicate) = duplicate_claim_id(&index.claims) {
+        return vec![CorpusError::DuplicateClaimId {
+            claim_id: duplicate,
+        }];
+    }
+
+    index
+        .claims
+        .iter()
+        .filter_map(|claim| validate_claim(corpus_root, claim).err())
+        .collect()
+}
+
+/// Return the provider's literal payload for a claim that references exactly one event frame.
+/// The payload is never decoded into or reserialized through a Comet wire type.
+pub fn selected_payload(corpus_root: &Path, claim_id: &str) -> Result<String, CorpusError> {
+    let index = read_index(corpus_root)?;
+    if let Some(duplicate) = duplicate_claim_id(&index.claims) {
+        return Err(CorpusError::DuplicateClaimId {
+            claim_id: duplicate,
+        });
+    }
+    let claim = index
+        .claims
+        .iter()
+        .find(|claim| claim.id == claim_id)
+        .ok_or_else(|| CorpusError::ClaimNotFound {
+            claim_id: claim_id.to_owned(),
+        })?;
+    if claim.frames.len() != 1 {
+        return Err(CorpusError::SelectedFrameCount {
+            claim_id: claim.id.clone(),
+            count: claim.frames.len(),
+        });
+    }
+    let frame = claim.frames[0];
+    let events = validate_claim(corpus_root, claim)?;
+    events
+        .into_iter()
+        .find(|event| event.sequence == frame.sequence)
+        .map(|event| event.payload)
+        .ok_or_else(|| CorpusError::MissingFrame {
+            claim_id: claim.id.clone(),
+            manifest: claim.manifest.clone(),
+            sequence: frame.sequence,
+        })
+}
+
+fn read_index(corpus_root: &Path) -> Result<CorpusIndex, CorpusError> {
+    let bytes =
+        std::fs::read(corpus_root.join("index.json")).map_err(|source| CorpusError::IndexRead {
+            kind: source.kind(),
+        })?;
+    let value: Value =
+        serde_json::from_slice(&bytes).map_err(|source| CorpusError::InvalidIndex {
+            line: source.line(),
+            column: source.column(),
+        })?;
+    let version = value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .ok_or(CorpusError::InvalidIndex { line: 0, column: 0 })?;
+    if version != 1 {
+        return Err(CorpusError::UnsupportedIndexSchemaVersion { version });
+    }
+    let index: CorpusIndex =
+        serde_json::from_value(value).map_err(|source| CorpusError::InvalidIndex {
+            line: source.line(),
+            column: source.column(),
+        })?;
+    debug_assert_eq!(index.schema_version, 1);
+    if let Some(claim) = index.claims.iter().find(|claim| {
+        [&claim.id, &claim.consumer, &claim.manifest, &claim.fact]
+            .into_iter()
+            .any(|value| contains_unresolved_placeholder(value.as_bytes()))
+    }) {
+        return Err(CorpusError::UnresolvedPlaceholder {
+            claim_id: claim.id.clone(),
+            location: "index",
+        });
+    }
+    Ok(index)
+}
+
+fn duplicate_claim_id(claims: &[CorpusClaim]) -> Option<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    claims
+        .iter()
+        .find(|claim| !seen.insert(claim.id.as_str()))
+        .map(|claim| claim.id.clone())
+}
+
+fn validate_claim(
+    corpus_root: &Path,
+    claim: &CorpusClaim,
+) -> Result<Vec<CaptureEvent>, CorpusError> {
+    if !is_canonical_relative_path(&claim.manifest) {
+        return Err(CorpusError::UnsafeManifestPath {
+            claim_id: claim.id.clone(),
+        });
+    }
+    let manifest_path = corpus_root.join(&claim.manifest);
+    let manifest_bytes = match std::fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CorpusError::MissingManifest {
+                claim_id: claim.id.clone(),
+                manifest: claim.manifest.clone(),
+            });
+        }
+        Err(source) => {
+            return Err(CorpusError::InvalidManifest {
+                claim_id: claim.id.clone(),
+                manifest: claim.manifest.clone(),
+                line: 0,
+                column: source.raw_os_error().unwrap_or_default() as usize,
+            });
+        }
+    };
+    if !existing_path_stays_below(corpus_root, &manifest_path) {
+        return Err(CorpusError::UnsafeManifestPath {
+            claim_id: claim.id.clone(),
+        });
+    }
+    if contains_unresolved_placeholder(&manifest_bytes) {
+        return Err(CorpusError::UnresolvedPlaceholder {
+            claim_id: claim.id.clone(),
+            location: "manifest",
+        });
+    }
+    let manifest_value: Value =
+        serde_json::from_slice(&manifest_bytes).map_err(|source| CorpusError::InvalidManifest {
+            claim_id: claim.id.clone(),
+            manifest: claim.manifest.clone(),
+            line: source.line(),
+            column: source.column(),
+        })?;
+    let version = manifest_value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| CorpusError::InvalidManifest {
+            claim_id: claim.id.clone(),
+            manifest: claim.manifest.clone(),
+            line: 0,
+            column: 0,
+        })?;
+    if version != 1 {
+        return Err(CorpusError::UnsupportedManifestSchemaVersion {
+            claim_id: claim.id.clone(),
+            manifest: claim.manifest.clone(),
+            version,
+        });
+    }
+    let manifest: CorpusManifest =
+        serde_json::from_value(manifest_value).map_err(|source| CorpusError::InvalidManifest {
+            claim_id: claim.id.clone(),
+            manifest: claim.manifest.clone(),
+            line: source.line(),
+            column: source.column(),
+        })?;
+    if !manifest.consumers.contains(&claim.consumer) {
+        return Err(CorpusError::MissingManifestConsumer {
+            claim_id: claim.id.clone(),
+            manifest: claim.manifest.clone(),
+            consumer: claim.consumer.clone(),
+        });
+    }
+
+    let events_path = manifest_path.with_file_name("events.jsonl");
+    let events_bytes = match std::fs::read(&events_path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CorpusError::MissingEvents {
+                claim_id: claim.id.clone(),
+                manifest: claim.manifest.clone(),
+            });
+        }
+        Err(_) => {
+            return Err(CorpusError::InvalidEvent {
+                claim_id: claim.id.clone(),
+                line: 0,
+            });
+        }
+    };
+    if !existing_path_stays_below(corpus_root, &events_path) {
+        return Err(CorpusError::UnsafeManifestPath {
+            claim_id: claim.id.clone(),
+        });
+    }
+    if contains_unresolved_placeholder(&events_bytes) {
+        return Err(CorpusError::UnresolvedPlaceholder {
+            claim_id: claim.id.clone(),
+            location: "events",
+        });
+    }
+
+    let mut events = Vec::new();
+    for (offset, line) in events_bytes.split(|byte| *byte == b'\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let event: CaptureEvent =
+            serde_json::from_slice(line).map_err(|_| CorpusError::InvalidEvent {
+                claim_id: claim.id.clone(),
+                line: offset + 1,
+            })?;
+        let expected = events.len() as u64 + 1;
+        if event.sequence != expected {
+            return Err(CorpusError::NonContiguousEventSequence {
+                claim_id: claim.id.clone(),
+                manifest: claim.manifest.clone(),
+                expected,
+                actual: event.sequence,
+            });
+        }
+        events.push(event);
+    }
+
+    for frame in &claim.frames {
+        let Some(event) = events.iter().find(|event| event.sequence == frame.sequence) else {
+            return Err(CorpusError::MissingFrame {
+                claim_id: claim.id.clone(),
+                manifest: claim.manifest.clone(),
+                sequence: frame.sequence,
+            });
+        };
+        if event.channel != frame.channel {
+            return Err(CorpusError::FrameChannelMismatch {
+                claim_id: claim.id.clone(),
+                sequence: frame.sequence,
+                expected: frame.channel,
+                actual: event.channel,
+            });
+        }
+    }
+    Ok(events)
+}
+
+fn is_canonical_relative_path(path: &str) -> bool {
+    if path.is_empty()
+        || path.contains('\\')
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains("//")
+        || path.contains(':')
+    {
+        return false;
+    }
+    let path_value = Path::new(path);
+    if path_value.file_name().and_then(|name| name.to_str()) != Some("manifest.json") {
+        return false;
+    }
+    let normalized = path_value
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => value.to_string_lossy().into_owned(),
+            _ => String::new(),
+        })
+        .collect::<Vec<_>>();
+    !normalized.iter().any(String::is_empty) && normalized.join("/") == path
+}
+
+fn existing_path_stays_below(corpus_root: &Path, path: &Path) -> bool {
+    let Ok(root) = std::fs::canonicalize(corpus_root) else {
+        return false;
+    };
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    path.starts_with(root)
+}
+
+fn contains_unresolved_placeholder(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    if text.contains("{{") || text.contains("${") || text.contains("[REDACTED]") {
+        return true;
+    }
+    let mut remaining = text.as_ref();
+    while let Some(start) = remaining.find('<') {
+        remaining = &remaining[start + 1..];
+        let Some(end) = remaining.find('>') else {
+            break;
+        };
+        let candidate = &remaining[..end];
+        if !candidate.is_empty()
+            && candidate
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            && !is_known_placeholder(candidate)
+        {
+            return true;
+        }
+        remaining = &remaining[end + 1..];
+    }
+    false
+}
+
+fn is_known_placeholder(candidate: &str) -> bool {
+    if matches!(candidate, "CWD" | "REPO" | "HOME" | "TEMP") {
+        return true;
+    }
+    const INDEXED: &[&str] = &[
+        "CLAUDE_REQUEST_ID",
+        "CODEX_RPC_ID",
+        "SESSION_ID",
+        "THREAD_ID",
+        "TURN_ID",
+        "TOOL_USE_ID",
+        "USER_TEXT",
+        "ASSISTANT_PROSE",
+        "ATTACHMENT_BYTES",
+    ];
+    INDEXED.iter().any(|prefix| {
+        candidate
+            .strip_prefix(prefix)
+            .and_then(|suffix| suffix.strip_prefix('_'))
+            .is_some_and(|number| {
+                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum RedactionKind {
     ClaudeRequestId,

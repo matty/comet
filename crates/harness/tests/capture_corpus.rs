@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use comet_harness::capture::{SanitizationError, sanitize_dir};
+use comet_harness::capture::{
+    CorpusError, SanitizationError, sanitize_dir, selected_payload, validate_corpus,
+};
 use serde_json::Value;
 
 fn staging_dir(root: &Path, name: &str) -> PathBuf {
@@ -60,6 +62,351 @@ fn sanitized_payloads(events_bytes: &[u8]) -> Vec<Value> {
             serde_json::from_str(event["payload"].as_str().unwrap()).unwrap()
         })
         .collect()
+}
+
+fn write_valid_literal_corpus(root: &Path) {
+    let scenario = root.join("claude/2.1.227/model-discovery");
+    std::fs::create_dir_all(&scenario).unwrap();
+    std::fs::write(
+        root.join("index.json"),
+        r#"{
+  "schema_version": 1,
+  "claims": [
+    {
+      "id": "claude-model-reply",
+      "consumer": "crates/harness/src/claude/discovery.rs:the_captured_reply_decodes_onto_curated_ids",
+      "manifest": "claude/2.1.227/model-discovery/manifest.json",
+      "frames": [{"sequence": 2, "channel": "stdout"}],
+      "fact": "The initialize response nests the provider model list twice."
+    }
+  ]
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        scenario.join("manifest.json"),
+        r#"{
+  "schema_version": 1,
+  "source": "capture.json",
+  "provider": "claude",
+  "cli_version": "2.1.227 (Claude Code)",
+  "normalized_cli_version": "2.1.227 (Claude Code)",
+  "platform": {"os": "windows", "arch": "x86_64"},
+  "command": {
+    "program": "claude",
+    "args": ["--print", "--input-format", "stream-json"],
+    "cwd": "<TEMP>",
+    "configured_env": {},
+    "stdin": "Piped",
+    "stdout": "Piped",
+    "stderr": "Piped",
+    "kill_on_drop": true,
+    "creation_flags": 134217728
+  },
+  "channels": ["stdin", "stdout", "stderr"],
+  "exit_code": 0,
+  "placeholders": [
+    {"placeholder": "<CLAUDE_REQUEST_ID_1>", "kind": "claude_request_id"}
+  ],
+  "redaction_counts": {"claude_request_id": 2},
+  "consumers": [
+    "crates/harness/src/claude/discovery.rs:the_captured_reply_decodes_onto_curated_ids"
+  ]
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        scenario.join("events.jsonl"),
+        concat!(
+            "{\"sequence\":1,\"channel\":\"stdin\",\"payload\":\"{\\\"type\\\":\\\"control_request\\\",\\\"request_id\\\":\\\"<CLAUDE_REQUEST_ID_1>\\\"}\"}\n",
+            "{\"sequence\":2,\"channel\":\"stdout\",\"payload\":\"{\\\"type\\\":\\\"control_response\\\",\\\"request_id\\\":\\\"<CLAUDE_REQUEST_ID_1>\\\",\\\"models\\\":[{\\\"value\\\":\\\"sonnet\\\"}]}\"}\n",
+            "{\"sequence\":3,\"channel\":\"stderr\",\"payload\":\"safe diagnostic\"}\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn overwrite(root: &Path, relative: &str, contents: &str) {
+    std::fs::write(root.join(relative), contents).unwrap();
+}
+
+/// Break caught: reserializing a selected provider frame through a Comet wire type can silently
+/// normalize away omitted fields or change the provider's literal JSON bytes.
+#[test]
+fn corpus_valid_literal_schema_returns_the_exact_selected_payload() {
+    let temp = tempfile::tempdir().unwrap();
+    write_valid_literal_corpus(temp.path());
+
+    let errors = validate_corpus(temp.path());
+    assert!(errors.is_empty(), "valid corpus returned {errors:#?}");
+    assert_eq!(
+        selected_payload(temp.path(), "claude-model-reply").unwrap(),
+        r#"{"type":"control_response","request_id":"<CLAUDE_REQUEST_ID_1>","models":[{"value":"sonnet"}]}"#
+    );
+}
+
+/// Break caught: accepting a future index or manifest schema under version-one assumptions can
+/// misread references while still returning a plausible provider payload.
+#[test]
+fn corpus_rejects_unknown_index_and_manifest_schema_versions_explicitly() {
+    let temp = tempfile::tempdir().unwrap();
+    write_valid_literal_corpus(temp.path());
+    overwrite(
+        temp.path(),
+        "index.json",
+        r#"{"schema_version":2,"claims":[]}"#,
+    );
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::UnsupportedIndexSchemaVersion { version: 2 }]
+    ));
+
+    write_valid_literal_corpus(temp.path());
+    let manifest = std::fs::read_to_string(
+        temp.path()
+            .join("claude/2.1.227/model-discovery/manifest.json"),
+    )
+    .unwrap()
+    .replacen(r#""schema_version": 1"#, r#""schema_version": 2"#, 1);
+    overwrite(
+        temp.path(),
+        "claude/2.1.227/model-discovery/manifest.json",
+        &manifest,
+    );
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::UnsupportedManifestSchemaVersion {
+            claim_id,
+            version: 2,
+            ..
+        }] if claim_id == "claude-model-reply"
+    ));
+}
+
+/// Break caught: sorting frames or merely checking uniqueness accepts gaps and duplicates, so a
+/// claim can name a sequence that never occupied that place in the recorded observer order.
+#[test]
+fn corpus_requires_contiguous_increasing_event_sequences() {
+    let temp = tempfile::tempdir().unwrap();
+    write_valid_literal_corpus(temp.path());
+    overwrite(
+        temp.path(),
+        "claude/2.1.227/model-discovery/events.jsonl",
+        concat!(
+            "{\"sequence\":1,\"channel\":\"stdin\",\"payload\":\"{}\"}\n",
+            "{\"sequence\":3,\"channel\":\"stdout\",\"payload\":\"{}\"}\n"
+        ),
+    );
+
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::NonContiguousEventSequence {
+            claim_id,
+            expected: 2,
+            actual: 3,
+            ..
+        }] if claim_id == "claude-model-reply"
+    ));
+}
+
+/// Break caught: permissive channel decoding accepts invented streams and lets an index claim
+/// stdout evidence that was actually sent on stdin.
+#[test]
+fn corpus_allows_only_stdio_channels_and_requires_an_exact_frame_channel() {
+    let temp = tempfile::tempdir().unwrap();
+    write_valid_literal_corpus(temp.path());
+    let events_path = "claude/2.1.227/model-discovery/events.jsonl";
+    overwrite(
+        temp.path(),
+        events_path,
+        "{\"sequence\":1,\"channel\":\"network\",\"payload\":\"{}\"}\n",
+    );
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::InvalidEvent { claim_id, line: 1, .. }]
+            if claim_id == "claude-model-reply"
+    ));
+
+    write_valid_literal_corpus(temp.path());
+    let index = std::fs::read_to_string(temp.path().join("index.json"))
+        .unwrap()
+        .replacen(r#""channel": "stdout""#, r#""channel": "stdin""#, 1);
+    overwrite(temp.path(), "index.json", &index);
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::FrameChannelMismatch {
+            claim_id,
+            sequence: 2,
+            expected: comet_harness::capture::Channel::Stdin,
+            actual: comet_harness::capture::Channel::Stdout,
+        }] if claim_id == "claude-model-reply"
+    ));
+}
+
+/// Break caught: indexing claims by last-write-wins or joining unvalidated paths can silently
+/// select another claim, leave the corpus root, or accept non-canonical aliases to one file.
+#[test]
+fn corpus_requires_unique_claim_ids_and_canonical_safe_relative_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    write_valid_literal_corpus(temp.path());
+    let index = std::fs::read_to_string(temp.path().join("index.json"))
+        .unwrap()
+        .replacen("\n  ]", ",\n    {\"id\":\"claude-model-reply\",\"consumer\":\"duplicate\",\"manifest\":\"claude/2.1.227/model-discovery/manifest.json\",\"frames\":[{\"sequence\":2,\"channel\":\"stdout\"}],\"fact\":\"duplicate\"}\n  ]", 1);
+    overwrite(temp.path(), "index.json", &index);
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::DuplicateClaimId { claim_id }]
+            if claim_id == "claude-model-reply"
+    ));
+
+    for unsafe_path in [
+        "../manifest.json",
+        "/absolute/manifest.json",
+        "claude\\\\2.1.227\\\\manifest.json",
+        "claude/./2.1.227/manifest.json",
+        "C:/manifest.json",
+        "claude/2.1.227/model-discovery/evidence.json",
+    ] {
+        write_valid_literal_corpus(temp.path());
+        let index = std::fs::read_to_string(temp.path().join("index.json"))
+            .unwrap()
+            .replacen(
+                "claude/2.1.227/model-discovery/manifest.json",
+                unsafe_path,
+                1,
+            );
+        overwrite(temp.path(), "index.json", &index);
+        let errors = validate_corpus(temp.path());
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [CorpusError::UnsafeManifestPath { claim_id }]
+                    if claim_id == "claude-model-reply"
+            ),
+            "{unsafe_path:?} returned {errors:#?}"
+        );
+    }
+}
+
+/// Break caught: weak referential checks can accept a claim whose evidence file, exact frame, or
+/// reciprocal manifest consumer entry is missing.
+#[test]
+fn corpus_requires_manifest_frame_and_reciprocal_consumer_references() {
+    let temp = tempfile::tempdir().unwrap();
+    write_valid_literal_corpus(temp.path());
+    std::fs::remove_file(
+        temp.path()
+            .join("claude/2.1.227/model-discovery/manifest.json"),
+    )
+    .unwrap();
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::MissingManifest { claim_id, .. }]
+            if claim_id == "claude-model-reply"
+    ));
+
+    write_valid_literal_corpus(temp.path());
+    let index = std::fs::read_to_string(temp.path().join("index.json"))
+        .unwrap()
+        .replacen(r#""sequence": 2"#, r#""sequence": 99"#, 1);
+    overwrite(temp.path(), "index.json", &index);
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::MissingFrame {
+            claim_id,
+            sequence: 99,
+            ..
+        }] if claim_id == "claude-model-reply"
+    ));
+
+    write_valid_literal_corpus(temp.path());
+    let manifest_path = "claude/2.1.227/model-discovery/manifest.json";
+    let manifest = std::fs::read_to_string(temp.path().join(manifest_path))
+        .unwrap()
+        .replace(
+            "crates/harness/src/claude/discovery.rs:the_captured_reply_decodes_onto_curated_ids",
+            "crates/harness/src/claude/discovery.rs:another_consumer",
+        );
+    overwrite(temp.path(), manifest_path, &manifest);
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::MissingManifestConsumer {
+            claim_id,
+            consumer,
+            ..
+        }] if claim_id == "claude-model-reply"
+            && consumer.ends_with("the_captured_reply_decodes_onto_curated_ids")
+    ));
+}
+
+/// Break caught: accepting ad-hoc redaction markers lets a reviewer mistake unresolved sensitive
+/// material for one of the sanitizer's known, audited placeholder families.
+#[test]
+fn corpus_rejects_unknown_or_unresolved_placeholder_syntax() {
+    let temp = tempfile::tempdir().unwrap();
+    write_valid_literal_corpus(temp.path());
+    let events_path = "claude/2.1.227/model-discovery/events.jsonl";
+    let events = std::fs::read_to_string(temp.path().join(events_path))
+        .unwrap()
+        .replace("safe diagnostic", "<UNKNOWN_SECRET>");
+    overwrite(temp.path(), events_path, &events);
+
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::UnresolvedPlaceholder { claim_id, .. }]
+            if claim_id == "claude-model-reply"
+    ));
+
+    write_valid_literal_corpus(temp.path());
+    let index = std::fs::read_to_string(temp.path().join("index.json"))
+        .unwrap()
+        .replace(
+            "The initialize response nests the provider model list twice.",
+            "Unresolved evidence <PENDING_SECRET>",
+        );
+    overwrite(temp.path(), "index.json", &index);
+    assert!(matches!(
+        validate_corpus(temp.path()).as_slice(),
+        [CorpusError::UnresolvedPlaceholder { claim_id, location: "index" }]
+            if claim_id == "claude-model-reply"
+    ));
+}
+
+/// Break caught: treating the pre-capture inventory as a valid corpus hides absent evidence, while
+/// failing on the first path prevents Task 5 from seeing the complete deterministic worklist.
+#[test]
+fn corpus_inventory_reports_the_exact_pending_manifest_set() {
+    let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    let errors = validate_corpus(&corpus_root);
+    assert_eq!(errors.len(), 36, "inventory errors: {errors:#?}");
+    assert!(
+        errors
+            .iter()
+            .all(|error| matches!(error, CorpusError::MissingManifest { .. })),
+        "inventory produced non-missing-manifest errors: {errors:#?}"
+    );
+    let manifests: std::collections::BTreeSet<&str> = errors
+        .iter()
+        .filter_map(|error| match error {
+            CorpusError::MissingManifest { manifest, .. } => Some(manifest.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        manifests,
+        std::collections::BTreeSet::from([
+            "claude/pending-observed-version/approval/manifest.json",
+            "claude/pending-observed-version/attachment/manifest.json",
+            "claude/pending-observed-version/command-discovery/manifest.json",
+            "claude/pending-observed-version/fresh-text/manifest.json",
+            "claude/pending-observed-version/model-discovery/manifest.json",
+            "codex/pending-observed-version/approval/manifest.json",
+            "codex/pending-observed-version/fresh-text/manifest.json",
+            "codex/pending-observed-version/model-discovery/manifest.json",
+        ])
+    );
 }
 
 /// Break caught: skipping any semantic branch leaves captured identifiers, human-authored
