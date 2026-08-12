@@ -1221,7 +1221,7 @@ fn sanitizer_replaces_semantic_values_with_typed_placeholders() {
         "<TOOL_USE_ID_2>"
     );
     assert_eq!(payloads[3]["message"]["content"][1]["name"], "Bash");
-    assert_eq!(payloads[4]["message"], "safe diagnostic for <SESSION_ID_1>");
+    assert_eq!(payloads[4]["message"], "<PROVIDER_PROSE_1>");
 
     let all_output = String::from_utf8(
         [
@@ -1665,6 +1665,318 @@ fn sanitizer_types_claude_assistant_message_ids_by_shape_and_reuses_placeholders
         first_message_id,
         "a message-shaped object is not a Claude message ID outside Claude evidence"
     );
+}
+
+/// Break caught: the resume identifier is repeated in Claude's launch argv, outside event JSON,
+/// and must reuse the exact typed session placeholder discovered from the captured wire frames.
+#[test]
+fn sanitizer_reuses_the_event_session_mapping_in_claude_resume_argv() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = "opaque-session-to-resume";
+    let raw = write_raw_capture(
+        temp.path(),
+        "claude-resume-argv",
+        &[&serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "session_id": session_id
+        })
+        .to_string()],
+    );
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    capture["scenario"] = Value::String("resume".into());
+    capture["command"]["args"] = serde_json::json!(["--print", format!("--resume={session_id}")]);
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "claude-resume-argv")).unwrap();
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+    assert_eq!(
+        manifest["command"]["args"],
+        serde_json::json!(["--print", "--resume=<SESSION_ID_1>"])
+    );
+    assert_eq!(manifest["redaction_counts"]["session_id"], 2);
+    assert!(
+        !String::from_utf8(report.manifest_bytes)
+            .unwrap()
+            .contains(session_id)
+    );
+}
+
+#[test]
+fn sanitizer_rejects_a_claude_resume_argv_identifier_absent_from_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "claude-unmapped-resume-argv",
+        &[r#"{"type":"result","subtype":"success","session_id":"captured-session"}"#],
+    );
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    capture["scenario"] = Value::String("resume".into());
+    capture["command"]["args"] = serde_json::json!(["--resume=different-session"]);
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+    let output = staging_dir(temp.path(), "claude-unmapped-resume-argv");
+
+    let error = sanitize_dir(&raw, &output).unwrap_err();
+    assert!(matches!(
+        error,
+        SanitizationError::InvalidClaudeResumeCommand { .. }
+    ));
+    assert!(!error.to_string().contains("different-session"));
+    assert!(!output.exists());
+}
+
+/// Break caught: recognizing only the happy-path prefix lets malformed, split, duplicate, absent,
+/// or scenario-inappropriate resume arguments bypass the manifest's semantic-ID contract.
+#[test]
+fn sanitizer_enforces_the_exact_claude_resume_command_grammar() {
+    let session_id = "captured-session";
+    let cases = [
+        ("missing", "resume", serde_json::json!(["--print"])),
+        ("empty", "resume", serde_json::json!(["--resume="])),
+        (
+            "split",
+            "resume",
+            serde_json::json!(["--resume", session_id]),
+        ),
+        (
+            "duplicate",
+            "resume",
+            serde_json::json!([
+                format!("--resume={session_id}"),
+                format!("--resume={session_id}")
+            ]),
+        ),
+        (
+            "malformed",
+            "resume",
+            serde_json::json!([format!("--resume-id={session_id}")]),
+        ),
+        (
+            "mismatch",
+            "resume",
+            serde_json::json!(["--resume=another-session"]),
+        ),
+        (
+            "unexpected-nonresume",
+            "fresh-text",
+            serde_json::json!([format!("--resume={session_id}")]),
+        ),
+    ];
+
+    for (name, scenario, args) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let raw = write_raw_capture(
+            temp.path(),
+            name,
+            &[&serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "session_id": session_id
+            })
+            .to_string()],
+        );
+        let capture_path = raw.join("capture.json");
+        let mut capture: Value =
+            serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+        capture["scenario"] = Value::String(scenario.into());
+        capture["command"]["args"] = args;
+        std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+        let output = staging_dir(temp.path(), name);
+
+        let error = sanitize_dir(&raw, &output).unwrap_err();
+        assert!(
+            matches!(error, SanitizationError::InvalidClaudeResumeCommand { .. }),
+            "{name}: {error}"
+        );
+        assert!(!error.to_string().contains(session_id), "{name}");
+        assert!(!error.to_string().contains("another-session"), "{name}");
+        assert!(!output.exists(), "{name}");
+    }
+}
+
+#[test]
+fn sanitizer_requires_the_claude_resume_command_to_map_the_sole_session_semantic() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "multiple-session-semantics",
+        &[
+            r#"{"type":"system","session_id":"first-session"}"#,
+            r#"{"type":"result","subtype":"success","session_id":"second-session"}"#,
+        ],
+    );
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    capture["scenario"] = Value::String("resume".into());
+    capture["command"]["args"] = serde_json::json!(["--resume=first-session"]);
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+    let output = staging_dir(temp.path(), "multiple-session-semantics");
+
+    let error = sanitize_dir(&raw, &output).unwrap_err();
+    assert!(matches!(
+        error,
+        SanitizationError::InvalidClaudeResumeCommand { .. }
+    ));
+    assert!(!error.to_string().contains("first-session"));
+    assert!(!error.to_string().contains("second-session"));
+    assert!(!output.exists());
+}
+
+/// Break caught: thinking signatures are opaque provider correlators repeated across stream and
+/// assistant frames; they need their own structural type instead of prefix or secret heuristics.
+#[test]
+fn sanitizer_types_nonempty_claude_thinking_signatures_by_shape() {
+    let temp = tempfile::tempdir().unwrap();
+    let first_signature = "opaque-signature-alpha";
+    let second_signature = "future-signature-format-beta";
+    let raw = write_raw_capture(
+        temp.path(),
+        "claude-thinking-signatures",
+        &[
+            &serde_json::json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "signature_delta", "signature": first_signature}
+                }
+            })
+            .to_string(),
+            &serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "private", "signature": first_signature},
+                        {"type": "thinking", "thinking": "private", "signature": second_signature},
+                        {"type": "thinking", "thinking": "private", "signature": ""}
+                    ]
+                }
+            })
+            .to_string(),
+        ],
+    );
+
+    let report = sanitize_dir(
+        &raw,
+        &staging_dir(temp.path(), "claude-thinking-signatures"),
+    )
+    .unwrap();
+    let payloads = sanitized_payloads(&report.events_bytes);
+    assert_eq!(
+        payloads[0]["event"]["delta"]["signature"],
+        "<CLAUDE_THINKING_SIGNATURE_1>"
+    );
+    assert_eq!(
+        payloads[1]["message"]["content"][0]["signature"],
+        "<CLAUDE_THINKING_SIGNATURE_1>"
+    );
+    assert_eq!(
+        payloads[1]["message"]["content"][1]["signature"],
+        "<CLAUDE_THINKING_SIGNATURE_2>"
+    );
+    assert_eq!(payloads[1]["message"]["content"][2]["signature"], "");
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+    assert_eq!(manifest["redaction_counts"]["claude_thinking_signature"], 3);
+
+    let capture_path = raw.join("capture.json");
+    let mut codex_capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    codex_capture["provider"] = Value::String("codex".into());
+    std::fs::write(
+        &capture_path,
+        serde_json::to_vec_pretty(&codex_capture).unwrap(),
+    )
+    .unwrap();
+    let codex = sanitize_dir(
+        &raw,
+        &staging_dir(temp.path(), "codex-thinking-shaped-values"),
+    )
+    .unwrap();
+    assert_eq!(
+        sanitized_payloads(&codex.events_bytes)[0]["event"]["delta"]["signature"],
+        first_signature
+    );
+}
+
+/// Break caught: a one-character assistant delta used to be replaced as a substring in every
+/// later JSON string, corrupting stable skill and slash-command metadata that happened to contain
+/// the same character. Semantic redaction is structural and provider diagnostics are whole fields.
+#[test]
+fn sanitizer_does_not_apply_assistant_semantics_to_unrelated_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "claude-short-assistant-delta",
+        &[
+            &serde_json::json!({
+                "type": "system",
+                "subtype": "init",
+                "skills": ["deep-research", "r"],
+                "slash_commands": ["review", "r"]
+            })
+            .to_string(),
+            &serde_json::json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "r"}
+                }
+            })
+            .to_string(),
+            &serde_json::json!({"level": "debug", "message": "r"}).to_string(),
+            &serde_json::json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "input_json_delta", "partial_json": "{\"skill\":\"r\"}"}
+                }
+            })
+            .to_string(),
+            &serde_json::json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "input_json_delta", "partial_json": "{\"skill\":\"r\"}"}
+                }
+            })
+            .to_string(),
+        ],
+    );
+
+    let report = sanitize_dir(
+        &raw,
+        &staging_dir(temp.path(), "claude-short-assistant-delta"),
+    )
+    .unwrap();
+    let payloads = sanitized_payloads(&report.events_bytes);
+    assert_eq!(
+        payloads[0],
+        serde_json::json!({
+            "type": "system",
+            "subtype": "init",
+            "skills": ["deep-research", "r"],
+            "slash_commands": ["review", "r"]
+        }),
+        "stable init metadata must remain byte-for-byte semantically unchanged"
+    );
+    assert_eq!(payloads[1]["event"]["delta"]["text"], "<ASSISTANT_PROSE_1>");
+    assert_eq!(payloads[2]["message"], "<PROVIDER_PROSE_1>");
+    assert_eq!(
+        payloads[3]["event"]["delta"]["partial_json"],
+        "<ASSISTANT_PROSE_2>"
+    );
+    assert_eq!(
+        payloads[4]["event"]["delta"]["partial_json"],
+        "<ASSISTANT_PROSE_2>"
+    );
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+    assert_eq!(manifest["redaction_counts"]["assistant_prose"], 3);
 }
 
 /// Break caught: isolated logged-out discovery cannot be sanitized because its explicitly
@@ -2184,12 +2496,14 @@ fn sanitizer_manifest_accounts_for_placeholder_definitions_and_counts() {
     );
     assert_eq!(manifest["redaction_counts"]["session_id"], 2);
     assert_eq!(manifest["redaction_counts"]["user_text"], 2);
+    assert_eq!(manifest["redaction_counts"]["provider_prose"], 1);
     assert_eq!(
         manifest["placeholders"],
         serde_json::json!([
             {"placeholder": "<SESSION_ID_1>", "kind": "session_id"},
             {"placeholder": "<USER_TEXT_1>", "kind": "user_text"},
-            {"placeholder": "<USER_TEXT_2>", "kind": "user_text"}
+            {"placeholder": "<USER_TEXT_2>", "kind": "user_text"},
+            {"placeholder": "<PROVIDER_PROSE_1>", "kind": "provider_prose"}
         ])
     );
     assert_eq!(

@@ -361,6 +361,8 @@ pub enum SanitizationError {
     SensitiveObjectKey { location: String },
     #[error("capture channel contains unparseable structured JSON at sequence {sequence}")]
     UnparseableStructuredPayload { sequence: u64 },
+    #[error("Claude capture command has invalid resume arguments at {location}")]
+    InvalidClaudeResumeCommand { location: String },
     #[error("sanitized capture could not be written")]
     WriteOutput {
         #[source]
@@ -1233,6 +1235,7 @@ enum RedactionKind {
     AttachmentBytes,
     ClaudeMemoryPath,
     ClaudeMessageId,
+    ClaudeThinkingSignature,
 }
 
 impl RedactionKind {
@@ -1251,6 +1254,7 @@ impl RedactionKind {
             Self::AttachmentBytes => "ATTACHMENT_BYTES",
             Self::ClaudeMemoryPath => "CLAUDE_MEMORY_PATH",
             Self::ClaudeMessageId => "CLAUDE_MESSAGE_ID",
+            Self::ClaudeThinkingSignature => "CLAUDE_THINKING_SIGNATURE",
         }
     }
 
@@ -1269,6 +1273,7 @@ impl RedactionKind {
             Self::AttachmentBytes => "attachment_bytes",
             Self::ClaudeMemoryPath => "claude_memory_path",
             Self::ClaudeMessageId => "claude_message_id",
+            Self::ClaudeThinkingSignature => "claude_thinking_signature",
         }
     }
 }
@@ -1372,6 +1377,9 @@ pub fn sanitize_dir(
 
     let mut command = serde_json::to_value(&capture.command)
         .map_err(|source| SanitizationError::EncodeOutput { source })?;
+    if capture.provider == Provider::Claude {
+        redactor.sanitize_claude_resume_argv(&mut command, &capture.scenario)?;
+    }
     redactor.sanitize_nonsemantic_value(&mut command, "command")?;
 
     let mut events_bytes = Vec::new();
@@ -1383,6 +1391,12 @@ pub fn sanitize_dir(
                     .map_err(|source| SanitizationError::EncodeOutput { source })?
             }
             Payload::Text(text) => {
+                let mut value = Value::String(text.clone());
+                redactor.replace_semantic(RedactionKind::ProviderProse, &mut value);
+                *text = value
+                    .as_str()
+                    .expect("text replacement stays a string")
+                    .to_owned();
                 redactor.sanitize_string(text, "event.payload")?;
                 text.clone()
             }
@@ -1906,34 +1920,84 @@ impl Redactor {
             .or_default() += 1;
     }
 
+    fn sanitize_claude_resume_argv(
+        &mut self,
+        command: &mut Value,
+        scenario: &str,
+    ) -> Result<(), SanitizationError> {
+        let Some(args) = command.get_mut("args").and_then(Value::as_array_mut) else {
+            return Err(SanitizationError::InvalidClaudeResumeCommand {
+                location: "command.args".to_owned(),
+            });
+        };
+        let resume_like: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter_map(|(index, arg)| {
+                arg.as_str()
+                    .is_some_and(|arg| arg.starts_with("--resume"))
+                    .then_some(index)
+            })
+            .collect();
+        if scenario != "resume" {
+            if resume_like.is_empty() {
+                return Ok(());
+            }
+            return Err(SanitizationError::InvalidClaudeResumeCommand {
+                location: "command.args".to_owned(),
+            });
+        }
+
+        let Some(&index) = resume_like
+            .as_slice()
+            .first()
+            .filter(|_| resume_like.len() == 1)
+        else {
+            return Err(SanitizationError::InvalidClaudeResumeCommand {
+                location: "command.args".to_owned(),
+            });
+        };
+        let Some(raw_session_id) = args[index]
+            .as_str()
+            .and_then(|arg| arg.strip_prefix("--resume="))
+            .filter(|session_id| !session_id.is_empty())
+        else {
+            return Err(SanitizationError::InvalidClaudeResumeCommand {
+                location: "command.args".to_owned(),
+            });
+        };
+        let Some([session]) = self
+            .semantics
+            .get(&RedactionKind::SessionId)
+            .map(Vec::as_slice)
+        else {
+            return Err(SanitizationError::InvalidClaudeResumeCommand {
+                location: "command.args".to_owned(),
+            });
+        };
+        let Some(original) = session.original.as_str().filter(|value| !value.is_empty()) else {
+            return Err(SanitizationError::InvalidClaudeResumeCommand {
+                location: "command.args".to_owned(),
+            });
+        };
+        if raw_session_id != original {
+            return Err(SanitizationError::InvalidClaudeResumeCommand {
+                location: "command.args".to_owned(),
+            });
+        }
+        args[index] = Value::String(format!("--resume={}", session.placeholder));
+        *self
+            .counts
+            .entry(RedactionKind::SessionId.manifest_name().to_owned())
+            .or_default() += 1;
+        Ok(())
+    }
+
     fn sanitize_string(
         &mut self,
         text: &mut String,
         location: &str,
     ) -> Result<(), SanitizationError> {
-        let replacements: Vec<(RedactionKind, String, String)> = self
-            .semantics
-            .iter()
-            .flat_map(|(kind, values)| {
-                values.iter().filter_map(move |value| {
-                    value
-                        .original
-                        .as_str()
-                        .map(|original| (*kind, original.to_owned(), value.placeholder.clone()))
-                })
-            })
-            .filter(|(_, original, _)| !original.is_empty())
-            .collect();
-        for (kind, original, placeholder) in replacements {
-            let occurrences = text.matches(&original).count() as u64;
-            if occurrences != 0 {
-                *text = text.replace(&original, &placeholder);
-                *self
-                    .counts
-                    .entry(kind.manifest_name().to_owned())
-                    .or_default() += occurrences;
-            }
-        }
         self.sanitize_paths_and_validate(text, location)
     }
 
@@ -2081,6 +2145,16 @@ fn semantic_kind(
         "data" if object.get("type").and_then(Value::as_str) == Some("base64") => {
             return Some(RedactionKind::AttachmentBytes);
         }
+        "signature"
+            if context.claude_capture
+                && value.as_str().is_some_and(|value| !value.is_empty())
+                && object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| matches!(kind, "thinking" | "signature_delta")) =>
+        {
+            return Some(RedactionKind::ClaudeThinkingSignature);
+        }
         "prompt" => return Some(RedactionKind::UserText),
         "content" | "text" if matches!(context.speaker, Speaker::User) => {
             return Some(RedactionKind::UserText);
@@ -2095,6 +2169,13 @@ fn semantic_kind(
             return Some(RedactionKind::UserText);
         }
         "text" if object.get("type").and_then(Value::as_str) == Some("text_delta") => {
+            return Some(RedactionKind::AssistantProse);
+        }
+        "partialjson"
+            if context.claude_capture
+                && object.get("type").and_then(Value::as_str) == Some("input_json_delta")
+                && value.as_str().is_some_and(|value| !value.is_empty()) =>
+        {
             return Some(RedactionKind::AssistantProse);
         }
         "delta" | "textdelta" if context.codex_assistant_prose => {
@@ -2117,6 +2198,12 @@ fn semantic_kind(
             return Some(RedactionKind::ProviderProse);
         }
         "message" if context.availability_nux => {
+            return Some(RedactionKind::ProviderProse);
+        }
+        "message"
+            if object.contains_key("level")
+                && value.as_str().is_some_and(|value| !value.is_empty()) =>
+        {
             return Some(RedactionKind::ProviderProse);
         }
         "output" | "stdout" | "stderr"
