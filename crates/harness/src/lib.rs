@@ -656,36 +656,27 @@ pub(crate) fn parse_cli_version(output: &str) -> Option<String> {
 /// one that supersedes it. Components are compared numerically, and a missing
 /// component counts as zero so `1.2` and `1.2.0` are equal.
 ///
-/// `None` means "cannot say" — either side having no parseable leading
-/// component, which happens with a nightly tag or a git describe string. The
-/// caller must render nothing rather than guessing, because both guesses are
+/// `None` means "cannot say", and **every component must parse strictly** for
+/// an answer to come back. A nightly tag, a git describe string, a pre-release
+/// suffix like `0.148.0-rc1`, or a component too large for `u64` all decline.
+/// The caller renders nothing rather than guessing, because both guesses are
 /// wrong in a way the user would act on: "up to date" hides a real update, and
 /// "update available" sends them to reinstall what they already have.
 ///
-/// Non-numeric suffixes are truncated per component, so `0.148.0-rc1` compares
-/// as `0.148.0`. A pre-release therefore reads as equal to its release, which
-/// is the conservative direction: it cannot manufacture an update that is not
-/// there.
+/// An earlier version truncated each component at its first non-digit, so
+/// `0.148.0-rc1` compared *equal* to `0.148.0`. That was described as the
+/// conservative direction and it was not: it is the "up to date" failure above,
+/// telling someone on a release candidate that the stable release superseding
+/// it does not exist. Truncation lost the one fact that mattered — that this
+/// string is not a plain version and cannot be ranked against one.
 pub(crate) fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
-    fn components(v: &str) -> Vec<u64> {
-        v.split('.')
-            .map(|part| {
-                let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
-                digits.parse::<u64>().unwrap_or(0)
-            })
-            .collect()
+    // Strict per component: `parse` rejects a pre-release suffix, an empty
+    // component, and an overflowing one alike, and all three mean the same
+    // thing here — this is not a dotted-numeric version.
+    fn components(v: &str) -> Option<Vec<u64>> {
+        v.split('.').map(|part| part.parse::<u64>().ok()).collect()
     }
-    // A version whose FIRST component is unparseable carries no usable order.
-    // Later components degrading to zero is fine; a leading one is not.
-    let parseable = |v: &str| {
-        v.split('.')
-            .next()
-            .is_some_and(|first| first.starts_with(|c: char| c.is_ascii_digit()))
-    };
-    if !parseable(a) || !parseable(b) {
-        return None;
-    }
-    let (left, right) = (components(a), components(b));
+    let (left, right) = (components(a)?, components(b)?);
     let width = left.len().max(right.len());
     for i in 0..width {
         let l = left.get(i).copied().unwrap_or(0);
@@ -1135,19 +1126,43 @@ mod probe_tests {
         assert_eq!(compare_versions("1.2.1", "1.2"), Some(Ordering::Greater));
     }
 
-    /// A version with no numeric lead is not orderable, and guessing either way
-    /// misleads: "up to date" hides a real update, "update available" sends the
-    /// user to reinstall what they have.
+    /// A version that is not plainly dotted-numeric is not orderable, and
+    /// guessing either way misleads: "up to date" hides a real update, "update
+    /// available" sends the user to reinstall what they have.
     #[test]
     fn an_unorderable_version_declines_to_compare() {
         assert_eq!(compare_versions("nightly", "0.147.0"), None);
         assert_eq!(compare_versions("0.147.0", "main-4a2077e"), None);
-        // A pre-release truncates to its release rather than inventing an
-        // ordering between them.
+    }
+
+    /// A pre-release must not compare EQUAL to its release. It used to, by
+    /// truncating at the first non-digit, which told a user on `0.148.0-rc1`
+    /// that the stable `0.148.0` superseding it did not exist. Declining is the
+    /// honest answer: this string cannot be ranked against a plain version.
+    #[test]
+    fn a_pre_release_declines_rather_than_reading_as_its_release() {
+        assert_eq!(compare_versions("0.148.0", "0.148.0-rc1"), None);
+        assert_eq!(compare_versions("0.148.0-rc1", "0.148.0"), None);
+    }
+
+    /// A component too large for `u64` must decline, not silently become zero.
+    /// Read as zero it inverts the comparison and suppresses a real update.
+    #[test]
+    fn an_overflowing_component_declines_rather_than_reading_as_zero() {
+        assert_eq!(compare_versions("18446744073709551616.0", "0.147.0"), None);
+        assert_eq!(compare_versions("0.147.0", "18446744073709551616.0"), None);
+        // The largest value that does fit still compares.
         assert_eq!(
-            compare_versions("0.148.0-rc1", "0.148.0"),
-            Some(std::cmp::Ordering::Equal)
+            compare_versions("18446744073709551615.0", "0.147.0"),
+            Some(std::cmp::Ordering::Greater)
         );
+    }
+
+    /// An empty component is not a zero. `1..2` is malformed, not `1.0.2`.
+    #[test]
+    fn an_empty_component_declines() {
+        assert_eq!(compare_versions("1..2", "1.0.2"), None);
+        assert_eq!(compare_versions("1.2.", "1.2.0"), None);
     }
 
     /// Windows resolves these CLIs to `.cmd` shims when they come from npm —
