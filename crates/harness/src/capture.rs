@@ -5265,6 +5265,66 @@ mod tests {
             .expect("isolated test directory")
     }
 
+    fn isolated_approval_target(prefix: &str) -> Option<tempfile::TempDir> {
+        let current = std::fs::canonicalize(std::env::current_dir().ok()?).ok()?;
+        let temp =
+            std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+        let mut parents = current
+            .ancestors()
+            .filter(|path| super::repository_root(path).is_none())
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        if let Some(home) = crate::home_dir() {
+            parents.push(home);
+        }
+
+        for parent in parents {
+            let Ok(parent) = std::fs::canonicalize(parent) else {
+                continue;
+            };
+            if parent.starts_with(&temp) {
+                continue;
+            }
+            let Ok(target) = tempfile::Builder::new().prefix(prefix).tempdir_in(parent) else {
+                continue;
+            };
+            let Ok(canonical) = std::fs::canonicalize(target.path()) else {
+                continue;
+            };
+            if canonical.starts_with(&temp)
+                || canonical.starts_with(&current)
+                || current.starts_with(&canonical)
+                || super::repository_root(&canonical).is_some()
+            {
+                continue;
+            }
+            return Some(target);
+        }
+
+        eprintln!("skipping Codex on-request test: no isolated approval target is writable");
+        None
+    }
+
+    #[test]
+    fn codex_on_request_capture_runs_from_a_temp_checkout() {
+        let checkout = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "capture::tests::codex_on_request_requires_ordered_failure_approval_retry_and_marker",
+                "--nocapture",
+            ])
+            .current_dir(checkout.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "on-request capture failed from a temp checkout:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
     fn config(
         name: &'static str,
         executable: PathBuf,
@@ -6495,7 +6555,9 @@ mod tests {
     async fn codex_on_request_requires_ordered_failure_approval_retry_and_marker() {
         let raw = tempfile::tempdir().unwrap();
         let cwd = isolated_tempdir("comet-onrequest-cwd-");
-        let target = isolated_tempdir("comet-onrequest-target-");
+        let Some(target) = isolated_approval_target("comet-onrequest-target-") else {
+            return;
+        };
         let request = RunRequest {
             prompt: format!("scenario:capture-onrequest:{}", target.path().display()),
             cwd: cwd.path().display().to_string(),
@@ -6522,7 +6584,9 @@ mod tests {
     async fn codex_on_request_echoes_zero_and_rejects_its_duplicate() {
         let raw = tempfile::tempdir().unwrap();
         let cwd = isolated_tempdir("comet-onrequest-zero-cwd-");
-        let target = isolated_tempdir("comet-onrequest-zero-target-");
+        let Some(target) = isolated_approval_target("comet-onrequest-zero-target-") else {
+            return;
+        };
         let request = RunRequest {
             prompt: format!(
                 "scenario:capture-onrequest-zero:{}",
@@ -6593,7 +6657,9 @@ mod tests {
         ] {
             let raw = tempfile::tempdir().unwrap();
             let cwd = isolated_tempdir("comet-onrequest-invalid-cwd-");
-            let target = isolated_tempdir("comet-onrequest-invalid-target-");
+            let Some(target) = isolated_approval_target("comet-onrequest-invalid-target-") else {
+                return;
+            };
             let request = RunRequest {
                 prompt: format!(
                     "scenario:capture-onrequest-invalid-{mode}:{}",
@@ -6699,7 +6765,9 @@ mod tests {
     async fn codex_on_request_rejects_approval_before_sandbox_failure() {
         let raw = tempfile::tempdir().unwrap();
         let cwd = isolated_tempdir("comet-onrequest-cwd-");
-        let target = isolated_tempdir("comet-onrequest-target-");
+        let Some(target) = isolated_approval_target("comet-onrequest-target-") else {
+            return;
+        };
         let request = RunRequest {
             prompt: "scenario:capture-onrequest-out-of-order".into(),
             cwd: cwd.path().display().to_string(),
@@ -6723,7 +6791,9 @@ mod tests {
     async fn codex_on_request_rejects_a_destructive_command_before_accepting() {
         let raw = tempfile::tempdir().unwrap();
         let cwd = isolated_tempdir("comet-onrequest-cwd-");
-        let target = isolated_tempdir("comet-onrequest-target-");
+        let Some(target) = isolated_approval_target("comet-onrequest-target-") else {
+            return;
+        };
         let request = RunRequest {
             prompt: "scenario:capture-onrequest-destructive".into(),
             cwd: cwd.path().display().to_string(),
@@ -6757,7 +6827,9 @@ mod tests {
             } else {
                 std::fs::create_dir(cwd.path().join(".git")).unwrap();
             }
-            let target = isolated_tempdir("comet-onrequest-target-");
+            let Some(target) = isolated_approval_target("comet-onrequest-target-") else {
+                return;
+            };
             let request = RunRequest {
                 prompt: "scenario:capture-onrequest-destructive".into(),
                 cwd: cwd.path().display().to_string(),
@@ -6785,7 +6857,9 @@ mod tests {
     async fn codex_on_request_preflight_rechecks_target_emptiness_before_spawn() {
         let raw = tempfile::tempdir().unwrap();
         let cwd = isolated_tempdir("comet-onrequest-cwd-");
-        let target = isolated_tempdir("comet-onrequest-target-");
+        let Some(target) = isolated_approval_target("comet-onrequest-target-") else {
+            return;
+        };
         std::fs::write(target.path().join("appeared-after-config.txt"), "hostile").unwrap();
         let request = RunRequest {
             prompt: "scenario:capture-onrequest-destructive".into(),
@@ -6814,7 +6888,9 @@ mod tests {
         for race in ["target", "marker", "identity"] {
             let raw = tempfile::tempdir().unwrap();
             let cwd = isolated_tempdir("comet-onrequest-cwd-");
-            let target = isolated_tempdir("comet-onrequest-target-");
+            let Some(target) = isolated_approval_target("comet-onrequest-target-") else {
+                return;
+            };
             let prompt = format!(
                 "scenario:capture-onrequest-{race}-race:{}",
                 target.path().display()
