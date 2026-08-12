@@ -1316,6 +1316,13 @@ pub enum AgentEvent {
     /// turns.
     #[serde(rename_all = "camelCase")]
     Usage {
+        /// The `inputTokens` alias is for **run-journal lines written before
+        /// the rename**, not for peers — `AgentEvent` crosses no RPC boundary
+        /// (verified: no references in `crates/rpc` or `crates/client`).
+        /// Without it `read_lines` skips every pre-upgrade usage line and
+        /// warns once per line. The old name is accepted, never written: it
+        /// says "input", and the value is now the cache-inclusive prompt.
+        #[serde(alias = "inputTokens")]
         prompt_tokens: u64,
         output_tokens: u64,
         /// `None` is "the provider did not say", never a default. Codex
@@ -1484,6 +1491,30 @@ mod tests {
                 output_tokens: 7,
                 context_window: None,
             }
+        );
+    }
+
+    /// A journal line written before the rename still decodes, and the new
+    /// name is what gets written back. The alias exists for the journal, which
+    /// skips undecodable lines with a warning — not for peers, since
+    /// `AgentEvent` crosses no RPC boundary.
+    #[test]
+    fn a_pre_rename_journal_line_still_decodes() {
+        let old = r#"{"type":"usage","inputTokens":10,"outputTokens":20}"#;
+        let ev: AgentEvent = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            ev,
+            AgentEvent::Usage {
+                prompt_tokens: 10,
+                output_tokens: 20,
+                context_window: None,
+            }
+        );
+        let rewritten = serde_json::to_string(&ev).unwrap();
+        assert!(rewritten.contains("promptTokens"), "{rewritten}");
+        assert!(
+            !rewritten.contains("inputTokens"),
+            "the old name is read, never written: {rewritten}"
         );
     }
 

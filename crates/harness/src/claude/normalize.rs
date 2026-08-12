@@ -70,9 +70,12 @@ fn usage_event(
 fn agreed_context_window(
     model_usage: &std::collections::BTreeMap<String, super::wire::ModelUsageBody>,
 ) -> Option<u64> {
-    let mut windows = model_usage.values().filter_map(|m| m.context_window);
-    let first = windows.next()?;
-    windows.all(|w| w == first).then_some(first)
+    // Every entry, not every entry that published one: filtering the silent
+    // models out would answer with the vocal model's window and draw the
+    // conversation against a limit only part of it is consuming.
+    let mut windows = model_usage.values().map(|m| m.context_window);
+    let first = windows.next()??;
+    windows.all(|w| w == Some(first)).then_some(first)
 }
 
 /// Which claude.ai usage window a `rate_limit_event` refers to.
@@ -615,6 +618,25 @@ mod tests {
             "usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,
                      "cache_creation_input_tokens":0}}"#;
         assert_eq!(result_usage(raw), None);
+    }
+
+    /// One model publishing a window and another staying silent is not
+    /// agreement. Filtering the silent one out answers with the vocal model's
+    /// limit, which the rest of the turn is not measured against.
+    #[test]
+    fn a_silent_model_is_not_agreement() {
+        let raw = r#"{"type":"result","subtype":"success","result":"ok","errors":[],
+            "usage":{"input_tokens":5,"output_tokens":1,"cache_read_input_tokens":100,
+                     "cache_creation_input_tokens":0},
+            "modelUsage":{"claude-haiku-4-5-20251001":{"contextWindow":200000},
+                          "claude-opus-4-8":{"inputTokens":7}}}"#;
+        assert!(matches!(
+            result_usage(raw),
+            Some(AgentEvent::Usage {
+                context_window: None,
+                ..
+            })
+        ));
     }
 
     /// Two models in one turn with different windows: there is no honest

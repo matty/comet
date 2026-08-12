@@ -1056,9 +1056,17 @@ impl SessionsEngine {
 impl Inner {
     /// Record a context reading against the chat's session row.
     ///
-    /// Dropped unless the provider named a window: a prompt size with no limit
-    /// to measure it against is not something the UI can draw, and inventing a
-    /// default limit would be a number the user acts on.
+    /// A window-less reading **clears** the row rather than leaving the last
+    /// one standing. The stale figure is not merely old, it is wrong: the
+    /// prompt has moved on, so the gauge would keep drawing the previous
+    /// turn's occupancy against the previous turn's limit. This is reachable
+    /// from Comet's own code, not just a provider quirk — a multi-model turn
+    /// whose windows disagree declines the window on purpose
+    /// (`claude::normalize::agreed_context_window`), and that decline arrives
+    /// here as `None`.
+    ///
+    /// A prompt with no limit still cannot be drawn, so nothing replaces it:
+    /// inventing a default limit would be a number the user acts on.
     ///
     /// The reading is deliberately NOT journaled. It is current occupancy, not
     /// history, and replaying a run would otherwise resurrect a figure that
@@ -1066,21 +1074,25 @@ impl Inner {
     fn record_context(&self, chat_id: &str, event: &AgentEvent) {
         let AgentEvent::Usage {
             prompt_tokens,
-            context_window: Some(context_window),
+            context_window,
             ..
         } = event
         else {
-            return;
+            return; // not a reading at all — a slash-command turn emits none
         };
+        let reading = (*context_window).map(|context_window| comet_proto::ContextUsage {
+            prompt_tokens: *prompt_tokens,
+            context_window,
+        });
         let session = {
             let mut statuses = lock(&self.statuses);
             let Some(entry) = statuses.get_mut(chat_id) else {
                 return; // no session row yet: nothing to hang the reading on
             };
-            entry.context = Some(comet_proto::ContextUsage {
-                prompt_tokens: *prompt_tokens,
-                context_window: *context_window,
-            });
+            if entry.context == reading {
+                return; // nothing changed; skip the broadcast and the doc write
+            }
+            entry.context = reading;
             let session = entry.clone();
             let mut list: Vec<Session> = statuses.values().cloned().collect();
             list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
@@ -2185,6 +2197,21 @@ mod tests {
             .inner
             .set_status("chat-1", SessionStatus::Idle, false);
         assert!(context_of("chat-1").is_some());
+
+        // A window-less reading AFTER a good one clears it. Leaving the old
+        // pair standing would draw the previous turn's occupancy against the
+        // previous turn's limit while the prompt has already moved on — and
+        // this is reachable from Comet's own decline path, not just a
+        // provider quirk (PR #52 review, Macroscope).
+        sessions.inner.record_context(
+            "chat-1",
+            &AgentEvent::Usage {
+                prompt_tokens: 120_000,
+                output_tokens: 12,
+                context_window: None,
+            },
+        );
+        assert_eq!(context_of("chat-1"), None);
     }
 
     fn session_started(cwd: &str, runtime_mode: RuntimeMode) -> AgentEvent {
