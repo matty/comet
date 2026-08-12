@@ -492,6 +492,30 @@ fn sanitizer_rejects_sensitive_object_keys_without_echoing_them() {
     }
 }
 
+/// Break caught: sanitizing a clone of an allowlisted path key and discarding the clone permits
+/// the original machine-specific key to serialize unchanged.
+#[test]
+fn sanitizer_rejects_allowlisted_path_keys_without_echoing_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw_key = r"D:\allowed\repo\private-key-name";
+    let payload = serde_json::json!({raw_key: "opaque"}).to_string();
+    let raw = write_raw_capture(temp.path(), "allowlisted-path-key", &[&payload]);
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(raw.join("capture.json")).unwrap()).unwrap();
+    capture["redaction_roots"]["cwd"] = Value::String(r"D:\allowed\repo".into());
+    std::fs::write(
+        raw.join("capture.json"),
+        serde_json::to_vec_pretty(&capture).unwrap(),
+    )
+    .unwrap();
+    let output = staging_dir(temp.path(), "allowlisted-path-key");
+
+    let error = sanitize_dir(&raw, &output).unwrap_err();
+    assert!(!error.to_string().contains(raw_key));
+    assert!(!error.to_string().contains("private-key-name"));
+    assert!(!output.exists());
+}
+
 /// Break caught: credential fields with opaque values bypass prefix scanning, while an overbroad
 /// `token` name rule would incorrectly reject ordinary numeric usage counters.
 #[test]
@@ -537,6 +561,52 @@ fn sanitizer_rejects_opaque_credential_fields_but_keeps_token_counters() {
     );
 }
 
+/// Break caught: exact credential names miss provider-prefixed token families, and counter-name
+/// exemptions accept opaque strings that are credentials disguised as usage metadata.
+#[test]
+fn sanitizer_classifies_credential_families_and_requires_numeric_counters() {
+    for field in [
+        "apiToken",
+        "githubApiToken",
+        "providerAccessToken",
+        "oauthRefreshToken",
+        "serviceClientSecret",
+        "accountPrivateKey",
+        "proxyAuthorization",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = serde_json::json!({field: "opaque-value"}).to_string();
+        let raw = write_raw_capture(temp.path(), field, &[&payload]);
+        assert!(matches!(
+            sanitize_dir(&raw, &staging_dir(temp.path(), field)),
+            Err(SanitizationError::SecretLikeField { .. })
+        ));
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "string-token-counter",
+        &[r#"{"usage":{"input_tokens":"opaque-value"}}"#],
+    );
+    assert!(matches!(
+        sanitize_dir(&raw, &staging_dir(temp.path(), "string-token-counter")),
+        Err(SanitizationError::SecretLikeField { .. })
+    ));
+
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "unrelated-token-field",
+        &[r#"{"tokenizerMode":"provider-default"}"#],
+    );
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "unrelated-token-field")).unwrap();
+    assert_eq!(
+        sanitized_payloads(&report.events_bytes)[0]["tokenizerMode"],
+        "provider-default"
+    );
+}
+
 /// Break caught: scanning for credentials before semantic replacement rejects safe redaction of
 /// a token pasted as user-authored content, while skipping user replacement publishes it.
 #[test]
@@ -578,6 +648,39 @@ fn sanitizer_is_byte_deterministic_and_uses_encounter_order() {
     let payloads = sanitized_payloads(&first.events_bytes);
     assert_eq!(payloads[0]["message"]["content"], "<USER_TEXT_1>");
     assert_eq!(payloads[1]["message"]["content"], "<USER_TEXT_2>");
+}
+
+/// Break caught: deriving manifest metadata from the raw directory makes byte-identical captures
+/// sanitize differently when copied or renamed for review.
+#[test]
+fn sanitizer_output_is_independent_of_raw_directory_name_and_location() {
+    let first_root = tempfile::tempdir().unwrap();
+    let second_root = tempfile::tempdir().unwrap();
+    let events = [
+        r#"{"type":"user","session_id":"same-session","message":{"role":"user","content":"same prompt"}}"#,
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"same answer"}]}}"#,
+    ];
+    let first_raw = write_raw_capture(first_root.path(), "first-raw-name", &events);
+    let second_raw = write_raw_capture(second_root.path(), "second-raw-name", &events);
+    let first_capture = std::fs::read(first_raw.join("capture.json")).unwrap();
+    let second_capture = std::fs::read(second_raw.join("capture.json")).unwrap();
+    assert_eq!(first_capture, second_capture);
+
+    let first = sanitize_dir(&first_raw, &staging_dir(first_root.path(), "first-output")).unwrap();
+    let second = sanitize_dir(
+        &second_raw,
+        &staging_dir(second_root.path(), "second-output"),
+    )
+    .unwrap();
+
+    assert_eq!(first.events_bytes, second.events_bytes);
+    assert_eq!(first.manifest_bytes, second.manifest_bytes);
+    let manifest = String::from_utf8(first.manifest_bytes).unwrap();
+    for ambient in ["first-raw-name", "second-raw-name"] {
+        assert!(!manifest.contains(ambient));
+    }
+    assert!(!manifest.contains(&first_raw.display().to_string()));
+    assert!(!manifest.contains(&second_raw.display().to_string()));
 }
 
 /// Break caught: deriving repository/home/temp roots during sanitization makes identical raw bytes
@@ -641,8 +744,9 @@ fn sanitizer_manifest_accounts_for_placeholder_definitions_and_counts() {
     let report = sanitize_dir(&raw, &staging_dir(temp.path(), "accounting")).unwrap();
     let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
     assert_eq!(manifest["schema_version"], 1);
+    assert_eq!(manifest["source"], "capture.json");
     assert_eq!(manifest["provider"], "claude");
-    assert_eq!(manifest["scenario"], "accounting");
+    assert!(manifest.get("scenario").is_none());
     assert_eq!(manifest["redaction_counts"]["session_id"], 2);
     assert_eq!(manifest["redaction_counts"]["user_text"], 2);
     assert_eq!(

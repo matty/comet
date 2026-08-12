@@ -286,6 +286,8 @@ pub enum SanitizationError {
     SecretLikeField { location: String },
     #[error("capture contains a secret-like value at {location}")]
     SecretLikeValue { location: String },
+    #[error("capture contains a sensitive object key at {location}")]
+    SensitiveObjectKey { location: String },
     #[error("capture channel contains unparseable structured JSON at sequence {sequence}")]
     UnparseableStructuredPayload { sequence: u64 },
     #[error("sanitized capture could not be written")]
@@ -466,19 +468,13 @@ pub fn sanitize_dir(
         }
         seen
     });
-    let mut scenario = raw_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("capture")
-        .to_owned();
-    redactor.sanitize_paths_and_validate(&mut scenario, "scenario")?;
     let manifest = json!({
         "schema_version": 1,
+        "source": "capture.json",
         "provider": capture.provider,
         "cli_version": cli_version,
         "normalized_cli_version": normalized_cli_version,
         "platform": platform,
-        "scenario": scenario,
         "command": command,
         "channels": channels,
         "exit_code": capture.exit_code,
@@ -511,6 +507,22 @@ fn publish_staging_pair_with<F>(
 where
     F: FnOnce(&Path) -> std::io::Result<()>,
 {
+    publish_staging_pair_with_commit(output_dir, events, manifest, after_events, |from, to| {
+        std::fs::rename(from, to)
+    })
+}
+
+fn publish_staging_pair_with_commit<F, C>(
+    output_dir: &Path,
+    events: &[u8],
+    manifest: &[u8],
+    after_events: F,
+    commit: C,
+) -> std::io::Result<()>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+    C: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
     let parent = output_dir.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -537,26 +549,35 @@ where
         return Err(error);
     }
 
-    if !output_dir.exists() {
-        if let Err(error) = std::fs::rename(&temporary, output_dir) {
-            let _ = remove_verified_generated_dir(&temporary, parent, &temporary_prefix);
-            return Err(error);
+    if output_dir.exists() {
+        let existing_events = match std::fs::read(output_dir.join("events.jsonl")) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = remove_verified_generated_dir(&temporary, parent, &temporary_prefix);
+                return Err(error);
+            }
+        };
+        let existing_manifest = match std::fs::read(output_dir.join("manifest.json")) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = remove_verified_generated_dir(&temporary, parent, &temporary_prefix);
+                return Err(error);
+            }
+        };
+        remove_verified_generated_dir(&temporary, parent, &temporary_prefix)?;
+        if existing_events == events && existing_manifest == manifest {
+            return Ok(());
         }
-        return Ok(());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "sanitized staging destination already contains different evidence",
+        ));
     }
 
-    let backup_prefix = format!(".{output_name}.previous-");
-    let backup = parent.join(format!("{backup_prefix}{}", uuid::Uuid::new_v4()));
-    if let Err(error) = std::fs::rename(output_dir, &backup) {
+    if let Err(error) = commit(&temporary, output_dir) {
         let _ = remove_verified_generated_dir(&temporary, parent, &temporary_prefix);
         return Err(error);
     }
-    if let Err(error) = std::fs::rename(&temporary, output_dir) {
-        let _ = std::fs::rename(&backup, output_dir);
-        let _ = remove_verified_generated_dir(&temporary, parent, &temporary_prefix);
-        return Err(error);
-    }
-    let _ = remove_verified_generated_dir(&backup, parent, &backup_prefix);
     Ok(())
 }
 
@@ -713,7 +734,7 @@ impl Redactor {
                 for (index, key) in keys.into_iter().enumerate() {
                     let child_location = format!("{location}.object[{index}]");
                     self.validate_key(&key, &child_location)?;
-                    if is_secret_field(&key) {
+                    if is_secret_field(&key, &object[&key]) {
                         return Err(SanitizationError::SecretLikeField {
                             location: child_location,
                         });
@@ -752,7 +773,7 @@ impl Redactor {
                 for (index, (key, value)) in object.iter_mut().enumerate() {
                     let child_location = format!("{location}.object[{index}]");
                     self.validate_key(key, &child_location)?;
-                    if is_secret_field(key) {
+                    if is_secret_field(key, value) {
                         return Err(SanitizationError::SecretLikeField {
                             location: child_location,
                         });
@@ -767,8 +788,14 @@ impl Redactor {
     }
 
     fn validate_key(&mut self, key: &str, location: &str) -> Result<(), SanitizationError> {
-        let mut key = key.to_owned();
-        self.sanitize_paths_and_validate(&mut key, location)
+        let mut sanitized = key.to_owned();
+        self.sanitize_paths_and_validate(&mut sanitized, location)?;
+        if sanitized != key {
+            return Err(SanitizationError::SensitiveObjectKey {
+                location: location.to_owned(),
+            });
+        }
+        Ok(())
     }
 
     fn replace_semantic(&mut self, kind: RedactionKind, value: &mut Value) {
@@ -1027,31 +1054,55 @@ fn is_protocol_discriminator(field: &str) -> bool {
     )
 }
 
-fn is_secret_field(field: &str) -> bool {
+fn is_secret_field(field: &str, value: &Value) -> bool {
+    let normalized = normalize_field(field);
+    if is_token_counter_field(&normalized) {
+        return !value.is_number();
+    }
+    normalized == "token"
+        || [
+            "apitoken",
+            "accesstoken",
+            "authtoken",
+            "bearertoken",
+            "idtoken",
+            "oauthtoken",
+            "personalaccesstoken",
+            "refreshtoken",
+            "sessiontoken",
+            "apikey",
+            "clientsecret",
+            "privatekey",
+            "secretkey",
+            "signingkey",
+            "credential",
+            "credentials",
+            "password",
+            "authorization",
+        ]
+        .iter()
+        .any(|family| normalized.ends_with(family))
+        || normalized == "secret"
+}
+
+fn is_token_counter_field(field: &str) -> bool {
     matches!(
-        normalize_field(field).as_str(),
-        "authorization"
-            | "proxyauthorization"
-            | "apikey"
-            | "openaiapikey"
-            | "anthropicapikey"
-            | "token"
-            | "accesstoken"
-            | "authtoken"
-            | "bearertoken"
-            | "idtoken"
-            | "oauthtoken"
-            | "personalaccesstoken"
-            | "refreshtoken"
-            | "sessiontoken"
-            | "clientsecret"
-            | "privatekey"
-            | "secretkey"
-            | "signingkey"
-            | "credential"
-            | "credentials"
-            | "password"
-            | "secret"
+        field,
+        "inputtoken"
+            | "inputtokens"
+            | "outputtoken"
+            | "outputtokens"
+            | "cachedinputtokens"
+            | "cachecreationinputtokens"
+            | "cachereadinputtokens"
+            | "reasoningoutputtokens"
+            | "maxtoken"
+            | "maxtokens"
+            | "totaltoken"
+            | "totaltokens"
+            | "tokencount"
+            | "totaltokencount"
+            | "tokenusage"
     )
 }
 
@@ -1907,7 +1958,8 @@ mod tests {
     use super::{
         CaptureConfig, CaptureOperation, CaptureScenario, Channel, ClaudeCaptureOperation,
         ClaudeRunScript, CodexCaptureOperation, CodexRunScript, CommandSnapshot, LaunchDescriptor,
-        Provider, RecordingSession, StdioMode, publish_staging_pair_with, record,
+        Provider, RecordingSession, StdioMode, publish_staging_pair_with,
+        publish_staging_pair_with_commit, record,
     };
 
     /// Break caught: writing events directly into the destination before manifest creation can
@@ -1940,6 +1992,98 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(siblings, [std::ffi::OsString::from("scenario")]);
+    }
+
+    /// Break caught: backup-and-replace publication mutates reviewed evidence when rerun bytes
+    /// differ, and a failed rollback can then lose the original pair.
+    #[test]
+    fn staging_pair_publish_rejects_a_different_existing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join(".comet-provider-captures/staging");
+        let destination = parent.join("scenario");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("events.jsonl"), b"reviewed events").unwrap();
+        std::fs::write(destination.join("manifest.json"), b"reviewed manifest").unwrap();
+
+        let error = publish_staging_pair_with(
+            &destination,
+            b"different events",
+            b"different manifest",
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(destination.join("events.jsonl")).unwrap(),
+            b"reviewed events"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("manifest.json")).unwrap(),
+            b"reviewed manifest"
+        );
+        let siblings: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(siblings, [std::ffi::OsString::from("scenario")]);
+    }
+
+    /// Break caught: an identical rerun still swaps directories, violating immutable destination
+    /// semantics and exposing a needless Windows rename failure path.
+    #[test]
+    fn staging_pair_publish_identical_existing_destination_is_a_noop() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join(".comet-provider-captures/staging");
+        let destination = parent.join("scenario");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("events.jsonl"), b"same events").unwrap();
+        std::fs::write(destination.join("manifest.json"), b"same manifest").unwrap();
+
+        publish_staging_pair_with_commit(
+            &destination,
+            b"same events",
+            b"same manifest",
+            |_| Ok(()),
+            |_, _| panic!("identical evidence must not invoke the commit rename"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(destination.join("events.jsonl")).unwrap(),
+            b"same events"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("manifest.json")).unwrap(),
+            b"same manifest"
+        );
+        let siblings: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(siblings, [std::ffi::OsString::from("scenario")]);
+    }
+
+    /// Break caught: a failed final rename can leave a generated sibling or a partially visible
+    /// destination, especially because directory replacement differs across platforms.
+    #[test]
+    fn staging_pair_publish_cleans_up_after_final_rename_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join(".comet-provider-captures/staging");
+        let destination = parent.join("scenario");
+
+        let error = publish_staging_pair_with_commit(
+            &destination,
+            b"complete events",
+            b"complete manifest",
+            |_| Ok(()),
+            |_, _| Err(std::io::Error::other("injected final rename failure")),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(parent).unwrap().count(), 0);
     }
 
     fn contract_request() -> RunRequest {
