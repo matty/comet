@@ -381,6 +381,14 @@ pub(crate) fn approval_unanswered_message() -> String {
 pub(crate) const NOTICE_SUMMARY_MAX: usize = 160;
 /// Byte budget for a notice `detail` built from provider prose.
 pub(crate) const NOTICE_DETAIL_MAX: usize = 480;
+/// Byte budget for a subagent's `prompt`, capped where it enters the doc
+/// (`AgentEvent::SubagentStarted`) — never at its full, unbounded length.
+/// The prompt is the same class of data `doc::parts::sanitize_tool_call`
+/// already strips from `WriteFile`/`Mcp`: the transcript replays over the
+/// LAN, and the full text belongs only in the local run journal. Same budget
+/// as [`NOTICE_DETAIL_MAX`] — no reason for a subagent's instructions to get
+/// a materially different allowance than any other provider prose.
+pub(crate) const SUBAGENT_PROMPT_MAX: usize = NOTICE_DETAIL_MAX;
 
 /// Cap unbounded provider prose at the harness boundary: truncate to
 /// `max_bytes` on a char boundary and append an ellipsis. Irreversible for

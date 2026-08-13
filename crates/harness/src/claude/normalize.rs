@@ -1,13 +1,15 @@
 //! Frame → [`AgentEvent`] normalization, ported from claude.ts's `normalize`
 //! (init dedupe, subagent filtering, tool decoding, error-code mapping).
 
+use std::collections::HashMap;
+
 use comet_proto::{
     AgentEvent, DiagnosticSeverity, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, RuntimeMode,
-    TodoItem, ToolCall,
+    SubagentStatus, TodoItem, ToolCall,
 };
 use serde_json::Value;
 
-use super::wire::{ContentBlock, Frame, SystemNoticeFrame};
+use super::wire::{ContentBlock, Frame, SubagentTaskFrame, SystemNoticeFrame};
 
 /// Human-readable text for the CLI's assistant-level error codes. These arrive
 /// as a terse `error` field on an `assistant` frame — usually with NO text
@@ -117,6 +119,84 @@ fn str_field(input: &Value, key: &str) -> String {
 
 fn opt_str_field(input: &Value, key: &str) -> Option<String> {
     input.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// Claude's `status` string on `task_notification` / `task_updated.patch`, to
+/// [`SubagentStatus`]. The capture never observed anything but `"completed"`
+/// — `Failed` and `Cancelled` are written by hand per
+/// `.agents/rules/optional-wire-fields.md`. Anything unrecognized (including
+/// a genuinely in-progress subagent, which reports no `status` field at all)
+/// degrades to `Running` rather than panicking: an unknown status is not
+/// evidence the subagent stopped.
+fn subagent_status(raw: &str) -> SubagentStatus {
+    match raw {
+        "completed" => SubagentStatus::Completed,
+        "failed" => SubagentStatus::Failed,
+        "cancelled" => SubagentStatus::Cancelled,
+        _ => SubagentStatus::Running,
+    }
+}
+
+/// The material fields of one `SubagentUpdated` reading, compared per
+/// `task_id` to dedupe repeated `task_progress` ticks whose content did not
+/// move. Deliberately NOT a merged/accumulated state: each frame's own
+/// reported fields are compared as-is against the last-EMITTED reading, so a
+/// `task_updated` (status only) naturally differs from a preceding
+/// `task_progress` (status + activity + usage) even though it reports fewer
+/// fields — that is a real transition, not filter noise. This is a dedupe at
+/// the normalize boundary, not a state machine: it never looks further back
+/// than the immediately preceding emission for the same `task_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubagentSnapshot {
+    status: SubagentStatus,
+    activity: Option<String>,
+    summary: Option<String>,
+    total_tokens: Option<u64>,
+    tool_uses: Option<u32>,
+    duration_ms: Option<u64>,
+}
+
+/// Sniff the `Agent` tool's own `tool_use_result` for a subagent record, keyed
+/// by `agentId` (== `task_id`). Shape-based rather than name-tracked: `agentId`
+/// alongside `status` is specific to an `Agent` result, so an ordinary tool's
+/// result (`Bash`'s `stdout`, `Write`'s diff, …) never matches. Returns `None`
+/// for anything that isn't one.
+fn subagent_result_from_tool_use_result(value: &Value) -> Option<(String, SubagentSnapshot)> {
+    let task_id = value.get("agentId").and_then(Value::as_str)?.to_owned();
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .map(subagent_status)
+        .unwrap_or(SubagentStatus::Running);
+    let summary = value
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|s| !s.is_empty());
+    let total_tokens = value.get("totalTokens").and_then(Value::as_u64);
+    let duration_ms = value.get("totalDurationMs").and_then(Value::as_u64);
+    let tool_uses = value
+        .get("totalToolUseCount")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    Some((
+        task_id,
+        SubagentSnapshot {
+            status,
+            activity: None,
+            summary,
+            total_tokens,
+            tool_uses,
+            duration_ms,
+        },
+    ))
 }
 
 /// Decode a Claude `tool_use` block (name + input) into a typed [`ToolCall`].
@@ -289,6 +369,9 @@ pub(crate) struct Normalizer {
     /// Echoed into `SessionStarted` so the journal records what the run was
     /// launched under. Nothing here acts on it.
     runtime_mode: RuntimeMode,
+    /// Last-EMITTED `SubagentUpdated` reading per `task_id` — the
+    /// material-transition filter's only state. See [`SubagentSnapshot`].
+    subagent_progress: HashMap<String, SubagentSnapshot>,
 }
 
 impl Normalizer {
@@ -298,6 +381,109 @@ impl Normalizer {
             assistant_message_id: new_message_id(),
             session_id: None,
             runtime_mode,
+            subagent_progress: HashMap::new(),
+        }
+    }
+
+    /// Emit a `SubagentUpdated` for `task_id`, unless `snapshot` is identical
+    /// to the last one emitted for the same id — the material-transition
+    /// filter. Also the mechanism behind the `tool_use_result` fallback:
+    /// when `task_notification` already reported this exact terminal state,
+    /// the fallback's candidate snapshot matches and is silently absorbed
+    /// rather than needing a second, separate "did we already resolve this"
+    /// check.
+    fn emit_subagent_update(
+        &mut self,
+        task_id: String,
+        snapshot: SubagentSnapshot,
+    ) -> Vec<AgentEvent> {
+        if self.subagent_progress.get(&task_id) == Some(&snapshot) {
+            return Vec::new();
+        }
+        let event = AgentEvent::SubagentUpdated {
+            task_id: task_id.clone(),
+            status: snapshot.status,
+            activity: snapshot.activity.clone(),
+            summary: snapshot.summary.clone(),
+            total_tokens: snapshot.total_tokens,
+            duration_ms: snapshot.duration_ms,
+            tool_uses: snapshot.tool_uses,
+        };
+        self.subagent_progress.insert(task_id, snapshot);
+        vec![event]
+    }
+
+    /// The four claimed `system/task_*` subtypes → `SubagentStarted` /
+    /// `SubagentUpdated`. See the module-level table in the task 3 brief for
+    /// which subtype feeds which fields.
+    fn normalize_subagent_task(&mut self, f: SubagentTaskFrame) -> Vec<AgentEvent> {
+        match f.subtype.as_str() {
+            "task_started" => vec![AgentEvent::SubagentStarted {
+                task_id: f.task_id,
+                tool_use_id: f.tool_use_id.unwrap_or_default(),
+                agent_type: f.subagent_type.unwrap_or_default(),
+                description: f.description.unwrap_or_default(),
+                prompt: f
+                    .prompt
+                    .map(|p| crate::cap_prose(&p, crate::SUBAGENT_PROMPT_MAX)),
+            }],
+            "task_progress" => {
+                let usage = f.usage.unwrap_or_default();
+                self.emit_subagent_update(
+                    f.task_id,
+                    SubagentSnapshot {
+                        status: SubagentStatus::Running,
+                        activity: f.description,
+                        summary: None,
+                        total_tokens: usage.total_tokens,
+                        tool_uses: usage.tool_uses,
+                        duration_ms: usage.duration_ms,
+                    },
+                )
+            }
+            "task_updated" => {
+                let status = f
+                    .patch
+                    .and_then(|p| p.status)
+                    .as_deref()
+                    .map(subagent_status)
+                    .unwrap_or(SubagentStatus::Running);
+                self.emit_subagent_update(
+                    f.task_id,
+                    SubagentSnapshot {
+                        status,
+                        activity: None,
+                        summary: None,
+                        total_tokens: None,
+                        tool_uses: None,
+                        duration_ms: None,
+                    },
+                )
+            }
+            "task_notification" => {
+                let usage = f.usage.unwrap_or_default();
+                let status = f
+                    .status
+                    .as_deref()
+                    .map(subagent_status)
+                    .unwrap_or(SubagentStatus::Running);
+                self.emit_subagent_update(
+                    f.task_id,
+                    SubagentSnapshot {
+                        status,
+                        activity: None,
+                        summary: f.summary,
+                        total_tokens: usage.total_tokens,
+                        tool_uses: usage.tool_uses,
+                        duration_ms: usage.duration_ms,
+                    },
+                )
+            }
+            // Unreachable in production: `parse_frame` routes only the four
+            // subtypes above into `Frame::SubagentTask`. Not a panic — a
+            // wire fact changing underneath this match must degrade quietly
+            // rather than crash a run.
+            _ => Vec::new(),
         }
     }
 
@@ -393,15 +579,31 @@ impl Normalizer {
                 if f.parent_tool_use_id.is_some() {
                     return Vec::new();
                 }
-                f.message
+                let mut out: Vec<AgentEvent> = f
+                    .message
                     .blocks()
                     .filter(|b: &ContentBlock| b.kind == "tool_result")
                     .map(|b| AgentEvent::ToolResult {
                         id: b.tool_use_id.clone(),
                         is_error: b.is_error.unwrap_or(false),
                     })
-                    .collect()
+                    .collect();
+                // The `Agent` tool's own result carries the whole subagent
+                // record on one frame — a fallback that resolves the card
+                // even if `task_notification` never arrived. Routed through
+                // the same dedupe as the live stream, so it is a no-op when
+                // that stream already reported this exact terminal state.
+                let fallback = f
+                    .tool_use_result
+                    .as_ref()
+                    .and_then(subagent_result_from_tool_use_result);
+                if let Some((task_id, snapshot)) = fallback {
+                    out.extend(self.emit_subagent_update(task_id, snapshot));
+                }
+                out
             }
+
+            Frame::SubagentTask(f) => self.normalize_subagent_task(f),
 
             // A claude.ai plan window. `rejected` blocks the turn and stays an
             // Error (deliberately unchanged this slice). `allowed_warning` is
@@ -959,5 +1161,307 @@ mod tests {
             &events[0],
             AgentEvent::Diagnostic { discriminator, .. } if discriminator == "malformed"
         ));
+    }
+
+    // ---- subagent task frames (slice 4.2 task 3) ----
+    // Literal shapes throughout: captures/2026-08-13-plan-todo-subagent/
+    // run2-claude-subagent.jsonl, per AGENTS.md's rule that wire-pinning
+    // tests point at the JSON the provider actually sends.
+
+    use comet_proto::SubagentStatus;
+
+    fn normalize_one(raw: &str) -> Vec<AgentEvent> {
+        let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
+        Normalizer::new(RuntimeMode::default()).normalize(frame, false)
+    }
+
+    #[test]
+    fn task_started_emits_subagent_started() {
+        let raw = r#"{"type":"system","subtype":"task_started","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","description":"Read README and report first heading","subagent_type":"general-purpose","task_type":"local_agent","prompt":"Read the README.md file in the current directory and report what the first heading is. Just state the heading text, nothing else."}"#;
+        assert_eq!(
+            normalize_one(raw),
+            vec![AgentEvent::SubagentStarted {
+                task_id: "a6d1ae6c4fec0efe9".into(),
+                tool_use_id: "toolu_01M553SNnGHZ1j4whxE9zWq9".into(),
+                agent_type: "general-purpose".into(),
+                description: "Read README and report first heading".into(),
+                prompt: Some(
+                    "Read the README.md file in the current directory and report what the first heading is. Just state the heading text, nothing else."
+                        .into()
+                ),
+            }]
+        );
+    }
+
+    /// The prompt is a privacy decision, not a display one — capped at the
+    /// harness boundary (per the slice's own decision doc) because it is
+    /// unbounded and the transcript replays over the LAN. `SUBAGENT_PROMPT_MAX`
+    /// is 480 bytes; the input has to exceed that for the assertion to be
+    /// non-vacuous.
+    #[test]
+    fn an_oversized_prompt_is_capped_at_the_harness_boundary() {
+        let long_prompt = "x".repeat(600);
+        let raw = format!(
+            r#"{{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"tu1","description":"d","subagent_type":"general-purpose","prompt":"{long_prompt}"}}"#
+        );
+        match &normalize_one(&raw)[0] {
+            AgentEvent::SubagentStarted { prompt, .. } => {
+                let prompt = prompt.as_ref().expect("prompt present");
+                assert_eq!(prompt.len(), crate::SUBAGENT_PROMPT_MAX + '…'.len_utf8());
+                assert!(prompt.ends_with('…'));
+            }
+            other => panic!("expected SubagentStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_progress_emits_a_running_update_with_activity_and_usage() {
+        let raw = r#"{"type":"system","subtype":"task_progress","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","description":"Reading README.md","subagent_type":"general-purpose","usage":{"total_tokens":19215,"tool_uses":1,"duration_ms":2906},"last_tool_name":"Read"}"#;
+        assert_eq!(
+            normalize_one(raw),
+            vec![AgentEvent::SubagentUpdated {
+                task_id: "a6d1ae6c4fec0efe9".into(),
+                status: SubagentStatus::Running,
+                activity: Some("Reading README.md".into()),
+                summary: None,
+                total_tokens: Some(19215),
+                duration_ms: Some(2906),
+                tool_uses: Some(1),
+            }]
+        );
+    }
+
+    /// The absent case, written by hand per
+    /// `.agents/rules/optional-wire-fields.md`: nothing on the wire promises
+    /// `task_progress` always carries a `usage` block, and `None` here must
+    /// mean "not reported", never collapse to a reported zero.
+    #[test]
+    fn task_progress_with_no_usage_block_reports_none_not_zero() {
+        let raw = r#"{"type":"system","subtype":"task_progress","task_id":"t1","tool_use_id":"tu1","description":"Starting up"}"#;
+        assert_eq!(
+            normalize_one(raw),
+            vec![AgentEvent::SubagentUpdated {
+                task_id: "t1".into(),
+                status: SubagentStatus::Running,
+                activity: Some("Starting up".into()),
+                summary: None,
+                total_tokens: None,
+                duration_ms: None,
+                tool_uses: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn task_updated_partial_patch_leaves_summary_and_usage_none() {
+        let raw = r#"{"type":"system","subtype":"task_updated","task_id":"a6d1ae6c4fec0efe9","patch":{"status":"completed","end_time":1786581776304}}"#;
+        assert_eq!(
+            normalize_one(raw),
+            vec![AgentEvent::SubagentUpdated {
+                task_id: "a6d1ae6c4fec0efe9".into(),
+                status: SubagentStatus::Completed,
+                activity: None,
+                summary: None,
+                total_tokens: None,
+                duration_ms: None,
+                tool_uses: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn task_notification_emits_a_terminal_update_with_summary_and_usage() {
+        let raw = r#"{"type":"system","subtype":"task_notification","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","status":"completed","output_file":"C:\\tmp\\out","summary":"Sandbox","usage":{"total_tokens":20044,"tool_uses":1,"duration_ms":4906}}"#;
+        assert_eq!(
+            normalize_one(raw),
+            vec![AgentEvent::SubagentUpdated {
+                task_id: "a6d1ae6c4fec0efe9".into(),
+                status: SubagentStatus::Completed,
+                activity: None,
+                summary: Some("Sandbox".into()),
+                total_tokens: Some(20044),
+                duration_ms: Some(4906),
+                tool_uses: Some(1),
+            }]
+        );
+    }
+
+    /// A `SendMessage`-resumed agent fires a second `task_started` for the
+    /// SAME `task_id` under a NEW `tool_use_id`. Keying the emitted event on
+    /// `task_id` (not `tool_use_id`) is what keeps this one card — the
+    /// falsification probe below breaks exactly this.
+    #[test]
+    fn a_resumed_agent_produces_two_started_events_sharing_one_task_id() {
+        let first = r#"{"type":"system","subtype":"task_started","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","description":"Read README and report first heading","subagent_type":"general-purpose","task_type":"local_agent","prompt":"Read the README.md file in the current directory and report what the first heading is. Just state the heading text, nothing else."}"#;
+        let second = r#"{"type":"system","subtype":"task_started","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_017ABUEwC8qtu28pSawot4BQ","description":"Read README and report first heading","subagent_type":"general-purpose","task_type":"local_agent","prompt":"What was the first heading you found?"}"#;
+
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+        let f1 = crate::claude::wire::parse_frame(first).unwrap();
+        let f2 = crate::claude::wire::parse_frame(second).unwrap();
+        let mut events = normalizer.normalize(f1, false);
+        events.extend(normalizer.normalize(f2, false));
+
+        assert_eq!(events.len(), 2, "{events:?}");
+        let (task_ids, tool_use_ids): (Vec<&str>, Vec<&str>) = events
+            .iter()
+            .map(|e| match e {
+                AgentEvent::SubagentStarted {
+                    task_id,
+                    tool_use_id,
+                    ..
+                } => (task_id.as_str(), tool_use_id.as_str()),
+                other => panic!("expected SubagentStarted, got {other:?}"),
+            })
+            .unzip();
+        assert_eq!(task_ids[0], task_ids[1], "both must share one task_id");
+        assert_ne!(
+            tool_use_ids[0], tool_use_ids[1],
+            "the resumed invocation uses a new tool_use_id"
+        );
+    }
+
+    #[test]
+    fn an_unknown_status_string_maps_to_running_not_a_panic() {
+        let raw = r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"sleeping","summary":"x"}"#;
+        let events = normalize_one(raw);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::SubagentUpdated {
+                status: SubagentStatus::Running,
+                ..
+            }
+        ));
+    }
+
+    /// Unobserved on the wire (the capture only ever saw `"completed"`), so
+    /// written by hand per `.agents/rules/optional-wire-fields.md`: a path
+    /// whose only real input is the happy fixture ships never having been
+    /// constructed.
+    #[test]
+    fn failed_and_cancelled_statuses_map_correctly() {
+        let failed = r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"failed","summary":"x"}"#;
+        assert!(matches!(
+            &normalize_one(failed)[0],
+            AgentEvent::SubagentUpdated {
+                status: SubagentStatus::Failed,
+                ..
+            }
+        ));
+        let cancelled = r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"cancelled","summary":"x"}"#;
+        assert!(matches!(
+            &normalize_one(cancelled)[0],
+            AgentEvent::SubagentUpdated {
+                status: SubagentStatus::Cancelled,
+                ..
+            }
+        ));
+        // task_updated's patch.status is the same string space.
+        let patch_failed = r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"failed"}}"#;
+        assert!(matches!(
+            &normalize_one(patch_failed)[0],
+            AgentEvent::SubagentUpdated {
+                status: SubagentStatus::Failed,
+                ..
+            }
+        ));
+    }
+
+    /// The material-transition filter: repeated `task_progress` ticks whose
+    /// activity and usage figures did not move must not each mint a new
+    /// event — this is the guard against the fan-out a coordinator's
+    /// `workflow_progress` array would otherwise cause (out of scope here;
+    /// Comet never decodes that array — see the task brief).
+    #[test]
+    fn repeated_identical_task_progress_frames_collapse_to_one_update() {
+        let raw = r#"{"type":"system","subtype":"task_progress","task_id":"t1","tool_use_id":"tu1","description":"Reading README.md","usage":{"total_tokens":100,"tool_uses":1,"duration_ms":500}}"#;
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+        let frame = crate::claude::wire::parse_frame(raw).unwrap();
+        let first = normalizer.normalize(frame, false);
+        assert_eq!(first.len(), 1, "{first:?}");
+
+        // An exact repeat: nothing material moved, so nothing emits.
+        let frame = crate::claude::wire::parse_frame(raw).unwrap();
+        let second = normalizer.normalize(frame, false);
+        assert!(second.is_empty(), "{second:?}");
+
+        // A real tick: the activity line and usage moved, so this emits.
+        let moved = r#"{"type":"system","subtype":"task_progress","task_id":"t1","tool_use_id":"tu1","description":"Writing report.md","usage":{"total_tokens":250,"tool_uses":2,"duration_ms":1200}}"#;
+        let frame = crate::claude::wire::parse_frame(moved).unwrap();
+        let third = normalizer.normalize(frame, false);
+        assert_eq!(
+            third,
+            vec![AgentEvent::SubagentUpdated {
+                task_id: "t1".into(),
+                status: SubagentStatus::Running,
+                activity: Some("Writing report.md".into()),
+                summary: None,
+                total_tokens: Some(250),
+                duration_ms: Some(1200),
+                tool_uses: Some(2),
+            }]
+        );
+    }
+
+    /// The `Agent` tool's own `tool_use_result` carries the whole record on
+    /// one frame — a fallback that resolves the card even if
+    /// `task_notification` never arrived. Literal shape:
+    /// run2-claude-subagent.jsonl sequence with `parent_tool_use_id: null`.
+    #[test]
+    fn agent_tool_use_result_resolves_the_card_with_no_notification() {
+        let raw = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","type":"tool_result","content":[{"type":"text","text":"Sandbox"}]}]},"parent_tool_use_id":null,"tool_use_result":{"status":"completed","agentId":"a6d1ae6c4fec0efe9","agentType":"general-purpose","content":[{"type":"text","text":"Sandbox"}],"resolvedModel":"claude-haiku-4-5-20251001","totalDurationMs":4907,"totalTokens":20115,"totalToolUseCount":1}}"#;
+        let events = normalize_one(raw);
+        let subagent_event = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::SubagentUpdated { .. }))
+            .expect("a SubagentUpdated fallback");
+        assert_eq!(
+            subagent_event,
+            &AgentEvent::SubagentUpdated {
+                task_id: "a6d1ae6c4fec0efe9".into(),
+                status: SubagentStatus::Completed,
+                activity: None,
+                summary: Some("Sandbox".into()),
+                total_tokens: Some(20115),
+                duration_ms: Some(4907),
+                tool_uses: Some(1),
+            }
+        );
+    }
+
+    /// The fallback must not double up when `task_notification` already
+    /// resolved the same terminal state — same dedupe path as the
+    /// material-transition filter above, not a separate mechanism.
+    #[test]
+    fn agent_tool_use_result_is_suppressed_when_notification_already_matched() {
+        let notification = r#"{"type":"system","subtype":"task_notification","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","status":"completed","summary":"Sandbox","usage":{"total_tokens":20115,"tool_uses":1,"duration_ms":4907}}"#;
+        let tool_result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","type":"tool_result","content":[{"type":"text","text":"Sandbox"}]}]},"parent_tool_use_id":null,"tool_use_result":{"status":"completed","agentId":"a6d1ae6c4fec0efe9","agentType":"general-purpose","content":[{"type":"text","text":"Sandbox"}],"resolvedModel":"claude-haiku-4-5-20251001","totalDurationMs":4907,"totalTokens":20115,"totalToolUseCount":1}}"#;
+
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+        let frame = crate::claude::wire::parse_frame(notification).unwrap();
+        let first = normalizer.normalize(frame, false);
+        assert_eq!(first.len(), 1, "{first:?}");
+
+        let frame = crate::claude::wire::parse_frame(tool_result).unwrap();
+        let second = normalizer.normalize(frame, false);
+        assert!(
+            !second
+                .iter()
+                .any(|e| matches!(e, AgentEvent::SubagentUpdated { .. })),
+            "identical terminal state must not re-emit: {second:?}"
+        );
+    }
+
+    /// An ordinary tool result (no `agentId`) must not be mistaken for a
+    /// subagent record.
+    #[test]
+    fn a_non_agent_tool_use_result_emits_no_subagent_event() {
+        let raw = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":[{"type":"text","text":"ok"}]}]},"parent_tool_use_id":null,"tool_use_result":{"stdout":"capture","interrupted":false}}"#;
+        let events = normalize_one(raw);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::SubagentUpdated { .. })),
+            "{events:?}"
+        );
     }
 }
