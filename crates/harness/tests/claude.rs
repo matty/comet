@@ -14,9 +14,9 @@ use comet_harness::{
     CancellationToken, ClaudeHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use comet_proto::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus, FileOperation,
-    HarnessId, NoticeKind, NoticeSeverity, RunRequest, RuntimeMode, SubagentStatus, ToolCall,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, ApprovalDecision, ApprovalRequest, ChecklistStatus, DiagnosticSeverity, DoneStatus,
+    FileOperation, HarnessId, NoticeKind, NoticeSeverity, RunRequest, RuntimeMode, SubagentStatus,
+    ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 /// The `fake-claude` bin target, built by cargo alongside this test.
@@ -314,6 +314,72 @@ async fn subagent_terminal_failure_reaches_the_event_stream() {
         duration_ms: Some(1_830),
         tool_uses: Some(1),
     }));
+}
+
+/// The task-tool decode crossing a real spawn: fake executable → harness →
+/// event stream. The unit tests in `normalize.rs` drive frames straight into
+/// the normalizer, so nothing had checked that the `tool_use_id` join survives
+/// a real session's interleaving until this fixture existed.
+///
+/// Fixture: `scenario:checklist` in `fixtures/fake_claude.rs`, shaped from
+/// `tests/corpus/claude/2.1.229/checklist`.
+#[tokio::test]
+async fn task_tool_mutations_reach_the_event_stream_as_checklist_changes() {
+    let (controls, _steer, _token) = controls("A");
+    let events = run_to_end(&harness(), request("scenario:checklist"), controls).await;
+
+    // A create: the id comes off the RESULT, the subject off either side.
+    assert!(
+        events.contains(&AgentEvent::ChecklistItemChanged {
+            item_id: "1".into(),
+            text: Some("Alpha step".into()),
+            active_form: None,
+            status: ChecklistStatus::Pending,
+        }),
+        "{events:?}"
+    );
+    // An update: activeForm off the INPUT, destination off the result.
+    assert!(
+        events.contains(&AgentEvent::ChecklistItemChanged {
+            item_id: "1".into(),
+            text: None,
+            active_form: Some("Working the first step".into()),
+            status: ChecklistStatus::InProgress,
+        }),
+        "{events:?}"
+    );
+    // A completion carries no activeForm at all.
+    assert!(
+        events.contains(&AgentEvent::ChecklistItemChanged {
+            item_id: "1".into(),
+            text: None,
+            active_form: None,
+            status: ChecklistStatus::Completed,
+        }),
+        "{events:?}"
+    );
+    // Task 9 was never created in this session — the resumed-run shape. It
+    // must still reach the stream, with no subject anywhere.
+    assert!(
+        events.contains(&AgentEvent::ChecklistItemChanged {
+            item_id: "9".into(),
+            text: None,
+            active_form: Some("Working an inherited step".into()),
+            status: ChecklistStatus::InProgress,
+        }),
+        "{events:?}"
+    );
+    // The task calls themselves stay ordinary tool chips.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCall {
+                call: comet_proto::ToolCall::Unknown { name, .. },
+                ..
+            } if name == "TaskCreate"
+        )),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]

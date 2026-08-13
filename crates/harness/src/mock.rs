@@ -458,6 +458,69 @@ impl Harness for MockHarness {
             )
             .into(),
         });
+        // Dev/testing knob: `COMET_MOCK_CHECKLIST=1` publishes a plan, which is
+        // the only way to put slice 4.4's checklist surface on screen without
+        // driving a real CLI through a multi-step task.
+        //
+        // Shaped from the recorded run at
+        // `crates/harness/tests/corpus/claude/2.1.229/checklist{,-resume}`, not
+        // composed: three items created pending, the first driven all the way
+        // through, the second left mid-flight, and a fourth that arrives as a
+        // bare status change carrying only an `activeForm`.
+        //
+        // Two states here exist because a happy-path fixture never produces
+        // them and both are the interesting ones to draw. **An item stuck in
+        // `InProgress`** is the state the whole surface exists to show — a
+        // fixture that runs every item to `Completed` never renders it. **An
+        // item with no `text` at all** is what a resumed run produces for a
+        // task the previous process created (capture §7); a card that assumes
+        // every row has a subject will render it as a blank line.
+        let mock_checklist = std::env::var("COMET_MOCK_CHECKLIST")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        let checklist_events = mock_checklist
+            .then(|| {
+                let created = |id: &str, text: &str| AgentEvent::ChecklistItemChanged {
+                    item_id: id.into(),
+                    text: Some(text.into()),
+                    active_form: None,
+                    status: comet_proto::ChecklistStatus::Pending,
+                };
+                let moved =
+                    |id: &str, active: Option<&str>, status| AgentEvent::ChecklistItemChanged {
+                        item_id: id.into(),
+                        text: None,
+                        active_form: active.map(str::to_owned),
+                        status,
+                    };
+                [
+                    created("1", "Read the configuration"),
+                    created("2", "Count the failing cases"),
+                    created("3", "Report both results"),
+                    moved(
+                        "1",
+                        Some("Reading the configuration"),
+                        comet_proto::ChecklistStatus::InProgress,
+                    ),
+                    // No activeForm on a completion, exactly as the wire sends
+                    // it — the row must keep the label it already had.
+                    moved("1", None, comet_proto::ChecklistStatus::Completed),
+                    moved(
+                        "2",
+                        Some("Counting the failing cases"),
+                        comet_proto::ChecklistStatus::InProgress,
+                    ),
+                    // Never created here: a status change for an id this run
+                    // has not seen, which the fold turns into a text-less row.
+                    moved(
+                        "4",
+                        Some("Checking the inherited step"),
+                        comet_proto::ChecklistStatus::InProgress,
+                    ),
+                ]
+            })
+            .into_iter()
+            .flatten();
         // With the code knob, also exercise a MULTILINE Exec command — the
         // round-9 chip breaker shape ("set -e\nfixture_in_original=0"): the
         // Run chip must stay one 30px line.
@@ -484,6 +547,7 @@ impl Harness for MockHarness {
             .take(body.len() * repeat)
             .cloned()
             .chain(code_tool_events)
+            .chain(checklist_events)
             .chain(code_event)
             .chain(table_event)
             .chain(mend_event)
