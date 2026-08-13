@@ -326,6 +326,33 @@ pub struct CheckoutDiff {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GetCheckoutFileDiffTextRequest {
+    pub checkout_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub diff_checksum: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutFileDiffText {
+    pub diff_checksum: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_content_hash: Option<String>,
+    pub binary: bool,
+    pub truncated: bool,
+    #[serde(default)]
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentAccount {
     pub id: String,
     pub harness: HarnessId,
@@ -514,5 +541,31 @@ mod tests {
         assert_eq!(json.get("runtimeMode").unwrap(), "approval-required");
         let round: ChatConfig = serde_json::from_value(json).unwrap();
         assert_eq!(round, config);
+    }
+
+    #[test]
+    fn checkout_file_diff_text_contract_is_camel_case() {
+        let request = GetCheckoutFileDiffTextRequest {
+            checkout_id: "checkout".into(),
+            cwd: "/repo".into(),
+            path: "src/lib.rs".into(),
+            diff_checksum: "abc".into(),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "checkoutId": "checkout",
+                "cwd": "/repo",
+                "path": "src/lib.rs",
+                "diffChecksum": "abc",
+            })
+        );
+        assert_eq!(value["checkoutId"], "checkout");
+        assert_eq!(value["diffChecksum"], "abc");
+        assert_eq!(
+            serde_json::from_value::<GetCheckoutFileDiffTextRequest>(value).unwrap(),
+            request
+        );
     }
 }

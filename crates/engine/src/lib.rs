@@ -37,7 +37,10 @@ pub mod uploads;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
-pub use diff_sync::{CheckoutDiffSync, DiffSnapshot, capture_diff};
+pub use diff_sync::{
+    CheckoutDiffSync, DiffFileTextPair, DiffSnapshot, capture_diff, read_diff_file_text,
+    working_diff_base,
+};
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig};
 pub use instance_lock::InstanceLock;
 pub use lan_server::{LanServer, LanServerHandle, LanServerStatus};

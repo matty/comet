@@ -991,6 +991,74 @@ impl EngineRpc {
             RpcReply::value(&serde_json::json!({ "ok": true }))
         })
     }
+
+    async fn checkout_file_diff_text_with_after_read<AfterRead, AfterReadFuture>(
+        &self,
+        request: comet_proto::GetCheckoutFileDiffTextRequest,
+        after_read: AfterRead,
+    ) -> Result<comet_proto::CheckoutFileDiffText, RpcError>
+    where
+        AfterRead: FnOnce() -> AfterReadFuture + Send,
+        AfterReadFuture: std::future::Future<Output = ()> + Send,
+    {
+        let identity = Box::pin(
+            self.repos
+                .checkout_identity(std::path::Path::new(&request.cwd)),
+        )
+        .await
+        .map_err(|error| RpcError::Failed(error.to_string()))?;
+        if identity.id != request.checkout_id {
+            return Err(RpcError::Failed("checkoutId does not match cwd".into()));
+        }
+
+        let stale = || comet_proto::CheckoutFileDiffText {
+            diff_checksum: request.diff_checksum.clone(),
+            old_text: None,
+            new_text: None,
+            old_content_hash: None,
+            new_content_hash: None,
+            binary: false,
+            truncated: false,
+            stale: true,
+        };
+        let root = identity.root.as_path();
+        let snapshot = Box::pin(crate::diff_sync::capture_diff(&self.repos, root))
+            .await
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        if snapshot.checksum != request.diff_checksum {
+            return Ok(stale());
+        }
+        let file = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == request.path)
+            .ok_or_else(|| RpcError::Failed("path is not part of diff snapshot".into()))?;
+        let base = Box::pin(crate::diff_sync::working_diff_base(root))
+            .await
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        let pair = Box::pin(crate::diff_sync::read_diff_file_text(root, &base, file))
+            .await
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+
+        after_read().await;
+
+        let current = Box::pin(crate::diff_sync::capture_diff(&self.repos, root))
+            .await
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        if current.checksum != request.diff_checksum {
+            return Ok(stale());
+        }
+        Ok(comet_proto::CheckoutFileDiffText {
+            diff_checksum: request.diff_checksum,
+            old_text: pair.old_text,
+            new_text: pair.new_text,
+            old_content_hash: pair.old_content_hash,
+            new_content_hash: pair.new_content_hash,
+            binary: pair.binary,
+            truncated: pair.truncated,
+            stale: false,
+        })
+    }
 }
 
 /// A watch receiver as a stream: current value first, then every change.
@@ -1286,6 +1354,23 @@ impl RpcService for EngineRpc {
             }
             methods::WATCH_CHECKOUT_DIFFS => {
                 Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))
+            }
+            methods::GET_CHECKOUT_FILE_DIFF_TEXT => {
+                // The source-pair path contains several large nested async
+                // futures. Keep that state off every unrelated RPC's worker
+                // stack; this is the same bounded-dispatch mechanism as the
+                // selected upstream stack follow-up (`1ef4aca`).
+                Box::pin(async move {
+                    let request: comet_proto::GetCheckoutFileDiffTextRequest =
+                        parse_params(params)?;
+                    let reply =
+                        Box::pin(self.checkout_file_diff_text_with_after_read(request, || {
+                            std::future::ready(())
+                        }))
+                        .await?;
+                    RpcReply::value(&reply)
+                })
+                .await
             }
             methods::LIST_REPOS => RpcReply::value(&self.repos.list().await),
             methods::ADD_REPO => {
@@ -2059,6 +2144,74 @@ mod tests {
         registry.register(Arc::new(comet_harness::mock::MockHarness::new()));
         crate::EngineCore::assemble(dir, registry, HarnessId::Mock, None)
             .expect("engine core assembles")
+    }
+
+    async fn init_source_pair_repo(root: &std::path::Path) {
+        std::fs::create_dir_all(root).expect("repo directory");
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["add", "."],
+            vec!["commit", "-m", "initial"],
+        ] {
+            if args[0] == "add" {
+                std::fs::write(root.join("a.txt"), "one\ntwo\n").expect("tracked source");
+            }
+            let output = tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@test")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@test")
+                .output()
+                .await
+                .expect("git command");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn checkout_file_diff_text_rpc_returns_stale_after_read_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        init_source_pair_repo(&repo).await;
+        std::fs::write(repo.join("a.txt"), "one\nfirst\n").expect("first edit");
+
+        let core = engine_core(&dir.path().join("data"));
+        let identity = core
+            .repos
+            .checkout_identity(&repo)
+            .await
+            .expect("checkout identity");
+        let snapshot = crate::diff_sync::capture_diff(&core.repos, &repo)
+            .await
+            .expect("diff snapshot");
+        let request = comet_proto::GetCheckoutFileDiffTextRequest {
+            checkout_id: identity.id,
+            cwd: repo.to_string_lossy().into_owned(),
+            path: "a.txt".into(),
+            diff_checksum: snapshot.checksum.clone(),
+        };
+        let changed_path = repo.join("a.txt");
+        let reply = core
+            .remote_rpc_service()
+            .checkout_file_diff_text_with_after_read(request, move || async move {
+                std::fs::write(changed_path, "one\nsecond\n").expect("post-read edit");
+            })
+            .await
+            .expect("stale reply");
+
+        assert_eq!(reply.diff_checksum, snapshot.checksum);
+        assert!(reply.stale);
+        assert_eq!(reply.old_text, None);
+        assert_eq!(reply.new_text, None);
+        assert_eq!(reply.old_content_hash, None);
+        assert_eq!(reply.new_content_hash, None);
+        core.shutdown().await;
     }
 
     fn recording_core(dir: &std::path::Path, requests: RequestLog) -> crate::EngineCore {

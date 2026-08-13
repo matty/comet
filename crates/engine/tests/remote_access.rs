@@ -795,6 +795,7 @@ fn operational_surface_is_explicitly_allowed() {
         methods::RESIZE_TERMINAL,
         methods::CLOSE_TERMINAL,
         methods::WATCH_CHECKOUT_DIFFS,
+        methods::GET_CHECKOUT_FILE_DIFF_TEXT,
         methods::LIST_AGENT_ACCOUNTS,
         methods::ACTIVATE_AGENT_ACCOUNT,
         methods::UPLOAD_CHUNK,

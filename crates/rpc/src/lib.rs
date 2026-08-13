@@ -78,6 +78,7 @@ pub mod methods {
     /// Checkout-diff stream for the target device's chats (DataRpc,
     /// server-qualified — diffs are produced where the checkout lives).
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
+    pub const GET_CHECKOUT_FILE_DIFF_TEXT: &str = "GetCheckoutFileDiffText";
     // Agent accounts (server-qualified — CLI logins are per Comet instance).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
     pub const ACTIVATE_AGENT_ACCOUNT: &str = "ActivateAgentAccount";

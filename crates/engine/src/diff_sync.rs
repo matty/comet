@@ -17,7 +17,7 @@
 //! Snapshots carry a sha256 checksum; an unchanged checksum publishes nothing.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
@@ -33,6 +33,7 @@ use crate::workspace_host::WorkspaceHost;
 
 /// Hard cap on the unified patch (plus untracked hunks) — "Partial snapshot".
 pub const MAX_PATCH_BYTES: usize = 3 * 1024 * 1024;
+pub const MAX_DIFF_SOURCE_BYTES: usize = 1024 * 1024;
 /// Trailing debounce after a filesystem event burst.
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Slow repair pass: re-reconcile + re-sync every checkout.
@@ -61,6 +62,16 @@ pub struct DiffSnapshot {
     pub deletions: u32,
     pub truncated: bool,
     pub checksum: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffFileTextPair {
+    pub old_text: Option<String>,
+    pub new_text: Option<String>,
+    pub old_content_hash: Option<String>,
+    pub new_content_hash: Option<String>,
+    pub binary: bool,
+    pub truncated: bool,
 }
 
 struct CheckoutEntry {
@@ -641,6 +652,134 @@ fn untracked_patch(path: &str, content: &str) -> String {
         "diff --git {a} {b}\nnew file mode 100644\n--- /dev/null\n+++ {b}\n@@ -0,0 +1,{} @@\n{body}\n",
         lines.len()
     )
+}
+
+fn validate_diff_path(path: &str) -> Result<&Path, EngineError> {
+    let path = Path::new(path);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(EngineError::Other("diff path escapes checkout".into()));
+    }
+    Ok(path)
+}
+
+fn decode_diff_source(
+    bytes: Vec<u8>,
+) -> Result<(Option<String>, Option<String>, bool), EngineError> {
+    if bytes.contains(&0) {
+        return Ok((None, None, true));
+    }
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => return Ok((None, None, true)),
+    };
+    let hash = crate::repos::hex(&Sha256::digest(text.as_bytes()));
+    Ok((Some(text), Some(hash), false))
+}
+
+async fn read_worktree_source(root: &Path, path: &Path) -> Result<Capture, EngineError> {
+    let canonical_root = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|error| EngineError::Other(format!("canonical checkout: {error}")))?;
+    let full = root.join(path);
+    let metadata = tokio::fs::symlink_metadata(&full)
+        .await
+        .map_err(|error| EngineError::Other(format!("read diff file metadata: {error}")))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(EngineError::Other(
+            "diff source is not a regular checkout file".into(),
+        ));
+    }
+    let canonical = tokio::fs::canonicalize(&full)
+        .await
+        .map_err(|error| EngineError::Other(format!("canonical diff file: {error}")))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(EngineError::Other("diff source escapes checkout".into()));
+    }
+    if metadata.len() > MAX_DIFF_SOURCE_BYTES as u64 {
+        return Ok(Capture {
+            stdout: Vec::new(),
+            truncated: true,
+        });
+    }
+    let stdout = tokio::fs::read(&canonical)
+        .await
+        .map_err(|error| EngineError::Other(format!("read diff file: {error}")))?;
+    Ok(Capture {
+        stdout,
+        truncated: false,
+    })
+}
+
+/// Read the exact old/new documents for one file in a previously captured diff.
+/// Paths must come from that snapshot's file summary; callers still recheck the
+/// snapshot checksum after this read to close the filesystem race.
+pub async fn read_diff_file_text(
+    root: &Path,
+    base: &str,
+    file: &DiffFileSummary,
+) -> Result<DiffFileTextPair, EngineError> {
+    let new_path = validate_diff_path(&file.path)?;
+    let old_path = (file.status != "added")
+        .then(|| validate_diff_path(file.old_path.as_deref().unwrap_or(&file.path)))
+        .transpose()?;
+
+    let old = if let Some(old_path) = old_path {
+        let spec = format!("{base}:{}", old_path.to_string_lossy());
+        Some(capture_git(root, &["cat-file", "blob", &spec], MAX_DIFF_SOURCE_BYTES).await?)
+    } else {
+        None
+    };
+    let new = if file.status == "deleted" {
+        None
+    } else {
+        Some(read_worktree_source(root, new_path).await?)
+    };
+    let truncated = old.as_ref().is_some_and(|source| source.truncated)
+        || new.as_ref().is_some_and(|source| source.truncated);
+    if truncated {
+        return Ok(DiffFileTextPair {
+            old_text: None,
+            new_text: None,
+            old_content_hash: None,
+            new_content_hash: None,
+            binary: false,
+            truncated: true,
+        });
+    }
+    let (old_text, old_content_hash, old_binary) = match old {
+        Some(source) => decode_diff_source(source.stdout)?,
+        None => (None, None, false),
+    };
+    let (new_text, new_content_hash, new_binary) = match new {
+        Some(source) => decode_diff_source(source.stdout)?,
+        None => (None, None, false),
+    };
+    let binary = old_binary || new_binary || file.binary;
+    Ok(DiffFileTextPair {
+        old_text: (!binary).then_some(old_text).flatten(),
+        new_text: (!binary).then_some(new_text).flatten(),
+        old_content_hash: (!binary).then_some(old_content_hash).flatten(),
+        new_content_hash: (!binary).then_some(new_content_hash).flatten(),
+        binary,
+        truncated: false,
+    })
+}
+
+pub async fn working_diff_base(root: &Path) -> Result<String, EngineError> {
+    let head = capture_git(root, &["rev-parse", "--verify", "HEAD"], 256)
+        .await
+        .map(|capture| String::from_utf8_lossy(&capture.stdout).trim().to_string())
+        .unwrap_or_default();
+    Ok(if head.is_empty() {
+        EMPTY_TREE_SHA.into()
+    } else {
+        head
+    })
 }
 
 /// One bounded atomic snapshot: tracked diff vs HEAD (or the empty tree) with
