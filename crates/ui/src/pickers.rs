@@ -2002,8 +2002,8 @@ impl Pickers {
                     Some(PickerKind::Reasoning) => 0,
                     None => 0,
                 };
-                self.nav_touched = true;
-                self.active = popover::menu_step(Some(self.active), count, delta).unwrap_or(0);
+                (self.active, self.nav_touched) =
+                    menu_nav(self.active, self.nav_touched, count, delta);
                 // Keep the highlighted MODEL row in view (the rows are the
                 // scroll container's direct children, so indices map 1:1);
                 // the traits chips below live in the pinned tray and never
@@ -3827,6 +3827,22 @@ fn model_highlight_index(ids: &[&str], selected: Option<&str>) -> usize {
     ids.iter().position(|id| *id == selected).unwrap_or(0)
 }
 
+/// One arrow press on an open menu: the row to highlight, and whether the
+/// press counts as navigation.
+///
+/// A press against a menu with no rows navigated nothing, so it must not claim
+/// it did. The chips stay clickable while the catalog is still on its way, and
+/// the render-time re-seat that lands the highlight on the checked row is
+/// gated on this flag — claim navigation here and the rows that arrive a
+/// moment later keep the highlight on row 0, so Enter picks the first mode or
+/// the first model instead of the one drawn as checked.
+fn menu_nav(active: usize, nav_touched: bool, count: usize, delta: isize) -> (usize, bool) {
+    match popover::menu_step(Some(active), count, delta) {
+        Some(next) => (next, true),
+        None => (active, nav_touched),
+    }
+}
+
 /// Tallest a picker card grows before its body has to scroll — comet caps its
 /// at min(640px, 75vh).
 const POPOVER_MAX_H: f32 = 640.0;
@@ -3895,6 +3911,27 @@ mod tests {
         // swapped under an open menu) must not leave the highlight adrift.
         assert_eq!(model_highlight_index(&ids, Some("gone")), 0);
         assert_eq!(model_highlight_index(&[], Some("fable-5")), 0);
+    }
+
+    /// The chips stay clickable while the catalog loads, so an arrow can land
+    /// on a menu that has no rows yet. Recording that as navigation suppressed
+    /// the re-seat for the rows that arrived a moment later: the highlight sat
+    /// on row 0 beside a checked row further down, and Enter picked row 0 —
+    /// `approval-required` in the permissions menu, the first model in the
+    /// model menu.
+    #[test]
+    fn an_arrow_on_an_empty_menu_is_not_navigation() {
+        // Rows loaded: the press walks, and it counts.
+        assert_eq!(menu_nav(0, false, 4, 1), (1, true));
+        assert_eq!(menu_nav(0, false, 4, -1), (3, true));
+
+        // Catalog still pending: nothing walked, nothing claimed.
+        assert_eq!(menu_nav(0, false, 0, 1), (0, false));
+        assert_eq!(menu_nav(0, false, 0, -1), (0, false));
+
+        // Real navigation already recorded stays recorded — only reopening the
+        // menu or switching harness hands the highlight back.
+        assert_eq!(menu_nav(2, true, 0, 1), (2, true));
     }
 
     #[test]
