@@ -57,9 +57,12 @@ fn corpus_promoted_token_free_claims_are_valid() {
             "claude-model-no-modality",
             "claude-model-real-catalog-merge",
             "claude-model-reply-shape",
+            "claude-resumed-run-updates-an-uncreated-task",
             "claude-routine-frame-fixture",
             "claude-routine-frame-ignore-list",
             "claude-routine-frame-integration",
+            "claude-task-create-result-shape",
+            "claude-task-update-status-transition",
             "claude-tool-use-result-present",
             "codex-model-cwd-invariance",
             "codex-model-effort-objects",
@@ -192,5 +195,73 @@ fn corpus_promoted_codex_steer_frames_have_the_observed_payloads() {
     assert_eq!(
         steer[2].1["params"]["turn"]["id"],
         steer[0].1["params"]["expectedTurnId"]
+    );
+}
+
+/// Break caught: a claim's frame selectors can drift onto neighbouring frames
+/// and every structural check still passes.
+///
+/// Adding these three claims with a selector off by one sequence produced a
+/// FULLY GREEN `--test capture_corpus` — the validator proves a selected frame
+/// exists, is on a declared channel and accounts for its placeholders, but
+/// nothing proves it holds the evidence the claim describes. Without a payload
+/// assertion a claim is decoration, which is the same weakness a claimless
+/// entry has while looking stronger.
+#[test]
+fn corpus_promoted_claude_checklist_frames_have_the_observed_payloads() {
+    let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+
+    // TaskCreate: the assigned id is on the RESULT and on no input.
+    let create = claim_payloads(&corpus_root, "claude-task-create-result-shape");
+    assert_eq!(create.len(), 2);
+    let call = &create[0].1["message"]["content"][0];
+    assert_eq!(call["name"], "TaskCreate");
+    assert!(
+        call["input"].get("taskId").is_none() && call["input"].get("id").is_none(),
+        "the create call must carry no id of its own: {call}"
+    );
+    assert_eq!(create[1].1["tool_use_result"]["task"]["id"], "1");
+    assert!(
+        create[1].1["tool_use_result"]["task"]["subject"].is_string(),
+        "the result echoes the subject"
+    );
+
+    // TaskUpdate: statusChange is on the result, activeForm only on the input.
+    let update = claim_payloads(&corpus_root, "claude-task-update-status-transition");
+    assert_eq!(update.len(), 2);
+    let input = &update[0].1["message"]["content"][0]["input"];
+    assert_eq!(input["taskId"], "1");
+    assert!(
+        input["activeForm"].is_string(),
+        "activeForm rides the input: {input}"
+    );
+    let result = &update[1].1["tool_use_result"];
+    assert!(
+        result.get("activeForm").is_none(),
+        "and never the result: {result}"
+    );
+    assert_eq!(result["statusChange"]["from"], "pending");
+    assert_eq!(result["statusChange"]["to"], "in_progress");
+
+    // A resumed process: nothing restated, and the first task frame moves an
+    // id this process never created.
+    let resumed = claim_payloads(&corpus_root, "claude-resumed-run-updates-an-uncreated-task");
+    assert_eq!(resumed.len(), 3);
+    let init = &resumed[0].1;
+    assert_eq!(init["subtype"], "init");
+    for key in ["tasks", "todos", "plan"] {
+        assert!(
+            init.get(key).is_none(),
+            "a resumed init restates no task list, but carried {key}: {init}"
+        );
+    }
+    assert_eq!(
+        resumed[1].1["message"]["content"][0]["input"]["taskId"],
+        "2"
+    );
+    assert_eq!(resumed[2].1["tool_use_result"]["taskId"], "2");
+    assert_eq!(
+        resumed[2].1["tool_use_result"]["statusChange"]["from"],
+        "pending"
     );
 }

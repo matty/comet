@@ -18,7 +18,8 @@ Providers:
 
 Scenarios:
   claude: model-discovery, model-discovery-neutral-cwd, model-discovery-project-cwd,
-          command-discovery, fresh-text, approval, resume, attachment
+          command-discovery, fresh-text, approval, resume, attachment, checklist,
+          checklist-resume
   codex:  model-discovery, model-discovery-neutral-cwd, model-discovery-project-cwd,
           model-discovery-logged-out, fresh-text, approval, approval-on-request, resume, steer,
           interruption
@@ -216,7 +217,11 @@ fn capture_config_with_env(
             purpose: "capture Claude's cwd-scoped command initialize reply",
             operation: CaptureOperation::Claude(ClaudeCaptureOperation::CommandDiscovery { cwd }),
         },
-        ("claude", name @ ("fresh-text" | "approval" | "resume" | "attachment")) => {
+        (
+            "claude",
+            name @ ("fresh-text" | "approval" | "resume" | "attachment" | "checklist"
+            | "checklist-resume"),
+        ) => {
             let (prompt, script) = match name {
                 "fresh-text" => (
                     "Reply with the single word capture.".to_owned(),
@@ -234,11 +239,22 @@ fn capture_config_with_env(
                     "Describe the attached image in one short sentence.".to_owned(),
                     ClaudeRunScript::Attachment,
                 ),
+                "checklist" => (
+                    comet_harness::capture::claude_checklist_prompt(),
+                    ClaudeRunScript::Checklist,
+                ),
+                "checklist-resume" => (
+                    comet_harness::capture::claude_checklist_resume_prompt(),
+                    ClaudeRunScript::ChecklistResume,
+                ),
                 _ => unreachable!(),
             };
             let mode = claude_runtime_mode(script);
             let mut request = cheap_claude_request(&prompt, cwd, mode);
-            if matches!(script, ClaudeRunScript::Resume) {
+            if matches!(
+                script,
+                ClaudeRunScript::Resume | ClaudeRunScript::ChecklistResume
+            ) {
                 request.resume = Some(args.resume_id.clone().ok_or_else(|| {
                     "The resume scenario needs --resume-id with a Claude session id.".to_owned()
                 })?);
@@ -363,6 +379,8 @@ fn supported_pair(provider: &str, scenario: &str) -> bool {
                 | "approval"
                 | "resume"
                 | "attachment"
+                | "checklist"
+                | "checklist-resume"
         ) | (
             "codex",
             "model-discovery"
@@ -405,6 +423,8 @@ fn canonical_scenario_name(name: &str) -> &'static str {
         "approval-on-request" => "approval-on-request",
         "resume" => "resume",
         "attachment" => "attachment",
+        "checklist" => "checklist",
+        "checklist-resume" => "checklist-resume",
         "steer" => "steer",
         "interruption" => "interruption",
         _ => unreachable!("only matched scenario names reach this helper"),

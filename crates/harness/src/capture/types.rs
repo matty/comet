@@ -159,6 +159,17 @@ pub enum ClaudeRunScript {
     Approval,
     Resume,
     Attachment,
+    /// Drives the task-list tools (`TaskCreate` / `TaskUpdate`) so a capture
+    /// carries real checklist mutations.
+    Checklist,
+    /// The same list, continued by a SECOND process resuming the first. This
+    /// is the only way to observe what a resumed run is told about a list it
+    /// did not create — which is nothing, so its updates arrive for ids the
+    /// process has never seen. Separate from [`ClaudeRunScript::Resume`]
+    /// because that one's prompt creates no tasks, and separate from
+    /// [`ClaudeRunScript::Checklist`] because it additionally requires
+    /// `--resume-id`.
+    ChecklistResume,
 }
 
 #[derive(Clone, Debug)]

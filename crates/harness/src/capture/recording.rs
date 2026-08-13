@@ -358,10 +358,25 @@ impl RecordingSession {
         let line = claude_user_line(&request, script).await?;
         self.write_line(&line).await?;
         let mut approval = ClaudeApprovalState::default();
+        // Counts the task mutations the run actually confirmed, so a capture
+        // whose model ignored the instructions cannot be promoted as evidence
+        // of a checklist. Keyed off `tool_use_result`, not the prose the model
+        // sees, for the same reason the decode is.
+        let mut task_mutations = 0usize;
         while let Some(line) = self.next_stdout().await? {
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
+            if matches!(
+                script,
+                ClaudeRunScript::Checklist | ClaudeRunScript::ChecklistResume
+            ) && value["type"] == "user"
+            {
+                let result = &value["tool_use_result"];
+                if result.get("task").is_some() || result.get("statusChange").is_some() {
+                    task_mutations += 1;
+                }
+            }
             if matches!(script, ClaudeRunScript::Approval) {
                 let frame = crate::claude::wire::parse_frame(&line)
                     .map_err(|_| anyhow!("Claude approval capture received malformed JSON."))?;
@@ -399,10 +414,26 @@ impl RecordingSession {
                         "Claude approval capture did not observe the exact successful Bash and bounded Write approval."
                     );
                 }
-                if matches!(script, ClaudeRunScript::Resume)
-                    && value["session_id"].as_str() != request.resume.as_deref()
+                if matches!(
+                    script,
+                    ClaudeRunScript::Resume | ClaudeRunScript::ChecklistResume
+                ) && value["session_id"].as_str() != request.resume.as_deref()
                 {
                     bail!("Claude resume capture returned a different session identifier.");
+                }
+                // Four for the first run (two creates, two updates), two for
+                // the resumed one (two updates). Below that the model skipped
+                // a step and the capture proves less than its scenario name
+                // says — fail rather than promote a thinner run.
+                let required = match script {
+                    ClaudeRunScript::Checklist => 4,
+                    ClaudeRunScript::ChecklistResume => 2,
+                    _ => 0,
+                };
+                if task_mutations < required {
+                    bail!(
+                        "Claude checklist capture confirmed {task_mutations} task mutations, needed {required}."
+                    );
                 }
                 return Ok(());
             }

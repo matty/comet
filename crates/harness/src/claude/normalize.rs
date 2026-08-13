@@ -2053,30 +2053,53 @@ mod tests {
 
     // ---- checklist (slice 4.3, task 3) ----
     //
-    // Every JSON literal below is copied from a real run, not composed:
-    // `captures/2026-08-13-plan-todo-subagent/run6-claude-resume-tasks.jsonl`,
-    // Claude Code 2.1.229. `AGENTS.md` requires a decode's test to point at the
-    // literal the provider sends, because a test that round-trips through the
-    // Rust type stays green through exactly the failure that matters.
+    // The wire evidence behind these tests is promoted corpus material, not
+    // prose in this file. Three claims, each naming the frames it rests on in
+    // `crates/harness/tests/corpus/index.json`:
+    //
+    // - `claude-task-create-result-shape` — `TaskCreate`'s result carries the
+    //   assigned id and subject; the id is on no tool input.
+    // - `claude-task-update-status-transition` — `TaskUpdate`'s result carries
+    //   an explicit `statusChange {from,to}` while `activeForm` is only ever on
+    //   the input, so neither frame alone describes the change.
+    // - `claude-resumed-run-updates-an-uncreated-task` — a resumed process
+    //   restates nothing at init and its first task frame updates an id it
+    //   never created.
+    //
+    // The JSON literals below are copied from those same captures (Claude Code
+    // 2.1.229), per `AGENTS.md`'s rule that a decode's test points at the
+    // literal the provider sends rather than round-tripping through the Rust
+    // type — a round trip stays green through exactly the failure that matters.
 
     /// Drive an assistant `tool_use` and its `user` result through one
     /// normalizer, the way the CLI actually sends them.
-    fn drive(normalizer: &mut Normalizer, raws: &[&str]) -> Vec<AgentEvent> {
+    fn drive(normalizer: &mut Normalizer, raws: &[impl AsRef<str>]) -> Vec<AgentEvent> {
         let mut out = Vec::new();
         for raw in raws {
-            let frame = crate::claude::wire::parse_frame(raw).unwrap();
+            let frame = crate::claude::wire::parse_frame(raw.as_ref()).unwrap();
             out.extend(normalizer.normalize(frame, false));
         }
         out
     }
 
-    const CREATE_CALL: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01KrpvHNfTJ46bPJGXovZUnQ","name":"TaskCreate","input":{"subject":"Read README.md","description":"Read the contents of README.md file"}}]},"parent_tool_use_id":null}"#;
-    const CREATE_RESULT: &str = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01KrpvHNfTJ46bPJGXovZUnQ","type":"tool_result","content":"Task #1 created successfully: Read README.md"}]},"parent_tool_use_id":null,"tool_use_result":{"task":{"id":"1","subject":"Read README.md"}}}"#;
+    /// The reviewed frames a claim rests on, in the order it lists them.
+    ///
+    /// Read from the corpus rather than pasted here so a re-recording cannot
+    /// leave this file asserting a shape the provider no longer sends. That
+    /// drift is silent: hand-copied literals keep passing forever.
+    fn claim_frames(claim_id: &str) -> Vec<String> {
+        crate::capture::selected_payloads(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
+            claim_id,
+        )
+        .expect("reviewed corpus frames")
+    }
 
     #[test]
     fn task_create_yields_a_pending_item_with_its_assigned_id() {
+        let frames = claim_frames("claude-task-create-result-shape");
         let mut n = Normalizer::new(RuntimeMode::default());
-        let events = drive(&mut n, &[CREATE_CALL, CREATE_RESULT]);
+        let events = drive(&mut n, &frames);
         let changed: Vec<_> = events
             .iter()
             .filter(|e| matches!(e, AgentEvent::ChecklistItemChanged { .. }))
@@ -2086,7 +2109,7 @@ mod tests {
             vec![&AgentEvent::ChecklistItemChanged {
                 // The id is on the RESULT only; the input never knows it.
                 item_id: "1".into(),
-                text: Some("Read README.md".into()),
+                text: Some("Alpha step".into()),
                 active_form: None,
                 status: ChecklistStatus::Pending,
             }],
@@ -2098,8 +2121,9 @@ mod tests {
     fn a_task_create_still_renders_an_ordinary_tool_chip() {
         // The plan is its own event; the calls driving it stay ordinary tool
         // calls. Nothing here may swallow the chip.
+        let frames = claim_frames("claude-task-create-result-shape");
         let mut n = Normalizer::new(RuntimeMode::default());
-        let events = drive(&mut n, &[CREATE_CALL]);
+        let events = drive(&mut n, &frames[..1]);
         assert!(
             events.iter().any(|e| matches!(
                 e,
@@ -2114,19 +2138,19 @@ mod tests {
 
     #[test]
     fn a_resumed_runs_update_for_an_unseen_task_carries_its_active_form() {
-        // Phase B of the resume capture, verbatim. Task 2 was created by the
+        // The claim's three frames are the resumed run's init (which restates
+        // no list), the update call, and its result. Task 2 was created by the
         // PREVIOUS process, so this normalizer has never seen its subject —
-        // `text` is None and `activeForm` is the only readable label. This is
-        // the ordinary two-turn case, not an exotic one (capture §7).
-        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01EymP3AH2cPAhsVcK4aLzKW","name":"TaskUpdate","input":{"taskId":"2","status":"in_progress","activeForm":"Counting lines in notes.txt"}}]},"parent_tool_use_id":null}"#;
-        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01EymP3AH2cPAhsVcK4aLzKW","type":"tool_result","content":"Updated task #2 activeForm, status"}]},"parent_tool_use_id":null,"tool_use_result":{"success":true,"taskId":"2","updatedFields":["activeForm","status"],"statusChange":{"from":"pending","to":"in_progress"}}}"#;
+        // `text` is None and `activeForm` is the only readable label. The
+        // ordinary two-turn case, not an exotic one.
+        let frames = claim_frames("claude-resumed-run-updates-an-uncreated-task");
         let mut n = Normalizer::new(RuntimeMode::default());
-        let events = drive(&mut n, &[call, result]);
+        let events = drive(&mut n, &frames);
         assert!(
             events.contains(&AgentEvent::ChecklistItemChanged {
                 item_id: "2".into(),
                 text: None,
-                active_form: Some("Counting lines in notes.txt".into()),
+                active_form: Some("Working the second step".into()),
                 status: ChecklistStatus::InProgress,
             }),
             "{events:?}"
@@ -2155,20 +2179,21 @@ mod tests {
 
     #[test]
     fn the_results_confirmed_transition_beats_the_inputs_request() {
-        // The input is what was asked for; the result is what happened. A
-        // rejected or coerced status must not be reported as if it landed.
-        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"TaskUpdate","input":{"taskId":"9","status":"completed"}}]},"parent_tool_use_id":null}"#;
-        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tu1","type":"tool_result","content":"Updated task #9 status"}]},"parent_tool_use_id":null,"tool_use_result":{"success":true,"taskId":"9","statusChange":{"from":"pending","to":"in_progress"}}}"#;
+        // The claim's two frames: an `in_progress` request whose result
+        // confirms the same transition, with `activeForm` present on the input
+        // and absent from the result. The decode must read the destination
+        // from the result — the input is what was asked for, the result is
+        // what happened.
+        let frames = claim_frames("claude-task-update-status-transition");
         let mut n = Normalizer::new(RuntimeMode::default());
-        let events = drive(&mut n, &[call, result]);
+        let events = drive(&mut n, &frames);
         assert!(
-            events.iter().any(|e| matches!(
-                e,
-                AgentEvent::ChecklistItemChanged {
-                    status: ChecklistStatus::InProgress,
-                    ..
-                }
-            )),
+            events.contains(&AgentEvent::ChecklistItemChanged {
+                item_id: "1".into(),
+                text: None,
+                active_form: Some("Working the first step".into()),
+                status: ChecklistStatus::InProgress,
+            }),
             "{events:?}"
         );
     }
