@@ -880,16 +880,27 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(activity) = &doc_part.activity {
         map.insert("activity", activity.as_str())?;
     }
-    if let Some(total_tokens) = doc_part.total_tokens {
-        map.insert("totalTokens", total_tokens as i64)?;
+    // `u64 as i64` wraps a value above `i64::MAX` into negative, and that
+    // negative number then fails to deserialize back into the `Option<u64>`
+    // field on read — taking the whole entry down with it, not just this
+    // field. A value that doesn't fit is written as absent instead.
+    if let Some(total_tokens) = doc_part.total_tokens.and_then(checked_i64) {
+        map.insert("totalTokens", total_tokens)?;
     }
-    if let Some(duration_ms) = doc_part.duration_ms {
-        map.insert("durationMs", duration_ms as i64)?;
+    if let Some(duration_ms) = doc_part.duration_ms.and_then(checked_i64) {
+        map.insert("durationMs", duration_ms)?;
     }
     if let Some(tool_uses) = doc_part.tool_uses {
         map.insert("toolUses", tool_uses as i64)?;
     }
     Ok(())
+}
+
+/// Narrow a wire-domain `u64` to the `i64` loro stores values as. `None` when
+/// the value doesn't fit — see the comment at the [`push_part`] call site for
+/// why that beats wrapping to a negative number.
+fn checked_i64(v: u64) -> Option<i64> {
+    i64::try_from(v).ok()
 }
 
 fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError> {
@@ -1224,8 +1235,16 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     set_or_clear(map, "detail", doc_part.detail.as_deref())?;
     set_or_clear(map, "key", doc_part.key.as_deref())?;
     set_or_clear(map, "activity", doc_part.activity.as_deref())?;
-    set_or_clear_i64(map, "totalTokens", doc_part.total_tokens.map(|v| v as i64))?;
-    set_or_clear_i64(map, "durationMs", doc_part.duration_ms.map(|v| v as i64))?;
+    set_or_clear_i64(
+        map,
+        "totalTokens",
+        doc_part.total_tokens.and_then(checked_i64),
+    )?;
+    set_or_clear_i64(
+        map,
+        "durationMs",
+        doc_part.duration_ms.and_then(checked_i64),
+    )?;
     set_or_clear_i64(map, "toolUses", doc_part.tool_uses.map(|v| v as i64))?;
     if let Some(occurrences) = doc_part.occurrences {
         map.insert("occurrences", occurrences as i64)?;
@@ -2222,6 +2241,45 @@ mod tests {
             "{parts:?}"
         );
         doc.validate_strict().unwrap();
+    }
+
+    /// A `total_tokens` above `i64::MAX` used to be cast with `as i64`, which
+    /// wraps to negative — and the persisted map then failed to deserialize
+    /// back into the `Option<u64>` field, taking the WHOLE ENTRY down, not
+    /// just this one part. The checked conversion writes it as absent
+    /// instead, so the entry (and the rest of the part) stays readable.
+    #[test]
+    fn a_subagent_part_with_out_of_range_total_tokens_stays_readable() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let mut part = subagent_part("task-1", comet_proto::SubagentStatus::Completed, None);
+        if let MessagePart::Subagent { total_tokens, .. } = &mut part {
+            *total_tokens = Some(u64::MAX);
+        }
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![part],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+
+        let entries = doc
+            .read_entries()
+            .expect("entry must stay readable despite the out-of-range field");
+        match &entries[0].parts[0] {
+            MessagePart::Subagent { total_tokens, .. } => {
+                assert_eq!(
+                    *total_tokens, None,
+                    "out-of-range total_tokens must read back absent, not wrapped"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        doc.validate_strict()
+            .expect("an absent totalTokens is a valid subagent row");
     }
 
     /// The live path: a `SubagentUpdated` refresh lands as a field update on

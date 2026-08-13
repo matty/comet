@@ -227,10 +227,13 @@ fn subagent_result_from_tool_use_result(value: &Value) -> Option<SubagentToolRes
         .filter(|s| !s.is_empty());
     let total_tokens = value.get("totalTokens").and_then(Value::as_u64);
     let duration_ms = value.get("totalDurationMs").and_then(Value::as_u64);
+    // `n as u32` truncates rather than erroring on a value above `u32::MAX`
+    // (e.g. `4294967296` silently becomes `0`) — a wrong count presented as a
+    // real one. `try_from` treats an out-of-range value as absent instead.
     let tool_uses = value
         .get("totalToolUseCount")
         .and_then(Value::as_u64)
-        .map(|n| n as u32);
+        .and_then(|n| u32::try_from(n).ok());
     Some(SubagentToolResult {
         task_id,
         status,
@@ -1801,6 +1804,32 @@ mod tests {
                 total_tokens: Some(20115),
                 duration_ms: Some(4907),
                 tool_uses: Some(1),
+            }
+        );
+    }
+
+    /// `n as u32` truncates rather than erroring, so a `totalToolUseCount`
+    /// above `u32::MAX` used to silently become a small wrong number instead
+    /// of a missing one (`4294967296 as u32 == 0`). The checked conversion
+    /// must read it as absent instead.
+    #[test]
+    fn an_out_of_range_tool_use_count_is_read_as_absent_not_wrapped() {
+        let raw = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","type":"tool_result","content":[{"type":"text","text":"Sandbox"}]}]},"parent_tool_use_id":null,"tool_use_result":{"status":"completed","agentId":"a6d1ae6c4fec0efe9","agentType":"general-purpose","content":[{"type":"text","text":"Sandbox"}],"resolvedModel":"claude-haiku-4-5-20251001","totalDurationMs":4907,"totalTokens":20115,"totalToolUseCount":4294967296}}"#;
+        let events = normalize_one(raw);
+        let subagent_event = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::SubagentUpdated { .. }))
+            .expect("a SubagentUpdated fallback");
+        assert_eq!(
+            subagent_event,
+            &AgentEvent::SubagentUpdated {
+                task_id: "a6d1ae6c4fec0efe9".into(),
+                status: SubagentStatus::Completed,
+                activity: None,
+                summary: Some("Sandbox".into()),
+                total_tokens: Some(20115),
+                duration_ms: Some(4907),
+                tool_uses: None,
             }
         );
     }
