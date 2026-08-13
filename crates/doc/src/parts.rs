@@ -310,7 +310,12 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         }
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
-        | AgentEvent::Diagnostic { .. } => {}
+        | AgentEvent::Diagnostic { .. }
+        // No `MessagePart` exists for these yet — that's a later slice
+        // (subagent attribution Task 6). Folding them in as a no-op keeps
+        // this match exhaustive without building ahead of the plan.
+        | AgentEvent::SubagentStarted { .. }
+        | AgentEvent::SubagentUpdated { .. } => {}
     }
 }
 
