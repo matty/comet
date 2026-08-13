@@ -685,20 +685,27 @@ impl SessionDoc {
         Ok(stamped)
     }
 
-    /// Stamp every `Subagent` part still `Running` in one entry `Cancelled`,
-    /// returning how many. Shares [`Self::expire_open_approvals`]'s
-    /// host-stamped rationale (replay and every LAN peer must agree on the
-    /// terminal state instead of each reader guessing locally) and its
-    /// crash-path caller (`DocHost::mark_abandoned_streams`): the process
-    /// died before the in-memory run-end sweep
+    /// Stamp every `Subagent` part still `Running` — INCLUDING one with no
+    /// `status` key at all — in one entry `Cancelled`, returning how many.
+    /// Shares [`Self::expire_open_approvals`]'s host-stamped rationale
+    /// (replay and every LAN peer must agree on the terminal state instead
+    /// of each reader guessing locally), its crash-path caller
+    /// (`DocHost::mark_abandoned_streams`), and now its absent-is-open match
+    /// rule too: the process died before the in-memory run-end sweep
     /// (`comet_engine::sessions::cancel_running_subagents`) ever ran, so this
-    /// entry is the only durable record of what was still `Running`. The
-    /// match rule itself diverges: the approval sweep treats an ABSENT
-    /// `decision` as open, while this one requires `status == "running"` to
-    /// be PRESENT. In practice the two behave the same — a status-less
-    /// `Subagent` part is rejected at read time (`status` is not an
-    /// `Option`), so this sweep never sees the absent case the approval one
-    /// has to handle.
+    /// entry is the only durable record of what was still `Running`.
+    ///
+    /// An ABSENT `status` counts as running for the same reason an absent
+    /// `decision` counts as open on the approval sweep above: `from_doc_part`
+    /// — the doc's own read path — degrades an absent `status` to `Running`
+    /// for every reader (`:274`), so a torn write that never got a `status`
+    /// key at all is already reading back as a live card everywhere else.
+    /// Requiring the literal string `"running"` here, as an earlier version
+    /// of this sweep did, left that exact card permanently `Running`: the
+    /// sweep could never see it (no reader ever writes the string back), so
+    /// it could never stamp it — the precise bug class this sweep exists to
+    /// close, reachable through the one input this sweep is FOR (a torn
+    /// write).
     ///
     /// A `Subagent` part already `Completed`, `Failed` or `Cancelled` keeps
     /// its real outcome.
@@ -738,10 +745,16 @@ impl SessionDoc {
                     part.get("kind"),
                     Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == "subagent"
                 );
-                let is_running = matches!(
-                    part.get("status"),
-                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == "running"
-                );
+                // Absent IS running, mirroring the approval sweep's
+                // absent-is-open rule above — see this fn's own doc for why
+                // an absent key is not merely "unknown" here.
+                let is_running = match part.get("status") {
+                    None => true,
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => {
+                        s.as_str() == "running"
+                    }
+                    Some(_) => false,
+                };
                 if is_subagent && is_running {
                     part.insert("status", loro_value_from_json(&cancelled))?;
                     stamped += 1;
@@ -1895,6 +1908,53 @@ mod tests {
             &parts[1],
             MessagePart::Subagent {
                 status: comet_proto::SubagentStatus::Completed,
+                ..
+            }
+        ));
+    }
+
+    /// A torn write that never got a `status` key at all — not the literal
+    /// string `"running"`, no key — must still be swept. `from_doc_part`
+    /// (the read path) already reads a status-less `Subagent` part back as
+    /// `Running` for every peer (`:274`); a sweep that only matched the
+    /// literal string would never see this card and could never stamp it,
+    /// leaving it `Running` forever — the exact defect this fn's doc comment
+    /// warns about. Built with raw `LoroMap` inserts (no `status` call at
+    /// all), the same technique `notice_row_without_occurrences_reads_as_one`
+    /// uses for its own torn-write case, since `push_message`'s typed
+    /// `MessagePart::Subagent` cannot omit `status` (it isn't an `Option`).
+    #[test]
+    fn cancel_running_subagents_stamps_a_status_less_torn_write_too() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let row = doc
+            .doc()
+            .get_list("messages")
+            .push_container(LoroMap::new())
+            .unwrap();
+        row.insert("id", "m1").unwrap();
+        row.insert("role", "assistant").unwrap();
+        row.insert("createdAt", 1i64).unwrap();
+        row.insert("deviceId", "dev-a").unwrap();
+        let parts = row.insert_container("parts", LoroList::new()).unwrap();
+        let part = parts.push_container(LoroMap::new()).unwrap();
+        part.insert("id", "sub-1").unwrap();
+        part.insert("kind", "subagent").unwrap();
+        part.insert("agentType", "general-purpose").unwrap();
+        part.insert("description", "Read README and report first heading")
+            .unwrap();
+        // Deliberately no "status" key at all.
+        doc.doc().commit();
+
+        assert_eq!(
+            doc.cancel_running_subagents("m1").unwrap(),
+            1,
+            "a status-less Subagent part must be swept, not silently skipped"
+        );
+        let parts = doc.read_entries().unwrap()[0].parts.clone();
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Subagent {
+                status: comet_proto::SubagentStatus::Cancelled,
                 ..
             }
         ));
