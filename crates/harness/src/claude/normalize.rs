@@ -166,6 +166,23 @@ fn is_terminal(status: SubagentStatus) -> bool {
     )
 }
 
+/// Whether `candidate` reports something `prior` left blank. The terminal
+/// guard uses this to tell a truly redundant second terminal reading (the
+/// `tool_use_result` fallback repeating a notification's own numbers — every
+/// field already populated on both sides) from a second terminal reading
+/// that's the FIRST to fill a field in (`task_updated` reports status alone;
+/// the `task_notification` one frame later is what actually carries the
+/// answer and usage). Only "prior was `None`, candidate is `Some`" counts —
+/// two different non-`None` numbers on the same field is the redundant case,
+/// not a fill-in.
+fn adds_new_detail(prior: &SubagentSnapshot, candidate: &SubagentSnapshot) -> bool {
+    (candidate.activity.is_some() && prior.activity.is_none())
+        || (candidate.summary.is_some() && prior.summary.is_none())
+        || (candidate.total_tokens.is_some() && prior.total_tokens.is_none())
+        || (candidate.tool_uses.is_some() && prior.tool_uses.is_none())
+        || (candidate.duration_ms.is_some() && prior.duration_ms.is_none())
+}
+
 /// The subagent fields recoverable from the `Agent` tool's own
 /// `tool_use_result`, with `status` still the RAW wire string. Resolving it
 /// to a [`SubagentStatus`] needs `&self` (to carry forward a prior reading
@@ -426,14 +443,15 @@ impl Normalizer {
     /// Emit a `SubagentUpdated` for `task_id`, unless either: (a) `snapshot`
     /// is identical to the last one emitted for the same id — the
     /// material-transition filter — or (b) BOTH the stored reading and the
-    /// new one are terminal. (b) is what actually makes the `tool_use_result`
-    /// fallback safe: on real captures the notification's task-tracking usage
-    /// and the tool result's own model-turn usage differ by a handful of
-    /// tokens/ms, so they are never snapshot-equal, and without this guard
-    /// every ordinary subagent completion would emit a second, barely-
-    /// different terminal update. Once a task_id has a terminal reading, a
-    /// second terminal reading (regardless of source or exact numbers) is
-    /// dropped outright — the first terminal reading wins.
+    /// new one are terminal AND the new one adds no detail the stored one was
+    /// missing (see [`adds_new_detail`]). (b) is what makes the
+    /// `tool_use_result` fallback safe without dropping the wire's own
+    /// progression: `task_updated` reports status alone and `task_notification`
+    /// one frame later is what actually carries the answer and usage — both
+    /// terminal, but the second one adds detail, so it must still surface. A
+    /// truly redundant terminal reading (the fallback repeating a
+    /// notification's own numbers, where every field is already populated on
+    /// both sides) adds nothing and is dropped.
     fn emit_subagent_update(
         &mut self,
         task_id: String,
@@ -443,7 +461,10 @@ impl Normalizer {
             if prior == &snapshot {
                 return Vec::new();
             }
-            if is_terminal(prior.status) && is_terminal(snapshot.status) {
+            if is_terminal(prior.status)
+                && is_terminal(snapshot.status)
+                && !adds_new_detail(prior, &snapshot)
+            {
                 return Vec::new();
             }
         }
@@ -465,15 +486,24 @@ impl Normalizer {
     /// which subtype feeds which fields.
     fn normalize_subagent_task(&mut self, f: SubagentTaskFrame) -> Vec<AgentEvent> {
         match f.subtype.as_str() {
-            "task_started" => vec![AgentEvent::SubagentStarted {
-                task_id: f.task_id,
-                tool_use_id: f.tool_use_id.unwrap_or_default(),
-                agent_type: f.subagent_type.unwrap_or_default(),
-                description: f.description.unwrap_or_default(),
-                prompt: f
-                    .prompt
-                    .map(|p| crate::cap_prose(&p, crate::SUBAGENT_PROMPT_MAX)),
-            }],
+            "task_started" => {
+                // A `SendMessage`-resumed agent fires a second `task_started`
+                // for the SAME task_id. Clear any stored reading from the
+                // PRIOR invocation first, so the new run's own terminal
+                // reading is compared against nothing — never against the
+                // last run's, which would otherwise look like a redundant
+                // terminal repeat and go silent.
+                self.subagent_progress.remove(&f.task_id);
+                vec![AgentEvent::SubagentStarted {
+                    task_id: f.task_id,
+                    tool_use_id: f.tool_use_id.unwrap_or_default(),
+                    agent_type: f.subagent_type.unwrap_or_default(),
+                    description: f.description.unwrap_or_default(),
+                    prompt: f
+                        .prompt
+                        .map(|p| crate::cap_prose(&p, crate::SUBAGENT_PROMPT_MAX)),
+                }]
+            }
             "task_progress" => {
                 let usage = f.usage.unwrap_or_default();
                 self.emit_subagent_update(
@@ -1572,6 +1602,102 @@ mod tests {
                 duration_ms: Some(1200),
                 tool_uses: Some(2),
             }]
+        );
+    }
+
+    /// The CAPTURED order (run2-claude-subagent.jsonl lines 106-107):
+    /// `task_updated{patch.status:"completed"}` arrives BEFORE
+    /// `task_notification{status:"completed", summary, usage}`. Both are
+    /// terminal readings for the same `task_id`, and the notification is the
+    /// ONLY one of the two carrying the answer and usage — a status-only
+    /// terminal reading arriving first must not cause the terminal guard to
+    /// drop the one that actually fills the card in.
+    #[test]
+    fn wire_order_task_updated_before_notification_still_surfaces_the_answer() {
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+
+        let progress = r#"{"type":"system","subtype":"task_progress","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","description":"Reading README.md","usage":{"total_tokens":19215,"tool_uses":1,"duration_ms":2906}}"#;
+        normalizer.normalize(crate::claude::wire::parse_frame(progress).unwrap(), false);
+
+        // Sequence 106: task_updated, status only.
+        let task_updated = r#"{"type":"system","subtype":"task_updated","task_id":"a6d1ae6c4fec0efe9","patch":{"status":"completed","end_time":1786581776304}}"#;
+        let after_updated = normalizer.normalize(
+            crate::claude::wire::parse_frame(task_updated).unwrap(),
+            false,
+        );
+        assert_eq!(
+            after_updated,
+            vec![AgentEvent::SubagentUpdated {
+                task_id: "a6d1ae6c4fec0efe9".into(),
+                status: SubagentStatus::Completed,
+                activity: None,
+                summary: None,
+                total_tokens: None,
+                duration_ms: None,
+                tool_uses: None,
+            }],
+            "the status-only terminal reading itself must still surface"
+        );
+
+        // Sequence 107: task_notification, the frame carrying the answer.
+        let notification = r#"{"type":"system","subtype":"task_notification","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","status":"completed","output_file":"C:\\tmp\\out","summary":"Sandbox","usage":{"total_tokens":20044,"tool_uses":1,"duration_ms":4906}}"#;
+        let after_notification = normalizer.normalize(
+            crate::claude::wire::parse_frame(notification).unwrap(),
+            false,
+        );
+        assert_eq!(
+            after_notification,
+            vec![AgentEvent::SubagentUpdated {
+                task_id: "a6d1ae6c4fec0efe9".into(),
+                status: SubagentStatus::Completed,
+                activity: None,
+                summary: Some("Sandbox".into()),
+                total_tokens: Some(20044),
+                duration_ms: Some(4906),
+                tool_uses: Some(1),
+            }],
+            "the notification must not be dropped just because a status-only \
+             terminal reading arrived first"
+        );
+    }
+
+    /// The full literal resume sequence (run2-claude-subagent.jsonl lines
+    /// 98, 103, 106, 107, 150, 168, 169 — `background_tasks_changed` at 149
+    /// omitted, it's a different task's territory): first invocation runs to
+    /// completion, then a second `task_started` resumes the SAME `task_id`
+    /// under a NEW `tool_use_id`. The second run's own terminal reading must
+    /// not go silent just because the first run already left a terminal
+    /// reading stored for this `task_id`.
+    #[test]
+    fn a_resumed_agent_end_to_end_surfaces_the_second_runs_answer() {
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+        let frames = [
+            // First invocation.
+            r#"{"type":"system","subtype":"task_started","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","description":"Read README and report first heading","subagent_type":"general-purpose","task_type":"local_agent","prompt":"Read the README.md file in the current directory and report what the first heading is. Just state the heading text, nothing else."}"#,
+            r#"{"type":"system","subtype":"task_progress","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","description":"Reading README.md","usage":{"total_tokens":19215,"tool_uses":1,"duration_ms":2906}}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"a6d1ae6c4fec0efe9","patch":{"status":"completed","end_time":1786581776304}}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","status":"completed","output_file":"C:\\tmp\\out","summary":"Sandbox","usage":{"total_tokens":20044,"tool_uses":1,"duration_ms":4906}}"#,
+            // Resumed: new tool_use_id, same task_id.
+            r#"{"type":"system","subtype":"task_started","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_017ABUEwC8qtu28pSawot4BQ","description":"Read README and report first heading","subagent_type":"general-purpose","task_type":"local_agent","prompt":"What was the first heading you found?"}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"a6d1ae6c4fec0efe9","patch":{"status":"completed","end_time":1786581781670}}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_017ABUEwC8qtu28pSawot4BQ","status":"completed","output_file":"C:\\tmp\\out2","summary":"The first heading is **Sandbox**.","usage":{"total_tokens":19111,"tool_uses":0,"duration_ms":2186}}"#,
+        ];
+        let mut events = Vec::new();
+        for raw in frames {
+            let frame = crate::claude::wire::parse_frame(raw).unwrap();
+            events.extend(normalizer.normalize(frame, false));
+        }
+        let second_run_answer = events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::SubagentUpdated { summary: Some(s), .. }
+                    if s == "The first heading is **Sandbox**."
+            )
+        });
+        assert!(
+            second_run_answer,
+            "the resumed run's own terminal notification must not be silently \
+             dropped against the first run's stored terminal reading: {events:?}"
         );
     }
 
