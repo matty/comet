@@ -1586,9 +1586,11 @@ mod tests {
 
     /// The material-transition filter: repeated `task_progress` ticks whose
     /// activity and usage figures did not move must not each mint a new
-    /// event — this is the guard against the fan-out a coordinator's
-    /// `workflow_progress` array would otherwise cause (out of scope here;
-    /// Comet never decodes that array — see the task brief).
+    /// event. This guards against redundant identical ticks, not against a
+    /// coordinator's fan-out — a `workflow_progress` array on `task_progress`
+    /// carries per-member updates this module never decodes in the first
+    /// place, which is what actually keeps one coordinator tick at one
+    /// `SubagentUpdated`. See `docs/debt/README.md`'s D55.
     #[test]
     fn repeated_identical_task_progress_frames_collapse_to_one_update() {
         let raw = r#"{"type":"system","subtype":"task_progress","task_id":"t1","tool_use_id":"tu1","description":"Reading README.md","usage":{"total_tokens":100,"tool_uses":1,"duration_ms":500}}"#;
