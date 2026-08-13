@@ -465,7 +465,13 @@ pub enum PickerKind {
     /// checkout/worktree | New worktree).
     Checkout,
     HarnessModel,
-    Traits,
+    /// The reasoning ladder + advertised model options. Its own chip and its
+    /// own menu (user request) — it used to be a section pinned inside the
+    /// harness/model popover.
+    Reasoning,
+    /// The permission axis (`RuntimeMode`). Its own chip and menu, for the
+    /// same reason.
+    Permissions,
 }
 
 pub struct Pickers {
@@ -495,6 +501,12 @@ pub struct Pickers {
     refs_space: Option<ServerRef>,
     /// Highlighted row in the open list (keyboard nav).
     active: usize,
+    /// Whether the arrow keys have moved [`Self::active`] since the popover
+    /// opened. Until they have, the model list re-seats the highlight on the
+    /// selected row every frame — the catalog usually lands after the menu is
+    /// already open, and an index chosen before the rows existed would leave
+    /// row 0 lit next to the checked one.
+    nav_touched: bool,
     /// Models-list scroll — keyboard nav keeps the highlighted row in view
     /// (`scroll_to_item`; the add-space palette standard).
     model_scroll: gpui::ScrollHandle,
@@ -596,12 +608,16 @@ impl Pickers {
             }
             cx.notify();
         });
-        // Dev/testing knob: `COMET_OPEN_PICKER=model|traits|repo|branch` boots
+        // Dev/testing knob:
+        // `COMET_OPEN_PICKER=model|reasoning|permissions|branch|checkout` boots
         // with that popover open — synthetic input can't reach the app on
         // headless compositors, so captures need a data-side path.
         let open = match std::env::var("COMET_OPEN_PICKER").ok().as_deref() {
             Some("model") => Some(PickerKind::HarnessModel),
-            Some("traits") => Some(PickerKind::HarnessModel),
+            // `traits` kept as an alias: it named the merged menu before the
+            // reasoning ladder moved to its own chip.
+            Some("reasoning") | Some("traits") => Some(PickerKind::Reasoning),
+            Some("permissions") => Some(PickerKind::Permissions),
             Some("branch") => Some(PickerKind::Branch),
             Some("checkout") => Some(PickerKind::Checkout),
             _ => None,
@@ -631,6 +647,7 @@ impl Pickers {
             refs: Loadable::Idle,
             refs_space: None,
             active: 0,
+            nav_touched: false,
             model_scroll: gpui::ScrollHandle::new(),
             search,
             focus: cx.focus_handle(),
@@ -927,13 +944,6 @@ impl Pickers {
     }
 
     fn toggle(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
-        // Model + traits merged into ONE menu (user request): the traits chip
-        // opens the combined harness/model/reasoning popover.
-        let kind = if kind == PickerKind::Traits {
-            PickerKind::HarnessModel
-        } else {
-            kind
-        };
         if self.open == Some(kind) {
             self.open = None;
             cx.notify();
@@ -953,13 +963,20 @@ impl Pickers {
             input.set_text("", cx);
         });
         // The keyboard-nav highlight starts ON the selected row — row 0
-        // otherwise reads as a second active row (user report).
+        // otherwise reads as a second active row (user report). The model menu
+        // needs the same thing, and the catalog may not have landed yet when
+        // this runs, so `nav_touched` lets the render re-seat the highlight
+        // once the rows exist (user report: picking any model left the top row
+        // highlighted on the next open).
+        self.nav_touched = false;
         self.active = match kind {
             PickerKind::Checkout => match self.config.checkout {
                 CheckoutKind::Local => 0,
                 CheckoutKind::NewWorktree => 1,
             },
             PickerKind::Branch => self.selected_ref_index(cx),
+            PickerKind::HarnessModel => self.selected_model_index(cx),
+            PickerKind::Permissions => self.runtime_mode_index(cx),
             _ => 0,
         };
         if kind == PickerKind::HarnessModel {
@@ -986,10 +1003,11 @@ impl Pickers {
             // worktree+branch, terminals switch refs) — every open
             // revalidates, keeping stale rows visible until fresh ones land.
             PickerKind::Branch | PickerKind::Checkout => self.ensure_refs(true, cx),
-            PickerKind::HarnessModel | PickerKind::Traits => {
-                // Opening either menu IS asking for the catalog again. Both
-                // render it, so both re-arm — unlike the model re-arm above,
-                // which the traits chip shares a popover with but does not own.
+            PickerKind::HarnessModel | PickerKind::Reasoning | PickerKind::Permissions => {
+                // Opening any of the three IS asking for the catalog again.
+                // The reasoning ladder and the permission modes both read the
+                // harness descriptor, so they re-arm it too — unlike the model
+                // re-arm above, which only the model menu owns.
                 self.rearm_cancelled_harnesses();
                 self.ensure_harnesses(cx);
                 // Availability is probed in the background at engine boot,
@@ -1173,7 +1191,9 @@ impl Pickers {
     fn harness_picker_open(&self) -> bool {
         matches!(
             self.open,
-            Some(PickerKind::HarnessModel) | Some(PickerKind::Traits)
+            Some(PickerKind::HarnessModel)
+                | Some(PickerKind::Reasoning)
+                | Some(PickerKind::Permissions)
         )
     }
 
@@ -1598,6 +1618,9 @@ impl Pickers {
         self.defaults.harness = Some(harness);
         self.save_defaults();
         self.model_scroll.set_offset(gpui::Point::default());
+        // A different list of rows: hand the highlight back to whichever row
+        // the new harness resolves to, however far the arrows had walked.
+        self.nav_touched = false;
         // Picking the harness IS asking for its models again, so a cancelled
         // slot must not stay cancelled here either.
         self.rearm_cancelled_models(cx);
@@ -1645,6 +1668,10 @@ impl Pickers {
     /// into [`ComposerDefaults`]: `full-access` chosen once for one chat must
     /// not become the setting every later chat silently starts in.
     fn pick_runtime_mode(&mut self, mode: RuntimeMode, cx: &mut Context<Self>) {
+        // Closes on pick, like the other dropdowns. It stayed open while it
+        // was a chip row pinned inside the model menu, where closing would
+        // have dismissed the menu the user was still working in.
+        self.open = None;
         if self.state.read(cx).selected_chat.is_some() {
             // `apply_owned_fields` re-derives `sandbox` after the change, so
             // the row's two permission fields cannot be written disagreeing.
@@ -1808,6 +1835,29 @@ impl Pickers {
             .unwrap_or(0)
     }
 
+    /// Row index of the resolved model pick, for the keyboard-nav highlight.
+    /// Falls back to 0, which is also what the row render treats as selected
+    /// when nothing is picked yet.
+    fn selected_model_index(&self, cx: &App) -> usize {
+        let selected = self.selected_model(cx).map(|m| m.id.clone());
+        let ids: Vec<&str> = self
+            .effective_harness(cx)
+            .and_then(|h| self.models.get(&h))
+            .and_then(|l| l.ready())
+            .map(|catalog| catalog.models.iter().map(|m| m.id.as_str()).collect())
+            .unwrap_or_default();
+        model_highlight_index(&ids, selected.as_deref())
+    }
+
+    /// Row index of the active permission mode, for the keyboard highlight.
+    fn runtime_mode_index(&self, cx: &App) -> usize {
+        let current = self.effective_runtime_mode(cx);
+        self.runtime_mode_choices(cx)
+            .iter()
+            .position(|mode| *mode == current)
+            .unwrap_or(0)
+    }
+
     /// Enter on the harness/model popover: pick the highlighted model.
     fn activate_model_row(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self
@@ -1944,13 +1994,15 @@ impl Pickers {
                 let count = match self.open {
                     Some(PickerKind::Branch) => self.filtered_ref_rows(cx).len().min(MAX_REF_ROWS),
                     Some(PickerKind::Checkout) => 2,
-                    // Keyboard nav walks the MODEL list only; the traits
-                    // chips below (reasoning ladder, model options) are
-                    // mouse-only.
                     Some(PickerKind::HarnessModel) => self.model_rows_len(cx),
-                    Some(PickerKind::Traits) => 0, // merged into HarnessModel
+                    // Permissions is a row dropdown, so it walks. The
+                    // reasoning ladder and model options are segmented chips,
+                    // and stay mouse-only.
+                    Some(PickerKind::Permissions) => self.runtime_mode_choices(cx).len(),
+                    Some(PickerKind::Reasoning) => 0,
                     None => 0,
                 };
+                self.nav_touched = true;
                 self.active = popover::menu_step(Some(self.active), count, delta).unwrap_or(0);
                 // Keep the highlighted MODEL row in view (the rows are the
                 // scroll container's direct children, so indices map 1:1);
@@ -1966,6 +2018,10 @@ impl Pickers {
             MenuKey::Enter if !search_focused => {
                 if self.open == Some(PickerKind::HarnessModel) {
                     self.activate_model_row(cx);
+                } else if self.open == Some(PickerKind::Permissions) {
+                    if let Some(mode) = self.runtime_mode_choices(cx).get(self.active).copied() {
+                        self.pick_runtime_mode(mode, cx);
+                    }
                 } else if self.open == Some(PickerKind::Checkout) {
                     let kind = if self.active == 0 {
                         CheckoutKind::Local
@@ -1997,10 +2053,10 @@ impl Pickers {
             PickerKind::Branch => "picker-branch",
             PickerKind::Checkout => "picker-checkout",
             PickerKind::HarnessModel => "picker-model",
-            PickerKind::Traits => "picker-traits",
+            PickerKind::Reasoning => "picker-reasoning",
+            PickerKind::Permissions => "picker-permissions",
         };
-        let open = self.open == Some(kind)
-            || (kind == PickerKind::Traits && self.open == Some(PickerKind::HarnessModel));
+        let open = self.open == Some(kind);
         // Ghost pill (comet composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
         // gap-1.5 text-[12px] font-medium text-muted-foreground`, icons size-4,
         // hover/open wash — no border, no caret; the actions row stays quiet.
@@ -2053,6 +2109,41 @@ impl Pickers {
                         .child(suffix),
                 )
             })
+    }
+
+    /// A selector chip whose catalog hasn't landed yet: the same 32px box and
+    /// 8px radius as [`Self::trigger_chip`], filled with the pulsing wash
+    /// instead of a label, so nothing moves when the label arrives. Pulse math
+    /// and wash are [`popover::skeleton_rows`]'; `slot` staggers the three so
+    /// the row reads as one wave rather than three blinking blocks.
+    ///
+    /// Still clickable, deliberately: the menu behind it renders its own
+    /// loading state, and for the model menu that is also where the Retry row
+    /// appears if the fetch fails.
+    fn skeleton_trigger(
+        &self,
+        kind: PickerKind,
+        id: &'static str,
+        width: f32,
+        slot: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let view = cx.entity_id();
+        let phase = motion::staggered_phase(
+            motion::pulse_delta(&motion::COMET_PULSE, view, cx),
+            slot,
+            0.08,
+        );
+        div()
+            .id(id)
+            .flex_none()
+            .w(px(width))
+            .h(px(32.0))
+            .rounded(px(8.0))
+            .bg(crate::theme::ink(0.04))
+            .opacity(0.35 + 0.4 * motion::pulse_wave(phase))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| this.toggle(kind, window, cx)))
     }
 
     /// A footer-row trigger (t3code ghost `Button size="xs"`): leading icon,
@@ -2305,7 +2396,9 @@ impl Pickers {
                     .hover(|s| s.bg(theme.element_hover))
                     .on_click(cx.listener(move |this, _, _, cx| match kind {
                         PickerKind::Branch | PickerKind::Checkout => this.ensure_refs(true, cx),
-                        PickerKind::HarnessModel | PickerKind::Traits => {
+                        PickerKind::HarnessModel
+                        | PickerKind::Reasoning
+                        | PickerKind::Permissions => {
                             // Read the harness BEFORE clearing the catalog.
                             // With no explicit pick and nothing remembered,
                             // `effective_harness` falls back to the first
@@ -2742,6 +2835,14 @@ impl Pickers {
 
         let _ = locked; // the lock still dims foreign rail rows above
 
+        // Re-seat the keyboard highlight on the selected row until the arrows
+        // move it. `toggle` can only guess when the catalog is still loading —
+        // and a harness switch replaces the whole list under an already-open
+        // menu — so row 0 would otherwise stay lit beside the checked row.
+        if !self.nav_touched {
+            self.active = self.selected_model_index(cx);
+        }
+
         // The rows are collected FLAT — they become the scroll container's
         // direct children so `scroll_to_item(active)` maps 1:1 (the palette's
         // keyboard-follow standard).
@@ -2832,15 +2933,12 @@ impl Pickers {
                 .and_then(|catalog| caption_for(catalog.source, h))
         });
 
-        // One combined menu (user request): harness tabs across the top,
-        // then the viewed harness's models, then the reasoning ladder and
-        // model options that used to live in the separate traits popover.
-        let traits = self.render_traits_sections(cx);
-        // The palette architecture: agents rail LEFT, models pane beside it
-        // with the traits INSPECTOR pinned below (models are the decision;
-        // reasoning/options are properties of it — they never scroll away
-        // with the list), legend footer under everything. FIXED height so
-        // harness switches and loading skeletons don't resize the card.
+        // The palette architecture: agents rail LEFT, models pane beside it,
+        // legend footer under everything. FIXED height so harness switches and
+        // loading skeletons don't resize the card. The reasoning/options tray
+        // that used to be pinned under the models pane now has its own chip
+        // and menu (user request), so this menu answers one question only:
+        // which agent, which model.
         div()
             .h(px(420.0))
             .flex()
@@ -2907,20 +3005,7 @@ impl Pickers {
                                         .text_color(theme.warning_muted)
                                         .child(SharedString::from(caption)),
                                 )
-                            })
-                            .child(
-                                // The pinned inspector tray (scrolls only if
-                                // a model advertises many option groups).
-                                div()
-                                    .id("model-traits-scroll")
-                                    .flex_none()
-                                    .max_h(px(190.0))
-                                    .overflow_y_scroll()
-                                    .border_t_1()
-                                    .border_color(crate::theme::hairline(0.06))
-                                    .p(px(4.0))
-                                    .child(traits),
-                            ),
+                            }),
                     ),
             )
             .child(
@@ -2947,23 +3032,20 @@ impl Pickers {
             .into_any_element()
     }
 
-    /// The traits INSPECTOR: the reasoning ladder plus every advertised
-    /// model option as headed segmented-chip sections, pinned under the
-    /// models pane (formerly menu rows in the shared scroll). Selecting
-    /// keeps the menu open; the active chip carries the wash + ring.
-    /// Mouse-only — arrow keys walk the model list above, never these chips.
-    fn render_traits_sections(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// The reasoning menu's body: the reasoning ladder plus every advertised
+    /// model option, as headed segmented-chip sections. Selecting keeps the
+    /// menu open; the active chip carries the wash + ring. Mouse-only.
+    ///
+    /// Permissions are NOT here — they are their own chip and menu (see
+    /// [`Self::render_permissions_section`]). They used to share this tray
+    /// because both hung off the one merged model popover.
+    fn render_reasoning_sections(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        // Built before the model gate below: the modes come from the harness
-        // descriptor, so a model catalog still loading must not hide the one
-        // control that decides what the agent may do to the machine.
-        let permissions = self.render_permissions_section(cx);
         let Some(model) = self.selected_model(cx).cloned() else {
             return div()
                 .flex()
                 .flex_col()
                 .gap(px(4.0))
-                .child(permissions)
                 .child(popover::skeleton_rows(
                     "traits-skeleton",
                     &theme,
@@ -3057,20 +3139,21 @@ impl Pickers {
             .flex_col()
             .gap(px(4.0))
             .pb(px(4.0))
-            .child(permissions)
             .child(ladder)
             .child(options)
             .into_any_element()
     }
 
-    /// The permission axis: one chip per mode the provider declares, with a
-    /// caption for the active one. Hidden entirely when the provider has
-    /// declared none (see [`Self::runtime_mode_choices`]).
+    /// The permission axis, as a plain dropdown (user request — it was a row
+    /// of segmented chips while it lived inside the model menu): one row per
+    /// mode the provider declares, each carrying its own caption, with the
+    /// check on the active one. Empty when the provider declares no modes (see
+    /// [`Self::runtime_mode_choices`]), which is what hides the chip.
     ///
-    /// The caption's colour is the only thing that changes with the mode —
-    /// `full-access` is amber because it is a state to be aware of, not an
-    /// error the user caused. Every layout constant is shared, so the section
-    /// is the same height whichever mode is active.
+    /// Colour carries nothing here (user request): every caption is the same
+    /// muted tone, `full-access` included — the words already say what it
+    /// removes, and the amber it used to get read as a warning about a mode
+    /// the user had deliberately chosen.
     fn render_permissions_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let modes = self.runtime_mode_choices(cx);
@@ -3078,39 +3161,58 @@ impl Pickers {
             return gpui::Empty.into_any_element();
         }
         let current = self.effective_runtime_mode(cx);
-        let caption_color = if current == RuntimeMode::FullAccess {
-            theme.warning_muted
-        } else {
-            theme.text_muted.opacity(0.7)
-        };
+        // Re-seat the highlight until the arrows move it, exactly as the model
+        // list does. `toggle` seeds it too, but `runtime_mode_choices` reads
+        // the harness catalog: seeded while that slot is momentarily unready
+        // the seed falls back to 0, and row 0 lights up beside the checked row
+        // — observed live with `full-access` picked.
+        if !self.nav_touched {
+            self.active = self.runtime_mode_index(cx);
+        }
+        let active = self.active;
         div()
             .flex()
             .flex_col()
-            .child(popover::menu_heading(&theme, "Permissions"))
-            .child(
-                div()
-                    .px(px(4.0))
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .gap(px(4.0))
-                    .children(modes.into_iter().enumerate().map(|(ix, mode)| {
-                        trait_chip(&theme, current == mode)
-                            .id(("runtime-mode-row", ix))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.pick_runtime_mode(mode, cx);
-                            }))
-                            .child(SharedString::from(runtime_mode_label(mode)))
-                    })),
-            )
-            .child(
-                div()
-                    .px(px(4.0))
-                    .pt(px(4.0))
-                    .text_size(px(11.0))
-                    .text_color(caption_color)
-                    .child(SharedString::from(runtime_mode_caption(current))),
-            )
+            .gap(px(2.0))
+            .children(modes.into_iter().enumerate().map(|(ix, mode)| {
+                let is_selected = current == mode;
+                popover::menu_row_nav(
+                    &theme,
+                    is_selected,
+                    ix == active,
+                    format!("runtime-mode-row-{ix}"),
+                )
+                .id(("runtime-mode-row", ix))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.pick_runtime_mode(mode, cx);
+                }))
+                .child(
+                    // Label + 11px caption subline, the model rows' column.
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .w_full()
+                                .truncate()
+                                .child(SharedString::from(runtime_mode_label(mode))),
+                        )
+                        .child(
+                            // No `truncate()`: the caption is the whole point
+                            // of the row, and the card is sized to hold the
+                            // longest one. Anything longer wraps rather than
+                            // losing its end (user request).
+                            div()
+                                .w_full()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted.opacity(0.7))
+                                .child(SharedString::from(runtime_mode_caption(mode))),
+                        ),
+                )
+                .when(is_selected, |el| el.child(popover::menu_check(&theme)))
+            }))
             .into_any_element()
     }
 }
@@ -3473,23 +3575,37 @@ impl Render for Pickers {
                 crate::icons::CLAUDE_MARK,
                 Some(crate::icons::claude_brand()),
             ));
-        let explicit_options = self.explicit_options(cx);
-        let traits_set = traits_summary(
-            self.selected_model(cx),
-            self.effective_reasoning(cx),
-            &explicit_options,
-            self.effective_runtime_mode(cx),
-        );
-        let traits_label: SharedString = traits_set
-            .clone()
-            .map(SharedString::from)
-            .unwrap_or_else(|| SharedString::from("Traits"));
+        // The reasoning chip is hidden when the model offers neither a ladder
+        // nor any options — an empty menu is worse than no affordance.
+        let ladder = self.trait_ladder(cx);
+        let has_options = self
+            .selected_model(cx)
+            .is_some_and(|m| !m.options.is_empty());
+        let reasoning_level = self.effective_reasoning(cx);
+        let reasoning_chip_label: Option<SharedString> =
+            (!ladder.is_empty() || has_options).then(|| {
+                match reasoning_level {
+                    Some(level) => SharedString::from(reasoning_label(level)),
+                    // A model with options but no ladder still needs a way in.
+                    None => SharedString::from("Options"),
+                }
+            });
+        // All three selectors read the same two catalogs, so they resolve
+        // together — see the skeleton branch below.
+        let catalog_pending = slot_pending(Some(&self.harnesses))
+            || slot_pending(self.effective_harness(cx).and_then(|h| self.models.get(&h)));
+        // Same rule for permissions: hidden when the provider declares no
+        // modes (`runtime_mode_choices`), which is what the old pinned section
+        // did too.
+        let runtime_mode = self.effective_runtime_mode(cx);
+        let permissions_label: Option<SharedString> = (!self.runtime_mode_choices(cx).is_empty())
+            .then(|| SharedString::from(runtime_mode_label(runtime_mode)));
 
         // Render the open popover's body first (mutable borrow), then the
         // chips. Branch/Checkout render in the composer FOOTER row (see
         // `render_footer`), not here.
         let mut overlay: Option<(PickerKind, AnyElement)> = match self.open {
-            Some(PickerKind::Branch) | Some(PickerKind::Checkout) => None,
+            Some(PickerKind::Branch) | Some(PickerKind::Checkout) | None => None,
             Some(PickerKind::HarnessModel) => {
                 let content = self.render_harness_model_popover(cx);
                 Some((
@@ -3497,50 +3613,139 @@ impl Render for Pickers {
                     self.popover_frame_flush(460.0, content, cx),
                 ))
             }
-            // Traits merged into the HarnessModel popover.
-            Some(PickerKind::Traits) | None => None,
+            Some(PickerKind::Reasoning) => {
+                let content = self.render_reasoning_sections(cx);
+                Some((
+                    PickerKind::Reasoning,
+                    self.popover_frame(260.0, content, cx),
+                ))
+            }
+            Some(PickerKind::Permissions) => {
+                let content = self.render_permissions_section(cx);
+                Some((
+                    PickerKind::Permissions,
+                    // Wide enough for the longest caption on one line
+                    // ("No sandbox and no approvals — …"), the model menu's
+                    // width. A narrower card cut the captions mid-sentence.
+                    self.popover_frame(460.0, content, cx),
+                ))
+            }
         };
 
-        // Left cluster (the branch chip moved to the composer FOOTER row).
-        // Right cluster: agent+model and traits — the composer appends
-        // attach + send after this element (comet composer-actions.tsx
-        // arrangement).
-        let left = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .min_w_0()
-            .gap(px(4.0));
-        // ONE combined model+effort chip (user request): brand icon + model
-        // name, then the effort level muted with no icon — a single button
-        // opening the single merged menu.
-        let combined_chip = self.trigger_chip(
+        // Left cluster (user request): model, then reasoning, then
+        // permissions — each its own chip and its own menu, separated by a
+        // hairline rule. The branch chip lives in the composer FOOTER row.
+        //
+        // While the catalog is still on its way all three render as
+        // skeletons, and all three stay clickable — the menus behind them show
+        // their own loading state, and the model menu is where the Retry row
+        // lives if the fetch fails.
+        if catalog_pending {
+            let mut left = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .min_w_0()
+                .gap(px(Theme::SPACE_SM));
+            for (slot, (kind, id, width)) in [
+                (PickerKind::HarnessModel, "picker-model", SKELETON_MODEL_W),
+                (
+                    PickerKind::Reasoning,
+                    "picker-reasoning",
+                    SKELETON_REASONING_W,
+                ),
+                (
+                    PickerKind::Permissions,
+                    "picker-permissions",
+                    SKELETON_PERMISSIONS_W,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if slot > 0 {
+                    left = left.child(chip_divider());
+                }
+                let chip = self.skeleton_trigger(kind, id, width, slot, cx);
+                left = left.child(attach_overlay(chip, &mut overlay, kind, "picker-popover"));
+            }
+            return div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(Theme::SPACE_SM))
+                .child(left)
+                // The gauge rides the session, not the catalog, so it keeps
+                // rendering while the chips are still resolving.
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .flex_none()
+                        .gap(px(Theme::SPACE_SM))
+                        .children(self.context_gauge(&theme, cx)),
+                );
+        }
+        let model_chip = self.trigger_chip(
             PickerKind::HarnessModel,
             model_label,
             true,
             Some(harness_icon),
-            Some(traits_label),
+            None,
             &theme,
             cx,
         );
-        let _ = traits_set;
+        let mut left = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .min_w_0()
+            .gap(px(Theme::SPACE_SM))
+            .child(attach_overlay(
+                model_chip,
+                &mut overlay,
+                PickerKind::HarnessModel,
+                "model-popover",
+            ));
+        if let Some(label) = reasoning_chip_label {
+            let chip = self.trigger_chip(
+                PickerKind::Reasoning,
+                label,
+                reasoning_level.is_some(),
+                None,
+                None,
+                &theme,
+                cx,
+            );
+            left = left.child(chip_divider()).child(attach_overlay(
+                chip,
+                &mut overlay,
+                PickerKind::Reasoning,
+                "reasoning-popover",
+            ));
+        }
+        if let Some(label) = permissions_label {
+            let chip =
+                self.trigger_chip(PickerKind::Permissions, label, true, None, None, &theme, cx);
+            left = left.child(chip_divider()).child(attach_overlay(
+                chip,
+                &mut overlay,
+                PickerKind::Permissions,
+                "permissions-popover",
+            ));
+        }
+        // Right cluster: the context gauge. The composer appends attach + send
+        // after this element (comet composer-actions.tsx arrangement).
         let right = div()
             .flex()
             .flex_row()
             .items_center()
             .flex_none()
-            .gap(px(4.0))
-            // End-anchored: the menu's right edge sits flush with the chip's
-            // right edge (user request), same as the footer's ref popover.
-            .child(attach_overlay_end(
-                combined_chip,
-                &mut overlay,
-                PickerKind::HarnessModel,
-                "model-popover",
-            ))
-            // After the model chip, by user request. The popover still anchors
-            // to the chip's own right edge rather than the row's, so the menu
-            // now sits a gauge-width in from the row end.
+            .gap(px(Theme::SPACE_SM))
             .children(self.context_gauge(&theme, cx));
         div()
             .w_full()
@@ -3554,6 +3759,46 @@ impl Render for Pickers {
             .child(right)
     }
 }
+
+/// The `|` between two selector chips: a hairline rule, not a glyph, so it
+/// stays a separator at any type scale. A plain number for the height — it
+/// must not vary with the palette (`.agents/rules/gpui-ui.md`).
+fn chip_divider() -> gpui::Div {
+    div()
+        .flex_none()
+        .w(px(1.0))
+        .h(px(16.0))
+        .bg(crate::theme::hairline(0.12))
+}
+
+/// Whether a catalog slot is still on its way to an answer. **`Error` is
+/// settled**, deliberately: an errored catalog hands the real chips back (the
+/// remembered label, and the popover's own Retry row), because a skeleton that
+/// outlives its request is a wait with no end — the thing
+/// `.agents/rules/user-facing-errors.md` forbids.
+fn slot_pending<T>(slot: Option<&Loadable<T>>) -> bool {
+    matches!(slot, None | Some(Loadable::Idle) | Some(Loadable::Loading))
+}
+
+/// Row the model menu's keyboard highlight should sit on: the selected model,
+/// or row 0 when nothing is picked yet (which is also the row the list draws
+/// as checked in that case). An id the catalog no longer carries — a stale
+/// remembered pick, or a list swapped by a harness switch — also lands on 0
+/// rather than leaving the highlight where it was.
+fn model_highlight_index(ids: &[&str], selected: Option<&str>) -> usize {
+    let Some(selected) = selected else {
+        return 0;
+    };
+    ids.iter().position(|id| *id == selected).unwrap_or(0)
+}
+
+/// Skeleton widths, one per selector: roughly what each label occupies once
+/// it lands ("Fable 5", "High", "Auto-accept edits"), so the row doesn't jump
+/// when it does. Plain numbers — they must not vary with the palette
+/// (`.agents/rules/gpui-ui.md`).
+const SKELETON_MODEL_W: f32 = 104.0;
+const SKELETON_REASONING_W: f32 = 56.0;
+const SKELETON_PERMISSIONS_W: f32 = 128.0;
 
 #[cfg(test)]
 mod tests {
@@ -3592,6 +3837,33 @@ mod tests {
             (last.0 - 10.0).abs() < 0.01 && (last.1 - 5.0).abs() < 0.01,
             "a full sweep closes back at twelve o'clock"
         );
+    }
+
+    #[test]
+    fn model_highlight_follows_the_selected_row() {
+        let ids = ["fable-5", "sonnet-5", "haiku-4-5"];
+        // The reported bug: picking any row left the highlight on row 0.
+        assert_eq!(model_highlight_index(&ids, Some("sonnet-5")), 1);
+        assert_eq!(model_highlight_index(&ids, Some("haiku-4-5")), 2);
+        // Nothing picked yet — row 0 is also the row drawn as checked.
+        assert_eq!(model_highlight_index(&ids, None), 0);
+        // An id this catalog doesn't carry (stale remembered pick, or a list
+        // swapped under an open menu) must not leave the highlight adrift.
+        assert_eq!(model_highlight_index(&ids, Some("gone")), 0);
+        assert_eq!(model_highlight_index(&[], Some("fable-5")), 0);
+    }
+
+    #[test]
+    fn a_slot_is_pending_until_it_answers_but_an_error_is_an_answer() {
+        // Nothing requested yet, and a request in flight: skeletons.
+        assert!(slot_pending::<u8>(None));
+        assert!(slot_pending(Some(&Loadable::<u8>::Idle)));
+        assert!(slot_pending(Some(&Loadable::<u8>::Loading)));
+        // Ready is obviously settled…
+        assert!(!slot_pending(Some(&Loadable::Ready(7u8))));
+        // …and so is Error. A skeleton that outlives its request is a wait
+        // with no end; the chips come back so the menu's Retry is reachable.
+        assert!(!slot_pending(Some(&Loadable::<u8>::Error("boom".into()))));
     }
 
     #[test]

@@ -42,10 +42,15 @@ use crate::theme::Theme;
 /// line 578) = 16 + 4.
 pub const TEXTAREA_PAD_V: f32 = 20.0;
 /// The expanded textarea BOX (content + padding) is clamped by the original's
-/// auto-grow effect: `ta.style.height = Math.min(Math.max(scrollHeight, 76),
-/// 260)` (comet composer.tsx line 235). The 76px floor applies even when
-/// empty — it's what makes the always-expanded new-chat composer tall.
-pub const TEXTAREA_MIN: f32 = 76.0;
+/// auto-grow effect: `ta.style.height = Math.min(Math.max(scrollHeight, …),
+/// 260)` (comet composer.tsx line 235). The floor applies even when empty —
+/// it's what makes the always-expanded composer tall.
+///
+/// The floor is **three text lines** by user request, so the controls row
+/// underneath reads as the fourth line. Derived from the line height rather
+/// than the original's 76px literal: the two must move together or a "3 lines"
+/// input silently becomes 2.7 the next time the type scale changes.
+pub const TEXTAREA_MIN: f32 = 3.0 * INPUT_LINE_HEIGHT + TEXTAREA_PAD_V;
 pub const TEXTAREA_MAX: f32 = 260.0;
 /// Expanded actions row: `pt-1` (4) + h-8 picker chips (32 — the tallest
 /// children; composer/styles.tsx pickerChip) + `pb-2.5` (10) — comet
@@ -53,8 +58,8 @@ pub const TEXTAREA_MAX: f32 = 260.0;
 pub const ACTIONS_ROW_HEIGHT: f32 = 46.0;
 /// The pill's 1px hairline, top + bottom (`rounded-[26px] border`).
 pub const PILL_BORDER_V: f32 = 2.0;
-/// Expanded composer bounds, border-box: 76 + 46 + 2 = 124 when empty (the
-/// new-chat canvas), 260 + 46 + 2 = 308 at the content cap.
+/// Expanded composer bounds, border-box: 88.25 + 46 + 2 = 136.25 at the
+/// three-line floor, 260 + 46 + 2 = 308 at the content cap.
 pub const COMPOSER_MIN_HEIGHT: f32 = TEXTAREA_MIN + ACTIONS_ROW_HEIGHT + PILL_BORDER_V;
 pub const COMPOSER_MAX_HEIGHT: f32 = TEXTAREA_MAX + ACTIONS_ROW_HEIGHT + PILL_BORDER_V;
 /// Compact pill, border-box: one-line textarea `py-3` (24) + one 22.75px line
@@ -128,9 +133,9 @@ pub fn input_content_height(wrapped_lines: usize) -> f32 {
 }
 
 /// Total expanded composer height (border-box) for a content height: the
-/// textarea BOX (content + `pt-4 pb-1`) clamps to 76–260 exactly like the
-/// original's auto-grow effect, then the 46px actions row and the hairline
-/// ride on top. Range 124–308.
+/// textarea BOX (content + `pt-4 pb-1`) clamps to [`TEXTAREA_MIN`]–260 like
+/// the original's auto-grow effect, then the 46px actions row and the
+/// hairline ride on top. Range 136.25–308.
 pub fn composer_total_height(content_height: f32) -> f32 {
     (content_height + TEXTAREA_PAD_V).clamp(TEXTAREA_MIN, TEXTAREA_MAX)
         + ACTIONS_ROW_HEIGHT
@@ -3446,6 +3451,8 @@ pub struct Composer {
     send_task: Option<Task<()>>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
     /// Current layout mode (persisted across frames — never derived fresh).
+    /// Pinned `true` for now: the render passes `composer_flip`'s always-expand
+    /// input, so the compact pill is unreachable (see `NEVER_COLLAPSE`).
     expanded_mode: bool,
     /// `layout_epoch` of the measurement that caused the last flip: the flip is
     /// re-evaluated only after the input has been laid out in the new mode, so
@@ -3533,7 +3540,7 @@ impl Composer {
             answered_approvals: HashSet::new(),
             advance_task: None,
             send_task: None,
-            expanded_mode: false,
+            expanded_mode: true,
             flip_epoch: 0,
             compact_capacity: 0.0,
             expanded_anchor: 0.0,
@@ -5612,11 +5619,10 @@ impl Render for Composer {
             self.reset_mention(None, cx);
         }
         let mode = self.button_mode(cx);
-        let (text_width, has_newline, content_height, last_width, epoch) = {
+        let (text_width, content_height, last_width, epoch) = {
             let input = self.input.read(cx);
             (
                 input.measured_text_width(),
-                input.has_newline(),
                 input.measured_content_height(),
                 input.last_width,
                 input.layout_epoch,
@@ -5677,11 +5683,19 @@ impl Render for Composer {
         } else {
             f32::MAX
         };
+        // Pinned expanded (user request): the input rests at three text lines
+        // with the controls row as the fourth, so there is no one-line pill to
+        // collapse back to. `true` here is `composer_flip`'s own always-expand
+        // input (its newline rule), which keeps the measurement bookkeeping
+        // above running while removing any cause to collapse. `expanded_mode`
+        // also STARTS true, so the first render commits no flip and nothing
+        // morphs at boot.
+        const NEVER_COLLAPSE: bool = true;
         let next = composer_flip(
             self.expanded_mode,
             text_width,
             capacity,
-            has_newline,
+            NEVER_COLLAPSE,
             resizing,
         );
         let committed_flip = next != self.expanded_mode && measured_since_flip;
@@ -5961,11 +5975,13 @@ impl Render for Composer {
                         .flex()
                         .flex_row()
                         .items_center()
-                        // Shared cluster metrics (see CLUSTER_X_DELTA): gap-1
-                        // internals identical to compact; only the right
-                        // inset (`px-3` 12) differs, and it GLIDES in from
-                        // the compact 8 so the buttons never step sideways.
-                        .gap(px(4.0))
+                        // Cluster metrics: the right inset (`px-3` 12) glides
+                        // in from the compact 8 so the buttons never step
+                        // sideways. The gap is SPACE_SM rather than the
+                        // original gap-1 — with the selectors split into three
+                        // chips the row needs air between the groups (user
+                        // request).
+                        .gap(px(Theme::SPACE_SM))
                         .pl(px(12.0))
                         .pr(px(morph_cluster_inset(true, morph_t)))
                         .pt(px(4.0))
@@ -6639,18 +6655,26 @@ mod tests {
 
     #[test]
     fn auto_grow_math() {
-        // The source heights (comet composer.tsx line 235 clamp, composer-
-        // actions.tsx row, 1px hairlines): 76+46+2 empty … 260+46+2 capped.
-        assert_eq!(COMPOSER_MIN_HEIGHT, 124.0);
+        // The floor is three text lines plus the textarea's own padding
+        // (user request — the actions row reads as the fourth line):
+        // 3×22.75+20 = 88.25, +46 actions +2 hairlines = 136.25. The cap is
+        // unchanged from the source (comet composer.tsx line 235): 260+46+2.
+        assert_eq!(TEXTAREA_MIN, 88.25);
+        assert_eq!(COMPOSER_MIN_HEIGHT, 136.25);
         assert_eq!(COMPOSER_MAX_HEIGHT, 308.0);
-        // One line sits at the floor: the textarea BOX (content + `pt-4 pb-1`)
-        // clamps UP to 76 exactly like `Math.max(scrollHeight, 76)` — this is
-        // what makes the always-expanded new-chat composer 124px tall.
+        // Anything up to three lines sits AT the floor — one line and three
+        // render the same height, which is what makes the resting composer a
+        // fixed three-line box rather than one that grows from the first
+        // keystroke.
         assert_eq!(
             composer_total_height(input_content_height(1)),
             COMPOSER_MIN_HEIGHT
         );
-        // Growth is linear once the textarea box exceeds its 76px floor.
+        assert_eq!(
+            composer_total_height(input_content_height(3)),
+            COMPOSER_MIN_HEIGHT
+        );
+        // Growth is linear once the textarea box exceeds that floor.
         let h4 = composer_total_height(input_content_height(4));
         assert_eq!(
             h4,
