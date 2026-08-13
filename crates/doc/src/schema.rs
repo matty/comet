@@ -88,6 +88,20 @@ struct DocPartJson {
     key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     occurrences: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<comet_proto::SubagentStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_uses: Option<u32>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -165,6 +179,33 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             occurrences: Some(*occurrences),
             ..Default::default()
         },
+        MessagePart::Subagent {
+            id: _,
+            task_id,
+            agent_type,
+            description,
+            status,
+            activity,
+            summary,
+            total_tokens,
+            duration_ms,
+            tool_uses,
+        } => DocPartJson {
+            // The task id IS the persisted part id, matching Approval/Input:
+            // the live fold's "sub-" prefix does not survive the write, and
+            // every doc-side mutation matches on this.
+            id: task_id.clone(),
+            kind: "subagent".into(),
+            agent_type: Some(agent_type.clone()),
+            description: Some(description.clone()),
+            status: Some(*status),
+            activity: activity.clone(),
+            summary: summary.clone(),
+            total_tokens: *total_tokens,
+            duration_ms: *duration_ms,
+            tool_uses: *tool_uses,
+            ..Default::default()
+        },
     })
 }
 
@@ -221,6 +262,21 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
             detail: p.detail,
             key: p.key,
             occurrences: p.occurrences.unwrap_or(1),
+        },
+        "subagent" => MessagePart::Subagent {
+            id: p.id.clone(),
+            task_id: p.id,
+            agent_type: p.agent_type.unwrap_or_default(),
+            description: p.description.unwrap_or_default(),
+            // Absent IS a torn write, same as an absent noticeKind — the
+            // conservative reading is the just-started state, never a
+            // fabricated terminal one.
+            status: p.status.unwrap_or(comet_proto::SubagentStatus::Running),
+            activity: p.activity,
+            summary: p.summary,
+            total_tokens: p.total_tokens,
+            duration_ms: p.duration_ms,
+            tool_uses: p.tool_uses,
         },
         _ => MessagePart::Text {
             id: p.id,
@@ -725,6 +781,32 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(occurrences) = doc_part.occurrences {
         map.insert("occurrences", occurrences as i64)?;
     }
+    if let Some(agent_type) = &doc_part.agent_type {
+        map.insert("agentType", agent_type.as_str())?;
+    }
+    if let Some(description) = &doc_part.description {
+        map.insert("description", description.as_str())?;
+    }
+    if let Some(status) = doc_part.status {
+        map.insert(
+            "status",
+            serde_json::to_value(status)?
+                .as_str()
+                .ok_or_else(|| DocError::Schema("status not a string".into()))?,
+        )?;
+    }
+    if let Some(activity) = &doc_part.activity {
+        map.insert("activity", activity.as_str())?;
+    }
+    if let Some(total_tokens) = doc_part.total_tokens {
+        map.insert("totalTokens", total_tokens as i64)?;
+    }
+    if let Some(duration_ms) = doc_part.duration_ms {
+        map.insert("durationMs", duration_ms as i64)?;
+    }
+    if let Some(tool_uses) = doc_part.tool_uses {
+        map.insert("toolUses", tool_uses as i64)?;
+    }
     Ok(())
 }
 
@@ -795,6 +877,17 @@ fn validate_message_parts(row: &serde_json::Value) -> Result<(), DocError> {
             }
             "error" if part.message.is_some() => {}
             "notice" if part.summary.is_some() => {}
+            "subagent" => {
+                if part.agent_type.is_none() {
+                    return Err(invalid("missing agentType"));
+                }
+                if part.description.is_none() {
+                    return Err(invalid("missing description"));
+                }
+                if part.status.is_none() {
+                    return Err(invalid("missing status"));
+                }
+            }
             "text" => return Err(invalid("missing text")),
             "error" => return Err(invalid("missing message")),
             "notice" => return Err(invalid("missing summary")),
@@ -1015,19 +1108,43 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
                 .ok_or_else(|| DocError::Schema("severity not a string".into()))?,
         )?;
     }
-    if let Some(summary) = &doc_part.summary {
-        map.insert("summary", summary.as_str())?;
+    if let Some(agent_type) = &doc_part.agent_type {
+        map.insert("agentType", agent_type.as_str())?;
     }
-    // NULLABLE notice fields: set-or-clear, not insert-only. Audit of the
-    // rest: `noticeKind`/`severity`/`summary`/`occurrences` are always `Some`
-    // for a notice, `call`/`questions` always `Some` for their kind,
-    // `approval` always `Some` for an approval, `resolved` always `Some` for
-    // an input, and `isError`/`decision` only ever go absent → present (tool
-    // resolution and approval resolution are both monotonic — an approval
-    // that has been answered or expired never returns to open). `detail` and
-    // `key` are the only two an in-place refresh can legitimately clear.
+    if let Some(description) = &doc_part.description {
+        map.insert("description", description.as_str())?;
+    }
+    if let Some(status) = doc_part.status {
+        map.insert(
+            "status",
+            serde_json::to_value(status)?
+                .as_str()
+                .ok_or_else(|| DocError::Schema("status not a string".into()))?,
+        )?;
+    }
+    // `summary` is set-or-clear, not insert-only: for a Notice it is always
+    // `Some` (unaffected either way), but for a Subagent card it legitimately
+    // goes `Some` → `None` — a resumed invocation's own `SubagentStarted`
+    // resets the prior run's answer, and an insert-only write would leave
+    // the stale one in the doc forever.
+    set_or_clear(map, "summary", doc_part.summary.as_deref())?;
+    // NULLABLE fields: set-or-clear, not insert-only. Audit of the rest:
+    // `noticeKind`/`severity`/`occurrences`/`agentType`/`description`/
+    // `status` are always `Some` for their kind, `call`/`questions` always
+    // `Some` for their kind, `approval` always `Some` for an approval,
+    // `resolved` always `Some` for an input, and `isError`/`decision` only
+    // ever go absent → present (tool resolution and approval resolution are
+    // both monotonic — an approval that has been answered or expired never
+    // returns to open). `detail`/`key` (Notice) and `activity`/`totalTokens`/
+    // `durationMs`/`toolUses` (Subagent) are the fields an in-place refresh
+    // can legitimately clear — the Subagent ones for the same resumed-run
+    // reason as `summary` above.
     set_or_clear(map, "detail", doc_part.detail.as_deref())?;
     set_or_clear(map, "key", doc_part.key.as_deref())?;
+    set_or_clear(map, "activity", doc_part.activity.as_deref())?;
+    set_or_clear_i64(map, "totalTokens", doc_part.total_tokens.map(|v| v as i64))?;
+    set_or_clear_i64(map, "durationMs", doc_part.duration_ms.map(|v| v as i64))?;
+    set_or_clear_i64(map, "toolUses", doc_part.tool_uses.map(|v| v as i64))?;
     if let Some(occurrences) = doc_part.occurrences {
         map.insert("occurrences", occurrences as i64)?;
     }
@@ -1055,6 +1172,17 @@ fn set_or_clear(map: &LoroMap, key: &str, value: Option<&str>) -> Result<(), Doc
         Some(v) => map.insert(key, v)?,
         // Only delete a key that is actually present: this runs for every part
         // kind, and most kinds legitimately have no `detail`/`key` at all.
+        None if map.get(key).is_some() => map.delete(key)?,
+        None => {}
+    }
+    Ok(())
+}
+
+/// [`set_or_clear`] for the numeric Subagent progress fields
+/// (`totalTokens`/`durationMs`/`toolUses`), which have no `&str` form.
+fn set_or_clear_i64(map: &LoroMap, key: &str, value: Option<i64>) -> Result<(), DocError> {
+    match value {
+        Some(v) => map.insert(key, v)?,
         None if map.get(key).is_some() => map.delete(key)?,
         None => {}
     }
@@ -1823,5 +1951,233 @@ mod tests {
 
         let err = doc.validate_strict().unwrap_err().to_string();
         assert!(err.contains("missing summary"), "{err}");
+    }
+
+    fn subagent_part(
+        task_id: &str,
+        status: comet_proto::SubagentStatus,
+        summary: Option<&str>,
+    ) -> MessagePart {
+        MessagePart::Subagent {
+            id: format!("sub-{task_id}"),
+            task_id: task_id.into(),
+            agent_type: "general-purpose".into(),
+            description: "Read README and report first heading".into(),
+            status,
+            activity: None,
+            summary: summary.map(str::to_owned),
+            total_tokens: Some(20_044),
+            duration_ms: Some(4_906),
+            tool_uses: Some(1),
+        }
+    }
+
+    /// Persisted JSON round-trips (task 6's own test list). The "sub-" prefix
+    /// on the live fold's `id` does NOT survive the write — same as
+    /// Approval/Input, and for the same reason: the task id IS the persisted
+    /// part id, and every doc-side mutation matches on that.
+    #[test]
+    fn a_subagent_part_round_trips_through_the_doc() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![subagent_part(
+                "task-1",
+                comet_proto::SubagentStatus::Completed,
+                Some("Sandbox"),
+            )],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+        let parts = doc.read_entries().unwrap()[0].parts.clone();
+        assert_eq!(
+            parts,
+            vec![MessagePart::Subagent {
+                // The live fold's "sub-" prefix does not survive the write —
+                // read back, `id` equals the bare `task_id`.
+                id: "task-1".into(),
+                task_id: "task-1".into(),
+                agent_type: "general-purpose".into(),
+                description: "Read README and report first heading".into(),
+                status: comet_proto::SubagentStatus::Completed,
+                activity: None,
+                summary: Some("Sandbox".into()),
+                total_tokens: Some(20_044),
+                duration_ms: Some(4_906),
+                tool_uses: Some(1),
+            }],
+            "{parts:?}"
+        );
+        doc.validate_strict().unwrap();
+    }
+
+    /// The live path: a `SubagentUpdated` refresh lands as a field update on
+    /// an ALREADY WRITTEN part (`update_part_fields`), not `push_part` — and
+    /// the None-preserving merge from `fold_event_into_parts` must survive
+    /// the trip through the doc, not just the in-memory accumulator.
+    #[test]
+    fn a_subagent_refresh_reaches_the_doc_without_clearing_unreported_fields() {
+        use crate::parts::fold_event_into_parts;
+        use comet_proto::{AgentEvent, SubagentStatus};
+
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a1", "dev-a", 5).unwrap();
+
+        let mut folded = Vec::new();
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::SubagentStarted {
+                task_id: "task-1".into(),
+                tool_use_id: "tool-a".into(),
+                agent_type: "general-purpose".into(),
+                description: "Read README and report first heading".into(),
+                prompt: Some("Read the README.md file.".into()),
+            },
+        );
+        writer.sync(&folded).unwrap();
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::SubagentUpdated {
+                task_id: "task-1".into(),
+                status: SubagentStatus::Running,
+                activity: Some("Reading README.md".into()),
+                summary: None,
+                total_tokens: Some(19_215),
+                duration_ms: Some(2_906),
+                tool_uses: Some(1),
+            },
+        );
+        writer.sync(&folded).unwrap();
+        // A status-only task_updated: everything else None on the wire.
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::SubagentUpdated {
+                task_id: "task-1".into(),
+                status: SubagentStatus::Completed,
+                activity: None,
+                summary: None,
+                total_tokens: None,
+                duration_ms: None,
+                tool_uses: None,
+            },
+        );
+        writer.finish(&folded, MessageStatus::Complete).unwrap();
+
+        match &doc.read_entries().unwrap()[0].parts[0] {
+            MessagePart::Subagent {
+                status,
+                activity,
+                total_tokens,
+                duration_ms,
+                tool_uses,
+                ..
+            } => {
+                assert_eq!(*status, SubagentStatus::Completed);
+                assert_eq!(
+                    activity.as_deref(),
+                    Some("Reading README.md"),
+                    "an unreported activity must not clear through the doc"
+                );
+                assert_eq!(*total_tokens, Some(19_215));
+                assert_eq!(*duration_ms, Some(2_906));
+                assert_eq!(*tool_uses, Some(1));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        doc.validate_strict().unwrap();
+    }
+
+    /// The other direction of the same in-place path: a RESUMED invocation's
+    /// `SubagentStarted` resets the progress fields back to `None` — and that
+    /// clear must reach the doc too, not just the accumulator (`summary`,
+    /// `activity`, `totalTokens`, `durationMs`, `toolUses` are set-or-clear in
+    /// `update_part_fields` for exactly this).
+    #[test]
+    fn a_resumed_subagent_clears_stale_progress_through_the_doc() {
+        use crate::parts::fold_event_into_parts;
+        use comet_proto::{AgentEvent, SubagentStatus};
+
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a1", "dev-a", 5).unwrap();
+        let mut folded = Vec::new();
+
+        let started = |tool_use_id: &str| AgentEvent::SubagentStarted {
+            task_id: "task-1".into(),
+            tool_use_id: tool_use_id.into(),
+            agent_type: "general-purpose".into(),
+            description: "Read README and report first heading".into(),
+            prompt: Some("p".into()),
+        };
+        fold_event_into_parts(&mut folded, &started("tool-a"));
+        writer.sync(&folded).unwrap();
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::SubagentUpdated {
+                task_id: "task-1".into(),
+                status: SubagentStatus::Completed,
+                activity: None,
+                summary: Some("Sandbox".into()),
+                total_tokens: Some(20_044),
+                duration_ms: Some(4_906),
+                tool_uses: Some(1),
+            },
+        );
+        writer.sync(&folded).unwrap();
+        assert_eq!(folded.len(), 1);
+
+        // Resumed: same task_id, new tool_use_id — resets progress in the
+        // accumulator (task 6's fold logic) AND must reset it in the doc.
+        fold_event_into_parts(&mut folded, &started("tool-b"));
+        writer.sync(&folded).unwrap();
+
+        match &doc.read_entries().unwrap()[0].parts[0] {
+            MessagePart::Subagent {
+                status,
+                summary,
+                total_tokens,
+                duration_ms,
+                tool_uses,
+                ..
+            } => {
+                assert_eq!(*status, SubagentStatus::Running);
+                assert_eq!(
+                    *summary, None,
+                    "stale summary survived the resume: doc read back Some"
+                );
+                assert_eq!(*total_tokens, None, "stale totalTokens survived the resume");
+                assert_eq!(*duration_ms, None, "stale durationMs survived the resume");
+                assert_eq!(*tool_uses, None, "stale toolUses survived the resume");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Strict validation names the missing field for a torn subagent row.
+    #[test]
+    fn strict_validation_rejects_a_subagent_without_status() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let row = doc
+            .doc()
+            .get_list("messages")
+            .push_container(LoroMap::new())
+            .unwrap();
+        row.insert("id", "m1").unwrap();
+        row.insert("role", "assistant").unwrap();
+        row.insert("createdAt", 1i64).unwrap();
+        row.insert("deviceId", "dev-a").unwrap();
+        let parts = row.insert_container("parts", LoroList::new()).unwrap();
+        let part = parts.push_container(LoroMap::new()).unwrap();
+        part.insert("id", "task-1").unwrap();
+        part.insert("kind", "subagent").unwrap();
+        part.insert("agentType", "general-purpose").unwrap();
+        part.insert("description", "d").unwrap();
+        doc.doc().commit();
+
+        let err = doc.validate_strict().unwrap_err().to_string();
+        assert!(err.contains("missing status"), "{err}");
     }
 }

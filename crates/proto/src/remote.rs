@@ -22,7 +22,12 @@ use serde::{Deserialize, Serialize};
 ///    A decode problem, unlike 4: the reply is a whole-value decode, so an
 ///    older peer fails the array-vs-object shape outright rather than
 ///    ignoring a key.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// 6: `MessagePart::Subagent` (subagent attribution, slice 4.2). A decode
+///    problem, same shape as 2 and 3: this variant crosses the RPC transcript
+///    stream inside `TranscriptFrame`, and `MessagePart`'s decode is
+///    all-or-nothing — an older peer fails the WHOLE transcript rather than
+///    skipping the one part it does not recognize.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

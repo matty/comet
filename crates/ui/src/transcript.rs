@@ -605,6 +605,13 @@ pub fn rows_for_entry(
                             timestamp: None,
                         });
                     }
+                    // Persisted, not drawn: subagent attribution (slice 4.2)
+                    // lands the part; rendering it as a card is slice 4.4's
+                    // build. An explicit no-op arm, never `_ => {}` — a
+                    // wildcard here would silently swallow the NEXT part kind
+                    // someone adds, and 4.4 would get no compile error naming
+                    // what to build.
+                    MessagePart::Subagent { .. } => {}
                 }
             }
         }
