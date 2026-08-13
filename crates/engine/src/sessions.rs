@@ -2559,7 +2559,7 @@ mod tests {
     /// drives the `Steered` arm's own dispatch path, so it would stay green
     /// even if that arm gained a `cancel_running_subagents` call alongside
     /// `expire_open_approvals`. Only
-    /// `crates/engine/tests/e2e.rs:2614-2675`'s
+    /// `crates/engine/tests/e2e.rs:2625-2686`'s
     /// `a_steer_over_a_running_subagent_does_not_stamp_it_cancelled` actually
     /// pins the arm calling `expire_open_approvals` alone — see D57.
     #[test]
