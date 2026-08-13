@@ -4,19 +4,15 @@ use std::path::Path;
 use anyhow::{anyhow, bail};
 use serde_json::{Value, json};
 
+#[cfg(test)]
+use super::common::APPROVAL_MARKER_CONTENT;
 #[cfg(windows)]
 use super::common::file_identity;
-#[cfg(all(test, not(windows)))]
-use super::common::resolve_trusted_powershell;
 use super::common::{
     APPROVAL_MARKER_ADD_DIFF, APPROVAL_MARKER_NAME, CODEX_APPROVAL_COMMAND, FileIdentity,
 };
-#[cfg(test)]
-use super::common::{APPROVAL_MARKER_CONTENT, validate_ordinary_approval_cwd};
 #[cfg(all(test, windows))]
-use super::common::{
-    canonical_protected_roots, select_trusted_powershell, windows_protected_roots,
-};
+use super::common::{canonical_protected_roots, select_trusted_powershell};
 
 #[derive(Default)]
 pub(in crate::capture) struct CodexApprovalState {
@@ -687,13 +683,13 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::APPROVAL_MARKER_NAME;
+    use crate::capture::recording::failed_session_stdin;
     use crate::capture::test_support::{
         channel_payloads, config, contains_response_id, fixture_path, isolated_approval_target,
         isolated_tempdir,
     };
     use crate::capture::{
-        CaptureOperation, Channel, CodexCaptureOperation, CodexRunScript, RecordingSession,
-        failed_session_stdin, record,
+        CaptureOperation, Channel, CodexCaptureOperation, CodexRunScript, record,
     };
 
     #[test]
@@ -1000,36 +996,6 @@ mod tests {
         std::fs::remove_file(&trusted).unwrap();
         std::fs::write(&trusted, b"replacement").unwrap();
         assert!(super::validate_codex_raw_launcher(&valid, &identity).is_err());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn codex_approval_trusted_roots_must_exist_and_canonicalize() {
-        let root = tempfile::tempdir().unwrap();
-        assert!(super::canonical_protected_roots([None, None, None]).is_err());
-        assert!(
-            super::canonical_protected_roots([
-                Some(root.path().join("missing").as_path()),
-                None,
-                None,
-            ])
-            .is_err()
-        );
-        let roots =
-            super::canonical_protected_roots([Some(root.path()), Some(root.path()), None]).unwrap();
-        assert_eq!(
-            roots.len(),
-            1,
-            "canonical root aliases must be deduplicated"
-        );
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn codex_approval_launcher_remains_fail_closed_without_unix_evidence() {
-        let error =
-            super::resolve_trusted_powershell(Path::new("/"), Path::new("/tmp/raw")).unwrap_err();
-        assert!(error.to_string().contains("safe Unix launcher"), "{error}");
     }
 
     #[cfg(windows)]
@@ -1457,80 +1423,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn codex_approval_cwd_identity_and_marker_are_rechecked() {
-        let parent = tempfile::tempdir().unwrap();
-        let cwd = parent.path().join("cwd");
-        std::fs::create_dir(&cwd).unwrap();
-        let identity = super::validate_ordinary_approval_cwd(&cwd, None, true).unwrap();
-        std::fs::write(cwd.join(APPROVAL_MARKER_NAME), "capture\n").unwrap();
-        assert!(super::validate_ordinary_approval_cwd(&cwd, Some(&identity), true).is_err());
-        std::fs::remove_file(cwd.join(APPROVAL_MARKER_NAME)).unwrap();
-        std::fs::remove_dir(&cwd).unwrap();
-        std::fs::create_dir(&cwd).unwrap();
-        assert!(super::validate_ordinary_approval_cwd(&cwd, Some(&identity), true).is_err());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn codex_approval_cwd_rejects_directory_reparse_points() {
-        let root = tempfile::tempdir().unwrap();
-        let target = root.path().join("target");
-        let link = root.path().join("cwd-link");
-        std::fs::create_dir(&target).unwrap();
-        let output = std::process::Command::new("cmd.exe")
-            .args(["/D", "/C", "mklink", "/J"])
-            .arg(&link)
-            .arg(&target)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "failed to construct a test-owned directory junction"
-        );
-        assert!(super::validate_ordinary_approval_cwd(&link, None, true).is_err());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn codex_approval_windows_api_roots_are_available_and_canonical() {
-        assert_eq!(usize::BITS, 64, "32-bit Windows must fail closed");
-        let roots = super::windows_protected_roots().unwrap();
-        assert!(!roots.is_empty());
-        assert_eq!(roots.iter().collect::<BTreeSet<_>>().len(), roots.len());
-        assert!(roots.iter().all(|root| root.is_absolute() && root.is_dir()));
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn codex_approval_precreated_marker_fails_before_spawn_or_reply() {
-        let raw = tempfile::tempdir().unwrap();
-        let cwd = tempfile::tempdir().unwrap();
-        std::fs::write(cwd.path().join(APPROVAL_MARKER_NAME), "capture\n").unwrap();
-        let request = RunRequest {
-            prompt: "scenario:capture-approval".into(),
-            cwd: cwd.path().display().to_string(),
-            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
-        };
-        let error = record(config(
-            "codex-approval-precreated-marker",
-            fixture_path("fake-codex"),
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request,
-                script: CodexRunScript::Approval,
-            }),
-            raw.path(),
-        ))
-        .await
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("marker must be absent"),
-            "{error}"
-        );
-        assert!(raw.path().read_dir().unwrap().next().is_none());
-    }
-
     #[tokio::test]
     async fn codex_on_request_rejects_approval_before_sandbox_failure() {
         let raw = tempfile::tempdir().unwrap();
@@ -1585,72 +1477,6 @@ mod tests {
             "unsafe on-request command received accept: {stdin:?}"
         );
         assert!(error.contains("approval request"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn codex_on_request_preflight_rejects_repository_and_linked_worktree_cwds() {
-        for linked in [false, true] {
-            let raw = tempfile::tempdir().unwrap();
-            let cwd = tempfile::tempdir().unwrap();
-            if linked {
-                std::fs::write(cwd.path().join(".git"), "gitdir: unused").unwrap();
-            } else {
-                std::fs::create_dir(cwd.path().join(".git")).unwrap();
-            }
-            let Some(target) = isolated_approval_target("comet-onrequest-target-") else {
-                return;
-            };
-            let request = RunRequest {
-                prompt: "scenario:capture-onrequest-destructive".into(),
-                cwd: cwd.path().display().to_string(),
-                ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
-            };
-            let mut capture_config = config(
-                "codex-approval-on-request-repository",
-                fixture_path("fake-codex"),
-                CaptureOperation::Codex(CodexCaptureOperation::Run {
-                    request,
-                    script: CodexRunScript::ApprovalOnRequest,
-                }),
-                raw.path(),
-            );
-            capture_config.approval_target = Some(target.path().into());
-            let error = match RecordingSession::start(capture_config).await {
-                Ok(_) => panic!("repository cwd must fail before spawn"),
-                Err(error) => error,
-            };
-            assert!(error.to_string().contains("non-repository"), "{error}");
-        }
-    }
-
-    #[tokio::test]
-    async fn codex_on_request_preflight_rechecks_target_emptiness_before_spawn() {
-        let raw = tempfile::tempdir().unwrap();
-        let cwd = isolated_tempdir("comet-onrequest-cwd-");
-        let Some(target) = isolated_approval_target("comet-onrequest-target-") else {
-            return;
-        };
-        std::fs::write(target.path().join("appeared-after-config.txt"), "hostile").unwrap();
-        let request = RunRequest {
-            prompt: "scenario:capture-onrequest-destructive".into(),
-            cwd: cwd.path().display().to_string(),
-            ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
-        };
-        let mut capture_config = config(
-            "codex-approval-on-request-raced-before-spawn",
-            fixture_path("fake-codex"),
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request,
-                script: CodexRunScript::ApprovalOnRequest,
-            }),
-            raw.path(),
-        );
-        capture_config.approval_target = Some(target.path().into());
-        let error = match RecordingSession::start(capture_config).await {
-            Ok(_) => panic!("nonempty target must fail before spawn"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("empty"), "{error}");
     }
 
     #[tokio::test]

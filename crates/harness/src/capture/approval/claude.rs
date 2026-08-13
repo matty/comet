@@ -167,10 +167,10 @@ pub(in crate::capture) fn observe_claude_approval_frame(
 mod tests {
     use comet_proto::{RunRequest, RuntimeMode};
 
+    use crate::capture::recording::failed_session_stdin;
     use crate::capture::test_support::{channel_payloads, config, fixture_path};
     use crate::capture::{
-        CaptureOperation, Channel, ClaudeCaptureOperation, ClaudeRunScript, failed_session_stdin,
-        record,
+        CaptureOperation, Channel, ClaudeCaptureOperation, ClaudeRunScript, record,
     };
 
     #[tokio::test]

@@ -4,9 +4,8 @@ use std::time::Duration;
 use comet_proto::{ReasoningLevel, RunRequest, RuntimeMode};
 use serde_json::json;
 
-use super::{
-    CaptureConfig, CaptureOperation, CaptureScenario, Channel, RawCapture, repository_root,
-};
+use super::approval::repository_root;
+use super::{CaptureConfig, CaptureOperation, CaptureScenario, Channel, RawCapture};
 
 pub(super) fn contract_request() -> RunRequest {
     let mut request = RunRequest {
