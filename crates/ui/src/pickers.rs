@@ -2333,8 +2333,7 @@ impl Pickers {
         let theme = Theme::of(cx).clone();
         popover::popover_card(&theme)
             .w(px(width))
-            // comet caps its tallest picker at min(640px, 75vh).
-            .max_h(px(640.0))
+            .max_h(px(POPOVER_MAX_H))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key_down(event, window, cx)
@@ -3134,11 +3133,21 @@ impl Pickers {
                         )
                 }));
 
+        // The body scrolls. `popover_card` is `overflow_hidden`, so a ladder
+        // plus enough option groups to outrun the card would put the lower
+        // groups permanently out of reach rather than merely off-card — the
+        // pinned inspector this menu replaced carried its own
+        // `overflow_y_scroll` for exactly that, and splitting it out lost it.
+        // The bound is this element's own, so it holds however the frame
+        // resolves its flex.
         div()
+            .id("reasoning-menu-scroll")
             .flex()
             .flex_col()
             .gap(px(4.0))
             .pb(px(4.0))
+            .max_h(px(REASONING_MENU_MAX_H))
+            .overflow_y_scroll()
             .child(ladder)
             .child(options)
             .into_any_element()
@@ -3592,8 +3601,12 @@ impl Render for Pickers {
             });
         // All three selectors read the same two catalogs, so they resolve
         // together — see the skeleton branch below.
-        let catalog_pending = slot_pending(Some(&self.harnesses))
-            || slot_pending(self.effective_harness(cx).and_then(|h| self.models.get(&h)));
+        let effective = self.effective_harness(cx);
+        let catalog_pending = chips_pending(
+            &self.harnesses,
+            effective.is_some(),
+            effective.as_ref().and_then(|h| self.models.get(h)),
+        );
         // Same rule for permissions: hidden when the provider declares no
         // modes (`runtime_mode_choices`), which is what the old pinned section
         // did too.
@@ -3780,6 +3793,28 @@ fn slot_pending<T>(slot: Option<&Loadable<T>>) -> bool {
     matches!(slot, None | Some(Loadable::Idle) | Some(Loadable::Loading))
 }
 
+/// Whether all three selectors should still render as skeletons.
+///
+/// The model slot is only asked when there is a harness to load models *for*.
+/// A missing slot means two opposite things — "not requested yet" when a
+/// harness is known, and "nothing to request" when none is — which is why the
+/// harness is passed separately rather than read back out of the slot.
+///
+/// The case that bites: `effective_harness` bottoms out in the harness
+/// catalog, so an **errored** catalog leaves no effective harness and hence no
+/// model slot. Counting that absence as pending strands the chips as skeletons
+/// with no request left in flight to end them, and the model menu's Retry row
+/// sits unreachable behind them — the unbounded wait
+/// `.agents/rules/user-facing-errors.md` forbids, arrived at by composition
+/// even though [`slot_pending`] settles `Error` correctly on its own.
+fn chips_pending<H, M>(
+    harnesses: &Loadable<H>,
+    has_harness: bool,
+    model_slot: Option<&Loadable<M>>,
+) -> bool {
+    slot_pending(Some(harnesses)) || (has_harness && slot_pending(model_slot))
+}
+
 /// Row the model menu's keyboard highlight should sit on: the selected model,
 /// or row 0 when nothing is picked yet (which is also the row the list draws
 /// as checked in that case). An id the catalog no longer carries — a stale
@@ -3791,6 +3826,15 @@ fn model_highlight_index(ids: &[&str], selected: Option<&str>) -> usize {
     };
     ids.iter().position(|id| *id == selected).unwrap_or(0)
 }
+
+/// Tallest a picker card grows before its body has to scroll — comet caps its
+/// at min(640px, 75vh).
+const POPOVER_MAX_H: f32 = 640.0;
+
+/// The reasoning menu's scrolling body: the card's cap less its `p-1` inset
+/// top and bottom (`popover::popover_card`). Derived rather than a second
+/// literal, so raising the cap raises the body with it.
+const REASONING_MENU_MAX_H: f32 = POPOVER_MAX_H - 2.0 * 4.0;
 
 /// Skeleton widths, one per selector: roughly what each label occupies once
 /// it lands ("Fable 5", "High", "Auto-accept edits"), so the row doesn't jump
@@ -3864,6 +3908,61 @@ mod tests {
         // …and so is Error. A skeleton that outlives its request is a wait
         // with no end; the chips come back so the menu's Retry is reachable.
         assert!(!slot_pending(Some(&Loadable::<u8>::Error("boom".into()))));
+    }
+
+    /// `slot_pending` settling `Error` is not enough on its own: the chips ask
+    /// it twice and OR the answers, and the second slot is reached *through*
+    /// the harness catalog. An errored catalog therefore leaves no effective
+    /// harness and no model slot, and a missing slot reads as pending — so the
+    /// skeletons outlived a request that had already failed, with the menu's
+    /// Retry row unreachable behind them.
+    #[test]
+    fn an_errored_harness_catalog_brings_the_chips_back_not_endless_skeletons() {
+        let errored = Loadable::<u8>::Error("no harnesses".into());
+        // No harness to load models for, so the absent model slot is the end
+        // of the road rather than a wait.
+        assert!(
+            !chips_pending(&errored, false, None::<&Loadable<u8>>),
+            "an errored catalog is settled — the chips come back so Retry is reachable"
+        );
+        // Same shape when the catalog is Ready but offers nothing visible.
+        assert!(!chips_pending(
+            &Loadable::Ready(0u8),
+            false,
+            None::<&Loadable<u8>>
+        ));
+
+        // Still skeletons while the harness catalog is genuinely in flight…
+        assert!(chips_pending(
+            &Loadable::<u8>::Loading,
+            false,
+            None::<&Loadable<u8>>
+        ));
+        // …and when a harness IS known but its models were never requested,
+        // which is the absence that really does mean "on its way".
+        assert!(chips_pending(
+            &Loadable::Ready(0u8),
+            true,
+            None::<&Loadable<u8>>
+        ));
+        assert!(chips_pending(
+            &Loadable::Ready(0u8),
+            true,
+            Some(&Loadable::<u8>::Loading)
+        ));
+
+        // Both settled: real chips.
+        assert!(!chips_pending(
+            &Loadable::Ready(0u8),
+            true,
+            Some(&Loadable::Ready(1u8))
+        ));
+        // A model catalog that errored is settled too, same rule.
+        assert!(!chips_pending(
+            &Loadable::Ready(0u8),
+            true,
+            Some(&Loadable::<u8>::Error("boom".into()))
+        ));
     }
 
     #[test]
