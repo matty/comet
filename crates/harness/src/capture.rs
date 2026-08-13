@@ -1,5 +1,6 @@
 mod approval;
 mod corpus;
+mod filesystem;
 mod recording;
 mod sanitize;
 #[cfg(test)]

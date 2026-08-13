@@ -63,11 +63,14 @@ pub async fn record(config: CaptureConfig) -> anyhow::Result<RawCapture> {
     RecordingSession::start(config).await?.finish().await
 }
 
+#[cfg(test)]
+pub(super) async fn start_for_preflight_test(config: CaptureConfig) -> anyhow::Result<()> {
+    RecordingSession::start(config).await.map(|_| ())
+}
+
 /// A live capture owns its child until a terminal frame or hard timeout.
 ///
-/// The type remains private to capture; sibling approval tests reach `start`
-/// only to prove preflight failures happen before the provider is spawned.
-pub(super) struct RecordingSession {
+struct RecordingSession {
     provider: Provider,
     operation: CaptureOperation,
     timeout: Duration,
@@ -93,7 +96,7 @@ pub(super) struct RecordingSession {
 }
 
 impl RecordingSession {
-    pub(super) async fn start(mut config: CaptureConfig) -> anyhow::Result<Self> {
+    async fn start(mut config: CaptureConfig) -> anyhow::Result<Self> {
         let approval_target_identity = validate_on_request_preflight(&config)?;
         if let CaptureOperation::Codex(CodexCaptureOperation::Run { request, script }) =
             &mut config.scenario.operation

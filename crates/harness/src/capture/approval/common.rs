@@ -5,7 +5,7 @@ use std::ffi::OsString;
 
 use anyhow::{anyhow, bail};
 
-use crate::capture::sanitize::has_windows_reparse_point;
+use crate::capture::filesystem::has_windows_reparse_point;
 use crate::capture::{CaptureConfig, CaptureOperation, CodexCaptureOperation, CodexRunScript};
 
 pub(super) const CLAUDE_APPROVAL_COMMAND: &str = "printf capture";
@@ -461,7 +461,7 @@ mod tests {
     use super::APPROVAL_MARKER_NAME;
     #[cfg(windows)]
     use crate::capture::record;
-    use crate::capture::recording::RecordingSession;
+    use crate::capture::recording::start_for_preflight_test;
     use crate::capture::test_support::{
         config, fixture_path, isolated_approval_target, isolated_tempdir,
     };
@@ -599,7 +599,7 @@ mod tests {
                 raw.path(),
             );
             capture_config.approval_target = Some(target.path().into());
-            let error = match RecordingSession::start(capture_config).await {
+            let error = match start_for_preflight_test(capture_config).await {
                 Ok(_) => panic!("repository cwd must fail before spawn"),
                 Err(error) => error,
             };
@@ -630,7 +630,7 @@ mod tests {
             raw.path(),
         );
         capture_config.approval_target = Some(target.path().into());
-        let error = match RecordingSession::start(capture_config).await {
+        let error = match start_for_preflight_test(capture_config).await {
             Ok(_) => panic!("nonempty target must fail before spawn"),
             Err(error) => error,
         };
