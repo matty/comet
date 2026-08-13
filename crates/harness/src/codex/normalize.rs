@@ -11,7 +11,9 @@
 //! Corpus claim `codex-routine-notification-ignore-list` pins the reviewed
 //! healthy-run methods in the ignored tier.
 
-use comet_proto::{AgentEvent, NoticeKind, NoticeSeverity, TodoItem, ToolCall};
+use comet_proto::{
+    AgentEvent, ChecklistItem, ChecklistStatus, NoticeKind, NoticeSeverity, ToolCall,
+};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +96,56 @@ pub(crate) fn usage_event(params: &Value) -> Option<AgentEvent> {
         output_tokens: count(&["outputTokens", "output_tokens"]),
         context_window: field(usage, &["modelContextWindow", "model_context_window"])
             .and_then(Value::as_u64),
+    })
+}
+
+/// Codex's plan statuses are already the spelling `ChecklistStatus` uses.
+/// Mapped explicitly anyway so an unrecognized value lands on `Unknown` here
+/// rather than relying on the proto type's `#[serde(other)]`, which only
+/// applies when a value is DESERIALIZED — these arrive as a `&str` read out of
+/// an untyped `Value` and never pass through serde at all.
+fn checklist_status_from_codex(raw: &str) -> ChecklistStatus {
+    match raw {
+        "pending" => ChecklistStatus::Pending,
+        "inProgress" | "in_progress" => ChecklistStatus::InProgress,
+        "completed" => ChecklistStatus::Completed,
+        _ => ChecklistStatus::Unknown,
+    }
+}
+
+/// `turn/plan/updated` → a whole-list [`AgentEvent::ChecklistReplaced`].
+///
+/// The payload is `{threadId, turnId, explanation, plan: [{step, status}]}`,
+/// captured 2026-08-13 against codex-cli 0.147.0. Steps carry no id of their
+/// own, so they are indexed positionally — safe here and only here, because a
+/// snapshot is never matched against previously stored ids.
+///
+/// `explanation` is Codex-only prose ("Finished the README read and moved to
+/// the line count."). Claude has no equivalent and none is invented for it.
+///
+/// An absent or empty `plan` yields `None` rather than an empty replacement: a
+/// notification that says nothing about the plan must not erase one.
+pub(crate) fn plan_update_event(params: &Value) -> Option<AgentEvent> {
+    let plan = field(params, &["plan"])?.as_array()?;
+    let items: Vec<ChecklistItem> = plan
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| ChecklistItem {
+            id: index.to_string(),
+            text: Some(str_field(entry, &["step"])),
+            active_form: None,
+            status: checklist_status_from_codex(&str_field(entry, &["status"])),
+        })
+        .collect();
+    if items.is_empty() {
+        return None;
+    }
+    Some(AgentEvent::ChecklistReplaced {
+        explanation: field(params, &["explanation"])
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        items,
     })
 }
 
@@ -217,19 +269,50 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
             },
             false,
         ),
+        // Never observed on 0.147.0 — every item in the 2026-08-13 capture was
+        // `agentMessage`, `commandExecution`, `reasoning` or `userMessage`, and
+        // Codex's plan travels as `turn/plan/updated` rather than as an item at
+        // all. Kept anyway, on `TodoWrite`'s reasoning: Comet does not pin the
+        // user's CLI version, and one run is not proof of absence.
+        //
+        // BOTH phases emit, deliberately. A replacement is idempotent — the
+        // second one restates the same list and the fold lands on the same
+        // result — whereas gating on `Started` drops the list entirely for a
+        // completion-only item, which is exactly what the app server sends for
+        // a `todoList` that was never streamed. Losing a plan is worse than
+        // folding it twice.
         "todoList" | "todo_list" => {
-            let items = item
+            let items: Vec<ChecklistItem> = item
                 .get("items")
                 .and_then(Value::as_array)
                 .map(|a| a.as_slice())
                 .unwrap_or_default()
                 .iter()
-                .map(|t| TodoItem {
-                    text: str_field(t, &["text"]),
-                    done: field(t, &["completed", "done"]).and_then(Value::as_bool) == Some(true),
+                .enumerate()
+                .map(|(index, t)| ChecklistItem {
+                    // Positional, like the plan snapshot below: this is a
+                    // replacement, so an index is never matched against a
+                    // previously stored one.
+                    id: index.to_string(),
+                    text: Some(str_field(t, &["text"])),
+                    active_form: None,
+                    // The legacy `completed`/`done` boolean is the only status
+                    // this item shape was ever seen to carry, and it cannot
+                    // express `inProgress`. Absent means absent, not pending.
+                    status: match field(t, &["completed", "done"]).and_then(Value::as_bool) {
+                        Some(true) => ChecklistStatus::Completed,
+                        Some(false) => ChecklistStatus::Pending,
+                        None => ChecklistStatus::Unknown,
+                    },
                 })
                 .collect();
-            tool_lifecycle(phase, id, ToolCall::Todo { items }, false)
+            if items.is_empty() {
+                return Vec::new();
+            }
+            vec![AgentEvent::ChecklistReplaced {
+                explanation: None,
+                items,
+            }]
         }
         "error" => vec![AgentEvent::Error {
             message: str_field(item, &["message"]),
@@ -420,10 +503,19 @@ pub(crate) fn rate_limit_notice(
 pub(crate) const IGNORED_NOTIFICATIONS: &[(&str, &str)] = &[
     // owned by a later slice
     ("skills/changed", "2.4"),
-    ("turn/plan/updated", "4.2"),
-    ("item/plan/delta", "4.2"),
-    ("hook/started", "4.2"),
-    ("hook/completed", "4.2"),
+    // `turn/plan/updated` is CLAIMED as of slice 4.3 and is deliberately no
+    // longer listed — a frame handled by a claimed arm never reaches
+    // `classify_unclaimed`, so an entry here would be a lie the next reader has
+    // to disprove.
+    //
+    // These three stay. None has ever been observed firing, on any capture;
+    // they are named by the generated schema alone, and one run is not proof of
+    // absence. The reason moves from 4.2 to 4.3 because 4.3 is the slice that
+    // owns the plan surface and declined them, rather than the slice that
+    // deferred them.
+    ("item/plan/delta", "4.3"),
+    ("hook/started", "4.3"),
+    ("hook/completed", "4.3"),
     ("item/autoApprovalReview/started", "phase-1"),
     ("item/autoApprovalReview/completed", "phase-1"),
     // no user-relevant state
@@ -448,6 +540,98 @@ pub(crate) const IGNORED_NOTIFICATIONS: &[(&str, &str)] = &[
     ("item/fileChange/outputDelta", "deprecated"),
     ("thread/compacted", "deprecated"),
 ];
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The payload verbatim from the 2026-08-13 capture against codex-cli
+    /// 0.147.0 — a complete snapshot per change, with a prose explanation and
+    /// all three statuses present at once.
+    fn captured_plan() -> Value {
+        json!({
+            "threadId": "019ff893-0000-7000-8000-000000000000",
+            "turnId": "019ff893-1111-7000-8000-000000000000",
+            "explanation": "Finished the README read and moved to the line count.",
+            "plan": [
+                {"step": "Read `README.md`.", "status": "completed"},
+                {"step": "Count the lines in `notes.txt`.", "status": "inProgress"},
+                {"step": "Report both results.", "status": "pending"},
+            ],
+        })
+    }
+
+    #[test]
+    fn a_plan_snapshot_becomes_a_whole_list_replacement() {
+        let event = plan_update_event(&captured_plan()).expect("the capture carries a plan");
+        assert_eq!(
+            event,
+            AgentEvent::ChecklistReplaced {
+                explanation: Some("Finished the README read and moved to the line count.".into()),
+                items: vec![
+                    ChecklistItem {
+                        id: "0".into(),
+                        text: Some("Read `README.md`.".into()),
+                        active_form: None,
+                        status: ChecklistStatus::Completed,
+                    },
+                    ChecklistItem {
+                        id: "1".into(),
+                        text: Some("Count the lines in `notes.txt`.".into()),
+                        active_form: None,
+                        // The state the whole redesign exists for. `TodoItem`
+                        // could not hold it.
+                        status: ChecklistStatus::InProgress,
+                    },
+                    ChecklistItem {
+                        id: "2".into(),
+                        text: Some("Report both results.".into()),
+                        active_form: None,
+                        status: ChecklistStatus::Pending,
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn a_notification_carrying_no_plan_erases_nothing() {
+        // A replacement built from an absent plan would wipe the list. Saying
+        // nothing about the plan is not saying the plan is empty.
+        assert!(plan_update_event(&json!({"turnId": "t1"})).is_none());
+        assert!(plan_update_event(&json!({"turnId": "t1", "plan": []})).is_none());
+    }
+
+    #[test]
+    fn an_unrecognized_step_status_is_unknown_rather_than_pending() {
+        // A status this build has never heard of must not be reported as "not
+        // started" — that reads as a step the agent has yet to begin.
+        let event = plan_update_event(&json!({
+            "plan": [{"step": "Do the thing.", "status": "blocked"}],
+        }))
+        .expect("a plan is present");
+        let AgentEvent::ChecklistReplaced { items, .. } = event else {
+            panic!("expected a replacement");
+        };
+        assert_eq!(items[0].status, ChecklistStatus::Unknown);
+    }
+
+    #[test]
+    fn an_absent_explanation_stays_absent() {
+        // Claude's paths send none and nothing may invent one, so an empty or
+        // missing string must not become `Some("")`.
+        let event = plan_update_event(&json!({
+            "plan": [{"step": "s", "status": "pending"}],
+            "explanation": "",
+        }))
+        .expect("a plan is present");
+        let AgentEvent::ChecklistReplaced { explanation, .. } = event else {
+            panic!("expected a replacement");
+        };
+        assert_eq!(explanation, None);
+    }
+}
 
 pub(crate) fn ignored_notification_reason(method: &str) -> Option<&'static str> {
     IGNORED_NOTIFICATIONS

@@ -11,3 +11,7 @@ node_modules
 build/
 edge/dist/
 **/__pycache__/
+
+# Leaked by 	empfile::tempdir() when TMPDIR resolves inside the checkout —
+# the codex suite's logged-in CODEX_HOME fixture creates one per run.
+.tmp*/

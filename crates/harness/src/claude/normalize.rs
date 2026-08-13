@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use comet_proto::{
     AgentEvent, ChecklistItem, ChecklistStatus, DiagnosticSeverity, DoneStatus, HarnessId,
-    NoticeKind, NoticeSeverity, RuntimeMode, SubagentStatus, TodoItem, ToolCall,
+    NoticeKind, NoticeSeverity, RuntimeMode, SubagentStatus, ToolCall,
 };
 use serde_json::Value;
 
@@ -250,6 +250,10 @@ pub(crate) enum TaskCallKind {
     Create,
     Update,
     List,
+    /// The pre-2.1.229 tool. Kept because Comet resolves whatever CLI the user
+    /// has installed, and an older one still emits it — removing this decode
+    /// would be a regression, not a cleanup.
+    TodoWrite,
 }
 
 impl TaskCallKind {
@@ -258,6 +262,7 @@ impl TaskCallKind {
             "TaskCreate" => Some(Self::Create),
             "TaskUpdate" => Some(Self::Update),
             "TaskList" => Some(Self::List),
+            "TodoWrite" => Some(Self::TodoWrite),
             _ => None,
         }
     }
@@ -337,6 +342,38 @@ fn checklist_event_from_task_call(
                 status,
             })
         }
+        TaskCallKind::TodoWrite => {
+            // The whole list on the INPUT, in one call — the shape the newer
+            // task tools replaced. The result confirms nothing this needs, and
+            // is consulted only so a failed call moves nothing.
+            //
+            // Its `status` is already the same tri-state string
+            // (`pending` / `in_progress` / `completed`). The old
+            // `TodoItem { done: bool }` decode read it as
+            // `status == "completed"`, which is what flattened `in_progress`
+            // into "not done" — the wire always carried it.
+            let todos = input.get("todos")?.as_array()?;
+            let items = todos
+                .iter()
+                .enumerate()
+                .map(|(index, t)| ChecklistItem {
+                    // `TodoWrite` numbers nothing: the list IS the order, and
+                    // every call restates all of it. Positional ids are safe
+                    // here for the same reason they are for Codex — this only
+                    // ever produces a whole-list replacement.
+                    id: index.to_string(),
+                    text: opt_str_field(t, "content"),
+                    active_form: opt_str_field(t, "activeForm"),
+                    status: opt_str_field(t, "status")
+                        .as_deref()
+                        .map_or(ChecklistStatus::Unknown, checklist_status_from_claude),
+                })
+                .collect::<Vec<_>>();
+            (!items.is_empty()).then_some(AgentEvent::ChecklistReplaced {
+                explanation: None,
+                items,
+            })
+        }
         TaskCallKind::List => {
             let tasks = result.get("tasks")?.as_array()?;
             let items: Vec<ChecklistItem> = tasks
@@ -403,19 +440,15 @@ pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
         "WebSearch" => ToolCall::WebSearch {
             query: str_field(input, "query"),
         },
-        "TodoWrite" => ToolCall::Todo {
-            items: input
-                .get("todos")
-                .and_then(Value::as_array)
-                .map(|a| a.as_slice())
-                .unwrap_or_default()
-                .iter()
-                .map(|t| TodoItem {
-                    text: str_field(t, "content"),
-                    done: t.get("status").and_then(Value::as_str) == Some("completed"),
-                })
-                .collect(),
-        },
+        // `TodoWrite` and the `Task*` family are DELIBERATELY absent here and
+        // fall through to `Unknown`, which is how they render as ordinary tool
+        // chips. The list they carry is its own event
+        // (`AgentEvent::ChecklistReplaced` / `ChecklistItemChanged`, emitted
+        // from `checklist_event_from_task_call`), not a `ToolCall` variant —
+        // the same split t3code arrived at, and the reason `ToolCall::Todo` is
+        // no longer constructed anywhere. See that variant's own doc comment
+        // for why it still exists.
+        //
         // MCP tools arrive as `mcp__<server>__<tool>`.
         _ => match name.strip_prefix("mcp__").and_then(|r| r.split_once("__")) {
             Some((server, tool)) => ToolCall::Mcp {
@@ -1036,17 +1069,18 @@ mod tests {
                 new_string: Some("y".into())
             }
         );
-        assert_eq!(
-            decode_tool_use(
-                "TodoWrite",
-                &json!({"todos": [{"content": "t", "status": "completed"}]})
-            ),
-            ToolCall::Todo {
-                items: vec![TodoItem {
-                    text: "t".into(),
-                    done: true
-                }]
-            }
+        // `TodoWrite` no longer decodes to `ToolCall::Todo` — the list it
+        // carries is its own event now, and the call itself is an ordinary
+        // chip like `TaskCreate` beside it. Nothing in this crate constructs
+        // `ToolCall::Todo` any more; the variant survives only so historical
+        // documents still decode (see its doc comment).
+        let todo_write = decode_tool_use(
+            "TodoWrite",
+            &json!({"todos": [{"content": "t", "status": "completed"}]}),
+        );
+        assert!(
+            matches!(&todo_write, ToolCall::Unknown { name, .. } if name == "TodoWrite"),
+            "{todo_write:?}"
         );
         assert_eq!(
             decode_tool_use("mcp__linear__search", &json!({"q": "bug"})),
@@ -2282,6 +2316,44 @@ mod tests {
                         text: Some("Count lines".into()),
                         active_form: None,
                         status: ChecklistStatus::InProgress,
+                    },
+                ],
+            }),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn todo_write_still_works_and_no_longer_flattens_in_progress() {
+        // The legacy tool on an older installed CLI. Its `status` was ALWAYS
+        // the same tri-state string — the old decode read it as
+        // `status == "completed"` into a bool, which is what lost
+        // `in_progress`. Nothing about the wire changed; the type did.
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tw1","name":"TodoWrite","input":{"todos":[{"content":"Read the file","status":"completed"},{"content":"Count the lines","status":"in_progress"},{"content":"Report","status":"pending"}]}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tw1","type":"tool_result","content":"Todos updated"}]},"parent_tool_use_id":null,"tool_use_result":{"ok":true}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[call, result]);
+        assert!(
+            events.contains(&AgentEvent::ChecklistReplaced {
+                explanation: None,
+                items: vec![
+                    ChecklistItem {
+                        id: "0".into(),
+                        text: Some("Read the file".into()),
+                        active_form: None,
+                        status: ChecklistStatus::Completed,
+                    },
+                    ChecklistItem {
+                        id: "1".into(),
+                        text: Some("Count the lines".into()),
+                        active_form: None,
+                        status: ChecklistStatus::InProgress,
+                    },
+                    ChecklistItem {
+                        id: "2".into(),
+                        text: Some("Report".into()),
+                        active_form: None,
+                        status: ChecklistStatus::Pending,
                     },
                 ],
             }),
