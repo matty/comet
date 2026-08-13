@@ -36,7 +36,7 @@ use gpui::{
 };
 
 use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
-use comet_proto::{NoticeSeverity, ServerId, ServerRef, ToolCall};
+use comet_proto::{NoticeSeverity, ServerId, ServerRef, SubagentStatus, ToolCall};
 
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
@@ -605,6 +605,13 @@ pub fn rows_for_entry(
                             timestamp: None,
                         });
                     }
+                    // Persisted, not drawn: subagent attribution (slice 4.2)
+                    // lands the part; rendering it as a card is slice 4.4's
+                    // build. An explicit no-op arm, never `_ => {}` — a
+                    // wildcard here would silently swallow the NEXT part kind
+                    // someone adds, and 4.4 would get no compile error naming
+                    // what to build.
+                    MessagePart::Subagent { .. } => {}
                 }
             }
         }
@@ -2702,6 +2709,32 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
         if let MessagePart::Input { resolved, .. } = part {
             acc.push(0x10 | *resolved as u8);
         }
+        // `byte_len` sees `description`/`activity`/`summary` text but is
+        // blind to these four fields — a `Running` -> `Completed` transition
+        // with no length change in the text fields would otherwise produce a
+        // byte-identical fingerprint and the row cache would miss the
+        // invalidation (mirrors the `Tool`/`Input` arms above, same reason).
+        if let MessagePart::Subagent {
+            status,
+            total_tokens,
+            duration_ms,
+            tool_uses,
+            ..
+        } = part
+        {
+            acc.push(match status {
+                SubagentStatus::Running => 0,
+                SubagentStatus::Completed => 1,
+                SubagentStatus::Failed => 2,
+                SubagentStatus::Cancelled => 3,
+            });
+            acc.push(total_tokens.is_some() as u8);
+            acc.extend_from_slice(&total_tokens.unwrap_or(0).to_le_bytes());
+            acc.push(duration_ms.is_some() as u8);
+            acc.extend_from_slice(&duration_ms.unwrap_or(0).to_le_bytes());
+            acc.push(tool_uses.is_some() as u8);
+            acc.extend_from_slice(&tool_uses.unwrap_or(0).to_le_bytes());
+        }
     }
     fnv1a(&acc)
 }
@@ -2773,6 +2806,55 @@ impl Render for Transcript {
 mod tests {
     use super::*;
     use comet_doc::MessagePart;
+
+    /// `byte_len` sees only `description`/`activity`/`summary` text, so a
+    /// `Running` -> `Completed` transition with no length change anywhere in
+    /// those fields must still change the fingerprint, the same way the
+    /// `Tool`/`Input` arms cover `is_error`/`resolved` — otherwise the row
+    /// cache never invalidates and a settled card renders stale.
+    #[test]
+    fn a_subagent_status_change_with_no_text_length_change_still_changes_the_fingerprint() {
+        let running = comet_doc::SessionMessageEntry {
+            id: "e1".into(),
+            role: comet_doc::MessageRole::Assistant,
+            parts: vec![MessagePart::Subagent {
+                id: "sub-1".into(),
+                task_id: "t1".into(),
+                agent_type: "general-purpose".into(),
+                description: "same length".into(),
+                status: comet_proto::SubagentStatus::Running,
+                activity: None,
+                summary: None,
+                total_tokens: None,
+                duration_ms: None,
+                tool_uses: None,
+            }],
+            created_at: 0,
+            device_id: "d1".into(),
+            status: None,
+            continuation_of: None,
+        };
+        let mut completed = running.clone();
+        completed.parts = vec![MessagePart::Subagent {
+            id: "sub-1".into(),
+            task_id: "t1".into(),
+            agent_type: "general-purpose".into(),
+            description: "same length".into(),
+            status: comet_proto::SubagentStatus::Completed,
+            activity: None,
+            summary: None,
+            total_tokens: Some(42),
+            duration_ms: Some(100),
+            tool_uses: Some(1),
+        }];
+
+        assert_ne!(
+            entry_fingerprint(&running, false),
+            entry_fingerprint(&completed, false),
+            "a Running -> Completed transition with identical part text must \
+             still change the fingerprint"
+        );
+    }
 
     #[test]
     fn equal_raw_chat_ids_on_different_servers_are_a_new_attachment() {

@@ -564,6 +564,72 @@ fn sanitizer_replaces_every_nonempty_claude_memory_path_as_typed_local_metadata(
     }
 }
 
+/// KNOWN GAP, not yet fixed (slice 4.2 task 9, docs/debt row D58): a subagent `task_id` has no
+/// `semantic_kind` rule under any key spelling -- `normalize_field("task_id")` is `"taskid"`,
+/// which matches none of `"tooluseid" | "parenttooluseid" | "itemid"` or `"hookid"`, so it is
+/// never typed, anywhere it appears, even under its own key. `task_notification` compounds this:
+/// it also carries `output_file`, a path under the operator's temp dir whose middle segment is
+/// the *same* hyphen-mangled cwd slug `memory_paths.auto` uses (colons and backslashes turned
+/// into hyphens -- see `sanitizer_replaces_every_nonempty_claude_memory_path_as_typed_local_metadata`
+/// above for the encoding), and `semantic_kind` has no rule keyed on `output_file` at all. Even a
+/// `session_id` -- which IS typed correctly under its own key -- leaks again here, because there
+/// is no value-based sweep that also replaces an already-typed identifier when it turns up
+/// embedded, unkeyed, inside a different field's string. This test pins today's behavior so a
+/// promotion built from a raw `task_notification` frame stays reviewable rather than silently
+/// leaking. Found while sanitizing `claude/2.1.229/subagent` by hand: that promotion's own
+/// `task_id` and `output_file` needed a manual pass this test proves the real tool lacks. When
+/// closed, these assertions flip and the test should be rewritten to expect redaction.
+#[test]
+fn sanitizer_has_no_rule_for_task_id_or_output_file_mangled_cwd_slug_known_gap() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = r"D:\capture-home";
+    let cwd = r"C:\private workspace\project";
+    let mangled_cwd_slug = "C--private-workspace-project";
+    let session_id = "session-under-tasks";
+    let task_id = "task-output-file";
+    let payload = serde_json::json!({
+        "type": "system",
+        "subtype": "task_notification",
+        "task_id": task_id,
+        "status": "completed",
+        "output_file": format!(
+            r"{home}\AppData\Local\Temp\claude\{mangled_cwd_slug}\{session_id}\tasks\{task_id}.output"
+        ),
+        "session_id": session_id
+    })
+    .to_string();
+    let raw = write_raw_capture(temp.path(), "output-file-gap", &[&payload]);
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    capture["redaction_roots"]["cwd"] = Value::String(cwd.into());
+    capture["redaction_roots"]["home"] = Value::String(home.into());
+    capture["command"]["cwd"] = Value::String(cwd.into());
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "output-file-gap")).unwrap();
+    let payload = &sanitized_payloads(&report.events_bytes)[0];
+
+    // session_id IS typed correctly under its own key -- the gap is specific to task_id (never
+    // typed anywhere) and to output_file's untouched embedded copy of both identifiers.
+    assert_eq!(payload["session_id"], "<SESSION_ID_1>");
+
+    // Known gap 1: task_id has no rule at all, so it survives literally under its own key too.
+    assert_eq!(payload["task_id"], task_id);
+
+    // Known gap 2: output_file itself is untouched by any rule, so the mangled cwd slug and both
+    // identifiers survive verbatim inside it even though session_id is typed correctly elsewhere.
+    let output_file = payload["output_file"].as_str().unwrap();
+    assert!(
+        output_file.contains(mangled_cwd_slug),
+        "expected today's known gap (mangled cwd slug NOT redacted), got: {output_file}"
+    );
+    assert!(
+        output_file.contains(task_id) && output_file.contains(session_id),
+        "expected today's known gap (embedded ids NOT redacted), got: {output_file}"
+    );
+}
+
 /// Break caught: Claude assistant message IDs are provider-generated correlators, and leaving
 /// them literal exposes run identity even when session, request, and tool IDs are typed correctly.
 #[test]

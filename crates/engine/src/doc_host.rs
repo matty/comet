@@ -180,6 +180,17 @@ impl ChatDocHandle {
                     Err(err) => tracing::warn!(chat = %self.chat_id, entry = %entry.id,
                         error = %err, "expiring open approvals failed"),
                 }
+                // Same crash path, for a subagent: the process died before
+                // `sessions::cancel_running_subagents` ever ran, so a part
+                // still `Running` here would otherwise persist that way
+                // forever, in this doc and in every LAN peer's replica.
+                match self.doc.cancel_running_subagents(&entry.id) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(chat = %self.chat_id, entry = %entry.id,
+                        cancelled = n, "cancelled subagents left running by a dead run"),
+                    Err(err) => tracing::warn!(chat = %self.chat_id, entry = %entry.id,
+                        error = %err, "cancelling running subagents failed"),
+                }
                 stamped.push((entry.id.clone(), entry.created_at));
             }
         }
@@ -870,7 +881,7 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comet_proto::{ChatConfig, HarnessId, RuntimeMode, SandboxLevel};
+    use comet_proto::{ChatConfig, HarnessId, RuntimeMode, SandboxLevel, SubagentStatus};
 
     // These tests only exercise the workspace-row read, never a dispatch, so
     // the stock mock harness (empty script) is enough to satisfy assembly.
@@ -996,5 +1007,64 @@ mod tests {
             .expect("chat row exists");
         assert_eq!(request.runtime_mode, RuntimeMode::FullAccess);
         assert_eq!(request.sandbox, SandboxLevel::DangerFullAccess);
+    }
+
+    /// The subagent analogue of the crash path an interrupt can never reach:
+    /// the process is killed while a child subagent is mid-run, so
+    /// `sessions::cancel_running_subagents` never gets to run and this
+    /// entry's `streaming` status is the only trace left. Exercises the real
+    /// `mark_abandoned_streams` wiring (not just the `SessionDoc` method it
+    /// calls), and reads the result back off the persisted doc.
+    #[tokio::test]
+    async fn mark_abandoned_streams_cancels_a_running_subagent_left_by_a_dead_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path().join("local-store")).unwrap());
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                default_harness: HarnessId::Mock,
+            },
+        );
+        let handle = host.open("chat-1").unwrap();
+        handle
+            .doc()
+            .push_message(&SessionMessageEntry {
+                id: "m1".into(),
+                role: MessageRole::Assistant,
+                parts: vec![MessagePart::Subagent {
+                    id: "sub-1".into(),
+                    task_id: "t1".into(),
+                    agent_type: "general-purpose".into(),
+                    description: "Read README and report first heading".into(),
+                    status: SubagentStatus::Running,
+                    activity: None,
+                    summary: None,
+                    total_tokens: None,
+                    duration_ms: None,
+                    tool_uses: None,
+                }],
+                created_at: 1,
+                device_id: "dev-a".into(),
+                status: Some(MessageStatus::Streaming),
+                continuation_of: None,
+            })
+            .unwrap();
+
+        handle.mark_abandoned_streams("backend restarted").unwrap();
+
+        let entries = handle.doc().read_entries().unwrap();
+        let subagent = entries[0]
+            .parts
+            .iter()
+            .find(|p| matches!(p, MessagePart::Subagent { .. }))
+            .expect("subagent part survives the sweep");
+        assert!(matches!(
+            subagent,
+            MessagePart::Subagent {
+                status: SubagentStatus::Cancelled,
+                ..
+            }
+        ));
     }
 }

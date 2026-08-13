@@ -820,6 +820,22 @@
       "fact": "The live server answered the captured model list in one page."
     },
     {
+      "id": "claude-tool-use-result-present",
+      "consumer": "crates/harness/src/claude/wire.rs:a_user_frame_decodes_the_captured_tool_use_result",
+      "evidence": [
+        {
+          "manifest": "claude/2.1.228/approval/manifest.json",
+          "frames": [
+            {
+              "sequence": 56,
+              "channel": "stdout"
+            }
+          ]
+        }
+      ],
+      "fact": "A captured Bash tool_result user frame carries a snake_case tool_use_result key with the tool's typed result."
+    },
+    {
       "id": "codex-steer-reply-before-completion",
       "consumer": "docs/debt/D44-provider-capture-corpus.md:residual-scenarios",
       "evidence": [

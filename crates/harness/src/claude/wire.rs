@@ -6,8 +6,9 @@
 //! and nothing vanishes silently (spec: docs/research/harness.md).
 //!
 //! Corpus claims: `claude-routine-frame-ignore-list`,
-//! `claude-approval-wire-fields`, `claude-attachment-block-order`, and
-//! `claude-attachment-block-order-test`.
+//! `claude-approval-wire-fields`, `claude-attachment-block-order`,
+//! `claude-attachment-block-order-test`, and
+//! `claude-tool-use-result-present`.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -21,6 +22,10 @@ pub(crate) enum Frame {
     StreamEvent(StreamEventFrame),
     Assistant(MessageFrame),
     User(MessageFrame),
+    /// One of the four claimed `system/task_*` subtypes (subagent lifecycle):
+    /// `task_started`, `task_progress`, `task_updated`, `task_notification`.
+    /// One tolerant struct across all four — see [`SubagentTaskFrame`].
+    SubagentTask(SubagentTaskFrame),
     RateLimit(RateLimitFrame),
     Result(ResultFrame),
     ControlRequest(ControlRequestFrame),
@@ -59,6 +64,17 @@ pub(crate) const NOTICE_SUBTYPES: &[&str] = &[
     "notification",
 ];
 
+/// The `system` subtypes claimed as subagent lifecycle frames (slice 4.2).
+/// Same allowlist pattern as [`NOTICE_SUBTYPES`]: an explicit list so a
+/// subtype nobody claimed still falls to the Ignored/Unknown split rather
+/// than vanishing.
+pub(crate) const SUBAGENT_TASK_SUBTYPES: &[&str] = &[
+    "task_started",
+    "task_progress",
+    "task_updated",
+    "task_notification",
+];
+
 /// Frames Comet recognizes and deliberately drops — the middle tier of the
 /// Claimed / Ignored / Unknown classification. Reasons: a slice number
 /// (e.g. `"4.2"`, `"2.4"`, `"phase-1"`) names a roadmap slice that will
@@ -88,12 +104,13 @@ pub(crate) const IGNORED_FRAMES: &[(&str, &str)] = &[
     ("system/hook_started", "4.2"), // ★ one per session with hooks
     ("system/hook_progress", "4.2"),
     ("system/hook_response", "4.2"), // ★
-    ("system/task_started", "4.2"),
-    ("system/task_progress", "4.2"),
-    ("system/task_updated", "4.2"),
-    ("system/task_notification", "4.2"),
     ("system/commands_changed", "2.4"),
     ("system/permission_denied", "phase-1"),
+    // Carries the live background-task set, but every task_type this frame
+    // has been observed to carry (local_agent) is also fully derivable from
+    // the task_* events the normalizer already emits, so no surface needs
+    // this frame's copy of it.
+    ("system/background_tasks_changed", "redundant"), // ★ twice per subagent run
     // Memory-feature chatter; fires routinely for memory-enabled users. No
     // planned slice owns a memory surface — the reason names that product
     // fact, not a deferral; whoever builds one claims this entry.
@@ -161,6 +178,61 @@ pub(crate) struct SystemNoticeFrame {
     pub priority: String,
 }
 
+/// One tolerant struct across all four claimed `system/task_*` subtypes,
+/// consistent with this module's "every field defaults" convention — the
+/// normalizer reads only the fields each subtype actually carries. Literal
+/// shapes: captures/2026-08-13-plan-todo-subagent/run2-claude-subagent.jsonl.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct SubagentTaskFrame {
+    #[serde(default)]
+    pub subtype: String,
+    #[serde(default)]
+    pub task_id: String,
+    /// The parent `Agent` tool_use id. Present on `task_started`,
+    /// `task_progress`, `task_notification`; absent on `task_updated`.
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    /// `task_started`'s description, OR `task_progress`'s LIVE activity line
+    /// — the same key moves ("Read README…" → "Reading README.md").
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub subagent_type: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// `task_notification`'s top-level terminal status. `task_updated`'s
+    /// status lives one level down, in [`patch`](Self::patch).
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub usage: Option<SubagentUsage>,
+    /// `task_updated`'s PARTIAL patch — only the field the CLI actually
+    /// changed, so an absent `status` here must decode absent, never as a
+    /// collapsed default.
+    #[serde(default)]
+    pub patch: Option<SubagentPatch>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct SubagentUsage {
+    /// `None` is "not reported yet", never zero — mirrors
+    /// [`comet_proto::AgentEvent::SubagentUpdated`]'s own field.
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+    #[serde(default)]
+    pub tool_uses: Option<u32>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct SubagentPatch {
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct CompactMetadata {
     #[serde(default)]
@@ -207,6 +279,15 @@ pub(crate) struct MessageFrame {
     /// Terse assistant-level error code (`rate_limit`, `billing_error`, …).
     #[serde(default)]
     pub error: Option<String>,
+    /// On `user` frames: the tool's own result, already typed per tool
+    /// (`Bash` gets stdout/stderr, `Write` gets a diff, …). **Snake_case on
+    /// the wire** — the SDK's typings declare a camelCase `toolUseResult`
+    /// that does not appear here at all. Consumed by `normalize.rs`'s
+    /// `subagent_result_from_tool_use_result`: the `Agent` tool's own result
+    /// carries the whole subagent record on one frame, a fallback for a run
+    /// that produced no `task_notification`.
+    #[serde(default)]
+    pub tool_use_result: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -349,6 +430,9 @@ pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
                 "init" => Frame::System(serde_json::from_value(value)?),
                 s if NOTICE_SUBTYPES.contains(&s) => {
                     Frame::SystemNotice(serde_json::from_value(value)?)
+                }
+                s if SUBAGENT_TASK_SUBTYPES.contains(&s) => {
+                    Frame::SubagentTask(serde_json::from_value(value)?)
                 }
                 s => {
                     let discriminator = format!("system/{s}");
@@ -589,6 +673,10 @@ mod tests {
                 r#"{"type":"system","subtype":"hook_response","hook":"SessionStart"}"#,
                 "4.2",
             ),
+            (
+                r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#,
+                "redundant",
+            ),
         ] {
             match parse_frame(raw).expect("parses") {
                 Frame::Ignored(r) => assert_eq!(r, reason, "{raw}"),
@@ -636,6 +724,126 @@ mod tests {
             panic!("expected a control request");
         };
         assert_eq!(req.request.description.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_user_frame_decodes_the_captured_tool_use_result() {
+        // Literal captured payload, per AGENTS.md: the SDK's typings declare
+        // camelCase toolUseResult, but the wire sends snake_case, and a
+        // hand-composed fixture would not catch the wrong spelling.
+        let line = corpus_payload("claude-tool-use-result-present");
+        let Frame::User(frame) = parse_frame(&line).unwrap() else {
+            panic!("expected a user frame");
+        };
+        let result = frame.tool_use_result.expect("captured frame has a result");
+        assert_eq!(result["stdout"], "capture");
+        assert_eq!(result["interrupted"], false);
+    }
+
+    #[test]
+    fn a_user_frame_without_tool_use_result_decodes_to_none() {
+        // The absent case, written by hand, per .agents/rules/optional-wire-fields.md.
+        let line =
+            r#"{"type":"user","message":{"role":"user","content":"hi"},"parent_tool_use_id":null}"#;
+        let Frame::User(frame) = parse_frame(line).unwrap() else {
+            panic!("expected a user frame");
+        };
+        assert_eq!(frame.tool_use_result, None);
+    }
+
+    #[test]
+    fn subagent_task_subtypes_decode_into_subagent_task_not_ignored() {
+        // The four frames slice 4.2 task 3 claims. Literal captured shape:
+        // captures/2026-08-13-plan-todo-subagent/run2-claude-subagent.jsonl.
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","description":"Read README and report first heading","subagent_type":"general-purpose","task_type":"local_agent","prompt":"Read the README.md file in the current directory and report what the first heading is. Just state the heading text, nothing else."}"#;
+        match parse_frame(started).unwrap() {
+            Frame::SubagentTask(f) => {
+                assert_eq!(f.subtype, "task_started");
+                assert_eq!(f.task_id, "a6d1ae6c4fec0efe9");
+                assert_eq!(
+                    f.tool_use_id.as_deref(),
+                    Some("toolu_01M553SNnGHZ1j4whxE9zWq9")
+                );
+                assert_eq!(f.subagent_type.as_deref(), Some("general-purpose"));
+                assert_eq!(
+                    f.description.as_deref(),
+                    Some("Read README and report first heading")
+                );
+                assert!(f.prompt.is_some());
+            }
+            other => panic!("expected SubagentTask, got {other:?}"),
+        }
+
+        let progress = r#"{"type":"system","subtype":"task_progress","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","description":"Reading README.md","subagent_type":"general-purpose","usage":{"total_tokens":19215,"tool_uses":1,"duration_ms":2906},"last_tool_name":"Read"}"#;
+        match parse_frame(progress).unwrap() {
+            Frame::SubagentTask(f) => {
+                assert_eq!(f.subtype, "task_progress");
+                assert_eq!(f.description.as_deref(), Some("Reading README.md"));
+                let usage = f.usage.expect("usage present");
+                assert_eq!(usage.total_tokens, Some(19215));
+                assert_eq!(usage.tool_uses, Some(1));
+                assert_eq!(usage.duration_ms, Some(2906));
+            }
+            other => panic!("expected SubagentTask, got {other:?}"),
+        }
+
+        let updated = r#"{"type":"system","subtype":"task_updated","task_id":"a6d1ae6c4fec0efe9","patch":{"status":"completed","end_time":1786581776304}}"#;
+        match parse_frame(updated).unwrap() {
+            Frame::SubagentTask(f) => {
+                assert_eq!(f.subtype, "task_updated");
+                assert_eq!(
+                    f.patch.expect("patch present").status.as_deref(),
+                    Some("completed")
+                );
+            }
+            other => panic!("expected SubagentTask, got {other:?}"),
+        }
+
+        let notification = r#"{"type":"system","subtype":"task_notification","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","status":"completed","output_file":"C:\\tmp\\out","summary":"Sandbox","usage":{"total_tokens":20044,"tool_uses":1,"duration_ms":4906}}"#;
+        match parse_frame(notification).unwrap() {
+            Frame::SubagentTask(f) => {
+                assert_eq!(f.subtype, "task_notification");
+                assert_eq!(f.status.as_deref(), Some("completed"));
+                assert_eq!(f.summary.as_deref(), Some("Sandbox"));
+                let usage = f.usage.expect("usage present");
+                assert_eq!(usage.total_tokens, Some(20044));
+            }
+            other => panic!("expected SubagentTask, got {other:?}"),
+        }
+    }
+
+    /// Deleting these from `IGNORED_FRAMES` is the point of task 3: a claimed
+    /// arm must never leave a stale reason lying about a frame it now handles.
+    #[test]
+    fn subagent_task_subtypes_are_no_longer_on_the_ignored_list() {
+        for subtype in [
+            "task_started",
+            "task_progress",
+            "task_updated",
+            "task_notification",
+        ] {
+            assert_eq!(
+                ignored_reason(&format!("system/{subtype}")),
+                None,
+                "system/{subtype} must be claimed, not ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn a_task_updated_partial_patch_leaves_everything_else_absent() {
+        // The patch is PARTIAL — only status moved. No other field is present
+        // at all, and the frame-level fields not set by task_updated
+        // (description, summary, usage) must decode to None, not to a
+        // collapsed default.
+        let line = r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"completed"}}"#;
+        let Frame::SubagentTask(f) = parse_frame(line).unwrap() else {
+            panic!("expected SubagentTask");
+        };
+        assert_eq!(f.description, None);
+        assert_eq!(f.summary, None);
+        assert!(f.usage.is_none());
+        assert_eq!(f.tool_use_id, None);
     }
 
     #[test]

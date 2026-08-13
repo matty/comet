@@ -1253,6 +1253,17 @@ pub fn sanitize_discriminator(raw: &str) -> String {
     raw[..raw.len().min(64)].to_string()
 }
 
+/// Lifecycle state of a subagent Claude delegated to. See
+/// [`AgentEvent::SubagentStarted`] for why this is Claude-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SubagentStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors comet's `AgentEvent` tagged enum.
@@ -1396,6 +1407,47 @@ pub enum AgentEvent {
         code: Option<String>,
         /// Comet copy, never provider text.
         summary: String,
+    },
+    /// A subagent this run delegated to. Claude-only: Codex has no subagent
+    /// concept on this surface (`guardian_subagent` is an approvals reviewer, a
+    /// different feature). Captured 2026-08-13 —
+    /// `captures/2026-08-13-plan-todo-subagent.md`.
+    #[serde(rename_all = "camelCase")]
+    SubagentStarted {
+        /// The DURABLE identity. A `SendMessage`-resumed agent fires a second
+        /// `task_started` with this same id under a new `tool_use_id`, so keying
+        /// on the tool id splits one agent into two cards.
+        task_id: String,
+        /// The parent `Agent` tool call. Also the value of `parent_tool_use_id`
+        /// on every frame the child emits — kept for the journal and for a later
+        /// slice that renders the child's own transcript.
+        tool_use_id: String,
+        /// e.g. "general-purpose", "Explore". Straight off the wire; never looked
+        /// up in the discovery handshake's `agents` catalogue (see D31).
+        agent_type: String,
+        description: String,
+        /// Capped at the harness boundary. `None` when the provider sent none.
+        prompt: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    SubagentUpdated {
+        task_id: String,
+        status: SubagentStatus,
+        /// The live activity line — Claude's `description` on `task_progress`
+        /// moves ("Read README and report first heading" → "Reading README.md").
+        #[serde(default)]
+        activity: Option<String>,
+        /// The child's answer, on completion only.
+        #[serde(default)]
+        summary: Option<String>,
+        /// `None` is "not reported yet", never zero: nothing on the wire promises
+        /// a `task_progress` before `task_notification`.
+        #[serde(default)]
+        total_tokens: Option<u64>,
+        #[serde(default)]
+        duration_ms: Option<u64>,
+        #[serde(default)]
+        tool_uses: Option<u32>,
     },
     #[serde(rename_all = "camelCase")]
     Done {
@@ -1956,5 +2008,120 @@ mod tests {
         assert!(json.contains(r#""source":"builtIn""#), "got {json}");
         let back: ModelCatalog = serde_json::from_str(&json).unwrap();
         assert_eq!(back.source, CatalogSource::BuiltIn);
+    }
+
+    #[test]
+    fn subagent_started_round_trips() {
+        let ev = AgentEvent::SubagentStarted {
+            task_id: "task-1".into(),
+            tool_use_id: "toolu_01".into(),
+            agent_type: "general-purpose".into(),
+            description: "Investigate the flaky test".into(),
+            prompt: Some("Find why test_foo is flaky".into()),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    /// `prompt` is `None` when the provider sent none — never a synthesized
+    /// empty string.
+    #[test]
+    fn subagent_started_without_a_prompt_decodes_to_none() {
+        let json = r#"{
+            "type":"subagentStarted",
+            "taskId":"task-1",
+            "toolUseId":"toolu_01",
+            "agentType":"Explore",
+            "description":"Find the config loader"
+        }"#;
+        let ev: AgentEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            ev,
+            AgentEvent::SubagentStarted {
+                task_id: "task-1".into(),
+                tool_use_id: "toolu_01".into(),
+                agent_type: "Explore".into(),
+                description: "Find the config loader".into(),
+                prompt: None,
+            }
+        );
+    }
+
+    #[test]
+    fn subagent_updated_round_trips() {
+        let ev = AgentEvent::SubagentUpdated {
+            task_id: "task-1".into(),
+            status: SubagentStatus::Completed,
+            activity: Some("Reading README.md".into()),
+            summary: Some("The first heading is \"Comet\".".into()),
+            total_tokens: Some(1_204),
+            duration_ms: Some(8_431),
+            tool_uses: Some(3),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    /// Every optional field absent decodes to all-`None` rather than erroring —
+    /// nothing on the wire promises a `task_progress` before a
+    /// `task_notification`, so a bare status update is legal.
+    #[test]
+    fn subagent_updated_with_every_optional_absent_decodes_to_all_none() {
+        let json = r#"{"type":"subagentUpdated","taskId":"task-1","status":"running"}"#;
+        let ev: AgentEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            ev,
+            AgentEvent::SubagentUpdated {
+                task_id: "task-1".into(),
+                status: SubagentStatus::Running,
+                activity: None,
+                summary: None,
+                total_tokens: None,
+                duration_ms: None,
+                tool_uses: None,
+            }
+        );
+    }
+
+    /// An extra key a future build adds must not fail this decode — the same
+    /// forward-compat contract every other `AgentEvent` variant honors.
+    #[test]
+    fn subagent_updated_with_an_unknown_extra_key_still_decodes() {
+        let json = r#"{
+            "type":"subagentUpdated",
+            "taskId":"task-1",
+            "status":"failed",
+            "fromAFutureBuild":"ignore me"
+        }"#;
+        let ev: AgentEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            ev,
+            AgentEvent::SubagentUpdated {
+                task_id: "task-1".into(),
+                status: SubagentStatus::Failed,
+                activity: None,
+                summary: None,
+                total_tokens: None,
+                duration_ms: None,
+                tool_uses: None,
+            }
+        );
+    }
+
+    #[test]
+    fn subagent_status_round_trips_camel_case() {
+        for (status, wire) in [
+            (SubagentStatus::Running, "\"running\""),
+            (SubagentStatus::Completed, "\"completed\""),
+            (SubagentStatus::Failed, "\"failed\""),
+            (SubagentStatus::Cancelled, "\"cancelled\""),
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, wire);
+            assert_eq!(
+                serde_json::from_str::<SubagentStatus>(&json).unwrap(),
+                status
+            );
+        }
     }
 }

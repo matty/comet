@@ -758,6 +758,7 @@ fn corpus_inventory_reports_the_exact_pending_manifest_set() {
             "claude-routine-frame-fixture",
             "claude-routine-frame-ignore-list",
             "claude-routine-frame-integration",
+            "claude-tool-use-result-present",
             "codex-model-cwd-invariance",
             "codex-model-effort-objects",
             "codex-model-fixture-shape",

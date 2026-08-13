@@ -6,8 +6,8 @@
 use serde::{Deserialize, Serialize};
 
 use comet_proto::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, NoticeKind, NoticeSeverity, ToolCall,
-    UserInputQuestion,
+    AgentEvent, ApprovalDecision, ApprovalRequest, NoticeKind, NoticeSeverity, SubagentStatus,
+    ToolCall, UserInputQuestion,
 };
 
 use crate::constants::MSG_INLINE_MAX;
@@ -86,6 +86,36 @@ pub enum MessagePart {
         #[serde(default = "one")]
         occurrences: u32,
     },
+    /// A subagent this run delegated to (Claude-only; see
+    /// `AgentEvent::SubagentStarted`'s own doc for why). One card per
+    /// `task_id` — a `SendMessage`-resumed agent's second `task_started`
+    /// refreshes this part in place rather than adding a second card,
+    /// matching how `SubagentUpdated` itself is applied.
+    #[serde(rename_all = "camelCase")]
+    Subagent {
+        id: String,
+        /// The DURABLE identity and the only field a `SubagentUpdated`
+        /// matches against — never `tool_use_id`, which changes across a
+        /// resume (see `AgentEvent::SubagentStarted`'s own doc).
+        task_id: String,
+        agent_type: String,
+        description: String,
+        status: SubagentStatus,
+        /// The live activity line. `None` until the first `task_progress`.
+        #[serde(default)]
+        activity: Option<String>,
+        /// The child's answer, on completion only.
+        #[serde(default)]
+        summary: Option<String>,
+        /// `None` is "not reported yet", never zero — see `total_tokens` on
+        /// `AgentEvent::SubagentUpdated`.
+        #[serde(default)]
+        total_tokens: Option<u64>,
+        #[serde(default)]
+        duration_ms: Option<u64>,
+        #[serde(default)]
+        tool_uses: Option<u32>,
+    },
 }
 
 impl MessagePart {
@@ -96,7 +126,8 @@ impl MessagePart {
             | MessagePart::Input { id, .. }
             | MessagePart::Approval { id, .. }
             | MessagePart::Error { id, .. }
-            | MessagePart::Notice { id, .. } => id,
+            | MessagePart::Notice { id, .. }
+            | MessagePart::Subagent { id, .. } => id,
         }
     }
 
@@ -114,6 +145,18 @@ impl MessagePart {
             MessagePart::Notice {
                 summary, detail, ..
             } => summary.len() + detail.as_deref().map_or(0, str::len),
+            MessagePart::Subagent {
+                agent_type,
+                description,
+                activity,
+                summary,
+                ..
+            } => {
+                agent_type.len()
+                    + description.len()
+                    + activity.as_deref().map_or(0, str::len)
+                    + summary.as_deref().map_or(0, str::len)
+            }
         }
     }
 }
@@ -306,6 +349,124 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     key: key.clone(),
                     occurrences: 1,
                 });
+            }
+        }
+        AgentEvent::SubagentStarted {
+            task_id,
+            agent_type,
+            description,
+            // `tool_use_id` is kept on the event for the journal and a later
+            // slice's child-transcript render, never as a match key here —
+            // see `task_id`'s own doc on `MessagePart::Subagent`. `prompt` is
+            // capped provider prose that must not enter the persisted
+            // transcript, the same policy `sanitize_tool_call` applies to a
+            // tool's write content.
+            ..
+        } => {
+            let mut found = false;
+            for p in out.iter_mut() {
+                if let MessagePart::Subagent {
+                    task_id: tid,
+                    agent_type: a,
+                    description: d,
+                    status,
+                    activity,
+                    summary,
+                    total_tokens,
+                    duration_ms,
+                    tool_uses,
+                    ..
+                } = p
+                    && tid == task_id
+                {
+                    found = true;
+                    // A `SendMessage`-resumed agent fires a second
+                    // `task_started` for the SAME task_id under a NEW
+                    // `tool_use_id` (Task 3's `normalize.rs`,
+                    // `subagent_progress.remove(&f.task_id)` on this same
+                    // event). Refresh the identity fields from the new
+                    // invocation and reset the progress fields to their
+                    // just-started values — carrying the prior run's
+                    // terminal reading forward would show a finished card
+                    // the instant the resumed run starts.
+                    *a = agent_type.clone();
+                    *d = description.clone();
+                    *status = SubagentStatus::Running;
+                    *activity = None;
+                    *summary = None;
+                    *total_tokens = None;
+                    *duration_ms = None;
+                    *tool_uses = None;
+                }
+            }
+            if !found {
+                out.push(MessagePart::Subagent {
+                    id: format!("sub-{task_id}"),
+                    task_id: task_id.clone(),
+                    agent_type: agent_type.clone(),
+                    description: description.clone(),
+                    status: SubagentStatus::Running,
+                    activity: None,
+                    summary: None,
+                    total_tokens: None,
+                    duration_ms: None,
+                    tool_uses: None,
+                });
+            }
+        }
+        AgentEvent::SubagentUpdated {
+            task_id,
+            status: new_status,
+            activity: new_activity,
+            summary: new_summary,
+            total_tokens: new_total_tokens,
+            duration_ms: new_duration_ms,
+            tool_uses: new_tool_uses,
+        } => {
+            // Matched by `task_id`, never `tool_use_id`: a resumed
+            // invocation's updates must land on the SAME card that
+            // `SubagentStarted` refreshed above, not spawn a second one keyed
+            // on the new tool call. An update for a `task_id` this
+            // accumulator never saw (a lost `task_started`) is dropped, not
+            // appended — a headless card with no description or agent_type
+            // would be worse than no card.
+            for p in out.iter_mut() {
+                if let MessagePart::Subagent {
+                    task_id: tid,
+                    status,
+                    activity,
+                    summary,
+                    total_tokens,
+                    duration_ms,
+                    tool_uses,
+                    ..
+                } = p
+                    && tid == task_id
+                {
+                    *status = *new_status;
+                    // DECISION (constraint 6): `task_updated` carries a
+                    // PARTIAL patch (Task 3) — an absent field means "this
+                    // frame said nothing about it", never "clear what an
+                    // earlier frame reported". Assigning `None` straight
+                    // through would silently discard a token count the
+                    // instant a later status-only frame arrived, on every
+                    // real run — see `.agents/rules/optional-wire-fields.md`.
+                    if new_activity.is_some() {
+                        *activity = new_activity.clone();
+                    }
+                    if new_summary.is_some() {
+                        *summary = new_summary.clone();
+                    }
+                    if new_total_tokens.is_some() {
+                        *total_tokens = *new_total_tokens;
+                    }
+                    if new_duration_ms.is_some() {
+                        *duration_ms = *new_duration_ms;
+                    }
+                    if new_tool_uses.is_some() {
+                        *tool_uses = *new_tool_uses;
+                    }
+                }
             }
         }
         AgentEvent::AssistantMessageCompleted { .. }
@@ -899,5 +1060,266 @@ mod tests {
             },
         );
         assert!(empty.is_empty());
+    }
+
+    fn subagent_started(task_id: &str, tool_use_id: &str, prompt: Option<&str>) -> AgentEvent {
+        AgentEvent::SubagentStarted {
+            task_id: task_id.into(),
+            tool_use_id: tool_use_id.into(),
+            agent_type: "general-purpose".into(),
+            description: "Read README and report first heading".into(),
+            prompt: prompt.map(str::to_owned),
+        }
+    }
+
+    fn subagent_updated(
+        task_id: &str,
+        status: SubagentStatus,
+        activity: Option<&str>,
+        summary: Option<&str>,
+        total_tokens: Option<u64>,
+        duration_ms: Option<u64>,
+        tool_uses: Option<u32>,
+    ) -> AgentEvent {
+        AgentEvent::SubagentUpdated {
+            task_id: task_id.into(),
+            status,
+            activity: activity.map(str::to_owned),
+            summary: summary.map(str::to_owned),
+            total_tokens,
+            duration_ms,
+            tool_uses,
+        }
+    }
+
+    /// `SubagentStarted` pushes a card, and a `SubagentUpdated` for the same
+    /// `task_id` refreshes it in place rather than adding a second one.
+    #[test]
+    fn subagent_started_then_updated_collapses_to_one_part() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(&mut parts, &subagent_started("t1", "tu1", Some("p")));
+        fold_event_into_parts(
+            &mut parts,
+            &subagent_updated(
+                "t1",
+                SubagentStatus::Running,
+                Some("Reading README.md"),
+                None,
+                Some(100),
+                Some(50),
+                Some(1),
+            ),
+        );
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        match &parts[0] {
+            MessagePart::Subagent {
+                task_id,
+                agent_type,
+                description,
+                status,
+                activity,
+                total_tokens,
+                duration_ms,
+                tool_uses,
+                ..
+            } => {
+                assert_eq!(task_id, "t1");
+                assert_eq!(agent_type, "general-purpose");
+                assert_eq!(description, "Read README and report first heading");
+                assert_eq!(*status, SubagentStatus::Running);
+                assert_eq!(activity.as_deref(), Some("Reading README.md"));
+                assert_eq!(*total_tokens, Some(100));
+                assert_eq!(*duration_ms, Some(50));
+                assert_eq!(*tool_uses, Some(1));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// A lost `task_started` must not let its `SubagentUpdated` fabricate a
+    /// headless card — no description, no agent_type, nothing to show.
+    #[test]
+    fn subagent_update_for_unknown_task_id_is_dropped() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &subagent_updated(
+                "ghost",
+                SubagentStatus::Running,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        );
+        assert!(parts.is_empty(), "{parts:?}");
+    }
+
+    /// Capped provider prose from `SubagentStarted.prompt` must never reach
+    /// the persisted transcript — the same policy `sanitize_tool_call`
+    /// applies to a tool's write content.
+    #[test]
+    fn subagent_part_never_carries_the_prompt() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &subagent_started("t1", "tu1", Some("a very specific secret prompt")),
+        );
+        let json = serde_json::to_string(&parts[0]).unwrap();
+        assert!(!json.contains("secret prompt"), "{json}");
+        assert!(!json.contains("\"prompt\""), "{json}");
+    }
+
+    /// DECISION (constraint 6, pinned): a `SubagentUpdated` whose fields are
+    /// `None` leaves the part's existing reading alone — `None` means "this
+    /// frame said nothing", never "clear it". A status-only `task_updated`
+    /// arriving after a `task_progress` already reported usage must not wipe
+    /// that usage back to unknown.
+    #[test]
+    fn subagent_update_with_none_fields_preserves_prior_values() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(&mut parts, &subagent_started("t1", "tu1", None));
+        fold_event_into_parts(
+            &mut parts,
+            &subagent_updated(
+                "t1",
+                SubagentStatus::Running,
+                Some("Reading README.md"),
+                None,
+                Some(19_215),
+                Some(2_906),
+                Some(1),
+            ),
+        );
+        // A status-only task_updated: every other field None on the wire.
+        fold_event_into_parts(
+            &mut parts,
+            &subagent_updated(
+                "t1",
+                SubagentStatus::Completed,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        );
+        match &parts[0] {
+            MessagePart::Subagent {
+                status,
+                activity,
+                total_tokens,
+                duration_ms,
+                tool_uses,
+                ..
+            } => {
+                assert_eq!(*status, SubagentStatus::Completed);
+                assert_eq!(
+                    activity.as_deref(),
+                    Some("Reading README.md"),
+                    "an unreported activity must keep the earlier reading"
+                );
+                assert_eq!(*total_tokens, Some(19_215));
+                assert_eq!(*duration_ms, Some(2_906));
+                assert_eq!(*tool_uses, Some(1));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// The resume falsification probe (task-3's own resume scenario, replayed
+    /// at the fold level): a `SendMessage`-resumed agent fires a SECOND
+    /// `SubagentStarted` for the SAME `task_id` under a NEW `tool_use_id`,
+    /// followed by that invocation's OWN terminal `SubagentUpdated`. The
+    /// whole sequence must still collapse to ONE card — matching by
+    /// `tool_use_id` anywhere in this path would leave two.
+    #[test]
+    fn a_resumed_subagent_collapses_to_one_card() {
+        let mut parts = Vec::new();
+        // First invocation.
+        fold_event_into_parts(
+            &mut parts,
+            &subagent_started(
+                "task-1",
+                "tool-a",
+                Some("Read the README.md file in the current directory."),
+            ),
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &subagent_updated(
+                "task-1",
+                SubagentStatus::Running,
+                Some("Reading README.md"),
+                None,
+                Some(19_215),
+                Some(2_906),
+                Some(1),
+            ),
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &subagent_updated(
+                "task-1",
+                SubagentStatus::Completed,
+                None,
+                Some("Sandbox"),
+                Some(20_044),
+                Some(4_906),
+                Some(1),
+            ),
+        );
+        assert_eq!(parts.len(), 1, "{parts:?}");
+
+        // Resumed invocation: same task_id, new tool_use_id, new prompt.
+        fold_event_into_parts(
+            &mut parts,
+            &subagent_started(
+                "task-1",
+                "tool-b",
+                Some("What was the first heading you found?"),
+            ),
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &subagent_updated(
+                "task-1",
+                SubagentStatus::Completed,
+                None,
+                Some("The first heading is **Sandbox**."),
+                Some(19_111),
+                Some(2_186),
+                Some(0),
+            ),
+        );
+
+        assert_eq!(
+            parts.len(),
+            1,
+            "the resumed invocation must land on the SAME card: {parts:?}"
+        );
+        match &parts[0] {
+            MessagePart::Subagent {
+                task_id,
+                status,
+                summary,
+                total_tokens,
+                duration_ms,
+                tool_uses,
+                ..
+            } => {
+                assert_eq!(task_id, "task-1");
+                assert_eq!(*status, SubagentStatus::Completed);
+                assert_eq!(
+                    summary.as_deref(),
+                    Some("The first heading is **Sandbox**.")
+                );
+                assert_eq!(*total_tokens, Some(19_111));
+                assert_eq!(*duration_ms, Some(2_186));
+                assert_eq!(*tool_uses, Some(0));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
