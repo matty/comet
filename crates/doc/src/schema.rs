@@ -2352,6 +2352,60 @@ mod tests {
         doc.validate_strict().unwrap();
     }
 
+    /// **The whole justification for keeping `ToolCall::Todo` after slice 4.3
+    /// stopped producing it.**
+    ///
+    /// Nothing writes a `{"kind":"todo"}` call any more, but documents written
+    /// before then hold them, and `from_doc_part` degrades a `tool` part whose
+    /// `call` will not decode into an EMPTY TEXT PART. So deleting the variant
+    /// would not fail loudly — it would silently blank the chip in every
+    /// historical transcript, with nothing to notice.
+    ///
+    /// Asserted against literal stored JSON rather than a round trip through
+    /// the Rust type, because a round trip is exactly what would keep passing
+    /// if the persisted spelling drifted.
+    #[test]
+    fn a_persisted_todo_tool_part_still_decodes() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let row = doc
+            .doc()
+            .get_list("messages")
+            .push_container(LoroMap::new())
+            .unwrap();
+        row.insert("id", "m1").unwrap();
+        row.insert("role", "assistant").unwrap();
+        row.insert("createdAt", 1i64).unwrap();
+        row.insert("deviceId", "dev-a").unwrap();
+        let parts = row.insert_container("parts", LoroList::new()).unwrap();
+        let part = parts.push_container(LoroMap::new()).unwrap();
+        part.insert("id", "t1").unwrap();
+        part.insert("kind", "tool").unwrap();
+        part.insert(
+            "call",
+            loro_value_from_json(&serde_json::json!({
+                "kind": "todo",
+                "items": [
+                    {"text": "Read the file", "done": true},
+                    {"text": "Count the lines", "done": false},
+                ],
+            })),
+        )
+        .unwrap();
+        doc.doc().commit();
+
+        let parts = doc.read_entries().unwrap()[0].parts.clone();
+        let MessagePart::Tool { call, .. } = &parts[0] else {
+            panic!("a historical todo part must stay a Tool, got {parts:?}");
+        };
+        let comet_proto::ToolCall::Todo { items } = call else {
+            panic!("expected a Todo call, got {call:?}");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, "Read the file");
+        assert!(items[0].done);
+        assert!(!items[1].done);
+    }
+
     /// A `total_tokens` above `i64::MAX` used to be cast with `as i64`, which
     /// wraps to negative — and the persisted map then failed to deserialize
     /// back into the `Option<u64>` field, taking the WHOLE ENTRY down, not

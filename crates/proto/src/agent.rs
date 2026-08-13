@@ -1070,6 +1070,22 @@ pub enum ToolCall {
     WebSearch {
         query: String,
     },
+    /// **DECODE-ONLY as of slice 4.3. Nothing constructs this any more.**
+    ///
+    /// Do not delete it as dead code. Documents written before 4.3 hold
+    /// `{"kind":"todo"}` tool parts, and `comet_doc`'s `from_doc_part`
+    /// degrades a `tool` part whose `call` will not decode into an **empty
+    /// text part** — so removing this variant would silently blank the chip in
+    /// every historical transcript, with no error anywhere and nothing to
+    /// notice. `a_persisted_todo_tool_part_still_decodes` in `crates/doc`
+    /// pins exactly that.
+    ///
+    /// A live plan is now [`AgentEvent::ChecklistReplaced`] /
+    /// [`AgentEvent::ChecklistItemChanged`] folded into
+    /// `MessagePart::Checklist`, because `TodoItem { text, done: bool }`
+    /// cannot express `inProgress` — the one state a live checklist exists to
+    /// show. The tools that drive it (`TodoWrite`, `TaskCreate`, `TaskUpdate`)
+    /// still render as ordinary tool chips through [`ToolCall::Unknown`].
     Todo {
         #[serde(default)]
         items: Vec<TodoItem>,
