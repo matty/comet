@@ -106,6 +106,10 @@ pub(crate) const IGNORED_FRAMES: &[(&str, &str)] = &[
     ("system/hook_response", "4.2"), // ★
     ("system/commands_changed", "2.4"),
     ("system/permission_denied", "phase-1"),
+    // Carries the live background-task set, but that set is fully derivable
+    // from the task_* events the normalizer already emits, so no surface
+    // needs this frame's copy of it.
+    ("system/background_tasks_changed", "redundant"), // ★ twice per subagent run
     // Memory-feature chatter; fires routinely for memory-enabled users. No
     // planned slice owns a memory surface — the reason names that product
     // fact, not a deferral; whoever builds one claims this entry.
@@ -667,6 +671,10 @@ mod tests {
             (
                 r#"{"type":"system","subtype":"hook_response","hook":"SessionStart"}"#,
                 "4.2",
+            ),
+            (
+                r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#,
+                "redundant",
             ),
         ] {
             match parse_frame(raw).expect("parses") {
