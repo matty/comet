@@ -45,7 +45,6 @@ use comet_proto::{
 };
 use comet_rpc::methods;
 
-use crate::markdown::highlight::{Lang, LineCarry, lang_for_tag, tokenize_line};
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
 use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
@@ -53,6 +52,7 @@ use crate::motion::{self, AnimationExt as _, RESIZE};
 use crate::state::AppState;
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
+use comet_syntax::LanguageId as Lang;
 
 // ---------------------------------------------------------------------------
 // Constants (mugen ports)
@@ -1318,42 +1318,49 @@ fn highlight_document(
     code: &str,
     cancellation: &AtomicUsize,
 ) -> Option<comet_syntax::HighlightedDocument> {
-    if comet_syntax::supports_language(lang) {
-        // Rust is the only bundled grammar at this checkpoint; unbundled
-        // languages take the local plain-token fallback below.
-        return comet_syntax::highlight_with_limits(
-            comet_syntax::HighlightRequest {
-                source: code,
-                path: None,
-                fence_tag: Some("rust"),
-            },
-            comet_syntax::HighlightLimits::default(),
-            Some(cancellation),
-        )
-        .ok();
+    comet_syntax::highlight_with_limits(
+        comet_syntax::HighlightRequest {
+            source: code,
+            path: None,
+            fence_tag: Some(language_alias(lang)),
+        },
+        comet_syntax::HighlightLimits::default(),
+        Some(cancellation),
+    )
+    .ok()
+}
+
+fn language_alias(language: Lang) -> &'static str {
+    match language {
+        Lang::Rust => "rust",
+        Lang::JavaScript => "javascript",
+        Lang::Jsx => "jsx",
+        Lang::TypeScript => "typescript",
+        Lang::Tsx => "tsx",
+        Lang::Python => "python",
+        Lang::Go => "go",
+        Lang::Json => "json",
+        Lang::Jsonc => "jsonc",
+        Lang::Bash => "bash",
+        Lang::Toml => "toml",
+        Lang::Markdown => "markdown",
+        Lang::Html => "html",
+        Lang::Css => "css",
+        Lang::Yaml => "yaml",
+        Lang::C => "c",
+        Lang::Cpp => "cpp",
+        Lang::CSharp => "csharp",
+        Lang::Java => "java",
+        Lang::Kotlin => "kotlin",
+        Lang::Swift => "swift",
+        Lang::Ruby => "ruby",
+        Lang::Php => "php",
+        Lang::Sql => "sql",
+        Lang::Lua => "lua",
+        Lang::Dockerfile => "dockerfile",
+        Lang::Nix => "nix",
+        Lang::Make => "make",
     }
-    let mut carry = LineCarry::None;
-    let mut lines = Vec::new();
-    for line in code.split('\n') {
-        if cancellation.load(Ordering::Relaxed) != 0 {
-            return None;
-        }
-        let (tokens, next) = tokenize_line(lang, line, carry);
-        carry = next;
-        lines.push(
-            tokens
-                .into_iter()
-                .map(|token| comet_syntax::HighlightSpan {
-                    range: token.range,
-                    kind: token.class.into(),
-                })
-                .collect(),
-        );
-    }
-    Some(comet_syntax::HighlightedDocument {
-        language: lang,
-        lines,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2027,7 +2034,7 @@ impl Transcript {
         diff: &ToolDiff,
         cx: &mut Context<Self>,
     ) -> Option<Arc<crate::changes::DiffHighlights>> {
-        let lang = crate::changes::lang_for_path(&diff.path)?;
+        let lang = comet_syntax::language_for_path(&diff.path)?;
         let old = diff.old_text.as_deref().and_then(|source| {
             self.highlights
                 .request(row_id.clone(), tool_ix * 2, lang, source, cx)
@@ -2582,7 +2589,9 @@ impl Transcript {
                 continue;
             }
             if let Block::CodeBlock { language, code } = &top.block
-                && let Some(lang) = language.as_deref().and_then(lang_for_tag)
+                && let Some(lang) = language
+                    .as_deref()
+                    .and_then(comet_syntax::language_for_alias)
             {
                 out.insert(
                     ix,
@@ -3596,6 +3605,18 @@ mod tests {
         let cancellation = std::sync::atomic::AtomicUsize::new(1);
         let source = "fn cancelled() {}\n".repeat(2_048);
         assert_eq!(highlight_document(Lang::Rust, &source, &cancellation), None);
+    }
+
+    #[test]
+    fn background_tree_sitter_highlighting_uses_the_requested_language() {
+        let cancellation = std::sync::atomic::AtomicUsize::new(0);
+        let document = highlight_document(
+            Lang::Python,
+            "def answer():\n    return 42\n",
+            &cancellation,
+        )
+        .expect("python highlighting");
+        assert_eq!(document.language, Lang::Python);
     }
 
     /// `byte_len` sees only `description`/`activity`/`summary` text, so a

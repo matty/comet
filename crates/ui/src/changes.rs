@@ -31,11 +31,11 @@ use gpui::{
 use comet_proto::{Chat, CheckoutDiff};
 use comet_rpc::methods;
 
-use crate::markdown::highlight::Lang;
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
 use crate::state::{AppState, ServerClient};
 use crate::theme::Theme;
+use comet_syntax::LanguageId as Lang;
 
 // ---------------------------------------------------------------------------
 // Layout numbers (analytic — they drive the fold tween)
@@ -594,11 +594,6 @@ pub fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value)
             false
         }
     }
-}
-
-/// Language for a file path's extension (drives per-line highlighting).
-pub fn lang_for_path(path: &str) -> Option<Lang> {
-    comet_syntax::language_for_path(path)
 }
 
 fn hash64(parts: &[&str]) -> u64 {
@@ -1254,7 +1249,7 @@ impl Changes {
         parsed_key: &str,
         cx: &mut Context<Self>,
     ) -> Option<Arc<DiffHighlights>> {
-        let lang = lang_for_path(&file.path)?;
+        let lang = comet_syntax::language_for_path(&file.path)?;
         let fingerprint = hash64(&[parsed_key, &file.path]);
         if let Some(slot) = self.highlights.get(&file.path)
             && slot.fingerprint == fingerprint
@@ -2374,16 +2369,6 @@ rename to new_name.rs
             serde_json::json!({"nope": true})
         ));
         assert_eq!(diffs[0].checkout_id, "co-2");
-    }
-
-    #[test]
-    fn langs_resolve_from_paths() {
-        assert_eq!(lang_for_path("src/main.rs"), Some(Lang::Rust));
-        assert_eq!(lang_for_path("a/b/app.tsx"), Some(Lang::Tsx));
-        assert_eq!(lang_for_path("Cargo.toml"), Some(Lang::Toml));
-        assert_eq!(lang_for_path("script.sh"), Some(Lang::Bash));
-        assert_eq!(lang_for_path("README"), None);
-        assert_eq!(lang_for_path("img.png"), None);
     }
 
     #[test]
