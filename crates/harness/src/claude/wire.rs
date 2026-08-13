@@ -106,9 +106,10 @@ pub(crate) const IGNORED_FRAMES: &[(&str, &str)] = &[
     ("system/hook_response", "4.2"), // ★
     ("system/commands_changed", "2.4"),
     ("system/permission_denied", "phase-1"),
-    // Carries the live background-task set, but that set is fully derivable
-    // from the task_* events the normalizer already emits, so no surface
-    // needs this frame's copy of it.
+    // Carries the live background-task set, but every task_type this frame
+    // has been observed to carry (local_agent) is also fully derivable from
+    // the task_* events the normalizer already emits, so no surface needs
+    // this frame's copy of it.
     ("system/background_tasks_changed", "redundant"), // ★ twice per subagent run
     // Memory-feature chatter; fires routinely for memory-enabled users. No
     // planned slice owns a memory surface — the reason names that product

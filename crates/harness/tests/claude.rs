@@ -638,8 +638,9 @@ async fn unclaimed_frames_surface_as_diagnostics_and_ignored_frames_stay_silent(
             assert!(!summary.contains("do-not-carry"), "{summary}");
         }
     }
-    // The capture-confirmed Ignored tier (status and the hook pair) produced nothing, no
-    // Error fired, and the run still ends cleanly.
+    // The capture-confirmed Ignored tier (status, the hook pair, and
+    // background_tasks_changed) produced nothing, no Error fired, and the
+    // run still ends cleanly.
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
     assert!(
         events

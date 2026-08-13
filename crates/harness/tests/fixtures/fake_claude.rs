@@ -755,6 +755,9 @@ fn diagnostics() {
     emit(
         r#"{"type":"system","subtype":"hook_response","hook":"SessionStart","session_id":"sess-d"}"#,
     );
+    emit(
+        r#"{"type":"system","subtype":"background_tasks_changed","tasks":[],"session_id":"sess-d"}"#,
+    );
     // Unknown tier: an unclaimed system subtype and an unknown top-level type.
     emit(
         r#"{"type":"system","subtype":"someFutureSubtype","payload":"do-not-carry","session_id":"sess-d"}"#,
