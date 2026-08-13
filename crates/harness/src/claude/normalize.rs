@@ -156,18 +156,41 @@ struct SubagentSnapshot {
     duration_ms: Option<u64>,
 }
 
+/// Whether a status is a resting state — nothing further changes it. Used
+/// only to decide whether a second terminal reading should reopen a
+/// resolved card; not exported, since nothing outside this dedupe cares.
+fn is_terminal(status: SubagentStatus) -> bool {
+    matches!(
+        status,
+        SubagentStatus::Completed | SubagentStatus::Failed | SubagentStatus::Cancelled
+    )
+}
+
+/// The subagent fields recoverable from the `Agent` tool's own
+/// `tool_use_result`, with `status` still the RAW wire string. Resolving it
+/// to a [`SubagentStatus`] needs `&self` (to carry forward a prior reading
+/// when this particular frame reports none), which a free function doesn't
+/// have — see [`Normalizer::status_or_carry_forward`].
+struct SubagentToolResult {
+    task_id: String,
+    status: Option<String>,
+    summary: Option<String>,
+    total_tokens: Option<u64>,
+    tool_uses: Option<u32>,
+    duration_ms: Option<u64>,
+}
+
 /// Sniff the `Agent` tool's own `tool_use_result` for a subagent record, keyed
 /// by `agentId` (== `task_id`). Shape-based rather than name-tracked: `agentId`
 /// alongside `status` is specific to an `Agent` result, so an ordinary tool's
 /// result (`Bash`'s `stdout`, `Write`'s diff, …) never matches. Returns `None`
 /// for anything that isn't one.
-fn subagent_result_from_tool_use_result(value: &Value) -> Option<(String, SubagentSnapshot)> {
+fn subagent_result_from_tool_use_result(value: &Value) -> Option<SubagentToolResult> {
     let task_id = value.get("agentId").and_then(Value::as_str)?.to_owned();
     let status = value
         .get("status")
         .and_then(Value::as_str)
-        .map(subagent_status)
-        .unwrap_or(SubagentStatus::Running);
+        .map(str::to_owned);
     let summary = value
         .get("content")
         .and_then(Value::as_array)
@@ -186,17 +209,14 @@ fn subagent_result_from_tool_use_result(value: &Value) -> Option<(String, Subage
         .get("totalToolUseCount")
         .and_then(Value::as_u64)
         .map(|n| n as u32);
-    Some((
+    Some(SubagentToolResult {
         task_id,
-        SubagentSnapshot {
-            status,
-            activity: None,
-            summary,
-            total_tokens,
-            tool_uses,
-            duration_ms,
-        },
-    ))
+        status,
+        summary,
+        total_tokens,
+        tool_uses,
+        duration_ms,
+    })
 }
 
 /// Decode a Claude `tool_use` block (name + input) into a typed [`ToolCall`].
@@ -385,20 +405,47 @@ impl Normalizer {
         }
     }
 
-    /// Emit a `SubagentUpdated` for `task_id`, unless `snapshot` is identical
-    /// to the last one emitted for the same id — the material-transition
-    /// filter. Also the mechanism behind the `tool_use_result` fallback:
-    /// when `task_notification` already reported this exact terminal state,
-    /// the fallback's candidate snapshot matches and is silently absorbed
-    /// rather than needing a second, separate "did we already resolve this"
-    /// check.
+    /// The status for a frame that may not report one: the previously known
+    /// status for this `task_id` when we have one, `Running` otherwise (the
+    /// only sane default for a `task_id` normalize has never seen). Never
+    /// `Running` as a blind fallback — a status-less frame arriving after a
+    /// terminal reading must not resurrect a finished card. This is exactly
+    /// `.agents/rules/optional-wire-fields.md`: an absent field is "unknown",
+    /// and "unknown" here means "whatever we already knew", not "restarted".
+    fn status_or_carry_forward(&self, task_id: &str, raw: Option<&str>) -> SubagentStatus {
+        match raw {
+            Some(s) => subagent_status(s),
+            None => self
+                .subagent_progress
+                .get(task_id)
+                .map(|snapshot| snapshot.status)
+                .unwrap_or(SubagentStatus::Running),
+        }
+    }
+
+    /// Emit a `SubagentUpdated` for `task_id`, unless either: (a) `snapshot`
+    /// is identical to the last one emitted for the same id — the
+    /// material-transition filter — or (b) BOTH the stored reading and the
+    /// new one are terminal. (b) is what actually makes the `tool_use_result`
+    /// fallback safe: on real captures the notification's task-tracking usage
+    /// and the tool result's own model-turn usage differ by a handful of
+    /// tokens/ms, so they are never snapshot-equal, and without this guard
+    /// every ordinary subagent completion would emit a second, barely-
+    /// different terminal update. Once a task_id has a terminal reading, a
+    /// second terminal reading (regardless of source or exact numbers) is
+    /// dropped outright — the first terminal reading wins.
     fn emit_subagent_update(
         &mut self,
         task_id: String,
         snapshot: SubagentSnapshot,
     ) -> Vec<AgentEvent> {
-        if self.subagent_progress.get(&task_id) == Some(&snapshot) {
-            return Vec::new();
+        if let Some(prior) = self.subagent_progress.get(&task_id) {
+            if prior == &snapshot {
+                return Vec::new();
+            }
+            if is_terminal(prior.status) && is_terminal(snapshot.status) {
+                return Vec::new();
+            }
         }
         let event = AgentEvent::SubagentUpdated {
             task_id: task_id.clone(),
@@ -442,12 +489,8 @@ impl Normalizer {
                 )
             }
             "task_updated" => {
-                let status = f
-                    .patch
-                    .and_then(|p| p.status)
-                    .as_deref()
-                    .map(subagent_status)
-                    .unwrap_or(SubagentStatus::Running);
+                let raw_status = f.patch.and_then(|p| p.status);
+                let status = self.status_or_carry_forward(&f.task_id, raw_status.as_deref());
                 self.emit_subagent_update(
                     f.task_id,
                     SubagentSnapshot {
@@ -462,11 +505,7 @@ impl Normalizer {
             }
             "task_notification" => {
                 let usage = f.usage.unwrap_or_default();
-                let status = f
-                    .status
-                    .as_deref()
-                    .map(subagent_status)
-                    .unwrap_or(SubagentStatus::Running);
+                let status = self.status_or_carry_forward(&f.task_id, f.status.as_deref());
                 self.emit_subagent_update(
                     f.task_id,
                     SubagentSnapshot {
@@ -591,14 +630,28 @@ impl Normalizer {
                 // The `Agent` tool's own result carries the whole subagent
                 // record on one frame — a fallback that resolves the card
                 // even if `task_notification` never arrived. Routed through
-                // the same dedupe as the live stream, so it is a no-op when
-                // that stream already reported this exact terminal state.
+                // the same dedupe as the live stream: on real captures its
+                // numbers differ slightly from the notification's (a
+                // task-tracking total vs. a model-turn total), so it is the
+                // terminal-vs-terminal guard in `emit_subagent_update` — not
+                // snapshot equality — that keeps this a no-op when the
+                // notification already resolved the card.
                 let fallback = f
                     .tool_use_result
                     .as_ref()
                     .and_then(subagent_result_from_tool_use_result);
-                if let Some((task_id, snapshot)) = fallback {
-                    out.extend(self.emit_subagent_update(task_id, snapshot));
+                if let Some(result) = fallback {
+                    let status =
+                        self.status_or_carry_forward(&result.task_id, result.status.as_deref());
+                    let snapshot = SubagentSnapshot {
+                        status,
+                        activity: None,
+                        summary: result.summary,
+                        total_tokens: result.total_tokens,
+                        tool_uses: result.tool_uses,
+                        duration_ms: result.duration_ms,
+                    };
+                    out.extend(self.emit_subagent_update(result.task_id, snapshot));
                 }
                 out
             }
@@ -1269,6 +1322,126 @@ mod tests {
         );
     }
 
+    /// A `task_updated` patch moving only `end_time` (no `status` key at
+    /// all) must NOT regress a card the notification already marked
+    /// `Completed` back to `Running`. `wire.rs`'s own doc comment on
+    /// `SubagentPatch::status` says the absent case must decode absent,
+    /// never collapse to a value — this is the normalizer honoring that one
+    /// layer up, per `.agents/rules/optional-wire-fields.md`.
+    #[test]
+    fn a_status_less_task_updated_carries_forward_the_prior_status() {
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+
+        let notification = r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"completed","summary":"done"}"#;
+        let frame = crate::claude::wire::parse_frame(notification).unwrap();
+        let first = normalizer.normalize(frame, false);
+        assert!(matches!(
+            &first[0],
+            AgentEvent::SubagentUpdated {
+                status: SubagentStatus::Completed,
+                ..
+            }
+        ));
+
+        // A patch that moves only end_time — status absent, not "running".
+        let status_less_update =
+            r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"end_time":123}}"#;
+        let frame = crate::claude::wire::parse_frame(status_less_update).unwrap();
+        let second = normalizer.normalize(frame, false);
+        // Carrying forward Completed means the candidate snapshot is
+        // terminal-vs-terminal against the stored one, so nothing emits —
+        // which is itself the point: the card must stay Completed, not
+        // silently become Running.
+        assert!(second.is_empty(), "{second:?}");
+    }
+
+    /// The same carry-forward, with no prior state at all: a `task_id`
+    /// normalize has never seen defaults to `Running`, the only sane answer.
+    #[test]
+    fn a_status_less_task_updated_with_no_prior_state_defaults_to_running() {
+        let raw =
+            r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"end_time":123}}"#;
+        assert!(matches!(
+            &normalize_one(raw)[0],
+            AgentEvent::SubagentUpdated {
+                status: SubagentStatus::Running,
+                ..
+            }
+        ));
+    }
+
+    /// A `task_notification` with no `status` field must carry forward too —
+    /// same rule, different subtype.
+    #[test]
+    fn a_status_less_task_notification_carries_forward_the_prior_status() {
+        // Starting from Running would not distinguish carry-forward from the
+        // old `unwrap_or(Running)` bug — both give the same answer from that
+        // starting point. Start from a TERMINAL prior reading instead, so
+        // the two implementations diverge: carry-forward stays Completed
+        // (and the terminal-vs-terminal guard then silences the repeat);
+        // `unwrap_or(Running)` would regress to Running and emit it.
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+
+        let notification = r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"completed","summary":"done"}"#;
+        let frame = crate::claude::wire::parse_frame(notification).unwrap();
+        let first = normalizer.normalize(frame, false);
+        assert!(matches!(
+            &first[0],
+            AgentEvent::SubagentUpdated {
+                status: SubagentStatus::Completed,
+                ..
+            }
+        ));
+
+        // A second notification reporting no status at all.
+        let status_less_notification =
+            r#"{"type":"system","subtype":"task_notification","task_id":"t1","summary":"partial"}"#;
+        let frame = crate::claude::wire::parse_frame(status_less_notification).unwrap();
+        let second = normalizer.normalize(frame, false);
+        assert!(
+            second.is_empty(),
+            "a status-less notification after Completed must carry Completed forward \
+             (and the terminal guard then silences it), not regress to Running: {second:?}"
+        );
+    }
+
+    /// A status-less `Agent` tool `tool_use_result` must carry forward too —
+    /// `Running` here would leave a genuinely finished card spinning forever,
+    /// since this frame only exists because the agent's turn ended.
+    #[test]
+    fn a_status_less_tool_use_result_carries_forward_the_prior_status() {
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+
+        let notification = r#"{"type":"system","subtype":"task_notification","task_id":"a6d1ae6c4fec0efe9","status":"completed","summary":"done"}"#;
+        let frame = crate::claude::wire::parse_frame(notification).unwrap();
+        let first = normalizer.normalize(frame, false);
+        assert!(matches!(
+            &first[0],
+            AgentEvent::SubagentUpdated {
+                status: SubagentStatus::Completed,
+                ..
+            }
+        ));
+
+        // No "status" key on this tool_use_result at all.
+        let tool_result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":[{"type":"text","text":"Sandbox"}]}]},"parent_tool_use_id":null,"tool_use_result":{"agentId":"a6d1ae6c4fec0efe9","agentType":"general-purpose","content":[{"type":"text","text":"Sandbox"}],"totalDurationMs":1,"totalTokens":1,"totalToolUseCount":1}}"#;
+        let frame = crate::claude::wire::parse_frame(tool_result).unwrap();
+        let second = normalizer.normalize(frame, false);
+        // Carried-forward Completed is terminal-vs-terminal against the
+        // stored Completed reading, so this is absorbed — the card must
+        // never be seen going back to Running.
+        assert!(
+            !second.iter().any(|e| matches!(
+                e,
+                AgentEvent::SubagentUpdated {
+                    status: SubagentStatus::Running,
+                    ..
+                }
+            )),
+            "{second:?}"
+        );
+    }
+
     #[test]
     fn task_notification_emits_a_terminal_update_with_summary_and_usage() {
         let raw = r#"{"type":"system","subtype":"task_notification","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","status":"completed","output_file":"C:\\tmp\\out","summary":"Sandbox","usage":{"total_tokens":20044,"tool_uses":1,"duration_ms":4906}}"#;
@@ -1428,12 +1601,19 @@ mod tests {
         );
     }
 
-    /// The fallback must not double up when `task_notification` already
-    /// resolved the same terminal state — same dedupe path as the
-    /// material-transition filter above, not a separate mechanism.
+    /// The fallback must not reopen a card `task_notification` already
+    /// resolved — but NOT via snapshot equality: on the real capture the
+    /// notification's task-tracking usage (`total_tokens: 20044,
+    /// duration_ms: 4906`, sequence 107 of run2-claude-subagent.jsonl) and
+    /// the Agent tool's own model-turn usage (`totalTokens: 20115,
+    /// totalDurationMs: 4907`, the very next frame) genuinely differ, so the
+    /// two snapshots are never `==`. It's the terminal-vs-terminal guard in
+    /// `emit_subagent_update` that suppresses this, which is why both
+    /// literal captured numbers are used here unaltered rather than a
+    /// synthetic pair chosen to match.
     #[test]
-    fn agent_tool_use_result_is_suppressed_when_notification_already_matched() {
-        let notification = r#"{"type":"system","subtype":"task_notification","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","status":"completed","summary":"Sandbox","usage":{"total_tokens":20115,"tool_uses":1,"duration_ms":4907}}"#;
+    fn agent_tool_use_result_does_not_reopen_a_card_the_notification_already_resolved() {
+        let notification = r#"{"type":"system","subtype":"task_notification","task_id":"a6d1ae6c4fec0efe9","tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","status":"completed","summary":"Sandbox","usage":{"total_tokens":20044,"tool_uses":1,"duration_ms":4906}}"#;
         let tool_result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01M553SNnGHZ1j4whxE9zWq9","type":"tool_result","content":[{"type":"text","text":"Sandbox"}]}]},"parent_tool_use_id":null,"tool_use_result":{"status":"completed","agentId":"a6d1ae6c4fec0efe9","agentType":"general-purpose","content":[{"type":"text","text":"Sandbox"}],"resolvedModel":"claude-haiku-4-5-20251001","totalDurationMs":4907,"totalTokens":20115,"totalToolUseCount":1}}"#;
 
         let mut normalizer = Normalizer::new(RuntimeMode::default());
@@ -1447,7 +1627,7 @@ mod tests {
             !second
                 .iter()
                 .any(|e| matches!(e, AgentEvent::SubagentUpdated { .. })),
-            "identical terminal state must not re-emit: {second:?}"
+            "a second terminal reading, even with different numbers, must not reopen the card: {second:?}"
         );
     }
 
