@@ -60,6 +60,7 @@ fn corpus_promoted_token_free_claims_are_valid() {
             "claude-routine-frame-fixture",
             "claude-routine-frame-ignore-list",
             "claude-routine-frame-integration",
+            "claude-tool-use-result-present",
             "codex-model-cwd-invariance",
             "codex-model-effort-objects",
             "codex-model-fixture-shape",

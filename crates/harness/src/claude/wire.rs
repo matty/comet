@@ -6,8 +6,9 @@
 //! and nothing vanishes silently (spec: docs/research/harness.md).
 //!
 //! Corpus claims: `claude-routine-frame-ignore-list`,
-//! `claude-approval-wire-fields`, `claude-attachment-block-order`, and
-//! `claude-attachment-block-order-test`.
+//! `claude-approval-wire-fields`, `claude-attachment-block-order`,
+//! `claude-attachment-block-order-test`, and
+//! `claude-tool-use-result-present`.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -207,6 +208,15 @@ pub(crate) struct MessageFrame {
     /// Terse assistant-level error code (`rate_limit`, `billing_error`, …).
     #[serde(default)]
     pub error: Option<String>,
+    /// On `user` frames: the tool's own result, already typed per tool
+    /// (`Bash` gets stdout/stderr, `Write` gets a diff, …). **Snake_case on
+    /// the wire** — the SDK's typings declare a camelCase `toolUseResult`
+    /// that does not appear here at all. Landed alone, with only its decode
+    /// test reading it; slice 4.2 task 3 is the first production consumer,
+    /// normalizing it per tool kind.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub tool_use_result: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -636,6 +646,31 @@ mod tests {
             panic!("expected a control request");
         };
         assert_eq!(req.request.description.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_user_frame_decodes_the_captured_tool_use_result() {
+        // Literal captured payload, per AGENTS.md: the SDK's typings declare
+        // camelCase toolUseResult, but the wire sends snake_case, and a
+        // hand-composed fixture would not catch the wrong spelling.
+        let line = corpus_payload("claude-tool-use-result-present");
+        let Frame::User(frame) = parse_frame(&line).unwrap() else {
+            panic!("expected a user frame");
+        };
+        let result = frame.tool_use_result.expect("captured frame has a result");
+        assert_eq!(result["stdout"], "capture");
+        assert_eq!(result["interrupted"], false);
+    }
+
+    #[test]
+    fn a_user_frame_without_tool_use_result_decodes_to_none() {
+        // The absent case, written by hand, per .agents/rules/optional-wire-fields.md.
+        let line =
+            r#"{"type":"user","message":{"role":"user","content":"hi"},"parent_tool_use_id":null}"#;
+        let Frame::User(frame) = parse_frame(line).unwrap() else {
+            panic!("expected a user frame");
+        };
+        assert_eq!(frame.tool_use_result, None);
     }
 
     #[test]
