@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 
 use comet_proto::{
-    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, RuntimeMode,
-    SubagentStatus, TodoItem, ToolCall,
+    AgentEvent, ChecklistItem, ChecklistStatus, DiagnosticSeverity, DoneStatus, HarnessId,
+    NoticeKind, NoticeSeverity, RuntimeMode, SubagentStatus, TodoItem, ToolCall,
 };
 use serde_json::Value;
 
@@ -244,6 +244,133 @@ fn subagent_result_from_tool_use_result(value: &Value) -> Option<SubagentToolRes
     })
 }
 
+/// Which task tool a held call was, so its result is read the right way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskCallKind {
+    Create,
+    Update,
+    List,
+}
+
+impl TaskCallKind {
+    fn from_tool_name(name: &str) -> Option<Self> {
+        match name {
+            "TaskCreate" => Some(Self::Create),
+            "TaskUpdate" => Some(Self::Update),
+            "TaskList" => Some(Self::List),
+            _ => None,
+        }
+    }
+}
+
+/// Claude's task statuses are snake_case on the wire (`in_progress`); the
+/// proto type is camelCase. Mapped by hand rather than through serde because
+/// the two spellings genuinely differ and a rename attribute would hide that
+/// from anyone reading either side.
+fn checklist_status_from_claude(raw: &str) -> ChecklistStatus {
+    match raw {
+        "pending" => ChecklistStatus::Pending,
+        "in_progress" => ChecklistStatus::InProgress,
+        "completed" => ChecklistStatus::Completed,
+        _ => ChecklistStatus::Unknown,
+    }
+}
+
+/// An id the CLI may send as a JSON string or a JSON number — `TaskCreate`
+/// answers `{"task":{"id":"1"}}` but nothing promises the quoting is stable,
+/// and a number silently read as absent would orphan every later update.
+fn id_field(value: &Value, key: &str) -> Option<String> {
+    match value.get(key) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Turn a held `Task*` call plus its result into a checklist event.
+///
+/// **Both halves are required and neither is redundant.** `activeForm` and the
+/// requested `status` appear ONLY on the tool input; `TaskCreate`'s assigned id
+/// and `TaskUpdate`'s confirmed `statusChange` appear ONLY on the result.
+/// Captured 2026-08-13 (`captures/2026-08-13-plan-todo-subagent.md`, §1 and §7)
+/// against Claude Code 2.1.229.
+fn checklist_event_from_task_call(
+    kind: TaskCallKind,
+    input: &Value,
+    result: &Value,
+) -> Option<AgentEvent> {
+    match kind {
+        TaskCallKind::Create => {
+            let task = result.get("task")?;
+            let item_id = id_field(task, "id")?;
+            Some(AgentEvent::ChecklistItemChanged {
+                item_id,
+                // The result echoes the subject; the input is the fallback for
+                // a build that stops echoing it.
+                text: opt_str_field(task, "subject").or_else(|| opt_str_field(input, "subject")),
+                active_form: opt_str_field(input, "activeForm"),
+                // A creation reports no status of its own. `pending` is not a
+                // guess: the first `TaskUpdate` on a fresh task reported
+                // `statusChange.from == "pending"` on every observed run.
+                status: opt_str_field(input, "status")
+                    .as_deref()
+                    .map_or(ChecklistStatus::Pending, checklist_status_from_claude),
+            })
+        }
+        TaskCallKind::Update => {
+            let item_id = id_field(result, "taskId").or_else(|| id_field(input, "taskId"))?;
+            // The result's confirmed transition wins over the input's request:
+            // the input is what was asked for, the result is what happened.
+            let status = result
+                .get("statusChange")
+                .and_then(|c| opt_str_field(c, "to"))
+                .or_else(|| opt_str_field(input, "status"))
+                .as_deref()
+                .map(checklist_status_from_claude)?;
+            Some(AgentEvent::ChecklistItemChanged {
+                item_id,
+                // An update never carries a subject. This is the field the
+                // fold may have to live without on a resumed run — see
+                // `ChecklistItem::text`.
+                text: None,
+                active_form: opt_str_field(input, "activeForm"),
+                status,
+            })
+        }
+        TaskCallKind::List => {
+            let tasks = result.get("tasks")?.as_array()?;
+            let items: Vec<ChecklistItem> = tasks
+                .iter()
+                .filter_map(|t| {
+                    Some(ChecklistItem {
+                        id: id_field(t, "id")?,
+                        text: opt_str_field(t, "subject"),
+                        active_form: opt_str_field(t, "activeForm"),
+                        status: opt_str_field(t, "status")
+                            .as_deref()
+                            .map_or(ChecklistStatus::Unknown, checklist_status_from_claude),
+                    })
+                })
+                .collect();
+            // **The element shape here is UNOBSERVED.** The capture recorded
+            // that `TaskList` answers `{"tasks":[…]}` and never recorded what
+            // is inside one, because the model never called it. So this
+            // refuses to emit unless every element yielded an id: a
+            // replacement built from a shape that turned out wrong would wipe
+            // a correctly accumulated list, which is the one failure here that
+            // destroys good data rather than merely missing some. Dropping the
+            // reconciliation instead is recoverable — the next mutation still
+            // lands. Confirm the shape before relaxing this.
+            (!items.is_empty() && items.len() == tasks.len()).then_some(
+                AgentEvent::ChecklistReplaced {
+                    explanation: None,
+                    items,
+                },
+            )
+        }
+    }
+}
+
 /// Decode a Claude `tool_use` block (name + input) into a typed [`ToolCall`].
 pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
     match name {
@@ -417,6 +544,16 @@ pub(crate) struct Normalizer {
     /// Last-EMITTED `SubagentUpdated` reading per `task_id` — the
     /// material-transition filter's only state. See [`SubagentSnapshot`].
     subagent_progress: HashMap<String, SubagentSnapshot>,
+    /// `Task*` calls whose result has not arrived yet, keyed by `tool_use_id`.
+    ///
+    /// Held because neither frame carries the whole picture: `activeForm` and
+    /// the requested status are only on the tool INPUT, while the assigned id
+    /// and the confirmed transition are only on the RESULT. Entries are
+    /// removed on consumption, so the map is bounded by the calls in flight —
+    /// a call whose result never arrives (an interrupted turn) leaks one small
+    /// entry for the life of the run, which is why this is per-run state and
+    /// not per-session.
+    pending_task_calls: HashMap<String, (TaskCallKind, Value)>,
 }
 
 impl Normalizer {
@@ -427,6 +564,7 @@ impl Normalizer {
             session_id: None,
             runtime_mode,
             subagent_progress: HashMap::new(),
+            pending_task_calls: HashMap::new(),
         }
     }
 
@@ -651,6 +789,18 @@ impl Normalizer {
                 if f.parent_tool_use_id.is_some() {
                     return Vec::new();
                 }
+                // Hold any `Task*` call until its result lands. The chip these
+                // calls render is unaffected — they stay ordinary tool calls,
+                // which is the split t3code arrived at: the plan is its own
+                // event and the calls driving it are not special-cased away.
+                for b in f.message.blocks() {
+                    if b.kind == "tool_use"
+                        && let Some(kind) = TaskCallKind::from_tool_name(&b.name)
+                    {
+                        self.pending_task_calls
+                            .insert(b.id.clone(), (kind, b.input.clone()));
+                    }
+                }
                 let mut out: Vec<AgentEvent> = f
                     .message
                     .blocks()
@@ -690,6 +840,29 @@ impl Normalizer {
                         is_error: b.is_error.unwrap_or(false),
                     })
                     .collect();
+                // Join each `tool_result` back to the `Task*` call it answers.
+                // `tool_use_result` is a SIBLING of `message` on this frame, not
+                // a field of the block, so it is read once per frame — the CLI
+                // sends one tool_result per user frame in every recorded run.
+                for b in f.message.blocks() {
+                    if b.kind != "tool_result" {
+                        continue;
+                    }
+                    let Some((kind, input)) = self.pending_task_calls.remove(&b.tool_use_id) else {
+                        continue;
+                    };
+                    // An errored call changed nothing, so it must not move the
+                    // checklist. The prose the model sees says so; the typed
+                    // result is absent or negative.
+                    if b.is_error.unwrap_or(false) {
+                        continue;
+                    }
+                    if let Some(result) = f.tool_use_result.as_ref()
+                        && let Some(ev) = checklist_event_from_task_call(kind, &input, result)
+                    {
+                        out.push(ev);
+                    }
+                }
                 // The `Agent` tool's own result carries the whole subagent
                 // record on one frame — a fallback that resolves the card
                 // even if `task_notification` never arrived. Routed through
@@ -1874,6 +2047,236 @@ mod tests {
             !events
                 .iter()
                 .any(|e| matches!(e, AgentEvent::SubagentUpdated { .. })),
+            "{events:?}"
+        );
+    }
+
+    // ---- checklist (slice 4.3, task 3) ----
+    //
+    // Every JSON literal below is copied from a real run, not composed:
+    // `captures/2026-08-13-plan-todo-subagent/run6-claude-resume-tasks.jsonl`,
+    // Claude Code 2.1.229. `AGENTS.md` requires a decode's test to point at the
+    // literal the provider sends, because a test that round-trips through the
+    // Rust type stays green through exactly the failure that matters.
+
+    /// Drive an assistant `tool_use` and its `user` result through one
+    /// normalizer, the way the CLI actually sends them.
+    fn drive(normalizer: &mut Normalizer, raws: &[&str]) -> Vec<AgentEvent> {
+        let mut out = Vec::new();
+        for raw in raws {
+            let frame = crate::claude::wire::parse_frame(raw).unwrap();
+            out.extend(normalizer.normalize(frame, false));
+        }
+        out
+    }
+
+    const CREATE_CALL: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01KrpvHNfTJ46bPJGXovZUnQ","name":"TaskCreate","input":{"subject":"Read README.md","description":"Read the contents of README.md file"}}]},"parent_tool_use_id":null}"#;
+    const CREATE_RESULT: &str = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01KrpvHNfTJ46bPJGXovZUnQ","type":"tool_result","content":"Task #1 created successfully: Read README.md"}]},"parent_tool_use_id":null,"tool_use_result":{"task":{"id":"1","subject":"Read README.md"}}}"#;
+
+    #[test]
+    fn task_create_yields_a_pending_item_with_its_assigned_id() {
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[CREATE_CALL, CREATE_RESULT]);
+        let changed: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ChecklistItemChanged { .. }))
+            .collect();
+        assert_eq!(
+            changed,
+            vec![&AgentEvent::ChecklistItemChanged {
+                // The id is on the RESULT only; the input never knows it.
+                item_id: "1".into(),
+                text: Some("Read README.md".into()),
+                active_form: None,
+                status: ChecklistStatus::Pending,
+            }],
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_task_create_still_renders_an_ordinary_tool_chip() {
+        // The plan is its own event; the calls driving it stay ordinary tool
+        // calls. Nothing here may swallow the chip.
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[CREATE_CALL]);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolCall {
+                    call: ToolCall::Unknown { name, .. },
+                    ..
+                } if name == "TaskCreate"
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_resumed_runs_update_for_an_unseen_task_carries_its_active_form() {
+        // Phase B of the resume capture, verbatim. Task 2 was created by the
+        // PREVIOUS process, so this normalizer has never seen its subject —
+        // `text` is None and `activeForm` is the only readable label. This is
+        // the ordinary two-turn case, not an exotic one (capture §7).
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01EymP3AH2cPAhsVcK4aLzKW","name":"TaskUpdate","input":{"taskId":"2","status":"in_progress","activeForm":"Counting lines in notes.txt"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01EymP3AH2cPAhsVcK4aLzKW","type":"tool_result","content":"Updated task #2 activeForm, status"}]},"parent_tool_use_id":null,"tool_use_result":{"success":true,"taskId":"2","updatedFields":["activeForm","status"],"statusChange":{"from":"pending","to":"in_progress"}}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[call, result]);
+        assert!(
+            events.contains(&AgentEvent::ChecklistItemChanged {
+                item_id: "2".into(),
+                text: None,
+                active_form: Some("Counting lines in notes.txt".into()),
+                status: ChecklistStatus::InProgress,
+            }),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_completion_update_carries_no_active_form_and_that_is_fine() {
+        // The `completed` transition sends neither subject nor activeForm. An
+        // item whose FIRST sighting is this has a status and no text of any
+        // kind — the case `ChecklistItem::text` is optional for.
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_0144zTWo88YYXGVKLQotEqpu","name":"TaskUpdate","input":{"taskId":"2","status":"completed"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_0144zTWo88YYXGVKLQotEqpu","type":"tool_result","content":"Updated task #2 status"}]},"parent_tool_use_id":null,"tool_use_result":{"success":true,"taskId":"2","updatedFields":["status"],"statusChange":{"from":"in_progress","to":"completed"}}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[call, result]);
+        assert!(
+            events.contains(&AgentEvent::ChecklistItemChanged {
+                item_id: "2".into(),
+                text: None,
+                active_form: None,
+                status: ChecklistStatus::Completed,
+            }),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn the_results_confirmed_transition_beats_the_inputs_request() {
+        // The input is what was asked for; the result is what happened. A
+        // rejected or coerced status must not be reported as if it landed.
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"TaskUpdate","input":{"taskId":"9","status":"completed"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tu1","type":"tool_result","content":"Updated task #9 status"}]},"parent_tool_use_id":null,"tool_use_result":{"success":true,"taskId":"9","statusChange":{"from":"pending","to":"in_progress"}}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[call, result]);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ChecklistItemChanged {
+                    status: ChecklistStatus::InProgress,
+                    ..
+                }
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn an_update_reporting_no_status_anywhere_emits_nothing() {
+        // An absent transition is not a transition. Defaulting to Pending here
+        // would silently reset an item the user watched reach completed.
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu2","name":"TaskUpdate","input":{"taskId":"3","activeForm":"Reporting results"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tu2","type":"tool_result","content":"Updated task #3 activeForm"}]},"parent_tool_use_id":null,"tool_use_result":{"success":true,"taskId":"3","updatedFields":["activeForm"]}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[call, result]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ChecklistItemChanged { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn an_errored_task_call_moves_nothing() {
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu3","name":"TaskUpdate","input":{"taskId":"4","status":"completed"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tu3","type":"tool_result","is_error":true,"content":"No task #4"}]},"parent_tool_use_id":null,"tool_use_result":{"success":false,"taskId":"4","statusChange":{"from":"pending","to":"completed"}}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[call, result]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ChecklistItemChanged { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_tools_result_emits_no_checklist_event() {
+        // A `Read` result flowing through the same frame shape. Nothing about
+        // it may look like a task mutation.
+        let raw = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01CBBqQr95WuVk1MNSokZmod","type":"tool_result","content":"1\talpha\n"}]},"parent_tool_use_id":null,"tool_use_result":{"type":"text","file":{"filePath":"notes.txt"}}}"#;
+        let events = normalize_one(raw);
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ChecklistItemChanged { .. } | AgentEvent::ChecklistReplaced { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn task_list_refuses_to_replace_from_an_unrecognized_element_shape() {
+        // The element shape is UNOBSERVED — the model never called `TaskList`
+        // on any recorded run. A replacement built from a wrong guess would
+        // wipe a correctly accumulated list, so a shape that yields no ids
+        // must emit nothing at all rather than an empty replacement.
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu4","name":"TaskList","input":{}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tu4","type":"tool_result","content":"3 tasks"}]},"parent_tool_use_id":null,"tool_use_result":{"tasks":[{"identifier":"1","title":"Read README.md"},{"identifier":"2","title":"Count lines"}]}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[call, result]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ChecklistReplaced { .. })),
+            "a shape whose elements yield no id must not produce a replacement: {events:?}"
+        );
+    }
+
+    #[test]
+    fn task_list_replaces_when_every_element_decodes() {
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu5","name":"TaskList","input":{}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tu5","type":"tool_result","content":"2 tasks"}]},"parent_tool_use_id":null,"tool_use_result":{"tasks":[{"id":"1","subject":"Read README.md","status":"completed"},{"id":"2","subject":"Count lines","status":"in_progress"}]}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[call, result]);
+        assert!(
+            events.contains(&AgentEvent::ChecklistReplaced {
+                explanation: None,
+                items: vec![
+                    ChecklistItem {
+                        id: "1".into(),
+                        text: Some("Read README.md".into()),
+                        active_form: None,
+                        status: ChecklistStatus::Completed,
+                    },
+                    ChecklistItem {
+                        id: "2".into(),
+                        text: Some("Count lines".into()),
+                        active_form: None,
+                        status: ChecklistStatus::InProgress,
+                    },
+                ],
+            }),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_numeric_task_id_decodes_rather_than_orphaning_the_item() {
+        // The capture showed `"1"` quoted. Nothing promises that stays true,
+        // and a number read as absent would drop every later update silently.
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu6","name":"TaskCreate","input":{"subject":"Read README.md"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tu6","type":"tool_result","content":"created"}]},"parent_tool_use_id":null,"tool_use_result":{"task":{"id":7,"subject":"Read README.md"}}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[call, result]);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ChecklistItemChanged { item_id, .. } if item_id == "7"
+            )),
             "{events:?}"
         );
     }
