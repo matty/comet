@@ -1451,9 +1451,11 @@ fn expire_open_approvals(inner: &Inner, chat_id: &str, run_id: &str, folded: &mu
 /// the CLI's stdin — the harness's steer arm in `comet_harness::claude`
 /// writes it and emits `Steered`, nothing more; the mutually-exclusive abort
 /// arm beside it is the one that signals interrupt and escalates
-/// SIGTERM→SIGKILL. A subagent running when the user steers is not touched by
-/// either the engine or the CLI process, so it most likely keeps running and
-/// completes. Stamping it `Cancelled` at that boundary would assert an
+/// SIGTERM→SIGKILL. A subagent running when the user steers: Comet sends
+/// nothing that would abort it, and what the CLI process does with it from
+/// there is uncaptured — no capture pins the child's real fate, so it most
+/// likely keeps running and completes, but that is an inference, not an
+/// observation. Stamping it `Cancelled` at that boundary would assert an
 /// outcome nobody observed. The pre-steer segment is orphaned either way —
 /// `fold_event_into_parts` clears the accumulator on `Steered`, so a
 /// `SubagentUpdated` for an unseen `task_id` in the new segment is dropped —

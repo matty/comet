@@ -245,9 +245,11 @@ fn happy() {
     // Spawns the subagent below. Realism, not one of the five system/task_*
     // frames itself (those start at the next `emit`) — a subagent block with
     // no call that spawned it is an incoherent sequence. Shaped from
-    // run2-claude-subagent.jsonl:97: `description`/`subagent_type`/`prompt`/
+    // run2-claude-subagent.jsonl:97: `description`/`subagent_type`/
     // `run_in_background`/`caller` plus the four numeric `usage` fields it
-    // carries are copied verbatim; the fake fixture's own convention is
+    // carries are copied verbatim. `prompt` is NOT verbatim — the capture's
+    // actual prompt runs a second sentence past what is emitted here; this
+    // fixture keeps only the first. The fake fixture's own convention is
     // readable ids, not the capture's opaque hex/toolu_ ones, so "sub-1" /
     // "sub-1-task" stand in for the real tool_use_id / task_id. Decodes as
     // ToolCall::Unknown{name:"Agent"}: nothing in this slice teaches
@@ -284,8 +286,12 @@ fn happy() {
         r#"{"type":"system","subtype":"task_notification","task_id":"sub-1-task","tool_use_id":"sub-1","status":"completed","output_file":"C:\\tmp\\sub-1-task.output","summary":"Sandbox","usage":{"total_tokens":20044,"tool_uses":1,"duration_ms":4906}}"#,
     );
     // A `SendMessage`-resumed agent: the SAME task_id under a NEW
-    // tool_use_id — the fifth distinct system/task_* shape (capture:150,
-    // 168, 169). This is what exercises `normalize.rs`'s
+    // tool_use_id — the fifth distinct system/task_* SHAPE this scenario
+    // emits (capture:150, 168, 169), not a fifth SUBTYPE: there are still
+    // only four claimed subtypes (task_started/task_progress/task_updated/
+    // task_notification, see normalize.rs's own doc comment on
+    // `normalize_subagent_task`); this is a second, differently-shaped
+    // `task_started` reusing one of them. This is what exercises `normalize.rs`'s
     // `subagent_progress.remove(&f.task_id)` on `task_started` through a
     // real spawn: without it, this second terminal reading would be
     // compared against the first invocation's already-terminal one and

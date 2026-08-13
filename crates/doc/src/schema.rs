@@ -686,13 +686,19 @@ impl SessionDoc {
     }
 
     /// Stamp every `Subagent` part still `Running` in one entry `Cancelled`,
-    /// returning how many. Mirrors [`Self::expire_open_approvals`] exactly —
-    /// same host-stamped rationale (replay and every LAN peer must agree on
-    /// the terminal state instead of each reader guessing locally), and the
-    /// same crash-path caller (`DocHost::mark_abandoned_streams`): the
-    /// process died before the in-memory run-end sweep
+    /// returning how many. Shares [`Self::expire_open_approvals`]'s
+    /// host-stamped rationale (replay and every LAN peer must agree on the
+    /// terminal state instead of each reader guessing locally) and its
+    /// crash-path caller (`DocHost::mark_abandoned_streams`): the process
+    /// died before the in-memory run-end sweep
     /// (`comet_engine::sessions::cancel_running_subagents`) ever ran, so this
-    /// entry is the only durable record of what was still `Running`.
+    /// entry is the only durable record of what was still `Running`. The
+    /// match rule itself diverges: the approval sweep treats an ABSENT
+    /// `decision` as open, while this one requires `status == "running"` to
+    /// be PRESENT. In practice the two behave the same — a status-less
+    /// `Subagent` part is rejected at read time (`status` is not an
+    /// `Option`), so this sweep never sees the absent case the approval one
+    /// has to handle.
     ///
     /// A `Subagent` part already `Completed`, `Failed` or `Cancelled` keeps
     /// its real outcome.
