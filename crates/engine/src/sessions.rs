@@ -2554,9 +2554,14 @@ mod tests {
     /// The `Steered` boundary must expire an open approval (the sweep causes
     /// that state) but must NOT cancel a running subagent (the sweep would
     /// only be labeling a state nobody observed) — this is the regression
-    /// case for treating the two as one mechanism. Mirrors exactly what the
-    /// `Steered` arm in `drive_run` calls: `expire_open_approvals` alone,
-    /// never `cancel_running_subagents`.
+    /// case for treating the two as one mechanism. This test calls
+    /// `expire_open_approvals` DIRECTLY on a hand-built `folded`; it never
+    /// drives the `Steered` arm's own dispatch path, so it would stay green
+    /// even if that arm gained a `cancel_running_subagents` call alongside
+    /// `expire_open_approvals`. Only
+    /// `crates/engine/tests/e2e.rs:2614-2675`'s
+    /// `a_steer_over_a_running_subagent_does_not_stamp_it_cancelled` actually
+    /// pins the arm calling `expire_open_approvals` alone — see D57.
     #[test]
     fn a_steer_boundary_expires_approvals_but_leaves_a_running_subagent_alone() {
         let dir = tempfile::tempdir().unwrap();

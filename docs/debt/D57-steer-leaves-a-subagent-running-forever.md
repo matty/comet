@@ -7,24 +7,25 @@ only one of them will conclude it's a bug and go looking for the other two.**
 ## The three sites
 
 **1. A steer finishes the pre-steer segment `Complete`, not `Streaming`.**
-The free module-level fn `drive_run` (`crates/engine/src/sessions.rs:1486`, not an associated fn
+The free module-level fn `drive_run` (`crates/engine/src/sessions.rs:1488`, not an associated fn
 of `SessionsEngine`)'s `Steered` arm (`:1749-1784`) calls `finish_segment(...,
 MessageStatus::Complete)` at line 1774. Whatever `MessagePart::Subagent` is sitting in that
 segment — including one still `Running` — is written into a **finished** entry.
 
 **2. `cancel_running_subagents` is deliberately not called at that boundary.**
-`crates/engine/src/sessions.rs:1440-1461`, in `cancel_running_subagents`'s own doc comment, spells
+`crates/engine/src/sessions.rs:1440-1467`, in `cancel_running_subagents`'s own doc comment, spells
 out why: a steer only queues a line for the CLI's stdin (`SessionsEngine::steer`, the harness's
-steer arm in `comet_harness::claude`) — it never touches the child subagent process. A subagent
-running when the user steers "most likely keeps running and completes," unobserved by Comet from
-that point on. Stamping it `Cancelled` at the steer boundary "would assert an outcome nobody
-observed." The function runs only from the `Done` arm (a run that genuinely ended), never from
-`Steered` — see the comment's own contrast with `expire_open_approvals`, which is deliberately
-called from both boundaries because approvals are a different case: dropping a parked resolver
-*causes* the "not approved" reading, so `Expired` becomes true by the sweep's own act regardless
-of where it runs. Cancelling a subagent has no equivalent causal act — the sweep would only be a
-label, not an event — which is exactly why it is confined to the one boundary where the label is
-true.
+steer arm in `comet_harness::claude`) — Comet sends nothing that would abort a subagent still
+running at that point, and what the CLI process does with it from there is uncaptured, which the
+comment is careful to mark as an inference rather than an observation: it "most likely keeps
+running and completes, but that is an inference, not an observation." Stamping it `Cancelled` at
+the steer boundary "would assert an outcome nobody observed." The function runs only from the
+`Done` arm (a run that genuinely ended), never from `Steered` — see the comment's own contrast with
+`expire_open_approvals`, which is deliberately called from both boundaries because approvals are a
+different case: dropping a parked resolver *causes* the "not approved" reading, so `Expired`
+becomes true by the sweep's own act regardless of where it runs. Cancelling a subagent has no
+equivalent causal act — the sweep would only be a label, not an event — which is exactly why it is
+confined to the one boundary where the label is true.
 
 **3. The crash-path sweep (task 7) can't reach it either, for an unrelated reason.**
 `DocHost::mark_abandoned_streams` (`crates/engine/src/doc_host.rs:159-172`) is the recovery sweep
@@ -39,7 +40,7 @@ independent guards, each correct on its own terms, compound into one segment nei
 A subagent still `Running` when the user steers stays `Running` in that segment for the life of
 the chat. Nothing downstream revisits it: `fold_event_into_parts` clears the accumulator on
 `Steered`, so a later `SubagentUpdated` for that `task_id` lands in a new, unrelated accumulator
-and is dropped as "an update for a `task_id` this accumulator never saw" (`parts.rs:427-430`); the
+and is dropped as "an update for a `task_id` this accumulator never saw" (`parts.rs:429-432`); the
 `Done` arm's own `cancel_running_subagents` call only ever sees the **current** segment's parts,
 never a prior, already-finished one.
 
@@ -51,7 +52,7 @@ containing `"steered"`, not on the run reaching `Done` — the coalesced flush p
 before the fold that finally settles the entry, so the assertion runs slightly ahead of `Done`,
 not after it.
 
-The fold-level twin, `sessions.rs:2559`'s `a_steer_boundary_expires_approvals_but_leaves_a_running_
+The fold-level twin, `sessions.rs:2561`'s `a_steer_boundary_expires_approvals_but_leaves_a_running_
 subagent_alone`, calls `expire_open_approvals` **directly** on a hand-built `folded` slice — it
 does not drive the `Steered` arm's dispatch path at all, so it would stay green even if that arm
 gained a `cancel_running_subagents` call alongside `expire_open_approvals`. It is the e2e test
