@@ -2654,7 +2654,17 @@ async fn a_steer_over_a_running_subagent_does_not_stamp_it_cancelled() {
     );
 
     wait_for(
-        || entries_text(&core).contains("steered"),
+        || {
+            entries_now(&core)
+                .iter()
+                .flat_map(|e| e.parts.iter())
+                .filter_map(|p| match p {
+                    MessagePart::Text { text, .. } => Some(text.as_str()),
+                    MessagePart::Error { message, .. } => Some(message.as_str()),
+                    _ => None,
+                })
+                .any(|text| text.contains("steered"))
+        },
         "the post-steer turn to complete",
     )
     .await;
