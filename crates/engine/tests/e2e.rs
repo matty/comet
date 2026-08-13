@@ -20,7 +20,8 @@ use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, CatalogSource, DiagnosticSeverity, DoneStatus,
     FileOperation, HarnessCapabilities, HarnessId, ModelCatalog, NoticeKind, NoticeSeverity,
-    ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel, SessionStatus, SteeringMode, ToolCall,
+    ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel, SessionStatus, SteeringMode,
+    SubagentStatus, ToolCall,
 };
 use comet_rpc::RpcService;
 use comet_sync::DocsStore;
@@ -2540,6 +2541,137 @@ async fn a_steer_over_an_open_approval_terminates_it_rather_than_stranding_it() 
         "the steered-over card to be stamped expired",
     )
     .await;
+}
+
+/// A harness whose child keeps running across a step-boundary steer — the
+/// real Claude behavior (`crates/harness/src/claude/mod.rs`'s steer arm queues
+/// a stdin line and emits `Steered`, nothing more; only the separate,
+/// mutually-exclusive abort arm signals interrupt). It never sends a
+/// `SubagentUpdated` for the task it starts, which is the point: a live
+/// subagent's fate is unknown at a steer boundary, unlike an approval, whose
+/// resolver the sweep itself drops.
+struct SteeredWhileSubagentRunningHarness;
+
+#[async_trait]
+impl Harness for SteeredWhileSubagentRunningHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "SteeredWhileSubagentRunning"
+    }
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities {
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: vec![ReasoningLevel::Medium],
+            runtime_modes: Vec::new(),
+            ..HarnessCapabilities::default()
+        }
+    }
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let mut steering = controls.steering;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tokio::spawn(async move {
+            let _ = tx.send(AgentEvent::SubagentStarted {
+                task_id: "t1".into(),
+                tool_use_id: "tu1".into(),
+                agent_type: "general-purpose".into(),
+                description: "Read README and report first heading".into(),
+                prompt: None,
+            });
+            let Some(steer) = steering.recv().await else {
+                return;
+            };
+            let _ = tx.send(AgentEvent::Steered {
+                assistant_message_id: None,
+                next_assistant_message_id: steer.message_id.map(|id| format!("a-{id}")),
+            });
+            let _ = tx.send(AgentEvent::TextDelta {
+                text: "steered".into(),
+            });
+            let _ = tx.send(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            });
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (Ok(event), rx))
+        })
+        .boxed())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_steer_over_a_running_subagent_does_not_stamp_it_cancelled() {
+    // The regression this covers: a steer is not a run end, so it must not
+    // claim to know a still-running child's fate. Only `expire_open_approvals`
+    // runs at the `Steered` boundary in `drive_run`; `cancel_running_subagents`
+    // runs only at `Done`, which this harness never reaches while the subagent
+    // is still open.
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(SteeredWhileSubagentRunningHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-subagent",
+        SessionCommandPayload::Run {
+            request: run_request("delegate this"),
+            message_id: "m-user".into(),
+        },
+    );
+
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.parts
+                    .iter()
+                    .any(|p| matches!(p, MessagePart::Subagent { .. }))
+            })
+        },
+        "the subagent card to land",
+    )
+    .await;
+
+    // The user types instead of waiting: a routed dispatch steers the live run.
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-steer-1",
+        SessionCommandPayload::Run {
+            request: run_request("actually, do this instead"),
+            message_id: "m-steer".into(),
+        },
+    );
+
+    wait_for(
+        || entries_text(&core).contains("steered"),
+        "the post-steer turn to complete",
+    )
+    .await;
+
+    let subagent_status = entries_now(&core)
+        .iter()
+        .flat_map(|e| e.parts.iter())
+        .find_map(|p| match p {
+            MessagePart::Subagent { status, .. } => Some(*status),
+            _ => None,
+        })
+        .expect("subagent card still present");
+    assert_eq!(
+        subagent_status,
+        SubagentStatus::Running,
+        "a steer must not claim to know a still-running child's fate"
+    );
 }
 
 /// Asks permission AFTER its run has ended. That is the state a run whose

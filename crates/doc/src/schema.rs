@@ -685,6 +685,69 @@ impl SessionDoc {
         Ok(stamped)
     }
 
+    /// Stamp every `Subagent` part still `Running` in one entry `Cancelled`,
+    /// returning how many. Mirrors [`Self::expire_open_approvals`] exactly —
+    /// same host-stamped rationale (replay and every LAN peer must agree on
+    /// the terminal state instead of each reader guessing locally), and the
+    /// same crash-path caller (`DocHost::mark_abandoned_streams`): the
+    /// process died before the in-memory run-end sweep
+    /// (`comet_engine::sessions::cancel_running_subagents`) ever ran, so this
+    /// entry is the only durable record of what was still `Running`.
+    ///
+    /// A `Subagent` part already `Completed`, `Failed` or `Cancelled` keeps
+    /// its real outcome.
+    ///
+    /// Scans every part rather than stopping at the first, unlike
+    /// `resolve_input`: an entry can hold more than one subagent, and all of
+    /// them died with the run's own process.
+    pub fn cancel_running_subagents(&self, entry_id: &str) -> Result<usize, DocError> {
+        let cancelled = serde_json::to_value(comet_proto::SubagentStatus::Cancelled)?;
+        let messages = self.doc.get_list("messages");
+        let mut stamped = 0usize;
+        for i in 0..messages.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
+                messages.get(i)
+            else {
+                continue;
+            };
+            let id_matches = matches!(
+                entry.get("id"),
+                Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == entry_id
+            );
+            if !id_matches {
+                continue;
+            }
+            let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) =
+                entry.get("parts")
+            else {
+                continue;
+            };
+            for j in 0..parts.len() {
+                let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) =
+                    parts.get(j)
+                else {
+                    continue;
+                };
+                let is_subagent = matches!(
+                    part.get("kind"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == "subagent"
+                );
+                let is_running = matches!(
+                    part.get("status"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == "running"
+                );
+                if is_subagent && is_running {
+                    part.insert("status", loro_value_from_json(&cancelled))?;
+                    stamped += 1;
+                }
+            }
+        }
+        if stamped > 0 {
+            self.doc.commit();
+        }
+        Ok(stamped)
+    }
+
     /// Export a snapshot (persistence) — `ExportMode::Snapshot`.
     pub fn export_snapshot(&self) -> Result<Vec<u8>, DocError> {
         self.doc
@@ -1768,6 +1831,86 @@ mod tests {
         })
         .unwrap();
         assert_eq!(doc.expire_open_approvals("m1").unwrap(), 0);
+    }
+
+    #[test]
+    fn cancel_running_subagents_stamps_only_the_running_ones() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![
+                MessagePart::Subagent {
+                    id: "sub-1".into(),
+                    task_id: "t1".into(),
+                    agent_type: "general-purpose".into(),
+                    description: "Read README and report first heading".into(),
+                    status: comet_proto::SubagentStatus::Running,
+                    activity: None,
+                    summary: None,
+                    total_tokens: None,
+                    duration_ms: None,
+                    tool_uses: None,
+                },
+                MessagePart::Subagent {
+                    id: "sub-2".into(),
+                    task_id: "t2".into(),
+                    agent_type: "general-purpose".into(),
+                    description: "A second, already-finished task".into(),
+                    status: comet_proto::SubagentStatus::Completed,
+                    activity: None,
+                    summary: Some("done".into()),
+                    total_tokens: Some(10),
+                    duration_ms: Some(20),
+                    tool_uses: Some(1),
+                },
+            ],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        })
+        .unwrap();
+        // This is the "reaches the persisted document" half of the coverage:
+        // `read_entries` decodes back off the same `SessionDoc` the stamp
+        // wrote into, not the `SessionMessageEntry` handed to `push_message`.
+        assert_eq!(doc.cancel_running_subagents("m1").unwrap(), 1);
+        let parts = doc.read_entries().unwrap()[0].parts.clone();
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Subagent {
+                status: comet_proto::SubagentStatus::Cancelled,
+                ..
+            }
+        ));
+        // An already-finished subagent keeps its real outcome — cancellation
+        // is not a reset.
+        assert!(matches!(
+            &parts[1],
+            MessagePart::Subagent {
+                status: comet_proto::SubagentStatus::Completed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cancel_running_subagents_is_a_no_op_on_an_entry_without_any() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "no subagents here".into(),
+            }],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        })
+        .unwrap();
+        assert_eq!(doc.cancel_running_subagents("m1").unwrap(), 0);
     }
 
     #[test]

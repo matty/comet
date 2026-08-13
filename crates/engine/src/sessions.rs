@@ -782,10 +782,9 @@ impl SessionsEngine {
             };
             // Note BEFORE interrupt: this folds into the live entry via
             // `engine_tx`, and after the interrupt the entry is finished and
-            // nothing can add to it — the same failure
-            // `expire_open_approvals_and_subagents`'s doc comment warns about.
-            // `kind` comes from the re-read too, so the wording names the wait
-            // that is open now.
+            // nothing can add to it — the same failure `expire_open_approvals`'
+            // doc comment warns about. `kind` comes from the re-read too, so
+            // the wording names the wait that is open now.
             let _ = live.engine_tx.send(AgentEvent::Error {
                 message: unattended_note(bound, live.kind),
             });
@@ -1407,34 +1406,20 @@ fn finish_segment<'a>(
     }
 }
 
-/// Terminally resolve everything this run still left open: drop the parked
-/// approval resolvers, stamp accumulated `Approval` parts `Expired`, and stamp
-/// accumulated `Subagent` parts still `Running` to `Cancelled`. Same job for
-/// both part kinds, done in the same pass rather than as two separate sweeps.
+/// Terminally resolve every approval this run still has open, both halves:
+/// drop the parked resolvers, and stamp the accumulated parts `Expired`.
 ///
 /// Called wherever `folded` is about to be written into a FINISHED entry. Past
-/// that point nothing can happen to either kind any more — `fold_event_into_parts`'s
-/// `ApprovalResolved` and `SubagentUpdated` arms both walk the live accumulator
-/// only, so a part left open here reads "waiting"/"running" for the life of the
-/// chat: the approval's resolver stays parked and the harness stays blocked on
-/// a tool call nobody will answer, and a subagent whose run already ended will
-/// never fold another update in (a resumed agent's `SubagentStarted` starts a
-/// NEW run, which finds no `Running` part to confuse with — see `task_id`'s
-/// doc on `MessagePart::Subagent`).
+/// that point neither half can happen any more — `fold_event_into_parts`'s
+/// `ApprovalResolved` arm and the run's own sweeps all walk the live
+/// accumulator only, so a card that leaves it undecided reads "waiting" for
+/// the life of the chat — while the resolver stays parked and the harness
+/// stays blocked on a tool call nobody will answer.
 ///
-/// Only a `Running` subagent is touched: `Completed`, `Failed` and `Cancelled`
-/// are already terminal, and overwriting one would erase a real outcome with a
-/// manufactured one.
-///
-/// Dropping the approval resolver, rather than sending a decision, is
-/// deliberate: every consumer reads a dropped resolver as NOT approved, which
-/// is the same rule `interrupt()` and `RunHandle::drop` use.
-fn expire_open_approvals_and_subagents(
-    inner: &Inner,
-    chat_id: &str,
-    run_id: &str,
-    folded: &mut [MessagePart],
-) {
+/// Dropping the resolver, rather than sending a decision, is deliberate: every
+/// consumer reads a dropped resolver as NOT approved, which is the same rule
+/// `interrupt()` and `RunHandle::drop` use.
+fn expire_open_approvals(inner: &Inner, chat_id: &str, run_id: &str, folded: &mut [MessagePart]) {
     let pending = lock(&inner.runs)
         .get(chat_id)
         .filter(|h| h.run_id == run_id)
@@ -1444,14 +1429,46 @@ fn expire_open_approvals_and_subagents(
         drop(parked);
     }
     for part in folded.iter_mut() {
-        match part {
-            MessagePart::Approval { decision, .. } if decision.is_none() => {
-                *decision = Some(ApprovalDecision::Expired);
-            }
-            MessagePart::Subagent { status, .. } if *status == SubagentStatus::Running => {
-                *status = SubagentStatus::Cancelled;
-            }
-            _ => {}
+        if let MessagePart::Approval { decision, .. } = part
+            && decision.is_none()
+        {
+            *decision = Some(ApprovalDecision::Expired);
+        }
+    }
+}
+
+/// Cancel every `Subagent` part still `Running` in `folded`. Called ONLY
+/// where a run has genuinely ended (the `Done` arm below) — deliberately NOT
+/// from the `Steered` boundary, unlike [`expire_open_approvals`].
+///
+/// That split is not "two mechanisms for one job": it is one mechanism kept
+/// out of a place it would lie. The approval sweep CAUSES the state it
+/// records — it drops the parked resolver, and every consumer reads a
+/// dropped resolver as NOT approved (`interrupt()`, `RunHandle::drop`), so
+/// `Expired` becomes true by the sweep's own act, regardless of boundary.
+/// This function performs no analogous act. Steering
+/// (`SessionsEngine::steer`, `RunHandle::steer_tx`) only queues a line for
+/// the CLI's stdin — the harness's steer arm in `comet_harness::claude`
+/// writes it and emits `Steered`, nothing more; the mutually-exclusive abort
+/// arm beside it is the one that signals interrupt and escalates
+/// SIGTERM→SIGKILL. A subagent running when the user steers is not touched by
+/// either the engine or the CLI process, so it most likely keeps running and
+/// completes. Stamping it `Cancelled` at that boundary would assert an
+/// outcome nobody observed. The pre-steer segment is orphaned either way —
+/// `fold_event_into_parts` clears the accumulator on `Steered`, so a
+/// `SubagentUpdated` for an unseen `task_id` in the new segment is dropped —
+/// but a stale `Running` reading is honest about what is unknown, and a
+/// manufactured `Cancelled` is not.
+///
+/// A `Subagent` part already `Completed`, `Failed` or `Cancelled` is left
+/// alone: those are real outcomes, and overwriting one would erase it in
+/// favor of a manufactured one.
+fn cancel_running_subagents(folded: &mut [MessagePart]) {
+    for part in folded.iter_mut() {
+        if let MessagePart::Subagent { status, .. } = part
+            && *status == SubagentStatus::Running
+        {
+            *status = SubagentStatus::Cancelled;
         }
     }
 }
@@ -1737,12 +1754,16 @@ async fn drive_run(
             inner.publish(&chat_id, &event);
             // A steer abandons whatever the previous turn was waiting on, and
             // this is the last moment either half of that can be recorded: the
-            // segment below is FINISHED, so a card left open in it — an
-            // approval or a still-`Running` subagent — can never be stamped by
-            // a later decision or update, by the Done-time sweep, or offered
-            // by the decision row again. Saying the wait ended unanswered is
-            // the honest read, and for an approval it also releases the harness.
-            expire_open_approvals_and_subagents(&inner, &chat_id, &run_id, &mut folded);
+            // segment below is FINISHED, so a card left open in it can never be
+            // stamped by a later decision, by the Done-time sweep, or offered
+            // by the decision row again. Saying the tool call was dropped is
+            // the honest answer, and it releases the harness.
+            //
+            // Deliberately approvals-only: a subagent still `Running` here is
+            // NOT stamped `Cancelled` — see `cancel_running_subagents`'s doc
+            // for why a steer must not claim to know a child's fate it never
+            // observed.
+            expire_open_approvals(&inner, &chat_id, &run_id, &mut folded);
             if let Err(err) = finish_segment(
                 doc_ref,
                 writer.take(),
@@ -1902,10 +1923,21 @@ async fn drive_run(
             // after a completed turn (below), so its resolvers would outlive
             // the transcript's "Expired" by up to the 30-minute idle reap,
             // and `respond_approval` would keep answering `true` for one of
-            // them the whole time. Same rule again for a `Subagent` part still
-            // `Running`: this run's own event stream is the only thing that
-            // could ever move it past that, and `Done` is the last event in it.
-            expire_open_approvals_and_subagents(&inner, &chat_id, &run_id, &mut folded);
+            // them the whole time.
+            expire_open_approvals(&inner, &chat_id, &run_id, &mut folded);
+            // Unlike the `Steered` boundary above, `Done` really does end the
+            // turn a subagent ran under — Claude's `Task` tool call is
+            // synchronous from the parent's own turn, so a part still
+            // `Running` here reflects a turn that was cut short (errored or
+            // interrupted), not one still quietly finishing elsewhere. This
+            // segment (`folded`/`entry_id`) also never gets another fold
+            // regardless: even a steerable harness that PARKS below keeps the
+            // same `run_id` alive, but its next turn folds into a NEW,
+            // cleared accumulator (`folded.clear()` further down), never back
+            // into this one — so a `Running` part written into this FINISHED
+            // segment is not merely stale-until-the-next-event, it is
+            // unreachable.
+            cancel_running_subagents(&mut folded);
             // A Done landing on a PARKED session with nothing streamed (the
             // idle reaper's or an interrupt's own teardown) has no entry to
             // finalize — writing one would leave an empty aborted stub.
@@ -2416,10 +2448,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // `expire_open_approvals_and_subagents`'s Subagent half — same rule as
-    // the Approval half it shares a pass with: a part this run's own event
-    // stream can never touch again reads "running" for the life of the chat
-    // unless a run-end sweep stamps it.
+    // `cancel_running_subagents` — a part this run's own event stream can
+    // never touch again reads "running" for the life of the chat unless a
+    // run-end sweep stamps it. And `expire_open_approvals` vs
+    // `cancel_running_subagents` at the two boundaries that finish a segment:
+    // a steer expires approvals (the sweep causes that state, by dropping the
+    // resolver) but must NOT cancel a subagent (the sweep would only be
+    // guessing at a state it did not cause — see `cancel_running_subagents`'s
+    // own doc comment).
     // -----------------------------------------------------------------------
 
     fn subagent_part(id: &str, task_id: &str, status: SubagentStatus) -> MessagePart {
@@ -2437,16 +2473,25 @@ mod tests {
         }
     }
 
-    /// A run that ends (Done, or a steer boundary) while a subagent is still
-    /// `Running` must not leave that part `Running` — nothing will ever fold
-    /// another `SubagentUpdated` into this segment.
+    fn open_approval(id: &str, request_id: &str) -> MessagePart {
+        MessagePart::Approval {
+            id: id.into(),
+            request_id: request_id.into(),
+            approval: comet_proto::ApprovalRequest::FileRead {
+                path: "a.rs".into(),
+            },
+            decision: None,
+        }
+    }
+
+    /// A run that truly ends (`Done`) while a subagent is still `Running`
+    /// must not leave that part `Running` — nothing will ever fold another
+    /// `SubagentUpdated` into this segment.
     #[test]
     fn a_run_that_ends_mid_subagent_leaves_no_running_part() {
-        let dir = tempfile::tempdir().unwrap();
-        let sessions = engine(dir.path());
         let mut folded = vec![subagent_part("sub-1", "t1", SubagentStatus::Running)];
 
-        expire_open_approvals_and_subagents(&sessions.inner, "chat-1", "run-1", &mut folded);
+        cancel_running_subagents(&mut folded);
 
         match &folded[0] {
             MessagePart::Subagent { status, .. } => {
@@ -2461,11 +2506,9 @@ mod tests {
     /// wait, and the sweep must not manufacture a different one.
     #[test]
     fn a_run_that_ends_after_the_subagent_completed_does_not_overwrite_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let sessions = engine(dir.path());
         let mut folded = vec![subagent_part("sub-1", "t1", SubagentStatus::Completed)];
 
-        expire_open_approvals_and_subagents(&sessions.inner, "chat-1", "run-1", &mut folded);
+        cancel_running_subagents(&mut folded);
 
         match &folded[0] {
             MessagePart::Subagent { status, .. } => {
@@ -2473,6 +2516,73 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// The `Done` boundary runs both sweeps: an open approval and a running
+    /// subagent in the SAME segment must both reach a terminal status.
+    #[test]
+    fn a_run_that_ends_resolves_both_an_open_approval_and_a_running_subagent() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = engine(dir.path());
+        let mut folded = vec![
+            open_approval("ap-r1", "r1"),
+            subagent_part("sub-1", "t1", SubagentStatus::Running),
+        ];
+
+        // Mirrors exactly what the `Done` arm in `drive_run` calls, in order.
+        expire_open_approvals(&sessions.inner, "chat-1", "run-1", &mut folded);
+        cancel_running_subagents(&mut folded);
+
+        assert!(matches!(
+            &folded[0],
+            MessagePart::Approval {
+                decision: Some(ApprovalDecision::Expired),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &folded[1],
+            MessagePart::Subagent {
+                status: SubagentStatus::Cancelled,
+                ..
+            }
+        ));
+    }
+
+    /// The `Steered` boundary must expire an open approval (the sweep causes
+    /// that state) but must NOT cancel a running subagent (the sweep would
+    /// only be labeling a state nobody observed) — this is the regression
+    /// case for treating the two as one mechanism. Mirrors exactly what the
+    /// `Steered` arm in `drive_run` calls: `expire_open_approvals` alone,
+    /// never `cancel_running_subagents`.
+    #[test]
+    fn a_steer_boundary_expires_approvals_but_leaves_a_running_subagent_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = engine(dir.path());
+        let mut folded = vec![
+            open_approval("ap-r1", "r1"),
+            subagent_part("sub-1", "t1", SubagentStatus::Running),
+        ];
+
+        expire_open_approvals(&sessions.inner, "chat-1", "run-1", &mut folded);
+
+        assert!(matches!(
+            &folded[0],
+            MessagePart::Approval {
+                decision: Some(ApprovalDecision::Expired),
+                ..
+            }
+        ));
+        assert!(
+            matches!(
+                &folded[1],
+                MessagePart::Subagent {
+                    status: SubagentStatus::Running,
+                    ..
+                }
+            ),
+            "a steer must not claim to know a still-running child's fate"
+        );
     }
 
     // -----------------------------------------------------------------------
