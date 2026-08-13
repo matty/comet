@@ -6,7 +6,7 @@
   "normalized_cli_version": "2.1.229 (Claude Code)",
   "captured_at_unix_ms": 1786631117153,
   "scenario": "subagent",
-  "purpose": "capture Claude delegating a Task/Agent subagent, including the resumed task_started sharing one task_id, patch-only task_updated, task_notification with usage, and background_tasks_changed empty-then-populated",
+  "purpose": "capture Claude delegating a Task/Agent subagent, including the resumed task_started sharing one task_id, patch-only task_updated, task_notification with usage, and background_tasks_changed populated-then-empty",
   "platform": {
     "os": "windows",
     "arch": "x86_64"
@@ -1521,10 +1521,18 @@
     {
       "placeholder": "<USER_TEXT_7>",
       "kind": "user_text"
+    },
+    {
+      "placeholder": "<USER_TEXT_8>",
+      "kind": "user_text"
+    },
+    {
+      "placeholder": "<USER_TEXT_9>",
+      "kind": "user_text"
     }
   ],
   "redaction_counts": {
-    "assistant_prose": 112,
+    "assistant_prose": 108,
     "claude_memory_path": 1,
     "claude_message_id": 25,
     "claude_request_id": 19,
@@ -1536,7 +1544,7 @@
     "session_id": 235,
     "temp_path": 3,
     "tool_use_id": 47,
-    "user_text": 11
+    "user_text": 14
   },
   "consumers": []
 }
