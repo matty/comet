@@ -174,9 +174,16 @@ impl HighlightedDocument {
             if span.range.is_empty() {
                 continue;
             }
-            for (line_ix, &start) in starts.iter().enumerate() {
+            let first_line = starts.partition_point(|&start| start <= span.range.start) - 1;
+            for (line_ix, &start) in starts.iter().enumerate().skip(first_line) {
                 let raw_end = starts.get(line_ix + 1).copied().unwrap_or(source.len());
-                let end = source[..raw_end].trim_end_matches(['\n', '\r']).len();
+                let mut end = raw_end;
+                if source.as_bytes().get(end.wrapping_sub(1)) == Some(&b'\n') {
+                    end -= 1;
+                    if source.as_bytes().get(end.wrapping_sub(1)) == Some(&b'\r') {
+                        end -= 1;
+                    }
+                }
                 let segment_start = span.range.start.max(start);
                 let segment_end = span.range.end.min(end);
                 if segment_start < segment_end {
@@ -771,6 +778,16 @@ mod tests {
     #[test]
     fn shebang_is_only_used_after_explicit_hints() {
         assert_eq!(
+            detect_language(Some("main.rs"), Some("python"), Some("#!/usr/bin/env bash")),
+            Some(LanguageId::Python),
+            "a fence alias outranks both path and shebang"
+        );
+        assert_eq!(
+            detect_language(Some("main.rs"), None, Some("#!/usr/bin/env python3")),
+            Some(LanguageId::Rust),
+            "a path outranks a shebang"
+        );
+        assert_eq!(
             detect_language(None, None, Some("#!/usr/bin/env python3")),
             Some(LanguageId::Python)
         );
@@ -869,6 +886,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cooperative_cancellation_returns_a_typed_error() {
+        let source = "fn item() -> usize { 42 }\n".repeat(8_000);
+        let cancelled = std::sync::atomic::AtomicUsize::new(1);
+        let result = highlight_with_limits(
+            HighlightRequest {
+                source: &source,
+                path: Some("cancelled.rs"),
+                fence_tag: None,
+            },
+            HighlightLimits::default(),
+            Some(&cancelled),
+        );
+        assert_eq!(result, Err(HighlightError::Cancelled));
+    }
+
     fn highlighted_fragments(source: &str) -> Vec<(&str, HighlightKind)> {
         let document = highlight(HighlightRequest {
             source,
@@ -903,7 +936,7 @@ fn build(value: usize) -> Widget {
             ("42", HighlightKind::Number),
         ] {
             assert!(
-                fragments.iter().any(|item| *item == (text, expected)),
+                fragments.contains(&(text, expected)),
                 "missing {text:?} as {expected:?}: {fragments:?}"
             );
         }
@@ -973,7 +1006,8 @@ fn build(value: usize) -> Widget {
     #[test]
     fn rust_queries_load_for_the_bundled_abi() {
         assert!(rust_configuration().is_ok());
-        assert!(tree_sitter::LANGUAGE_VERSION >= tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION);
+        let language_version = std::hint::black_box(tree_sitter::LANGUAGE_VERSION);
+        assert!(language_version >= tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION);
     }
 
     #[test]
@@ -1072,8 +1106,26 @@ fn build(value: usize) -> Widget {
             .collect::<Vec<_>>();
         assert!(kinds.contains(&HighlightKind::Tag));
         assert!(kinds.contains(&HighlightKind::Attribute));
+        assert!(kinds.contains(&HighlightKind::Property));
         assert!(kinds.contains(&HighlightKind::Keyword));
         assert!(kinds.contains(&HighlightKind::Number));
+    }
+
+    #[test]
+    fn jsonc_accepts_and_highlights_comments() {
+        let source = "{\n  // explanation\n  \"enabled\": true\n}\n";
+        let document = highlight(HighlightRequest {
+            source,
+            path: Some("settings.jsonc"),
+            fence_tag: None,
+        })
+        .unwrap();
+        assert_eq!(document.language, LanguageId::Jsonc);
+        assert!(
+            document.lines[1]
+                .iter()
+                .any(|span| span.kind == HighlightKind::Comment)
+        );
     }
 
     #[test]

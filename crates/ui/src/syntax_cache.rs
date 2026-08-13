@@ -39,6 +39,8 @@ struct CachedDocument {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyntaxHighlightCacheStats {
+    pub hits: u64,
+    pub misses: u64,
     pub documents: usize,
     pub retained_bytes: usize,
 }
@@ -48,11 +50,17 @@ pub struct SyntaxHighlightCache {
     documents: HashMap<DocumentHighlightKey, CachedDocument>,
     recency: VecDeque<DocumentHighlightKey>,
     retained_bytes: usize,
+    hits: u64,
+    misses: u64,
 }
 
 impl SyntaxHighlightCache {
     pub fn get(&mut self, key: &DocumentHighlightKey) -> Option<Arc<HighlightedDocument>> {
-        let document = self.documents.get(key)?.document.clone();
+        let Some(document) = self.documents.get(key).map(|entry| entry.document.clone()) else {
+            self.misses += 1;
+            return None;
+        };
+        self.hits += 1;
         self.touch(*key);
         Some(document)
     }
@@ -88,6 +96,8 @@ impl SyntaxHighlightCache {
 
     pub fn stats(&self) -> SyntaxHighlightCacheStats {
         SyntaxHighlightCacheStats {
+            hits: self.hits,
+            misses: self.misses,
             documents: self.documents.len(),
             retained_bytes: self.retained_bytes,
         }
@@ -96,6 +106,11 @@ impl SyntaxHighlightCache {
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.documents.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.documents.is_empty()
     }
 }
 
@@ -136,6 +151,8 @@ mod tests {
         cache.insert(key, document.clone());
         assert!(Arc::ptr_eq(&cache.get(&key).unwrap(), &document));
         assert_eq!(cache.len(), 1);
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().misses, 0);
     }
 
     #[test]
