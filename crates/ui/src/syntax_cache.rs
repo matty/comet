@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use comet_syntax::{HighlightSpan, HighlightedDocument, LanguageId};
+use comet_syntax::{HighlightedDocument, LanguageId};
 use sha2::{Digest, Sha256};
 
 pub const QUERY_GENERATION: u32 = 1;
@@ -65,11 +65,19 @@ impl SyntaxHighlightCache {
         Some(document)
     }
 
-    pub fn insert(&mut self, key: DocumentHighlightKey, document: Arc<HighlightedDocument>) {
+    pub fn insert(
+        &mut self,
+        key: DocumentHighlightKey,
+        document: Arc<HighlightedDocument>,
+    ) -> bool {
         if let Some(previous) = self.documents.remove(&key) {
             self.retained_bytes = self.retained_bytes.saturating_sub(previous.retained_bytes);
         }
         let retained_bytes = estimated_document_bytes(&document);
+        if retained_bytes > MAX_RETAINED_BYTES {
+            self.recency.retain(|candidate| *candidate != key);
+            return false;
+        }
         self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
         self.documents.insert(
             key,
@@ -87,6 +95,7 @@ impl SyntaxHighlightCache {
                 self.retained_bytes = self.retained_bytes.saturating_sub(removed.retained_bytes);
             }
         }
+        self.documents.contains_key(&key)
     }
 
     fn touch(&mut self, key: DocumentHighlightKey) {
@@ -112,6 +121,22 @@ impl SyntaxHighlightCache {
     pub fn is_empty(&self) -> bool {
         self.documents.is_empty()
     }
+}
+
+fn estimated_document_bytes(document: &HighlightedDocument) -> usize {
+    std::mem::size_of::<HighlightedDocument>()
+        .saturating_add(
+            document
+                .lines
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Vec<comet_syntax::HighlightSpan>>()),
+        )
+        .saturating_add(document.lines.iter().fold(0usize, |total, line| {
+            total.saturating_add(
+                line.capacity()
+                    .saturating_mul(std::mem::size_of::<comet_syntax::HighlightSpan>()),
+            )
+        }))
 }
 
 #[cfg(test)]
@@ -148,7 +173,7 @@ mod tests {
             .unwrap(),
         );
         let mut cache = SyntaxHighlightCache::default();
-        cache.insert(key, document.clone());
+        assert!(cache.insert(key, document.clone()));
         assert!(Arc::ptr_eq(&cache.get(&key).unwrap(), &document));
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.stats().hits, 1);
@@ -168,7 +193,7 @@ mod tests {
             + document.lines.capacity() * std::mem::size_of::<Vec<comet_syntax::HighlightSpan>>()
             + document.lines[0].capacity() * std::mem::size_of::<comet_syntax::HighlightSpan>();
         let mut cache = SyntaxHighlightCache::default();
-        cache.insert(key, document);
+        assert!(cache.insert(key, document));
 
         assert_eq!(cache.stats().retained_bytes, expected);
     }
@@ -197,30 +222,31 @@ mod tests {
 
         let oversized = Arc::new(HighlightedDocument {
             language: LanguageId::Rust,
-            lines: vec![Vec::<HighlightSpan>::with_capacity(
-                MAX_RETAINED_BYTES / std::mem::size_of::<HighlightSpan>() + 1,
+            lines: vec![Vec::<comet_syntax::HighlightSpan>::with_capacity(
+                MAX_RETAINED_BYTES / std::mem::size_of::<comet_syntax::HighlightSpan>() + 1,
             )],
         });
-        cache.insert(
+        assert!(!cache.insert(
             DocumentHighlightKey::new(LanguageId::Rust, "oversized"),
             oversized,
-        );
+        ));
         assert!(cache.stats().retained_bytes <= MAX_RETAINED_BYTES);
     }
-}
 
-fn estimated_document_bytes(document: &HighlightedDocument) -> usize {
-    std::mem::size_of::<HighlightedDocument>()
-        .saturating_add(
-            document
-                .lines
-                .capacity()
-                .saturating_mul(std::mem::size_of::<Vec<HighlightSpan>>()),
-        )
-        .saturating_add(document.lines.iter().fold(0usize, |total, line| {
-            total.saturating_add(
-                line.capacity()
-                    .saturating_mul(std::mem::size_of::<HighlightSpan>()),
-            )
-        }))
+    #[test]
+    fn retained_bytes_measure_materialized_spans_not_source_text() {
+        let source = "let x = 1;";
+        let key = DocumentHighlightKey::new(LanguageId::Rust, source);
+        let document = Arc::new(
+            comet_syntax::highlight(comet_syntax::HighlightRequest {
+                source,
+                path: None,
+                fence_tag: Some("rust"),
+            })
+            .unwrap(),
+        );
+        let mut cache = SyntaxHighlightCache::default();
+        assert!(cache.insert(key, document));
+        assert!(cache.stats().retained_bytes > source.len());
+    }
 }

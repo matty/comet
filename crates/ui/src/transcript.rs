@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{
-    Arc,
+    Arc, Weak,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -1196,7 +1196,7 @@ pub fn format_elapsed(secs: i64) -> String {
 
 struct HighlightEntry {
     key: DocumentHighlightKey,
-    document: Option<Arc<comet_syntax::HighlightedDocument>>,
+    document: Option<Weak<comet_syntax::HighlightedDocument>>,
     cancellation: Arc<AtomicUsize>,
     _task: Option<Task<()>>,
 }
@@ -1217,6 +1217,23 @@ struct HighlightStore {
 }
 
 impl HighlightStore {
+    fn remember_cached_document(
+        &mut self,
+        slot_key: (SharedString, usize),
+        document_key: DocumentHighlightKey,
+        document: &Arc<comet_syntax::HighlightedDocument>,
+    ) {
+        self.entries.insert(
+            slot_key,
+            HighlightEntry {
+                key: document_key,
+                document: Some(Arc::downgrade(document)),
+                cancellation: Arc::new(AtomicUsize::new(0)),
+                _task: None,
+            },
+        );
+    }
+
     /// Current tokens if ready; kicks a background tokenize when stale/missing.
     fn request(
         &mut self,
@@ -1231,19 +1248,14 @@ impl HighlightStore {
         if let Some(entry) = self.entries.get(&slot_key)
             && entry.key == document_key
         {
-            return entry.document.clone();
+            let document = entry.document.as_ref()?;
+            if let Some(document) = document.upgrade() {
+                return Some(document);
+            }
         }
         self.entries.remove(&slot_key);
         if let Some(document) = self.cache.get(&document_key) {
-            self.entries.insert(
-                slot_key,
-                HighlightEntry {
-                    key: document_key,
-                    document: Some(document.clone()),
-                    cancellation: Arc::new(AtomicUsize::new(0)),
-                    _task: None,
-                },
-            );
+            self.remember_cached_document(slot_key, document_key, &document);
             return Some(document);
         }
         let code = code.to_string();
@@ -1272,7 +1284,7 @@ impl HighlightStore {
                     && let Some(document) = document
                 {
                     let document = Arc::new(document);
-                    transcript
+                    let retained = transcript
                         .highlights
                         .cache
                         .insert(document_key, document.clone());
@@ -1284,7 +1296,7 @@ impl HighlightStore {
                             elapsed_us = started.elapsed().as_micros() as u64,
                             "syntax highlight ready"
                         );
-                        entry.document = Some(document);
+                        entry.document = retained.then(|| Arc::downgrade(&document));
                         cx.notify();
                     }
                 }
@@ -3617,6 +3629,38 @@ mod tests {
         )
         .expect("python highlighting");
         assert_eq!(document.language, Lang::Python);
+    }
+
+    #[test]
+    fn transcript_entries_do_not_outlive_bounded_cache() {
+        let mut store = HighlightStore::default();
+        let slot_key = (SharedString::from("row"), 0);
+        let first_key = DocumentHighlightKey::new(Lang::Rust, "first");
+        let first = Arc::new(comet_syntax::HighlightedDocument {
+            language: Lang::Rust,
+            lines: Vec::new(),
+        });
+        assert!(store.cache.insert(first_key, first.clone()));
+        store.remember_cached_document(slot_key, first_key, &first);
+        let first_weak = Arc::downgrade(&first);
+        drop(first);
+
+        for index in 0..128 {
+            let key = DocumentHighlightKey::new(Lang::Rust, &format!("document-{index}"));
+            store.cache.insert(
+                key,
+                Arc::new(comet_syntax::HighlightedDocument {
+                    language: Lang::Rust,
+                    lines: Vec::new(),
+                }),
+            );
+        }
+
+        assert!(store.cache.get(&first_key).is_none());
+        assert!(
+            first_weak.upgrade().is_none(),
+            "a transcript slot kept a document alive after bounded-cache eviction"
+        );
     }
 
     /// `byte_len` sees only `description`/`activity`/`summary` text, so a
