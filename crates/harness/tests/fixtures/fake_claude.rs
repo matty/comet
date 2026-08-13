@@ -153,6 +153,8 @@ fn main() {
         );
     } else if first.contains("scenario:happy") {
         happy();
+    } else if first.contains("scenario:subagent-failed") {
+        subagent_failed();
     } else if first.contains("scenario:askuser") {
         askuser(&mut stdin);
     } else if first.contains("scenario:steer") {
@@ -240,6 +242,20 @@ fn happy() {
     emit(
         r#"{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}}"#,
     );
+    // Spawns the subagent below. Shaped from
+    // run2-claude-subagent.jsonl:97 (the fake fixture's own convention is
+    // readable ids, not the capture's opaque hex/toolu_ ones, so "sub-1" /
+    // "sub-1-task" stand in for the real tool_use_id / task_id — everything
+    // else, including the usage block's cache fields, is the capture's own
+    // values). Decodes as ToolCall::Unknown{name:"Agent"}: nothing in this
+    // slice teaches decode_tool_use a dedicated Agent arm.
+    emit(
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"sub-1","name":"Agent","input":{"description":"Read README and report first heading","subagent_type":"general-purpose","prompt":"Read the README.md file in the current directory and report what the first heading is.","run_in_background":false},"caller":{"type":"direct"}}],"usage":{"input_tokens":10,"cache_creation_input_tokens":1496,"cache_read_input_tokens":34676,"output_tokens":3}}}"#,
+    );
+    // Shaped from run2-claude-subagent.jsonl:98.
+    emit(
+        r#"{"type":"system","subtype":"task_started","task_id":"sub-1-task","tool_use_id":"sub-1","description":"Read README and report first heading","subagent_type":"general-purpose","task_type":"local_agent","prompt":"Read the README.md file in the current directory and report what the first heading is."}"#,
+    );
     // Subagent frames (parent_tool_use_id set): all filtered.
     emit(
         r#"{"type":"stream_event","parent_tool_use_id":"sub-1","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"SUBAGENT"}}}"#,
@@ -249,6 +265,20 @@ fn happy() {
     );
     emit(
         r#"{"type":"user","parent_tool_use_id":"sub-1","message":{"content":[{"type":"tool_result","tool_use_id":"sub-tool","is_error":false}]}}"#,
+    );
+    // Shaped from run2-claude-subagent.jsonl:103.
+    emit(
+        r#"{"type":"system","subtype":"task_progress","task_id":"sub-1-task","tool_use_id":"sub-1","description":"Reading README.md","subagent_type":"general-purpose","usage":{"total_tokens":19215,"tool_uses":1,"duration_ms":2906},"last_tool_name":"Read"}"#,
+    );
+    // Shaped from run2-claude-subagent.jsonl:106 — a PARTIAL patch, status
+    // only, exactly like the real one.
+    emit(
+        r#"{"type":"system","subtype":"task_updated","task_id":"sub-1-task","patch":{"status":"completed","end_time":1786581776304}}"#,
+    );
+    // Shaped from run2-claude-subagent.jsonl:107 — the frame carrying the
+    // answer and the terminal usage totals.
+    emit(
+        r#"{"type":"system","subtype":"task_notification","task_id":"sub-1-task","tool_use_id":"sub-1","status":"completed","output_file":"C:\\tmp\\sub-1-task.output","summary":"Sandbox","usage":{"total_tokens":20044,"tool_uses":1,"duration_ms":4906}}"#,
     );
     emit(
         r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Hello"},{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"ls -la"}},{"type":"tool_use","id":"tool-2","name":"mcp__linear__search","input":{"q":"bug"}}]}}"#,
@@ -264,6 +294,44 @@ fn happy() {
         // place the context window appears. A fixture without them let the
         // adapter report single-digit prompts for months.
         r#"{"type":"result","subtype":"success","result":"done!","errors":[],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":34932,"cache_creation_input_tokens":75},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":10,"outputTokens":20,"contextWindow":200000}},"session_id":"sess-1","total_cost_usd":0.01}"#,
+    );
+}
+
+/// A subagent whose terminal reading is `"failed"`, not `"completed"`. No
+/// capture has ever recorded this — every run in
+/// `run2-claude-subagent.jsonl` ends `status: "completed"` — so
+/// `normalize.rs`'s `Failed`/`Cancelled` arms were written by hand against
+/// `.agents/rules/optional-wire-fields.md`'s rule and never exercised through
+/// a real spawn. This scenario is that exercise: same lifecycle shape as
+/// `happy()`'s subagent (task_started → child work → terminal reading), with
+/// only the status strings changed and the child's own tool result marked
+/// `is_error`.
+fn subagent_failed() {
+    emit(
+        r#"{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash"],"cwd":"/tmp","session_id":"sess-subfail"}"#,
+    );
+    emit(
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"sub-1","name":"Agent","input":{"description":"Run the release check","subagent_type":"general-purpose","prompt":"Run scripts/check.sh and report the result.","run_in_background":false},"caller":{"type":"direct"}}],"usage":{"input_tokens":10,"cache_creation_input_tokens":1200,"cache_read_input_tokens":30000,"output_tokens":3}}}"#,
+    );
+    emit(
+        r#"{"type":"system","subtype":"task_started","task_id":"sub-1-task","tool_use_id":"sub-1","description":"Run the release check","subagent_type":"general-purpose","task_type":"local_agent","prompt":"Run scripts/check.sh and report the result."}"#,
+    );
+    emit(
+        r#"{"type":"assistant","parent_tool_use_id":"sub-1","message":{"content":[{"type":"tool_use","id":"sub-tool","name":"Bash","input":{"command":"scripts/check.sh"}}]}}"#,
+    );
+    emit(
+        r#"{"type":"user","parent_tool_use_id":"sub-1","message":{"content":[{"type":"tool_result","tool_use_id":"sub-tool","content":"check.sh: exit 1","is_error":true}]}}"#,
+    );
+    // The partial patch, same shape as the completed case (line 106 of the
+    // capture) with the status string swapped.
+    emit(
+        r#"{"type":"system","subtype":"task_updated","task_id":"sub-1-task","patch":{"status":"failed","end_time":1786581776304}}"#,
+    );
+    emit(
+        r#"{"type":"system","subtype":"task_notification","task_id":"sub-1-task","tool_use_id":"sub-1","status":"failed","output_file":"C:\\tmp\\sub-1-task.output","summary":"check.sh exited 1","usage":{"total_tokens":8120,"tool_uses":1,"duration_ms":1830}}"#,
+    );
+    emit(
+        r#"{"type":"result","subtype":"success","result":"the release check failed","errors":[],"usage":{"input_tokens":10,"output_tokens":20},"session_id":"sess-subfail"}"#,
     );
 }
 

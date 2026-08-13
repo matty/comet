@@ -15,8 +15,8 @@ use comet_harness::{
 };
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus, FileOperation,
-    HarnessId, NoticeKind, NoticeSeverity, RunRequest, RuntimeMode, ToolCall, UserInputAnswer,
-    UserInputQuestion,
+    HarnessId, NoticeKind, NoticeSeverity, RunRequest, RuntimeMode, SubagentStatus, ToolCall,
+    UserInputAnswer, UserInputQuestion,
 };
 
 /// The `fake-claude` bin target, built by cargo alongside this test.
@@ -163,6 +163,53 @@ async fn happy_path_normalizes_events_and_filters_subagents() {
         "subagent tool frames leaked: {events:?}"
     );
 
+    // But the coordinator's OWN view of the subagent — the four claimed
+    // system/task_* frames, none of which carry a parent_tool_use_id — must
+    // reach the event stream through the real spawn path, not just through
+    // normalize.rs's unit tests.
+    assert!(events.contains(&AgentEvent::SubagentStarted {
+        task_id: "sub-1-task".into(),
+        tool_use_id: "sub-1".into(),
+        agent_type: "general-purpose".into(),
+        description: "Read README and report first heading".into(),
+        prompt: Some(
+            "Read the README.md file in the current directory and report what the first heading is."
+                .into()
+        ),
+    }));
+    // task_progress: a live Running reading.
+    assert!(events.contains(&AgentEvent::SubagentUpdated {
+        task_id: "sub-1-task".into(),
+        status: SubagentStatus::Running,
+        activity: Some("Reading README.md".into()),
+        summary: None,
+        total_tokens: Some(19_215),
+        duration_ms: Some(2_906),
+        tool_uses: Some(1),
+    }));
+    // task_updated: status only, and task_notification: adds the answer and
+    // usage the status-only reading was missing — both terminal, but the
+    // notification adds detail, so both survive the material-transition
+    // filter as distinct events.
+    assert!(events.contains(&AgentEvent::SubagentUpdated {
+        task_id: "sub-1-task".into(),
+        status: SubagentStatus::Completed,
+        activity: None,
+        summary: None,
+        total_tokens: None,
+        duration_ms: None,
+        tool_uses: None,
+    }));
+    assert!(events.contains(&AgentEvent::SubagentUpdated {
+        task_id: "sub-1-task".into(),
+        status: SubagentStatus::Completed,
+        activity: None,
+        summary: Some("Sandbox".into()),
+        total_tokens: Some(20_044),
+        duration_ms: Some(4_906),
+        tool_uses: Some(1),
+    }));
+
     // Typed tool decoding: Bash -> Exec, mcp__server__tool -> Mcp.
     assert!(events.contains(&AgentEvent::ToolCall {
         id: "tool-1".into(),
@@ -212,6 +259,46 @@ async fn happy_path_normalizes_events_and_filters_subagents() {
             session_id: Some("sess-1".into()),
         })
     );
+}
+
+/// `normalize.rs`'s `SubagentStatus::Failed`/`Cancelled` arms were written by
+/// hand — no capture has ever recorded a subagent ending any way but
+/// `"completed"` (see `run2-claude-subagent.jsonl`) — so nothing had run the
+/// `Failed` arm through a real spawn until this fixture existed. Fixture:
+/// `scenario:subagent-failed` in `fixtures/fake_claude.rs`.
+#[tokio::test]
+async fn subagent_terminal_failure_reaches_the_event_stream() {
+    let (controls, _steer, _token) = controls("A");
+    let events = run_to_end(&harness(), request("scenario:subagent-failed"), controls).await;
+
+    assert!(events.contains(&AgentEvent::SubagentStarted {
+        task_id: "sub-1-task".into(),
+        tool_use_id: "sub-1".into(),
+        agent_type: "general-purpose".into(),
+        description: "Run the release check".into(),
+        prompt: Some("Run scripts/check.sh and report the result.".into()),
+    }));
+    // task_updated: status only, no summary/usage yet.
+    assert!(events.contains(&AgentEvent::SubagentUpdated {
+        task_id: "sub-1-task".into(),
+        status: SubagentStatus::Failed,
+        activity: None,
+        summary: None,
+        total_tokens: None,
+        duration_ms: None,
+        tool_uses: None,
+    }));
+    // task_notification: adds the summary and usage the status-only reading
+    // was missing, so it survives the material-transition filter too.
+    assert!(events.contains(&AgentEvent::SubagentUpdated {
+        task_id: "sub-1-task".into(),
+        status: SubagentStatus::Failed,
+        activity: None,
+        summary: Some("check.sh exited 1".into()),
+        total_tokens: Some(8_120),
+        duration_ms: Some(1_830),
+        tool_uses: Some(1),
+    }));
 }
 
 #[tokio::test]
