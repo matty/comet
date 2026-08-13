@@ -1532,7 +1532,7 @@
     }
   ],
   "redaction_counts": {
-    "assistant_prose": 108,
+    "assistant_prose": 109,
     "claude_memory_path": 1,
     "claude_message_id": 25,
     "claude_request_id": 19,
