@@ -174,7 +174,11 @@ fn is_terminal(status: SubagentStatus) -> bool {
 /// the `task_notification` one frame later is what actually carries the
 /// answer and usage). Only "prior was `None`, candidate is `Some`" counts —
 /// two different non-`None` numbers on the same field is the redundant case,
-/// not a fill-in.
+/// not a fill-in. This checks only ADDITION, not disagreement: a populated
+/// `Failed` arriving after a populated `Completed` also returns `false` here
+/// (nothing is `None` → `Some`) and is dropped by the guard — a contradicted
+/// status is swallowed the same as a genuinely redundant repeat, inherited
+/// from "first terminal reading wins" and unchanged by this function.
 fn adds_new_detail(prior: &SubagentSnapshot, candidate: &SubagentSnapshot) -> bool {
     (candidate.activity.is_some() && prior.activity.is_none())
         || (candidate.summary.is_some() && prior.summary.is_none())
@@ -451,7 +455,12 @@ impl Normalizer {
     /// terminal, but the second one adds detail, so it must still surface. A
     /// truly redundant terminal reading (the fallback repeating a
     /// notification's own numbers, where every field is already populated on
-    /// both sides) adds nothing and is dropped.
+    /// both sides) adds nothing and is dropped. A CONTRADICTED terminal
+    /// reading — e.g. a populated `Failed` arriving after a populated
+    /// `Completed` — is dropped the same way, for the same reason: nothing in
+    /// it is `None` where the stored reading was `Some`, so `adds_new_detail`
+    /// reports no addition either. First terminal reading wins even when the
+    /// second one disagrees, not only when it repeats.
     fn emit_subagent_update(
         &mut self,
         task_id: String,
@@ -1457,19 +1466,25 @@ mod tests {
         let tool_result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":[{"type":"text","text":"Sandbox"}]}]},"parent_tool_use_id":null,"tool_use_result":{"agentId":"a6d1ae6c4fec0efe9","agentType":"general-purpose","content":[{"type":"text","text":"Sandbox"}],"totalDurationMs":1,"totalTokens":1,"totalToolUseCount":1}}"#;
         let frame = crate::claude::wire::parse_frame(tool_result).unwrap();
         let second = normalizer.normalize(frame, false);
-        // Carried-forward Completed is terminal-vs-terminal against the
-        // stored Completed reading, so this is absorbed — the card must
-        // never be seen going back to Running.
-        assert!(
-            !second.iter().any(|e| matches!(
-                e,
-                AgentEvent::SubagentUpdated {
-                    status: SubagentStatus::Running,
-                    ..
-                }
-            )),
-            "{second:?}"
-        );
+        // This is NOT absorbed: the stored reading is {Completed,
+        // summary: Some("done"), tokens/tool_uses/duration None} and this
+        // frame supplies Some for all three usage fields, so
+        // `adds_new_detail` is true and a SubagentUpdated DOES emit — the
+        // point being tested is only that its status is the carried-forward
+        // Completed, never a regression to Running. Pin the status exactly
+        // (not merely "not Running") so a future change to the mechanism
+        // can't silently satisfy a weaker assertion again.
+        match second
+            .iter()
+            .find(|e| matches!(e, AgentEvent::SubagentUpdated { .. }))
+        {
+            Some(AgentEvent::SubagentUpdated { status, .. }) => {
+                assert_eq!(*status, SubagentStatus::Completed, "{second:?}");
+            }
+            _ => {
+                panic!("expected a SubagentUpdated carrying the carried-forward status: {second:?}")
+            }
+        }
     }
 
     #[test]
