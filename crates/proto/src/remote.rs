@@ -27,7 +27,13 @@ use serde::{Deserialize, Serialize};
 ///    stream inside `TranscriptFrame`, and `MessagePart`'s decode is
 ///    all-or-nothing — an older peer fails the WHOLE transcript rather than
 ///    skipping the one part it does not recognize.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// 7: `MessagePart::Checklist` (the plan/todo checklist, slice 4.3). Same
+///    mechanism as 6 exactly — a new `MessagePart` variant on the transcript
+///    stream. Note what does NOT appear in this list: `ToolCall::Todo` stopped
+///    being produced in the same slice, and that needed no bump, because
+///    ceasing to SEND a variant every peer already decodes breaks nobody. The
+///    variant is still decoded, for documents written before the change.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

@@ -102,6 +102,10 @@ struct DocPartJson {
     duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_uses: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    explanation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    items: Option<serde_json::Value>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -206,6 +210,17 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             tool_uses: *tool_uses,
             ..Default::default()
         },
+        MessagePart::Checklist {
+            id,
+            explanation,
+            items,
+        } => DocPartJson {
+            id: id.clone(),
+            kind: "checklist".into(),
+            explanation: explanation.clone(),
+            items: Some(serde_json::to_value(items)?),
+            ..Default::default()
+        },
     })
 }
 
@@ -250,6 +265,20 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
         "error" => MessagePart::Error {
             id: p.id,
             message: p.message.unwrap_or_default(),
+        },
+        // An items array that will not decode degrades to an EMPTY checklist
+        // rather than to a text part, unlike `tool` and `approval` above. The
+        // difference is that those carry their whole meaning in the field that
+        // failed, while a checklist that loses its items still records
+        // truthfully that this run published a plan. Turning it into a blank
+        // text part would erase that and leave nothing to notice.
+        "checklist" => MessagePart::Checklist {
+            id: p.id,
+            explanation: p.explanation,
+            items: p
+                .items
+                .and_then(|i| serde_json::from_value(i).ok())
+                .unwrap_or_default(),
         },
         "notice" => MessagePart::Notice {
             id: p.id,
@@ -890,6 +919,12 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(duration_ms) = doc_part.duration_ms.and_then(checked_i64) {
         map.insert("durationMs", duration_ms)?;
     }
+    if let Some(explanation) = &doc_part.explanation {
+        map.insert("explanation", explanation.as_str())?;
+    }
+    if let Some(items) = &doc_part.items {
+        map.insert("items", loro_value_from_json(items))?;
+    }
     if let Some(tool_uses) = doc_part.tool_uses {
         map.insert("toolUses", tool_uses as i64)?;
     }
@@ -980,6 +1015,20 @@ fn validate_message_parts(row: &serde_json::Value) -> Result<(), DocError> {
                 if part.status.is_none() {
                     return Err(invalid("missing status"));
                 }
+            }
+            "checklist" => {
+                // `items` must be PRESENT and DECODABLE. `from_doc_part`
+                // degrades an undecodable array to an empty checklist, so
+                // without this a corrupt plan would read back as a plan with
+                // no steps — indistinguishable from an agent that published an
+                // empty one, which is the failure the approval arm above
+                // documents in its own words.
+                //
+                // No check on `explanation`: absent is ordinary there, since
+                // only Codex ever sends one.
+                let items = part.items.ok_or_else(|| invalid("missing items"))?;
+                serde_json::from_value::<Vec<comet_proto::ChecklistItem>>(items)
+                    .map_err(|err| invalid(&format!("invalid items: {err}")))?;
             }
             "text" => return Err(invalid("missing text")),
             "error" => return Err(invalid("missing message")),
@@ -1246,6 +1295,18 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
         doc_part.duration_ms.and_then(checked_i64),
     )?;
     set_or_clear_i64(map, "toolUses", doc_part.tool_uses.map(|v| v as i64))?;
+    // A checklist's `items` is the one field here that must mirror the part
+    // EXACTLY rather than accumulate: a `ChecklistReplaced` legitimately
+    // shrinks the list, and an insert-only write would leave a step the plan
+    // dropped sitting in the doc forever — the same defect the fold's
+    // replace-don't-merge rule exists to prevent, re-entered one layer down.
+    if let Some(items) = &doc_part.items {
+        map.insert("items", loro_value_from_json(items))?;
+    }
+    // `explanation` is nullable in principle and monotonic in practice (the
+    // fold preserves the last one rather than clearing it), so set-or-clear
+    // simply mirrors whatever the part holds.
+    set_or_clear(map, "explanation", doc_part.explanation.as_deref())?;
     if let Some(occurrences) = doc_part.occurrences {
         map.insert("occurrences", occurrences as i64)?;
     }
@@ -2237,6 +2298,54 @@ mod tests {
                 total_tokens: Some(20_044),
                 duration_ms: Some(4_906),
                 tool_uses: Some(1),
+            }],
+            "{parts:?}"
+        );
+        doc.validate_strict().unwrap();
+    }
+
+    /// A checklist survives the write with its tri-state intact, including the
+    /// text-less item a resumed run produces — the case `text: Option<String>`
+    /// exists for. `None` must persist as absent and read back as `None`,
+    /// never as `Some("")`, which a reader would draw as a blank row.
+    #[test]
+    fn a_checklist_part_round_trips_including_a_text_less_item() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let items = vec![
+            comet_proto::ChecklistItem {
+                id: "1".into(),
+                text: Some("Read the file".into()),
+                active_form: None,
+                status: comet_proto::ChecklistStatus::Completed,
+            },
+            comet_proto::ChecklistItem {
+                id: "2".into(),
+                text: None,
+                active_form: Some("Counting the lines".into()),
+                status: comet_proto::ChecklistStatus::InProgress,
+            },
+        ];
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Checklist {
+                id: "checklist".into(),
+                explanation: Some("Moved to the line count.".into()),
+                items: items.clone(),
+            }],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+        let parts = doc.read_entries().unwrap()[0].parts.clone();
+        assert_eq!(
+            parts,
+            vec![MessagePart::Checklist {
+                id: "checklist".into(),
+                explanation: Some("Moved to the line count.".into()),
+                items,
             }],
             "{parts:?}"
         );
