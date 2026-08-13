@@ -1,11 +1,12 @@
 //! Frame → [`AgentEvent`] normalization, ported from claude.ts's `normalize`
 //! (init dedupe, subagent filtering, tool decoding, error-code mapping).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 
 use comet_proto::{
     AgentEvent, ChecklistItem, ChecklistStatus, DiagnosticSeverity, DoneStatus, HarnessId,
-    NoticeKind, NoticeSeverity, RuntimeMode, SubagentStatus, ToolCall,
+    NoticeKind, NoticeSeverity, RuntimeMode, SubagentStatus, TOOL_DIFF_PATH_MAX_BYTES,
+    TOOL_DIFF_SOURCE_MAX_BYTES, ToolCall, ToolDiff,
 };
 use serde_json::Value;
 
@@ -242,6 +243,100 @@ fn subagent_result_from_tool_use_result(value: &Value) -> Option<SubagentToolRes
         tool_uses,
         duration_ms,
     })
+}
+
+const MAX_PENDING_FILE_CALLS: usize = 256;
+
+enum PendingFileCall {
+    Candidate(ToolCall),
+    Ambiguous,
+}
+
+/// A pending call has to be small enough to become a complete diff before it
+/// enters correlation state. The result is not available yet, so bound every
+/// source field it does carry independently.
+fn pending_file_call_fits_limits(call: &ToolCall) -> bool {
+    let path_fits = |path: &str| !path.is_empty() && path.len() <= TOOL_DIFF_PATH_MAX_BYTES;
+    match call {
+        ToolCall::WriteFile {
+            path,
+            content: Some(content),
+        } => path_fits(path) && content.len() <= TOOL_DIFF_SOURCE_MAX_BYTES,
+        ToolCall::EditFile {
+            path,
+            old_string: Some(old_string),
+            new_string: Some(new_string),
+        } => {
+            path_fits(path)
+                && old_string.len() <= TOOL_DIFF_SOURCE_MAX_BYTES
+                && new_string.len() <= TOOL_DIFF_SOURCE_MAX_BYTES
+        }
+        _ => false,
+    }
+}
+
+/// Builds a diff only when one observed Claude result proves the complete
+/// source pair for its matching Write or Edit call.
+fn complete_tool_diff(call: &ToolCall, result: &Value) -> Option<ToolDiff> {
+    if result.get("userModified").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let file_path = result.get("filePath").and_then(Value::as_str)?;
+    if file_path.is_empty() {
+        return None;
+    }
+
+    let diff = match call {
+        ToolCall::WriteFile {
+            path,
+            content: Some(content),
+        } if path == file_path => ToolDiff {
+            path: path.clone(),
+            old_text: match result.get("originalFile") {
+                Some(Value::String(original)) => Some(original.clone()),
+                Some(Value::Null) => None,
+                _ => return None,
+            },
+            new_text: content.clone(),
+        },
+        ToolCall::EditFile {
+            path,
+            old_string: Some(old_string),
+            new_string: Some(new_string),
+        } if path == file_path => {
+            let original = result.get("originalFile").and_then(Value::as_str)?;
+            let mut occurrences = original.match_indices(old_string);
+            occurrences.next()?;
+            if occurrences.next().is_some() {
+                return None;
+            }
+            ToolDiff {
+                path: path.clone(),
+                old_text: Some(original.to_owned()),
+                new_text: original.replacen(old_string, new_string, 1),
+            }
+        }
+        _ => return None,
+    };
+    diff.fits_inline_limits().then_some(diff)
+}
+
+/// Counts `tool_result` objects before tolerant content-block decoding, which
+/// deliberately drops malformed blocks. Every recoverable id is retained so
+/// malformed batches still consume correlation state rather than leaking it.
+fn raw_tool_results(content: &Value) -> (usize, Vec<String>) {
+    let mut count = 0;
+    let mut ids = Vec::new();
+    for block in content.as_array().into_iter().flatten() {
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        count += 1;
+        if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+            ids.push(id.to_owned());
+        }
+    }
+    (count, ids)
 }
 
 /// Which task tool a held call was, so its result is read the right way.
@@ -560,6 +655,9 @@ pub(crate) struct Normalizer {
     /// entry for the life of the run, which is why this is per-run state and
     /// not per-session.
     pending_task_calls: HashMap<String, (TaskCallKind, Value)>,
+    /// Write/Edit calls with complete source inputs, awaiting the one sibling
+    /// `tool_use_result` that can prove their complete old/new pair.
+    pending_file_calls: HashMap<String, PendingFileCall>,
 }
 
 impl Normalizer {
@@ -571,6 +669,7 @@ impl Normalizer {
             runtime_mode,
             subagent_progress: HashMap::new(),
             pending_task_calls: HashMap::new(),
+            pending_file_calls: HashMap::new(),
         }
     }
 
@@ -806,6 +905,27 @@ impl Normalizer {
                         self.pending_task_calls
                             .insert(b.id.clone(), (kind, b.input.clone()));
                     }
+                    if b.kind == "tool_use" {
+                        let call = decode_tool_use(&b.name, &b.input);
+                        let at_cap = self.pending_file_calls.len() == MAX_PENDING_FILE_CALLS;
+                        match self.pending_file_calls.entry(b.id.clone()) {
+                            Entry::Occupied(mut entry) => {
+                                entry.insert(PendingFileCall::Ambiguous);
+                            }
+                            Entry::Vacant(entry) if pending_file_call_fits_limits(&call) => {
+                                if at_cap {
+                                    tracing::debug!(
+                                        target: "comet_harness::claude",
+                                        tool_use_id = %b.id,
+                                        "pending file-call correlation limit reached"
+                                    );
+                                } else {
+                                    entry.insert(PendingFileCall::Candidate(call));
+                                }
+                            }
+                            Entry::Vacant(_) => {}
+                        }
+                    }
                 }
                 let mut out: Vec<AgentEvent> = f
                     .message
@@ -837,13 +957,49 @@ impl Normalizer {
                 if f.parent_tool_use_id.is_some() {
                     return Vec::new();
                 }
-                let mut out: Vec<AgentEvent> = f
+                let (raw_tool_results, raw_tool_result_ids) = raw_tool_results(&f.message.content);
+                let pending_file_call = if raw_tool_results == 1 {
+                    raw_tool_result_ids
+                        .first()
+                        .and_then(|id| self.pending_file_calls.remove(id))
+                } else {
+                    for id in &raw_tool_result_ids {
+                        self.pending_file_calls.remove(id);
+                    }
+                    None
+                };
+                let tool_result_blocks: Vec<_> = f
                     .message
                     .blocks()
                     .filter(|b: &ContentBlock| b.kind == "tool_result")
-                    .map(|b| AgentEvent::ToolResult {
-                        id: b.tool_use_id.clone(),
-                        is_error: b.is_error.unwrap_or(false),
+                    .collect();
+                let one_result = raw_tool_results == 1 && tool_result_blocks.len() == 1;
+                let mut out: Vec<AgentEvent> = tool_result_blocks
+                    .iter()
+                    .map(|b| {
+                        let is_error = b.is_error.unwrap_or(false);
+                        let diff = (one_result && !is_error)
+                            .then(|| {
+                                pending_file_call
+                                    .as_ref()
+                                    .and_then(|call| match call {
+                                        PendingFileCall::Candidate(call) => Some(call),
+                                        PendingFileCall::Ambiguous => None,
+                                    })
+                                    .and_then(|call| {
+                                        f.tool_use_result
+                                            .as_ref()
+                                            .and_then(|result| complete_tool_diff(call, result))
+                                    })
+                            })
+                            .flatten();
+                        AgentEvent::ToolResult {
+                            id: b.tool_use_id.clone(),
+                            is_error,
+                            diff,
+                            diff_ref: None,
+                            diff_stats: None,
+                        }
                     })
                     .collect();
                 // Join the `tool_result` back to the `Task*` call it answers.
@@ -856,18 +1012,14 @@ impl Normalizer {
                 // build ever batches two, applying one result to both would
                 // silently stamp one call with the other's id and status.
                 //
-                // So a batched frame correlates NOTHING. The pending entries
+                // So a batched frame correlates NOTHING. Task pending entries
                 // stay pending rather than being consumed against a result
                 // that may not be theirs: a missing mutation is recoverable
                 // (the next frame for that task still lands) while a wrong one
                 // is not. If this ever fires in practice the fix is upstream —
                 // the frame would need per-block results to be decodable at
                 // all.
-                let tool_results = f
-                    .message
-                    .blocks()
-                    .filter(|b: &ContentBlock| b.kind == "tool_result")
-                    .count();
+                let tool_results = tool_result_blocks.len();
                 for b in f.message.blocks().filter(|_| tool_results == 1) {
                     if b.kind != "tool_result" {
                         continue;
@@ -2120,6 +2272,268 @@ mod tests {
 
     const CHECKLIST: &str = "claude/2.1.229/checklist";
     const CHECKLIST_RESUME: &str = "claude/2.1.229/checklist-resume";
+
+    // ---- exact file diffs (local tool-diff sidecar, task 4) ----
+
+    #[test]
+    fn captured_claude_write_result_carries_the_complete_new_file() {
+        let events = corpus_run("claude/2.1.228/approval", &[100, 104]);
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut normalizer, &events);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult {
+                diff: Some(comet_proto::ToolDiff { old_text: None, new_text, .. }),
+                ..
+            } if new_text == "capture\n"
+        )));
+    }
+
+    #[test]
+    fn claude_result_without_typed_result_never_invents_a_diff() {
+        let write_call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"a.rs","content":"fn main() {}\n"}}]},"parent_tool_use_id":null}"#;
+        let result_without_typed_result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"ok"}]},"parent_tool_use_id":null}"#;
+        let events = drive(
+            &mut Normalizer::new(RuntimeMode::default()),
+            &[write_call, result_without_typed_result],
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::ToolResult { diff: Some(_), .. }))
+        );
+    }
+
+    #[test]
+    fn claude_result_without_user_modified_never_invents_a_diff() {
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"a.rs","content":"new\n"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"ok"}]},"parent_tool_use_id":null,"tool_use_result":{"filePath":"a.rs","originalFile":null}}"#;
+        let events = drive(
+            &mut Normalizer::new(RuntimeMode::default()),
+            &[call, result],
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::ToolResult { diff: Some(_), .. }))
+        );
+    }
+
+    #[test]
+    fn claude_user_modified_write_never_carries_a_diff() {
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"a.rs","content":"new\n"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"ok"}]},"parent_tool_use_id":null,"tool_use_result":{"userModified":true,"filePath":"a.rs","originalFile":null}}"#;
+        let events = drive(
+            &mut Normalizer::new(RuntimeMode::default()),
+            &[call, result],
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::ToolResult { diff: Some(_), .. }))
+        );
+    }
+
+    #[test]
+    fn claude_errored_write_never_carries_a_diff() {
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"a.rs","content":"new\n"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","is_error":true,"content":"failed"}]},"parent_tool_use_id":null,"tool_use_result":{"userModified":false,"filePath":"a.rs","originalFile":null}}"#;
+        let events = drive(
+            &mut Normalizer::new(RuntimeMode::default()),
+            &[call, result],
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::ToolResult { diff: Some(_), .. }))
+        );
+    }
+
+    #[test]
+    fn claude_write_result_with_a_different_path_never_carries_a_diff() {
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"a.rs","content":"new\n"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"ok"}]},"parent_tool_use_id":null,"tool_use_result":{"userModified":false,"filePath":"b.rs","originalFile":null}}"#;
+        let events = drive(
+            &mut Normalizer::new(RuntimeMode::default()),
+            &[call, result],
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::ToolResult { diff: Some(_), .. }))
+        );
+    }
+
+    #[test]
+    fn claude_sibling_result_is_ambiguous_for_two_tool_results() {
+        let calls = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"a.rs","content":"a\n"}},{"type":"tool_use","id":"t2","name":"Write","input":{"file_path":"b.rs","content":"b\n"}}]},"parent_tool_use_id":null}"#;
+        let results = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"ok"},{"tool_use_id":"t2","type":"tool_result","content":"ok"}]},"parent_tool_use_id":null,"tool_use_result":{"userModified":false,"filePath":"a.rs","originalFile":null}}"#;
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut normalizer, &[calls, results]);
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::ToolResult { diff: Some(_), .. }))
+        );
+        assert!(normalizer.pending_file_calls.is_empty());
+    }
+
+    #[test]
+    fn claude_edit_with_one_old_string_occurrence_carries_the_complete_file() {
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"a.rs","old_string":"old","new_string":"new"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"ok"}]},"parent_tool_use_id":null,"tool_use_result":{"userModified":false,"filePath":"a.rs","originalFile":"before old after"}}"#;
+        let events = drive(
+            &mut Normalizer::new(RuntimeMode::default()),
+            &[call, result],
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult {
+                diff: Some(comet_proto::ToolDiff { old_text: Some(old_text), new_text, .. }),
+                ..
+            } if old_text == "before old after" && new_text == "before new after"
+        )));
+    }
+
+    #[test]
+    fn claude_edit_with_repeated_old_string_never_carries_a_diff() {
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"a.rs","old_string":"same","new_string":"new"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"ok"}]},"parent_tool_use_id":null,"tool_use_result":{"userModified":false,"filePath":"a.rs","originalFile":"same and same"}}"#;
+        let events = drive(
+            &mut Normalizer::new(RuntimeMode::default()),
+            &[call, result],
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::ToolResult { diff: Some(_), .. }))
+        );
+    }
+
+    #[test]
+    fn claude_oversized_write_is_not_retained_for_a_future_diff() {
+        let content = "x".repeat(comet_proto::TOOL_DIFF_SOURCE_MAX_BYTES + 1);
+        let call = json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "t1", "name": "Write",
+                "input": {"file_path": "a.rs", "content": content},
+            }]},
+            "parent_tool_use_id": null,
+        })
+        .to_string();
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"ok"}]},"parent_tool_use_id":null,"tool_use_result":{"userModified":false,"filePath":"a.rs","originalFile":null}}"#;
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut normalizer, &[call, result.to_string()]);
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::ToolResult { diff: Some(_), .. }))
+        );
+        assert!(normalizer.pending_file_calls.is_empty());
+    }
+
+    #[test]
+    fn claude_pending_file_calls_stop_at_the_cap() {
+        let calls: Vec<_> = (0..257)
+            .map(|n| {
+                json!({
+                    "type": "tool_use",
+                    "id": format!("t{n}"),
+                    "name": "Write",
+                    "input": {"file_path": format!("{n}.rs"), "content": "new\n"},
+                })
+            })
+            .collect();
+        let call_frame = json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": calls},
+            "parent_tool_use_id": null,
+        })
+        .to_string();
+        let stored_result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t255","type":"tool_result","content":"ok"}]},"parent_tool_use_id":null,"tool_use_result":{"userModified":false,"filePath":"255.rs","originalFile":null}}"#;
+        let rejected_result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t256","type":"tool_result","content":"ok"}]},"parent_tool_use_id":null,"tool_use_result":{"userModified":false,"filePath":"256.rs","originalFile":null}}"#;
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+        let events = drive(
+            &mut normalizer,
+            &[
+                call_frame,
+                stored_result.to_string(),
+                rejected_result.to_string(),
+            ],
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { id, diff: Some(_), .. } if id == "t255"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { id, diff: None, .. } if id == "t256"
+        )));
+    }
+
+    #[test]
+    fn duplicate_pending_file_call_id_is_ambiguous_below_the_cap() {
+        let calls = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"a.rs","content":"first\n"}},{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"a.rs","content":"second\n"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"ok"}]},"parent_tool_use_id":null,"tool_use_result":{"userModified":false,"filePath":"a.rs","originalFile":null}}"#;
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut normalizer, &[calls, result]);
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::ToolResult { diff: Some(_), .. }))
+        );
+        assert!(normalizer.pending_file_calls.is_empty());
+    }
+
+    #[test]
+    fn duplicate_pending_file_call_id_is_ambiguous_at_the_cap() {
+        let mut calls: Vec<_> = (0..256)
+            .map(|n| {
+                json!({
+                    "type": "tool_use",
+                    "id": format!("t{n}"),
+                    "name": "Write",
+                    "input": {"file_path": format!("{n}.rs"), "content": "first\n"},
+                })
+            })
+            .collect();
+        calls.push(json!({
+            "type": "tool_use",
+            "id": "t255",
+            "name": "Write",
+            "input": {"file_path": "255.rs", "content": "second\n"},
+        }));
+        let call_frame = json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": calls},
+            "parent_tool_use_id": null,
+        })
+        .to_string();
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t255","type":"tool_result","content":"ok"}]},"parent_tool_use_id":null,"tool_use_result":{"userModified":false,"filePath":"255.rs","originalFile":null}}"#;
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut normalizer, &[call_frame, result.to_string()]);
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::ToolResult { diff: Some(_), .. }))
+        );
+        assert!(!normalizer.pending_file_calls.contains_key("t255"));
+    }
+
+    #[test]
+    fn malformed_sibling_tool_result_makes_the_batch_ambiguous_and_cleans_up() {
+        let calls = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"a.rs","content":"a\n"}},{"type":"tool_use","id":"t2","name":"Write","input":{"file_path":"b.rs","content":"b\n"}}]},"parent_tool_use_id":null}"#;
+        let results = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"ok"},{"tool_use_id":"t2","type":"tool_result","is_error":"invalid","content":"malformed"}]},"parent_tool_use_id":null,"tool_use_result":{"userModified":false,"filePath":"a.rs","originalFile":null}}"#;
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut normalizer, &[calls, results]);
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::ToolResult { diff: Some(_), .. }))
+        );
+        assert!(normalizer.pending_file_calls.is_empty());
+    }
 
     /// `TaskCreate`'s `tool_use_result` carries the assigned task id and its
     /// subject; the id appears nowhere on the tool input, so a decode reading

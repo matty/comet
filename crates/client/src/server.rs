@@ -43,9 +43,27 @@ struct GenericCall {
     reply: Option<tokio::sync::oneshot::Sender<Result<serde_json::Value, RpcError>>>,
 }
 
+impl GenericCall {
+    /// A `Request` whose caller stopped waiting must not occupy the generic
+    /// lane. Fire-and-forget `Call`s intentionally have no receiver.
+    fn receiver_is_closed(&self) -> bool {
+        self.reply.as_ref().is_some_and(|reply| reply.is_closed())
+    }
+}
+
 struct ActiveCall {
     future: BoxFuture<'static, Result<serde_json::Value, RpcError>>,
     reply: Option<tokio::sync::oneshot::Sender<Result<serde_json::Value, RpcError>>>,
+}
+
+enum ActiveCallEvent {
+    Completed(Result<serde_json::Value, RpcError>),
+    Canceled,
+}
+
+enum TranscriptReplacementWait<T> {
+    Ready(T),
+    Restart,
 }
 
 enum SubscriptionSetupResult {
@@ -93,11 +111,74 @@ fn start_call(client: Arc<RpcClient>, call: GenericCall) -> ActiveCall {
     }
 }
 
-async fn active_call_next(active: &mut Option<ActiveCall>) -> Result<serde_json::Value, RpcError> {
+async fn active_call_next(active: &mut Option<ActiveCall>) -> ActiveCallEvent {
     match active {
-        Some(call) => call.future.as_mut().await,
+        Some(call) => {
+            if let Some(reply) = call.reply.as_mut() {
+                tokio::select! {
+                    result = call.future.as_mut() => ActiveCallEvent::Completed(result),
+                    _ = reply.closed() => ActiveCallEvent::Canceled,
+                }
+            } else {
+                ActiveCallEvent::Completed(call.future.as_mut().await)
+            }
+        }
         None => futures::future::pending().await,
     }
+}
+
+/// Start the first FIFO call whose requester still awaits a reply. Closed
+/// `Request`s are work the caller explicitly no longer needs; plain `Call`s
+/// always remain eligible.
+fn promote_queued_call(
+    client: Arc<RpcClient>,
+    queued_calls: &mut VecDeque<GenericCall>,
+) -> Option<ActiveCall> {
+    while let Some(call) = queued_calls.pop_front() {
+        if call.receiver_is_closed() {
+            continue;
+        }
+        return Some(start_call(client, call));
+    }
+    None
+}
+
+/// Keep FIFO order for runnable work while releasing bounded admission slots
+/// as soon as their Request callers stop waiting. Plain Calls have no reply
+/// receiver and are therefore always retained.
+fn prune_closed_queued_calls(queued_calls: &mut VecDeque<GenericCall>) {
+    queued_calls.retain(|call| !call.receiver_is_closed());
+}
+
+fn finish_active_call(
+    event: ActiveCallEvent,
+    active_call: &mut Option<ActiveCall>,
+    queued_calls: &mut VecDeque<GenericCall>,
+    client: &Arc<RpcClient>,
+    server_id: &comet_proto::ServerId,
+    events: &mpsc::UnboundedSender<FederationEvent>,
+) {
+    let finished = active_call.take().expect("active call resolved");
+    match event {
+        ActiveCallEvent::Completed(result) => {
+            if let Some(reply) = finished.reply {
+                let _ = reply.send(result);
+            } else if let Err(error) = result {
+                let _ = events.send(FederationEvent::Notice {
+                    server_id: server_id.clone(),
+                    message: error.to_string(),
+                });
+            }
+        }
+        ActiveCallEvent::Canceled => {
+            // The federation oneshot receiver closed (UI timeout, owner
+            // change, or row removal). Dropping the live future triggers
+            // RpcClient's PendingGuard cancellation before the next queued
+            // request enters the generic lane.
+            drop(finished);
+        }
+    }
+    *active_call = promote_queued_call(client.clone(), queued_calls);
 }
 
 fn decode<T: serde::de::DeserializeOwned>(
@@ -236,6 +317,97 @@ async fn replace_transcript(
     }
 }
 
+struct ConnectedTranscriptReplacement<'a> {
+    client: Arc<RpcClient>,
+    server_id: &'a comet_proto::ServerId,
+    commands: &'a mut mpsc::UnboundedReceiver<SupervisorCommand>,
+    selected_chat: &'a mut Option<String>,
+    events: &'a mpsc::UnboundedSender<FederationEvent>,
+    active_call: &'a mut Option<ActiveCall>,
+    queued_calls: &'a mut VecDeque<GenericCall>,
+}
+
+/// Wait for one connected transcript replacement while keeping the generic
+/// lane cancelable. Both a WatchTranscript change and a desynced stream use
+/// this wait, so an owner-driven caller drop cannot be hidden behind either
+/// subscription setup.
+async fn wait_for_transcript_replacement<T>(
+    operation: impl std::future::Future<Output = Result<T, RpcError>>,
+    replacement: &mut ConnectedTranscriptReplacement<'_>,
+) -> Result<Phase<TranscriptReplacementWait<T>>, RpcError> {
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            result = &mut operation => return result.map(|value| Phase::Ready(TranscriptReplacementWait::Ready(value))),
+            event = active_call_next(replacement.active_call) => {
+                finish_active_call(
+                    event,
+                    replacement.active_call,
+                    replacement.queued_calls,
+                    &replacement.client,
+                    replacement.server_id,
+                    replacement.events,
+                );
+            }
+            command = replacement.commands.recv() => match command {
+                Some(SupervisorCommand::Reconnect) => return Ok(Phase::Exit(ConnectedExit::Reconnect)),
+                Some(SupervisorCommand::Shutdown) | None => return Ok(Phase::Exit(ConnectedExit::Shutdown)),
+                Some(SupervisorCommand::WatchTranscript { chat_id, acknowledged }) => {
+                    *replacement.selected_chat = chat_id;
+                    if let Some(acknowledged) = acknowledged { let _ = acknowledged.send(()); }
+                    return Ok(Phase::Ready(TranscriptReplacementWait::Restart));
+                }
+                Some(SupervisorCommand::Call(method, _)) => {
+                    let _ = replacement.events.send(FederationEvent::Notice {
+                        server_id: replacement.server_id.clone(),
+                        message: format!("cannot call {method} while transcript subscription is changing"),
+                    });
+                }
+                Some(SupervisorCommand::Request { method, reply, .. }) => {
+                    let _ = reply.send(Err(RpcError::Failed(format!("cannot call {method} while transcript subscription is changing"))));
+                }
+                Some(SupervisorCommand::Subscribe { method, reply, .. }) => {
+                    let _ = reply.send(Err(RpcError::Failed(format!("cannot subscribe to {method} while transcript subscription is changing"))));
+                }
+            }
+        }
+    }
+}
+
+async fn replace_transcript_while_connected(
+    client: &Arc<RpcClient>,
+    server_id: &comet_proto::ServerId,
+    commands: &mut mpsc::UnboundedReceiver<SupervisorCommand>,
+    selected_chat: &mut Option<String>,
+    events: &mpsc::UnboundedSender<FederationEvent>,
+    active_call: &mut Option<ActiveCall>,
+    queued_calls: &mut VecDeque<GenericCall>,
+) -> Result<Phase<Option<TranscriptSubscription>>, RpcError> {
+    let mut replacement = ConnectedTranscriptReplacement {
+        client: client.clone(),
+        server_id,
+        commands,
+        selected_chat,
+        events,
+        active_call,
+        queued_calls,
+    };
+    loop {
+        let Some(chat_id) = replacement.selected_chat.clone() else {
+            return Ok(Phase::Ready(None));
+        };
+        let operation_client = replacement.client.clone();
+        let operation = subscribe_transcript(&operation_client, replacement.server_id, &chat_id);
+        match wait_for_transcript_replacement(operation, &mut replacement).await? {
+            Phase::Ready(TranscriptReplacementWait::Ready(transcript)) => {
+                return Ok(Phase::Ready(Some(transcript)));
+            }
+            Phase::Ready(TranscriptReplacementWait::Restart) => continue,
+            Phase::Exit(exit) => return Ok(Phase::Exit(exit)),
+        }
+    }
+}
+
 pub(crate) async fn supervise_connected(
     client: Arc<RpcClient>,
     hello: ServerHello,
@@ -293,12 +465,14 @@ pub(crate) async fn supervise_connected(
                 let Some(active) = transcript.as_mut() else { continue; };
                 if let Err(error) = apply_transcript_value(&mut active.entries, value) {
                     tracing::warn!(chat = ?active.chat, %error, "resubscribing desynced transcript");
-                    transcript = match replace_transcript(
+                    transcript = match replace_transcript_while_connected(
                         &client,
                         &hello.server_id,
                         commands,
                         selected_chat,
                         &events,
+                        &mut active_call,
+                        &mut queued_calls,
                     ).await? {
                         Phase::Ready(transcript) => transcript,
                         Phase::Exit(exit) => return Ok(exit),
@@ -311,19 +485,15 @@ pub(crate) async fn supervise_connected(
                 });
                 continue;
             }
-            result = active_call_next(&mut active_call) => {
-                let finished = active_call.take().expect("active call completed");
-                if let Some(reply) = finished.reply {
-                    let _ = reply.send(result);
-                } else if let Err(error) = result {
-                    let _ = events.send(FederationEvent::Notice {
-                        server_id: hello.server_id.clone(),
-                        message: error.to_string(),
-                    });
-                }
-                active_call = queued_calls
-                    .pop_front()
-                    .map(|call| start_call(client.clone(), call));
+            event = active_call_next(&mut active_call) => {
+                finish_active_call(
+                    event,
+                    &mut active_call,
+                    &mut queued_calls,
+                    &client,
+                    &hello.server_id,
+                    &events,
+                );
                 continue;
             }
             setup = subscription_setup_next(&mut subscription_setups) => {
@@ -364,28 +534,36 @@ pub(crate) async fn supervise_connected(
                     let call = GenericCall { method, params, reply: None };
                     if active_call.is_none() {
                         active_call = Some(start_call(client.clone(), call));
-                    } else if queued_calls.len() < MAX_QUEUED_CALLS {
-                        queued_calls.push_back(call);
                     } else {
-                        let _ = events.send(FederationEvent::Notice {
-                            server_id: hello.server_id.clone(),
-                            message: format!(
-                                "cannot call {method}: generic RPC queue is full ({MAX_QUEUED_CALLS})"
-                            ),
-                        });
+                        prune_closed_queued_calls(&mut queued_calls);
+                        if queued_calls.len() < MAX_QUEUED_CALLS {
+                            queued_calls.push_back(call);
+                        } else {
+                            let _ = events.send(FederationEvent::Notice {
+                                server_id: hello.server_id.clone(),
+                                message: format!(
+                                    "cannot call {method}: generic RPC queue is full ({MAX_QUEUED_CALLS})"
+                                ),
+                            });
+                        }
                     }
                     continue;
                 }
                 Some(SupervisorCommand::Request { method, params, reply }) => {
                     let call = GenericCall { method, params, reply: Some(reply) };
-                    if active_call.is_none() {
+                    if call.receiver_is_closed() {
+                        continue;
+                    } else if active_call.is_none() {
                         active_call = Some(start_call(client.clone(), call));
-                    } else if queued_calls.len() < MAX_QUEUED_CALLS {
-                        queued_calls.push_back(call);
-                    } else if let Some(reply) = call.reply {
-                        let _ = reply.send(Err(RpcError::Failed(format!(
-                            "cannot call {method}: generic RPC queue is full ({MAX_QUEUED_CALLS})"
-                        ))));
+                    } else {
+                        prune_closed_queued_calls(&mut queued_calls);
+                        if queued_calls.len() < MAX_QUEUED_CALLS {
+                            queued_calls.push_back(call);
+                        } else if let Some(reply) = call.reply {
+                            let _ = reply.send(Err(RpcError::Failed(format!(
+                                "cannot call {method}: generic RPC queue is full ({MAX_QUEUED_CALLS})"
+                            ))));
+                        }
                     }
                     continue;
                 }
@@ -414,12 +592,14 @@ pub(crate) async fn supervise_connected(
                         let _ = events.send(FederationEvent::Transcript { chat: old.chat, entries: Vec::new() });
                     }
                     *selected_chat = chat_id;
-                    transcript = match replace_transcript(
+                    transcript = match replace_transcript_while_connected(
                         &client,
                         &hello.server_id,
                         commands,
                         selected_chat,
                         &events,
+                        &mut active_call,
+                        &mut queued_calls,
                     )
                     .await? {
                         Phase::Ready(transcript) => transcript,
@@ -476,7 +656,10 @@ mod tests {
     use comet_proto::{PROTOCOL_VERSION, ServerId};
     use comet_rpc::{RpcReply, RpcService};
     use futures::StreamExt;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
 
     #[test]
     fn transcript_wire_frames_materialize_in_the_server_copy() {
@@ -525,6 +708,22 @@ mod tests {
         }
     }
 
+    struct FirstPollPending {
+        first_polled: Arc<tokio::sync::Notify>,
+        polled: Arc<AtomicBool>,
+    }
+
+    impl Future for FirstPollPending {
+        type Output = Result<(), RpcError>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if !self.polled.swap(true, Ordering::SeqCst) {
+                self.first_polled.notify_one();
+            }
+            Poll::Pending
+        }
+    }
+
     struct StalledService {
         stalled_method: &'static str,
         started: Arc<tokio::sync::Notify>,
@@ -535,6 +734,14 @@ mod tests {
         first_started: Arc<tokio::sync::Notify>,
         release_first: Arc<tokio::sync::Notify>,
         second_started: Arc<tokio::sync::Notify>,
+    }
+
+    struct CancellationService {
+        block_started: Arc<tokio::sync::Notify>,
+        block_dropped: Arc<AtomicBool>,
+        first_started: Arc<tokio::sync::Notify>,
+        release_first: Arc<tokio::sync::Notify>,
+        queued_started: Arc<AtomicUsize>,
     }
 
     struct QuietSubscriptionService {
@@ -617,6 +824,47 @@ mod tests {
                         .boxed(),
                 )),
                 "FailStream" => Err(RpcError::Failed("stream failure".into())),
+                other => Err(RpcError::UnknownMethod(other.into())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RpcService for CancellationService {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            match method {
+                methods::WATCH_DEVICES
+                | methods::WATCH_SPACES
+                | methods::WATCH_CHATS
+                | methods::WATCH_SESSIONS => Ok(RpcReply::Stream(
+                    futures::stream::once(async { serde_json::json!([]) })
+                        .chain(futures::stream::pending())
+                        .boxed(),
+                )),
+                "Block" => {
+                    let guard = DropFlag(self.block_dropped.clone());
+                    self.block_started.notify_one();
+                    futures::future::pending::<()>().await;
+                    #[allow(unreachable_code)]
+                    {
+                        drop(guard);
+                        unreachable!()
+                    }
+                }
+                "First" => {
+                    self.first_started.notify_one();
+                    self.release_first.notified().await;
+                    RpcReply::value(&true)
+                }
+                "Queued" => {
+                    self.queued_started.fetch_add(1, Ordering::SeqCst);
+                    RpcReply::value(&true)
+                }
+                "Next" => RpcReply::value(&true),
                 other => Err(RpcError::UnknownMethod(other.into())),
             }
         }
@@ -728,6 +976,24 @@ mod tests {
             release_first,
             second_started,
         )
+    }
+
+    fn spawn_cancellation_service() -> (
+        SupervisorTask,
+        mpsc::UnboundedSender<SupervisorCommand>,
+        mpsc::UnboundedReceiver<FederationEvent>,
+        Arc<CancellationService>,
+    ) {
+        let service = Arc::new(CancellationService {
+            block_started: Arc::new(tokio::sync::Notify::new()),
+            block_dropped: Arc::new(AtomicBool::new(false)),
+            first_started: Arc::new(tokio::sync::Notify::new()),
+            release_first: Arc::new(tokio::sync::Notify::new()),
+            queued_started: Arc::new(AtomicUsize::new(0)),
+        });
+        let client = comet_rpc::memory_client(service.clone());
+        let (task, commands, events) = spawn_with_client(client);
+        (task, commands, events, service)
     }
 
     fn backpressured_client(capacity: usize, prefill: usize) -> RpcClient {
@@ -973,6 +1239,338 @@ mod tests {
         commands.send(SupervisorCommand::Reconnect).unwrap();
         assert!(matches!(received.await.unwrap(), Err(RpcError::Closed)));
         assert!(matches!(task.await, Ok(Ok(ConnectedExit::Reconnect))));
+    }
+
+    #[tokio::test]
+    async fn closing_an_active_request_cancels_server_work_and_promotes_the_next_request() {
+        let (task, commands, mut events, service) = spawn_cancellation_service();
+        wait_online(&mut events).await;
+
+        let (reply, received) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Request {
+                method: "Block",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            service.block_started.notified(),
+        )
+        .await
+        .expect("active request never reached the server");
+        drop(received);
+
+        let (reply, next) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Request {
+                method: "Next",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            while !service.block_dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closing the federation request did not cancel server work");
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), next)
+                .await
+                .expect("next request remained behind the cancelled request")
+                .expect("next request reply sender closed")
+                .expect("next request failed"),
+            serde_json::json!(true)
+        );
+
+        commands.send(SupervisorCommand::Shutdown).unwrap();
+        assert!(matches!(task.await, Ok(Ok(ConnectedExit::Shutdown))));
+    }
+
+    #[tokio::test]
+    async fn active_request_cancels_and_promotes_while_transcript_replacement_waits() {
+        let service = Arc::new(CancellationService {
+            block_started: Arc::new(tokio::sync::Notify::new()),
+            block_dropped: Arc::new(AtomicBool::new(false)),
+            first_started: Arc::new(tokio::sync::Notify::new()),
+            release_first: Arc::new(tokio::sync::Notify::new()),
+            queued_started: Arc::new(AtomicUsize::new(0)),
+        });
+        let client = Arc::new(comet_rpc::memory_client(service.clone()));
+        let (active_reply, active_receiver) = tokio::sync::oneshot::channel();
+        let mut active_call = Some(start_call(
+            client.clone(),
+            GenericCall {
+                method: "Block",
+                params: serde_json::Value::Null,
+                reply: Some(active_reply),
+            },
+        ));
+        let (next_reply, next_receiver) = tokio::sync::oneshot::channel();
+        let mut queued_calls = VecDeque::from([GenericCall {
+            method: "Next",
+            params: serde_json::Value::Null,
+            reply: Some(next_reply),
+        }]);
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (events, _event_rx) = mpsc::unbounded_channel();
+        let mut selected_chat = Some("chat-1".into());
+        let server_id = hello().server_id;
+        let replacement_first_polled = Arc::new(tokio::sync::Notify::new());
+        let replacement_polled = Arc::new(AtomicBool::new(false));
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            tokio::select! {
+                _ = active_call_next(&mut active_call) => panic!("blocking active request completed"),
+                _ = service.block_started.notified() => {}
+            }
+        })
+        .await
+        .expect("active request never reached the server");
+        assert!(
+            !service.block_dropped.load(Ordering::SeqCst),
+            "server work ended before the transcript replacement began"
+        );
+
+        let replacement_first_polled_for_task = replacement_first_polled.clone();
+        let replacement_polled_for_task = replacement_polled.clone();
+        let replacement = tokio::spawn(async move {
+            let mut context = ConnectedTranscriptReplacement {
+                client,
+                server_id: &server_id,
+                commands: &mut command_rx,
+                selected_chat: &mut selected_chat,
+                events: &events,
+                active_call: &mut active_call,
+                queued_calls: &mut queued_calls,
+            };
+            wait_for_transcript_replacement(
+                FirstPollPending {
+                    first_polled: replacement_first_polled_for_task,
+                    polled: replacement_polled_for_task,
+                },
+                &mut context,
+            )
+            .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            replacement_first_polled.notified(),
+        )
+        .await
+        .expect("transcript replacement did not begin waiting");
+        assert!(
+            replacement_polled.load(Ordering::SeqCst),
+            "transcript replacement was not pending before the federation receiver closed"
+        );
+        assert!(
+            !service.block_dropped.load(Ordering::SeqCst),
+            "server work ended before the federation receiver closed"
+        );
+        drop(active_receiver);
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            while !service.block_dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed active request survived the stalled transcript replacement");
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), next_receiver)
+                .await
+                .expect("queued request waited for the transcript replacement")
+                .expect("next request reply sender closed")
+                .expect("next request failed"),
+            serde_json::json!(true)
+        );
+
+        command_tx.send(SupervisorCommand::Shutdown).unwrap();
+        assert!(matches!(
+            replacement.await,
+            Ok(Ok(Phase::Exit(ConnectedExit::Shutdown)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn closing_a_queued_request_discards_it_before_starting_the_next_request() {
+        let (task, commands, mut events, service) = spawn_cancellation_service();
+        wait_online(&mut events).await;
+
+        let (reply, first) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Request {
+                method: "First",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            service.first_started.notified(),
+        )
+        .await
+        .expect("first request never reached the server");
+
+        let (reply, queued) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Request {
+                method: "Queued",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+        drop(queued);
+
+        let (reply, next) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Request {
+                method: "Next",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+        service.release_first.notify_one();
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), next)
+                .await
+                .expect("next request remained behind a closed queued request")
+                .expect("next request reply sender closed")
+                .expect("next request failed"),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            service.queued_started.load(Ordering::SeqCst),
+            0,
+            "closed queued request still reached the server"
+        );
+        assert_eq!(first.await.unwrap().unwrap(), serde_json::json!(true));
+
+        commands.send(SupervisorCommand::Shutdown).unwrap();
+        assert!(matches!(task.await, Ok(Ok(ConnectedExit::Shutdown))));
+    }
+
+    #[tokio::test]
+    async fn closed_queued_requests_do_not_consume_admission_capacity() {
+        let (task, commands, mut events, service) = spawn_cancellation_service();
+        wait_online(&mut events).await;
+
+        let (reply, first) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Request {
+                method: "First",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            service.first_started.notified(),
+        )
+        .await
+        .expect("first request never reached the server");
+
+        let mut canceled_receivers = Vec::new();
+        for _ in 0..MAX_QUEUED_CALLS {
+            let (reply, dropped) = tokio::sync::oneshot::channel();
+            commands
+                .send(SupervisorCommand::Request {
+                    method: "Queued",
+                    params: serde_json::Value::Null,
+                    reply,
+                })
+                .unwrap();
+            canceled_receivers.push(dropped);
+        }
+        let (acknowledged, ack) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::WatchTranscript {
+                chat_id: None,
+                acknowledged: Some(acknowledged),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(100), ack)
+            .await
+            .expect("canceled requests were not admitted before the fence")
+            .expect("transcript fence acknowledgment was dropped");
+        drop(canceled_receivers);
+        let (reply, next) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::Request {
+                method: "Next",
+                params: serde_json::Value::Null,
+                reply,
+            })
+            .unwrap();
+        let (acknowledged, next_admitted) = tokio::sync::oneshot::channel();
+        commands
+            .send(SupervisorCommand::WatchTranscript {
+                chat_id: None,
+                acknowledged: Some(acknowledged),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(100), next_admitted)
+            .await
+            .expect("live request was not admitted before the release fence")
+            .expect("live-request admission fence acknowledgment was dropped");
+        service.release_first.notify_one();
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), next)
+                .await
+                .expect("live request was not admitted after canceled queued requests")
+                .expect("live request reply sender closed")
+                .expect("live request was rejected despite canceled queue entries"),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            service.queued_started.load(Ordering::SeqCst),
+            0,
+            "closed queued request reached the server"
+        );
+        assert_eq!(first.await.unwrap().unwrap(), serde_json::json!(true));
+
+        commands.send(SupervisorCommand::Shutdown).unwrap();
+        assert!(matches!(task.await, Ok(Ok(ConnectedExit::Shutdown))));
+    }
+
+    #[tokio::test]
+    async fn promoting_queued_requests_skips_a_closed_receiver_before_its_rpc_starts() {
+        let (client, _transport, mut outbound) = controllable_transport();
+        let (reply, closed) = tokio::sync::oneshot::channel();
+        drop(closed);
+        let (next_reply, _next) = tokio::sync::oneshot::channel();
+        let mut queued = VecDeque::from([
+            GenericCall {
+                method: "Queued",
+                params: serde_json::Value::Null,
+                reply: Some(reply),
+            },
+            GenericCall {
+                method: "Next",
+                params: serde_json::Value::Null,
+                reply: Some(next_reply),
+            },
+        ]);
+
+        let mut active = Some(
+            promote_queued_call(Arc::new(client), &mut queued)
+                .expect("next live queued request was not promoted"),
+        );
+        let task = tokio::spawn(async move { active_call_next(&mut active).await });
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(100), outbound.recv())
+            .await
+            .expect("promoted request did not reach the transport")
+            .expect("transport closed before the promoted request");
+        let frame: serde_json::Value = serde_json::from_str(&frame).expect("RPC frame is JSON");
+        assert_eq!(frame["method"], "Next");
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]

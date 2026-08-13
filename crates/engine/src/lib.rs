@@ -73,6 +73,10 @@ pub enum EngineError {
     Harness(#[from] comet_harness::HarnessError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// The workspace tombstone committed, but one local artifact cleanup leg
+    /// failed. Diagnostics stay in tracing and finalization will retry.
+    #[error("chat cleanup is pending retry")]
+    ChatCleanupPendingRetry,
     #[error("{0}")]
     Other(String),
 }

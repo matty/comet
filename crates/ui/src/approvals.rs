@@ -250,6 +250,8 @@ mod tests {
             },
             is_error: false,
             resolved,
+            diff_ref: None,
+            diff_stats: None,
         }
     }
 

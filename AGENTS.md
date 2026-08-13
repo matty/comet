@@ -8,6 +8,21 @@ this machine or on explicitly paired machines on the LAN. There is no account, h
 plane, or cloud sync. Read `ARCHITECTURE.md` for the trust and process boundaries and
 `docs/PARITY.md` for the implemented feature surface when a change touches either.
 
+## Local and LAN authority model
+
+The engine that owns a data directory is authoritative for its spaces, chats,
+sessions, agent processes and durable state, whether it is embedded by Desktop
+or running headless. A paired LAN client is a trusted remote controller, not a
+read-only client and not a data replica: its allowed operations execute on the
+host engine, and durable results stay in that engine's local store.
+
+`comet-client` federates separately scoped server buckets in the UI. It does not
+merge engine stores, persist a remote's child state locally, or inherit a remote
+engine's own remote registry. Equal entity ids on different servers are distinct.
+When a remote disconnects, its child state is removed from the local live view.
+Do not design LAN features as engine-to-engine sync, assume transitive trust, or
+copy remote authoritative data into the connecting machine's durable store.
+
 ## Workspace
 
 Rust 2024 workspace; the toolchain is pinned by `rust-toolchain.toml` (stable, with

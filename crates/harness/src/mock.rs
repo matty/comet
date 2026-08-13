@@ -536,6 +536,9 @@ impl Harness for MockHarness {
                     AgentEvent::ToolResult {
                         id: "mock-code-tool".into(),
                         is_error: false,
+                        diff: None,
+                        diff_ref: None,
+                        diff_stats: None,
                     },
                 ]
             })

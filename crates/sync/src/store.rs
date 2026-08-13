@@ -8,6 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+mod tool_diff;
+
+pub use tool_diff::{PutToolDiffOutcome, ToolDiffLimit};
+
 /// Errors surfaced by [`DocsStore`].
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -15,6 +19,12 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("tool diff sidecar is corrupt: {0}")]
+    CorruptToolDiff(&'static str),
+    #[error("tool diff sidecar cannot retain the current diff within quota")]
+    ToolDiffQuota,
+    #[error("tool diff sidecar write refused because the chat is being purged")]
+    ToolDiffPurged,
 }
 
 /// Ordered, append-only migrations. Each entry runs once inside a transaction;
@@ -30,6 +40,19 @@ const MIGRATIONS: &[&str] = &[
         command_id   TEXT PRIMARY KEY,
         processed_at INTEGER NOT NULL
      ) STRICT;",
+    // v2 — bounded exact-source sidecars for transcript tool diffs
+    "CREATE TABLE tool_diff_sidecars (
+        chat_id     TEXT NOT NULL,
+        part_id     TEXT NOT NULL,
+        diff_ref    TEXT NOT NULL,
+        bytes       BLOB NOT NULL,
+        byte_len    INTEGER NOT NULL,
+        created_at  INTEGER NOT NULL,
+        accessed_at INTEGER NOT NULL,
+        PRIMARY KEY (chat_id, part_id)
+    ) STRICT;
+    CREATE INDEX tool_diff_sidecars_accessed_at
+        ON tool_diff_sidecars(accessed_at);",
 ];
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).

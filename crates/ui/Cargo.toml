@@ -33,6 +33,7 @@ chrono.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 sha2.workspace = true
+similar.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"

@@ -23,7 +23,7 @@
 //! inside the 70px band; own-send re-engages with the same glide.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{
@@ -39,7 +39,11 @@ use gpui::{
 };
 
 use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
-use comet_proto::{ChecklistStatus, NoticeSeverity, ServerId, ServerRef, SubagentStatus, ToolCall};
+use comet_proto::{
+    ChecklistStatus, NoticeSeverity, ReadToolDiffReply, ServerId, ServerRef, SubagentStatus,
+    ToolCall, ToolDiff, ToolDiffStat,
+};
+use comet_rpc::methods;
 
 use crate::markdown::highlight::{Lang, LineCarry, lang_for_tag, tokenize_line};
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
@@ -74,6 +78,12 @@ pub const CHIP_HEIGHT: f32 = 38.0;
 pub const CHIP_GAP: f32 = 0.0;
 pub const CHIP_CARD_HEIGHT: f32 = 30.0;
 const CHIPS_TOP_PAD: f32 = 2.0;
+/// The diff detail wrapper's top padding. It participates in every open
+/// detail height, including loading and terminal unavailable states.
+const TOOL_DIFF_DETAIL_TOP_PAD: f32 = 2.0;
+const TOOL_DIFF_STATUS_HEIGHT: f32 = 20.0;
+/// A sidecar read may not occupy the federated generic RPC lane indefinitely.
+const TOOL_DIFF_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 /// How long a user fold toggle keeps its height tween armed: the RESIZE
 /// spec's 200ms plus margin. Past this the fold renders statically — an armed
 /// tween replays on remount, i.e. on every scroll-back-into-view.
@@ -194,9 +204,311 @@ impl StickSpring {
 /// One tool invocation inside a group row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolItem {
+    pub id: SharedString,
     pub call: ToolCall,
     pub is_error: bool,
     pub resolved: bool,
+    pub diff_ref: Option<SharedString>,
+    pub diff_stats: Option<Arc<Vec<ToolDiffStat>>>,
+}
+
+/// A source-pair request is scoped to its authoritative chat and immutable
+/// sidecar reference, so a delayed result cannot overwrite a newer row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ToolDiffFetchKey {
+    owner: ServerRef,
+    part_id: String,
+    diff_ref: String,
+}
+
+enum ToolDiffFetchState {
+    Loading {
+        generation: u64,
+    },
+    Ready {
+        diff: Arc<ToolDiff>,
+        file: Arc<crate::changes::FileDiff>,
+    },
+    Unavailable,
+}
+
+/// Internal reasons a sidecar cannot become a visible detail. The UI always
+/// presents one safe message, while tracing retains the diagnostic category.
+#[derive(Debug, PartialEq, Eq)]
+enum ToolDiffValidationFailure {
+    NotAvailable,
+    ChecksumCalculation { error: String },
+    ChecksumMismatch { expected: String, actual: String },
+    SourceMismatch,
+}
+
+fn tool_item_from_part(part: &MessagePart) -> Option<ToolItem> {
+    let MessagePart::Tool {
+        id,
+        call,
+        is_error,
+        resolved,
+        diff_ref,
+        diff_stats,
+    } = part
+    else {
+        return None;
+    };
+    Some(ToolItem {
+        id: id.clone().into(),
+        call: call.clone(),
+        is_error: *is_error,
+        resolved: *resolved,
+        diff_ref: diff_ref.clone().map(Into::into),
+        diff_stats: diff_stats.clone().map(Arc::new),
+    })
+}
+
+fn tool_diff_reply_is_current(
+    selected_owner: Option<&ServerRef>,
+    states: &HashMap<ToolDiffFetchKey, ToolDiffFetchState>,
+    key: &ToolDiffFetchKey,
+    generation: u64,
+) -> bool {
+    selected_owner == Some(&key.owner)
+        && matches!(
+            states.get(key),
+            Some(ToolDiffFetchState::Loading {
+                generation: current,
+            }) if *current == generation
+        )
+}
+
+/// A retained Ready or Unavailable result is terminal for this immutable
+/// sidecar reference, so reopening the detail reuses it rather than starting
+/// a second request.
+fn tool_diff_fetch_needs_start(
+    fetches: &HashMap<ToolDiffFetchKey, ToolDiffFetchState>,
+    key: &ToolDiffFetchKey,
+) -> bool {
+    !fetches.contains_key(key)
+}
+
+/// Complete one sidecar request at the non-GPUI boundary shared by the task
+/// callback and focused tests. A task removes only its own generation; then a
+/// late owner/key/generation result leaves the current fetch state unchanged.
+fn complete_tool_diff_fetch<T>(
+    selected_owner: Option<&ServerRef>,
+    fetches: &mut HashMap<ToolDiffFetchKey, ToolDiffFetchState>,
+    tasks: &mut HashMap<ToolDiffFetchKey, (u64, T)>,
+    key: ToolDiffFetchKey,
+    generation: u64,
+    resolved: Option<(Arc<ToolDiff>, Arc<crate::changes::FileDiff>)>,
+) -> bool {
+    if tasks
+        .get(&key)
+        .is_some_and(|(task_generation, _)| *task_generation == generation)
+    {
+        tasks.remove(&key);
+    }
+    if !tool_diff_reply_is_current(selected_owner, fetches, &key, generation) {
+        return false;
+    }
+    let state = match resolved {
+        Some((diff, file)) => ToolDiffFetchState::Ready { diff, file },
+        None => ToolDiffFetchState::Unavailable,
+    };
+    fetches.insert(key, state);
+    true
+}
+
+/// Omit precisely the one line terminator that `similar::TextDiff::from_lines`
+/// leaves attached to each change value. This preserves other trailing text,
+/// including an intentional second newline, while keeping visible rows in the
+/// same form as complete-source validation.
+fn without_line_terminator(value: &str) -> &str {
+    value
+        .strip_suffix("\r\n")
+        .or_else(|| value.strip_suffix('\n'))
+        .or_else(|| value.strip_suffix('\r'))
+        .unwrap_or(value)
+}
+
+/// Unified diff represents an empty range at the preceding line rather than
+/// after it: a new file starts at `-0,0`, while a deleted file starts at
+/// `+0,0`.
+fn unified_hunk_range(range: &Range<usize>) -> (usize, usize) {
+    let len = range.len();
+    let start = if len == 0 {
+        range.start
+    } else {
+        range.start + 1
+    };
+    (start, len)
+}
+
+fn validate_tool_diff_reference(
+    expected: &str,
+    actual: serde_json::Result<String>,
+) -> Result<(), ToolDiffValidationFailure> {
+    let actual = actual.map_err(|error| ToolDiffValidationFailure::ChecksumCalculation {
+        error: error.to_string(),
+    })?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ToolDiffValidationFailure::ChecksumMismatch {
+            expected: expected.to_owned(),
+            actual,
+        })
+    }
+}
+
+fn validate_tool_diff_sources(
+    diff: &ToolDiff,
+    file: &crate::changes::FileDiff,
+) -> Result<(), ToolDiffValidationFailure> {
+    crate::changes::sources_match_diff(file, diff.old_text.as_deref(), Some(&diff.new_text))
+        .then_some(())
+        .ok_or(ToolDiffValidationFailure::SourceMismatch)
+}
+
+/// Convert the complete pair into the changes pane's neutral row model. The
+/// line numbers come from `similar` rather than byte offsets, keeping Unicode
+/// source text and the displayed diff in the same coordinate system.
+fn diff_to_file(diff: &ToolDiff) -> crate::changes::FileDiff {
+    use crate::changes::{DiffLine, FileDiff, FileStatus, Hunk, LineKind};
+
+    let old = diff.old_text.as_deref().unwrap_or("");
+    let text_diff = similar::TextDiff::from_lines(old, &diff.new_text);
+    let mut hunks = Vec::new();
+    let (mut additions, mut deletions) = (0u32, 0u32);
+    let mut max_line = 0u32;
+    for group in text_diff.grouped_ops(3) {
+        let (Some(first), Some(last)) = (group.first(), group.last()) else {
+            continue;
+        };
+        let old_range = first.old_range().start..last.old_range().end;
+        let new_range = first.new_range().start..last.new_range().end;
+        let (old_start, old_len) = unified_hunk_range(&old_range);
+        let (new_start, new_len) = unified_hunk_range(&new_range);
+        let header = format!(
+            "@@ -{},{} +{},{} @@",
+            old_start, old_len, new_start, new_len,
+        );
+        let mut lines = Vec::new();
+        for op in &group {
+            for change in text_diff.iter_changes(op) {
+                let kind = match change.tag() {
+                    similar::ChangeTag::Delete => {
+                        deletions += 1;
+                        LineKind::Del
+                    }
+                    similar::ChangeTag::Insert => {
+                        additions += 1;
+                        LineKind::Add
+                    }
+                    similar::ChangeTag::Equal => LineKind::Context,
+                };
+                let old_no = change.old_index().map(|line| line as u32 + 1);
+                let new_no = change.new_index().map(|line| line as u32 + 1);
+                max_line = max_line.max(old_no.unwrap_or(0)).max(new_no.unwrap_or(0));
+                lines.push(DiffLine {
+                    kind,
+                    old_no,
+                    new_no,
+                    text: without_line_terminator(change.value()).to_owned(),
+                });
+                if change.missing_newline() {
+                    lines.push(DiffLine {
+                        kind: LineKind::Meta,
+                        old_no: None,
+                        new_no: None,
+                        text: "\\ No newline at end of file".into(),
+                    });
+                }
+            }
+        }
+        hunks.push(Hunk { header, lines });
+    }
+    FileDiff {
+        path: diff.path.clone(),
+        old_path: None,
+        status: if diff.old_text.is_none() {
+            FileStatus::Added
+        } else if diff.new_text.is_empty() {
+            FileStatus::Deleted
+        } else {
+            FileStatus::Modified
+        },
+        binary: false,
+        notices: Vec::new(),
+        hunks,
+        additions,
+        deletions,
+        max_line,
+    }
+}
+
+fn validate_tool_diff_reply(
+    expected_ref: &str,
+    reply: ReadToolDiffReply,
+) -> Result<(ToolDiff, crate::changes::FileDiff), ToolDiffValidationFailure> {
+    let diff = match reply {
+        ReadToolDiffReply::Available { diff } => diff,
+        ReadToolDiffReply::NotAvailable => return Err(ToolDiffValidationFailure::NotAvailable),
+    };
+    validate_tool_diff_reference(expected_ref, diff.diff_ref())?;
+    let file = diff_to_file(&diff);
+    validate_tool_diff_sources(&diff, &file)?;
+    Ok((diff, file))
+}
+
+fn log_tool_diff_validation_failure(key: &ToolDiffFetchKey, failure: &ToolDiffValidationFailure) {
+    match failure {
+        ToolDiffValidationFailure::NotAvailable => {
+            tracing::warn!(
+                owner = ?key.owner,
+                part_id = %key.part_id,
+                category = "not_available",
+                "tool diff sidecar is not available"
+            );
+        }
+        ToolDiffValidationFailure::ChecksumCalculation { error } => {
+            tracing::warn!(
+                owner = ?key.owner,
+                part_id = %key.part_id,
+                category = "checksum_calculation",
+                error = %error,
+                "tool diff checksum calculation failed"
+            );
+        }
+        ToolDiffValidationFailure::ChecksumMismatch { expected, actual } => {
+            tracing::warn!(
+                owner = ?key.owner,
+                part_id = %key.part_id,
+                category = "checksum_mismatch",
+                expected_ref = %expected,
+                actual_ref = %actual,
+                "tool diff checksum did not match the transcript reference"
+            );
+        }
+        ToolDiffValidationFailure::SourceMismatch => {
+            tracing::warn!(
+                owner = ?key.owner,
+                part_id = %key.part_id,
+                category = "source_mismatch",
+                "tool diff complete sources did not match the rendered rows"
+            );
+        }
+    }
+}
+
+/// The fixed analytic height of an open per-tool detail, including its wrapper
+/// padding. A missing fetch state paints the same loading row as `Loading`.
+fn tool_diff_detail_height(state: Option<&ToolDiffFetchState>) -> f32 {
+    TOOL_DIFF_DETAIL_TOP_PAD
+        + match state {
+            Some(ToolDiffFetchState::Ready { file, .. }) => crate::changes::body_height(file),
+            Some(ToolDiffFetchState::Loading { .. })
+            | Some(ToolDiffFetchState::Unavailable)
+            | None => TOOL_DIFF_STATUS_HEIGHT,
+        }
 }
 
 /// The approval card's paint discriminator — the ONLY thing that may vary by
@@ -348,9 +660,20 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
     let mut acc = Vec::with_capacity(tools.len() * 8 + 1);
     for t in tools {
         let (label, detail) = tool_chip_content(&t.call);
+        acc.extend_from_slice(t.id.as_bytes());
         acc.extend_from_slice(label.as_bytes());
-        acc.extend_from_slice(&(detail.len() as u32).to_le_bytes());
+        acc.extend_from_slice(detail.as_bytes());
         acc.push(t.is_error as u8 | (t.resolved as u8) << 1);
+        if let Some(diff_ref) = &t.diff_ref {
+            acc.extend_from_slice(diff_ref.as_bytes());
+        }
+        if let Some(stats) = &t.diff_stats {
+            for stat in stats.iter() {
+                acc.extend_from_slice(stat.path.as_bytes());
+                acc.extend_from_slice(&stat.additions.to_le_bytes());
+                acc.extend_from_slice(&stat.deletions.to_le_bytes());
+            }
+        }
     }
     acc.push(auto_open as u8);
     fnv1a(&acc)
@@ -435,194 +758,182 @@ pub fn rows_for_entry(
         };
 
     for (part_ix, part) in entry.parts.iter().enumerate() {
+        if let Some(tool) = tool_item_from_part(part) {
+            pending_group.push(tool);
+            group_last_part_ix = part_ix;
+            continue;
+        }
+        flush_group(
+            &mut rows,
+            &mut pending_group,
+            &mut group_ix,
+            group_last_part_ix,
+        );
         match part {
-            MessagePart::Tool {
-                call,
-                is_error,
+            MessagePart::Text { id: part_id, text } => {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let key = format!("{}#{}", entry.id, part_id);
+                let tree = parse(&key, text);
+                // Live and completed parts split identically — one row
+                // per top-level block, same ids, so the live→complete
+                // handoff never changes row identity. The version is a
+                // content hash of the block's bytes (LSB = streaming),
+                // so a commit only splices rows whose bytes actually
+                // changed — the settled prefix of a live reply is
+                // untouched (and its render caches stay valid).
+                for block_ix in 0..tree.blocks.len() {
+                    let range = &tree.blocks[block_ix].range;
+                    let end = range.end.min(text.len());
+                    let bytes = text
+                        .as_bytes()
+                        .get(range.start.min(end)..end)
+                        .unwrap_or_default();
+                    let version = (fnv1a(bytes) << 1) | streaming as u64;
+                    rows.push(Row {
+                        id: format!("{key}.{block_ix}").into(),
+                        version,
+                        turn_start: false,
+                        entry_id: entry_id.clone(),
+                        timestamp: None,
+                        kind: if streaming {
+                            RowKind::LiveMarkdown {
+                                tree: tree.clone(),
+                                block_ix,
+                            }
+                        } else {
+                            RowKind::Markdown {
+                                tree: tree.clone(),
+                                block_ix,
+                            }
+                        },
+                    });
+                }
+            }
+            MessagePart::Input {
+                id: part_id,
+                questions,
                 resolved,
                 ..
             } => {
-                pending_group.push(ToolItem {
-                    call: call.clone(),
-                    is_error: *is_error,
-                    resolved: *resolved,
+                // Model-generated header onto the one-line chip.
+                let header: SharedString = single_line(
+                    &questions
+                        .first()
+                        .map(|q| q.header.clone())
+                        .unwrap_or_else(|| "Question".to_string()),
+                )
+                .into();
+                rows.push(Row {
+                    id: format!("{}#{}", entry.id, part_id).into(),
+                    version: fnv1a(header.as_bytes()) << 1 | *resolved as u64,
+                    turn_start: false,
+                    kind: RowKind::InputChip {
+                        header,
+                        resolved: *resolved,
+                    },
+                    entry_id: entry_id.clone(),
+                    timestamp: None,
                 });
-                group_last_part_ix = part_ix;
             }
-            other => {
-                flush_group(
-                    &mut rows,
-                    &mut pending_group,
-                    &mut group_ix,
-                    group_last_part_ix,
-                );
-                match other {
-                    MessagePart::Text { id: part_id, text } => {
-                        if text.trim().is_empty() {
-                            continue;
-                        }
-                        let key = format!("{}#{}", entry.id, part_id);
-                        let tree = parse(&key, text);
-                        // Live and completed parts split identically — one row
-                        // per top-level block, same ids, so the live→complete
-                        // handoff never changes row identity. The version is a
-                        // content hash of the block's bytes (LSB = streaming),
-                        // so a commit only splices rows whose bytes actually
-                        // changed — the settled prefix of a live reply is
-                        // untouched (and its render caches stay valid).
-                        for block_ix in 0..tree.blocks.len() {
-                            let range = &tree.blocks[block_ix].range;
-                            let end = range.end.min(text.len());
-                            let bytes = text
-                                .as_bytes()
-                                .get(range.start.min(end)..end)
-                                .unwrap_or_default();
-                            let version = (fnv1a(bytes) << 1) | streaming as u64;
-                            rows.push(Row {
-                                id: format!("{key}.{block_ix}").into(),
-                                version,
-                                turn_start: false,
-                                entry_id: entry_id.clone(),
-                                timestamp: None,
-                                kind: if streaming {
-                                    RowKind::LiveMarkdown {
-                                        tree: tree.clone(),
-                                        block_ix,
-                                    }
-                                } else {
-                                    RowKind::Markdown {
-                                        tree: tree.clone(),
-                                        block_ix,
-                                    }
-                                },
-                            });
-                        }
-                    }
-                    MessagePart::Input {
-                        id: part_id,
-                        questions,
-                        resolved,
-                        ..
-                    } => {
-                        // Model-generated header onto the one-line chip.
-                        let header: SharedString = single_line(
-                            &questions
-                                .first()
-                                .map(|q| q.header.clone())
-                                .unwrap_or_else(|| "Question".to_string()),
-                        )
-                        .into();
-                        rows.push(Row {
-                            id: format!("{}#{}", entry.id, part_id).into(),
-                            version: fnv1a(header.as_bytes()) << 1 | *resolved as u64,
-                            turn_start: false,
-                            kind: RowKind::InputChip {
-                                header,
-                                resolved: *resolved,
-                            },
-                            entry_id: entry_id.clone(),
-                            timestamp: None,
-                        });
-                    }
-                    MessagePart::Error {
-                        id: part_id,
-                        message,
-                    } => {
-                        rows.push(Row {
-                            id: format!("{}#{}", entry.id, part_id).into(),
-                            version: message.len() as u64,
-                            turn_start: false,
-                            kind: RowKind::ErrorChip {
-                                // Harness-generated; the chip is one line.
-                                message: single_line(message).into(),
-                            },
-                            entry_id: entry_id.clone(),
-                            timestamp: None,
-                        });
-                    }
-                    // Tools are grouped by the outer arm; nothing reaches here.
-                    MessagePart::Tool { .. } => {}
-                    MessagePart::Approval {
-                        id: part_id,
-                        approval,
-                        decision,
-                        ..
-                    } => {
-                        let (label, detail) = comet_proto::view::approval_chip_content(approval);
-                        let state = decision.as_ref().map(|d| {
-                            SharedString::from(comet_proto::view::approval_decision_label(d))
-                        });
-                        let paint = ApprovalPaint::of(decision.as_ref());
-                        let mut fp = detail.as_bytes().to_vec();
-                        fp.extend_from_slice(label.as_bytes());
-                        if let Some(state) = &state {
-                            fp.extend_from_slice(state.as_bytes());
-                        }
-                        rows.push(Row {
-                            id: format!("{}#{}", entry.id, part_id).into(),
-                            // The decision folds into the version: a card that
-                            // resolves must repaint even though nothing else in
-                            // the entry changed.
-                            version: fnv1a(&fp),
-                            turn_start: false,
-                            kind: RowKind::ApprovalCard {
-                                label,
-                                detail: detail.into(),
-                                state,
-                                paint,
-                            },
-                            entry_id: entry_id.clone(),
-                            timestamp: None,
-                        });
-                    }
-                    MessagePart::Notice {
-                        id: part_id,
-                        severity,
-                        summary,
-                        detail,
-                        occurrences,
-                        ..
-                    } => {
-                        // A detail that restates the summary earns nothing on
-                        // hover (0.2a's duplicate-copy lesson) — drop it here.
-                        let detail: Option<SharedString> = detail
-                            .as_ref()
-                            .filter(|d| d.as_str() != summary.as_str())
-                            .map(|d| SharedString::from(single_line(d)));
-                        let mut fp = summary.as_bytes().to_vec();
-                        if let Some(d) = &detail {
-                            fp.extend_from_slice(d.as_bytes());
-                        }
-                        rows.push(Row {
-                            id: format!("{}#{}", entry.id, part_id).into(),
-                            // Occurrences folds into the version: a collapse
-                            // that only bumps the counter must still repaint.
-                            version: (fnv1a(&fp) << 1) ^ u64::from(*occurrences),
-                            turn_start: false,
-                            kind: RowKind::NoticeChip {
-                                summary: SharedString::from(single_line(summary)),
-                                detail,
-                                severity: *severity,
-                                occurrences: *occurrences,
-                            },
-                            entry_id: entry_id.clone(),
-                            timestamp: None,
-                        });
-                    }
-                    // Persisted, not drawn: subagent attribution (slice 4.2)
-                    // lands the part; rendering it as a card is slice 4.4's
-                    // build. An explicit no-op arm, never `_ => {}` — a
-                    // wildcard here would silently swallow the NEXT part kind
-                    // someone adds, and 4.4 would get no compile error naming
-                    // what to build.
-                    MessagePart::Subagent { .. } => {}
-                    // Same deal for the checklist (slice 4.3). 4.4 draws both
-                    // surfaces together, deliberately: they are the two new
-                    // non-chip things in a transcript, and designing them
-                    // apart is how one ends up with two unrelated card idioms.
-                    MessagePart::Checklist { .. } => {}
+            MessagePart::Error {
+                id: part_id,
+                message,
+            } => {
+                rows.push(Row {
+                    id: format!("{}#{}", entry.id, part_id).into(),
+                    version: message.len() as u64,
+                    turn_start: false,
+                    kind: RowKind::ErrorChip {
+                        // Harness-generated; the chip is one line.
+                        message: single_line(message).into(),
+                    },
+                    entry_id: entry_id.clone(),
+                    timestamp: None,
+                });
+            }
+            // `tool_item_from_part` handles every tool before this arm.
+            MessagePart::Tool { .. } => unreachable!("tool part was not adapted"),
+            MessagePart::Approval {
+                id: part_id,
+                approval,
+                decision,
+                ..
+            } => {
+                let (label, detail) = comet_proto::view::approval_chip_content(approval);
+                let state = decision
+                    .as_ref()
+                    .map(|d| SharedString::from(comet_proto::view::approval_decision_label(d)));
+                let paint = ApprovalPaint::of(decision.as_ref());
+                let mut fp = detail.as_bytes().to_vec();
+                fp.extend_from_slice(label.as_bytes());
+                if let Some(state) = &state {
+                    fp.extend_from_slice(state.as_bytes());
                 }
+                rows.push(Row {
+                    id: format!("{}#{}", entry.id, part_id).into(),
+                    // The decision folds into the version: a card that
+                    // resolves must repaint even though nothing else in
+                    // the entry changed.
+                    version: fnv1a(&fp),
+                    turn_start: false,
+                    kind: RowKind::ApprovalCard {
+                        label,
+                        detail: detail.into(),
+                        state,
+                        paint,
+                    },
+                    entry_id: entry_id.clone(),
+                    timestamp: None,
+                });
             }
+            MessagePart::Notice {
+                id: part_id,
+                severity,
+                summary,
+                detail,
+                occurrences,
+                ..
+            } => {
+                // A detail that restates the summary earns nothing on
+                // hover (0.2a's duplicate-copy lesson) — drop it here.
+                let detail: Option<SharedString> = detail
+                    .as_ref()
+                    .filter(|d| d.as_str() != summary.as_str())
+                    .map(|d| SharedString::from(single_line(d)));
+                let mut fp = summary.as_bytes().to_vec();
+                if let Some(d) = &detail {
+                    fp.extend_from_slice(d.as_bytes());
+                }
+                rows.push(Row {
+                    id: format!("{}#{}", entry.id, part_id).into(),
+                    // Occurrences folds into the version: a collapse
+                    // that only bumps the counter must still repaint.
+                    version: (fnv1a(&fp) << 1) ^ u64::from(*occurrences),
+                    turn_start: false,
+                    kind: RowKind::NoticeChip {
+                        summary: SharedString::from(single_line(summary)),
+                        detail,
+                        severity: *severity,
+                        occurrences: *occurrences,
+                    },
+                    entry_id: entry_id.clone(),
+                    timestamp: None,
+                });
+            }
+            // Persisted, not drawn: subagent attribution (slice 4.2)
+            // lands the part; rendering it as a card is slice 4.4's
+            // build. An explicit no-op arm, never `_ => {}` — a
+            // wildcard here would silently swallow the NEXT part kind
+            // someone adds, and 4.4 would get no compile error naming
+            // what to build.
+            MessagePart::Subagent { .. } => {}
+            // Same deal for the checklist (slice 4.3). 4.4 draws both
+            // surfaces together, deliberately: they are the two new
+            // non-chip things in a transcript, and designing them
+            // apart is how one ends up with two unrelated card idioms.
+            MessagePart::Checklist { .. } => {}
         }
     }
     flush_group(
@@ -995,6 +1306,11 @@ impl HighlightStore {
     fn clear(&mut self) {
         self.entries.clear();
     }
+
+    /// Dropping an entry cooperatively cancels any background parse it owns.
+    fn retain_slots(&mut self, slots: &HashSet<(SharedString, usize)>) {
+        self.entries.retain(|slot, _| slots.contains(slot));
+    }
 }
 
 fn highlight_document(
@@ -1096,6 +1412,9 @@ pub struct Transcript {
     /// boundary invalidates only the live tail per commit.
     render_cache: Rc<RefCell<RenderCache>>,
     highlights: HighlightStore,
+    tool_diff_fetches: HashMap<ToolDiffFetchKey, ToolDiffFetchState>,
+    tool_diff_tasks: HashMap<ToolDiffFetchKey, (u64, Task<()>)>,
+    tool_diff_generation: u64,
     show_jump_button: bool,
     /// Distance from the bottom at the last observation (wheel event or spring
     /// tick) — restick and escape are direction-aware
@@ -1166,6 +1485,9 @@ impl Transcript {
             veil_attach_pending: true,
             render_cache: Rc::new(RefCell::new(RenderCache::default())),
             highlights: HighlightStore::default(),
+            tool_diff_fetches: HashMap::new(),
+            tool_diff_tasks: HashMap::new(),
+            tool_diff_generation: 0,
             show_jump_button: false,
             last_scroll_distance: 0.0,
             pinned: true,
@@ -1418,6 +1740,8 @@ impl Transcript {
             self.veils.clear();
             self.render_cache.borrow_mut().clear();
             self.highlights.clear();
+            self.tool_diff_fetches.clear();
+            self.tool_diff_tasks.clear();
             self.list.reset(0);
             self.pinned = true;
             self.spring.reset();
@@ -1436,6 +1760,53 @@ impl Transcript {
         }
         for echo in &echoes {
             new_rows.extend(self.rows_for(echo, true));
+        }
+
+        if !attached {
+            let mut live_fetches = HashSet::new();
+            let mut live_highlights: HashSet<(SharedString, usize)> = new_rows
+                .iter()
+                .filter_map(|row| match &row.kind {
+                    RowKind::Markdown { tree, block_ix }
+                    | RowKind::LiveMarkdown { tree, block_ix }
+                        if matches!(
+                            tree.blocks.get(*block_ix).map(|top| &top.block),
+                            Some(Block::CodeBlock { .. })
+                        ) =>
+                    {
+                        Some((row.id.clone(), *block_ix))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let mut live_folds: HashSet<SharedString> =
+                new_rows.iter().map(|row| row.id.clone()).collect();
+            if let Some(owner) = &self.chat_id {
+                for row in &new_rows {
+                    let RowKind::ToolGroup { tools, .. } = &row.kind else {
+                        continue;
+                    };
+                    for (tool_ix, tool) in tools.iter().enumerate() {
+                        let Some(diff_ref) = &tool.diff_ref else {
+                            continue;
+                        };
+                        live_fetches.insert(ToolDiffFetchKey {
+                            owner: owner.clone(),
+                            part_id: tool.id.to_string(),
+                            diff_ref: diff_ref.to_string(),
+                        });
+                        live_folds.insert(format!("{}#tool-{tool_ix}", row.id).into());
+                        live_highlights.insert((row.id.clone(), tool_ix * 2));
+                        live_highlights.insert((row.id.clone(), tool_ix * 2 + 1));
+                    }
+                }
+            }
+            self.tool_diff_fetches
+                .retain(|key, _| live_fetches.contains(key));
+            self.tool_diff_tasks
+                .retain(|key, _| live_fetches.contains(key));
+            self.highlights.retain_slots(&live_highlights);
+            self.folds.retain(|id, _| live_folds.contains(id));
         }
 
         // Text already streamed before this (re)attach is the veil BASELINE:
@@ -1552,17 +1923,120 @@ impl Transcript {
         rows
     }
 
-    fn toggle_fold(&mut self, row_id: SharedString, tool_count: usize, auto_open: bool) {
+    fn toggle_fold(&mut self, row_id: SharedString, current_height: f32, auto_open: bool) {
         let entry = self.folds.entry(row_id).or_default();
         let currently_open = entry.open.unwrap_or(auto_open);
-        entry.from = if currently_open {
-            chips_height(tool_count)
-        } else {
-            0.0
-        };
+        entry.from = if currently_open { current_height } else { 0.0 };
         entry.open = Some(!currently_open);
         entry.epoch += 1;
         entry.toggled_at = Some(Instant::now());
+    }
+
+    fn toggle_tool_diff_detail(&mut self, detail_id: SharedString) {
+        let entry = self.folds.entry(detail_id).or_default();
+        entry.open = Some(!entry.open.unwrap_or(false));
+        entry.epoch += 1;
+        entry.toggled_at = Some(Instant::now());
+    }
+
+    fn begin_tool_diff_fetch(&mut self, key: ToolDiffFetchKey, cx: &mut Context<Self>) {
+        if !tool_diff_fetch_needs_start(&self.tool_diff_fetches, &key) {
+            return;
+        }
+        self.tool_diff_generation = self.tool_diff_generation.wrapping_add(1);
+        let generation = self.tool_diff_generation;
+        self.tool_diff_fetches
+            .insert(key.clone(), ToolDiffFetchState::Loading { generation });
+
+        let client = self.state.read(cx).client_for(&key.owner);
+        let Some(client) = client else {
+            tracing::warn!(owner = ?key.owner, "tool diff fetch has no client for chat owner");
+            self.tool_diff_fetches
+                .insert(key, ToolDiffFetchState::Unavailable);
+            cx.notify();
+            return;
+        };
+
+        let request_key = key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let call = client.call_as::<ReadToolDiffReply>(
+                methods::READ_TOOL_DIFF,
+                serde_json::json!({
+                    "chatId": request_key.owner.local_id.clone(),
+                    "partId": request_key.part_id.clone(),
+                    "diffRef": request_key.diff_ref.clone(),
+                }),
+            );
+            let timer = cx.background_executor().timer(TOOL_DIFF_FETCH_TIMEOUT);
+            futures::pin_mut!(call);
+            let resolved = match futures::future::select(call, timer).await {
+                futures::future::Either::Left((Ok(reply), _)) => {
+                    match validate_tool_diff_reply(&request_key.diff_ref, reply) {
+                        Ok((diff, mut file)) => {
+                            // One transcript row paints this inline. Bound element count while
+                            // keeping the complete sources for background highlighting.
+                            crate::changes::truncate_file_lines(&mut file, 400);
+                            Some((Arc::new(diff), Arc::new(file)))
+                        }
+                        Err(failure) => {
+                            log_tool_diff_validation_failure(&request_key, &failure);
+                            None
+                        }
+                    }
+                }
+                futures::future::Either::Left((Err(error), _)) => {
+                    tracing::warn!(
+                        owner = ?request_key.owner,
+                        part_id = %request_key.part_id,
+                        error = %error,
+                        "tool diff request failed"
+                    );
+                    None
+                }
+                futures::future::Either::Right(_) => {
+                    tracing::warn!(
+                        owner = ?request_key.owner,
+                        part_id = %request_key.part_id,
+                        timeout_secs = TOOL_DIFF_FETCH_TIMEOUT.as_secs(),
+                        "tool diff request timed out"
+                    );
+                    None
+                }
+            };
+            this.update(cx, |transcript, cx| {
+                if complete_tool_diff_fetch(
+                    transcript.chat_id.as_ref(),
+                    &mut transcript.tool_diff_fetches,
+                    &mut transcript.tool_diff_tasks,
+                    request_key.clone(),
+                    generation,
+                    resolved,
+                ) {
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        self.tool_diff_tasks.insert(key, (generation, task));
+    }
+
+    fn tool_diff_highlights_for(
+        &mut self,
+        row_id: &SharedString,
+        tool_ix: usize,
+        diff: &ToolDiff,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<crate::changes::DiffHighlights>> {
+        let lang = crate::changes::lang_for_path(&diff.path)?;
+        let old = diff.old_text.as_deref().and_then(|source| {
+            self.highlights
+                .request(row_id.clone(), tool_ix * 2, lang, source, cx)
+        });
+        let new =
+            self.highlights
+                .request(row_id.clone(), tool_ix * 2 + 1, lang, &diff.new_text, cx);
+        (old.is_some() || new.is_some())
+            .then(|| Arc::new(crate::changes::DiffHighlights { old, new }))
     }
 
     // ---- attachment read-back (user-attachments.tsx + transcript cache) ----
@@ -2129,11 +2603,43 @@ impl Transcript {
     ) -> AnyElement {
         let fold = self.folds.get(row_id).copied().unwrap_or_default();
         let open = fold.open.unwrap_or(auto_open);
-        let target = if open { chips_height(tools.len()) } else { 0.0 };
+        let mut target = chips_height(tools.len());
+        if open {
+            for (tool_ix, tool) in tools.iter().enumerate() {
+                let detail_id: SharedString = format!("{row_id}#tool-{tool_ix}").into();
+                let stat_rows = tool.diff_stats.as_deref().map_or(0, Vec::len);
+                if stat_rows > 0 {
+                    target += 20.0 * stat_rows as f32;
+                } else if tool.diff_ref.is_some() {
+                    target += 20.0;
+                }
+                if !self
+                    .folds
+                    .get(&detail_id)
+                    .is_some_and(|state| state.open.unwrap_or(false))
+                {
+                    continue;
+                }
+                let key =
+                    self.chat_id
+                        .as_ref()
+                        .zip(tool.diff_ref.as_ref())
+                        .map(|(owner, diff_ref)| ToolDiffFetchKey {
+                            owner: owner.clone(),
+                            part_id: tool.id.to_string(),
+                            diff_ref: diff_ref.to_string(),
+                        });
+                target += tool_diff_detail_height(
+                    key.as_ref().and_then(|key| self.tool_diff_fetches.get(key)),
+                );
+            }
+        } else {
+            target = 0.0;
+        }
         let summary = tool_group_summary(tools);
 
         let toggle_id = row_id.clone();
-        let tool_count = tools.len();
+        let current_height = target;
         // Header (comet tool-group.tsx): a small chevron tile centered over the
         // chips' guide rail, then the quiet 12px summary.
         let header = div()
@@ -2154,7 +2660,7 @@ impl Transcript {
             .text_color(theme.text_muted)
             .hover(|s| s.text_color(theme.text))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_fold(toggle_id.clone(), tool_count, auto_open);
+                this.toggle_fold(toggle_id.clone(), current_height, auto_open);
                 cx.notify();
             }))
             .child(
@@ -2177,12 +2683,137 @@ impl Transcript {
                     .child(SharedString::from(summary)),
             );
 
+        let mut tool_rows: Vec<AnyElement> = Vec::new();
+        for (tool_ix, tool) in tools.iter().enumerate() {
+            tool_rows.push(tool_chip(tool, theme));
+            let detail_id: SharedString = format!("{row_id}#tool-{tool_ix}").into();
+            let detail_open = self
+                .folds
+                .get(&detail_id)
+                .is_some_and(|state| state.open.unwrap_or(false));
+            let key = self
+                .chat_id
+                .as_ref()
+                .zip(tool.diff_ref.as_ref())
+                .map(|(owner, diff_ref)| ToolDiffFetchKey {
+                    owner: owner.clone(),
+                    part_id: tool.id.to_string(),
+                    diff_ref: diff_ref.to_string(),
+                });
+            if detail_open && let Some(key) = key.clone() {
+                self.begin_tool_diff_fetch(key, cx);
+            }
+
+            let mut stats: Vec<AnyElement> = Vec::new();
+            if let Some(diff_stats) = &tool.diff_stats {
+                for (stat_ix, stat) in diff_stats.iter().enumerate() {
+                    let label: SharedString =
+                        format!("{} · +{} −{}", stat.path, stat.additions, stat.deletions).into();
+                    let row = div()
+                        .id(SharedString::from(format!("{detail_id}-stat-{stat_ix}")))
+                        .h(px(20.0))
+                        .ml(px(37.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_faint)
+                        .child(label);
+                    let row = if tool.diff_ref.is_some() {
+                        let toggle_id = detail_id.clone();
+                        row.cursor_pointer()
+                            .hover(|element| element.text_color(theme.text_muted))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_tool_diff_detail(toggle_id.clone());
+                                cx.notify();
+                            }))
+                    } else {
+                        row
+                    };
+                    stats.push(row.into_any_element());
+                }
+            } else if tool.diff_ref.is_some() {
+                let toggle_id = detail_id.clone();
+                stats.push(
+                    div()
+                        .id(SharedString::from(format!("{detail_id}-open")))
+                        .h(px(20.0))
+                        .ml(px(37.0))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_faint)
+                        .hover(|element| element.text_color(theme.text_muted))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_tool_diff_detail(toggle_id.clone());
+                            cx.notify();
+                        }))
+                        .child(SharedString::from("View diff"))
+                        .into_any_element(),
+                );
+            }
+            tool_rows.extend(stats);
+
+            if !detail_open {
+                continue;
+            }
+            let ready = key.as_ref().and_then(|key| {
+                self.tool_diff_fetches
+                    .get(key)
+                    .and_then(|state| match state {
+                        ToolDiffFetchState::Ready { diff, file, .. } => {
+                            Some((diff.clone(), file.clone()))
+                        }
+                        _ => None,
+                    })
+            });
+            let detail: AnyElement = match ready {
+                Some((diff, file)) => crate::changes::render_file_body_with_syntax(
+                    &file,
+                    self.tool_diff_highlights_for(row_id, tool_ix, &diff, cx),
+                    theme,
+                ),
+                None if key.as_ref().is_some_and(|key| {
+                    matches!(
+                        self.tool_diff_fetches.get(key),
+                        Some(ToolDiffFetchState::Loading { .. })
+                    )
+                }) =>
+                {
+                    div()
+                        .h(px(TOOL_DIFF_STATUS_HEIGHT))
+                        .flex()
+                        .items_center()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from("Loading diff…"))
+                        .into_any_element()
+                }
+                _ => div()
+                    .h(px(TOOL_DIFF_STATUS_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.0))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from("Diff details unavailable"))
+                    .into_any_element(),
+            };
+            tool_rows.push(
+                div()
+                    .ml(px(37.0))
+                    .pt(px(TOOL_DIFF_DETAIL_TOP_PAD))
+                    .overflow_hidden()
+                    .child(detail)
+                    .into_any_element(),
+            );
+        }
+
         let chips = div()
             .pt(px(CHIPS_TOP_PAD))
             .flex()
             .flex_col()
             .gap(px(CHIP_GAP))
-            .children(tools.iter().map(|tool| tool_chip(tool, theme)));
+            .children(tool_rows);
 
         // Fold body: 200ms committed-height tween on a USER toggle only — and
         // only within a short window of the click. Auto-open (streaming) and
@@ -2804,10 +3435,24 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
         acc.extend_from_slice(part.id().as_bytes());
         acc.extend_from_slice(&(part.byte_len() as u64).to_le_bytes());
         if let MessagePart::Tool {
-            is_error, resolved, ..
+            is_error,
+            resolved,
+            diff_ref,
+            diff_stats,
+            ..
         } = part
         {
             acc.push(*is_error as u8 | (*resolved as u8) << 1);
+            if let Some(diff_ref) = diff_ref {
+                acc.extend_from_slice(diff_ref.as_bytes());
+            }
+            if let Some(diff_stats) = diff_stats {
+                for stat in diff_stats {
+                    acc.extend_from_slice(stat.path.as_bytes());
+                    acc.extend_from_slice(&stat.additions.to_le_bytes());
+                    acc.extend_from_slice(&stat.deletions.to_le_bytes());
+                }
+            }
         }
         if let MessagePart::Input { resolved, .. } = part {
             acc.push(0x10 | *resolved as u8);
@@ -3228,6 +3873,8 @@ mod tests {
             },
             is_error: false,
             resolved: true,
+            diff_ref: None,
+            diff_stats: None,
         }
     }
 
@@ -3808,11 +4455,15 @@ mod tests {
     #[test]
     fn tool_group_summaries() {
         let exec = |c: &str| ToolItem {
+            id: c.into(),
             call: ToolCall::Exec { command: c.into() },
             is_error: false,
             resolved: true,
+            diff_ref: None,
+            diff_stats: None,
         };
         let edit = |p: &str| ToolItem {
+            id: p.into(),
             call: ToolCall::EditFile {
                 path: p.into(),
                 old_string: None,
@@ -3820,6 +4471,8 @@ mod tests {
             },
             is_error: false,
             resolved: true,
+            diff_ref: None,
+            diff_stats: None,
         };
         let tools = vec![
             exec("ls"),
@@ -3842,21 +4495,30 @@ mod tests {
         // Reads / searches / misc.
         let tools = vec![
             ToolItem {
+                id: "read".into(),
                 call: ToolCall::ReadFile { path: "x".into() },
                 is_error: false,
                 resolved: true,
+                diff_ref: None,
+                diff_stats: None,
             },
             ToolItem {
+                id: "glob".into(),
                 call: ToolCall::Glob {
                     pattern: "*.rs".into(),
                 },
                 is_error: false,
                 resolved: true,
+                diff_ref: None,
+                diff_stats: None,
             },
             ToolItem {
+                id: "web".into(),
                 call: ToolCall::WebSearch { query: "q".into() },
                 is_error: false,
                 resolved: true,
+                diff_ref: None,
+                diff_stats: None,
             },
         ];
         assert_eq!(tool_group_summary(&tools), "Read 1 file · searched 2 times");
@@ -4011,5 +4673,469 @@ mod tests {
             vec![text_part("t0", ""), text_part("t1", "   ")],
         );
         assert!(rows_for_entry(&entry, false, &mut parse).is_empty());
+    }
+
+    #[test]
+    fn rows_keep_tool_part_identity_reference_and_stats() {
+        let part = MessagePart::Tool {
+            id: "tool-1".into(),
+            call: ToolCall::EditFile {
+                path: "src/lib.rs".into(),
+                old_string: None,
+                new_string: None,
+            },
+            is_error: false,
+            resolved: true,
+            diff_ref: Some("v1:abc".into()),
+            diff_stats: Some(vec![comet_proto::ToolDiffStat {
+                path: "src/lib.rs".into(),
+                additions: 2,
+                deletions: 1,
+            }]),
+        };
+        let item = tool_item_from_part(&part).unwrap();
+        assert_eq!(item.id.as_ref(), "tool-1");
+        assert_eq!(item.diff_ref.as_deref(), Some("v1:abc"));
+        assert_eq!(item.diff_stats.as_deref().unwrap()[0].additions, 2);
+    }
+
+    #[test]
+    fn a_late_tool_diff_reply_cannot_replace_a_new_chat_or_reference() {
+        let owner_a = ServerRef::new(ServerId::new("server-a"), "chat-a");
+        let owner_b = ServerRef::new(ServerId::new("server-b"), "chat-b");
+        let key = ToolDiffFetchKey {
+            owner: owner_a.clone(),
+            part_id: "tool-1".into(),
+            diff_ref: "v1:old".into(),
+        };
+        let mut states = HashMap::new();
+        states.insert(key.clone(), ToolDiffFetchState::Loading { generation: 7 });
+        assert!(tool_diff_reply_is_current(Some(&owner_a), &states, &key, 7));
+        assert!(!tool_diff_reply_is_current(
+            Some(&owner_b),
+            &states,
+            &key,
+            7
+        ));
+        assert!(!tool_diff_reply_is_current(
+            Some(&owner_a),
+            &states,
+            &key,
+            6
+        ));
+        let newer = ToolDiffFetchKey {
+            diff_ref: "v1:new".into(),
+            ..key.clone()
+        };
+        assert!(!tool_diff_reply_is_current(
+            Some(&owner_a),
+            &states,
+            &newer,
+            7
+        ));
+    }
+
+    #[test]
+    fn tool_diff_reference_mismatch_becomes_unavailable() {
+        let expected = comet_proto::ToolDiff {
+            path: "src/lib.rs".into(),
+            old_text: Some("old\n".into()),
+            new_text: "new\n".into(),
+        };
+        let wrong = comet_proto::ToolDiff {
+            path: "src/lib.rs".into(),
+            old_text: Some("old\n".into()),
+            new_text: "different\n".into(),
+        };
+        assert!(
+            validate_tool_diff_reply(
+                &expected.diff_ref().unwrap(),
+                comet_proto::ReadToolDiffReply::Available { diff: wrong },
+            )
+            .is_err_and(|failure| matches!(
+                failure,
+                ToolDiffValidationFailure::ChecksumMismatch { .. }
+            ))
+        );
+    }
+
+    #[test]
+    fn tool_diff_validation_preserves_unavailable_checksum_and_source_categories() {
+        let diff = comet_proto::ToolDiff {
+            path: "src/lib.rs".into(),
+            old_text: Some("old\n".into()),
+            new_text: "new\n".into(),
+        };
+        let expected_ref = diff.diff_ref().unwrap();
+        assert!(matches!(
+            validate_tool_diff_reply(&expected_ref, comet_proto::ReadToolDiffReply::NotAvailable),
+            Err(ToolDiffValidationFailure::NotAvailable)
+        ));
+        assert!(matches!(
+            validate_tool_diff_reference(
+                &expected_ref,
+                Err(serde_json::Error::io(std::io::Error::other(
+                    "checksum fixture"
+                ))),
+            ),
+            Err(ToolDiffValidationFailure::ChecksumCalculation { .. })
+        ));
+
+        let mut file = diff_to_file(&diff);
+        file.hunks[0].lines[0].text = "corrupted".into();
+        assert!(matches!(
+            validate_tool_diff_sources(&diff, &file),
+            Err(ToolDiffValidationFailure::SourceMismatch)
+        ));
+    }
+
+    #[test]
+    fn tool_diff_plain_model_exists_before_highlights_are_ready() {
+        let diff = comet_proto::ToolDiff {
+            path: "src/lib.rs".into(),
+            old_text: Some("fn old() {}\n".into()),
+            new_text: "fn new() {}\n".into(),
+        };
+        let file = diff_to_file(&diff);
+        let kinds: Vec<crate::changes::LineKind> =
+            file.hunks[0].lines.iter().map(|line| line.kind).collect();
+        assert!(kinds.contains(&crate::changes::LineKind::Del));
+        assert!(kinds.contains(&crate::changes::LineKind::Add));
+        assert_eq!(file.deletions, 1);
+        assert_eq!(file.additions, 1);
+    }
+
+    #[test]
+    fn new_file_stats_match_rendered_rows_for_all_line_endings() {
+        for (case, source, additions) in [
+            ("empty", "", 0),
+            ("LF", "first\nsecond\n", 2),
+            ("CRLF", "first\r\nsecond\r\n", 2),
+            ("lone CR", "first\rsecond\r", 2),
+            ("final newline", "last\n", 1),
+        ] {
+            let diff = comet_proto::ToolDiff {
+                path: "src/new.rs".into(),
+                old_text: None,
+                new_text: source.into(),
+            };
+            let file = diff_to_file(&diff);
+            let stat = diff.stat();
+            assert_eq!(stat.additions, additions, "{case}");
+            assert_eq!(stat.deletions, 0, "{case}");
+            assert_eq!(stat.additions, u64::from(file.additions), "{case}");
+            assert_eq!(stat.deletions, u64::from(file.deletions), "{case}");
+        }
+    }
+
+    #[test]
+    fn tool_diff_crlf_and_cr_sources_validate_without_visible_terminators() {
+        for (old, new) in [
+            ("old\r\nkeep\r\n", "new\r\nkeep\r\n"),
+            ("old\rkeep\r", "new\rkeep\r"),
+        ] {
+            let diff = comet_proto::ToolDiff {
+                path: "src/lib.rs".into(),
+                old_text: Some(old.into()),
+                new_text: new.into(),
+            };
+            let file = diff_to_file(&diff);
+            let visible: Vec<_> = file
+                .hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .filter(|line| line.kind != crate::changes::LineKind::Meta)
+                .map(|line| (line.kind, line.text.as_str()))
+                .collect();
+            assert_eq!(
+                visible,
+                vec![
+                    (crate::changes::LineKind::Del, "old"),
+                    (crate::changes::LineKind::Add, "new"),
+                    (crate::changes::LineKind::Context, "keep"),
+                ]
+            );
+            assert!(crate::changes::sources_match_diff(
+                &file,
+                diff.old_text.as_deref(),
+                Some(&diff.new_text),
+            ));
+        }
+    }
+
+    #[test]
+    fn tool_diff_final_newline_change_has_a_visible_meta_row() {
+        let diff = comet_proto::ToolDiff {
+            path: "src/lib.rs".into(),
+            old_text: Some("line".into()),
+            new_text: "line\n".into(),
+        };
+        let file = diff_to_file(&diff);
+        let visible: Vec<_> = file
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .map(|line| (line.kind, line.text.as_str()))
+            .collect();
+        assert_eq!(
+            visible,
+            vec![
+                (crate::changes::LineKind::Del, "line"),
+                (
+                    crate::changes::LineKind::Meta,
+                    "\\ No newline at end of file"
+                ),
+                (crate::changes::LineKind::Add, "line"),
+            ]
+        );
+        assert!(crate::changes::sources_match_diff(
+            &file,
+            diff.old_text.as_deref(),
+            Some(&diff.new_text),
+        ));
+    }
+
+    #[test]
+    fn tool_diff_new_and_deleted_files_use_unified_zero_length_headers() {
+        let added = comet_proto::ToolDiff {
+            path: "src/new.rs".into(),
+            old_text: None,
+            new_text: "new\n".into(),
+        };
+        let added_file = diff_to_file(&added);
+        assert_eq!(added_file.hunks[0].header, "@@ -0,0 +1,1 @@");
+        assert_eq!(
+            added_file.hunks[0].lines,
+            vec![crate::changes::DiffLine {
+                kind: crate::changes::LineKind::Add,
+                old_no: None,
+                new_no: Some(1),
+                text: "new".into(),
+            }]
+        );
+        assert!(crate::changes::sources_match_diff(
+            &added_file,
+            None,
+            Some(&added.new_text),
+        ));
+
+        let deleted = comet_proto::ToolDiff {
+            path: "src/old.rs".into(),
+            old_text: Some("old\n".into()),
+            new_text: String::new(),
+        };
+        let deleted_file = diff_to_file(&deleted);
+        assert_eq!(deleted_file.hunks[0].header, "@@ -1,1 +0,0 @@");
+        assert_eq!(
+            deleted_file.hunks[0].lines,
+            vec![crate::changes::DiffLine {
+                kind: crate::changes::LineKind::Del,
+                old_no: Some(1),
+                new_no: None,
+                text: "old".into(),
+            }]
+        );
+        assert!(crate::changes::sources_match_diff(
+            &deleted_file,
+            deleted.old_text.as_deref(),
+            Some(&deleted.new_text),
+        ));
+    }
+
+    #[test]
+    fn unicode_source_lines_validate_by_line_not_byte_offset() {
+        let diff = comet_proto::ToolDiff {
+            path: "src/lib.rs".into(),
+            old_text: Some("let café = \"Paris\";\n".into()),
+            new_text: "let café = \"東京\";\n".into(),
+        };
+        let file = diff_to_file(&diff);
+        assert!(crate::changes::sources_match_diff(
+            &file,
+            diff.old_text.as_deref(),
+            Some(&diff.new_text),
+        ));
+    }
+
+    #[test]
+    fn syntax_runs_do_not_change_diff_geometry_or_font_weight() {
+        let theme = Theme::dark();
+        let line = crate::changes::DiffLine {
+            kind: crate::changes::LineKind::Add,
+            old_no: None,
+            new_no: Some(1),
+            text: "fn café() {}".into(),
+        };
+        let plain = crate::changes::diff_text_runs(&line, &[], &theme);
+        let highlighted = crate::changes::diff_text_runs(
+            &line,
+            &[comet_syntax::HighlightSpan {
+                range: 0..2,
+                kind: comet_syntax::HighlightKind::Keyword,
+            }],
+            &theme,
+        );
+        assert_eq!(
+            plain.iter().map(|run| run.len).sum::<usize>(),
+            line.text.len()
+        );
+        assert_eq!(
+            highlighted.iter().map(|run| run.len).sum::<usize>(),
+            line.text.len()
+        );
+        let mono = gpui::font(theme.font_mono.clone());
+        assert!(plain.iter().all(|run| run.font == mono));
+        assert!(highlighted.iter().all(|run| run.font == mono));
+    }
+
+    #[test]
+    fn tool_diff_timeout_completion_removes_its_task_and_becomes_terminal_after_eight_seconds() {
+        let key = ToolDiffFetchKey {
+            owner: ServerRef::new(ServerId::new("server-a"), "chat-a"),
+            part_id: "tool-1".into(),
+            diff_ref: "v1:old".into(),
+        };
+        let mut fetches =
+            HashMap::from([(key.clone(), ToolDiffFetchState::Loading { generation: 7 })]);
+        let mut tasks = HashMap::from([(key.clone(), (7, ()))]);
+
+        assert!(complete_tool_diff_fetch(
+            Some(&key.owner),
+            &mut fetches,
+            &mut tasks,
+            key.clone(),
+            7,
+            None,
+        ));
+        assert!(tasks.is_empty());
+        assert!(matches!(
+            fetches.get(&key),
+            Some(ToolDiffFetchState::Unavailable)
+        ));
+        assert!(!tool_diff_fetch_needs_start(&fetches, &key));
+        assert_eq!(TOOL_DIFF_FETCH_TIMEOUT, Duration::from_secs(8));
+    }
+
+    #[test]
+    fn late_tool_diff_completion_keeps_owner_and_newer_generation_fetches_intact() {
+        let key = ToolDiffFetchKey {
+            owner: ServerRef::new(ServerId::new("server-a"), "chat-a"),
+            part_id: "tool-1".into(),
+            diff_ref: "v1:old".into(),
+        };
+        let mut fetches =
+            HashMap::from([(key.clone(), ToolDiffFetchState::Loading { generation: 8 })]);
+        let mut tasks = HashMap::from([(key.clone(), (8, ()))]);
+        assert!(!complete_tool_diff_fetch(
+            Some(&key.owner),
+            &mut fetches,
+            &mut tasks,
+            key.clone(),
+            7,
+            None,
+        ));
+        assert!(matches!(
+            fetches.get(&key),
+            Some(ToolDiffFetchState::Loading { generation: 8 })
+        ));
+        assert_eq!(tasks.get(&key).map(|(generation, _)| *generation), Some(8));
+
+        let other_owner = ServerRef::new(ServerId::new("server-b"), "chat-b");
+        let mut owner_fetches =
+            HashMap::from([(key.clone(), ToolDiffFetchState::Loading { generation: 7 })]);
+        let mut owner_tasks = HashMap::from([(key.clone(), (7, ()))]);
+        assert!(!complete_tool_diff_fetch(
+            Some(&other_owner),
+            &mut owner_fetches,
+            &mut owner_tasks,
+            key.clone(),
+            7,
+            None,
+        ));
+        assert!(matches!(
+            owner_fetches.get(&key),
+            Some(ToolDiffFetchState::Loading { generation: 7 })
+        ));
+        assert!(owner_tasks.is_empty());
+    }
+
+    #[test]
+    fn ready_tool_diff_completion_is_reused_without_starting_a_second_fetch() {
+        let key = ToolDiffFetchKey {
+            owner: ServerRef::new(ServerId::new("server-a"), "chat-a"),
+            part_id: "tool-1".into(),
+            diff_ref: "v1:ready".into(),
+        };
+        let diff = Arc::new(comet_proto::ToolDiff {
+            path: "src/lib.rs".into(),
+            old_text: Some("old\n".into()),
+            new_text: "new\n".into(),
+        });
+        let file = Arc::new(diff_to_file(&diff));
+        let mut fetches =
+            HashMap::from([(key.clone(), ToolDiffFetchState::Loading { generation: 7 })]);
+        let mut tasks = HashMap::from([(key.clone(), (7, ()))]);
+
+        assert!(complete_tool_diff_fetch(
+            Some(&key.owner),
+            &mut fetches,
+            &mut tasks,
+            key.clone(),
+            7,
+            Some((diff.clone(), file.clone())),
+        ));
+        assert!(tasks.is_empty());
+        assert!(!tool_diff_fetch_needs_start(&fetches, &key));
+        assert!(matches!(
+            fetches.get(&key),
+            Some(ToolDiffFetchState::Ready { diff: cached, file: cached_file })
+                if Arc::ptr_eq(cached, &diff) && Arc::ptr_eq(cached_file, &file)
+        ));
+    }
+
+    #[test]
+    fn tool_diff_detail_height_includes_the_wrapper_padding_for_every_terminal_state() {
+        let loading = ToolDiffFetchState::Loading { generation: 1 };
+        let unavailable = ToolDiffFetchState::Unavailable;
+        let file = Arc::new(crate::changes::FileDiff {
+            path: "src/lib.rs".into(),
+            old_path: None,
+            status: crate::changes::FileStatus::Modified,
+            binary: false,
+            notices: Vec::new(),
+            hunks: vec![crate::changes::Hunk {
+                header: "@@ -1,1 +1,1 @@".into(),
+                lines: vec![crate::changes::DiffLine {
+                    kind: crate::changes::LineKind::Add,
+                    old_no: None,
+                    new_no: Some(1),
+                    text: "new".into(),
+                }],
+            }],
+            additions: 1,
+            deletions: 0,
+            max_line: 1,
+        });
+        let ready = ToolDiffFetchState::Ready {
+            diff: Arc::new(comet_proto::ToolDiff {
+                path: "src/lib.rs".into(),
+                old_text: Some("old\n".into()),
+                new_text: "new\n".into(),
+            }),
+            file: file.clone(),
+        };
+
+        assert_eq!(
+            tool_diff_detail_height(Some(&loading)),
+            TOOL_DIFF_STATUS_HEIGHT + 2.0
+        );
+        assert_eq!(
+            tool_diff_detail_height(Some(&unavailable)),
+            TOOL_DIFF_STATUS_HEIGHT + 2.0
+        );
+        assert_eq!(
+            tool_diff_detail_height(Some(&ready)),
+            crate::changes::body_height(&file) + 2.0
+        );
     }
 }

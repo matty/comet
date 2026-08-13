@@ -47,6 +47,7 @@ pub fn remote_method_allowed(method: &str) -> bool {
             | methods::UPLOAD_CHUNK
             | methods::UPLOAD_COMMIT
             | methods::READ_ATTACHMENT_CHUNK
+            | methods::READ_TOOL_DIFF
     )
 }
 
@@ -231,6 +232,10 @@ impl RpcService for RemoteRpcService {
                     parsed.offset,
                     &self.local_device_id,
                 );
+            }
+            methods::READ_TOOL_DIFF => {
+                let parsed: ChatParams = parse_params(params.clone())?;
+                self.require_local_chat(&parsed.chat_id)?;
             }
             _ => {}
         }

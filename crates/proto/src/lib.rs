@@ -8,8 +8,10 @@ pub mod agent;
 pub mod entities;
 pub mod motion;
 pub mod remote;
+pub mod tool_diff;
 pub mod view;
 
 pub use agent::*;
 pub use entities::*;
 pub use remote::*;
+pub use tool_diff::*;
