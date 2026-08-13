@@ -124,16 +124,17 @@ fn opt_str_field(input: &Value, key: &str) -> Option<String> {
 /// Claude's `status` string on `task_notification` / `task_updated.patch`, to
 /// [`SubagentStatus`]. The capture never observed anything but `"completed"`
 /// — `Failed` and `Cancelled` are written by hand per
-/// `.agents/rules/optional-wire-fields.md`. Anything unrecognized (including
-/// a genuinely in-progress subagent, which reports no `status` field at all)
-/// degrades to `Running` rather than panicking: an unknown status is not
-/// evidence the subagent stopped.
-fn subagent_status(raw: &str) -> SubagentStatus {
+/// `.agents/rules/optional-wire-fields.md`. `None` means the string matched
+/// none of the three known values — distinct from the field being absent
+/// entirely, which callers represent as `raw: None` in
+/// [`Normalizer::status_or_carry_forward`], the function that decides what an
+/// unrecognized or absent reading degrades to.
+fn subagent_status(raw: &str) -> Option<SubagentStatus> {
     match raw {
-        "completed" => SubagentStatus::Completed,
-        "failed" => SubagentStatus::Failed,
-        "cancelled" => SubagentStatus::Cancelled,
-        _ => SubagentStatus::Running,
+        "completed" => Some(SubagentStatus::Completed),
+        "failed" => Some(SubagentStatus::Failed),
+        "cancelled" => Some(SubagentStatus::Cancelled),
+        _ => None,
     }
 }
 
@@ -203,9 +204,9 @@ struct SubagentToolResult {
 
 /// Sniff the `Agent` tool's own `tool_use_result` for a subagent record, keyed
 /// by `agentId` (== `task_id`). Shape-based rather than name-tracked: `agentId`
-/// alongside `status` is specific to an `Agent` result, so an ordinary tool's
-/// result (`Bash`'s `stdout`, `Write`'s diff, …) never matches. Returns `None`
-/// for anything that isn't one.
+/// alone is specific to an `Agent` result, so an ordinary tool's result
+/// (`Bash`'s `stdout`, `Write`'s diff, …) never matches. Returns `None` for
+/// anything that isn't one.
 fn subagent_result_from_tool_use_result(value: &Value) -> Option<SubagentToolResult> {
     let task_id = value.get("agentId").and_then(Value::as_str)?.to_owned();
     let status = value
@@ -426,21 +427,35 @@ impl Normalizer {
         }
     }
 
-    /// The status for a frame that may not report one: the previously known
-    /// status for this `task_id` when we have one, `Running` otherwise (the
-    /// only sane default for a `task_id` normalize has never seen). Never
-    /// `Running` as a blind fallback — a status-less frame arriving after a
-    /// terminal reading must not resurrect a finished card. This is exactly
-    /// `.agents/rules/optional-wire-fields.md`: an absent field is "unknown",
-    /// and "unknown" here means "whatever we already knew", not "restarted".
+    /// The status for a frame that may not report one, or may report a
+    /// string this build doesn't recognize: the previously known status for
+    /// this `task_id` when we have one, `Running` otherwise (the only sane
+    /// default for a `task_id` normalize has never seen). Never `Running` as
+    /// a blind fallback — a status-less OR unrecognized-status frame arriving
+    /// after a terminal reading must not resurrect a finished card, because
+    /// "unknown" is not evidence the subagent restarted. This is exactly
+    /// `.agents/rules/optional-wire-fields.md` for the absent case; the
+    /// unrecognized case gets the same treatment for the same reason — the
+    /// CLI ships often and a future status spelling ("succeeded",
+    /// "timed_out", …) is the likelier trigger, not an exotic race. A
+    /// NON-terminal stored reading (or no stored reading at all) still
+    /// degrades an unrecognized string to `Running`, matching how a first,
+    /// never-seen reading has always been handled — only a stored terminal
+    /// reading is protected from being reopened.
     fn status_or_carry_forward(&self, task_id: &str, raw: Option<&str>) -> SubagentStatus {
+        let stored = self
+            .subagent_progress
+            .get(task_id)
+            .map(|snapshot| snapshot.status);
         match raw {
-            Some(s) => subagent_status(s),
-            None => self
-                .subagent_progress
-                .get(task_id)
-                .map(|snapshot| snapshot.status)
-                .unwrap_or(SubagentStatus::Running),
+            Some(s) => match subagent_status(s) {
+                Some(status) => status,
+                None => match stored {
+                    Some(status) if is_terminal(status) => status,
+                    _ => SubagentStatus::Running,
+                },
+            },
+            None => stored.unwrap_or(SubagentStatus::Running),
         }
     }
 
@@ -458,9 +473,9 @@ impl Normalizer {
     /// both sides) adds nothing and is dropped. A CONTRADICTED terminal
     /// reading — e.g. a populated `Failed` arriving after a populated
     /// `Completed` — is dropped the same way, for the same reason: nothing in
-    /// it is `None` where the stored reading was `Some`, so `adds_new_detail`
-    /// reports no addition either. First terminal reading wins even when the
-    /// second one disagrees, not only when it repeats.
+    /// the candidate is `Some` where the stored reading was `None`, so
+    /// `adds_new_detail` reports no addition either. First terminal reading
+    /// wins even when the second one disagrees, not only when it repeats.
     fn emit_subagent_update(
         &mut self,
         task_id: String,
@@ -503,6 +518,12 @@ impl Normalizer {
                 // last run's, which would otherwise look like a redundant
                 // terminal repeat and go silent.
                 self.subagent_progress.remove(&f.task_id);
+                if let Some(p) = &f.prompt {
+                    tracing::debug!(
+                        target: "comet_harness::claude",
+                        "subagent prompt (full text): {}", p
+                    );
+                }
                 vec![AgentEvent::SubagentStarted {
                     task_id: f.task_id,
                     tool_use_id: f.tool_use_id.unwrap_or_default(),
@@ -1549,6 +1570,46 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The mirror of the test above, with a stored TERMINAL reading in
+    /// place: an unrecognized status string is not evidence a genuinely
+    /// running subagent started, and it is also not evidence a finished one
+    /// restarted — but before this fix `subagent_status` collapsed both to
+    /// `Running` unconditionally, so a future CLI spelling ("succeeded",
+    /// "timed_out", …) arriving after `Completed` reopened the card forever.
+    /// `usage.total_tokens` is new detail the first reading never reported,
+    /// so the terminal-vs-terminal guard does not silence this update and
+    /// the emitted status is directly observable.
+    #[test]
+    fn an_unrecognized_status_after_a_terminal_reading_carries_it_forward_instead_of_reopening() {
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+
+        let notification = r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"completed","summary":"done"}"#;
+        let frame = crate::claude::wire::parse_frame(notification).unwrap();
+        let first = normalizer.normalize(frame, false);
+        assert!(matches!(
+            &first[0],
+            AgentEvent::SubagentUpdated {
+                status: SubagentStatus::Completed,
+                ..
+            }
+        ));
+
+        let unrecognized = r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"succeeded","summary":"done","usage":{"total_tokens":42}}"#;
+        let frame = crate::claude::wire::parse_frame(unrecognized).unwrap();
+        let second = normalizer.normalize(frame, false);
+        match second.first() {
+            Some(AgentEvent::SubagentUpdated { status, .. }) => {
+                assert_eq!(
+                    *status,
+                    SubagentStatus::Completed,
+                    "an unrecognized status after a terminal reading must carry the terminal \
+                     status forward, not reopen the card as Running: {second:?}"
+                );
+            }
+            other => panic!("expected a SubagentUpdated: {other:?}"),
+        }
     }
 
     /// Unobserved on the wire (the capture only ever saw `"completed"`), so
