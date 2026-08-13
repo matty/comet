@@ -209,9 +209,10 @@ fn entries_now(core: &EngineCore) -> Vec<SessionMessageEntry> {
 
 /// Every Text and Error part's message, across every entry, joined — for
 /// substring assertions about what the transcript says without caring which
-/// entry it landed in.
-fn entries_text(core: &EngineCore) -> String {
-    entries(core)
+/// entry it landed in. Shared by `entries_text` and `entries_text_now` so
+/// the join logic can't drift between the panicking and tolerant readers.
+fn join_text(entries: &[SessionMessageEntry]) -> String {
+    entries
         .iter()
         .flat_map(|e| e.parts.iter())
         .filter_map(|p| match p {
@@ -221,6 +222,16 @@ fn entries_text(core: &EngineCore) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn entries_text(core: &EngineCore) -> String {
+    join_text(&entries(core))
+}
+
+/// Tolerant counterpart to `entries_text`, for a hot-polling predicate — see
+/// `entries_now`'s comment for why a mid-write snapshot must not panic here.
+fn entries_text_now(core: &EngineCore) -> String {
+    join_text(&entries_now(core))
 }
 
 fn command_status(core: &EngineCore, id: &str) -> Option<(SessionCommandStatus, Option<String>)> {
@@ -2654,17 +2665,7 @@ async fn a_steer_over_a_running_subagent_does_not_stamp_it_cancelled() {
     );
 
     wait_for(
-        || {
-            entries_now(&core)
-                .iter()
-                .flat_map(|e| e.parts.iter())
-                .filter_map(|p| match p {
-                    MessagePart::Text { text, .. } => Some(text.as_str()),
-                    MessagePart::Error { message, .. } => Some(message.as_str()),
-                    _ => None,
-                })
-                .any(|text| text.contains("steered"))
-        },
+        || entries_text_now(&core).contains("steered"),
         "the post-steer turn to complete",
     )
     .await;
