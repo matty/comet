@@ -1264,6 +1264,59 @@ pub enum SubagentStatus {
     Cancelled,
 }
 
+/// How far along one step of a published plan is.
+///
+/// Codex's spelling, which Claude's `TaskUpdate` matches snake-cased and which
+/// t3code converged on independently — two implementations reaching one shape
+/// is what settled it against Comet's own `TodoItem { text, done: bool }`,
+/// which cannot express `InProgress` at all. That is the one state a live
+/// checklist exists to show.
+///
+/// `#[serde(other)]` degrades an unrecognized status to `Unknown` on
+/// [`NoticeKind`]'s precedent and for its reason: a status this build has never
+/// heard of must not fail the surrounding part. Note this differs from
+/// [`SubagentStatus`], which has NO such arm and instead carries a status
+/// forward in the normalizer — that mechanism exists because a *terminal*
+/// subagent reading must not be reopened by a later status-less frame, and a
+/// checklist item has no equivalent one-way door.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChecklistStatus {
+    Pending,
+    InProgress,
+    Completed,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One step of a plan the agent published.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChecklistItem {
+    /// The provider's own item identity where it has one — Claude's integer
+    /// `taskId`, stringified. Codex sends no per-step id, so its steps are
+    /// indexed positionally; that is safe there and ONLY there, because a
+    /// Codex plan always arrives as a whole snapshot
+    /// ([`AgentEvent::ChecklistReplaced`]) and a positional id is therefore
+    /// never matched against a previously stored one.
+    pub id: String,
+    /// The step as the agent phrased it. `None` means **this run never saw the
+    /// subject**, never "the step has no subject": a resumed Claude process
+    /// restates nothing and updates tasks the previous process created, so an
+    /// item can be first sighted by a bare status change. Captured 2026-08-13,
+    /// `captures/2026-08-13-plan-todo-subagent.md` §7.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Claude's present-participle label ("Counting lines in notes.txt") as
+    /// distinct from `text` ("Count the lines in notes.txt"). Carried here
+    /// because it cannot be synthesized from `text` afterwards, and because on
+    /// a resumed run it is often the only human-readable text an item has.
+    /// Codex sends none.
+    #[serde(default)]
+    pub active_form: Option<String>,
+    pub status: ChecklistStatus,
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors comet's `AgentEvent` tagged enum.
@@ -1448,6 +1501,38 @@ pub enum AgentEvent {
         duration_ms: Option<u64>,
         #[serde(default)]
         tool_uses: Option<u32>,
+    },
+    /// The agent published a whole plan, replacing whatever it had before.
+    ///
+    /// Codex's `turn/plan/updated` (one complete snapshot per change), Claude's
+    /// legacy `TodoWrite` (the whole list in one call), and Claude's `TaskList`
+    /// when the model chooses to call it. **Omitted items are gone** — that is
+    /// what replacement means, and it is why this is a separate variant from
+    /// [`AgentEvent::ChecklistItemChanged`] rather than the same one with a
+    /// flag. A fold cannot guess which of the two a flag meant.
+    #[serde(rename_all = "camelCase")]
+    ChecklistReplaced {
+        /// Codex's one-line prose saying why the plan changed. Claude has no
+        /// equivalent and one must NOT be synthesized for it.
+        #[serde(default)]
+        explanation: Option<String>,
+        items: Vec<ChecklistItem>,
+    },
+    /// One step moved. Claude's `TaskCreate` and `TaskUpdate`, both read from
+    /// the `tool_use_result` sibling key rather than from the prose the model
+    /// sees.
+    ///
+    /// Every field but `item_id` and `status` is a PARTIAL patch: absent means
+    /// "this frame said nothing about it", never "clear what an earlier frame
+    /// reported". `TaskUpdate` reports a status transition and no subject.
+    #[serde(rename_all = "camelCase")]
+    ChecklistItemChanged {
+        item_id: String,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        active_form: Option<String>,
+        status: ChecklistStatus,
     },
     #[serde(rename_all = "camelCase")]
     Done {
@@ -2123,5 +2208,108 @@ mod tests {
                 status
             );
         }
+    }
+
+    #[test]
+    fn checklist_status_round_trips_camel_case() {
+        for (status, wire) in [
+            (ChecklistStatus::Pending, "\"pending\""),
+            (ChecklistStatus::InProgress, "\"inProgress\""),
+            (ChecklistStatus::Completed, "\"completed\""),
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, wire);
+            assert_eq!(
+                serde_json::from_str::<ChecklistStatus>(&json).unwrap(),
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_checklist_status_degrades_rather_than_failing() {
+        // A CLI shipping a fourth status ("blocked", "cancelled", …) must not
+        // take the whole surrounding part down with it. This is the entire
+        // reason for `#[serde(other)]`; without it this is a decode ERROR, not
+        // a wrong value.
+        let ev: AgentEvent = serde_json::from_str(
+            r#"{"type":"checklistItemChanged","itemId":"7","status":"blocked"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ev,
+            AgentEvent::ChecklistItemChanged {
+                item_id: "7".into(),
+                text: None,
+                active_form: None,
+                status: ChecklistStatus::Unknown,
+            }
+        );
+    }
+
+    #[test]
+    fn checklist_replaced_round_trips() {
+        let ev = AgentEvent::ChecklistReplaced {
+            explanation: Some("Finished the README read.".into()),
+            items: vec![
+                ChecklistItem {
+                    id: "1".into(),
+                    text: Some("Read `README.md`.".into()),
+                    active_form: None,
+                    status: ChecklistStatus::Completed,
+                },
+                ChecklistItem {
+                    id: "2".into(),
+                    text: Some("Count the lines in notes.txt".into()),
+                    active_form: Some("Counting lines in notes.txt".into()),
+                    status: ChecklistStatus::InProgress,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    #[test]
+    fn a_checklist_item_decodes_with_neither_text_nor_active_form() {
+        // What a resumed Claude run produces: a `TaskUpdate` for a task the
+        // previous process created, whose `completed` transition carries no
+        // `activeForm` either. `None` here is "this run never saw the
+        // subject", and the decode must not require one. Capture §7.
+        let ev: AgentEvent = serde_json::from_str(
+            r#"{"type":"checklistItemChanged","itemId":"2","status":"completed"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ev,
+            AgentEvent::ChecklistItemChanged {
+                item_id: "2".into(),
+                text: None,
+                active_form: None,
+                status: ChecklistStatus::Completed,
+            }
+        );
+    }
+
+    #[test]
+    fn checklist_replaced_defaults_an_absent_explanation() {
+        // Both Claude paths (`TodoWrite`, `TaskList`) send none; only Codex
+        // has an equivalent, and nothing may synthesize one.
+        let ev: AgentEvent = serde_json::from_str(
+            r#"{"type":"checklistReplaced","items":[{"id":"0","status":"pending"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ev,
+            AgentEvent::ChecklistReplaced {
+                explanation: None,
+                items: vec![ChecklistItem {
+                    id: "0".into(),
+                    text: None,
+                    active_form: None,
+                    status: ChecklistStatus::Pending,
+                }],
+            }
+        );
     }
 }

@@ -472,6 +472,14 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
         | AgentEvent::Diagnostic { .. } => {}
+        // TEMPORARY (slice 4.3, task 2). These two fold into
+        // `MessagePart::Checklist` and the part does not exist yet; this arm
+        // exists only so the workspace builds between task 2 and task 5, since
+        // the match above is exhaustive by design and has no `_` catch-all.
+        // Task 5 moves them out. An inert arm left behind is a lie the next
+        // reader has to disprove — the same obligation `IGNORED_FRAMES`
+        // documents for a slice number in its reason column.
+        AgentEvent::ChecklistReplaced { .. } | AgentEvent::ChecklistItemChanged { .. } => {}
     }
 }
 
