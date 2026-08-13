@@ -146,12 +146,14 @@ impl MessagePart {
                 summary, detail, ..
             } => summary.len() + detail.as_deref().map_or(0, str::len),
             MessagePart::Subagent {
+                agent_type,
                 description,
                 activity,
                 summary,
                 ..
             } => {
-                description.len()
+                agent_type.len()
+                    + description.len()
                     + activity.as_deref().map_or(0, str::len)
                     + summary.as_deref().map_or(0, str::len)
             }
