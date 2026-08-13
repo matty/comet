@@ -31,7 +31,7 @@ use comet_doc::{
 use comet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DoneStatus, HarnessId, RunRequest, RuntimeMode,
-    Session, SessionStatus, UserInputAnswer, UserInputQuestion,
+    Session, SessionStatus, SubagentStatus, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
@@ -782,9 +782,10 @@ impl SessionsEngine {
             };
             // Note BEFORE interrupt: this folds into the live entry via
             // `engine_tx`, and after the interrupt the entry is finished and
-            // nothing can add to it — the same failure `expire_open_approvals`'
-            // doc comment warns about. `kind` comes from the re-read too, so
-            // the wording names the wait that is open now.
+            // nothing can add to it — the same failure
+            // `expire_open_approvals_and_subagents`'s doc comment warns about.
+            // `kind` comes from the re-read too, so the wording names the wait
+            // that is open now.
             let _ = live.engine_tx.send(AgentEvent::Error {
                 message: unattended_note(bound, live.kind),
             });
@@ -1406,20 +1407,34 @@ fn finish_segment<'a>(
     }
 }
 
-/// Terminally resolve every approval this run still has open, both halves:
-/// drop the parked resolvers, and stamp the accumulated parts `Expired`.
+/// Terminally resolve everything this run still left open: drop the parked
+/// approval resolvers, stamp accumulated `Approval` parts `Expired`, and stamp
+/// accumulated `Subagent` parts still `Running` to `Cancelled`. Same job for
+/// both part kinds, done in the same pass rather than as two separate sweeps.
 ///
 /// Called wherever `folded` is about to be written into a FINISHED entry. Past
-/// that point neither half can happen any more — `fold_event_into_parts`'s
-/// `ApprovalResolved` arm and the run's own sweeps all walk the live
-/// accumulator only, so a card that leaves it undecided reads "waiting" for
-/// the life of the chat — while the resolver stays parked and the harness
-/// stays blocked on a tool call nobody will answer.
+/// that point nothing can happen to either kind any more — `fold_event_into_parts`'s
+/// `ApprovalResolved` and `SubagentUpdated` arms both walk the live accumulator
+/// only, so a part left open here reads "waiting"/"running" for the life of the
+/// chat: the approval's resolver stays parked and the harness stays blocked on
+/// a tool call nobody will answer, and a subagent whose run already ended will
+/// never fold another update in (a resumed agent's `SubagentStarted` starts a
+/// NEW run, which finds no `Running` part to confuse with — see `task_id`'s
+/// doc on `MessagePart::Subagent`).
 ///
-/// Dropping the resolver, rather than sending a decision, is deliberate: every
-/// consumer reads a dropped resolver as NOT approved, which is the same rule
-/// `interrupt()` and `RunHandle::drop` use.
-fn expire_open_approvals(inner: &Inner, chat_id: &str, run_id: &str, folded: &mut [MessagePart]) {
+/// Only a `Running` subagent is touched: `Completed`, `Failed` and `Cancelled`
+/// are already terminal, and overwriting one would erase a real outcome with a
+/// manufactured one.
+///
+/// Dropping the approval resolver, rather than sending a decision, is
+/// deliberate: every consumer reads a dropped resolver as NOT approved, which
+/// is the same rule `interrupt()` and `RunHandle::drop` use.
+fn expire_open_approvals_and_subagents(
+    inner: &Inner,
+    chat_id: &str,
+    run_id: &str,
+    folded: &mut [MessagePart],
+) {
     let pending = lock(&inner.runs)
         .get(chat_id)
         .filter(|h| h.run_id == run_id)
@@ -1429,10 +1444,14 @@ fn expire_open_approvals(inner: &Inner, chat_id: &str, run_id: &str, folded: &mu
         drop(parked);
     }
     for part in folded.iter_mut() {
-        if let MessagePart::Approval { decision, .. } = part
-            && decision.is_none()
-        {
-            *decision = Some(ApprovalDecision::Expired);
+        match part {
+            MessagePart::Approval { decision, .. } if decision.is_none() => {
+                *decision = Some(ApprovalDecision::Expired);
+            }
+            MessagePart::Subagent { status, .. } if *status == SubagentStatus::Running => {
+                *status = SubagentStatus::Cancelled;
+            }
+            _ => {}
         }
     }
 }
@@ -1718,11 +1737,12 @@ async fn drive_run(
             inner.publish(&chat_id, &event);
             // A steer abandons whatever the previous turn was waiting on, and
             // this is the last moment either half of that can be recorded: the
-            // segment below is FINISHED, so a card left open in it can never be
-            // stamped by a later decision, by the Done-time sweep, or offered
-            // by the decision row again. Saying the tool call was dropped is
-            // the honest answer, and it releases the harness.
-            expire_open_approvals(&inner, &chat_id, &run_id, &mut folded);
+            // segment below is FINISHED, so a card left open in it — an
+            // approval or a still-`Running` subagent — can never be stamped by
+            // a later decision or update, by the Done-time sweep, or offered
+            // by the decision row again. Saying the wait ended unanswered is
+            // the honest read, and for an approval it also releases the harness.
+            expire_open_approvals_and_subagents(&inner, &chat_id, &run_id, &mut folded);
             if let Err(err) = finish_segment(
                 doc_ref,
                 writer.take(),
@@ -1882,8 +1902,10 @@ async fn drive_run(
             // after a completed turn (below), so its resolvers would outlive
             // the transcript's "Expired" by up to the 30-minute idle reap,
             // and `respond_approval` would keep answering `true` for one of
-            // them the whole time.
-            expire_open_approvals(&inner, &chat_id, &run_id, &mut folded);
+            // them the whole time. Same rule again for a `Subagent` part still
+            // `Running`: this run's own event stream is the only thing that
+            // could ever move it past that, and `Done` is the last event in it.
+            expire_open_approvals_and_subagents(&inner, &chat_id, &run_id, &mut folded);
             // A Done landing on a PARKED session with nothing streamed (the
             // idle reaper's or an interrupt's own teardown) has no entry to
             // finalize — writing one would leave an empty aborted stub.
@@ -2391,6 +2413,66 @@ mod tests {
             Some((t(5), WaitKind::Answer)),
             "the earlier question beats the later approval outside a tie"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // `expire_open_approvals_and_subagents`'s Subagent half — same rule as
+    // the Approval half it shares a pass with: a part this run's own event
+    // stream can never touch again reads "running" for the life of the chat
+    // unless a run-end sweep stamps it.
+    // -----------------------------------------------------------------------
+
+    fn subagent_part(id: &str, task_id: &str, status: SubagentStatus) -> MessagePart {
+        MessagePart::Subagent {
+            id: id.into(),
+            task_id: task_id.into(),
+            agent_type: "general-purpose".into(),
+            description: "Read README and report first heading".into(),
+            status,
+            activity: None,
+            summary: None,
+            total_tokens: None,
+            duration_ms: None,
+            tool_uses: None,
+        }
+    }
+
+    /// A run that ends (Done, or a steer boundary) while a subagent is still
+    /// `Running` must not leave that part `Running` — nothing will ever fold
+    /// another `SubagentUpdated` into this segment.
+    #[test]
+    fn a_run_that_ends_mid_subagent_leaves_no_running_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = engine(dir.path());
+        let mut folded = vec![subagent_part("sub-1", "t1", SubagentStatus::Running)];
+
+        expire_open_approvals_and_subagents(&sessions.inner, "chat-1", "run-1", &mut folded);
+
+        match &folded[0] {
+            MessagePart::Subagent { status, .. } => {
+                assert_eq!(*status, SubagentStatus::Cancelled);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// A run that ends after the subagent already reached a terminal status
+    /// must not stamp over it — `Completed` is a real outcome, not an open
+    /// wait, and the sweep must not manufacture a different one.
+    #[test]
+    fn a_run_that_ends_after_the_subagent_completed_does_not_overwrite_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = engine(dir.path());
+        let mut folded = vec![subagent_part("sub-1", "t1", SubagentStatus::Completed)];
+
+        expire_open_approvals_and_subagents(&sessions.inner, "chat-1", "run-1", &mut folded);
+
+        match &folded[0] {
+            MessagePart::Subagent { status, .. } => {
+                assert_eq!(*status, SubagentStatus::Completed);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------
