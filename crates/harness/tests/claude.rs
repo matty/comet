@@ -209,6 +209,21 @@ async fn happy_path_normalizes_events_and_filters_subagents() {
         duration_ms: Some(4_906),
         tool_uses: Some(1),
     }));
+    // The resumed invocation (same task_id, new tool_use_id "sub-2") reaches
+    // the stream with its OWN summary — proving `normalize.rs:505`'s
+    // `subagent_progress.remove(&f.task_id)` on the second `task_started`
+    // actually runs through a real spawn. Without it this terminal reading
+    // would be compared against the first invocation's already-terminal one
+    // (summary "Sandbox", both `Some`) and dropped as adding nothing new.
+    assert!(events.contains(&AgentEvent::SubagentUpdated {
+        task_id: "sub-1-task".into(),
+        status: SubagentStatus::Completed,
+        activity: None,
+        summary: Some("The first heading is **Sandbox**.".into()),
+        total_tokens: Some(19_111),
+        duration_ms: Some(2_186),
+        tool_uses: Some(0),
+    }));
 
     // Typed tool decoding: Bash -> Exec, mcp__server__tool -> Mcp.
     assert!(events.contains(&AgentEvent::ToolCall {
