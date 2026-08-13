@@ -1404,7 +1404,7 @@ dependencies = [
 
 [[package]]
 name = "comet-syntax"
-version = "0.1.54"
+version = "0.1.15"
 dependencies = [
  "thiserror 2.0.19",
  "tree-sitter",
@@ -1438,6 +1438,7 @@ dependencies = [
  "pulldown-cmark",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",

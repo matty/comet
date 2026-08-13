@@ -5,7 +5,9 @@
 
 use std::{ops::Range, path::Path, sync::atomic::AtomicUsize};
 
-use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
+use tree_sitter_highlight::{
+    Error as TreeSitterHighlightError, HighlightConfiguration, HighlightEvent, Highlighter,
+};
 
 pub const DEFAULT_MAX_SOURCE_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_SPANS: usize = 200_000;
@@ -21,21 +23,6 @@ impl Default for HighlightLimits {
         Self {
             max_source_bytes: DEFAULT_MAX_SOURCE_BYTES,
             max_spans: DEFAULT_MAX_SPANS,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HighlightLimits {
-    pub max_source_bytes: usize,
-    pub max_spans: usize,
-}
-
-impl Default for HighlightLimits {
-    fn default() -> Self {
-        Self {
-            max_source_bytes: 1024 * 1024,
-            max_spans: 200_000,
         }
     }
 }
@@ -154,6 +141,10 @@ pub enum HighlightError {
     SourceTooLarge,
     #[error("highlight output exceeds the configured span limit")]
     TooManySpans,
+    #[error("highlighting was cancelled")]
+    Cancelled,
+    #[error("highlight configuration is incompatible with its grammar")]
+    IncompatibleConfiguration,
     #[error("parser failed: {0}")]
     Parser(String),
     #[error("the {0:?} grammar is not bundled")]
@@ -166,6 +157,15 @@ impl HighlightedDocument {
         language: LanguageId,
         source: &str,
         spans: impl IntoIterator<Item = HighlightSpan>,
+    ) -> Result<Self, HighlightError> {
+        Self::from_absolute_spans_with_limit(language, source, spans, usize::MAX)
+    }
+
+    fn from_absolute_spans_with_limit(
+        language: LanguageId,
+        source: &str,
+        spans: impl IntoIterator<Item = HighlightSpan>,
+        max_spans: usize,
     ) -> Result<Self, HighlightError> {
         let starts = line_starts(source);
         let mut lines = vec![Vec::new(); starts.len()];
@@ -190,8 +190,13 @@ impl HighlightedDocument {
                 }
             }
         }
+        let mut normalized_span_count = 0usize;
         for line in &mut lines {
             *line = normalize_line(std::mem::take(line));
+            normalized_span_count = normalized_span_count.saturating_add(line.len());
+            if normalized_span_count > max_spans {
+                return Err(HighlightError::TooManySpans);
+            }
         }
         Ok(Self { language, lines })
     }
@@ -297,12 +302,12 @@ pub fn highlight_with_limits(
             cancellation_flag,
             |_| None,
         )
-        .map_err(|error| HighlightError::Parser(error.to_string()))?;
+        .map_err(map_highlight_error)?;
 
     let mut active = Vec::new();
     let mut spans = Vec::new();
     for event in events {
-        match event.map_err(|error| HighlightError::Parser(error.to_string()))? {
+        match event.map_err(map_highlight_error)? {
             HighlightEvent::HighlightStart(highlight) => active.push(CAPTURE_KINDS[highlight.0]),
             HighlightEvent::HighlightEnd => {
                 active.pop();
@@ -313,14 +318,16 @@ pub fn highlight_with_limits(
                         range: start..end,
                         kind,
                     });
-                    if spans.len() > limits.max_spans {
-                        return Err(HighlightError::TooManySpans);
-                    }
                 }
             }
         }
     }
-    HighlightedDocument::from_absolute_spans(language, request.source, spans)
+    HighlightedDocument::from_absolute_spans_with_limit(
+        language,
+        request.source,
+        spans,
+        limits.max_spans,
+    )
 }
 
 fn rust_configuration() -> Result<HighlightConfiguration, HighlightError> {
@@ -346,7 +353,17 @@ fn rust_configuration() -> Result<HighlightConfiguration, HighlightError> {
         tree_sitter_rust::INJECTIONS_QUERY,
         "",
     )
-    .map_err(|error| HighlightError::Parser(error.to_string()))
+    .map_err(|_| HighlightError::IncompatibleConfiguration)
+}
+
+fn map_highlight_error(error: TreeSitterHighlightError) -> HighlightError {
+    match error {
+        TreeSitterHighlightError::Cancelled => HighlightError::Cancelled,
+        TreeSitterHighlightError::InvalidLanguage => HighlightError::IncompatibleConfiguration,
+        TreeSitterHighlightError::Unknown => {
+            HighlightError::Parser("tree-sitter highlighter returned an unknown error".into())
+        }
+    }
 }
 
 // Ordered from generic to specific. `HighlightConfiguration::configure`
@@ -583,6 +600,45 @@ mod tests {
                 }]
             ),
             Err(HighlightError::InvalidUtf8Boundary { start: 8, end: 9 })
+        );
+    }
+
+    #[test]
+    fn span_limit_applies_to_final_line_relative_spans() {
+        let source = "first\nsecond\nthird";
+        assert_eq!(
+            HighlightedDocument::from_absolute_spans_with_limit(
+                LanguageId::Rust,
+                source,
+                [HighlightSpan {
+                    range: 0..source.len(),
+                    kind: HighlightKind::Comment,
+                }],
+                2,
+            ),
+            Err(HighlightError::TooManySpans)
+        );
+    }
+
+    #[test]
+    fn cancellation_and_incompatible_configuration_stay_typed() {
+        let cancellation = std::sync::atomic::AtomicUsize::new(1);
+        let source = "fn cancelled() {}\n".repeat(2_048);
+        assert_eq!(
+            highlight_with_limits(
+                HighlightRequest {
+                    source: &source,
+                    path: Some("main.rs"),
+                    fence_tag: None,
+                },
+                HighlightLimits::default(),
+                Some(&cancellation),
+            ),
+            Err(HighlightError::Cancelled)
+        );
+        assert_eq!(
+            map_highlight_error(tree_sitter_highlight::Error::InvalidLanguage),
+            HighlightError::IncompatibleConfiguration
         );
     }
 

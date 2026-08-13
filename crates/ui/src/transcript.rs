@@ -26,7 +26,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -38,12 +41,13 @@ use gpui::{
 use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 use comet_proto::{ChecklistStatus, NoticeSeverity, ServerId, ServerRef, SubagentStatus, ToolCall};
 
-use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
+use crate::markdown::highlight::{Lang, LineCarry, lang_for_tag, tokenize_line};
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
 use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
 use crate::motion::{self, AnimationExt as _, RESIZE};
 use crate::state::AppState;
+use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -879,24 +883,17 @@ pub fn format_elapsed(secs: i64) -> String {
 // Highlight store (background, time-sliced, paint-only)
 // ---------------------------------------------------------------------------
 
-async fn yield_now() {
-    let mut yielded = false;
-    futures::future::poll_fn(move |cx| {
-        if yielded {
-            std::task::Poll::Ready(())
-        } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            std::task::Poll::Pending
-        }
-    })
-    .await
+struct HighlightEntry {
+    key: DocumentHighlightKey,
+    document: Option<Arc<comet_syntax::HighlightedDocument>>,
+    cancellation: Arc<AtomicUsize>,
+    _task: Option<Task<()>>,
 }
 
-struct HighlightEntry {
-    code_len: usize,
-    lines: Option<Arc<Vec<Vec<Token>>>>,
-    _task: Option<Task<()>>,
+impl Drop for HighlightEntry {
+    fn drop(&mut self) {
+        self.cancellation.store(1, Ordering::Relaxed);
+    }
 }
 
 /// Cache of tokenized code blocks keyed by `(row id, block ix)`. Tokenization
@@ -905,6 +902,7 @@ struct HighlightEntry {
 #[derive(Default)]
 struct HighlightStore {
     entries: HashMap<(SharedString, usize), HighlightEntry>,
+    cache: SyntaxHighlightCache,
 }
 
 impl HighlightStore {
@@ -916,41 +914,68 @@ impl HighlightStore {
         lang: Lang,
         code: &str,
         cx: &mut Context<Transcript>,
-    ) -> Option<Arc<Vec<Vec<Token>>>> {
-        let key = (row_id.clone(), block_ix);
-        if let Some(entry) = self.entries.get(&key)
-            && entry.code_len == code.len()
+    ) -> Option<Arc<comet_syntax::HighlightedDocument>> {
+        let slot_key = (row_id.clone(), block_ix);
+        let document_key = DocumentHighlightKey::new(lang, code);
+        if let Some(entry) = self.entries.get(&slot_key)
+            && entry.key == document_key
         {
-            return entry.lines.clone();
+            return entry.document.clone();
         }
-        // Keep stale lines visible while the fresh parse runs (paint-only, so a
-        // briefly stale color is harmless; lengths shift at most on the tail).
-        let stale = self.entries.get(&key).and_then(|e| e.lines.clone());
+        self.entries.remove(&slot_key);
+        if let Some(document) = self.cache.get(&document_key) {
+            self.entries.insert(
+                slot_key,
+                HighlightEntry {
+                    key: document_key,
+                    document: Some(document.clone()),
+                    cancellation: Arc::new(AtomicUsize::new(0)),
+                    _task: None,
+                },
+            );
+            return Some(document);
+        }
         let code = code.to_string();
-        let code_len = code.len();
+        let source_bytes = code.len();
+        let cancellation = Arc::new(AtomicUsize::new(0));
+        let background_cancellation = cancellation.clone();
+        let apply_cancellation = cancellation.clone();
         let task = cx.spawn(async move |this, cx| {
-            let lines = cx
+            let started = Instant::now();
+            let document = cx
                 .background_executor()
-                .spawn(async move {
-                    let mut carry = LineCarry::None;
-                    let mut out = Vec::new();
-                    for (ix, line) in code.split('\n').enumerate() {
-                        let (tokens, next) = tokenize_line(lang, line, carry);
-                        carry = next;
-                        out.push(tokens);
-                        if ix % 128 == 127 {
-                            yield_now().await;
-                        }
-                    }
-                    out
-                })
+                .spawn(async move { highlight_document(lang, &code, &background_cancellation) })
                 .await;
             this.update(cx, |transcript, cx| {
-                if let Some(entry) = transcript.highlights.entries.get_mut(&key)
-                    && entry.code_len == code_len
+                let is_current =
+                    transcript
+                        .highlights
+                        .entries
+                        .get(&slot_key)
+                        .is_some_and(|entry| {
+                            entry.key == document_key
+                                && Arc::ptr_eq(&entry.cancellation, &apply_cancellation)
+                        });
+                if apply_cancellation.load(Ordering::Relaxed) == 0
+                    && is_current
+                    && let Some(document) = document
                 {
-                    entry.lines = Some(Arc::new(lines));
-                    cx.notify();
+                    let document = Arc::new(document);
+                    transcript
+                        .highlights
+                        .cache
+                        .insert(document_key, document.clone());
+                    if let Some(entry) = transcript.highlights.entries.get_mut(&slot_key) {
+                        tracing::debug!(
+                            language = ?lang,
+                            source_bytes,
+                            spans = document.lines.iter().map(Vec::len).sum::<usize>(),
+                            elapsed_us = started.elapsed().as_micros() as u64,
+                            "syntax highlight ready"
+                        );
+                        entry.document = Some(document);
+                        cx.notify();
+                    }
                 }
             })
             .ok();
@@ -958,13 +983,61 @@ impl HighlightStore {
         self.entries.insert(
             (row_id, block_ix),
             HighlightEntry {
-                code_len,
-                lines: stale.clone(),
+                key: document_key,
+                document: None,
+                cancellation,
                 _task: Some(task),
             },
         );
-        stale
+        None
     }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+fn highlight_document(
+    lang: Lang,
+    code: &str,
+    cancellation: &AtomicUsize,
+) -> Option<comet_syntax::HighlightedDocument> {
+    if comet_syntax::supports_language(lang) {
+        // Rust is the only bundled grammar at this checkpoint; unbundled
+        // languages take the local plain-token fallback below.
+        return comet_syntax::highlight_with_limits(
+            comet_syntax::HighlightRequest {
+                source: code,
+                path: None,
+                fence_tag: Some("rust"),
+            },
+            comet_syntax::HighlightLimits::default(),
+            Some(cancellation),
+        )
+        .ok();
+    }
+    let mut carry = LineCarry::None;
+    let mut lines = Vec::new();
+    for line in code.split('\n') {
+        if cancellation.load(Ordering::Relaxed) != 0 {
+            return None;
+        }
+        let (tokens, next) = tokenize_line(lang, line, carry);
+        carry = next;
+        lines.push(
+            tokens
+                .into_iter()
+                .map(|token| comet_syntax::HighlightSpan {
+                    range: token.range,
+                    kind: token.class.into(),
+                })
+                .collect(),
+        );
+    }
+    Some(comet_syntax::HighlightedDocument {
+        language: lang,
+        lines,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1344,7 +1417,7 @@ impl Transcript {
             self.folds.clear();
             self.veils.clear();
             self.render_cache.borrow_mut().clear();
-            self.highlights.entries.clear();
+            self.highlights.clear();
             self.list.reset(0);
             self.pinned = true;
             self.spring.reset();
@@ -1805,7 +1878,7 @@ impl Transcript {
                     highlight
                         .get(block_ix)
                         .and_then(|o| o.as_deref())
-                        .map(|v| v.as_slice()),
+                        .map(|v| v.lines.as_slice()),
                 )
             }
             RowKind::LiveMarkdown { tree, block_ix } => {
@@ -1848,7 +1921,7 @@ impl Transcript {
                     highlight
                         .get(block_ix)
                         .and_then(|o| o.as_deref())
-                        .map(|v| v.as_slice()),
+                        .map(|v| v.lines.as_slice()),
                 );
                 if let Some(start) = timer {
                     record_live_frame_us(start.elapsed().as_micros() as u64);
@@ -2028,7 +2101,7 @@ impl Transcript {
         tree: &Arc<BlockTree>,
         only: Option<usize>,
         cx: &mut Context<Self>,
-    ) -> HashMap<usize, Option<Arc<Vec<Vec<Token>>>>> {
+    ) -> HashMap<usize, Option<Arc<comet_syntax::HighlightedDocument>>> {
         let mut out = HashMap::new();
         for (ix, top) in tree.blocks.iter().enumerate() {
             if only.is_some_and(|o| o != ix) {
@@ -2859,6 +2932,26 @@ impl Render for Transcript {
 mod tests {
     use super::*;
     use comet_doc::MessagePart;
+
+    #[test]
+    fn dropping_a_highlight_entry_signals_its_background_work() {
+        let cancellation = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entry = HighlightEntry {
+            key: DocumentHighlightKey::new(Lang::Rust, "fn main() {}"),
+            document: None,
+            cancellation: cancellation.clone(),
+            _task: None,
+        };
+        drop(entry);
+        assert_ne!(cancellation.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn background_tree_sitter_highlighting_observes_its_cancellation_token() {
+        let cancellation = std::sync::atomic::AtomicUsize::new(1);
+        let source = "fn cancelled() {}\n".repeat(2_048);
+        assert_eq!(highlight_document(Lang::Rust, &source, &cancellation), None);
+    }
 
     /// `byte_len` sees only `description`/`activity`/`summary` text, so a
     /// `Running` -> `Completed` transition with no length change anywhere in
