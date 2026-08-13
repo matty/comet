@@ -457,12 +457,15 @@ mod tests {
 
     use comet_proto::{RunRequest, RuntimeMode};
 
+    #[cfg(windows)]
     use super::APPROVAL_MARKER_NAME;
+    #[cfg(windows)]
+    use crate::capture::record;
     use crate::capture::recording::RecordingSession;
     use crate::capture::test_support::{
         config, fixture_path, isolated_approval_target, isolated_tempdir,
     };
-    use crate::capture::{CaptureOperation, CodexCaptureOperation, CodexRunScript, record};
+    use crate::capture::{CaptureOperation, CodexCaptureOperation, CodexRunScript};
 
     #[cfg(windows)]
     #[test]

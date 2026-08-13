@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{anyhow, bail};
 use serde_json::{Value, json};
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use super::common::APPROVAL_MARKER_CONTENT;
 #[cfg(windows)]
 use super::common::file_identity;
@@ -676,21 +676,21 @@ pub(in crate::capture) fn validate_codex_on_request_approval(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    #[cfg(not(windows))]
-    use std::path::Path;
 
     use comet_proto::{RunRequest, RuntimeMode};
     use serde_json::{Value, json};
 
+    #[cfg(windows)]
     use super::APPROVAL_MARKER_NAME;
+    #[cfg(windows)]
+    use crate::capture::Channel;
     use crate::capture::recording::failed_session_stdin;
+    #[cfg(windows)]
+    use crate::capture::test_support::channel_payloads;
     use crate::capture::test_support::{
-        channel_payloads, config, contains_response_id, fixture_path, isolated_approval_target,
-        isolated_tempdir,
+        config, contains_response_id, fixture_path, isolated_approval_target, isolated_tempdir,
     };
-    use crate::capture::{
-        CaptureOperation, Channel, CodexCaptureOperation, CodexRunScript, record,
-    };
+    use crate::capture::{CaptureOperation, CodexCaptureOperation, CodexRunScript, record};
 
     #[test]
     fn codex_on_request_capture_runs_from_a_temp_checkout() {
