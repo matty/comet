@@ -19,3 +19,10 @@ session/task/tool/message/device ids replaced with reused placeholders, `mcp__*`
 dropped from the tools list); neither follows the corpus manifest schema in
 `docs/testing/provider-captures.md`, since they are not provider-wire evidence and are not
 indexed in `../../../index.json`.
+
+`manifest.json`'s `"consumers": []` is not an oversight: this scenario is claimless, per
+`docs/testing/provider-captures.md:73-74`. That is also what leaves it unenforced — the corpus
+validator's reciprocal-reference checks (`crates/harness/tests/capture_corpus/corpus_validation.rs`)
+only run against a scenario once some source names a claim ID pointing at it in `index.json`. A
+future slice that wants this evidence checked, not just retained, turns the validator on by adding
+that claim.
