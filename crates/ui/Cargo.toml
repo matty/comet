@@ -13,6 +13,7 @@ comet-engine.workspace = true
 comet-identity.workspace = true
 comet-rpc.workspace = true
 comet-update.workspace = true
+comet-syntax.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
