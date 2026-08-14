@@ -1,9 +1,5 @@
 //! CodexHarness integration tests against the fake app server in
 //! `tests/fixtures/fake_codex.rs` (no real `codex` binary involved).
-//!
-//! Corpus consumers: `codex-model-integration-shape`,
-//! `codex-routine-notification-integration`, `codex-model-text-only-integration`,
-//! and `codex-model-logged-out-integration`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -931,10 +927,10 @@ async fn model_discovery_drains_stderr() {
 }
 
 /// The slice's deliverable: a real spawn, a real `initialize` + `model/list`
-/// round trip, and a merged catalog that says it is live. The fixture answers
-/// shaped as pinned by `codex-model-integration-shape`, and pages
-/// by default — the real server returns all seven models in one page and would
-/// never exercise the loop.
+/// round trip, and a merged catalog that says it is live. The fixture is a
+/// paged form of the captured live reply, `codex/0.147.0/model-discovery`
+/// frame 6, and pages by default — the real server returns all seven models
+/// in one page and would never exercise the loop.
 #[tokio::test]
 async fn models_come_back_live_and_merged() {
     let catalog = harness().models().await.expect("models");
@@ -1161,9 +1157,10 @@ async fn an_opaque_cursor_survives_the_next_request() {
 
 /// A logged-out `codex` answers `model/list` **successfully**, with a
 /// hardcoded five-model list that does not match the account: it contains a
-/// model the account cannot use and misses three it has
-/// (`codex-model-logged-out-integration`). Nothing in the envelope says so,
-/// so the only defence is not to ask.
+/// model the account cannot use and misses three it has. The logged-out
+/// success reply, `codex/0.147.0/model-discovery-logged-out` frame 6,
+/// motivates skipping `model/list` without auth evidence. Nothing in the
+/// envelope says so, so the only defence is not to ask.
 ///
 /// The fixture here is the good one — it would answer `Live`. Getting the
 /// built-in list back is the proof that the gate fired before the spawn.

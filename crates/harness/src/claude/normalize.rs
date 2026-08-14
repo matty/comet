@@ -2147,8 +2147,7 @@ mod tests {
     }
 
     /// `TaskCreate`'s `tool_use_result` carries the assigned task id and its
-    /// subject; the id appears nowhere on the tool input, so a decode reading
-    /// only the input cannot key the item.
+    /// subject.
     #[test]
     fn a_task_create_still_renders_an_ordinary_tool_chip() {
         // The plan is its own event; the calls driving it stay ordinary tool

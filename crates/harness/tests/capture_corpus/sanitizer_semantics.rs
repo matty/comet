@@ -187,7 +187,7 @@ fn sanitizer_preserves_claude_tool_input_semantics_across_approval_frames() {
 }
 
 /// Break caught: Claude discovery can embed locally authored command and agent descriptions,
-/// including machine paths, even though those prose fields are irrelevant to corpus claims.
+/// including machine paths, even though those prose fields are irrelevant to corpus evidence.
 #[test]
 fn sanitizer_replaces_discovery_descriptions_as_provider_prose() {
     let temp = tempfile::tempdir().unwrap();

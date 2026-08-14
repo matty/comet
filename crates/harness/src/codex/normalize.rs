@@ -8,8 +8,8 @@
 //! understand becomes an Unknown diagnostic (see `map_item`'s `other` arm),
 //! counted and journaled rather than dropped silently.
 //!
-//! Corpus claim `codex-routine-notification-ignore-list` pins the reviewed
-//! healthy-run methods in the ignored tier.
+//! Healthy runs emit the routine notification methods assigned to the ignored
+//! tier, per `codex/0.147.0/fresh-text` frames 3, 16 and 17.
 
 use comet_proto::{
     AgentEvent, ChecklistItem, ChecklistStatus, NoticeKind, NoticeSeverity, ToolCall,

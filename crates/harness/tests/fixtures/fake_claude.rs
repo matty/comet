@@ -8,9 +8,6 @@
 //! Rust rather than `#!/bin/sh` because Windows cannot spawn a shell script:
 //! the harness hands the path straight to `CreateProcess`, which rejects a
 //! non-PE image with "%1 is not a valid Win32 application" (os error 193).
-//!
-//! Corpus-backed contracts: `claude-model-fixture-shape`,
-//! `claude-routine-frame-fixture`, and `claude-approval-fixture-shape`.
 
 use std::io::{BufRead, StdinLock, Write};
 use std::process::exit;
@@ -96,8 +93,8 @@ fn check_permission_mode() {
 }
 
 /// Shaped exactly like Claude Code 2.1.227's answer, including the double
-/// nesting and `resolvedModel` pinned by `claude-model-fixture-shape`. Two
-/// models are enough to prove the merge; the full five are pinned in
+/// nesting and `resolvedModel`, per `claude/2.1.228/model-discovery` frame 2.
+/// Two models are enough to prove the merge; the full five are pinned in
 /// `claude/discovery.rs`'s unit test.
 const INITIALIZE_REPLY: &str = r#"{"type":"control_response","response":{"subtype":"success","request_id":"comet-discovery-1","response":{"commands":[],"agents":[],"output_style":"default","available_output_styles":["default"],"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-5","displayName":"Sonnet","description":"Sonnet 5","supportsEffort":true,"supportedEffortLevels":["low","high"]},{"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001","displayName":"Haiku","description":"Haiku 4.5"}],"account":{"email":"user@example.test","organization":"Example","subscriptionType":"Claude Max","apiProvider":"firstParty"},"pid":1234,"current_permission_mode":"acceptEdits"}}}"#;
 
@@ -548,8 +545,8 @@ const WRITE_TARGET_JSON: &str = if cfg!(windows) {
 };
 
 /// Requests permission for a Write, then reports what it was told. The
-/// `control_request` frame shape follows `claude-approval-fixture-shape`, with
-/// only the path swapped for one this machine can be
+/// `control_request` frame shape follows `claude/2.1.228/approval` frame 102,
+/// with only the path swapped for one this machine can be
 /// trusted not to have. The reply is echoed as a `stream_event` text delta
 /// rather than a full `assistant` message: `normalize.rs`'s `Frame::Assistant`
 /// arm only turns `tool_use` blocks into events and drops a bare text block, so
