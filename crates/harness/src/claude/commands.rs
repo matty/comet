@@ -9,9 +9,8 @@
 //! 2. **It cannot reuse the model discovery's spawn**, because that one passes
 //!    `--bare`, which skips user and project skill discovery. Debt row D32.
 //!
-//! Corpus claims: `claude-command-discovery-behavior`,
-//! `claude-command-reply-decoder`, `claude-command-empty-hint`, and
-//! `claude-command-absent-aliases`.
+//! The reviewed reply is `claude/2.1.228/command-discovery` frame 5: non-bare
+//! initialization discovers scoped commands from the selected working directory.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

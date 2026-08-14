@@ -1,7 +1,8 @@
 //! Claude's `can_use_tool` request → Comet's `ApprovalRequest`.
 //!
-//! Tool names and input shapes are pinned by `claude-approval-tool-input-shapes`
-//! and `claude-approval-write-path-absolute` in the capture corpus, plus the
+//! Tool names and input shapes come from `claude/2.1.228/approval` frame 102:
+//! `can_use_tool` requests use the captured tool names and input fields, and
+//! captured `Write` requests carry an absolute `file_path` and no cwd. Plus the
 //! tool set in sdk.d.ts. An unrecognized tool is NOT an
 //! error — it becomes `Unknown` with Comet copy, because the alternative is
 //! either dropping the request (the agent hangs) or auto-allowing it.
