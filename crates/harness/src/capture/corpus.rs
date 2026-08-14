@@ -965,13 +965,30 @@ mod frame_tests {
 
     /// Addressing a frame by scenario and sequence returns that frame's exact
     /// payload bytes and its channel.
+    ///
+    /// The payload must be the extracted `payload` field, not the raw event
+    /// line: the raw line also contains the substring "control_response" (it
+    /// is nested inside the escaped payload text), so a `contains` check on
+    /// that substring alone cannot tell the two apart. Parsing the payload as
+    /// its own JSON document and checking its *top-level* shape can: the raw
+    /// line's top level is `{"sequence", "channel", "payload"}`, while the
+    /// extracted payload's top level is the control-response envelope itself,
+    /// with no `sequence` or `channel` key of its own.
     #[test]
     fn a_frame_is_addressed_by_scenario_and_sequence() {
         let found = corpus_frame("claude/2.1.228/model-discovery", 2);
         assert_eq!(found.channel, Channel::Stdout);
-        assert!(
-            found.payload.contains("control_response"),
+        let parsed: Value =
+            serde_json::from_str(&found.payload).expect("payload is its own valid JSON document");
+        assert_eq!(
+            parsed.get("type").and_then(Value::as_str),
+            Some("control_response"),
             "the model-discovery reply frame: {}",
+            found.payload
+        );
+        assert!(
+            parsed.get("sequence").is_none() && parsed.get("channel").is_none(),
+            "payload must be the extracted payload, not the raw event line: {}",
             found.payload
         );
     }
