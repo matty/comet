@@ -18,7 +18,7 @@ pub use corpus::{CorpusError, selected_payload, selected_payloads, validate_corp
 pub use recording::record;
 pub use sanitize::{SanitizationError, SanitizationReport, sanitize_dir};
 pub use surface::{
-    Direction, FieldObservation, FrameRef, JsonType, SurfaceError, ValueSample, observe_corpus,
+    Direction, FieldObservation, FrameRef, SurfaceError, observe_corpus, observed_field_lines,
 };
 pub use types::{
     CaptureConfig, CaptureEvent, CaptureOperation, CaptureScenario, Channel,

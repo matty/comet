@@ -1,14 +1,15 @@
-//! The corpus walker behind the provider surface map.
+//! The corpus walker behind the new-field gate.
 //!
 //! Answers one question over promoted evidence: which fields do Claude Code and
-//! Codex actually put on the wire, in which direction, at which version. The
-//! output is read by people deciding what to build, so it records **shape**
-//! and publishes a value only when the value's own grammar makes that safe.
+//! Codex put on the wire, and in which direction. A committed snapshot of that
+//! set is what makes a new CLI version's added field arrive as a test failure
+//! instead of as a surprise later.
 //!
-//! The safety rule here is the same one [`super::sanitize`] uses to decide what
-//! may be carried literally. That is deliberate: two tests for "is this safe to
-//! show" would eventually disagree, and the one that drifted would be the one
-//! nobody reruns.
+//! It records the field's *name and direction only*. An earlier version also
+//! sampled values, types, versions and counts to render a per-provider report;
+//! the report's central column turned out to be a leaf-name heuristic, so it and
+//! everything feeding it were removed. If a question needs a field's values, the
+//! corpus is right there and greppable.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -29,39 +30,12 @@ pub enum Direction {
     FromProvider,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum JsonType {
-    Null,
-    Bool,
-    Number,
-    String,
-    Array,
-    Object,
-}
-
 /// Where a field was first seen, so triage starts at the frame and not a grep.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrameRef {
     /// `provider/version/scenario`, the corpus directory that holds it.
     pub scenario: String,
     pub sequence: u64,
-}
-
-/// What may be said about a field's values in a document people read.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ValueSample {
-    /// Distinct token-shaped values, capped. These are what make a field
-    /// designable against: `end_turn | tool_use` beats "a string".
-    pub literals: BTreeSet<String>,
-    /// Kinds behind redacted values, from the manifest's placeholder table.
-    /// More useful than the placeholder and free, because the sanitizer
-    /// already did the classification.
-    pub redaction_kinds: BTreeSet<String>,
-    /// At least one value was prose or otherwise unpublishable.
-    pub withheld: bool,
-    /// The literal set hit [`MAX_LITERALS`]. Recorded rather than silently
-    /// dropped, so a report never implies it listed every value it saw.
-    pub truncated: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -71,12 +45,7 @@ pub struct FieldObservation {
     /// map entry, so `.modelUsage.{}.costUSD` names a field and not a model id.
     pub path: String,
     pub direction: Direction,
-    pub versions: BTreeSet<String>,
-    pub scenarios: BTreeSet<String>,
-    pub json_types: BTreeSet<JsonType>,
-    pub count: u64,
     pub first_seen: FrameRef,
-    pub values: ValueSample,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -94,18 +63,9 @@ pub enum SurfaceError {
 /// Declared rather than inferred. A model-keyed map is indistinguishable from a
 /// struct by shape alone — every capture on this machine used one model, so its
 /// key set looks perfectly stable — and a wrong guess silently renames a field.
-/// An undeclared map shows up in the report as a field with an obviously
+/// An undeclared map shows up in the snapshot as a field with an obviously
 /// data-shaped name, which triage catches and adds here.
 const MAP_PATHS: &[&str] = &[".modelUsage"];
-
-/// Beyond this many distinct literals a field is an open set, not an enum, and
-/// listing more stops being useful.
-const MAX_LITERALS: usize = 8;
-
-/// Characters a value may contain and still be published verbatim. No ASCII
-/// whitespace: prose has spaces, and prose is the whole risk.
-const SAFE_VALUE_CHARS: &str = "._:/@+-[]()\\";
-const MAX_VALUE_BYTES: usize = 64;
 
 pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, SurfaceError> {
     let scenarios = promoted_scenarios(corpus_root)?;
@@ -117,7 +77,6 @@ pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, Surfa
 
     let mut inventory: BTreeMap<(String, Direction, String), FieldObservation> = BTreeMap::new();
     for scenario in scenarios {
-        let placeholders = placeholder_kinds(&scenario.directory);
         let events =
             std::fs::read_to_string(scenario.directory.join("events.jsonl")).map_err(|_| {
                 SurfaceError::UnreadableEvents {
@@ -139,8 +98,8 @@ pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, Surfa
             };
             // Only stderr is allowed to be plain text. A structured frame that
             // will not parse must stop the walk: skipping it would produce a
-            // map that looks complete and is quietly missing a frame's fields,
-            // which is the failure this module refuses to have.
+            // snapshot that looks complete and is quietly missing a frame's
+            // fields, which is the failure this module refuses to have.
             let payload = match event["payload"]
                 .as_str()
                 .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
@@ -158,7 +117,6 @@ pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, Surfa
                 scenario: &scenario,
                 direction,
                 sequence,
-                placeholders: &placeholders,
             };
             visit.walk(&payload, String::new());
         }
@@ -172,7 +130,6 @@ struct PromotedScenario {
     /// `provider/version/scenario`.
     label: String,
     provider: String,
-    version: String,
 }
 
 fn promoted_scenarios(corpus_root: &Path) -> Result<Vec<PromotedScenario>, SurfaceError> {
@@ -183,8 +140,8 @@ fn promoted_scenarios(corpus_root: &Path) -> Result<Vec<PromotedScenario>, Surfa
     for provider in sorted_directories(corpus_root).ok_or_else(unreadable)? {
         let provider_name = file_name(&provider);
         // An unreadable subtree is an error, never an empty one. Treating it as
-        // empty would drop every field beneath it from a map whose whole job is
-        // saying what the evidence contains.
+        // empty would drop every field beneath it from a snapshot whose whole
+        // job is saying what the evidence contains.
         for version in sorted_directories(&provider).ok_or_else(unreadable)? {
             let version_name = file_name(&version);
             for scenario in sorted_directories(&version).ok_or_else(unreadable)? {
@@ -195,7 +152,6 @@ fn promoted_scenarios(corpus_root: &Path) -> Result<Vec<PromotedScenario>, Surfa
                 scenarios.push(PromotedScenario {
                     label: format!("{provider_name}/{version_name}/{scenario_name}"),
                     provider: provider_name.clone(),
-                    version: version_name.clone(),
                     directory: scenario,
                 });
             }
@@ -221,39 +177,11 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// The manifest's placeholder table, `<SESSION_ID_1>` to `session_id`.
-///
-/// Absent or malformed is not an error: a manifest predating a schema is still
-/// real evidence, and a missing entry only costs the derived kind below.
-fn placeholder_kinds(directory: &Path) -> BTreeMap<String, String> {
-    let Ok(bytes) = std::fs::read(directory.join("manifest.json")) else {
-        return BTreeMap::new();
-    };
-    let Ok(manifest) = serde_json::from_slice::<Value>(&bytes) else {
-        return BTreeMap::new();
-    };
-    manifest["placeholders"]
-        .as_array()
-        .map(|definitions| {
-            definitions
-                .iter()
-                .filter_map(|definition| {
-                    Some((
-                        definition["placeholder"].as_str()?.to_owned(),
-                        definition["kind"].as_str()?.to_owned(),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 struct Visit<'a> {
     inventory: &'a mut BTreeMap<(String, Direction, String), FieldObservation>,
     scenario: &'a PromotedScenario,
     direction: Direction,
     sequence: u64,
-    placeholders: &'a BTreeMap<String, String>,
 }
 
 impl Visit<'_> {
@@ -270,7 +198,7 @@ impl Visit<'_> {
                     // A map entry is data, not a field, so only its contents
                     // are recorded.
                     if !is_map {
-                        self.record(&child_path, child);
+                        self.record(&child_path);
                     }
                     self.walk(child, child_path);
                 }
@@ -285,119 +213,36 @@ impl Visit<'_> {
         }
     }
 
-    fn record(&mut self, path: &str, value: &Value) {
+    fn record(&mut self, path: &str) {
         let key = (
             self.scenario.provider.clone(),
             self.direction,
             path.to_owned(),
         );
-        let observation = self
-            .inventory
+        self.inventory
             .entry(key)
             .or_insert_with(|| FieldObservation {
                 provider: self.scenario.provider.clone(),
                 path: path.to_owned(),
                 direction: self.direction,
-                versions: BTreeSet::new(),
-                scenarios: BTreeSet::new(),
-                json_types: BTreeSet::new(),
-                count: 0,
                 first_seen: FrameRef {
                     scenario: self.scenario.label.clone(),
                     sequence: self.sequence,
                 },
-                values: ValueSample::default(),
             });
-        observation.count += 1;
-        observation.versions.insert(self.scenario.version.clone());
-        observation.scenarios.insert(self.scenario.label.clone());
-        observation.json_types.insert(json_type(value));
-        if let Value::String(text) = value {
-            sample(&mut observation.values, text, self.placeholders);
-        }
     }
 }
 
-fn json_type(value: &Value) -> JsonType {
-    match value {
-        Value::Null => JsonType::Null,
-        Value::Bool(_) => JsonType::Bool,
-        Value::Number(_) => JsonType::Number,
-        Value::String(_) => JsonType::String,
-        Value::Array(_) => JsonType::Array,
-        Value::Object(_) => JsonType::Object,
-    }
-}
-
-fn sample(values: &mut ValueSample, text: &str, placeholders: &BTreeMap<String, String>) {
-    if let Some(kind) = redaction_kind(text, placeholders) {
-        values.redaction_kinds.insert(kind);
-        return;
-    }
-    if !publishable(text) {
-        values.withheld = true;
-        return;
-    }
-    if values.literals.len() >= MAX_LITERALS && !values.literals.contains(text) {
-        values.truncated = true;
-        return;
-    }
-    values.literals.insert(text.to_owned());
-}
-
-/// `<SESSION_ID_1>` to `session_id`, via the manifest and then by derivation.
-///
-/// Only a value that is *entirely* a placeholder names a kind. A value that
-/// merely contains one (`<CWD>\marker.txt`) is a shape worth publishing whole.
-fn redaction_kind(text: &str, placeholders: &BTreeMap<String, String>) -> Option<String> {
-    if !is_placeholder(text) {
-        return None;
-    }
-    if let Some(kind) = placeholders.get(text) {
-        return Some(kind.clone());
-    }
-    let inner = text.trim_start_matches('<').trim_end_matches('>');
-    let stem = inner
-        .rsplit_once('_')
-        .filter(|(_, suffix)| suffix.chars().all(|character| character.is_ascii_digit()))
-        .map_or(inner, |(stem, _)| stem);
-    Some(stem.to_ascii_lowercase())
-}
-
-fn is_placeholder(text: &str) -> bool {
-    text.len() > 2
-        && text.starts_with('<')
-        && text.ends_with('>')
-        && text[1..text.len() - 1].chars().all(|character| {
-            character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
+/// Every observed field as `provider direction path`, the snapshot's line form.
+pub fn observed_field_lines(observations: &[FieldObservation]) -> BTreeSet<String> {
+    observations
+        .iter()
+        .map(|observation| {
+            let direction = match observation.direction {
+                Direction::ToProvider => "to-provider",
+                Direction::FromProvider => "from-provider",
+            };
+            format!("{} {direction} {}", observation.provider, observation.path)
         })
-}
-
-/// Token-shaped: an enum, an id, a model name, a path fragment. Never prose.
-fn publishable(text: &str) -> bool {
-    let masked = mask_placeholders(text);
-    masked.len() <= MAX_VALUE_BYTES
-        && masked.chars().all(|character| {
-            character.is_ascii_alphanumeric() || SAFE_VALUE_CHARS.contains(character)
-        })
-}
-
-fn mask_placeholders(text: &str) -> String {
-    let mut masked = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find('<') {
-        let Some(end) = rest[start..].find('>').map(|offset| start + offset) else {
-            break;
-        };
-        if is_placeholder(&rest[start..=end]) {
-            masked.push_str(&rest[..start]);
-            masked.push('P');
-            rest = &rest[end + 1..];
-        } else {
-            masked.push_str(&rest[..=start]);
-            rest = &rest[start + 1..];
-        }
-    }
-    masked.push_str(rest);
-    masked
+        .collect()
 }

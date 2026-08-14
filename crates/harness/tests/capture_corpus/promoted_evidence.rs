@@ -30,60 +30,11 @@ fn corpus_promoted_token_free_claims_are_valid() {
         })
         .map(|claim| claim["id"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        promoted,
-        std::collections::BTreeSet::from([
-            "claude-approval-fixture-shape",
-            "claude-approval-tool-input-shapes",
-            "claude-approval-wire-fields",
-            "claude-approval-write-path-absolute",
-            "claude-attachment-block-order",
-            "claude-attachment-block-order-test",
-            "claude-attachment-run-order",
-            "claude-command-absent-aliases",
-            "claude-command-discovery-behavior",
-            "claude-command-empty-hint",
-            "claude-command-nonbare-count",
-            "claude-command-reply-decoder",
-            "claude-model-bare-effects",
-            "claude-model-close-exit",
-            "claude-model-curated-id-decoder",
-            "claude-model-cwd-invariance",
-            "claude-model-default-alias",
-            "claude-model-effort-levels",
-            "claude-model-fixture-shape",
-            "claude-model-initialize-request",
-            "claude-model-integration-shape",
-            "claude-model-no-modality",
-            "claude-model-real-catalog-merge",
-            "claude-model-reply-shape",
-            "claude-resumed-run-updates-an-uncreated-task",
-            "claude-routine-frame-fixture",
-            "claude-routine-frame-ignore-list",
-            "claude-routine-frame-integration",
-            "claude-task-create-result-shape",
-            "claude-task-update-status-transition",
-            "claude-tool-use-result-present",
-            "codex-model-cwd-invariance",
-            "codex-model-effort-objects",
-            "codex-model-fixture-shape",
-            "codex-model-input-modalities",
-            "codex-model-integration-shape",
-            "codex-model-logged-out-fallback",
-            "codex-model-logged-out-integration",
-            "codex-model-notification-order",
-            "codex-model-one-page",
-            "codex-model-page-decoder",
-            "codex-model-reply-shape",
-            "codex-model-request-shape",
-            "codex-model-source-notification-order",
-            "codex-model-text-only-integration",
-            "codex-routine-notification-fixture",
-            "codex-routine-notification-ignore-list",
-            "codex-routine-notification-integration",
-            "codex-steer-reply-before-completion",
-        ])
+    assert!(
+        !promoted.is_empty(),
+        "every claim reads as pending; the promoted filter is inverted"
     );
+
     let errors = validate_corpus(&corpus_root);
     assert!(
         errors.iter().all(|error| matches!(

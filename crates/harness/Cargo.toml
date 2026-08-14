@@ -28,12 +28,6 @@ windows-sys.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
-# Reads the decode modules' own AST for the provider surface map: which wire
-# fields does Comet actually name? A regex over the same source was wrong in
-# both directions, counting any Rust field name and missing `serde(rename)`.
-# Test-only on purpose - nothing on the runtime path parses Rust.
-syn = { version = "2", features = ["full", "parsing", "extra-traits", "visit"] }
-
 # Scripted fake CLIs for the adapter integration suites, spawned through
 # `CARGO_BIN_EXE_*`. Rust rather than shell scripts so they are spawnable on
 # Windows too — `CreateProcess` rejects a `#!/bin/sh` file (os error 193).
