@@ -17,6 +17,7 @@ pub mod appearance;
 pub mod approvals;
 pub mod attachments;
 pub mod changes;
+pub mod comments;
 pub mod composer;
 pub mod edge_fade;
 pub mod errors;
