@@ -2,7 +2,9 @@
 
 `manifest.json` and `events.jsonl` are the corpus pair — raw provider wire frames from a
 `drive_claude_plan.py` capture, driven directly against `claude.exe` (see `manifest.json`'s
-`command` block). No test reads these frames. They are archived evidence: richer than a
+`command` block). No test asserts against these frames — only the generated field snapshot
+enumerates them, which checks what fields exist and nothing about their values. They are
+archived evidence: richer than a
 single-agent capture and kept so a later slice has something to read (a resumed `task_started`
 sharing one `task_id`, `task_progress`, patch-only `task_updated`, `task_notification` with
 usage, and `background_tasks_changed` populated-then-empty).

@@ -37,11 +37,13 @@ the manifest's own `source` field:
 > `captures/2026-08-13-plan-todo-subagent/drive_claude_plan.py raw capture
 > (corpus-subagent-2.1.229.jsonl), hand-sanitized for slice 4.2 task 9`
 
-No test reads that entry's frames, which is what keeps it harmless: nothing depends on the
-hand-sanitization being correct. (It was additionally protected by the corpus validator's
-reciprocal claim checks until those were removed on 2026-08-14; the protection now comes
-from the simpler fact that no test names it.) It also produced D58 — two real sanitizer gaps
-found *by* doing it by hand, which the tool would never have surfaced.
+No test asserts against that entry's frames — only the generated field snapshot enumerates
+them, which checks what fields exist and nothing about their values — which is what keeps it
+harmless: nothing depends on the hand-sanitization being correct. (It was additionally
+protected by the corpus validator's reciprocal claim checks until those were removed on
+2026-08-14; the protection now comes from the simpler fact that no test names it.) It also
+produced D58 — two real sanitizer gaps found *by* doing it by hand, which the tool would never
+have surfaced.
 
 **4.3** took the other route: added `checklist` and `checklist-resume` scenarios to
 `comet-provider-capture`, re-captured through the tool, and sanitized with the real sanitizer.

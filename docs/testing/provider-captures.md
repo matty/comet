@@ -53,8 +53,8 @@ Compare raw and staged artifacts recursively before copying anything into Git. C
 
 - provider, CLI version, platform, capture timestamp, scenario, purpose, command, cwd, configured
   environment, channels, and exit outcome match the observation;
-- event sequences and channels are complete and ordered, and selected neighborhoods prove the
-  claim without relying on sanitized provider prose;
+- event sequences and channels are complete and ordered, and the selected frames prove what the
+  scenario is for, without relying on sanitized provider prose;
 - every placeholder definition, use, kind, and redaction count is reciprocal and consistent;
 - no username, home/repository/temp path, email/account identity, hostname or server name, machine
   identifier, credential/token, attachment bytes, unrecognized absolute path, or policy-redacted
