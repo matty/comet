@@ -311,8 +311,5 @@
   },
   "scenario": "model-discovery-project-cwd",
   "schema_version": 1,
-  "source": "capture.json",
-  "consumers": [
-    "crates/harness/src/claude/discovery.rs:handshake"
-  ]
+  "source": "capture.json"
 }

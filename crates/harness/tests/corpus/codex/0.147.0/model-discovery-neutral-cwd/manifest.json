@@ -124,8 +124,5 @@
   },
   "scenario": "model-discovery-neutral-cwd",
   "schema_version": 1,
-  "source": "capture.json",
-  "consumers": [
-    "crates/harness/src/codex/discovery.rs:handshake cwd choice"
-  ]
+  "source": "capture.json"
 }

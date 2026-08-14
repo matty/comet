@@ -811,12 +811,5 @@
   },
   "scenario": "approval",
   "schema_version": 1,
-  "source": "capture.json",
-  "consumers": [
-    "crates/harness/src/claude/approval.rs:approval_request",
-    "crates/harness/src/claude/wire.rs:a_can_use_tool_request_decodes_the_fields_a_card_needs",
-    "crates/harness/tests/fixtures/fake_claude.rs:approval",
-    "crates/harness/src/claude/approval.rs:write_operation",
-    "crates/harness/src/claude/wire.rs:a_user_frame_decodes_the_captured_tool_use_result"
-  ]
+  "source": "capture.json"
 }

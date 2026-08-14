@@ -140,9 +140,5 @@
   },
   "scenario": "model-discovery-logged-out",
   "schema_version": 1,
-  "source": "capture.json",
-  "consumers": [
-    "crates/harness/src/codex/discovery.rs:logged_in",
-    "crates/harness/tests/codex.rs:a_logged_out_cli_is_never_asked"
-  ]
+  "source": "capture.json"
 }
