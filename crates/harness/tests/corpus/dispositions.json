@@ -1,0 +1,4252 @@
+{
+  "entries": [
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".message",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".message.content",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".message.content[].source",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".message.content[].source.data",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".message.content[].source.media_type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".message.content[].source.type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".message.content[].text",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".message.content[].type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".message.role",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".parent_tool_use_id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".request",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".request.subtype",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".request_id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".response",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".response.request_id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".response.response",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".response.response.behavior",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".response.response.updatedInput",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".response.response.updatedInput.content",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".response.response.updatedInput.file_path",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".response.subtype",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "debt": "D31",
+      "direction": "from-provider",
+      "domains": [
+        "subagents"
+      ],
+      "how": "Nothing needs it: `agentType` arrives per-run on `task_started`, and these entries' `description` fields are long model-facing prose rather than card copy. The row records why it stays unread, not work queued.",
+      "path": ".agents",
+      "provider": "claude",
+      "state": "deferred"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".analytics_disabled",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".apiKeySource",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".api_error_status",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".capabilities",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".claude_code_version",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".cwd",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".description",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".duration_api_ms",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".duration_ms",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".estimated_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".estimated_tokens_delta",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.content_block",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.content_block.caller",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.content_block.caller.type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.content_block.id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.content_block.input",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.content_block.name",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.content_block.signature",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.content_block.text",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.content_block.thinking",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.content_block.type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.context_management",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.context_management.applied_edits",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.delta",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.delta.estimated_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.delta.partial_json",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.delta.signature",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.delta.stop_details",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.delta.stop_reason",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.delta.stop_sequence",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.delta.text",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.delta.thinking",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.delta.type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.index",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.message",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.message.content",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.message.diagnostics",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.message.id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.message.model",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.message.role",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.message.stop_details",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.message.stop_reason",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.message.stop_sequence",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.message.type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.message.usage",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.message.usage.cache_creation",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.message.usage.cache_creation.ephemeral_1h_input_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.message.usage.cache_creation.ephemeral_5m_input_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.message.usage.cache_creation_input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.message.usage.cache_read_input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.message.usage.inference_geo",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.message.usage.input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.message.usage.output_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.message.usage.service_tier",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.usage",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.usage.cache_creation_input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.usage.cache_read_input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.usage.input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.usage.iterations",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.usage.iterations[].cache_creation",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.usage.iterations[].cache_creation.ephemeral_1h_input_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.usage.iterations[].cache_creation.ephemeral_5m_input_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.usage.iterations[].cache_creation_input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.usage.iterations[].cache_read_input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.usage.iterations[].input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.usage.iterations[].output_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.usage.iterations[].type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".event.usage.output_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.usage.output_tokens_details",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".event.usage.output_tokens_details.thinking_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".exit_code",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".fast_mode_disabled_reason",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".fast_mode_state",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".hook_event",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".hook_id",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".hook_name",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".isSynthetic",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".is_error",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".last_tool_name",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".mcp_servers",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".mcp_servers[].name",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".mcp_servers[].status",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".memory_paths",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".memory_paths.auto",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.content[].caller",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].caller.type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].content",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].content[].text",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].content[].tool_name",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].content[].type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].input",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.content[].input.activeForm",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].input.command",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].input.content",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].input.description",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.content[].input.file_path",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.content[].input.limit",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.content[].input.max_results",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].input.message",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].input.prompt",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.content[].input.query",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.content[].input.recipient",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.content[].input.run_in_background",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.content[].input.skill",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].input.status",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].input.subagent_type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.content[].input.subject",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.content[].input.taskId",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.content[].input.to",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].input.type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].is_error",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].name",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.content[].signature",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].text",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].thinking",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].tool_use_id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.content[].type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.context_management",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.diagnostics",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.diagnostics.cache_miss_reason",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.diagnostics.cache_miss_reason.cache_missed_input_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.diagnostics.cache_miss_reason.type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.model",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.role",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.stop_details",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.stop_reason",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.stop_sequence",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.usage",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.usage.cache_creation",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.usage.cache_creation.ephemeral_1h_input_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.usage.cache_creation.ephemeral_5m_input_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.usage.cache_creation_input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.usage.cache_read_input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.usage.inference_geo",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.usage.input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".message.usage.output_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".message.usage.service_tier",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".model",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".modelUsage",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".modelUsage.{}.cacheCreationInputTokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".modelUsage.{}.cacheReadInputTokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".modelUsage.{}.canonicalModel",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".modelUsage.{}.contextWindow",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".modelUsage.{}.costUSD",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".modelUsage.{}.inputTokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".modelUsage.{}.maxOutputTokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".modelUsage.{}.outputTokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".modelUsage.{}.provider",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".modelUsage.{}.webSearchRequests",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".num_turns",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".outcome",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".output",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".output_file",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".output_style",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".parent_tool_use_id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".patch",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".patch.end_time",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".patch.status",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".permissionMode",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".permission_denials",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".plugins",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".plugins[].name",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".plugins[].path",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".plugins[].source",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".plugins[].version",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".product_feedback_disabled",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".prompt",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".rate_limit_info",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".rate_limit_info.isUsingOverage",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".rate_limit_info.overageDisabledReason",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".rate_limit_info.overageStatus",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".rate_limit_info.rateLimitType",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".rate_limit_info.resetsAt",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".rate_limit_info.status",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".request",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".request.description",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".request.display_name",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".request.input",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".request.input.content",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".request.input.file_path",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".request.permission_suggestions",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".request.permission_suggestions[].destination",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".request.permission_suggestions[].mode",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".request.permission_suggestions[].type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".request.subtype",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".request.tool_name",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".request.tool_use_id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".request_id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.request_id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.response",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".response.response.account",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".response.response.account.apiProvider",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".response.response.account.tokenSource",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "debt": "D31",
+      "direction": "from-provider",
+      "domains": [
+        "subagents"
+      ],
+      "how": "The same catalogue on the initialize reply; same decision as `.agents`.",
+      "path": ".response.response.agents",
+      "provider": "claude",
+      "state": "deferred"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.response.agents[].description",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.response.agents[].model",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.response.agents[].name",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".response.response.available_output_styles",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.response.commands",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.response.commands[].aliases",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.response.commands[].argumentHint",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.response.commands[].description",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.response.commands[].name",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".response.response.current_permission_mode",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".response.response.fast_mode_disabled_reason",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".response.response.fast_mode_state",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".response.response.ide_rc_auto_enable_gate",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.response.models",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.response.models[].description",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.response.models[].displayName",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.response.models[].resolvedModel",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.response.models[].supportedEffortLevels",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".response.response.models[].supportsAdaptiveThinking",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".response.response.models[].supportsAutoMode",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".response.response.models[].supportsEffort",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".response.response.models[].supportsFastMode",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.response.models[].value",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".response.response.output_style",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".response.response.pid",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".response.response.remote_control_auto_enable",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".response.response.remote_control_auto_on_by_default",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".response.subtype",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".session_id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".skills",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".slash_commands",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".status",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".stderr",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".stdout",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".stop_reason",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".subagent_type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".subtype",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".summary",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".task_description",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".task_id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".task_type",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tasks",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tasks[].description",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tasks[].task_id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tasks[].task_type",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".terminal_reason",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".terminal_slash_commands",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".time_to_request_ms",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".timestamp",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.agentId",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.agentType",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.commandName",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.content",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.content[].text",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.content[].type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.file",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.file.content",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.file.filePath",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.file.numLines",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.file.startLine",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.file.totalLines",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.filePath",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.interrupted",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.isImage",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.matches",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.message",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.noOutputExpected",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.originalFile",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.pin",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.pin.id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.pin.name",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.pin.ref",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.prompt",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.query",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.resolvedModel",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.resumedAgentId",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.status",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.statusChange",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.statusChange.from",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.statusChange.to",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.stderr",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.stdout",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.structuredPatch",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.success",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.task",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.task.id",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.task.subject",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.taskId",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.toolStats",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.toolStats.bashCount",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.toolStats.editFileCount",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.toolStats.linesAdded",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.toolStats.linesRemoved",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.toolStats.otherToolCount",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.toolStats.readCount",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.toolStats.searchCount",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.totalDurationMs",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.totalTokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.totalToolUseCount",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.total_deferred_tools",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.updatedFields",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.cache_creation",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.cache_creation.ephemeral_1h_input_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.cache_creation.ephemeral_5m_input_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.cache_creation_input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.cache_read_input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.inference_geo",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.iterations",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.iterations[].cache_creation",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.iterations[].cache_creation.ephemeral_1h_input_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.iterations[].cache_creation.ephemeral_5m_input_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.iterations[].cache_creation_input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.iterations[].cache_read_input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.iterations[].input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.iterations[].output_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.iterations[].type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.output_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.output_tokens_details",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.output_tokens_details.thinking_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.server_tool_use",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.server_tool_use.web_fetch_requests",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.server_tool_use.web_search_requests",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.service_tier",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.usage.speed",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".tool_use_result.userModified",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".tools",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".total_cost_usd",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".ttft_ms",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".ttft_stream_ms",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".usage",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".usage.cache_creation",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".usage.cache_creation.ephemeral_1h_input_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".usage.cache_creation.ephemeral_5m_input_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".usage.cache_creation_input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".usage.cache_read_input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".usage.duration_ms",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".usage.inference_geo",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".usage.input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".usage.iterations",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".usage.iterations[].cache_creation",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".usage.iterations[].cache_creation.ephemeral_1h_input_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".usage.iterations[].cache_creation.ephemeral_5m_input_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".usage.iterations[].cache_creation_input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".usage.iterations[].cache_read_input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".usage.iterations[].input_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".usage.iterations[].output_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".usage.iterations[].type",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".usage.output_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".usage.output_tokens_details",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".usage.output_tokens_details.thinking_tokens",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".usage.server_tool_use",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".usage.server_tool_use.web_fetch_requests",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".usage.server_tool_use.web_search_requests",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".usage.service_tier",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".usage.speed",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".usage.tool_uses",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".usage.total_tokens",
+      "provider": "claude",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".uuid",
+      "provider": "claude",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".id",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".jsonrpc",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".method",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".params",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".params.approvalPolicy",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".params.approvalsReviewer",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".params.capabilities",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".params.capabilities.experimentalApi",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".params.clientInfo",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".params.clientInfo.name",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".params.clientInfo.title",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".params.clientInfo.version",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".params.cwd",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".params.effort",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".params.expectedTurnId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".params.input",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".params.input[].text",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".params.input[].type",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".params.model",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".params.sandbox",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".params.sandboxPolicy",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".params.sandboxPolicy.networkAccess",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".params.sandboxPolicy.type",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "to-provider",
+      "path": ".params.summary",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "to-provider",
+      "path": ".params.threadId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".emittedAtMs",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".id",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".method",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.completedAtMs",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.delta",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.environmentId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.error",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.failureReason",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.installationId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.item",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.item.clientId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.item.content",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.item.content[].text",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.item.content[].text_elements",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.item.content[].type",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.item.id",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.item.memoryCitation",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.item.phase",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.item.summary",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.item.text",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.item.type",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.itemId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.name",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.rateLimits",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.rateLimits.credits",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.rateLimits.credits.balance",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.rateLimits.credits.hasCredits",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.rateLimits.credits.unlimited",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.rateLimits.individualLimit",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.rateLimits.limitId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.rateLimits.limitName",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.rateLimits.planType",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.rateLimits.primary",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.rateLimits.primary.resetsAt",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.rateLimits.primary.usedPercent",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.rateLimits.primary.windowDurationMins",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.rateLimits.rateLimitReachedType",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.rateLimits.secondary",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.rateLimits.spendControlReached",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.serverName",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.startedAtMs",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.status",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.status.activeFlags",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.status.type",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.summaryIndex",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.thread",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.agentNickname",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.agentRole",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.canAcceptDirectInput",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.cliVersion",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.createdAt",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.thread.cwd",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.ephemeral",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.extra",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.forkedFromId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.gitInfo",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.historyMode",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.thread.id",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.modelProvider",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.thread.name",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.parentThreadId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.thread.path",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.preview",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.recencyAt",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.section",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.sectionEnteredAt",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.sessionId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.source",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.thread.status",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.thread.status.type",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.threadSource",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.turns",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.thread.updatedAt",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.activePermissionProfile",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.approvalPolicy",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.approvalsReviewer",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.collaborationMode",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.collaborationMode.mode",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.collaborationMode.settings",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.collaborationMode.settings.developer_instructions",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.threadSettings.collaborationMode.settings.model",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.collaborationMode.settings.reasoning_effort",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.threadSettings.cwd",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.effort",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.threadSettings.model",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.modelProvider",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.multiAgentMode",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.personality",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.sandboxPolicy",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.sandboxPolicy.excludeSlashTmp",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.sandboxPolicy.excludeTmpdirEnvVar",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.sandboxPolicy.networkAccess",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.threadSettings.sandboxPolicy.type",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.threadSettings.sandboxPolicy.writableRoots",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.threadSettings.serviceTier",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.threadSettings.summary",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.tokenUsage",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.tokenUsage.last",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.tokenUsage.last.cacheWriteInputTokens",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.tokenUsage.last.cachedInputTokens",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.tokenUsage.last.inputTokens",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.tokenUsage.last.outputTokens",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.tokenUsage.last.reasoningOutputTokens",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.tokenUsage.last.totalTokens",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.tokenUsage.modelContextWindow",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.tokenUsage.total",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.tokenUsage.total.cacheWriteInputTokens",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.tokenUsage.total.cachedInputTokens",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.tokenUsage.total.inputTokens",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.tokenUsage.total.outputTokens",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.tokenUsage.total.reasoningOutputTokens",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.tokenUsage.total.totalTokens",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.turn",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.turn.completedAt",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.turn.durationMs",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.turn.error",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.turn.id",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.turn.items",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.turn.itemsView",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.turn.items[].id",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.turn.items[].memoryCitation",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.turn.items[].phase",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.turn.items[].text",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.turn.items[].type",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.turn.startedAt",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".params.turn.status",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".params.turnId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.activePermissionProfile",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.approvalPolicy",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.approvalsReviewer",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.codexHome",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.cwd",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.data",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.data[].additionalSpeedTiers",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.data[].availabilityNux",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.data[].availabilityNux.message",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "debt": "D36",
+      "direction": "from-provider",
+      "domains": [
+        "models",
+        "reasoning"
+      ],
+      "how": "Needs a declared default on `comet_proto::Model`, whose ladder carries none, so it costs a `PROTOCOL_VERSION` question. Read that constant's doc comment on whether an absent value is safe for an older peer before deciding.",
+      "path": ".result.data[].defaultReasoningEffort",
+      "provider": "codex",
+      "state": "deferred"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.data[].defaultServiceTier",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.data[].description",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.data[].displayName",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.data[].hidden",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.data[].id",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.data[].inputModalities",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "debt": "D72",
+      "direction": "from-provider",
+      "domains": [
+        "models"
+      ],
+      "how": "Let the live answer order the merged catalog in `codex/catalog.rs`, so `pickers::default_model`'s first-row rule lands on the model Codex actually names. Carrying it on `comet_proto::Model` instead would cost a `PROTOCOL_VERSION` question. Latent today: the curated list already leads with `gpt-5.6-sol`, so the two agree by coincidence.",
+      "path": ".result.data[].isDefault",
+      "provider": "codex",
+      "state": "deferred"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.data[].model",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.data[].modelSpecialty",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.data[].serviceTiers",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.data[].serviceTiers[].description",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.data[].serviceTiers[].id",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.data[].serviceTiers[].name",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.data[].supportedReasoningEfforts",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.data[].supportedReasoningEfforts[].description",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.data[].supportedReasoningEfforts[].reasoningEffort",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.data[].supportsPersonality",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "debt": "D35",
+      "direction": "from-provider",
+      "domains": [
+        "models"
+      ],
+      "how": "A replacement model id. `AgentEvent::Notice` already exists as a surface, so no proto change is needed; the open question is whether a catalog reply is a legitimate producer for a notice.",
+      "path": ".result.data[].upgrade",
+      "provider": "codex",
+      "state": "deferred"
+    },
+    {
+      "debt": "D35",
+      "direction": "from-provider",
+      "domains": [
+        "models"
+      ],
+      "how": "The object carrying `migrationMarkdown`; same decision as `.upgrade`.",
+      "path": ".result.data[].upgradeInfo",
+      "provider": "codex",
+      "state": "deferred"
+    },
+    {
+      "debt": "D35",
+      "direction": "from-provider",
+      "domains": [
+        "models"
+      ],
+      "how": "Provider-written deprecation copy, so it is prose and the walker withholds its value. Showing it means routing a catalog reply into `AgentEvent::Notice`.",
+      "path": ".result.data[].upgradeInfo.migrationMarkdown",
+      "provider": "codex",
+      "state": "deferred"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.data[].upgradeInfo.model",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.data[].upgradeInfo.modelLink",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.data[].upgradeInfo.upgradeCopy",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.initialTurnsPage",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.instructionSources",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.itemsBackwardsCursor",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.model",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.modelProvider",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.multiAgentMode",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.nextCursor",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.platformFamily",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.platformOs",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.reasoningEffort",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.runtimeWorkspaceRoots",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.sandbox",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.sandbox.excludeSlashTmp",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.sandbox.excludeTmpdirEnvVar",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.sandbox.networkAccess",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.sandbox.type",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.sandbox.writableRoots",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.serviceTier",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.thread",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.agentNickname",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.agentRole",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.canAcceptDirectInput",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.cliVersion",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.createdAt",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.thread.cwd",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.ephemeral",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.extra",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.forkedFromId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.gitInfo",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.historyMode",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.thread.id",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.modelProvider",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.thread.name",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.parentThreadId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.thread.path",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.preview",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.recencyAt",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.section",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.sectionEnteredAt",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.sessionId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.source",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.thread.status",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.thread.status.type",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.threadSource",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.turns",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].completedAt",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].durationMs",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].error",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].id",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].items",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].itemsView",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].items[].clientId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].items[].content",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].items[].content[].text",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].items[].content[].text_elements",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].items[].content[].type",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].items[].id",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].items[].memoryCitation",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].items[].phase",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].items[].text",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].items[].type",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].startedAt",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.thread.turns[].status",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.thread.updatedAt",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.turn",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.turn.completedAt",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.turn.durationMs",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.turn.error",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.turn.id",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.turn.items",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.turn.itemsView",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.turn.startedAt",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "consumer": "derived: named in the decode sources",
+      "direction": "from-provider",
+      "path": ".result.turn.status",
+      "provider": "codex",
+      "state": "consumed"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.turnId",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.turnsBackwardsCursor",
+      "provider": "codex",
+      "state": "unknown"
+    },
+    {
+      "direction": "from-provider",
+      "path": ".result.userAgent",
+      "provider": "codex",
+      "state": "unknown"
+    }
+  ],
+  "schema_version": 1
+}

@@ -20,7 +20,10 @@ use serde_json::Value;
 /// Input surface is not decoration: `ToProvider` fields are how Comet *drives*
 /// the client, and an unused input capability (Codex's structured `skill` item)
 /// is exactly as much unused surface as an unread reply field.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "kebab-case")]
 pub enum Direction {
     ToProvider,
     FromProvider,

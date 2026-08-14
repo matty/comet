@@ -100,6 +100,28 @@ the record. Read it rather than any spec, plan or handoff file quoting it. `PROT
 has been quoted secondhand twice and was a slice out of date both times, and both times a spec
 inherited the wrong number.
 
+## What the providers send, and what we do with it
+
+`docs/testing/provider-surface/` is a generated report, one file per provider: every field the
+promoted corpus observes, in both directions, with what Comet does about it and — where the
+value's grammar makes it safe — the values it takes. Read it before building on a provider
+field, and before assuming a field does not exist.
+
+Decisions live in `crates/harness/tests/corpus/dispositions.json`, not in the report. A field
+with no entry **fails the suite**, which is how a new CLI version's added field surfaces as a
+test failure instead of as a bug. `unknown` is a legitimate state meaning nobody has looked;
+the backlog is allowed to be large and honest.
+
+Regenerate both after promoting a capture:
+
+```powershell
+$env:COMET_UPDATE_SURFACE = "1"; cargo test -p comet-harness --test capture_corpus surface_report
+```
+
+**The map's blind spot is absence.** It reports fields that are present but unread; a capability
+no capture ever exercised cannot appear in it at all. Procedure is in
+`docs/testing/provider-captures.md`.
+
 ## The gpui fork rev is load-bearing
 
 `gpui` comes from `wingleeio/zed` at a pinned rev, not from crates.io. Comet depends on

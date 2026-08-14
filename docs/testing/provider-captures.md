@@ -84,6 +84,36 @@ cargo test -p comet-harness
 Before committing, deliberately break each new contract once, observe a meaningful named failure,
 restore it, and rerun green. Finish with the repository gate from `AGENTS.md`.
 
+## The second index: the provider surface map
+
+`index.json` answers *"is this claim backed?"*. It cannot answer *"what does the provider send,
+and do we read it?"* — a promoted capture full of unread fields is invisible to it, because
+nothing points at those fields and inventing a claim to populate a consumer list is forbidden
+above, correctly.
+
+So a second index sits beside it. `crates/harness/tests/corpus/dispositions.json` carries one
+entry per observed field per direction — `consumed`, `not-applicable`, `deferred` or `unknown` —
+and [`docs/testing/provider-surface/`](provider-surface/) holds the rendered report per provider.
+Both are generated and committed:
+
+```powershell
+$env:COMET_UPDATE_SURFACE = "1"; cargo test -p comet-harness --test capture_corpus surface_report
+```
+
+**Promotion is what makes a field visible to the map**, so a scenario promoted here shows up
+there on the next regeneration — as `unknown`, until somebody decides. The suite fails when an
+observed field has no entry at all, which is how a new CLI version's added field arrives as a
+test failure rather than as a bug.
+
+Two rules the record keeps, enforced by the same suite. A `deferred` entry names a **real** row
+in `docs/debt/README.md` and a `how` note saying what consuming it would touch; a
+`not-applicable` entry names a reason and **must not** carry a debt row, because the debt index
+tracks work deferred and a field that is null in every frame is not work owed.
+
+The report prints a value only where the value's own grammar makes that safe, and a redacted
+value reports its kind rather than its content. That is the same test the sanitizer uses, on
+purpose: two answers to "is this safe to show" would eventually disagree.
+
 ## Provider contradictions
 
 A live contradiction stops retries and promotion for that scenario. Preserve its ignored
