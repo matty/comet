@@ -1771,7 +1771,7 @@ impl Shell {
             self.state.update(cx, |s, cx| s.select_chat(None, cx));
         }
         self.composer
-            .update(cx, |composer, _| composer.purge_chat(&chat_id));
+            .update(cx, |composer, cx| composer.purge_chat(&chat_id, cx));
         self.mutate_for(
             chat_id.clone(),
             serde_json::json!({ "op": "deleteChat", "chatId": chat_id.local_id }),
