@@ -17,7 +17,7 @@ use comet_harness::{
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus, FileOperation,
     HarnessId, NoticeKind, NoticeSeverity, ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel,
-    TodoItem, ToolCall, UserInputAnswer,
+    ToolCall, UserInputAnswer,
 };
 
 /// The `fake-codex` bin target, built by cargo alongside this test.
@@ -221,26 +221,10 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         is_error: false
     }));
 
-    // Completion-only todoList still opens and closes the lifecycle.
-    assert!(events.contains(&AgentEvent::ToolCall {
-        id: "td1".into(),
-        call: ToolCall::Todo {
-            items: vec![
-                TodoItem {
-                    text: "a".into(),
-                    done: true
-                },
-                TodoItem {
-                    text: "b".into(),
-                    done: false
-                },
-            ]
-        },
-    }));
-    assert!(events.contains(&AgentEvent::ToolResult {
-        id: "td1".into(),
-        is_error: false
-    }));
+    // No `todoList` assertion: the fixture no longer sends one, because no
+    // supported codex-cli does. Codex's plan reaches the checklist through
+    // `turn/plan/updated`, covered by `plan_tests` in
+    // `crates/harness/src/codex/normalize.rs`.
 
     // Streamed agentMessage must not re-emit its completed text…
     assert!(

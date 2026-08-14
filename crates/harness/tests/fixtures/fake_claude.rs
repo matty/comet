@@ -155,6 +155,8 @@ fn main() {
         happy();
     } else if first.contains("scenario:subagent-failed") {
         subagent_failed();
+    } else if first.contains("scenario:checklist") {
+        checklist();
     } else if first.contains("scenario:askuser") {
         askuser(&mut stdin);
     } else if first.contains("scenario:steer") {
@@ -333,6 +335,59 @@ fn happy() {
 /// also marked `is_error` for realism only — it carries `parent_tool_use_id`
 /// and is filtered before normalization, so it does not feed either
 /// assertion below.
+/// The task-tool sequence, shaped from the recorded run at
+/// `tests/corpus/claude/2.1.229/checklist`.
+///
+/// Every `tool_use_result` here is the literal shape that capture recorded —
+/// `{"task":{"id","subject"}}` on a create, `statusChange {from,to}` on an
+/// update. The `activeForm` rides the tool INPUT and never the result, which
+/// is the split the decode exists for; a fixture that put it on the result
+/// would let a wrong decode pass.
+///
+/// Ends with a bare update for task `"9"`, which this session never created —
+/// the resumed-run case (capture §7). Nothing in the run names its subject, so
+/// the fold has to build a row from a status and an `activeForm` alone.
+fn checklist() {
+    emit(
+        r#"{"type":"system","subtype":"init","model":"claude-haiku-4-5-20251001","tools":["Bash","TaskCreate","TaskUpdate"],"cwd":"/tmp","session_id":"sess-checklist"}"#,
+    );
+    emit(
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"tc-1","name":"TaskCreate","input":{"subject":"Alpha step","description":"The first step"}}]}}"#,
+    );
+    emit(
+        r#"{"type":"user","parent_tool_use_id":null,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tc-1","content":"Task #1 created successfully: Alpha step"}]},"tool_use_result":{"task":{"id":"1","subject":"Alpha step"}}}"#,
+    );
+    emit(
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"tc-2","name":"TaskCreate","input":{"subject":"Beta step","description":"The second step"}}]}}"#,
+    );
+    emit(
+        r#"{"type":"user","parent_tool_use_id":null,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tc-2","content":"Task #2 created successfully: Beta step"}]},"tool_use_result":{"task":{"id":"2","subject":"Beta step"}}}"#,
+    );
+    emit(
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"tu-1","name":"TaskUpdate","input":{"taskId":"1","status":"in_progress","activeForm":"Working the first step"}}]}}"#,
+    );
+    emit(
+        r#"{"type":"user","parent_tool_use_id":null,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu-1","content":"Updated task #1 activeForm, status"}]},"tool_use_result":{"success":true,"taskId":"1","updatedFields":["activeForm","status"],"statusChange":{"from":"pending","to":"in_progress"}}}"#,
+    );
+    // No `activeForm` on the completion, exactly as the wire sends it: the row
+    // must keep the label the previous frame gave it.
+    emit(
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"tu-2","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}}]}}"#,
+    );
+    emit(
+        r#"{"type":"user","parent_tool_use_id":null,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu-2","content":"Updated task #1 status"}]},"tool_use_result":{"success":true,"taskId":"1","updatedFields":["status"],"statusChange":{"from":"in_progress","to":"completed"}}}"#,
+    );
+    emit(
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"tu-3","name":"TaskUpdate","input":{"taskId":"9","status":"in_progress","activeForm":"Working an inherited step"}}]}}"#,
+    );
+    emit(
+        r#"{"type":"user","parent_tool_use_id":null,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu-3","content":"Updated task #9 activeForm, status"}]},"tool_use_result":{"success":true,"taskId":"9","updatedFields":["activeForm","status"],"statusChange":{"from":"pending","to":"in_progress"}}}"#,
+    );
+    emit(
+        r#"{"type":"result","subtype":"success","result":"planned","errors":[],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30000,"cache_creation_input_tokens":75},"session_id":"sess-checklist","total_cost_usd":0.01}"#,
+    );
+}
+
 fn subagent_failed() {
     emit(
         r#"{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash"],"cwd":"/tmp","session_id":"sess-subfail"}"#,

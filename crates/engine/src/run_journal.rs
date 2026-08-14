@@ -1,6 +1,7 @@
 //! Per-session on-disk event journal (port of comet's `run-journal.ts`, JSONL-shaped).
 //!
-//! One append-only JSONL file per chat under `{data_dir}/journals/{chat_id}.jsonl`; each
+//! One append-only JSONL file per chat under
+//! `{data_dir}/local-store/journals/{chat_id}.jsonl`; each
 //! line is `{"seq": n, "event": AgentEvent}` with a monotonically increasing `seq`. The
 //! journal is the durable replay source for live streams (`Subscribe` = replay then tail
 //! the broadcast hub) and the crash-recovery gauge: a journal whose LAST event is not

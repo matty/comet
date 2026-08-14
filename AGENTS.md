@@ -160,6 +160,21 @@ and no waiting state can last forever — every skeleton needs a reply, a timeou
 retry that gives up into something actionable. Failures split into a short `summary` and an
 actionable `hint`, with the diagnostic detail left in `tracing`.
 
+## Which provider versions we support
+
+`docs/testing/supported-provider-versions.md` names the oldest Claude Code and codex-cli each
+adapter is written against. It is the basis on which a decode may be **deleted**: a tool or
+frame no supported version emits does not get one, because that path ships never having been
+constructed.
+
+It says nothing about persisted documents. A transcript written by an older Comet must keep
+decoding whatever CLI the user now runs — `ToolCall::Todo` survives for exactly that reason.
+Provider-version support and document-format support are different axes; conflating them blanks
+somebody's history.
+
+Nothing enforces the floor (`docs/debt/` D69–D70). Raising it is a deliberate change with a new
+capture, not a side effect of upgrading a local CLI.
+
 ## Fields a provider may omit
 
 Read `.agents/rules/optional-wire-fields.md` before consuming an `Option` that came off a

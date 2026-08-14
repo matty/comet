@@ -6,8 +6,8 @@
 use serde::{Deserialize, Serialize};
 
 use comet_proto::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, NoticeKind, NoticeSeverity, SubagentStatus,
-    ToolCall, UserInputQuestion,
+    AgentEvent, ApprovalDecision, ApprovalRequest, ChecklistItem, NoticeKind, NoticeSeverity,
+    SubagentStatus, ToolCall, UserInputQuestion,
 };
 
 use crate::constants::MSG_INLINE_MAX;
@@ -25,6 +25,14 @@ pub enum MessageStatus {
 fn one() -> u32 {
     1
 }
+
+/// The id of the single [`MessagePart::Checklist`] in a run.
+///
+/// Fixed rather than generated, for the same reason `Subagent` derives its id
+/// from `task_id`: the fold must be replay-safe. A generated id would make
+/// re-folding the same event stream produce a part the previous fold did not
+/// have, and there is exactly one checklist per run for it to collide with.
+const CHECKLIST_PART_ID: &str = "checklist";
 
 /// One rendered part of an assistant message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -116,6 +124,27 @@ pub enum MessagePart {
         #[serde(default)]
         tool_uses: Option<u32>,
     },
+    /// The plan the agent published for this run, accumulated in place.
+    ///
+    /// **One per run, not one per publication.** Both providers restate rather
+    /// than append — Codex sends a complete snapshot per change and Claude's
+    /// `TaskCreate`/`TaskUpdate` move one item of a server-held list — so a
+    /// second card would be a second copy of the same plan, not new
+    /// information.
+    ///
+    /// Its scope is the RUN, which is native for Codex (its plan is turn-scoped)
+    /// and an imposition on Claude (whose list is session-scoped and outlives
+    /// the process). That asymmetry is deliberate and is what makes the
+    /// unknown-id rule in `apply_event` necessary; see it for the evidence.
+    #[serde(rename_all = "camelCase")]
+    Checklist {
+        id: String,
+        /// Codex's one-line rationale for the latest change. Claude sends none
+        /// and none is synthesized for it, so `None` here is ordinary.
+        #[serde(default)]
+        explanation: Option<String>,
+        items: Vec<ChecklistItem>,
+    },
 }
 
 impl MessagePart {
@@ -127,7 +156,8 @@ impl MessagePart {
             | MessagePart::Approval { id, .. }
             | MessagePart::Error { id, .. }
             | MessagePart::Notice { id, .. }
-            | MessagePart::Subagent { id, .. } => id,
+            | MessagePart::Subagent { id, .. }
+            | MessagePart::Checklist { id, .. } => id,
         }
     }
 
@@ -156,6 +186,18 @@ impl MessagePart {
                     + description.len()
                     + activity.as_deref().map_or(0, str::len)
                     + summary.as_deref().map_or(0, str::len)
+            }
+            MessagePart::Checklist {
+                explanation, items, ..
+            } => {
+                explanation.as_deref().map_or(0, str::len)
+                    + items
+                        .iter()
+                        .map(|i| {
+                            i.text.as_deref().map_or(0, str::len)
+                                + i.active_form.as_deref().map_or(0, str::len)
+                        })
+                        .sum::<usize>()
             }
         }
     }
@@ -472,12 +514,109 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
         | AgentEvent::Diagnostic { .. } => {}
+        AgentEvent::ChecklistReplaced { explanation, items } => {
+            // REPLACE, never merge. An item the snapshot omits is gone: Codex
+            // drops a step from its plan and the card must drop it too.
+            // Upserting here instead would accumulate every step the plan ever
+            // held, which reads as a plan that only ever grows.
+            if let Some(MessagePart::Checklist {
+                explanation: e,
+                items: existing,
+                ..
+            }) = out
+                .iter_mut()
+                .find(|p| matches!(p, MessagePart::Checklist { .. }))
+            {
+                *existing = items.clone();
+                // Assigned UNCONDITIONALLY, including to `None`. The
+                // explanation belongs to the snapshot that carried it: it
+                // reads as the rationale for the change on screen beside it,
+                // so keeping the previous one alive next to a newer plan
+                // states a reason the agent did not give for it.
+                //
+                // A run is one provider, so there is no Claude replacement to
+                // blank a Codex explanation — and if there were, clearing is
+                // still the honest answer. Every observed `turn/plan/updated`
+                // carried one (4 of 4, `run4-codex-plan.jsonl`), so this is
+                // the unobserved case written by hand per
+                // `.agents/rules/optional-wire-fields.md`.
+                *e = explanation.clone();
+            } else {
+                out.push(MessagePart::Checklist {
+                    id: CHECKLIST_PART_ID.to_owned(),
+                    explanation: explanation.clone(),
+                    items: items.clone(),
+                });
+            }
+        }
+        AgentEvent::ChecklistItemChanged {
+            item_id,
+            text,
+            active_form,
+            status,
+        } => {
+            let Some(MessagePart::Checklist { items, .. }) = out
+                .iter_mut()
+                .find(|p| matches!(p, MessagePart::Checklist { .. }))
+            else {
+                // No checklist yet: the first mutation of a run creates one.
+                out.push(MessagePart::Checklist {
+                    id: CHECKLIST_PART_ID.to_owned(),
+                    explanation: None,
+                    items: vec![ChecklistItem {
+                        id: item_id.clone(),
+                        text: text.clone(),
+                        active_form: active_form.clone(),
+                        status: *status,
+                    }],
+                });
+                return;
+            };
+            if let Some(item) = items.iter_mut().find(|i| &i.id == item_id) {
+                item.status = *status;
+                // PARTIAL patch: absent means "this frame said nothing about
+                // it", never "clear what an earlier frame reported". A
+                // `TaskUpdate` carries no subject at all, and a `completed`
+                // transition carries no `activeForm` either — assigning
+                // straight through would blank both on the last update of
+                // every item. Same trap `SubagentUpdated` documents above.
+                if text.is_some() {
+                    item.text = text.clone();
+                }
+                if active_form.is_some() {
+                    item.active_form = active_form.clone();
+                }
+            } else {
+                // CREATE on an unknown id, rather than dropping it.
+                //
+                // A resumed Claude process is told nothing about the list it
+                // inherits — no `tasks` key on `system/init`, no `TaskList`
+                // call — and its first task frame updates an id the previous
+                // process created. Dropping would leave the whole resumed run
+                // with an empty checklist, because nothing ever reconciles it.
+                // Captured 2026-08-13 against 2.1.229:
+                // `captures/2026-08-13-plan-todo-subagent.md` §7, and the
+                // corpus pair at `claude/2.1.229/checklist{,-resume}`.
+                //
+                // `text` stays None when the update carries no subject, which
+                // is what a `completed`-only first sighting produces. None
+                // means "this run never saw the subject", NOT "the step has no
+                // subject" — a reader that renders it as an empty line has
+                // read it wrong.
+                items.push(ChecklistItem {
+                    id: item_id.clone(),
+                    text: text.clone(),
+                    active_form: active_form.clone(),
+                    status: *status,
+                });
+            }
+        }
     }
 }
 
 /// Render-only privacy policy — strip heavy/sensitive tool inputs before a call enters the doc.
 ///
-/// Keeps: command / path / pattern / url / query / todo items / server+tool names.
+/// Keeps: command / path / pattern / url / query / server+tool names.
 /// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/Unknown input.
 /// Full inputs remain only in the host's local run journal. Idempotent.
 pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
@@ -1321,5 +1460,211 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    // ---- checklist fold (slice 4.3, task 5) ----
+
+    fn item(id: &str, text: Option<&str>, status: comet_proto::ChecklistStatus) -> ChecklistItem {
+        ChecklistItem {
+            id: id.into(),
+            text: text.map(str::to_owned),
+            active_form: None,
+            status,
+        }
+    }
+
+    fn checklist_of(parts: &[MessagePart]) -> &Vec<ChecklistItem> {
+        parts
+            .iter()
+            .find_map(|p| match p {
+                MessagePart::Checklist { items, .. } => Some(items),
+                _ => None,
+            })
+            .expect("a checklist part")
+    }
+
+    #[test]
+    fn a_replacement_drops_the_items_it_omits() {
+        // The whole reason `ChecklistReplaced` is its own variant. Codex sends
+        // a complete snapshot per change; a step it stops sending is gone from
+        // the plan, and merging here would build a plan that only ever grows.
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ChecklistReplaced {
+                explanation: None,
+                items: vec![
+                    item("0", Some("a"), comet_proto::ChecklistStatus::Completed),
+                    item("1", Some("b"), comet_proto::ChecklistStatus::InProgress),
+                    item("2", Some("c"), comet_proto::ChecklistStatus::Pending),
+                ],
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ChecklistReplaced {
+                explanation: None,
+                items: vec![
+                    item("0", Some("a"), comet_proto::ChecklistStatus::Completed),
+                    item("1", Some("b"), comet_proto::ChecklistStatus::Completed),
+                ],
+            },
+        );
+        assert_eq!(parts.len(), 1, "one card, not one per publication");
+        let items = checklist_of(&parts);
+        assert_eq!(items.len(), 2, "the dropped step is gone: {items:?}");
+        assert!(items.iter().all(|i| i.text.as_deref() != Some("c")));
+    }
+
+    #[test]
+    fn a_mutation_upserts_in_place_and_never_adds_a_second_card() {
+        let mut parts = Vec::new();
+        for status in [
+            comet_proto::ChecklistStatus::Pending,
+            comet_proto::ChecklistStatus::InProgress,
+        ] {
+            fold_event_into_parts(
+                &mut parts,
+                &AgentEvent::ChecklistItemChanged {
+                    item_id: "1".into(),
+                    text: Some("Read the file".into()),
+                    active_form: None,
+                    status,
+                },
+            );
+        }
+        assert_eq!(parts.len(), 1);
+        let items = checklist_of(&parts);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, comet_proto::ChecklistStatus::InProgress);
+    }
+
+    #[test]
+    fn a_status_only_update_does_not_blank_the_subject() {
+        // The partial-patch trap. A `completed` transition carries neither
+        // subject nor activeForm, so assigning straight through would blank
+        // both on the LAST update of every item — i.e. on every finished row,
+        // every time.
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ChecklistItemChanged {
+                item_id: "1".into(),
+                text: Some("Read the file".into()),
+                active_form: Some("Reading the file".into()),
+                status: comet_proto::ChecklistStatus::InProgress,
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ChecklistItemChanged {
+                item_id: "1".into(),
+                text: None,
+                active_form: None,
+                status: comet_proto::ChecklistStatus::Completed,
+            },
+        );
+        let items = checklist_of(&parts);
+        assert_eq!(items[0].status, comet_proto::ChecklistStatus::Completed);
+        assert_eq!(items[0].text.as_deref(), Some("Read the file"));
+        assert_eq!(items[0].active_form.as_deref(), Some("Reading the file"));
+    }
+
+    #[test]
+    fn an_update_for_an_unknown_id_creates_the_item_rather_than_vanishing() {
+        // What a resumed Claude run does on its very first task frame. The
+        // previous process created task 2; this one is told nothing about it
+        // (no `tasks` key on init, no `TaskList` call) and updates it blind.
+        // Dropping would leave the whole resumed run with an empty checklist,
+        // because nothing ever reconciles it. Capture §7, 2026-08-13, 2.1.229.
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ChecklistItemChanged {
+                item_id: "2".into(),
+                text: None,
+                active_form: Some("Working the second step".into()),
+                status: comet_proto::ChecklistStatus::InProgress,
+            },
+        );
+        let items = checklist_of(&parts);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "2");
+        assert_eq!(
+            items[0].text, None,
+            "None means this run never saw the subject, not that there is none"
+        );
+        assert_eq!(
+            items[0].active_form.as_deref(),
+            Some("Working the second step"),
+            "activeForm is the only readable label such a row has"
+        );
+    }
+
+    #[test]
+    fn a_replacement_without_an_explanation_clears_the_previous_one() {
+        // The explanation belongs to the snapshot that carried it: it reads as
+        // the rationale for the plan shown beside it, so keeping the previous
+        // one alive next to newer items states a reason the agent did not give
+        // for them.
+        //
+        // Every observed `turn/plan/updated` carried one (4 of 4,
+        // `run4-codex-plan.jsonl`), so this is the unobserved case written by
+        // hand per `.agents/rules/optional-wire-fields.md`.
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ChecklistReplaced {
+                explanation: Some("Moved to the line count.".into()),
+                items: vec![item("0", Some("a"), comet_proto::ChecklistStatus::Pending)],
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ChecklistReplaced {
+                explanation: None,
+                items: vec![item(
+                    "0",
+                    Some("a"),
+                    comet_proto::ChecklistStatus::Completed,
+                )],
+            },
+        );
+        let MessagePart::Checklist { explanation, .. } = &parts[0] else {
+            panic!("expected a checklist");
+        };
+        assert_eq!(
+            explanation, &None,
+            "stale rationale must not survive beside a newer plan"
+        );
+    }
+
+    #[test]
+    fn a_run_boundary_clears_the_checklist_with_everything_else() {
+        // `SessionStarted` resets the accumulator, which is what makes the
+        // part run-scoped rather than chat-scoped. Pinned because the scoping
+        // is the slice's most reversible decision (4.4 may want it wider).
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ChecklistReplaced {
+                explanation: None,
+                items: vec![item("0", Some("a"), comet_proto::ChecklistStatus::Pending)],
+            },
+        );
+        assert_eq!(parts.len(), 1);
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::SessionStarted {
+                harness: comet_proto::HarnessId::ClaudeCode,
+                model: "haiku".into(),
+                tools: Vec::new(),
+                cwd: "/tmp".into(),
+                session_id: "s1".into(),
+                assistant_message_id: "m1".into(),
+                runtime_mode: Default::default(),
+            },
+        );
+        assert!(parts.is_empty(), "{parts:?}");
     }
 }

@@ -305,6 +305,64 @@ pub fn selected_payload(corpus_root: &Path, claim_id: &str) -> Result<String, Co
         })
 }
 
+/// Return the provider's literal payloads for a claim referencing one OR MORE
+/// event frames, in the order the claim lists them.
+///
+/// [`selected_payload`] deliberately refuses a claim that selects more than one
+/// frame, and that contract is right for a claim about a single reply shape.
+/// It cannot express a claim whose whole point is a RELATIONSHIP between
+/// frames — that a tool call's input carries one half of a change and its
+/// result the other, or that a resumed run's init says nothing about a task its
+/// next frame updates. Those need the frames together, in order, and reading
+/// them one call at a time would lose the ordering the claim asserts.
+///
+/// The validation performed is identical; only the arity differs.
+pub fn selected_payloads(corpus_root: &Path, claim_id: &str) -> Result<Vec<String>, CorpusError> {
+    let index = read_index(corpus_root)?;
+    if let Some(duplicate) = duplicate_claim_id(&index.claims) {
+        return Err(CorpusError::DuplicateClaimId {
+            claim_id: duplicate,
+        });
+    }
+    let claim = index
+        .claims
+        .iter()
+        .find(|claim| claim.id == claim_id)
+        .ok_or_else(|| CorpusError::ClaimNotFound {
+            claim_id: claim_id.to_owned(),
+        })?;
+    let expected_consumers = expected_manifest_consumers(&index.claims);
+    let mut payloads = Vec::new();
+    for evidence in &claim.evidence {
+        let events = validate_evidence(
+            corpus_root,
+            claim,
+            evidence,
+            expected_consumers
+                .get(&evidence.manifest)
+                .expect("selected evidence contributes consumer expectations"),
+        )?;
+        for frame in &evidence.frames {
+            let payload = events
+                .iter()
+                .find(|event| event.sequence == frame.sequence)
+                .map(|event| event.payload.clone())
+                .ok_or_else(|| CorpusError::MissingFrame {
+                    claim_id: claim.id.clone(),
+                    manifest: evidence.manifest.clone(),
+                    sequence: frame.sequence,
+                })?;
+            payloads.push(payload);
+        }
+    }
+    if payloads.is_empty() {
+        return Err(CorpusError::MissingEvidence {
+            claim_id: claim.id.clone(),
+        });
+    }
+    Ok(payloads)
+}
+
 fn read_index(corpus_root: &Path) -> Result<CorpusIndex, CorpusError> {
     let bytes =
         std::fs::read(corpus_root.join("index.json")).map_err(|source| CorpusError::IndexRead {

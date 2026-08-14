@@ -36,7 +36,7 @@ use gpui::{
 };
 
 use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
-use comet_proto::{NoticeSeverity, ServerId, ServerRef, SubagentStatus, ToolCall};
+use comet_proto::{ChecklistStatus, NoticeSeverity, ServerId, ServerRef, SubagentStatus, ToolCall};
 
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
@@ -612,6 +612,11 @@ pub fn rows_for_entry(
                     // someone adds, and 4.4 would get no compile error naming
                     // what to build.
                     MessagePart::Subagent { .. } => {}
+                    // Same deal for the checklist (slice 4.3). 4.4 draws both
+                    // surfaces together, deliberately: they are the two new
+                    // non-chip things in a transcript, and designing them
+                    // apart is how one ends up with two unrelated card idioms.
+                    MessagePart::Checklist { .. } => {}
                 }
             }
         }
@@ -2734,6 +2739,29 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
             acc.extend_from_slice(&duration_ms.unwrap_or(0).to_le_bytes());
             acc.push(tool_uses.is_some() as u8);
             acc.extend_from_slice(&tool_uses.unwrap_or(0).to_le_bytes());
+        }
+        // Same blindness, sharper here: a checklist's ONLY interesting change
+        // is usually a status moving with no text change at all
+        // (`pending` -> `inProgress` -> `completed` on a fixed list), which
+        // `byte_len` cannot see because it sums text lengths. Fingerprint the
+        // item count and every status so the row cache invalidates on exactly
+        // the transitions the card exists to show.
+        if let MessagePart::Checklist { items, .. } = part {
+            acc.push(0x20);
+            acc.extend_from_slice(&(items.len() as u64).to_le_bytes());
+            for item in items {
+                acc.push(match item.status {
+                    ChecklistStatus::Pending => 0,
+                    ChecklistStatus::InProgress => 1,
+                    ChecklistStatus::Completed => 2,
+                    ChecklistStatus::Unknown => 3,
+                });
+                // An item gaining a subject on a later frame is a visible
+                // change even when the status did not move — a resumed run's
+                // text-less row becoming a named one.
+                acc.push(item.text.is_some() as u8);
+                acc.push(item.active_form.is_some() as u8);
+            }
         }
     }
     fnv1a(&acc)

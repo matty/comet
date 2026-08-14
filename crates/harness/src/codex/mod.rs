@@ -59,7 +59,8 @@ use catalog::{
 };
 use normalize::{
     Phase, RateLimitThresholds, delta_text, ignored_notification_reason, item_id, item_type,
-    map_item, notice_for, rate_limit_notice, turn_error_message, turn_id, usage_event,
+    map_item, notice_for, plan_update_event, rate_limit_notice, turn_error_message, turn_id,
+    usage_event,
 };
 use rpc::{Incoming, RpcClient};
 
@@ -796,6 +797,17 @@ async fn run_session(session: Session) {
                     "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
                         if let Some(text) = delta_text(&params)
                             && !send(&event_tx, AgentEvent::ReasoningDelta { text }).await
+                        {
+                            break 'main;
+                        }
+                    }
+
+                    // The whole plan, every time — Codex sends a complete
+                    // snapshot per change rather than a delta, which is why
+                    // this is a replacement and needs no accumulator.
+                    "turn/plan/updated" => {
+                        if let Some(event) = plan_update_event(&params)
+                            && !send(&event_tx, event).await
                         {
                             break 'main;
                         }

@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 
 use comet_proto::{
-    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessId, NoticeKind, NoticeSeverity, RuntimeMode,
-    SubagentStatus, TodoItem, ToolCall,
+    AgentEvent, ChecklistItem, ChecklistStatus, DiagnosticSeverity, DoneStatus, HarnessId,
+    NoticeKind, NoticeSeverity, RuntimeMode, SubagentStatus, ToolCall,
 };
 use serde_json::Value;
 
@@ -244,6 +244,143 @@ fn subagent_result_from_tool_use_result(value: &Value) -> Option<SubagentToolRes
     })
 }
 
+/// Which task tool a held call was, so its result is read the right way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskCallKind {
+    Create,
+    Update,
+    List,
+}
+
+impl TaskCallKind {
+    /// `TodoWrite` is deliberately absent. It does not exist on any supported
+    /// Claude Code — not on 2.1.229 and not on 2.1.228, the floor recorded in
+    /// `docs/testing/supported-provider-versions.md`. Decoding a tool no
+    /// supported CLI can send is a path that ships never having been
+    /// constructed, which is the exact failure
+    /// `.agents/rules/optional-wire-fields.md` exists to prevent.
+    ///
+    /// This says nothing about `ToolCall::Todo`, which survives for a
+    /// different reason entirely — documents written before this branch, on
+    /// any CLI. See that variant's own doc comment.
+    fn from_tool_name(name: &str) -> Option<Self> {
+        match name {
+            "TaskCreate" => Some(Self::Create),
+            "TaskUpdate" => Some(Self::Update),
+            "TaskList" => Some(Self::List),
+            _ => None,
+        }
+    }
+}
+
+/// Claude's task statuses are snake_case on the wire (`in_progress`); the
+/// proto type is camelCase. Mapped by hand rather than through serde because
+/// the two spellings genuinely differ and a rename attribute would hide that
+/// from anyone reading either side.
+fn checklist_status_from_claude(raw: &str) -> ChecklistStatus {
+    match raw {
+        "pending" => ChecklistStatus::Pending,
+        "in_progress" => ChecklistStatus::InProgress,
+        "completed" => ChecklistStatus::Completed,
+        _ => ChecklistStatus::Unknown,
+    }
+}
+
+/// An id the CLI may send as a JSON string or a JSON number — `TaskCreate`
+/// answers `{"task":{"id":"1"}}` but nothing promises the quoting is stable,
+/// and a number silently read as absent would orphan every later update.
+fn id_field(value: &Value, key: &str) -> Option<String> {
+    match value.get(key) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Turn a held `Task*` call plus its result into a checklist event.
+///
+/// **Both halves are required and neither is redundant.** `activeForm` and the
+/// requested `status` appear ONLY on the tool input; `TaskCreate`'s assigned id
+/// and `TaskUpdate`'s confirmed `statusChange` appear ONLY on the result.
+/// Captured 2026-08-13 (`captures/2026-08-13-plan-todo-subagent.md`, §1 and §7)
+/// against Claude Code 2.1.229.
+fn checklist_event_from_task_call(
+    kind: TaskCallKind,
+    input: &Value,
+    result: &Value,
+) -> Option<AgentEvent> {
+    match kind {
+        TaskCallKind::Create => {
+            let task = result.get("task")?;
+            let item_id = id_field(task, "id")?;
+            Some(AgentEvent::ChecklistItemChanged {
+                item_id,
+                // The result echoes the subject; the input is the fallback for
+                // a build that stops echoing it.
+                text: opt_str_field(task, "subject").or_else(|| opt_str_field(input, "subject")),
+                active_form: opt_str_field(input, "activeForm"),
+                // A creation reports no status of its own. `pending` is not a
+                // guess: the first `TaskUpdate` on a fresh task reported
+                // `statusChange.from == "pending"` on every observed run.
+                status: opt_str_field(input, "status")
+                    .as_deref()
+                    .map_or(ChecklistStatus::Pending, checklist_status_from_claude),
+            })
+        }
+        TaskCallKind::Update => {
+            let item_id = id_field(result, "taskId").or_else(|| id_field(input, "taskId"))?;
+            // The result's confirmed transition wins over the input's request:
+            // the input is what was asked for, the result is what happened.
+            let status = result
+                .get("statusChange")
+                .and_then(|c| opt_str_field(c, "to"))
+                .or_else(|| opt_str_field(input, "status"))
+                .as_deref()
+                .map(checklist_status_from_claude)?;
+            Some(AgentEvent::ChecklistItemChanged {
+                item_id,
+                // An update never carries a subject. This is the field the
+                // fold may have to live without on a resumed run — see
+                // `ChecklistItem::text`.
+                text: None,
+                active_form: opt_str_field(input, "activeForm"),
+                status,
+            })
+        }
+        TaskCallKind::List => {
+            let tasks = result.get("tasks")?.as_array()?;
+            let items: Vec<ChecklistItem> = tasks
+                .iter()
+                .filter_map(|t| {
+                    Some(ChecklistItem {
+                        id: id_field(t, "id")?,
+                        text: opt_str_field(t, "subject"),
+                        active_form: opt_str_field(t, "activeForm"),
+                        status: opt_str_field(t, "status")
+                            .as_deref()
+                            .map_or(ChecklistStatus::Unknown, checklist_status_from_claude),
+                    })
+                })
+                .collect();
+            // **The element shape here is UNOBSERVED.** The capture recorded
+            // that `TaskList` answers `{"tasks":[…]}` and never recorded what
+            // is inside one, because the model never called it. So this
+            // refuses to emit unless every element yielded an id: a
+            // replacement built from a shape that turned out wrong would wipe
+            // a correctly accumulated list, which is the one failure here that
+            // destroys good data rather than merely missing some. Dropping the
+            // reconciliation instead is recoverable — the next mutation still
+            // lands. Confirm the shape before relaxing this.
+            (!items.is_empty() && items.len() == tasks.len()).then_some(
+                AgentEvent::ChecklistReplaced {
+                    explanation: None,
+                    items,
+                },
+            )
+        }
+    }
+}
+
 /// Decode a Claude `tool_use` block (name + input) into a typed [`ToolCall`].
 pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
     match name {
@@ -276,19 +413,15 @@ pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
         "WebSearch" => ToolCall::WebSearch {
             query: str_field(input, "query"),
         },
-        "TodoWrite" => ToolCall::Todo {
-            items: input
-                .get("todos")
-                .and_then(Value::as_array)
-                .map(|a| a.as_slice())
-                .unwrap_or_default()
-                .iter()
-                .map(|t| TodoItem {
-                    text: str_field(t, "content"),
-                    done: t.get("status").and_then(Value::as_str) == Some("completed"),
-                })
-                .collect(),
-        },
+        // `TodoWrite` and the `Task*` family are DELIBERATELY absent here and
+        // fall through to `Unknown`, which is how they render as ordinary tool
+        // chips. The list they carry is its own event
+        // (`AgentEvent::ChecklistReplaced` / `ChecklistItemChanged`, emitted
+        // from `checklist_event_from_task_call`), not a `ToolCall` variant —
+        // the same split t3code arrived at, and the reason `ToolCall::Todo` is
+        // no longer constructed anywhere. See that variant's own doc comment
+        // for why it still exists.
+        //
         // MCP tools arrive as `mcp__<server>__<tool>`.
         _ => match name.strip_prefix("mcp__").and_then(|r| r.split_once("__")) {
             Some((server, tool)) => ToolCall::Mcp {
@@ -417,6 +550,16 @@ pub(crate) struct Normalizer {
     /// Last-EMITTED `SubagentUpdated` reading per `task_id` — the
     /// material-transition filter's only state. See [`SubagentSnapshot`].
     subagent_progress: HashMap<String, SubagentSnapshot>,
+    /// `Task*` calls whose result has not arrived yet, keyed by `tool_use_id`.
+    ///
+    /// Held because neither frame carries the whole picture: `activeForm` and
+    /// the requested status are only on the tool INPUT, while the assigned id
+    /// and the confirmed transition are only on the RESULT. Entries are
+    /// removed on consumption, so the map is bounded by the calls in flight —
+    /// a call whose result never arrives (an interrupted turn) leaks one small
+    /// entry for the life of the run, which is why this is per-run state and
+    /// not per-session.
+    pending_task_calls: HashMap<String, (TaskCallKind, Value)>,
 }
 
 impl Normalizer {
@@ -427,6 +570,7 @@ impl Normalizer {
             session_id: None,
             runtime_mode,
             subagent_progress: HashMap::new(),
+            pending_task_calls: HashMap::new(),
         }
     }
 
@@ -651,6 +795,18 @@ impl Normalizer {
                 if f.parent_tool_use_id.is_some() {
                     return Vec::new();
                 }
+                // Hold any `Task*` call until its result lands. The chip these
+                // calls render is unaffected — they stay ordinary tool calls,
+                // which is the split t3code arrived at: the plan is its own
+                // event and the calls driving it are not special-cased away.
+                for b in f.message.blocks() {
+                    if b.kind == "tool_use"
+                        && let Some(kind) = TaskCallKind::from_tool_name(&b.name)
+                    {
+                        self.pending_task_calls
+                            .insert(b.id.clone(), (kind, b.input.clone()));
+                    }
+                }
                 let mut out: Vec<AgentEvent> = f
                     .message
                     .blocks()
@@ -690,6 +846,47 @@ impl Normalizer {
                         is_error: b.is_error.unwrap_or(false),
                     })
                     .collect();
+                // Join the `tool_result` back to the `Task*` call it answers.
+                //
+                // **`tool_use_result` is a SIBLING of `message`, not a field of
+                // the block**, so it describes the frame and cannot be
+                // attributed to one block among several. Every recorded frame
+                // carries exactly one `tool_result` (19 of 19 across the
+                // corpus), but nothing on the wire promises that — and if a
+                // build ever batches two, applying one result to both would
+                // silently stamp one call with the other's id and status.
+                //
+                // So a batched frame correlates NOTHING. The pending entries
+                // stay pending rather than being consumed against a result
+                // that may not be theirs: a missing mutation is recoverable
+                // (the next frame for that task still lands) while a wrong one
+                // is not. If this ever fires in practice the fix is upstream —
+                // the frame would need per-block results to be decodable at
+                // all.
+                let tool_results = f
+                    .message
+                    .blocks()
+                    .filter(|b: &ContentBlock| b.kind == "tool_result")
+                    .count();
+                for b in f.message.blocks().filter(|_| tool_results == 1) {
+                    if b.kind != "tool_result" {
+                        continue;
+                    }
+                    let Some((kind, input)) = self.pending_task_calls.remove(&b.tool_use_id) else {
+                        continue;
+                    };
+                    // An errored call changed nothing, so it must not move the
+                    // checklist. The prose the model sees says so; the typed
+                    // result is absent or negative.
+                    if b.is_error.unwrap_or(false) {
+                        continue;
+                    }
+                    if let Some(result) = f.tool_use_result.as_ref()
+                        && let Some(ev) = checklist_event_from_task_call(kind, &input, result)
+                    {
+                        out.push(ev);
+                    }
+                }
                 // The `Agent` tool's own result carries the whole subagent
                 // record on one frame — a fallback that resolves the card
                 // even if `task_notification` never arrived. Routed through
@@ -863,17 +1060,18 @@ mod tests {
                 new_string: Some("y".into())
             }
         );
-        assert_eq!(
-            decode_tool_use(
-                "TodoWrite",
-                &json!({"todos": [{"content": "t", "status": "completed"}]})
-            ),
-            ToolCall::Todo {
-                items: vec![TodoItem {
-                    text: "t".into(),
-                    done: true
-                }]
-            }
+        // `TodoWrite` no longer decodes to `ToolCall::Todo` — the list it
+        // carries is its own event now, and the call itself is an ordinary
+        // chip like `TaskCreate` beside it. Nothing in this crate constructs
+        // `ToolCall::Todo` any more; the variant survives only so historical
+        // documents still decode (see its doc comment).
+        let todo_write = decode_tool_use(
+            "TodoWrite",
+            &json!({"todos": [{"content": "t", "status": "completed"}]}),
+        );
+        assert!(
+            matches!(&todo_write, ToolCall::Unknown { name, .. } if name == "TodoWrite"),
+            "{todo_write:?}"
         );
         assert_eq!(
             decode_tool_use("mcp__linear__search", &json!({"q": "bug"})),
@@ -1874,6 +2072,329 @@ mod tests {
             !events
                 .iter()
                 .any(|e| matches!(e, AgentEvent::SubagentUpdated { .. })),
+            "{events:?}"
+        );
+    }
+
+    // ---- checklist (slice 4.3, task 3) ----
+    //
+    // The wire evidence behind these tests is promoted corpus material, not
+    // prose in this file. Three claims, each naming the frames it rests on in
+    // `crates/harness/tests/corpus/index.json`:
+    //
+    // - `claude-task-create-result-shape` — `TaskCreate`'s result carries the
+    //   assigned id and subject; the id is on no tool input.
+    // - `claude-task-update-status-transition` — `TaskUpdate`'s result carries
+    //   an explicit `statusChange {from,to}` while `activeForm` is only ever on
+    //   the input, so neither frame alone describes the change.
+    // - `claude-resumed-run-updates-an-uncreated-task` — a resumed process
+    //   restates nothing at init and its first task frame updates an id it
+    //   never created.
+    //
+    // The JSON literals below are copied from those same captures (Claude Code
+    // 2.1.229), per `AGENTS.md`'s rule that a decode's test points at the
+    // literal the provider sends rather than round-tripping through the Rust
+    // type — a round trip stays green through exactly the failure that matters.
+
+    /// Drive an assistant `tool_use` and its `user` result through one
+    /// normalizer, the way the CLI actually sends them.
+    fn drive(normalizer: &mut Normalizer, raws: &[impl AsRef<str>]) -> Vec<AgentEvent> {
+        let mut out = Vec::new();
+        for raw in raws {
+            let frame = crate::claude::wire::parse_frame(raw.as_ref()).unwrap();
+            out.extend(normalizer.normalize(frame, false));
+        }
+        out
+    }
+
+    /// The reviewed frames a claim rests on, in the order it lists them.
+    ///
+    /// Read from the corpus rather than pasted here so a re-recording cannot
+    /// leave this file asserting a shape the provider no longer sends. That
+    /// drift is silent: hand-copied literals keep passing forever.
+    fn claim_frames(claim_id: &str) -> Vec<String> {
+        crate::capture::selected_payloads(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
+            claim_id,
+        )
+        .expect("reviewed corpus frames")
+    }
+
+    #[test]
+    fn task_create_yields_a_pending_item_with_its_assigned_id() {
+        let frames = claim_frames("claude-task-create-result-shape");
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &frames);
+        let changed: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ChecklistItemChanged { .. }))
+            .collect();
+        assert_eq!(
+            changed,
+            vec![&AgentEvent::ChecklistItemChanged {
+                // The id is on the RESULT only; the input never knows it.
+                item_id: "1".into(),
+                text: Some("Alpha step".into()),
+                active_form: None,
+                status: ChecklistStatus::Pending,
+            }],
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_task_create_still_renders_an_ordinary_tool_chip() {
+        // The plan is its own event; the calls driving it stay ordinary tool
+        // calls. Nothing here may swallow the chip.
+        let frames = claim_frames("claude-task-create-result-shape");
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &frames[..1]);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolCall {
+                    call: ToolCall::Unknown { name, .. },
+                    ..
+                } if name == "TaskCreate"
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_resumed_runs_update_for_an_unseen_task_carries_its_active_form() {
+        // The claim's three frames are the resumed run's init (which restates
+        // no list), the update call, and its result. Task 2 was created by the
+        // PREVIOUS process, so this normalizer has never seen its subject —
+        // `text` is None and `activeForm` is the only readable label. The
+        // ordinary two-turn case, not an exotic one.
+        let frames = claim_frames("claude-resumed-run-updates-an-uncreated-task");
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &frames);
+        assert!(
+            events.contains(&AgentEvent::ChecklistItemChanged {
+                item_id: "2".into(),
+                text: None,
+                active_form: Some("Working the second step".into()),
+                status: ChecklistStatus::InProgress,
+            }),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_completion_update_carries_no_active_form_and_that_is_fine() {
+        // The `completed` transition sends neither subject nor activeForm. An
+        // item whose FIRST sighting is this has a status and no text of any
+        // kind — the case `ChecklistItem::text` is optional for.
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_0144zTWo88YYXGVKLQotEqpu","name":"TaskUpdate","input":{"taskId":"2","status":"completed"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_0144zTWo88YYXGVKLQotEqpu","type":"tool_result","content":"Updated task #2 status"}]},"parent_tool_use_id":null,"tool_use_result":{"success":true,"taskId":"2","updatedFields":["status"],"statusChange":{"from":"in_progress","to":"completed"}}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[call, result]);
+        assert!(
+            events.contains(&AgentEvent::ChecklistItemChanged {
+                item_id: "2".into(),
+                text: None,
+                active_form: None,
+                status: ChecklistStatus::Completed,
+            }),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn the_results_confirmed_transition_beats_the_inputs_request() {
+        // The claim's two frames: an `in_progress` request whose result
+        // confirms the same transition, with `activeForm` present on the input
+        // and absent from the result. The decode must read the destination
+        // from the result — the input is what was asked for, the result is
+        // what happened.
+        let frames = claim_frames("claude-task-update-status-transition");
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &frames);
+        assert!(
+            events.contains(&AgentEvent::ChecklistItemChanged {
+                item_id: "1".into(),
+                text: None,
+                active_form: Some("Working the first step".into()),
+                status: ChecklistStatus::InProgress,
+            }),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn an_update_reporting_no_status_anywhere_emits_nothing() {
+        // An absent transition is not a transition. Defaulting to Pending here
+        // would silently reset an item the user watched reach completed.
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu2","name":"TaskUpdate","input":{"taskId":"3","activeForm":"Reporting results"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tu2","type":"tool_result","content":"Updated task #3 activeForm"}]},"parent_tool_use_id":null,"tool_use_result":{"success":true,"taskId":"3","updatedFields":["activeForm"]}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[call, result]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ChecklistItemChanged { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn an_errored_task_call_moves_nothing() {
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu3","name":"TaskUpdate","input":{"taskId":"4","status":"completed"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tu3","type":"tool_result","is_error":true,"content":"No task #4"}]},"parent_tool_use_id":null,"tool_use_result":{"success":false,"taskId":"4","statusChange":{"from":"pending","to":"completed"}}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[call, result]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ChecklistItemChanged { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_tools_result_emits_no_checklist_event() {
+        // A `Read` result flowing through the same frame shape. Nothing about
+        // it may look like a task mutation.
+        let raw = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01CBBqQr95WuVk1MNSokZmod","type":"tool_result","content":"1\talpha\n"}]},"parent_tool_use_id":null,"tool_use_result":{"type":"text","file":{"filePath":"notes.txt"}}}"#;
+        let events = normalize_one(raw);
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ChecklistItemChanged { .. } | AgentEvent::ChecklistReplaced { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn task_list_refuses_to_replace_from_an_unrecognized_element_shape() {
+        // The element shape is UNOBSERVED — the model never called `TaskList`
+        // on any recorded run. A replacement built from a wrong guess would
+        // wipe a correctly accumulated list, so a shape that yields no ids
+        // must emit nothing at all rather than an empty replacement.
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu4","name":"TaskList","input":{}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tu4","type":"tool_result","content":"3 tasks"}]},"parent_tool_use_id":null,"tool_use_result":{"tasks":[{"identifier":"1","title":"Read README.md"},{"identifier":"2","title":"Count lines"}]}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[call, result]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ChecklistReplaced { .. })),
+            "a shape whose elements yield no id must not produce a replacement: {events:?}"
+        );
+    }
+
+    #[test]
+    fn task_list_replaces_when_every_element_decodes() {
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu5","name":"TaskList","input":{}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tu5","type":"tool_result","content":"2 tasks"}]},"parent_tool_use_id":null,"tool_use_result":{"tasks":[{"id":"1","subject":"Read README.md","status":"completed"},{"id":"2","subject":"Count lines","status":"in_progress"}]}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[call, result]);
+        assert!(
+            events.contains(&AgentEvent::ChecklistReplaced {
+                explanation: None,
+                items: vec![
+                    ChecklistItem {
+                        id: "1".into(),
+                        text: Some("Read README.md".into()),
+                        active_form: None,
+                        status: ChecklistStatus::Completed,
+                    },
+                    ChecklistItem {
+                        id: "2".into(),
+                        text: Some("Count lines".into()),
+                        active_form: None,
+                        status: ChecklistStatus::InProgress,
+                    },
+                ],
+            }),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn todo_write_publishes_no_checklist_on_a_supported_cli() {
+        // `TodoWrite` exists on NO supported Claude Code — absent from 2.1.229
+        // and from 2.1.228, the floor in
+        // `docs/testing/supported-provider-versions.md`. Decoding it would be
+        // a path that ships never having been constructed.
+        //
+        // If it ever reappears this is the test that will fail, which is the
+        // point: it is a statement about supported versions, not about the
+        // tool being impossible.
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tw1","name":"TodoWrite","input":{"todos":[{"content":"Read the file","status":"completed"},{"content":"Count the lines","status":"in_progress"}]}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tw1","type":"tool_result","content":"Todos updated"}]},"parent_tool_use_id":null,"tool_use_result":{"ok":true}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[call, result]);
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ChecklistReplaced { .. } | AgentEvent::ChecklistItemChanged { .. }
+            )),
+            "{events:?}"
+        );
+        // It still renders, as an ordinary unknown-tool chip — the call is not
+        // swallowed, only its list is not interpreted.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolCall {
+                    call: ToolCall::Unknown { name, .. },
+                    ..
+                } if name == "TodoWrite"
+            )),
+            "{events:?}"
+        );
+    }
+
+    /// `tool_use_result` describes the FRAME, so a frame carrying two
+    /// `tool_result` blocks cannot say which of them it belongs to. Applying
+    /// it to both would stamp one call with the other's id and status — the
+    /// silent mis-attribution, which is strictly worse than the missing
+    /// mutation that dropping produces.
+    ///
+    /// Never observed: 19 of 19 recorded frames carry exactly one block. This
+    /// is the unobserved case written by hand, per
+    /// `.agents/rules/optional-wire-fields.md`.
+    #[test]
+    fn a_frame_batching_two_tool_results_correlates_neither() {
+        let calls = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tb1","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}},{"type":"tool_use","id":"tb2","name":"TaskUpdate","input":{"taskId":"2","status":"completed"}}]},"parent_tool_use_id":null}"#;
+        let batched = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tb1","type":"tool_result","content":"ok"},{"tool_use_id":"tb2","type":"tool_result","content":"ok"}]},"parent_tool_use_id":null,"tool_use_result":{"success":true,"taskId":"1","statusChange":{"from":"in_progress","to":"completed"}}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[calls, batched]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ChecklistItemChanged { .. })),
+            "a batched frame must correlate nothing rather than guess: {events:?}"
+        );
+        // Both tool_results still reach the stream as ordinary results — only
+        // the checklist correlation is withheld.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::ToolResult { .. }))
+                .count(),
+            2,
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_numeric_task_id_decodes_rather_than_orphaning_the_item() {
+        // The capture showed `"1"` quoted. Nothing promises that stays true,
+        // and a number read as absent would drop every later update silently.
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu6","name":"TaskCreate","input":{"subject":"Read README.md"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tu6","type":"tool_result","content":"created"}]},"parent_tool_use_id":null,"tool_use_result":{"task":{"id":7,"subject":"Read README.md"}}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[call, result]);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ChecklistItemChanged { item_id, .. } if item_id == "7"
+            )),
             "{events:?}"
         );
     }

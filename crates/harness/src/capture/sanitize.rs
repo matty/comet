@@ -800,6 +800,20 @@ impl Redactor {
             .or_default() += 1;
     }
 
+    /// Scenarios whose argv may legitimately carry `--resume=<id>`.
+    ///
+    /// The rule this gates is fail-closed on purpose: a `--resume` in a
+    /// capture that had no business resuming is evidence the command was not
+    /// what the scenario says, and that must stop promotion rather than be
+    /// sanitized away. What is wrong with it is only that the permitted set is
+    /// a literal here, so every new resume-bearing scenario is rejected until
+    /// someone finds this function — `checklist-resume` was, and the error
+    /// (`Claude capture command has invalid resume arguments at command.args`)
+    /// names the argv rather than the missing registration. **D60** is the
+    /// structural fix: one scenario table the help text, `supported_pair` and
+    /// this list all read from.
+    const RESUMING_SCENARIOS: &'static [&'static str] = &["resume", "checklist-resume"];
+
     fn sanitize_claude_resume_argv(
         &mut self,
         command: &mut Value,
@@ -819,7 +833,7 @@ impl Redactor {
                     .then_some(index)
             })
             .collect();
-        if scenario != "resume" {
+        if !Self::RESUMING_SCENARIOS.contains(&scenario) {
             if resume_like.is_empty() {
                 return Ok(());
             }
