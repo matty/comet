@@ -2073,6 +2073,150 @@ async fn real_claude_sees_uploaded_image_inline() {
     core.shutdown().await;
 }
 
+/// Slice 4.3's evidence, since nothing renders: drive a REAL Claude run that
+/// uses the task tools, then read back both the persisted document and the run
+/// journal. Same standard 1.4 and 4.2 were held to.
+///
+/// The unit tests fold events straight into a parts vector and the harness
+/// tests stop at the event stream; neither proves a checklist survives the
+/// engine's own write path into a real Loro document.
+///
+/// Ignored by default: needs an installed, authenticated `claude` CLI and
+/// spends real tokens (haiku, one short turn).
+/// Run with: `cargo test -p comet-engine --test e2e -- --ignored`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires installed+authenticated claude CLI; spends tokens"]
+async fn real_claude_task_tools_persist_a_checklist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    let cwd = tmp.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let core = EngineCore::assemble(
+        &dir,
+        Arc::new(comet_engine::default_registry()),
+        HarnessId::ClaudeCode,
+        None,
+    )
+    .expect("engine core assembles");
+    core.workspace
+        .create_space("space-checklist", &core.device_id, "/tmp", None, false)
+        .expect("create space row");
+    core.workspace
+        .create_chat(CHAT, "space-checklist", None, Some("/tmp".into()))
+        .expect("create chat row");
+    // Pre-title the chat so the auto-titler does not spend a second model call.
+    core.workspace
+        .rename_chat(CHAT, "Pre-titled")
+        .expect("rename chat");
+
+    // The same instruction shape the capture scenario uses, and for the same
+    // reason: the task tools are DEFERRED on at least one machine, so a prompt
+    // that does not name them can produce a run with no checklist at all.
+    let request = RunRequest {
+        prompt: concat!(
+            "Use ToolSearch exactly once with input ",
+            r#"{"query":"select:TaskCreate,TaskUpdate","max_results":5}. "#,
+            "Then use TaskCreate exactly twice, first with input ",
+            r#"{"subject":"Alpha step","description":"The first step"} "#,
+            "and then with input ",
+            r#"{"subject":"Beta step","description":"The second step"}. "#,
+            "Then use TaskUpdate exactly once with input ",
+            r#"{"taskId":"1","status":"in_progress","activeForm":"Working the first step"}. "#,
+            "Then use TaskUpdate exactly once with input ",
+            r#"{"taskId":"1","status":"completed"}. "#,
+            "Do nothing else, and reply with the single word planned."
+        )
+        .into(),
+        model: Some("haiku".into()),
+        reasoning: None,
+        model_options: Default::default(),
+        cwd: cwd.to_string_lossy().to_string(),
+        runtime_mode: RuntimeMode::default(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        attachments: Vec::new(),
+        resume: None,
+    };
+    core.doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::Run {
+                request,
+                message_id: "msg-checklist-1".into(),
+            },
+        )
+        .expect("queue real checklist run");
+    wait_for_within_secs(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
+        },
+        "real claude checklist turn",
+        180,
+    )
+    .await;
+
+    // 1. The PERSISTED DOCUMENT holds exactly one checklist, with the first
+    //    item carried all the way to completed and its subject intact through
+    //    a status-only final update.
+    let checklists: Vec<_> = entries(&core)
+        .iter()
+        .flat_map(|e| e.parts.iter())
+        .filter_map(|p| match p {
+            MessagePart::Checklist { items, .. } => Some(items.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        checklists.len(),
+        1,
+        "one checklist per run, not one per publication: {checklists:?}"
+    );
+    let items = &checklists[0];
+    assert!(
+        items.len() >= 2,
+        "expected the two created tasks: {items:?}"
+    );
+    let first = items
+        .iter()
+        .find(|i| i.id == "1")
+        .unwrap_or_else(|| panic!("task 1 missing from {items:?}"));
+    assert_eq!(
+        first.status,
+        comet_proto::ChecklistStatus::Completed,
+        "{items:?}"
+    );
+    assert_eq!(
+        first.text.as_deref(),
+        Some("Alpha step"),
+        "the status-only completion must not blank the subject: {items:?}"
+    );
+    assert_eq!(
+        first.active_form.as_deref(),
+        Some("Working the first step"),
+        "nor the activeForm the in_progress frame set: {items:?}"
+    );
+
+    // 2. The RUN JOURNAL recorded the mutations themselves, which is what a
+    //    replay or a LAN peer reconstructs the card from.
+    let journal = dir
+        .join("local-store")
+        .join("journals")
+        .join(format!("{CHAT}.jsonl"));
+    let raw = std::fs::read_to_string(&journal).expect("journal file");
+    let changes = raw
+        .lines()
+        .filter(|l| l.contains("\"checklistItemChanged\""))
+        .count();
+    assert!(
+        changes >= 3,
+        "expected at least two creates and one update in {}: got {changes}",
+        journal.display()
+    );
+    core.shutdown().await;
+}
+
 async fn wait_for_within_secs<F>(mut predicate: F, what: &str, secs: u64)
 where
     F: FnMut() -> bool,
