@@ -557,9 +557,7 @@ pub enum RowKind {
         /// Image refs parsed out of the message text (message-attachments.ts):
         /// thumbnails load from the owning device via ReadAttachmentChunk.
         attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
-        /// Structured context the prompt folded in as text — diff comments and
-        /// anything else registered in `badges` — lifted back out and shown as
-        /// pills over the bubble instead of raw bullets.
+        /// Context the prompt folded in as text, lifted back out by `badges`.
         badges: Arc<Vec<crate::badges::MessageBadge>>,
         /// Optimistic echo not yet confirmed by a doc frame.
         pending: bool,
@@ -713,8 +711,7 @@ pub fn rows_for_entry(
         // File mentions render as chips here too, not just in the composer.
         // The projection is pure over the text, so the raw-length row version
         // below stays a valid cache/diff key.
-        // Badge blocks (diff comments today) ride the same plain text; lift
-        // them out before the mention projection so a comment body's own
+        // Lifted before the mention projection, so a comment body's own
         // Markdown never lands in the bubble.
         let (body, badges) = crate::badges::split(&parsed.text);
         let (text, mentions) = match crate::composer::sent_mention_display(&body) {
@@ -2334,10 +2331,6 @@ impl Transcript {
                 if !attachments.is_empty() {
                     column = column.child(self.render_user_attachments(&row.id, &attachments, cx));
                 }
-                // Badge pills sit between the thumbnails and the bubble, on
-                // the same right-aligned axis — the composer shows the very
-                // same pill while the prompt is being written, so sending one
-                // reads as the chip moving into the transcript.
                 if !badges.is_empty() {
                     column = column.child(
                         div()
@@ -2349,11 +2342,13 @@ impl Transcript {
                             .items_center()
                             .gap(px(6.0))
                             .pb(px(6.0))
-                            .children(
-                                badges
-                                    .iter()
-                                    .map(|badge| crate::badges::render(badge, &theme)),
-                            ),
+                            .children(badges.iter().enumerate().map(|(bix, badge)| {
+                                crate::badges::render(
+                                    SharedString::from(format!("{}#badge{bix}", row.id)),
+                                    badge,
+                                    &theme,
+                                )
+                            })),
                     );
                 }
                 if !text.is_empty() {
@@ -4470,6 +4465,47 @@ mod tests {
         };
         assert_eq!(text.as_ref(), "");
         assert_eq!(attachments.len(), 1);
+    }
+
+    #[test]
+    fn user_row_extracts_attachment_then_comment_badge_without_mutating_entry() {
+        let comments = vec![crate::comments::DiffComment::new(
+            "src/lib.rs",
+            crate::comments::CommentSide::New,
+            9,
+            "tighten this",
+        )];
+        let with_comments = crate::comments::with_comments("review", &comments);
+        let raw =
+            crate::attachments::with_attachments(&with_comments, &[r"C:\tmp\shot.png".to_string()]);
+        let mut entry = assistant("u-comments", MessageStatus::Complete, vec![]);
+        entry.role = MessageRole::User;
+        entry.status = None;
+        entry.parts = vec![text_part("t0", &raw)];
+
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::User {
+            text,
+            attachments,
+            badges,
+            ..
+        } = &rows[0].kind
+        else {
+            panic!("expected a user row");
+        };
+        assert_eq!(text.as_ref(), "review");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(badges.len(), 1);
+        assert_eq!(badges[0].label.as_ref(), "1 comment");
+        assert_eq!(badges[0].details[0].location.as_ref(), "src/lib.rs:9");
+        assert_eq!(badges[0].details[0].tag.as_deref(), Some("R"));
+        assert_eq!(badges[0].details[0].body.as_ref(), "tighten this");
+        let MessagePart::Text { text: stored, .. } = &entry.parts[0] else {
+            panic!("expected stored text");
+        };
+        assert_eq!(stored, &raw);
+        assert!(stored.contains(crate::comments::COMMENT_BLOCK_HEADER));
+        assert!(stored.contains("Attached images"));
     }
 
     /// A sent prompt's file mentions render as chips in the transcript: the
