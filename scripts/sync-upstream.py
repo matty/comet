@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 from typing import Callable, Sequence, TextIO
 from urllib.parse import urlsplit
 
@@ -1002,19 +1003,22 @@ def create_draft_pr(
 ) -> str:
     if run.sync_branch is None:
         raise SyncError("A bootstrap run cannot create a pull request.")
-    result = gh.run(
-        "pr",
-        "create",
-        "--draft",
-        "--base",
-        run.target_branch,
-        "--head",
-        run.sync_branch,
-        "--title",
-        title,
-        "--body",
-        body,
-    )
+    with tempfile.TemporaryDirectory(prefix="comet-upstream-sync-") as temp_dir:
+        body_path = Path(temp_dir) / "pr-body.md"
+        body_path.write_text(body, encoding="utf-8", newline="\n")
+        result = gh.run(
+            "pr",
+            "create",
+            "--draft",
+            "--base",
+            run.target_branch,
+            "--head",
+            run.sync_branch,
+            "--title",
+            title,
+            "--body-file",
+            str(body_path),
+        )
     url = result.stdout.strip()
     if not url:
         raise SyncError("GitHub CLI did not return the created PR URL.")
