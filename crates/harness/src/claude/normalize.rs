@@ -2079,17 +2079,16 @@ mod tests {
     // ---- checklist (slice 4.3, task 3) ----
     //
     // The wire evidence behind these tests is promoted corpus material, not
-    // prose in this file. Three claims, each naming the frames it rests on in
-    // `crates/harness/tests/corpus/index.json`:
+    // prose in this file — read at test time from `tests/corpus` by scenario
+    // and frame sequence:
     //
-    // - `claude-task-create-result-shape` — `TaskCreate`'s result carries the
-    //   assigned id and subject; the id is on no tool input.
-    // - `claude-task-update-status-transition` — `TaskUpdate`'s result carries
-    //   an explicit `statusChange {from,to}` while `activeForm` is only ever on
-    //   the input, so neither frame alone describes the change.
-    // - `claude-resumed-run-updates-an-uncreated-task` — a resumed process
-    //   restates nothing at init and its first task frame updates an id it
-    //   never created.
+    // - `TaskCreate`'s result carries the assigned id and subject; the id is
+    //   on no tool input.
+    // - `TaskUpdate`'s result carries an explicit `statusChange {from,to}`
+    //   while `activeForm` is only ever on the input, so neither frame alone
+    //   describes the change.
+    // - A resumed process restates nothing at init and its first task frame
+    //   updates an id it never created.
     //
     // The JSON literals below are copied from those same captures (Claude Code
     // 2.1.229), per `AGENTS.md`'s rule that a decode's test points at the
@@ -2107,22 +2106,27 @@ mod tests {
         out
     }
 
-    /// The reviewed frames a claim rests on, in the order it lists them.
+    /// The reviewed frames a test rests on, in the order it names them.
     ///
     /// Read from the corpus rather than pasted here so a re-recording cannot
     /// leave this file asserting a shape the provider no longer sends. That
     /// drift is silent: hand-copied literals keep passing forever.
-    fn claim_frames(claim_id: &str) -> Vec<String> {
-        crate::capture::selected_payloads(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
-            claim_id,
-        )
-        .expect("reviewed corpus frames")
+    fn corpus_run(scenario: &str, sequences: &[u64]) -> Vec<String> {
+        sequences
+            .iter()
+            .map(|sequence| crate::capture::corpus_frame(scenario, *sequence).payload)
+            .collect()
     }
 
+    const CHECKLIST: &str = "claude/2.1.229/checklist";
+    const CHECKLIST_RESUME: &str = "claude/2.1.229/checklist-resume";
+
+    /// `TaskCreate`'s `tool_use_result` carries the assigned task id and its
+    /// subject; the id appears nowhere on the tool input, so a decode reading
+    /// only the input cannot key the item.
     #[test]
     fn task_create_yields_a_pending_item_with_its_assigned_id() {
-        let frames = claim_frames("claude-task-create-result-shape");
+        let frames = corpus_run(CHECKLIST, &[55, 64]);
         let mut n = Normalizer::new(RuntimeMode::default());
         let events = drive(&mut n, &frames);
         let changed: Vec<_> = events
@@ -2142,11 +2146,14 @@ mod tests {
         );
     }
 
+    /// `TaskCreate`'s `tool_use_result` carries the assigned task id and its
+    /// subject; the id appears nowhere on the tool input, so a decode reading
+    /// only the input cannot key the item.
     #[test]
     fn a_task_create_still_renders_an_ordinary_tool_chip() {
         // The plan is its own event; the calls driving it stay ordinary tool
         // calls. Nothing here may swallow the chip.
-        let frames = claim_frames("claude-task-create-result-shape");
+        let frames = corpus_run(CHECKLIST, &[55, 64]);
         let mut n = Normalizer::new(RuntimeMode::default());
         let events = drive(&mut n, &frames[..1]);
         assert!(
@@ -2161,6 +2168,9 @@ mod tests {
         );
     }
 
+    /// A resumed Claude process restates no task list at init and its first
+    /// task frame updates an id it never created, so a per-run accumulator
+    /// receives a status change for an unknown item.
     #[test]
     fn a_resumed_runs_update_for_an_unseen_task_carries_its_active_form() {
         // The claim's three frames are the resumed run's init (which restates
@@ -2168,7 +2178,7 @@ mod tests {
         // PREVIOUS process, so this normalizer has never seen its subject —
         // `text` is None and `activeForm` is the only readable label. The
         // ordinary two-turn case, not an exotic one.
-        let frames = claim_frames("claude-resumed-run-updates-an-uncreated-task");
+        let frames = corpus_run(CHECKLIST_RESUME, &[2, 50, 55]);
         let mut n = Normalizer::new(RuntimeMode::default());
         let events = drive(&mut n, &frames);
         assert!(
@@ -2202,6 +2212,9 @@ mod tests {
         );
     }
 
+    /// `TaskUpdate`'s `tool_use_result` reports an explicit `statusChange
+    /// {from,to}`, while `activeForm` appears only on the tool input, so
+    /// neither frame alone describes the change.
     #[test]
     fn the_results_confirmed_transition_beats_the_inputs_request() {
         // The claim's two frames: an `in_progress` request whose result
@@ -2209,7 +2222,7 @@ mod tests {
         // and absent from the result. The decode must read the destination
         // from the result — the input is what was asked for, the result is
         // what happened.
-        let frames = claim_frames("claude-task-update-status-transition");
+        let frames = corpus_run(CHECKLIST, &[88, 93]);
         let mut n = Normalizer::new(RuntimeMode::default());
         let events = drive(&mut n, &frames);
         assert!(

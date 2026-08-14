@@ -1,8 +1,8 @@
 //! Claude's live model discovery: reading one `initialize` control response.
 //!
-//! Reviewed evidence is indexed in `tests/corpus/index.json` by the
-//! `claude-model-*` claims. Three facts from that corpus shape this file, and
-//! none of them is in sdk.d.ts 0.3.195:
+//! Reviewed evidence lives in `tests/corpus`, addressed by scenario and frame
+//! sequence. Three facts from that corpus shape this file, and none of them
+//! is in sdk.d.ts 0.3.195:
 //!
 //! 1. The reply nests twice: `control_response.response.response`.
 //! 2. Each model carries an undocumented `resolvedModel`, and it is the only
@@ -13,12 +13,6 @@
 //! Canonicalization lives in this file rather than in the shared merge because
 //! `resolvedModel` is a Claude field; `crate::discovery` stays
 //! provider-agnostic and unchanged.
-//!
-//! Corpus claims: `claude-model-reply-shape`, `claude-model-curated-id-decoder`,
-//! `claude-model-cwd-invariance`, `claude-model-bare-effects`,
-//! `claude-model-real-catalog-merge`, `claude-model-default-alias`,
-//! `claude-model-no-modality`, `claude-model-effort-levels`,
-//! `claude-model-initialize-request`, and `claude-model-close-exit`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -312,17 +306,11 @@ pub(crate) fn discovery_from_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::selected_payload;
+    use crate::capture::corpus_frame;
     use crate::claude::catalog::static_models;
     use comet_proto::ReasoningLevel;
 
-    fn corpus_payload(claim_id: &str) -> String {
-        selected_payload(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
-            claim_id,
-        )
-        .expect("reviewed corpus frame")
-    }
+    const MODEL_DISCOVERY: &str = "claude/2.1.228/model-discovery";
 
     fn curated_ids() -> Vec<String> {
         static_models().into_iter().map(|m| m.id).collect()
@@ -338,12 +326,15 @@ mod tests {
     /// rejects the live CLI.
     ///
     /// The ids are the CURATED ones, because Claude's own spellings never match
-    /// them literally (`claude-model-curated-id-decoder`) and every consumer downstream — the
+    /// them literally and every consumer downstream — the
     /// merge, the picker, `--model` — speaks curated.
+    ///
+    /// Provider model selectors and resolved identifiers decode onto curated
+    /// model identifiers.
     #[test]
     fn the_captured_reply_decodes_onto_curated_ids() {
         let owned = curated_ids();
-        let payload = corpus_payload("claude-model-curated-id-decoder");
+        let payload = corpus_frame(MODEL_DISCOVERY, 2).payload;
         let discovery = discovery_from_reply(&payload, &borrowed(&owned)).expect("decodes");
         let ids: Vec<&str> = discovery.models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
@@ -366,10 +357,13 @@ mod tests {
     /// The slice's whole point, on the real data and the real catalog. The
     /// shared merge is unchanged from 2.1 — if the adapter did not
     /// canonicalize, this is where eleven rows would show up.
+    ///
+    /// Captured aliases do not duplicate curated rows while a live-only
+    /// selector remains available.
     #[test]
     fn the_captured_reply_deduplicates_aliases_and_keeps_a_live_only_row() {
         let owned = curated_ids();
-        let payload = corpus_payload("claude-model-real-catalog-merge");
+        let payload = corpus_frame(MODEL_DISCOVERY, 2).payload;
         let discovery = discovery_from_reply(&payload, &borrowed(&owned)).unwrap();
         let merged = crate::discovery::merge(static_models(), &discovery);
         let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
@@ -393,10 +387,13 @@ mod tests {
     /// labelled "Default (recommended)". Kept, it would either duplicate the
     /// model it resolves to or, once that model is not curated, put a row named
     /// after a setting in the picker.
+    ///
+    /// The captured default selector resolves to an existing model and is not
+    /// its own row.
     #[test]
     fn the_default_alias_row_is_dropped() {
         let owned = curated_ids();
-        let payload = corpus_payload("claude-model-default-alias");
+        let payload = corpus_frame(MODEL_DISCOVERY, 2).payload;
         let discovery = discovery_from_reply(&payload, &borrowed(&owned)).unwrap();
         assert!(discovery.models.iter().all(|m| m.id != "default"));
         assert!(
@@ -434,18 +431,21 @@ mod tests {
 
     /// Claude publishes no modality field at all, so every model stays `None` —
     /// "the provider did not say", never "no images".
+    ///
+    /// Captured Claude model entries omit a modality field.
     #[test]
     fn no_modality_field_means_the_provider_did_not_say() {
         let owned = curated_ids();
-        let payload = corpus_payload("claude-model-no-modality");
+        let payload = corpus_frame(MODEL_DISCOVERY, 2).payload;
         let discovery = discovery_from_reply(&payload, &borrowed(&owned)).unwrap();
         assert!(discovery.models.iter().all(|m| m.accepts_images.is_none()));
     }
 
+    /// Captured effort arrays map to the ladder while Haiku reports none.
     #[test]
     fn effort_levels_map_to_the_ladder_and_haiku_reports_none() {
         let owned = curated_ids();
-        let payload = corpus_payload("claude-model-effort-levels");
+        let payload = corpus_frame(MODEL_DISCOVERY, 2).payload;
         let discovery = discovery_from_reply(&payload, &borrowed(&owned)).unwrap();
         assert_eq!(
             discovery.models[2].reasoning_levels,

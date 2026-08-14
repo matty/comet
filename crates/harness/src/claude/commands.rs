@@ -147,19 +147,14 @@ pub(crate) fn commands_from_reply(line: &str) -> Result<Vec<AgentCommand>, Disco
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::selected_payload;
+    use crate::capture::corpus_frame;
 
-    fn corpus_payload(claim_id: &str) -> String {
-        selected_payload(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
-            claim_id,
-        )
-        .expect("reviewed corpus frame")
-    }
+    const COMMAND_DISCOVERY: &str = "claude/2.1.228/command-discovery";
 
+    /// Command objects include `argumentHint` and may include `aliases`.
     #[test]
     fn the_captured_reply_decodes_every_command() {
-        let payload = corpus_payload("claude-command-reply-decoder");
+        let payload = corpus_frame(COMMAND_DISCOVERY, 5).payload;
         let commands = commands_from_reply(&payload).expect("decodes");
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names.len(), 57, "the literal provider list is complete");
@@ -183,9 +178,11 @@ mod tests {
     /// `argumentHint: ""` is what the CLI sends for a command that takes no
     /// arguments — 47 of the 64 in the capture. Kept as `Some("")` it would
     /// render an empty hint slot on most rows in the menu.
+    ///
+    /// Most captured no-argument commands carry an empty `argumentHint` string.
     #[test]
     fn an_empty_argument_hint_is_absent_not_blank() {
-        let payload = corpus_payload("claude-command-empty-hint");
+        let payload = corpus_frame(COMMAND_DISCOVERY, 5).payload;
         let commands = commands_from_reply(&payload).unwrap();
         assert_eq!(commands[0].argument_hint, None);
         assert_eq!(commands[1].argument_hint, None);
@@ -193,9 +190,11 @@ mod tests {
 
     /// Aliases are optional on the wire — most commands carry none — and the
     /// absent case must be an empty list rather than a decode failure.
+    ///
+    /// Captured command entries may omit `aliases`.
     #[test]
     fn a_command_without_aliases_decodes_to_an_empty_list() {
-        let payload = corpus_payload("claude-command-absent-aliases");
+        let payload = corpus_frame(COMMAND_DISCOVERY, 5).payload;
         let commands = commands_from_reply(&payload).unwrap();
         assert!(commands[0].aliases.is_empty());
     }
