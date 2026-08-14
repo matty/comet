@@ -846,11 +846,29 @@ impl Normalizer {
                         is_error: b.is_error.unwrap_or(false),
                     })
                     .collect();
-                // Join each `tool_result` back to the `Task*` call it answers.
-                // `tool_use_result` is a SIBLING of `message` on this frame, not
-                // a field of the block, so it is read once per frame — the CLI
-                // sends one tool_result per user frame in every recorded run.
-                for b in f.message.blocks() {
+                // Join the `tool_result` back to the `Task*` call it answers.
+                //
+                // **`tool_use_result` is a SIBLING of `message`, not a field of
+                // the block**, so it describes the frame and cannot be
+                // attributed to one block among several. Every recorded frame
+                // carries exactly one `tool_result` (19 of 19 across the
+                // corpus), but nothing on the wire promises that — and if a
+                // build ever batches two, applying one result to both would
+                // silently stamp one call with the other's id and status.
+                //
+                // So a batched frame correlates NOTHING. The pending entries
+                // stay pending rather than being consumed against a result
+                // that may not be theirs: a missing mutation is recoverable
+                // (the next frame for that task still lands) while a wrong one
+                // is not. If this ever fires in practice the fix is upstream —
+                // the frame would need per-block results to be decodable at
+                // all.
+                let tool_results = f
+                    .message
+                    .blocks()
+                    .filter(|b: &ContentBlock| b.kind == "tool_result")
+                    .count();
+                for b in f.message.blocks().filter(|_| tool_results == 1) {
                     if b.kind != "tool_result" {
                         continue;
                     }
@@ -2327,6 +2345,39 @@ mod tests {
                     ..
                 } if name == "TodoWrite"
             )),
+            "{events:?}"
+        );
+    }
+
+    /// `tool_use_result` describes the FRAME, so a frame carrying two
+    /// `tool_result` blocks cannot say which of them it belongs to. Applying
+    /// it to both would stamp one call with the other's id and status — the
+    /// silent mis-attribution, which is strictly worse than the missing
+    /// mutation that dropping produces.
+    ///
+    /// Never observed: 19 of 19 recorded frames carry exactly one block. This
+    /// is the unobserved case written by hand, per
+    /// `.agents/rules/optional-wire-fields.md`.
+    #[test]
+    fn a_frame_batching_two_tool_results_correlates_neither() {
+        let calls = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tb1","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}},{"type":"tool_use","id":"tb2","name":"TaskUpdate","input":{"taskId":"2","status":"completed"}}]},"parent_tool_use_id":null}"#;
+        let batched = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tb1","type":"tool_result","content":"ok"},{"tool_use_id":"tb2","type":"tool_result","content":"ok"}]},"parent_tool_use_id":null,"tool_use_result":{"success":true,"taskId":"1","statusChange":{"from":"in_progress","to":"completed"}}}"#;
+        let mut n = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut n, &[calls, batched]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ChecklistItemChanged { .. })),
+            "a batched frame must correlate nothing rather than guess: {events:?}"
+        );
+        // Both tool_results still reach the stream as ordinary results — only
+        // the checklist correlation is withheld.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::ToolResult { .. }))
+                .count(),
+            2,
             "{events:?}"
         );
     }

@@ -528,14 +528,19 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 .find(|p| matches!(p, MessagePart::Checklist { .. }))
             {
                 *existing = items.clone();
-                // An absent explanation is "this provider sends none"
-                // (both Claude paths) rather than "clear the last one", so
-                // a Claude replacement must not blank Codex's prose. In
-                // practice one run is one provider; the rule costs nothing
-                // and removes the question.
-                if explanation.is_some() {
-                    *e = explanation.clone();
-                }
+                // Assigned UNCONDITIONALLY, including to `None`. The
+                // explanation belongs to the snapshot that carried it: it
+                // reads as the rationale for the change on screen beside it,
+                // so keeping the previous one alive next to a newer plan
+                // states a reason the agent did not give for it.
+                //
+                // A run is one provider, so there is no Claude replacement to
+                // blank a Codex explanation — and if there were, clearing is
+                // still the honest answer. Every observed `turn/plan/updated`
+                // carried one (4 of 4, `run4-codex-plan.jsonl`), so this is
+                // the unobserved case written by hand per
+                // `.agents/rules/optional-wire-fields.md`.
+                *e = explanation.clone();
             } else {
                 out.push(MessagePart::Checklist {
                     id: CHECKLIST_PART_ID.to_owned(),
@@ -1597,9 +1602,15 @@ mod tests {
     }
 
     #[test]
-    fn a_claude_replacement_does_not_blank_an_explanation() {
-        // Only Codex sends one. An absent explanation is "this provider sends
-        // none", never "clear the last one".
+    fn a_replacement_without_an_explanation_clears_the_previous_one() {
+        // The explanation belongs to the snapshot that carried it: it reads as
+        // the rationale for the plan shown beside it, so keeping the previous
+        // one alive next to newer items states a reason the agent did not give
+        // for them.
+        //
+        // Every observed `turn/plan/updated` carried one (4 of 4,
+        // `run4-codex-plan.jsonl`), so this is the unobserved case written by
+        // hand per `.agents/rules/optional-wire-fields.md`.
         let mut parts = Vec::new();
         fold_event_into_parts(
             &mut parts,
@@ -1622,7 +1633,10 @@ mod tests {
         let MessagePart::Checklist { explanation, .. } = &parts[0] else {
             panic!("expected a checklist");
         };
-        assert_eq!(explanation.as_deref(), Some("Moved to the line count."));
+        assert_eq!(
+            explanation, &None,
+            "stale rationale must not survive beside a newer plan"
+        );
     }
 
     #[test]
