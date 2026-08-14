@@ -18,8 +18,9 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use gpui::{
-    App, Context, Entity, FocusHandle, IntoElement, KeyBinding, KeyDownEvent, MouseButton, Render,
-    ScrollDelta, SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
+    App, Context, Entity, FocusHandle, IntoElement, KeyBinding, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta, SharedString,
+    Subscription, Task, Window, actions, div, prelude::*, px,
 };
 
 use comet_proto::{ServerRef, TerminalEvent, TerminalSession};
@@ -30,10 +31,10 @@ use crate::settings::{TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT};
 use crate::state::{AppState, ServerClient};
 use crate::theme::Theme;
 
-use super::emulator::{CellSnapshot, CursorSnapshot, Emulator};
+use super::emulator::{CellSnapshot, CursorSnapshot, Emulator, GridPoint, SelectionType, Side};
 use super::view::{
-    COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, TerminalElement, keystroke_bytes, paste_bytes,
-    terminal_bg,
+    COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, SELECTION_DRAG_THRESHOLD, TerminalElement,
+    cell_at, keystroke_bytes, paste_bytes, terminal_bg,
 };
 
 /// Fixed tab width — drag-reorder math stays analytic.
@@ -142,6 +143,16 @@ pub fn shell_title(shell: &str) -> String {
     }
 }
 
+/// Resolve a tab label from the running program's OSC 0/2 title, falling
+/// back to the stable sequential label when the title is absent or blank.
+fn resolved_tab_title(osc_title: Option<&str>, fallback: &str) -> String {
+    osc_title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
 fn decode_base64(data: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
         .decode(data)
@@ -164,6 +175,38 @@ fn encode_base64(bytes: &[u8]) -> String {
 pub struct GridSnapshot {
     pub lines: Vec<Vec<CellSnapshot>>,
     pub cursor: Option<CursorSnapshot>,
+}
+
+/// Where the grid landed this frame, in window coordinates.
+///
+/// Reported by element prepaint because that is the only place the measured
+/// font metrics exist. Mouse events arrive on the wrapping div in window
+/// space, so mapping a pointer to a cell needs the glyph origin and the cell
+/// size the *current* frame used — a stale one puts the selection a row off
+/// after a resize.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridGeometry {
+    /// Top-left of the first glyph (bounds origin plus padding).
+    pub origin: gpui::Point<Pixels>,
+    pub cell_w: f32,
+    pub line_h: f32,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// An in-flight left-button gesture.
+///
+/// A press alone does not select. It arms this, and only pointer travel past
+/// [`SELECTION_DRAG_THRESHOLD`] promotes it to a real selection — otherwise the
+/// click that focuses the panel would leave a one-cell selection behind
+/// whenever the hand moves a pixel.
+#[derive(Debug, Clone, Copy)]
+struct SelectionDrag {
+    /// Press position, in window space: both the threshold origin and the
+    /// selection's anchor, so the selection starts where the press landed
+    /// rather than where the threshold happened to trip.
+    origin: gpui::Point<Pixels>,
+    armed: bool,
 }
 
 struct TerminalTab {
@@ -245,6 +288,10 @@ pub struct TerminalPanel {
     tab_seq: u64,
     drag: Option<DragState>,
     last_selected: Option<ServerRef>,
+    /// Last reported grid placement; `None` until the first prepaint.
+    geometry: Option<GridGeometry>,
+    /// Left-button gesture in flight, if any.
+    selection_drag: Option<SelectionDrag>,
     _observe: Subscription,
 }
 
@@ -259,6 +306,8 @@ impl TerminalPanel {
             tab_seq: 0,
             drag: None,
             last_selected: None,
+            geometry: None,
+            selection_drag: None,
             _observe: observe,
         }
     }
@@ -277,6 +326,13 @@ impl TerminalPanel {
         cx.notify();
     }
 
+    /// A tab's display label: the live OSC 0/2 title when the running
+    /// program set one (shells title themselves with the cwd / running
+    /// command — the contextual name, user request), else the fixed
+    /// "Terminal N".
+    fn display_title(tab: &TerminalTab) -> SharedString {
+        resolved_tab_title(tab.emulator.title(), tab.title.as_ref()).into()
+    }
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
         let (selected, unavailable) = {
             let state = self.state.read(cx);
@@ -666,6 +722,16 @@ impl TerminalPanel {
             cx.stop_propagation();
             return;
         }
+        // Copy: Cmd+C (macOS) / Ctrl+Shift+C. Only swallowed when it actually
+        // copied — so Ctrl+Shift+C with nothing selected still falls through
+        // to the interrupt, and plain Ctrl+C (no shift) never reaches here.
+        if ks.key == "c"
+            && (mods.platform || (mods.control && mods.shift))
+            && self.copy_selection(cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
         let app_cursor = self
             .active_tab(cx)
             .map(|tab| tab.emulator.app_cursor_mode())
@@ -678,9 +744,14 @@ impl TerminalPanel {
 
     // ---- grid metrics / element hooks ----
 
-    /// Called from element prepaint with the measured cols×rows. Resizes the
-    /// emulator immediately; the `ResizeTerminal` RPC debounces 80 ms.
-    pub fn on_grid_metrics(&mut self, cols: u16, rows: u16, cx: &mut Context<Self>) {
+    /// Called from element prepaint with the frame's grid placement. Resizes
+    /// the emulator immediately; the `ResizeTerminal` RPC debounces 80 ms.
+    pub fn on_grid_metrics(&mut self, geometry: GridGeometry, cx: &mut Context<Self>) {
+        // Stash unconditionally, before the early returns below: pointer
+        // mapping needs the placement even on frames where nothing resized,
+        // which is almost all of them.
+        self.geometry = Some(geometry);
+        let (cols, rows) = (geometry.cols, geometry.rows);
         let Some(chat) = self.selected_chat(cx) else {
             return;
         };
@@ -740,6 +811,161 @@ impl TerminalPanel {
             lines: tab.emulator.lines(),
             cursor: tab.emulator.cursor(),
         })
+    }
+
+    // ---- selection ----
+
+    /// Run `f` against the active tab's emulator.
+    fn with_active_emulator<R>(
+        &mut self,
+        cx: &App,
+        f: impl FnOnce(&mut Emulator) -> R,
+    ) -> Option<R> {
+        let chat = self.selected_chat(cx)?;
+        let tabs = self.chats.get_mut(&chat)?;
+        let active = tabs.active;
+        tabs.tabs.get_mut(active).map(|tab| f(&mut tab.emulator))
+    }
+
+    /// Window position → grid point, using this frame's placement. `None`
+    /// before the first prepaint, or when no tab is active.
+    fn grid_point_at(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        cx: &App,
+    ) -> Option<(GridPoint, Side)> {
+        let geometry = self.geometry?;
+        let hit = cell_at(
+            f32::from(position.x - geometry.origin.x),
+            f32::from(position.y - geometry.origin.y),
+            geometry.cell_w,
+            geometry.line_h,
+            geometry.cols as usize,
+            geometry.rows as usize,
+        );
+        let point = self.with_active_emulator(cx, |emu| emu.grid_point(hit.row, hit.col))?;
+        Some((point, hit.side))
+    }
+
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        let Some((point, side)) = self.grid_point_at(event.position, cx) else {
+            return;
+        };
+        // Click count picks the granularity, the same mapping every terminal
+        // uses: drag, word, line.
+        let ty = match event.click_count {
+            0 => return,
+            1 => SelectionType::Simple,
+            2 => SelectionType::Semantic,
+            _ => SelectionType::Lines,
+        };
+        let shift = event.modifiers.shift;
+        if ty == SelectionType::Simple {
+            // Shift+click extends an existing selection instead of replacing
+            // it — the one gesture that reaches text off the bottom of a long
+            // drag without redoing the whole thing.
+            let extended = shift
+                && self
+                    .with_active_emulator(cx, |emu| {
+                        let extend = emu.has_selection();
+                        if extend {
+                            emu.update_selection(point, side);
+                        }
+                        extend
+                    })
+                    .unwrap_or(false);
+            if extended {
+                self.selection_drag = Some(SelectionDrag {
+                    origin: event.position,
+                    armed: true,
+                });
+                cx.notify();
+                return;
+            }
+            // A plain press clears and arms; the selection itself only begins
+            // once the pointer travels far enough to mean it.
+            self.with_active_emulator(cx, |emu| emu.clear_selection());
+            self.selection_drag = Some(SelectionDrag {
+                origin: event.position,
+                armed: false,
+            });
+        } else {
+            // Word and line selections are complete on the press, so they need
+            // no threshold — but keep the drag live so the pointer can extend
+            // them at that granularity.
+            self.with_active_emulator(cx, |emu| emu.start_selection(ty, point, side));
+            self.selection_drag = Some(SelectionDrag {
+                origin: event.position,
+                armed: true,
+            });
+        }
+        cx.notify();
+    }
+
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging() {
+            return;
+        }
+        let Some(drag) = self.selection_drag else {
+            return;
+        };
+        if !drag.armed {
+            let dx = f32::from(event.position.x - drag.origin.x);
+            let dy = f32::from(event.position.y - drag.origin.y);
+            if dx.hypot(dy) < SELECTION_DRAG_THRESHOLD {
+                return;
+            }
+            // Threshold tripped: anchor at the *press*, not here, so the
+            // selection covers the whole gesture.
+            let Some((anchor, side)) = self.grid_point_at(drag.origin, cx) else {
+                return;
+            };
+            self.with_active_emulator(cx, |emu| {
+                emu.start_selection(SelectionType::Simple, anchor, side)
+            });
+            self.selection_drag = Some(SelectionDrag {
+                armed: true,
+                ..drag
+            });
+        }
+        let Some((point, side)) = self.grid_point_at(event.position, cx) else {
+            return;
+        };
+        self.with_active_emulator(cx, |emu| emu.update_selection(point, side));
+        cx.notify();
+    }
+
+    fn on_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.selection_drag = None;
+    }
+
+    /// Copy the selection. Returns whether anything was copied, so the caller
+    /// can decide whether to swallow the keystroke.
+    fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self
+            .with_active_emulator(cx, |emu| emu.selection_text())
+            .flatten()
+        else {
+            return false;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        true
     }
 
     fn scroll_active(&mut self, delta_lines: i32, cx: &mut Context<Self>) {
@@ -864,9 +1090,10 @@ impl TerminalPanel {
                     .map(|(ix, tab)| {
                         let selected = ix == active;
                         let key = tab.key;
-                        // Fixed sequential label (comet: "Terminal N") — the
-                        // OSC title never replaces it.
-                        let title = tab.title.clone();
+                        // Contextual label (user request): the OSC title —
+                        // the shell's own cwd/command name — wins over the
+                        // fixed "Terminal N" fallback.
+                        let title = Self::display_title(tab);
                         let exited = tab.exited.is_some();
                         (ix, key, title, selected, exited)
                     })
@@ -1131,12 +1358,14 @@ impl Render for TerminalPanel {
                     .key_context("Terminal")
                     .track_focus(&self.focus_handle)
                     .on_key_down(cx.listener(Self::on_key_down))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window: &mut Window, cx| {
-                            window.focus(&this.focus_handle, cx);
-                        }),
-                    )
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    .on_mouse_move(cx.listener(Self::on_mouse_move))
+                    // Bound on the window, not the element: a drag that ends
+                    // outside the panel still has to end the gesture, or the
+                    // next unrelated pointer move keeps extending a selection
+                    // the user let go of.
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
                         let lines = match event.delta {
                             ScrollDelta::Lines(delta) => delta.y,
@@ -1256,6 +1485,16 @@ mod tests {
         assert_eq!(shell_title("C:\\Windows\\System32\\cmd.exe"), "cmd.exe");
         assert_eq!(shell_title("bash"), "bash");
         assert_eq!(shell_title(""), "terminal");
+    }
+
+    #[test]
+    fn tab_title_prefers_a_nonempty_osc_title() {
+        assert_eq!(
+            resolved_tab_title(Some("  cargo test  "), "Terminal 1"),
+            "cargo test"
+        );
+        assert_eq!(resolved_tab_title(Some("   "), "Terminal 1"), "Terminal 1");
+        assert_eq!(resolved_tab_title(None, "Terminal 1"), "Terminal 1");
     }
 
     #[test]
