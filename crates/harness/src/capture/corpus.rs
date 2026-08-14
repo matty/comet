@@ -200,6 +200,61 @@ struct PlaceholderDefinition {
     kind: String,
 }
 
+/// One promoted frame, addressed by the scenario directory that holds it.
+///
+/// Replaces claim-ID indirection: a test names the evidence it rests on
+/// directly, so a re-recording that moves or renumbers a frame fails that test
+/// by name instead of passing an index check that proves only that a comment
+/// still exists.
+#[derive(Clone, Debug)]
+pub struct Frame {
+    pub channel: Channel,
+    pub payload: String,
+}
+
+/// Read one frame from a corpus rooted anywhere.
+///
+/// Panics rather than returning an error: every caller is a test that would
+/// immediately unwrap, and the panic message carries the scenario and sequence,
+/// which is the whole triage path.
+pub fn frame(corpus_root: &Path, scenario: &str, sequence: u64) -> Frame {
+    let events_path = corpus_root.join(scenario).join("events.jsonl");
+    let events = std::fs::read_to_string(&events_path)
+        .unwrap_or_else(|error| panic!("corpus {scenario} is unreadable: {error}"));
+
+    for line in events.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: Value = serde_json::from_str(line)
+            .unwrap_or_else(|error| panic!("corpus {scenario} has an invalid event: {error}"));
+        if event["sequence"].as_u64() != Some(sequence) {
+            continue;
+        }
+        let channel: Channel = serde_json::from_value(event["channel"].clone())
+            .unwrap_or_else(|_| panic!("corpus {scenario} frame {sequence} has no known channel"));
+        let payload = event["payload"]
+            .as_str()
+            .unwrap_or_else(|| panic!("corpus {scenario} frame {sequence} has no payload"))
+            .to_owned();
+        return Frame { channel, payload };
+    }
+
+    panic!("corpus {scenario} has no frame {sequence}");
+}
+
+/// [`frame`] against this crate's own corpus.
+///
+/// Kept separate from [`frame`] so the reader can move to its own crate later
+/// while this path stays anchored to `comet-harness`.
+pub fn corpus_frame(scenario: &str, sequence: u64) -> Frame {
+    frame(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
+        scenario,
+        sequence,
+    )
+}
+
 /// Validate every claim in a checked-in provider corpus without stopping at the first absent
 /// evidence file. Index-shape errors are global; artifact errors are returned once per claim.
 pub fn validate_corpus(corpus_root: &Path) -> Vec<CorpusError> {
@@ -902,4 +957,45 @@ fn validate_placeholder_definitions(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    /// Addressing a frame by scenario and sequence returns that frame's exact
+    /// payload bytes and its channel.
+    #[test]
+    fn a_frame_is_addressed_by_scenario_and_sequence() {
+        let found = corpus_frame("claude/2.1.228/model-discovery", 2);
+        assert_eq!(found.channel, Channel::Stdout);
+        assert!(
+            found.payload.contains("control_response"),
+            "the model-discovery reply frame: {}",
+            found.payload
+        );
+    }
+
+    /// A stdin frame is reachable too, so input surface stays addressable.
+    #[test]
+    fn a_stdin_frame_is_addressable() {
+        let found = corpus_frame("claude/2.1.228/attachment", 1);
+        assert_eq!(found.channel, Channel::Stdin);
+    }
+
+    /// A missing sequence names the scenario and the sequence, so triage starts
+    /// at the frame rather than at a grep.
+    #[test]
+    #[should_panic(expected = "claude/2.1.228/model-discovery has no frame 9999")]
+    fn a_missing_sequence_names_the_scenario_and_sequence() {
+        corpus_frame("claude/2.1.228/model-discovery", 9999);
+    }
+
+    /// A missing scenario directory fails by name too, which is what catches a
+    /// re-recording that moved a scenario.
+    #[test]
+    #[should_panic(expected = "claude/9.9.9/nope")]
+    fn a_missing_scenario_names_itself() {
+        corpus_frame("claude/9.9.9/nope", 1);
+    }
 }
