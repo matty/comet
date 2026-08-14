@@ -114,14 +114,16 @@ pub enum ShortcutId {
     ToggleChanges,
     ToggleTerminal,
     FocusSearch,
+    NewSession,
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 4] = [
+    pub const ALL: [ShortcutId; 5] = [
         ShortcutId::ToggleSidebar,
         ShortcutId::ToggleChanges,
         ShortcutId::ToggleTerminal,
         ShortcutId::FocusSearch,
+        ShortcutId::NewSession,
     ];
 
     /// Row label (comet lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
@@ -131,6 +133,7 @@ impl ShortcutId {
             ShortcutId::ToggleChanges => "Toggle right sidebar",
             ShortcutId::ToggleTerminal => "Toggle terminal",
             ShortcutId::FocusSearch => "Focus sidebar search",
+            ShortcutId::NewSession => "New session",
         }
     }
 
@@ -140,6 +143,7 @@ impl ShortcutId {
             ShortcutId::ToggleChanges => "mod-b",
             ShortcutId::ToggleTerminal => "mod-j",
             ShortcutId::FocusSearch => "mod-p",
+            ShortcutId::NewSession => "mod-n",
         }
     }
 }
@@ -153,6 +157,7 @@ pub struct KeymapConfig {
     pub toggle_changes: String,
     pub toggle_terminal: String,
     pub focus_search: String,
+    pub new_session: String,
 }
 
 impl Default for KeymapConfig {
@@ -162,6 +167,7 @@ impl Default for KeymapConfig {
             toggle_changes: ShortcutId::ToggleChanges.default_combo().into(),
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
             focus_search: ShortcutId::FocusSearch.default_combo().into(),
+            new_session: ShortcutId::NewSession.default_combo().into(),
         }
     }
 }
@@ -173,6 +179,7 @@ impl KeymapConfig {
             ShortcutId::ToggleChanges => &self.toggle_changes,
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
             ShortcutId::FocusSearch => &self.focus_search,
+            ShortcutId::NewSession => &self.new_session,
         }
     }
 
@@ -182,6 +189,7 @@ impl KeymapConfig {
             ShortcutId::ToggleChanges => self.toggle_changes = combo,
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
             ShortcutId::FocusSearch => self.focus_search = combo,
+            ShortcutId::NewSession => self.new_session = combo,
         }
     }
 
@@ -463,6 +471,20 @@ mod tests {
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
         keymap.reset(ShortcutId::ToggleSidebar);
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-s");
+    }
+
+    #[test]
+    fn new_session_is_a_defaulted_rebindable_shortcut() {
+        let legacy: KeymapConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.get(ShortcutId::NewSession), "mod-n");
+        assert!(ShortcutId::ALL.contains(&ShortcutId::FocusSearch));
+        assert!(ShortcutId::ALL.contains(&ShortcutId::NewSession));
+
+        let mut changed = legacy;
+        changed.set(ShortcutId::NewSession, "mod-shift-n".into());
+        assert_eq!(changed.get(ShortcutId::NewSession), "mod-shift-n");
+        changed.reset(ShortcutId::NewSession);
+        assert_eq!(changed.get(ShortcutId::NewSession), "mod-n");
     }
 
     #[test]

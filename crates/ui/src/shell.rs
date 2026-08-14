@@ -58,7 +58,13 @@ use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
 actions!(
     shell,
-    [ToggleSidebar, ToggleChanges, AddSpacePalette, FocusSearch]
+    [
+        ToggleSidebar,
+        ToggleChanges,
+        AddSpacePalette,
+        FocusSearch,
+        NewSession
+    ]
 );
 
 // ---------------------------------------------------------------------------
@@ -148,23 +154,18 @@ fn windows_caption_font_for_build(build: u32) -> &'static str {
 /// (Re-)apply the whole app keymap: clears every binding, restores the composer
 /// map, then binds the customizable shortcuts from `keymap` (feature-inventory
 /// §1.4). Invalid persisted combos fall back to that shortcut's default.
-pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
-    fn valid_or_default(combo: &str, fallback: &str) -> String {
-        let candidate = platform_combo(combo);
-        if Keystroke::parse(&candidate).is_ok() {
-            candidate
-        } else {
-            tracing::warn!(%combo, "unparseable shortcut combo; using default");
-            platform_combo(fallback)
-        }
+fn valid_or_default(combo: &str, fallback: &str) -> String {
+    let candidate = platform_combo(combo);
+    if Keystroke::parse(&candidate).is_ok() {
+        candidate
+    } else {
+        tracing::warn!(%combo, "unparseable shortcut combo; using default");
+        platform_combo(fallback)
     }
-    cx.clear_key_bindings();
-    crate::composer::init(cx);
-    // Fixed app-level shortcuts (⌘Q quit, ⌘W close, ⌘M minimize, ⌘H hide) —
-    // these back the native menu key equivalents and must survive keymap
-    // re-application.
-    crate::app_menus::bind_keys(cx);
-    cx.bind_keys([
+}
+
+fn shell_key_bindings(keymap: &KeymapConfig) -> Vec<KeyBinding> {
+    vec![
         KeyBinding::new(
             &valid_or_default(&keymap.toggle_sidebar, "mod-s"),
             ToggleSidebar,
@@ -185,10 +186,25 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
             FocusSearch,
             None,
         ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.new_session, "mod-n"),
+            NewSession,
+            None,
+        ),
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
         // bar); pressing it again dismisses.
         KeyBinding::new(&platform_combo("mod-k"), AddSpacePalette, None),
-    ]);
+    ]
+}
+
+pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
+    cx.clear_key_bindings();
+    crate::composer::init(cx);
+    // Fixed app-level shortcuts (⌘Q quit, ⌘W close, ⌘M minimize, ⌘H hide) —
+    // these back the native menu key equivalents and must survive keymap
+    // re-application.
+    crate::app_menus::bind_keys(cx);
+    cx.bind_keys(shell_key_bindings(keymap));
 }
 
 /// The settings sections (feature-inventory §1.5 routes).
@@ -4120,6 +4136,10 @@ impl Render for Shell {
                     this.focus_search(window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &NewSession, window, cx| {
+                this.set_route(Route::Chat, cx);
+                this.start_session_from_sidebar(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleChanges, _, cx| {
                 if matches!(this.route, Route::Chat) {
                     this.toggle_right_pane(cx)
@@ -4377,6 +4397,7 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Action as _;
 
     fn space_ids(ids: &[&str]) -> Vec<String> {
         ids.iter().map(|id| (*id).to_string()).collect()
@@ -4388,6 +4409,23 @@ mod tests {
             new_session_target(&SidebarScope::Space("s2".into()), &space_ids(&["s1", "s2"])),
             NewSessionTarget::Space("s2".into()),
             "a scoped sidebar already answers the question the picker would ask"
+        );
+    }
+
+    #[test]
+    fn shell_key_bindings_include_new_session() {
+        let bindings = shell_key_bindings(&KeymapConfig::default());
+        let binding = bindings
+            .iter()
+            .find(|binding| binding.action().name() == NewSession.name())
+            .expect("NewSession binding");
+        assert_eq!(
+            binding
+                .keystrokes()
+                .iter()
+                .map(|key| key.inner().clone())
+                .collect::<Vec<_>>(),
+            vec![Keystroke::parse(&platform_combo("mod-n")).unwrap()]
         );
     }
 
