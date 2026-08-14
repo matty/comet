@@ -35,9 +35,10 @@ independently under the contradiction policy.
 
 ## Residual scenarios
 
-- `codex-steer-reply-before-completion` is backed by a successful sanitized
-  `codex-cli 0.147.0` capture. The request, matching successful reply, and terminal
-  completion are literal frames in the promoted artifact.
+- The bounded steer sequence is backed by a successful sanitized `codex-cli 0.147.0`
+  capture. `codex/0.147.0/steer` frames 19, 20 and 56 are the request, its matching
+  successful reply, and the terminal completion, as literal frames in the promoted
+  artifact.
 - Ordinary approval stopped after its single permitted attempt when the run emitted
   one failed command execution instead of the reviewed multi-command ordering.
   Its `codex-cli 0.147.0` partial remains ignored and cannot back an assertion.
