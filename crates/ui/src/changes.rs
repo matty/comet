@@ -1817,11 +1817,14 @@ rename to new_name.rs
         file.max_line = 9999;
         assert!(gutter_width(&file) > GUTTER_WIDTH);
         file.max_line = 27404;
-        assert!(gutter_width(&file) > gutter_width(&{
-            let mut f = file.clone();
-            f.max_line = 9999;
-            f
-        }));
+        assert!(
+            gutter_width(&file)
+                > gutter_width(&{
+                    let mut f = file.clone();
+                    f.max_line = 9999;
+                    f
+                })
+        );
 
         // Truncation refits the gutter to what actually renders: the first
         // 3 lines are ctx(1,1) / del(2,·) / add(·,2) — max line 2.
