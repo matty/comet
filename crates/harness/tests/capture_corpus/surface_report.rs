@@ -18,8 +18,8 @@ use comet_harness::capture::{Direction, FieldObservation, observe_corpus};
 
 use super::consumed::{consumed_fields, decode_sources};
 use super::dispositions::{
-    Disposition, DispositionFile, SCHEMA_VERSION, State, dispositions_path, known_debt_rows, load,
-    validate,
+    Disposition, DispositionFile, SCHEMA_VERSION, State, dispositions_path, known_debt_rows,
+    leaf_name, load, validate,
 };
 
 /// Consumers written by the seed rather than by a person. Named so the report
@@ -49,12 +49,10 @@ fn updating() -> bool {
     std::env::var_os("COMET_UPDATE_SURFACE").is_some()
 }
 
-/// The last real segment of a field path: `.a.b[].c` is `c`.
-fn leaf_name(path: &str) -> &str {
-    path.rsplit('.')
-        .find(|segment| !segment.is_empty() && *segment != "{}" && !segment.starts_with("[]"))
-        .map(|segment| segment.trim_end_matches("[]"))
-        .unwrap_or(path)
+/// Adopting fields the corpus has never shown before, which is deliberately a
+/// second key: see the arrivals check in the regeneration test.
+fn adopting() -> bool {
+    std::env::var_os("COMET_ADOPT_FIELDS").is_some()
 }
 
 fn observed_keys(observations: &[FieldObservation]) -> BTreeSet<(String, Direction, String)> {
@@ -93,6 +91,7 @@ fn seed(observations: &[FieldObservation], consumed: &BTreeSet<String>) -> Dispo
                 reason: None,
                 debt: None,
                 how: None,
+                derivation_note: None,
                 domains: Vec::new(),
             }
         })
@@ -330,7 +329,38 @@ fn the_disposition_record_and_the_reports_are_current() {
     if updating() {
         let fresh = seed(&observations, &consumed);
         let merged = match load(&path) {
-            Ok(existing) => merge(&existing, fresh),
+            Ok(existing) => {
+                // Adopting new surface is a separate decision from refreshing
+                // the report. Without this the fix for "a field has no
+                // disposition" is the command that silences it, and a CLI
+                // version's forty new fields join a backlog of hundreds with
+                // nobody having read what arrived.
+                let known: BTreeSet<(String, Direction, String)> = existing
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.provider.clone(), entry.direction, entry.path.clone()))
+                    .collect();
+                let arrivals: Vec<String> = fresh
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        !known.contains(&(
+                            entry.provider.clone(),
+                            entry.direction,
+                            entry.path.clone(),
+                        ))
+                    })
+                    .map(|entry| format!("{} {:?} {}", entry.provider, entry.direction, entry.path))
+                    .collect();
+                assert!(
+                    arrivals.is_empty() || adopting(),
+                    "{} field(s) are new to the corpus. Read them, then re-run with \
+                     COMET_ADOPT_FIELDS=1 to record them as unknown:\n  {}",
+                    arrivals.len(),
+                    arrivals.join("\n  ")
+                );
+                merge(&existing, fresh)
+            }
             Err(_) => fresh,
         };
         let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({
@@ -388,6 +418,7 @@ fn entry_json(entry: &Disposition) -> serde_json::Value {
         ("reason", &entry.reason),
         ("debt", &entry.debt),
         ("how", &entry.how),
+        ("derivation_note", &entry.derivation_note),
     ] {
         if let Some(held) = held {
             object.insert(key.to_owned(), serde_json::Value::String(held.clone()));
@@ -456,6 +487,7 @@ fn the_disposition_record_keeps_its_own_rules() {
         &dispositions,
         &observed_keys(&observations),
         &known_debt_rows(&repo_root()).unwrap(),
+        &consumed_fields(&decode_sources(&crate_root()).unwrap()).unwrap(),
     );
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }

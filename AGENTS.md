@@ -118,6 +118,13 @@ Regenerate both after promoting a capture:
 $env:COMET_UPDATE_SURFACE = "1"; cargo test -p comet-harness --test capture_corpus surface_report
 ```
 
+Fields the corpus has never shown before are **not** adopted by that run. It fails and lists
+them; add `$env:COMET_ADOPT_FIELDS = "1"` once you have read them. Two keys on purpose — with
+one, the fix for "this field has no disposition" would be the command that silences it. The
+same rule catches the other direction: a `deferred` or `not-applicable` field the decode sources
+have since started naming fails until somebody closes it or records why the name match is
+coincidental.
+
 **The map's blind spot is absence.** It reports fields that are present but unread; a capability
 no capture ever exercised cannot appear in it at all. Procedure is in
 `docs/testing/provider-captures.md`.

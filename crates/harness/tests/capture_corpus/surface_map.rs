@@ -283,6 +283,50 @@ fn the_promoted_corpus_yields_both_directions_and_no_data_shaped_field_names() {
     );
 }
 
+/// Break caught (PR #58 review): a structured frame that will not parse is
+/// skipped, so the map looks complete while quietly missing that frame's
+/// fields. Only stderr may carry plain text.
+#[test]
+fn an_unparseable_structured_frame_is_an_error_and_stderr_text_is_not() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = write_scenario(
+        root.path(),
+        "claude",
+        "2.1.229",
+        "checklist",
+        json!([]),
+        &[(1, "stdout", json!({"kept": "yes"}))],
+    );
+    // stderr is allowed to be prose; the walk continues past it.
+    let mut events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+    events.push_str(
+        &serde_json::to_string(&json!({
+            "sequence": 2, "channel": "stderr", "payload": "a plain diagnostic line",
+        }))
+        .unwrap(),
+    );
+    events.push('\n');
+    std::fs::write(directory.join("events.jsonl"), &events).unwrap();
+    assert!(
+        observe_corpus(root.path()).is_ok(),
+        "stderr prose must not stop the walk"
+    );
+
+    // stdout carrying the same prose must not.
+    events.push_str(
+        &serde_json::to_string(&json!({
+            "sequence": 3, "channel": "stdout", "payload": "not json at all",
+        }))
+        .unwrap(),
+    );
+    events.push('\n');
+    std::fs::write(directory.join("events.jsonl"), events).unwrap();
+    assert!(
+        observe_corpus(root.path()).is_err(),
+        "an unparseable stdout frame silently vanished from the inventory"
+    );
+}
+
 /// Break caught: the walker silently reports an empty inventory when the
 /// corpus root is wrong, which reads as "nothing unconsumed" - the most
 /// dangerous possible false negative for a map whose job is finding gaps.

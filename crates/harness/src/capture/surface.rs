@@ -137,12 +137,21 @@ pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, Surfa
                 Some("stdin") => Direction::ToProvider,
                 _ => Direction::FromProvider,
             };
-            // A stderr frame is allowed to be plain text; it carries no fields.
-            let Some(payload) = event["payload"]
+            // Only stderr is allowed to be plain text. A structured frame that
+            // will not parse must stop the walk: skipping it would produce a
+            // map that looks complete and is quietly missing a frame's fields,
+            // which is the failure this module refuses to have.
+            let payload = match event["payload"]
                 .as_str()
                 .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
-            else {
-                continue;
+            {
+                Some(payload) => payload,
+                None if event["channel"].as_str() == Some("stderr") => continue,
+                None => {
+                    return Err(SurfaceError::UnreadableEvents {
+                        scenario: scenario.label.clone(),
+                    });
+                }
             };
             let mut visit = Visit {
                 inventory: &mut inventory,
@@ -173,9 +182,12 @@ fn promoted_scenarios(corpus_root: &Path) -> Result<Vec<PromotedScenario>, Surfa
     let mut scenarios = Vec::new();
     for provider in sorted_directories(corpus_root).ok_or_else(unreadable)? {
         let provider_name = file_name(&provider);
-        for version in sorted_directories(&provider).unwrap_or_default() {
+        // An unreadable subtree is an error, never an empty one. Treating it as
+        // empty would drop every field beneath it from a map whose whole job is
+        // saying what the evidence contains.
+        for version in sorted_directories(&provider).ok_or_else(unreadable)? {
             let version_name = file_name(&version);
-            for scenario in sorted_directories(&version).unwrap_or_default() {
+            for scenario in sorted_directories(&version).ok_or_else(unreadable)? {
                 if !scenario.join("events.jsonl").is_file() {
                     continue;
                 }

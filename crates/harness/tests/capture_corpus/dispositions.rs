@@ -51,6 +51,11 @@ pub(super) struct Disposition {
     /// difference between a catalogue and guidance.
     #[serde(default)]
     pub(super) how: Option<String>,
+    /// Why a hand decision stands even though the decode sources now name this
+    /// field. Records a coincidental name match (`command`, `id`, `message` are
+    /// common words) so the disagreement is answered once instead of re-argued.
+    #[serde(default)]
+    pub(super) derivation_note: Option<String>,
     #[serde(default)]
     pub(super) domains: Vec<String>,
 }
@@ -116,11 +121,20 @@ pub(super) fn known_debt_rows(repo_root: &Path) -> Result<BTreeSet<String>, Stri
     Ok(rows)
 }
 
+/// The last real segment of a field path: `.a.b[].c` is `c`.
+pub(super) fn leaf_name(path: &str) -> &str {
+    path.rsplit('.')
+        .find(|segment| !segment.is_empty() && *segment != "{}" && !segment.starts_with("[]"))
+        .map(|segment| segment.trim_end_matches("[]"))
+        .unwrap_or(path)
+}
+
 /// Every rule the record has to keep, as messages naming the offending entry.
 pub(super) fn validate(
     file: &DispositionFile,
     observed: &BTreeSet<(String, Direction, String)>,
     debt_rows: &BTreeSet<String>,
+    consumed: &BTreeSet<String>,
 ) -> Vec<String> {
     let mut problems = Vec::new();
     let mut seen: BTreeMap<(&str, Direction, &str), usize> = BTreeMap::new();
@@ -182,6 +196,21 @@ pub(super) fn validate(
                 "{at}: no promoted evidence observes this field; the record is stale"
             ));
         }
+
+        // A hand decision wins over the derivation, but it is not allowed to
+        // ignore it. A field parked as deferred or not-applicable that the
+        // decode sources have since started naming is either done, or a
+        // coincidental name match somebody should say so about once.
+        if matches!(entry.state, State::Deferred | State::NotApplicable)
+            && consumed.contains(leaf_name(&entry.path))
+            && entry.derivation_note.is_none()
+        {
+            problems.push(format!(
+                "{at}: the decode sources now name `{}` - close it, or add a derivation_note \
+                 saying why the match is coincidental",
+                leaf_name(&entry.path)
+            ));
+        }
     }
 
     for ((provider, direction, path), count) in seen {
@@ -232,7 +261,12 @@ mod tests {
             "provider": "codex", "direction": "from-provider", "path": ".upgrade", "state": "deferred",
             "debt": "D999", "how": "read it onto Notice",
         }]));
-        let problems = validate(&missing_row, &observed(&[("codex", ".upgrade")]), &debt());
+        let problems = validate(
+            &missing_row,
+            &observed(&[("codex", ".upgrade")]),
+            &debt(),
+            &BTreeSet::new(),
+        );
         assert!(
             problems
                 .iter()
@@ -243,7 +277,12 @@ mod tests {
         let no_how = file(serde_json::json!([{
             "provider": "codex", "direction": "from-provider", "path": ".upgrade", "state": "deferred", "debt": "D35",
         }]));
-        let problems = validate(&no_how, &observed(&[("codex", ".upgrade")]), &debt());
+        let problems = validate(
+            &no_how,
+            &observed(&[("codex", ".upgrade")]),
+            &debt(),
+            &BTreeSet::new(),
+        );
         assert!(
             problems.iter().any(|problem| problem.contains("how note")),
             "{problems:?}"
@@ -261,6 +300,7 @@ mod tests {
             &no_reason,
             &observed(&[("claude", ".stop_sequence")]),
             &debt(),
+            &BTreeSet::new(),
         );
         assert!(
             problems
@@ -277,6 +317,7 @@ mod tests {
             &with_debt,
             &observed(&[("claude", ".stop_sequence")]),
             &debt(),
+            &BTreeSet::new(),
         );
         assert!(
             problems
@@ -295,7 +336,12 @@ mod tests {
             "provider": "claude", "direction": "from-provider", "path": ".ttft_ms", "state": "unknown",
             "how": "we thought about this a lot",
         }]));
-        let problems = validate(&reasoned, &observed(&[("claude", ".ttft_ms")]), &debt());
+        let problems = validate(
+            &reasoned,
+            &observed(&[("claude", ".ttft_ms")]),
+            &debt(),
+            &BTreeSet::new(),
+        );
         assert!(
             problems
                 .iter()
@@ -311,7 +357,12 @@ mod tests {
         let bare = file(serde_json::json!([{
             "provider": "claude", "direction": "from-provider", "path": ".session_id", "state": "consumed",
         }]));
-        let problems = validate(&bare, &observed(&[("claude", ".session_id")]), &debt());
+        let problems = validate(
+            &bare,
+            &observed(&[("claude", ".session_id")]),
+            &debt(),
+            &BTreeSet::new(),
+        );
         assert!(
             problems
                 .iter()
@@ -327,7 +378,12 @@ mod tests {
         let stale = file(serde_json::json!([{
             "provider": "claude", "direction": "from-provider", "path": ".gone", "state": "unknown",
         }]));
-        let problems = validate(&stale, &observed(&[("claude", ".present")]), &debt());
+        let problems = validate(
+            &stale,
+            &observed(&[("claude", ".present")]),
+            &debt(),
+            &BTreeSet::new(),
+        );
         assert!(
             problems.iter().any(|problem| problem.contains("stale")),
             "{problems:?}"
@@ -342,7 +398,12 @@ mod tests {
             {"provider": "claude", "direction": "from-provider", "path": ".x", "state": "unknown"},
             {"provider": "claude", "direction": "from-provider", "path": ".x", "state": "unknown"},
         ]));
-        let problems = validate(&twice, &observed(&[("claude", ".x")]), &debt());
+        let problems = validate(
+            &twice,
+            &observed(&[("claude", ".x")]),
+            &debt(),
+            &BTreeSet::new(),
+        );
         assert!(
             problems
                 .iter()

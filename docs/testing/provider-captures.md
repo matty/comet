@@ -105,6 +105,17 @@ there on the next regeneration — as `unknown`, until somebody decides. The sui
 observed field has no entry at all, which is how a new CLI version's added field arrives as a
 test failure rather than as a bug.
 
+**Adopting new surface takes a second key**, deliberately:
+
+```powershell
+$env:COMET_ADOPT_FIELDS = "1"   # only alongside COMET_UPDATE_SURFACE, and only after reading them
+```
+
+Without it, regenerating **fails** and lists the fields the corpus has never shown before.
+Otherwise the fix for "this field has no disposition" would be the command that silences it, and
+a CLI version's forty new fields would join a backlog of hundreds with nobody having read what
+arrived.
+
 Two rules the record keeps, enforced by the same suite. A `deferred` entry names a **real** row
 in `docs/debt/README.md` and a `how` note saying what consuming it would touch; a
 `not-applicable` entry names a reason and **must not** carry a debt row, because the debt index
