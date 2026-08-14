@@ -1164,19 +1164,37 @@ class PullRequestTests(unittest.TestCase):
                         gh, "sync/upstream-2026-08-05", "main"
                     )
 
-    def test_create_pr_is_draft_against_original_target(self):
+    def test_create_pr_uses_utf8_body_file_against_original_target(self):
         run = self.sample_run()
-        title, body = sync.format_pr(run)
-        command = (
-            "pr", "create", "--draft", "--base", "main", "--head",
-            run.sync_branch, "--title", title, "--body", body,
-        )
-        gh = ScriptedGh({command: "https://example/pr/2\n"})
+        title = "Sync upstream commits (2026-08-05)"
+        body = "Résumé → " + "x" * 40_000
+        seen = {}
+
+        class BodyReadingGh:
+            def run(inner_self, *args, check=True):
+                self.assertIn("--body-file", args)
+                self.assertNotIn("--body", args)
+                body_path = Path(args[args.index("--body-file") + 1])
+                seen["path"] = body_path
+                seen["body"] = body_path.read_text(encoding="utf-8")
+                seen["command"] = args
+                return subprocess.CompletedProcess(
+                    args, 0, "https://example/pr/2\n", ""
+                )
+
         self.assertEqual(
-            sync.create_draft_pr(gh, run, title, body),
+            sync.create_draft_pr(BodyReadingGh(), run, title, body),
             "https://example/pr/2",
         )
-        self.assertEqual(gh.commands, [(command, True)])
+        self.assertEqual(seen["body"], body)
+        self.assertFalse(seen["path"].exists())
+        self.assertEqual(
+            seen["command"][:-1],
+            (
+                "pr", "create", "--draft", "--base", "main", "--head",
+                run.sync_branch, "--title", title, "--body-file",
+            ),
+        )
 
 
 class PendingStateTests(unittest.TestCase):
