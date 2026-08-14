@@ -138,16 +138,15 @@ pub fn classify_key(key: &str, cmd: bool, ctrl: bool) -> MenuKey {
 // ---------------------------------------------------------------------------
 
 /// The floating-menu surface (comet `.glass-surface` + `menuSurface`):
-/// `rounded-xl border border-white/[0.1] p-1` over the frosted glass tint.
-/// gpui has no backdrop blur at the pinned rev, so the glass
-/// (`oklch(0.33 0 0 / 34%)` over blurred dark content) is approximated with
-/// the near-opaque tone it composites to on the dark panels (~#161616), plus
-/// the same hairline + baked-in shadow.
+/// Corner radius of every floating card. The frost wrapper masks its backdrop
+/// blur to the same value, so the two must agree.
+pub const CARD_RADIUS: f32 = 12.0;
+
 pub fn popover_card(theme: &Theme) -> gpui::Div {
     let card = div()
         .border_1()
         .border_color(hairline(0.10))
-        .rounded(px(12.0))
+        .rounded(px(CARD_RADIUS))
         .shadow_lg()
         .p(px(4.0))
         .overflow_hidden()

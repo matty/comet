@@ -519,9 +519,6 @@ pub fn body_height(file: &FileDiff) -> f32 {
     body_height_with(file, &[], None)
 }
 
-/// Body height including the comment cards and open draft that hang inside
-/// it. Analytic like everything else here — it walks the same row model the
-/// renderer draws.
 pub fn body_height_with(
     file: &FileDiff,
     comments: &[DiffComment],
@@ -533,9 +530,8 @@ pub fn body_height_with(
         .sum()
 }
 
-/// Which side/number a rendered diff row hangs its comments off: deletions
-/// only exist in the pre-change file, everything else is cited against the
-/// post-change file (what the agent will actually edit).
+/// A deletion only exists in the pre-change file; everything else is cited
+/// against the post-change file, which is what the agent edits.
 pub fn line_anchor(line: &DiffLine) -> Option<(CommentSide, u32)> {
     match line.kind {
         LineKind::Meta => None,
@@ -640,13 +636,10 @@ pub fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value)
     }
 }
 
-/// Fingerprint of everything the row model folds in beyond the patch itself:
-/// the staged comments (ids are unique and bodies immutable once staged) and
-/// the open draft's anchor.
 fn comment_state_key(comments: &[DiffComment], draft: Option<&(String, CommentSide, u32)>) -> u64 {
     let mut parts: Vec<String> = comments.iter().map(|comment| comment.id.clone()).collect();
     if let Some((path, side, line)) = draft {
-        parts.push(format!("draft:{path}:{}:{line}", side_tag(*side)));
+        parts.push(format!("draft:{path}:{}:{line}", side.tag()));
     }
     let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
     hash64(&refs)
@@ -847,13 +840,11 @@ pub enum DiffRow {
         /// Flat index across the file's hunks — keys into the highlight slot.
         flat: u32,
     },
-    /// A staged comment card under its anchor line. `card` indexes the
-    /// file's own staged-comment slice, in staged order.
+    /// `card` indexes the file's own staged-comment slice, in staged order.
     CommentCard {
         file: u32,
         card: u32,
     },
-    /// The one open comment draft, under its anchor line.
     CommentDraft {
         file: u32,
     },
@@ -870,10 +861,8 @@ pub enum DiffRow {
 }
 
 impl DiffRow {
-    /// Analytic height of one steady-state row. `comments` is the same
-    /// per-file slice `body_rows` indexed `CommentCard::card` into.
-    /// `FoldingBody` stand-ins are height-animated, not analytic — they
-    /// report 0 here and never appear in a height sum.
+    /// `FoldingBody` is height-animated, so it reports 0 and never lands in a
+    /// height sum.
     fn height(self, comments: &[DiffComment]) -> f32 {
         match self {
             DiffRow::FileHeader { .. } => FILE_HEADER_HEIGHT,
@@ -891,15 +880,12 @@ impl DiffRow {
     }
 }
 
-/// Rows an expanded body contributes (notices + hunk headers + lines + pad),
-/// before comment cards — a capacity hint, not the exact count.
+/// Capacity hint only — comment cards are not counted.
 pub fn body_row_count(file: &FileDiff) -> usize {
     let lines: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
     file_notices(file).len() + file.hunks.len() + lines + 1
 }
 
-/// The steady-state body rows of one expanded file, with this file's staged
-/// comment cards (and the open draft) parked under the lines they anchor to.
 pub fn body_rows(
     file_ix: u32,
     file: &FileDiff,
@@ -981,8 +967,8 @@ pub fn body_rows(
 
 /// Flatten all files into rows + each file's row span (header at
 /// `range.start`, body rows after it). `collapsed(ix)` folds a file to just
-/// its header. `comments` is the whole staged set — each file takes its own
-/// path's slice; `draft` names the file its card hangs in by path.
+/// its header. `comments` is the whole staged set; each file takes its own
+/// path's slice.
 pub fn flatten_rows(
     files: &[FileDiff],
     comments: &[DiffComment],
@@ -1072,7 +1058,6 @@ fn promote_highlights_if_current(
     true
 }
 
-/// The diff line the pointer is on — the only line that draws a `+`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HoverRow {
     path: String,
@@ -1080,7 +1065,6 @@ struct HoverRow {
     line: u32,
 }
 
-/// A comment being written: where it will land plus the input holding it.
 struct CommentDraft {
     key: comet_proto::ServerRef,
     path: String,
@@ -1119,11 +1103,7 @@ pub struct Changes {
     /// The one open comment draft, if any. Only ever one — a second `+` click
     /// moves the card rather than stacking two half-written notes.
     draft: Option<CommentDraft>,
-    /// The diff line the pointer is on. Exactly one `+` exists at a time.
     hover: Option<HoverRow>,
-    /// Fingerprint of (staged comments, draft anchor) the current row
-    /// model was built with — [`Changes::sync_comment_rows`] splices bodies
-    /// only when it changes.
     comment_key: u64,
     _observe: Subscription,
 }
@@ -1267,8 +1247,6 @@ impl Changes {
         };
         let key = format!("{}:{}", diff.checkout_id, diff.checksum);
         if self.parsed.as_ref().is_some_and(|p| p.key == key) {
-            // Same patch, but the staged comments / draft may have
-            // moved under us (the composer purges comments on send).
             self.sync_comment_rows(cx);
             return;
         }
@@ -1341,8 +1319,31 @@ impl Changes {
         };
         let body = range.start + 1..range.end;
         let delta = new_body.len() as isize - body.len() as isize;
-        self.list.splice(body.clone(), new_body.len());
-        self.rows.splice(body, new_body);
+        // Only splice the rows that moved: `ListState::splice` clamps the
+        // scroll anchor to the range start when the anchored row is inside it,
+        // so replacing a whole body jumped the pane to the top of the file.
+        let (prefix, suffix) = {
+            let old = &self.rows[body.clone()];
+            let prefix = old
+                .iter()
+                .zip(&new_body)
+                .take_while(|(a, b)| a == b)
+                .count();
+            let suffix = old[prefix..]
+                .iter()
+                .rev()
+                .zip(new_body[prefix..].iter().rev())
+                .take_while(|(a, b)| a == b)
+                .count();
+            (prefix, suffix)
+        };
+        if delta == 0 && prefix + suffix >= body.len() {
+            return;
+        }
+        let changed = body.start + prefix..body.end - suffix;
+        let mid: Vec<DiffRow> = new_body[prefix..new_body.len() - suffix].to_vec();
+        self.list.splice(changed.clone(), mid.len());
+        self.rows.splice(changed, mid);
         self.row_ranges[file_ix] = range.start..(range.end as isize + delta) as usize;
         for r in &mut self.row_ranges[file_ix + 1..] {
             *r = (r.start as isize + delta) as usize..(r.end as isize + delta) as usize;
@@ -1463,7 +1464,6 @@ impl Changes {
             .unwrap_or_default()
     }
 
-    /// One file's staged comments, in the order `body_rows` indexes them.
     fn comments_for(&self, path: &str, cx: &App) -> Vec<DiffComment> {
         self.staged_comments(cx)
             .into_iter()
@@ -1484,9 +1484,6 @@ impl Changes {
             .map(|draft| (draft.side, draft.line))
     }
 
-    /// Splice every expanded file's body when the staged comments or the open
-    /// draft changed — splices keep the list's scroll anchor, a full reset
-    /// would jump the pane to the top on every comment.
     fn sync_comment_rows(&mut self, cx: &mut Context<Self>) {
         if self.parsed.is_none() {
             return;
@@ -1504,8 +1501,7 @@ impl Changes {
         let files = parsed.files.clone();
         for file_ix in (0..self.row_ranges.len().min(files.len())).rev() {
             let file = &files[file_ix];
-            // Collapsed bodies have no rows to refresh, and a mid-tween
-            // stand-in is the settle sweep's to replace, not ours.
+            // A mid-tween stand-in is the settle sweep's to replace.
             if self
                 .folds
                 .get(&file.path)
@@ -1537,7 +1533,6 @@ impl Changes {
         cx.notify();
     }
 
-    /// Point the hover `+` at one line, re-rendering only when it moves.
     fn set_hover(
         &mut self,
         path: &str,
@@ -1555,7 +1550,6 @@ impl Changes {
         }
     }
 
-    /// Drop the `+` when the pointer leaves the row that owns it.
     fn clear_hover_at(&mut self, path: &str, side: CommentSide, line: u32, cx: &mut Context<Self>) {
         if self
             .hover
@@ -1608,8 +1602,6 @@ impl Changes {
         cx.notify();
     }
 
-    /// Stage the open draft. An empty body just closes the card — a blank
-    /// comment would ride the prompt as a bullet with nothing after the colon.
     fn commit_draft(&mut self, cx: &mut Context<Self>) {
         let Some(draft) = self.draft.take() else {
             return;
@@ -2278,24 +2270,10 @@ fn diff_line_row_with_runs(
         .into_any_element()
 }
 
-/// Stable per-side token for element ids (`L`/`R`, matching how the comment
-/// cites its line in the prompt).
-fn side_tag(side: CommentSide) -> &'static str {
-    match side {
-        CommentSide::Old => "L",
-        CommentSide::New => "R",
-    }
-}
-
-/// Size of the `+` button, and where it sits.
 pub const COMMENT_ADDER_SIZE: f32 = 16.0;
 
-/// Left inset of the hover `+` for a row: centred over the line-number column
-/// the comment will cite, so the button lands on the very number that ends up
-/// in the prompt.
-///
 /// A row carries both gutters side by side, and a deletion numbers in the
-/// first one.
+/// first.
 pub fn comment_adder_left(side: CommentSide, gutter_px: f32) -> f32 {
     let column = match side {
         CommentSide::Old => 0.0,
@@ -2304,7 +2282,6 @@ pub fn comment_adder_left(side: CommentSide, gutter_px: f32) -> f32 {
     ACCENT_BAR_WIDTH + column + (gutter_px - COMMENT_ADDER_SIZE) / 2.0
 }
 
-/// The `+` plate, parked over the line-number column of the row it belongs to.
 fn positioned_adder(left: f32, adder: AnyElement) -> gpui::Div {
     div()
         .absolute()
@@ -2316,10 +2293,6 @@ fn positioned_adder(left: f32, adder: AnyElement) -> gpui::Div {
         .child(adder)
 }
 
-/// The hover `+` on a diff line: a solid plate over the line number, invisible
-/// until the row is hovered, so a quiet diff stays quiet. `solid`/`on_solid`
-/// are the neutral primary pair — near-white on dark, near-black on light —
-/// not an accent hue.
 fn render_comment_adder(
     path: &str,
     old_path: Option<String>,
@@ -2332,7 +2305,7 @@ fn render_comment_adder(
     div()
         .id(SharedString::from(format!(
             "cmt-add-{path}-{}-{line}",
-            side_tag(side)
+            side.tag()
         )))
         .size(px(COMMENT_ADDER_SIZE))
         .flex()
@@ -2368,13 +2341,13 @@ fn render_comment_card(
     div()
         .group(group.clone())
         .h(px(comments::card_height(&comment.body)))
+        .w_full()
         .flex_none()
         .flex()
         .flex_row()
         .bg(crate::theme::ink(0.05))
-        // A real bar, not a border: it has to be the same ACCENT_BAR_WIDTH as
-        // the +/− bars on the diff rows above and below, or the card's edge
-        // steps in and out of the column (user report).
+        // A bar, not a border: it must match ACCENT_BAR_WIDTH exactly or the
+        // card's edge steps in and out of the column.
         .child(comment_accent_bar(theme.solid.opacity(0.35)))
         .child(
             div()
@@ -2435,9 +2408,8 @@ fn render_comment_card(
                     div()
                         .flex_1()
                         .min_h_0()
-                        // The card's height is analytic (comments::card_height);
-                        // an unexpectedly long body clips inside the card
-                        // instead of pushing the file body past its fold height.
+                        // Height is analytic, so an over-long body clips
+                        // inside the card rather than past the fold height.
                         .overflow_hidden()
                         .text_size(px(12.0))
                         .line_height(px(comments::CARD_LINE_HEIGHT))
@@ -2448,14 +2420,11 @@ fn render_comment_card(
         .into_any_element()
 }
 
-/// The card's left edge: the same solid bar, at the same width, as the +/−
-/// accent bars on the diff rows it sits between.
 fn comment_accent_bar(color: gpui::Hsla) -> gpui::Div {
     div().w(px(ACCENT_BAR_WIDTH)).h_full().flex_none().bg(color)
 }
 
-/// The open draft card: input plus Cancel / Comment. Fixed height so an open
-/// draft never fights the fold tween.
+/// Fixed height, so an open draft never fights the fold tween.
 fn render_comment_draft(
     path: &str,
     line: u32,
@@ -2465,6 +2434,7 @@ fn render_comment_draft(
 ) -> AnyElement {
     div()
         .h(px(comments::DRAFT_CARD_HEIGHT))
+        .w_full()
         .flex_none()
         .flex()
         .flex_row()
@@ -2532,7 +2502,6 @@ fn render_comment_draft(
         .into_any_element()
 }
 
-/// One button on the draft card. `primary` is the filled Comment action.
 fn comment_action(
     id: &'static str,
     label: &'static str,
@@ -2549,8 +2518,6 @@ fn comment_action(
         .text_size(px(11.0))
         .font_weight(gpui::FontWeight::MEDIUM)
         .cursor_pointer()
-        // The neutral primary plate (theme.solid / on_solid), same pair the
-        // send button uses — no accent hue anywhere in the comment surface.
         .when(primary, |el| el.bg(theme.solid).text_color(theme.on_solid))
         .when(!primary, |el| {
             el.text_color(motion::hover_blend(id, theme.text_muted, theme.text))

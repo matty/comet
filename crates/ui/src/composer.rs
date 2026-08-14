@@ -212,9 +212,6 @@ pub fn attachment_strip_height(count: usize, inner_width: f32) -> f32 {
     STRIP_PAD_TOP + rows as f32 * STRIP_THUMB + (rows - 1) as f32 * STRIP_GAP
 }
 
-/// The staged-badge chip row: one pill on its own line above the input, same
-/// top inset as the attachment strip. Constant, because each badge collapses
-/// its whole staged set into a single label.
 pub fn comment_strip_height(count: usize) -> f32 {
     if count == 0 {
         return 0.0;
@@ -3728,9 +3725,7 @@ impl Composer {
         });
     }
 
-    /// Diff comments staged for the chat the composer is aimed at. They live
-    /// in `AppState` because the changes pane writes them — the composer only
-    /// shows the count and folds them into the next prompt.
+    /// Staged in `AppState` because the changes pane writes them.
     fn staged_comments(&self, cx: &App) -> Vec<crate::comments::DiffComment> {
         let Some(key) = self.current_key.as_ref() else {
             return Vec::new();
@@ -3738,11 +3733,8 @@ impl Composer {
         self.state.read(cx).diff_comments(key).to_vec()
     }
 
-    /// The "N comments" chip: a read-only ghost pill above the input, the same
-    /// tone as the footer picker chips. It reports what will ride the next
-    /// prompt; the comments themselves are edited in the changes pane, so
-    /// there is nothing to click here.
-    fn render_comments_chip(&self, theme: &Theme, cx: &App) -> Option<gpui::Div> {
+    fn render_comments_chip(&self, theme: &Theme, cx: &Context<Self>) -> Option<gpui::Div> {
+        let owner = self.current_key.clone()?;
         let count = self.staged_comments(cx).len();
         if count == 0 {
             return None;
@@ -3753,13 +3745,41 @@ impl Composer {
                 .flex_row()
                 .px(px(STRIP_PAD_X))
                 .pt(px(STRIP_PAD_TOP))
-                .child(crate::badges::render(
-                    &crate::badges::MessageBadge {
-                        icon: crate::icons::CHAT_ROUND_LINE,
-                        label: crate::comments::chip_label(count).into(),
-                    },
-                    theme,
-                )),
+                .child(
+                    crate::badges::render(
+                        "composer-comments",
+                        &crate::badges::MessageBadge {
+                            icon: crate::icons::CHAT_ROUND_LINE,
+                            label: crate::comments::chip_label(count).into(),
+                            // The staged set is already on screen in the changes
+                            // pane, so a hover card would only repeat it.
+                            details: Vec::new(),
+                        },
+                        theme,
+                    )
+                    .child(
+                        div()
+                            .id("composer-comments-remove")
+                            .ml(px(2.0))
+                            .size(px(14.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.state.update(cx, |state, _| {
+                                    state.purge_diff_comments(&owner);
+                                });
+                                cx.notify();
+                            }))
+                            .child(
+                                crate::icons::icon(crate::icons::CLOSE_CIRCLE)
+                                    .size(px(11.0))
+                                    .text_color(theme.text_faint),
+                            ),
+                    ),
+                ),
         )
     }
 
@@ -4720,9 +4740,7 @@ impl Composer {
             .attachments
             .remove(&self.current_key)
             .unwrap_or_default();
-        // Diff comments ride the prompt as plain text and clear on the same
-        // beat — the chip empties the instant the message carrying them goes
-        // out. `typed` keeps the user's own words for the failure hand-back:
+        // `typed` keeps the user's own words for the failure hand-back below:
         // restoring the folded prompt would paste the comment block into the
         // input as literal text.
         let key = self.current_key.clone();
@@ -5940,7 +5958,6 @@ impl Render for Composer {
         let staged_count = self.staged().len();
         let strip_width_hint = if last_width > 0.0 { last_width } else { 720.0 };
         let strip_h = attachment_strip_height(staged_count, strip_width_hint);
-        // Staged diff comments add one chip row on the same terms.
         let comment_strip_h = comment_strip_height(self.staged_comments(cx).len());
         let base_height = if expanded {
             composer_total_height(content_height)
@@ -6038,8 +6055,7 @@ impl Render for Composer {
                     }),
             );
         // Staged-thumbnail strip (attachment-ui.tsx AttachmentStrip), above
-        // the input inside the pill in both modes. The comments chip sits
-        // above it — comments are about the diff, images about the prompt.
+        // the input inside the pill in both modes.
         let strip = self.render_attachment_strip(&theme, cx);
         let comments_chip = self.render_comments_chip(&theme, cx);
 
