@@ -5,4 +5,5 @@ mod capture_corpus {
     mod sanitizer_safety;
     mod sanitizer_semantics;
     mod support;
+    mod surface_map;
 }
