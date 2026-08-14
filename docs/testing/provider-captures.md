@@ -106,5 +106,5 @@ and fresh authorization.
 Before starting another scenario, decide whether the contradiction invalidates a contract that
 scenario shares. If it does, stop the shared group. If it does not, the independent scenario may
 run, sanitize, and promote on its own evidence. One failed scenario must not erase provenance for
-another. The resolution is an explicit design update, removal of an unsupported claim, or a
+another. The resolution is an explicit design update, removal of an unsupported assertion, or a
 documented deferral.
