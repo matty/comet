@@ -1344,7 +1344,27 @@ def is_expected_upstream(url: str) -> bool:
     return normalize_github_url(url) == "github.com/zeronsh/comet"
 
 
+def force_utf8_console(*streams: TextIO) -> None:
+    """Make console output survive non-ASCII commit subjects.
+
+    Upstream subjects carry arrows, em dashes and accented author names, and a
+    Windows console hands Python a cp1252 stream by default: the commit listing
+    then dies mid-print with UnicodeEncodeError, aborting the run before any
+    selection is possible. `errors="replace"` keeps a stream that cannot be
+    reconfigured to UTF-8 from taking the run down with it.
+    """
+    for stream in streams:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    force_utf8_console(sys.stdout, sys.stderr)
     parser = argparse.ArgumentParser(
         description="Select and cherry-pick commits from zeronsh/comet",
         epilog=(
