@@ -23,10 +23,10 @@ round-trips and process lifecycle.
 
 ## Partial result, 2026-08-12
 
-The repository now carries a sanitized, versioned corpus and an exact reciprocal
-claim index. Every retained capture-derived claim is backed by a promoted literal
-frame, and unsupported Codex approval claims were removed after two bounded live
-attempts contradicted the proposed capture contract. The operator procedure is
+The repository now carries a sanitized, versioned corpus. Every retained
+capture-derived assertion rests on a promoted literal frame, and unsupported
+Codex approval assertions were removed after two bounded live attempts
+contradicted the proposed capture contract. The operator procedure is
 [`docs/testing/provider-captures.md`](../testing/provider-captures.md).
 
 D44 remains open because the plan's all-twelve-scenarios acceptance criterion is
@@ -40,15 +40,18 @@ independently under the contradiction policy.
   completion are literal frames in the promoted artifact.
 - Ordinary approval stopped after its single permitted attempt when the run emitted
   one failed command execution instead of the reviewed multi-command ordering.
-  Its `codex-cli 0.147.0` partial remains ignored and cannot satisfy a claim.
+  Its `codex-cli 0.147.0` partial remains ignored and cannot back an assertion.
 - On-request approval stopped when its approval request arrived before the required
   sandbox-failure completion. Its `codex-cli 0.147.0` partial remains ignored and
-  cannot satisfy a claim.
+  cannot back an assertion.
 - Interruption stopped after Codex acknowledged the request but emitted
   `turn/completed` with status `interrupted`, not the required `turn/aborted` terminal
-  event. Its `codex-cli 0.147.0` partial remains ignored and cannot satisfy a claim.
+  event. Its `codex-cli 0.147.0` partial remains ignored and cannot back an assertion.
 
 The three partials record only `driver_error` outcomes and remain beneath the ignored
 raw capture root. Checking any incomplete evidence into the corpus requires a separate
 contradiction-artifact specification and implementation plan; this successful-capture
 schema remains unchanged.
+
+The claim index this page originally described was removed on 2026-08-14; tests now name a
+frame by scenario and sequence directly. The partial-coverage finding is unaffected.

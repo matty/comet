@@ -2173,7 +2173,7 @@ mod tests {
     /// receives a status change for an unknown item.
     #[test]
     fn a_resumed_runs_update_for_an_unseen_task_carries_its_active_form() {
-        // The claim's three frames are the resumed run's init (which restates
+        // This test's three frames are the resumed run's init (which restates
         // no list), the update call, and its result. Task 2 was created by the
         // PREVIOUS process, so this normalizer has never seen its subject —
         // `text` is None and `activeForm` is the only readable label. The
@@ -2217,7 +2217,7 @@ mod tests {
     /// neither frame alone describes the change.
     #[test]
     fn the_results_confirmed_transition_beats_the_inputs_request() {
-        // The claim's two frames: an `in_progress` request whose result
+        // This test's two frames: an `in_progress` request whose result
         // confirms the same transition, with `activeForm` present on the input
         // and absent from the result. The decode must read the destination
         // from the result — the input is what was asked for, the result is
