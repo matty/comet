@@ -423,6 +423,34 @@ class FormattingTests(unittest.TestCase):
         )
 
 
+class ConsoleEncodingTests(unittest.TestCase):
+    @staticmethod
+    def cp1252_stream():
+        return io.TextIOWrapper(io.BytesIO(), encoding="cp1252", newline="")
+
+    def test_non_ascii_subject_survives_a_cp1252_console(self):
+        # A Windows console hands Python cp1252; upstream subjects carry '→'.
+        stream = self.cp1252_stream()
+        sync.force_utf8_console(stream)
+        commit = sync.Commit("oid", "abc1234", "2026-08-14", "Alice", "local→synced")
+
+        print(sync.format_commit(1, commit), file=stream)
+        stream.flush()
+
+        self.assertIn("local→synced", stream.buffer.getvalue().decode("utf-8"))
+
+    def test_a_stream_that_cannot_be_reconfigured_is_left_alone(self):
+        class Fixed(io.StringIO):
+            def reconfigure(self, **_kwargs):
+                raise ValueError("stream is not reconfigurable")
+
+        stream = Fixed()
+        sync.force_utf8_console(stream, io.StringIO())  # must not raise
+
+        print("still writable", file=stream)
+        self.assertIn("still writable", stream.getvalue())
+
+
 class TrackedWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
