@@ -6,7 +6,7 @@
 //! green suite. Sequence numbers alone are not evidence; these tests assert what
 //! the frames actually contain.
 
-use comet_harness::capture::corpus_frame;
+use comet_harness::capture::{Channel, corpus_frame};
 use serde_json::Value;
 
 const CODEX_MODEL_DISCOVERY: &str = "codex/0.147.0/model-discovery";
@@ -51,6 +51,11 @@ fn codex_acknowledges_a_steer_before_completing_the_same_turn() {
     let completion = payload(CODEX_STEER, 56);
 
     assert_eq!(request["method"], "turn/steer");
+    assert_eq!(corpus_frame(CODEX_STEER, 19).channel, Channel::Stdin);
+    assert!(
+        request["params"]["expectedTurnId"].is_string(),
+        "the steer request must name a turn: {request}"
+    );
     assert_eq!(reply["id"], request["id"]);
     assert!(reply["result"].is_object());
     assert_eq!(
