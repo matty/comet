@@ -14,11 +14,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use comet_harness::capture::Direction;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub(super) const SCHEMA_VERSION: u64 = 1;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(super) enum State {
     /// Comet reads it; `consumer` says where.
@@ -33,7 +33,11 @@ pub(super) enum State {
     Unknown,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+/// The record is written by the same derive that reads it, deliberately. A
+/// hand-written writer beside a derived reader drops a field it was never
+/// taught about, and the loss lands on the entries a person triaged by hand -
+/// silently, because regeneration rewrites the whole file.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct Disposition {
     pub(super) provider: String,
     /// Sent and received are different surfaces, so the same key in each
@@ -41,26 +45,26 @@ pub(super) struct Disposition {
     pub(super) direction: Direction,
     pub(super) path: String,
     pub(super) state: State,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) consumer: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) reason: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) debt: Option<String>,
     /// What consuming this field would touch, and what it would cost. The
     /// difference between a catalogue and guidance.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) how: Option<String>,
     /// Why a hand decision stands even though the decode sources now name this
     /// field. Records a coincidental name match (`command`, `id`, `message` are
     /// common words) so the disagreement is answered once instead of re-argued.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) derivation_note: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) domains: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct DispositionFile {
     pub(super) schema_version: u64,
     pub(super) entries: Vec<Disposition>,
@@ -253,6 +257,27 @@ mod tests {
         BTreeSet::from(["D35".to_owned(), "D36".to_owned()])
     }
 
+    /// The keys the first entry is written with, sorted, by the same call
+    /// regeneration makes.
+    ///
+    /// Sorted because read-back order is not ours to predict: `serde_json`'s
+    /// object is a `BTreeMap` under `cargo test -p comet-harness` and an
+    /// insertion-ordered map under `cargo test --workspace`, where another
+    /// member unifies the `preserve_order` feature in. The question here is
+    /// which fields survive the write, not what order they read in.
+    fn written_keys(file: &DispositionFile) -> Vec<String> {
+        let written: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec_pretty(file).unwrap()).unwrap();
+        let mut keys: Vec<String> = written["entries"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// Break caught: a deferred field points at a debt row nobody can follow,
     /// and the decision loses the record that was its whole point.
     #[test]
@@ -409,6 +434,51 @@ mod tests {
                 .iter()
                 .any(|problem| problem.contains("2 entries for one field")),
             "{problems:?}"
+        );
+    }
+
+    /// Break caught: regeneration drops a field somebody triaged by hand.
+    /// `COMET_UPDATE_SURFACE=1` rewrites the whole record, so a writer that does
+    /// not know about a field erases it from every entry at once - and the
+    /// entries that lose the most are the ones a person wrote.
+    #[test]
+    fn a_written_entry_carries_every_field_it_was_given() {
+        let full = file(serde_json::json!([{
+            "provider": "codex", "direction": "from-provider", "path": ".upgrade",
+            "state": "deferred", "consumer": "codex/normalize.rs:209", "reason": "not yet",
+            "debt": "D35", "how": "read it onto AgentEvent::Notice",
+            "derivation_note": "`upgrade` is a common word", "domains": ["notices"],
+        }]));
+
+        assert_eq!(
+            written_keys(&full),
+            [
+                "consumer",
+                "debt",
+                "derivation_note",
+                "direction",
+                "domains",
+                "how",
+                "path",
+                "provider",
+                "reason",
+                "state",
+            ]
+        );
+
+        let reread: DispositionFile =
+            serde_json::from_slice(&serde_json::to_vec_pretty(&full).unwrap()).unwrap();
+        assert_eq!(reread.entries[0].debt.as_deref(), Some("D35"));
+        assert_eq!(reread.entries[0].domains, ["notices"]);
+
+        // The absent ones stay absent, so a seeded backlog entry reads as four
+        // lines rather than ten mostly-null ones.
+        let bare = file(serde_json::json!([{
+            "provider": "claude", "direction": "from-provider", "path": ".ttft_ms", "state": "unknown",
+        }]));
+        assert_eq!(
+            written_keys(&bare),
+            ["direction", "path", "provider", "state"]
         );
     }
 

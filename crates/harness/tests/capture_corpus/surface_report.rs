@@ -363,13 +363,9 @@ fn the_disposition_record_and_the_reports_are_current() {
             }
             Err(_) => fresh,
         };
-        let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({
-            "schema_version": merged.schema_version,
-            "entries": merged.entries.iter().map(entry_json).collect::<Vec<_>>(),
-        }))
-        .unwrap();
+        let mut bytes = serde_json::to_vec_pretty(&merged).unwrap();
         bytes.push(b'\n');
-        std::fs::write(&path, bytes).unwrap();
+        replace(&path, &bytes);
     }
 
     let dispositions = load(&path)
@@ -380,7 +376,7 @@ fn the_disposition_record_and_the_reports_are_current() {
         let destination = report_path(&repo_root(), &provider);
         if updating() {
             std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
-            std::fs::write(&destination, rendered.as_bytes()).unwrap();
+            replace(&destination, rendered.as_bytes());
             continue;
         }
         let committed = std::fs::read_to_string(&destination)
@@ -395,39 +391,16 @@ fn the_disposition_record_and_the_reports_are_current() {
     }
 }
 
-fn entry_json(entry: &Disposition) -> serde_json::Value {
-    let state = match entry.state {
-        State::Consumed => "consumed",
-        State::NotApplicable => "not-applicable",
-        State::Deferred => "deferred",
-        State::Unknown => "unknown",
-    };
-    let direction = match entry.direction {
-        Direction::ToProvider => "to-provider",
-        Direction::FromProvider => "from-provider",
-    };
-    let mut value = serde_json::json!({
-        "provider": entry.provider,
-        "direction": direction,
-        "path": entry.path,
-        "state": state,
-    });
-    let object = value.as_object_mut().unwrap();
-    for (key, held) in [
-        ("consumer", &entry.consumer),
-        ("reason", &entry.reason),
-        ("debt", &entry.debt),
-        ("how", &entry.how),
-        ("derivation_note", &entry.derivation_note),
-    ] {
-        if let Some(held) = held {
-            object.insert(key.to_owned(), serde_json::Value::String(held.clone()));
-        }
-    }
-    if !entry.domains.is_empty() {
-        object.insert("domains".to_owned(), serde_json::json!(entry.domains));
-    }
-    value
+/// Puts the new contents in place in one step.
+///
+/// The regeneration command's own filter (`--test capture_corpus surface_report`)
+/// matches four tests, three of which read `dispositions.json` while this one
+/// rewrites it. `fs::write` truncates before it fills, so a reader could catch
+/// the file empty and fail as though the record were corrupt.
+fn replace(path: &Path, bytes: &[u8]) {
+    let temporary = path.with_extension("regenerating");
+    std::fs::write(&temporary, bytes).unwrap();
+    std::fs::rename(&temporary, path).unwrap();
 }
 
 /// The gate.
