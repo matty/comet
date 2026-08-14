@@ -542,8 +542,5 @@
   },
   "scenario": "checklist-resume",
   "schema_version": 1,
-  "source": "capture.json",
-  "consumers": [
-    "crates/harness/src/claude/normalize.rs:a_resumed_runs_update_for_an_unseen_task_carries_its_active_form"
-  ]
+  "source": "capture.json"
 }

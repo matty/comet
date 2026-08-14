@@ -14,7 +14,7 @@ pub use approval::{
     codex_approval_prompt,
 };
 pub use checklist::{claude_checklist_prompt, claude_checklist_resume_prompt};
-pub use corpus::{CorpusError, selected_payload, selected_payloads, validate_corpus};
+pub use corpus::{Frame, corpus_frame, frame};
 pub use recording::record;
 pub use sanitize::{SanitizationError, SanitizationReport, sanitize_dir};
 pub use surface::{

@@ -45,7 +45,7 @@ Raising it is a deliberate change, not a consequence of upgrading a local CLI:
 2. Update the table above **and say what became removable**, with the evidence that no supported
    version emits it.
 3. Leave the old version's corpus entries in place unless they are actively wrong. They are the
-   record of what that version did, and a claim pointing at them stays valid.
+   record of what that version did, and an assertion resting on them stays valid.
 
 The corpus is what makes this safe: it holds real frames per version, so "does any supported
 version still send X" is a question with an answer on disk rather than a guess.

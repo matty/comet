@@ -421,13 +421,5 @@
   },
   "scenario": "command-discovery",
   "schema_version": 1,
-  "source": "capture.json",
-  "consumers": [
-    "crates/harness/src/claude/discovery.rs:DISCOVERY_ARGS",
-    "crates/harness/src/claude/commands.rs:module capture facts",
-    "crates/harness/src/claude/commands.rs:the_captured_reply_decodes_every_command",
-    "crates/harness/tests/claude.rs:live_cli_commands_include_this_repositorys_own_skills",
-    "crates/harness/src/claude/commands.rs:an_empty_argument_hint_is_absent_not_blank",
-    "crates/harness/src/claude/commands.rs:a_command_without_aliases_decodes_to_an_empty_list"
-  ]
+  "source": "capture.json"
 }

@@ -5,10 +5,8 @@
 //! or [`Frame::Unknown`] (a diagnostic) — so a newer CLI never breaks parsing
 //! and nothing vanishes silently (spec: docs/research/harness.md).
 //!
-//! Corpus claims: `claude-routine-frame-ignore-list`,
-//! `claude-approval-wire-fields`, `claude-attachment-block-order`,
-//! `claude-attachment-block-order-test`, and
-//! `claude-tool-use-result-present`.
+//! Reviewed evidence lives in `tests/corpus`, addressed by scenario and frame
+//! sequence.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -549,15 +547,7 @@ pub(crate) fn interrupt_request_line(request_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::selected_payload;
-
-    fn corpus_payload(claim_id: &str) -> String {
-        selected_payload(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
-            claim_id,
-        )
-        .expect("reviewed corpus frame")
-    }
+    use crate::capture::corpus_frame;
 
     #[test]
     fn parses_known_and_unknown_frames() {
@@ -585,9 +575,10 @@ mod tests {
         assert!(v["parent_tool_use_id"].is_null());
     }
 
+    /// The literal attachment user frame orders image blocks before text.
     #[test]
     fn user_line_with_images_is_blocks_then_text() {
-        let captured = corpus_payload("claude-attachment-block-order-test");
+        let captured = corpus_frame("claude/2.1.228/attachment", 1).payload;
         let captured: Value = serde_json::from_str(&captured).expect("captured stdin JSON");
         let captured_content = captured["message"]["content"]
             .as_array()
@@ -685,9 +676,11 @@ mod tests {
         }
     }
 
+    /// A `can_use_tool` request carries request id, tool, input, description,
+    /// and additional ignored fields.
     #[test]
     fn a_can_use_tool_request_decodes_the_fields_a_card_needs() {
-        let line = corpus_payload("claude-approval-wire-fields");
+        let line = corpus_frame("claude/2.1.228/approval", 102).payload;
         let Frame::ControlRequest(req) = parse_frame(&line).unwrap() else {
             panic!("expected a control request");
         };
@@ -726,12 +719,14 @@ mod tests {
         assert_eq!(req.request.description.as_deref(), Some(""));
     }
 
+    /// A captured Bash `tool_result` user frame carries a snake_case
+    /// `tool_use_result` key with the tool's typed result.
     #[test]
     fn a_user_frame_decodes_the_captured_tool_use_result() {
         // Literal captured payload, per AGENTS.md: the SDK's typings declare
         // camelCase toolUseResult, but the wire sends snake_case, and a
         // hand-composed fixture would not catch the wrong spelling.
-        let line = corpus_payload("claude-tool-use-result-present");
+        let line = corpus_frame("claude/2.1.228/approval", 56).payload;
         let Frame::User(frame) = parse_frame(&line).unwrap() else {
             panic!("expected a user frame");
         };

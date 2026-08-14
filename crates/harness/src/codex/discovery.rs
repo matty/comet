@@ -1,13 +1,8 @@
 //! Codex's live model discovery: a short-lived `codex app-server` paging
 //! `model/list`.
 //!
-//! Reviewed evidence is indexed in `tests/corpus/index.json` by the
-//! `codex-model-*` claims. Four facts from that corpus shape this file:
-//! `codex-model-reply-shape`, `codex-model-page-decoder`,
-//! `codex-model-request-shape`, `codex-model-logged-out-fallback`,
-//! `codex-model-effort-objects`, `codex-model-input-modalities`,
-//! `codex-model-cwd-invariance`, `codex-model-source-notification-order`, and
-//! `codex-model-one-page` name the retained evidence.
+//! Reviewed evidence lives in `tests/corpus`, addressed by scenario and frame
+//! sequence. Several facts from that corpus shape this file:
 //!
 //! 1. `model/list` answers cold, before any thread exists — but only after the
 //!    `initialize` handshake, which is why this spawn repeats `run`'s.
@@ -101,7 +96,7 @@ pub(crate) fn codex_home() -> Option<PathBuf> {
 ///
 /// A logged-out `codex` does not fail `model/list` — it answers, in 14ms,
 /// with a five-model list baked into the binary that contains a model the
-/// account cannot use and misses three it has (`codex-model-logged-out-fallback`).
+/// account cannot use and misses three it has.
 /// The envelope is identical to a
 /// real answer, so "the call succeeded" cannot mean the list is the account's.
 ///
@@ -400,19 +395,15 @@ pub(crate) fn page_from_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::selected_payload;
+    use crate::capture::corpus_frame;
 
-    fn corpus_payload(claim_id: &str) -> String {
-        selected_payload(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
-            claim_id,
-        )
-        .expect("reviewed corpus frame")
-    }
+    const MODEL_DISCOVERY: &str = "codex/0.147.0/model-discovery";
 
+    /// The `model/list` result `data` and `nextCursor` envelope decode from
+    /// literal provider bytes.
     #[test]
     fn the_captured_reply_decodes_onto_curated_ids() {
-        let payload = corpus_payload("codex-model-page-decoder");
+        let payload = corpus_frame(MODEL_DISCOVERY, 6).payload;
         let (models, next) = page_from_reply(&payload).expect("captured reply decodes");
         assert_eq!(next, None, "an explicit null cursor ends the paging");
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
@@ -424,9 +415,12 @@ mod tests {
 
     /// The effort array is objects, and `ultra` is a real provider-reported
     /// level rather than one Comet layers on.
+    ///
+    /// Captured `supportedReasoningEfforts` entries are objects and include
+    /// ultra.
     #[test]
     fn efforts_decode_from_objects_including_ultra() {
-        let payload = corpus_payload("codex-model-effort-objects");
+        let payload = corpus_frame(MODEL_DISCOVERY, 6).payload;
         let (models, _) = page_from_reply(&payload).expect("decodes");
         assert_eq!(
             models[0].reasoning_levels,
@@ -443,9 +437,12 @@ mod tests {
 
     /// The field 2.4's modality gate reads, and the one place the live answer
     /// contradicts the curated catalog today.
+    ///
+    /// Captured `inputModalities` distinguish text-only from image-capable
+    /// models.
     #[test]
     fn input_modalities_split_text_only_from_image_capable() {
-        let payload = corpus_payload("codex-model-input-modalities");
+        let payload = corpus_frame(MODEL_DISCOVERY, 6).payload;
         let (models, _) = page_from_reply(&payload).expect("decodes");
         let sol = models
             .iter()
@@ -517,9 +514,12 @@ mod tests {
 
     /// `includeHidden` is never sent, and a cursor is sent only once there is
     /// one to send.
+    ///
+    /// `model/list` omits `includeHidden` and sends a cursor only when
+    /// paging.
     #[test]
     fn the_request_line_asks_for_exactly_what_the_capture_asked_for() {
-        let captured = corpus_payload("codex-model-request-shape");
+        let captured = corpus_frame(MODEL_DISCOVERY, 5).payload;
         let captured: serde_json::Value = serde_json::from_str(&captured).unwrap();
         let generated: serde_json::Value = serde_json::from_str(&model_list_line(2, None)).unwrap();
         assert_eq!(generated["method"], captured["method"]);

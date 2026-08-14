@@ -2,10 +2,12 @@
 
 `manifest.json` and `events.jsonl` are the corpus pair — raw provider wire frames from a
 `drive_claude_plan.py` capture, driven directly against `claude.exe` (see `manifest.json`'s
-`command` block). They are unclaimed evidence (`"consumers": []`), richer than a single-agent
-scenario needs (a resumed `task_started` sharing one `task_id`, `task_progress`,
-patch-only `task_updated`, `task_notification` with usage, and `background_tasks_changed`
-populated-then-empty).
+`command` block). No test asserts against these frames — only the generated field snapshot
+enumerates them, which checks what fields exist and nothing about their values. They are
+archived evidence: richer than a
+single-agent capture and kept so a later slice has something to read (a resumed `task_started`
+sharing one `task_id`, `task_progress`, patch-only `task_updated`, `task_notification` with
+usage, and `background_tasks_changed` populated-then-empty).
 
 `read-back-run-journal.jsonl` and `read-back-doc-snapshot.json` are **evidence from a separate
 session** — the live run driven through Comet's actual `comet headless` engine (real
@@ -17,12 +19,4 @@ different token totals than the capture above — the two are not the same sessi
 meant to be read as one. Both are sanitized to the same standard (cwd/home substituted,
 session/task/tool/message/device ids replaced with reused placeholders, `mcp__*` tool entries
 dropped from the tools list); neither follows the corpus manifest schema in
-`docs/testing/provider-captures.md`, since they are not provider-wire evidence and are not
-indexed in `../../../index.json`.
-
-`manifest.json`'s `"consumers": []` is not an oversight: this scenario is claimless, per
-`docs/testing/provider-captures.md:73-74`. That is also what leaves it unenforced — the corpus
-validator's reciprocal-reference checks (`crates/harness/tests/capture_corpus/corpus_validation.rs`)
-only run against a scenario once some source names a claim ID pointing at it in `index.json`. A
-future slice that wants this evidence checked, not just retained, turns the validator on by adding
-that claim.
+`docs/testing/provider-captures.md`, since they are not provider-wire evidence.

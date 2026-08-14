@@ -7,9 +7,6 @@
 //! Rust rather than `#!/bin/sh` because Windows cannot spawn a shell script:
 //! the harness hands the path straight to `CreateProcess`, which rejects a
 //! non-PE image with "%1 is not a valid Win32 application" (os error 193).
-//!
-//! Corpus-backed contracts: `codex-model-notification-order`,
-//! `codex-model-fixture-shape`, and `codex-routine-notification-fixture`.
 
 use std::io::{BufRead, StdinLock, Write};
 use std::process::exit;
@@ -80,8 +77,8 @@ fn model_entry(
     levels: &[&str],
     modalities: Option<&[&str]>,
 ) -> Value {
-    // Objects, not strings, as pinned by `codex-model-fixture-shape`, and the one the phase spec's field
-    // summary gets wrong.
+    // Objects, not strings, per `codex/0.147.0/model-discovery` frame 6 — the
+    // one the phase spec's field summary gets wrong.
     let efforts: Vec<Value> = levels
         .iter()
         .map(|l| json!({"reasoningEffort": l, "description": format!("effort {l}")}))

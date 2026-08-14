@@ -2,9 +2,9 @@
 
 The harness corpus preserves reviewed provider evidence under
 `crates/harness/tests/corpus/<provider>/<version>/<scenario>/`. Each scenario has a
-`manifest.json` and ordered `events.jsonl`; `index.json` maps a named claim to exact event
-sequences and a source consumer. Tests read those literal payload bytes, never a round trip through
-Comet's own wire types.
+`manifest.json` and ordered `events.jsonl`. Tests read a frame by its scenario directory and
+sequence number, from the literal payload bytes, never a round trip through Comet's own wire
+types.
 
 ## Safety boundary
 
@@ -53,8 +53,8 @@ Compare raw and staged artifacts recursively before copying anything into Git. C
 
 - provider, CLI version, platform, capture timestamp, scenario, purpose, command, cwd, configured
   environment, channels, and exit outcome match the observation;
-- event sequences and channels are complete and ordered, and selected neighborhoods prove the
-  claim without relying on sanitized provider prose;
+- event sequences and channels are complete and ordered, and the selected frames prove what the
+  scenario is for, without relying on sanitized provider prose;
 - every placeholder definition, use, kind, and redaction count is reciprocal and consistent;
 - no username, home/repository/temp path, email/account identity, hostname or server name, machine
   identifier, credential/token, attachment bytes, unrecognized absolute path, or policy-redacted
@@ -66,13 +66,10 @@ If sanitization leaks, corrupts semantics, or accepts an unknown sensitive shape
 captured-shape failing test, fix the fail-closed structural rule, re-sanitize to a fresh staging
 name, and repeat the complete review. Do not edit staged output by hand.
 
-## Promote and index
+## Promote
 
-Copy only the reviewed `manifest.json` and `events.jsonl` pair into the observed version/scenario
-directory. Add or update the claim in `index.json` with literal sequence/channel selectors. The
-manifest `consumers` must be the exact reciprocal set derived from the index, and each consumer
-source must name its claim ID. Claimless scenario artifacts use an empty consumer list; never
-invent a claim merely to populate it.
+Copy the reviewed `manifest.json` and `events.jsonl` pair into the observed version/scenario
+directory.
 
 Run the focused gate after every promotion:
 
@@ -86,13 +83,9 @@ restore it, and rerun green. Finish with the repository gate from `AGENTS.md`.
 
 ## The field snapshot
 
-`index.json` answers *"is this claim backed?"*. It cannot answer *"what did the provider send?"*
-— a promoted capture full of unread fields is invisible to it, because nothing points at those
-fields and inventing a claim to populate a consumer list is forbidden above, correctly.
-
-So a generated snapshot sits beside it. `crates/harness/tests/corpus/observed-fields.json` lists
-every field the corpus shows, per provider and direction, and nothing else. Promotion is what
-makes a field appear in it, so a scenario promoted here changes it on the next regeneration:
+`crates/harness/tests/corpus/observed-fields.json` is a generated snapshot recording what the
+corpus shows, per provider and direction, and nothing else. Promotion is what makes a field
+appear in it, so a scenario promoted here changes it on the next regeneration:
 
 ```powershell
 $env:COMET_UPDATE_SURFACE = "1"; cargo test -p comet-harness --test capture_corpus observed_fields
@@ -113,5 +106,5 @@ and fresh authorization.
 Before starting another scenario, decide whether the contradiction invalidates a contract that
 scenario shares. If it does, stop the shared group. If it does not, the independent scenario may
 run, sanitize, and promote on its own evidence. One failed scenario must not erase provenance for
-another. The resolution is an explicit design update, removal of an unsupported claim, or a
+another. The resolution is an explicit design update, removal of an unsupported assertion, or a
 documented deferral.

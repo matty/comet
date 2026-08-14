@@ -1,8 +1,5 @@
 //! ClaudeHarness integration tests against the fake CLI in
 //! `tests/fixtures/fake_claude.rs` (no real `claude` binary involved).
-//!
-//! Corpus consumers: `claude-model-integration-shape`,
-//! `claude-command-nonbare-count`, and `claude-routine-frame-integration`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -844,8 +841,8 @@ async fn initialize_discovery_drains_stderr_for_models_and_commands() {
 }
 
 /// The slice's deliverable: a real spawn, a real handshake round-trip, and a
-/// merged catalog that says it is live. The fixture answers `initialize`
-/// shaped as pinned by `claude-model-integration-shape`.
+/// merged catalog that says it is live. The fixture is a reduced form of the
+/// captured initialize reply, `claude/2.1.228/model-discovery` frame 2.
 #[tokio::test]
 async fn models_come_back_live_and_merged() {
     let catalog = harness().models().await.expect("models");
@@ -1035,8 +1032,10 @@ async fn live_cli_discovery_lands_on_curated_ids() {
 ///
 /// It asserts a project-scoped command specifically, because that is what the
 /// non-bare spawn buys: with `--bare` the same call answers with built-ins only
-/// (the differing lists are pinned by `claude-command-nonbare-count`) and every other assertion here
-/// would still pass.
+/// and every other assertion here would still pass. The non-bare handshake
+/// includes project-scoped commands the bare handshake omits, per
+/// `claude/2.1.228/model-discovery` frame 2 (bare) and
+/// `claude/2.1.228/command-discovery` frame 5 (non-bare).
 /// Run with: `cargo test -p comet-harness --test claude -- --ignored`
 #[tokio::test]
 #[ignore = "requires installed+authenticated claude CLI (spends no tokens)"]

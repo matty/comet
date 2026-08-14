@@ -13,7 +13,8 @@
 //! - Interrupt: cancelling [`RunControls::interrupt`] sends the protocol-level
 //!   interrupt control request, then escalates to SIGTERM and SIGKILL.
 //!
-//! Corpus claim `claude-attachment-run-order` pins attachment stdin ordering.
+//! `claude/2.1.228/attachment` frame 1 pins attachment stdin ordering: captured
+//! attachment turns put image content blocks before text.
 
 mod approval;
 mod catalog;

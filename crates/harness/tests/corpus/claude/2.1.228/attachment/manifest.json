@@ -419,10 +419,5 @@
   },
   "scenario": "attachment",
   "schema_version": 1,
-  "source": "capture.json",
-  "consumers": [
-    "crates/harness/src/claude/wire.rs:user_message_line_with_images",
-    "crates/harness/src/claude/mod.rs:run attachment stdin construction",
-    "crates/harness/src/claude/wire.rs:user_line_with_images_is_blocks_then_text"
-  ]
+  "source": "capture.json"
 }

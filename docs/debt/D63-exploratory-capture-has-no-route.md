@@ -9,7 +9,7 @@
 1. `comet-provider-capture <provider> <named-scenario>` into an immutable raw root,
 2. `comet-provider-sanitize` into an immutable staging name,
 3. review raw against staged,
-4. copy the reviewed `manifest.json` + `events.jsonl` pair into the corpus, add a claim.
+4. copy the reviewed `manifest.json` + `events.jsonl` pair into the corpus.
 
 It also states two prohibitions that close every other path: *"Never copy raw data into the
 corpus"* (`:11`) and *"Do not edit staged output by hand"* (`:67`).
@@ -37,10 +37,13 @@ the manifest's own `source` field:
 > `captures/2026-08-13-plan-todo-subagent/drive_claude_plan.py raw capture
 > (corpus-subagent-2.1.229.jsonl), hand-sanitized for slice 4.2 task 9`
 
-That entry is **claimless**, which is what keeps it harmless: the corpus validator's reciprocal
-checks only run against a scenario once some source names a claim pointing at it, so nothing
-depends on the hand-sanitization being correct. It also produced D58 — two real sanitizer gaps
-found *by* doing it by hand, which the tool would never have surfaced.
+No test asserts against that entry's frames — only the generated field snapshot enumerates
+them, which checks what fields exist and nothing about their values — which is what keeps it
+harmless: nothing depends on the hand-sanitization being correct. (It was additionally
+protected by the corpus validator's reciprocal claim checks until those were removed on
+2026-08-14; the protection now comes from the simpler fact that no test names it.) It also
+produced D58 — two real sanitizer gaps found *by* doing it by hand, which the tool would never
+have surfaced.
 
 **4.3** took the other route: added `checklist` and `checklist-resume` scenarios to
 `comet-provider-capture`, re-captured through the tool, and sanitized with the real sanitizer.
@@ -55,10 +58,9 @@ Not a code change first — a doc change. `provider-captures.md` should describe
 and the bridge between them:
 
 - **Explore** with a rig, against the real CLI, with an arbitrary prompt. Output is raw JSONL
-  outside the repo and a written-up finding. Nothing here is corpus evidence and nothing here
-  is claimed.
+  outside the repo and a written-up finding. Nothing here is corpus evidence.
 - **Promote** by writing the scenario the finding justifies, re-capturing through
-  `comet-provider-capture`, and running the existing sanitize → review → claim pipeline
+  `comet-provider-capture`, and running the existing sanitize → review → promote pipeline
   unchanged.
 
 Stated that way, 4.3's route is simply the correct one and 4.2's was a shortcut taken because

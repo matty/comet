@@ -1,7 +1,6 @@
 mod capture_corpus {
-    mod corpus_validation;
+    mod corpus_frames;
     mod observed_fields;
-    mod promoted_evidence;
     mod sanitizer_publication;
     mod sanitizer_safety;
     mod sanitizer_semantics;

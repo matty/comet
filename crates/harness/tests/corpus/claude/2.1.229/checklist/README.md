@@ -31,20 +31,20 @@ subject meaningless. **Do not "improve" them into something descriptive**, and d
 this pair from an ad-hoc prompt. `docs/debt/README.md` **D64** tracks the sanitizer gap; until it
 closes, the prompt is the control.
 
-## Claims
+## Assertions
 
-Three, all in `../../../index.json`, all consumed by `crates/harness/src/claude/normalize.rs`:
+Three, all asserted in `crates/harness/src/claude/normalize.rs`, which reads them by sequence:
 
-| Claim | Rests on |
-| --- | --- |
-| `claude-task-create-result-shape` | the create call and its result — the assigned id is on the result and on no input |
-| `claude-task-update-status-transition` | the update call and its result — `statusChange` on the result, `activeForm` only on the input |
-| `claude-resumed-run-updates-an-uncreated-task` | the resumed init plus the call and result that move task 2 |
+| Assertion | Sequence(s) | Rests on |
+| --- | --- | --- |
+| task create result shape | 55/64 | the create call and its result — the assigned id is on the result and on no input |
+| task update status transition | 88/93 | the update call and its result — `statusChange` on the result, `activeForm` only on the input |
+| resumed run updates an uncreated task | 2/50/55 (`checklist-resume`) | the resumed init plus the call and result that move task 2 |
 
-`crates/harness/tests/capture_corpus/promoted_evidence.rs` asserts the payloads behind all
-three. That test exists because **the structural validator alone does not check them**: pointing
-a claim's selector at a neighbouring sequence left `--test capture_corpus` fully green until the
-payload assertions were added. A claim without one is decoration.
+`crates/harness/tests/capture_corpus/corpus_frames.rs` asserts the raw payloads behind the same
+sequences. That file exists because **presence alone does not prove content**: pointing a test's
+selector at a neighbouring sequence once left `--test capture_corpus` fully green until the
+payload assertions were added. A sequence number without one is decoration.
 
 ## The Codex half has no automated live check, deliberately
 

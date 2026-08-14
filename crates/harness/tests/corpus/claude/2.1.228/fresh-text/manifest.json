@@ -149,10 +149,5 @@
   },
   "scenario": "fresh-text",
   "schema_version": 1,
-  "source": "capture.json",
-  "consumers": [
-    "crates/harness/src/claude/wire.rs:the_ignore_list_covers_every_capture_confirmed_routine_frame",
-    "crates/harness/tests/fixtures/fake_claude.rs:diagnostics",
-    "crates/harness/tests/claude.rs:unclaimed_frames_surface_as_diagnostics_and_ignored_frames_stay_silent"
-  ]
+  "source": "capture.json"
 }

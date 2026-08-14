@@ -311,19 +311,5 @@
   },
   "scenario": "model-discovery",
   "schema_version": 1,
-  "source": "capture.json",
-  "consumers": [
-    "crates/harness/src/claude/discovery.rs:module capture facts",
-    "crates/harness/src/claude/discovery.rs:the_captured_reply_decodes_onto_curated_ids",
-    "crates/harness/src/claude/discovery.rs:DISCOVERY_ARGS",
-    "crates/harness/tests/fixtures/fake_claude.rs:INITIALIZE_REPLY",
-    "crates/harness/tests/claude.rs:models_come_back_live_and_merged",
-    "crates/harness/tests/claude.rs:live_cli_commands_include_this_repositorys_own_skills",
-    "crates/harness/src/claude/discovery.rs:the_captured_reply_deduplicates_aliases_and_keeps_a_live_only_row",
-    "crates/harness/src/claude/discovery.rs:the_default_alias_row_is_dropped",
-    "crates/harness/src/claude/discovery.rs:no_modality_field_means_the_provider_did_not_say",
-    "crates/harness/src/claude/discovery.rs:effort_levels_map_to_the_ladder_and_haiku_reports_none",
-    "crates/harness/src/claude/discovery.rs:INITIALIZE_LINE",
-    "crates/harness/src/claude/discovery.rs:initialize_reply"
-  ]
+  "source": "capture.json"
 }
