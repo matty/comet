@@ -64,37 +64,6 @@ pub(super) fn sanitized_payloads(events_bytes: &[u8]) -> Vec<Value> {
         .collect()
 }
 
-pub(super) fn claim_payloads(corpus_root: &Path, claim_id: &str) -> Vec<(String, Value)> {
-    let index: Value =
-        serde_json::from_slice(&std::fs::read(corpus_root.join("index.json")).unwrap()).unwrap();
-    let claim = index["claims"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|claim| claim["id"] == claim_id)
-        .unwrap_or_else(|| panic!("missing residual claim {claim_id}"));
-    let mut payloads = Vec::new();
-    for evidence in claim["evidence"].as_array().unwrap() {
-        let manifest = evidence["manifest"].as_str().unwrap();
-        let events_path = corpus_root.join(manifest).with_file_name("events.jsonl");
-        let events: Vec<Value> = std::fs::read_to_string(events_path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        for frame in evidence["frames"].as_array().unwrap() {
-            let sequence = frame["sequence"].as_u64().unwrap();
-            let event = events
-                .iter()
-                .find(|event| event["sequence"] == sequence)
-                .unwrap_or_else(|| panic!("{claim_id}: missing frame {sequence}"));
-            let payload = serde_json::from_str(event["payload"].as_str().unwrap()).unwrap();
-            payloads.push((event["channel"].as_str().unwrap().to_owned(), payload));
-        }
-    }
-    payloads
-}
-
 pub(super) fn write_valid_literal_corpus(root: &Path) {
     let scenario = root.join("claude/2.1.227/model-discovery");
     std::fs::create_dir_all(&scenario).unwrap();
