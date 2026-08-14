@@ -16,6 +16,7 @@ pub mod app_menus;
 pub mod appearance;
 pub mod approvals;
 pub mod attachments;
+pub mod badges;
 pub mod changes;
 pub mod comments;
 pub mod composer;
