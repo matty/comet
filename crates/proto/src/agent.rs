@@ -1084,8 +1084,16 @@ pub enum ToolCall {
     /// [`AgentEvent::ChecklistItemChanged`] folded into
     /// `MessagePart::Checklist`, because `TodoItem { text, done: bool }`
     /// cannot express `inProgress` — the one state a live checklist exists to
-    /// show. The tools that drive it (`TodoWrite`, `TaskCreate`, `TaskUpdate`)
-    /// still render as ordinary tool chips through [`ToolCall::Unknown`].
+    /// show. The tools that drive it (`TaskCreate`, `TaskUpdate`) still render
+    /// as ordinary tool chips through [`ToolCall::Unknown`].
+    ///
+    /// **This variant's survival has nothing to do with provider versions.**
+    /// `TodoWrite` was dropped from the adapters entirely once
+    /// `docs/testing/supported-provider-versions.md` set a floor no version of
+    /// which emits it. This stays regardless, because it is about DOCUMENTS —
+    /// a transcript written by an older Comet, read by any CLI. Provider
+    /// support and document-format support are different axes, and conflating
+    /// them is how a cleanup blanks somebody's history.
     Todo {
         #[serde(default)]
         items: Vec<TodoItem>,

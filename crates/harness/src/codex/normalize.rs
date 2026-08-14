@@ -269,51 +269,17 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
             },
             false,
         ),
-        // Never observed on 0.147.0 — every item in the 2026-08-13 capture was
-        // `agentMessage`, `commandExecution`, `reasoning` or `userMessage`, and
-        // Codex's plan travels as `turn/plan/updated` rather than as an item at
-        // all. Kept anyway, on `TodoWrite`'s reasoning: Comet does not pin the
-        // user's CLI version, and one run is not proof of absence.
+        // `todoList` is deliberately NOT decoded. It does not exist on the
+        // supported codex-cli (0.147.0, the floor in
+        // `docs/testing/supported-provider-versions.md`): every item in the
+        // 2026-08-13 capture was `agentMessage`, `commandExecution`,
+        // `reasoning` or `userMessage`, and Codex's plan travels as
+        // `turn/plan/updated` rather than as an item at all.
         //
-        // BOTH phases emit, deliberately. A replacement is idempotent — the
-        // second one restates the same list and the fold lands on the same
-        // result — whereas gating on `Started` drops the list entirely for a
-        // completion-only item, which is exactly what the app server sends for
-        // a `todoList` that was never streamed. Losing a plan is worse than
-        // folding it twice.
-        "todoList" | "todo_list" => {
-            let items: Vec<ChecklistItem> = item
-                .get("items")
-                .and_then(Value::as_array)
-                .map(|a| a.as_slice())
-                .unwrap_or_default()
-                .iter()
-                .enumerate()
-                .map(|(index, t)| ChecklistItem {
-                    // Positional, like the plan snapshot below: this is a
-                    // replacement, so an index is never matched against a
-                    // previously stored one.
-                    id: index.to_string(),
-                    text: Some(str_field(t, &["text"])),
-                    active_form: None,
-                    // The legacy `completed`/`done` boolean is the only status
-                    // this item shape was ever seen to carry, and it cannot
-                    // express `inProgress`. Absent means absent, not pending.
-                    status: match field(t, &["completed", "done"]).and_then(Value::as_bool) {
-                        Some(true) => ChecklistStatus::Completed,
-                        Some(false) => ChecklistStatus::Pending,
-                        None => ChecklistStatus::Unknown,
-                    },
-                })
-                .collect();
-            if items.is_empty() {
-                return Vec::new();
-            }
-            vec![AgentEvent::ChecklistReplaced {
-                explanation: None,
-                items,
-            }]
-        }
+        // It therefore falls through to the `other` arm below and raises an
+        // Unknown diagnostic, which is the honest answer for an item type no
+        // supported version sends: if one ever arrives, we hear about it
+        // rather than silently decoding a shape nobody has observed.
         "error" => vec![AgentEvent::Error {
             message: str_field(item, &["message"]),
         }],

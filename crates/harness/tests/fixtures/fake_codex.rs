@@ -1018,10 +1018,12 @@ fn happy(turn_line: &str, thread_line: &str, tid: &str) {
     emit(
         r#"{"method":"item/completed","params":{"item":{"id":"w1","type":"webSearch","query":"rust"}}}"#,
     );
-    // Completion-only lifecycle: must still open AND close the tool call.
-    emit(
-        r#"{"method":"item/completed","params":{"item":{"id":"td1","type":"todoList","items":[{"text":"a","completed":true},{"text":"b","completed":false}]}}}"#,
-    );
+    // A `todoList` item used to be emitted here to exercise the old
+    // `ToolCall::Todo` decode. It is gone: no supported codex-cli sends one
+    // (0.147.0 is the floor — `docs/testing/supported-provider-versions.md`),
+    // Codex's plan arrives as `turn/plan/updated`, and a fixture that keeps
+    // sending a shape no supported version produces makes the happy path
+    // raise a diagnostic that a real healthy run never would.
     // Streamed agentMessage: completed text must NOT re-emit.
     emit(
         r#"{"method":"item/completed","params":{"item":{"id":"m1","type":"agentMessage","text":"Hello world"}}}"#,

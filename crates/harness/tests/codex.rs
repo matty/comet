@@ -15,9 +15,9 @@ use comet_harness::{
     CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use comet_proto::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, ChecklistItem, ChecklistStatus,
-    DiagnosticSeverity, DoneStatus, FileOperation, HarnessId, NoticeKind, NoticeSeverity,
-    ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel, ToolCall, UserInputAnswer,
+    AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus, FileOperation,
+    HarnessId, NoticeKind, NoticeSeverity, ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel,
+    ToolCall, UserInputAnswer,
 };
 
 /// The `fake-codex` bin target, built by cargo alongside this test.
@@ -221,30 +221,10 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         is_error: false
     }));
 
-    // A completion-only `todoList` still yields its list. It is no longer a
-    // tool lifecycle at all — the plan is its own event now — so there is no
-    // `ToolCall`/`ToolResult` pair for it, and the legacy boolean maps onto the
-    // tri-state with `inProgress` unreachable from this item shape.
-    assert!(
-        events.contains(&AgentEvent::ChecklistReplaced {
-            explanation: None,
-            items: vec![
-                ChecklistItem {
-                    id: "0".into(),
-                    text: Some("a".into()),
-                    active_form: None,
-                    status: ChecklistStatus::Completed,
-                },
-                ChecklistItem {
-                    id: "1".into(),
-                    text: Some("b".into()),
-                    active_form: None,
-                    status: ChecklistStatus::Pending,
-                },
-            ],
-        }),
-        "{events:?}"
-    );
+    // No `todoList` assertion: the fixture no longer sends one, because no
+    // supported codex-cli does. Codex's plan reaches the checklist through
+    // `turn/plan/updated`, covered by `plan_tests` in
+    // `crates/harness/src/codex/normalize.rs`.
 
     // Streamed agentMessage must not re-emit its completed text…
     assert!(

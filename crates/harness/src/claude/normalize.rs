@@ -250,19 +250,24 @@ pub(crate) enum TaskCallKind {
     Create,
     Update,
     List,
-    /// The pre-2.1.229 tool. Kept because Comet resolves whatever CLI the user
-    /// has installed, and an older one still emits it — removing this decode
-    /// would be a regression, not a cleanup.
-    TodoWrite,
 }
 
 impl TaskCallKind {
+    /// `TodoWrite` is deliberately absent. It does not exist on any supported
+    /// Claude Code — not on 2.1.229 and not on 2.1.228, the floor recorded in
+    /// `docs/testing/supported-provider-versions.md`. Decoding a tool no
+    /// supported CLI can send is a path that ships never having been
+    /// constructed, which is the exact failure
+    /// `.agents/rules/optional-wire-fields.md` exists to prevent.
+    ///
+    /// This says nothing about `ToolCall::Todo`, which survives for a
+    /// different reason entirely — documents written before this branch, on
+    /// any CLI. See that variant's own doc comment.
     fn from_tool_name(name: &str) -> Option<Self> {
         match name {
             "TaskCreate" => Some(Self::Create),
             "TaskUpdate" => Some(Self::Update),
             "TaskList" => Some(Self::List),
-            "TodoWrite" => Some(Self::TodoWrite),
             _ => None,
         }
     }
@@ -340,38 +345,6 @@ fn checklist_event_from_task_call(
                 text: None,
                 active_form: opt_str_field(input, "activeForm"),
                 status,
-            })
-        }
-        TaskCallKind::TodoWrite => {
-            // The whole list on the INPUT, in one call — the shape the newer
-            // task tools replaced. The result confirms nothing this needs, and
-            // is consulted only so a failed call moves nothing.
-            //
-            // Its `status` is already the same tri-state string
-            // (`pending` / `in_progress` / `completed`). The old
-            // `TodoItem { done: bool }` decode read it as
-            // `status == "completed"`, which is what flattened `in_progress`
-            // into "not done" — the wire always carried it.
-            let todos = input.get("todos")?.as_array()?;
-            let items = todos
-                .iter()
-                .enumerate()
-                .map(|(index, t)| ChecklistItem {
-                    // `TodoWrite` numbers nothing: the list IS the order, and
-                    // every call restates all of it. Positional ids are safe
-                    // here for the same reason they are for Codex — this only
-                    // ever produces a whole-list replacement.
-                    id: index.to_string(),
-                    text: opt_str_field(t, "content"),
-                    active_form: opt_str_field(t, "activeForm"),
-                    status: opt_str_field(t, "status")
-                        .as_deref()
-                        .map_or(ChecklistStatus::Unknown, checklist_status_from_claude),
-                })
-                .collect::<Vec<_>>();
-            (!items.is_empty()).then_some(AgentEvent::ChecklistReplaced {
-                explanation: None,
-                items,
             })
         }
         TaskCallKind::List => {
@@ -2324,39 +2297,36 @@ mod tests {
     }
 
     #[test]
-    fn todo_write_still_works_and_no_longer_flattens_in_progress() {
-        // The legacy tool on an older installed CLI. Its `status` was ALWAYS
-        // the same tri-state string — the old decode read it as
-        // `status == "completed"` into a bool, which is what lost
-        // `in_progress`. Nothing about the wire changed; the type did.
-        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tw1","name":"TodoWrite","input":{"todos":[{"content":"Read the file","status":"completed"},{"content":"Count the lines","status":"in_progress"},{"content":"Report","status":"pending"}]}}]},"parent_tool_use_id":null}"#;
+    fn todo_write_publishes_no_checklist_on_a_supported_cli() {
+        // `TodoWrite` exists on NO supported Claude Code — absent from 2.1.229
+        // and from 2.1.228, the floor in
+        // `docs/testing/supported-provider-versions.md`. Decoding it would be
+        // a path that ships never having been constructed.
+        //
+        // If it ever reappears this is the test that will fail, which is the
+        // point: it is a statement about supported versions, not about the
+        // tool being impossible.
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tw1","name":"TodoWrite","input":{"todos":[{"content":"Read the file","status":"completed"},{"content":"Count the lines","status":"in_progress"}]}}]},"parent_tool_use_id":null}"#;
         let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tw1","type":"tool_result","content":"Todos updated"}]},"parent_tool_use_id":null,"tool_use_result":{"ok":true}}"#;
         let mut n = Normalizer::new(RuntimeMode::default());
         let events = drive(&mut n, &[call, result]);
         assert!(
-            events.contains(&AgentEvent::ChecklistReplaced {
-                explanation: None,
-                items: vec![
-                    ChecklistItem {
-                        id: "0".into(),
-                        text: Some("Read the file".into()),
-                        active_form: None,
-                        status: ChecklistStatus::Completed,
-                    },
-                    ChecklistItem {
-                        id: "1".into(),
-                        text: Some("Count the lines".into()),
-                        active_form: None,
-                        status: ChecklistStatus::InProgress,
-                    },
-                    ChecklistItem {
-                        id: "2".into(),
-                        text: Some("Report".into()),
-                        active_form: None,
-                        status: ChecklistStatus::Pending,
-                    },
-                ],
-            }),
+            !events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ChecklistReplaced { .. } | AgentEvent::ChecklistItemChanged { .. }
+            )),
+            "{events:?}"
+        );
+        // It still renders, as an ordinary unknown-tool chip — the call is not
+        // swallowed, only its list is not interpreted.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolCall {
+                    call: ToolCall::Unknown { name, .. },
+                    ..
+                } if name == "TodoWrite"
+            )),
             "{events:?}"
         );
     }
