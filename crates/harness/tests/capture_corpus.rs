@@ -1,4 +1,5 @@
 mod capture_corpus {
+    mod consumed;
     mod corpus_validation;
     mod promoted_evidence;
     mod sanitizer_publication;
