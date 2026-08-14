@@ -143,6 +143,16 @@ pub fn shell_title(shell: &str) -> String {
     }
 }
 
+/// Resolve a tab label from the running program's OSC 0/2 title, falling
+/// back to the stable sequential label when the title is absent or blank.
+fn resolved_tab_title(osc_title: Option<&str>, fallback: &str) -> String {
+    osc_title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
 fn decode_base64(data: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
         .decode(data)
@@ -316,6 +326,13 @@ impl TerminalPanel {
         cx.notify();
     }
 
+    /// A tab's display label: the live OSC 0/2 title when the running
+    /// program set one (shells title themselves with the cwd / running
+    /// command — the contextual name, user request), else the fixed
+    /// "Terminal N".
+    fn display_title(tab: &TerminalTab) -> SharedString {
+        resolved_tab_title(tab.emulator.title(), tab.title.as_ref()).into()
+    }
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
         let (selected, unavailable) = {
             let state = self.state.read(cx);
@@ -1073,9 +1090,10 @@ impl TerminalPanel {
                     .map(|(ix, tab)| {
                         let selected = ix == active;
                         let key = tab.key;
-                        // Fixed sequential label (comet: "Terminal N") — the
-                        // OSC title never replaces it.
-                        let title = tab.title.clone();
+                        // Contextual label (user request): the OSC title —
+                        // the shell's own cwd/command name — wins over the
+                        // fixed "Terminal N" fallback.
+                        let title = Self::display_title(tab);
                         let exited = tab.exited.is_some();
                         (ix, key, title, selected, exited)
                     })
@@ -1467,6 +1485,16 @@ mod tests {
         assert_eq!(shell_title("C:\\Windows\\System32\\cmd.exe"), "cmd.exe");
         assert_eq!(shell_title("bash"), "bash");
         assert_eq!(shell_title(""), "terminal");
+    }
+
+    #[test]
+    fn tab_title_prefers_a_nonempty_osc_title() {
+        assert_eq!(
+            resolved_tab_title(Some("  cargo test  "), "Terminal 1"),
+            "cargo test"
+        );
+        assert_eq!(resolved_tab_title(Some("   "), "Terminal 1"), "Terminal 1");
+        assert_eq!(resolved_tab_title(None, "Terminal 1"), "Terminal 1");
     }
 
     #[test]
