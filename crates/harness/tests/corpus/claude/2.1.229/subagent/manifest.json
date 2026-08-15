@@ -2392,102 +2392,6 @@
     {
       "kind": "v",
       "placeholder": "<V349>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V350>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V351>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V352>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V353>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V354>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V355>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V356>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V357>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V358>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V359>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V360>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V361>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V362>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V363>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V364>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V365>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V366>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V367>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V368>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V369>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V370>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V371>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V372>"
-    },
-    {
-      "kind": "v",
-      "placeholder": "<V373>"
     }
   ],
   "platform": {
@@ -2500,7 +2404,7 @@
     "machine": 232,
     "request": 19,
     "session": 232,
-    "v": 914
+    "v": 915
   },
   "scenario": "subagent",
   "schema_version": 1,
