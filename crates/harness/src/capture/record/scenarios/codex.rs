@@ -519,11 +519,11 @@ mod tests {
     ///
     /// Ported from `recording.rs`, renamed from `..._records_the_explicit_script` — `CodexRunScript`
     /// no longer names what runs, the scenario functions do. `fresh_text`'s real prompt ("Reply with
-    /// the single word capture.") matches no branch in `fake_codex.rs`, so this exercises the
-    /// fixture's `fail_turn` fallback ("unknown scenario" -> `turn/failed`), not a modelled success
-    /// transcript — the same situation `record/scenarios/claude.rs`'s
-    /// `recorder_claude_run_records_the_exact_initial_write` documents for Claude. The methods
-    /// asserted below are only what we send, so the fallback still proves them.
+    /// the single word capture.") now has its own branch in `fake_codex.rs` (`simple_completed`,
+    /// additive alongside the pre-existing `scenario:capture-fresh` test marker, same rationale as
+    /// the `steer`/`interrupt` matches below), so this drives a genuine modelled `turn/completed`
+    /// transcript rather than the fixture's generic `fail_turn` fallback — the pin below fails
+    /// loudly if that dispatch match ever stops matching and the fallback quietly took over.
     #[tokio::test]
     async fn recorder_codex_run_records_the_explicit_scenario() {
         let raw = tempfile::tempdir().unwrap();
@@ -556,6 +556,16 @@ mod tests {
         assert_eq!(
             methods,
             ["initialize", "initialized", "thread/start", "turn/start"]
+        );
+        // Pinned to `simple_completed`'s exact terminal frame, per its own literal in
+        // `fake_codex.rs` — `fail_turn`'s fallback emits a *different* terminal id ("t-bad") and
+        // method ("turn/failed"), so a fallthrough (the prompt match silently stopping) fails this
+        // assertion instead of satisfying it by coincidence.
+        let stdout = channel_payloads(&capture, Channel::Stdout);
+        assert!(
+            stdout.contains(&r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#),
+            "the fake-codex simple_completed() branch must have run, not the unknown-scenario \
+             fallthrough: {stdout:?}"
         );
         assert_eq!(capture.exit_code, Some(0));
     }
@@ -785,6 +795,53 @@ mod tests {
             error
                 .to_string()
                 .contains("rejected the requested thread resume")
+        );
+    }
+
+    /// Break caught: `resume` hand-builds the `thread/resume` params instead of calling the
+    /// production `crate::codex::thread_resume_params`, or passes the wrong id.
+    /// `codex_resume_never_falls_back_to_a_fresh_thread` above only drives the rejection branch
+    /// (`resume_thread`'s bail on an error reply) and never inspects what was actually sent; this
+    /// covers the success path, the same gap `recorder_codex_run_preserves_production_linked_worktree_parameters`
+    /// leaves for `thread/start`/`turn/start` closed by driving the real function rather than
+    /// asserting a production helper against itself.
+    #[tokio::test]
+    async fn resume_sends_the_production_thread_resume_params() {
+        let raw = tempfile::tempdir().unwrap();
+        let executable = fixture_path("fake-codex");
+        let input = ScenarioInput {
+            resume_id: Some("resume-success".into()),
+            ..ScenarioInput::default()
+        };
+        let launch = resume_launch(&input, &executable).unwrap();
+        let cfg = config(
+            "codex-resume-success",
+            executable,
+            CaptureOperation::Codex(CodexCaptureOperation::Run {
+                request: resume_request(&input).unwrap(),
+                script: CodexRunScript::Resume,
+            }),
+            raw.path(),
+        );
+        let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
+            .await
+            .unwrap();
+
+        resume(&mut session, &input).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let capture = session.finish(deadline).await.unwrap();
+
+        let stdin: Vec<Value> = channel_payloads(&capture, Channel::Stdin)
+            .into_iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let resume_line = stdin
+            .iter()
+            .find(|line| line["method"] == "thread/resume")
+            .expect("a thread/resume line was sent");
+        assert_eq!(
+            resume_line["params"],
+            crate::codex::thread_resume_params(&resume_request(&input).unwrap(), "resume-success")
         );
     }
 }

@@ -342,56 +342,78 @@ impl RecordingSession {
         }
     }
 
-    async fn claude_run(&mut self, request: RunRequest) -> anyhow::Result<()> {
-        // Every Claude run script — `fresh-text`/`attachment`/`resume`/
-        // `checklist`/`checklist-resume`/`approval` — is ported to
-        // `record/scenarios/claude.rs` (including the attachment's
-        // must-inline-an-image check and, as of this task, the approval
-        // driving loop). `Approval` was the last one with script-specific
-        // handling left here (the `ClaudeApprovalState` accounting and its
-        // frame validators, deleted along with `capture/approval/claude.rs`
-        // per design §3.2), so this function is now the same
-        // "write the line, wait for the terminal result" shape for every
-        // script, still driven here only until the SCENARIOS table wires
-        // these scenarios in (Task 7).
-        let images = crate::claude::load_image_blocks(&request.attachments).await;
-        let line = crate::claude::wire::user_message_line_with_images(&request.prompt, &images);
-        self.write_line(&line).await?;
-        while let Some(line) = self.next_stdout().await? {
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if value["type"] == "result" {
-                if value["subtype"] != "success" {
-                    bail!("Claude ended the capture without a successful terminal result.");
-                }
-                return Ok(());
-            }
-        }
-        protocol_stopped("Claude", "terminal result")
+    /// Every Claude run script — `fresh-text`/`attachment`/`resume`/`checklist`/
+    /// `checklist-resume`/`approval`, i.e. every `ClaudeRunScript` variant — is now ported to
+    /// `record/scenarios/claude.rs`. Nothing reaches this function through a real capture any
+    /// more: `capture::record()` (the new `record/` module) still falls back to
+    /// `recording::record` for every `Run` operation until the SCENARIOS table is wired in (Task
+    /// 7), and `comet-provider-capture.rs` still constructs and dispatches all six scripts, so
+    /// the fallback route stays live traffic, not dead code — an accidental invocation here would
+    /// otherwise silently drive a duplicate, unreviewed implementation of already-ported behavior
+    /// against a real (token-spending) CLI. Bailing immediately, before a single line reaches the
+    /// child's stdin, costs nothing: the process was already spawned by
+    /// `RecordingSession::start`, but `finish()`'s `DriverError` path (`terminate_and_reap`) kills
+    /// it having sent no prompt, so no tokens are spent. This entire function is dead weight that
+    /// Task 7 deletes along with the rest of `recording.rs`.
+    async fn claude_run(&mut self, _request: RunRequest) -> anyhow::Result<()> {
+        bail!(
+            "Claude run scenarios are ported to record/scenarios/claude.rs and are not driven \
+             from here any more; the SCENARIOS table wires them into capture::record in Task 7."
+        );
     }
 
     /// Approval and on-request approval only, from this task onward:
     /// `fresh-text`/`resume`/`steer`/`interruption` moved to
     /// `record/scenarios/codex.rs`'s `fresh_text`/`resume`/`steer`/
-    /// `interruption` (not yet reachable from production code — the
-    /// SCENARIOS table only gains their rows in Task 7). Everything that
-    /// existed here only to serve those four — the `thread/resume` vs
-    /// `thread/start` selection, the resume-identity bail, the scripted
-    /// steer/interrupt send and its reply bookkeeping, and the terminal-frame
-    /// bail for anything but `Approval`/`ApprovalOnRequest` — is deleted
-    /// along with them, not merely superseded: the resume-rejection bail and
-    /// the generic "must end in turn/completed" bail were themselves exactly
-    /// the "frame check that aborts" class this stage's design removes
-    /// (§3.2), and the ported `resume`/`steer`/`interruption` reproduce the
-    /// parts of that which are driving rather than validating (see their own
-    /// doc comments). `Approval`/`ApprovalOnRequest` keep every one of their
-    /// validators untouched — Task 6's scope, not this one's.
+    /// `interruption`. Everything that existed here only to serve those four
+    /// — the `thread/resume` vs `thread/start` selection, the resume-identity
+    /// bail, the scripted steer/interrupt send and its reply bookkeeping, and
+    /// the terminal-frame bail for anything but `Approval`/`ApprovalOnRequest`
+    /// — is deleted along with them, not merely superseded: the
+    /// resume-rejection bail and the generic "must end in turn/completed"
+    /// bail were themselves exactly the "frame check that aborts" class this
+    /// stage's design removes (§3.2), and the ported `resume`/`steer`/
+    /// `interruption` reproduce the parts of that which are driving rather
+    /// than validating (see their own doc comments). `Approval`/
+    /// `ApprovalOnRequest` keep every one of their validators untouched —
+    /// Task 6's scope, not this one's.
+    ///
+    /// The four ported scripts still reach this function through live
+    /// traffic: `capture::record()` falls back to `recording::record` for
+    /// every `Run` operation until the SCENARIOS table is wired in (Task 7),
+    /// and `comet-provider-capture.rs` still constructs and dispatches all
+    /// six `CodexRunScript` values, `Resume`/`Steer`/`Interruption` included.
+    /// Without an explicit bail, this stripped-down body would silently
+    /// mis-drive them: `Resume` would send `thread/start` and record a fresh
+    /// thread archived as a resume (the exact mislabeling
+    /// `codex_resume_never_falls_back_to_a_fresh_thread` exists to catch,
+    /// just reached through the fallback path that test does not cover),
+    /// `Steer`/`Interruption` would never send their action at all, and the
+    /// bare `_ => {}` in the terminal match below would let all three exit 0
+    /// — a clean-looking, wrong archive with no signal, spending real
+    /// provider tokens to produce it. Bailing first, before a single line
+    /// reaches the child's stdin, costs nothing: `RecordingSession::start`
+    /// already spawned the process, but `finish()`'s `DriverError` path
+    /// (`terminate_and_reap`) kills it having sent no prompt. This bail and
+    /// everything below it for `FreshText`/`Resume`/`Steer`/`Interruption`
+    /// disappears with the rest of `recording.rs` in Task 7.
     async fn codex_run(
         &mut self,
         request: RunRequest,
         script: CodexRunScript,
     ) -> anyhow::Result<()> {
+        if matches!(
+            script,
+            CodexRunScript::FreshText
+                | CodexRunScript::Resume
+                | CodexRunScript::Steer
+                | CodexRunScript::Interruption
+        ) {
+            bail!(
+                "Codex {script:?} is ported to record/scenarios/codex.rs and is not driven from \
+                 here any more; the SCENARIOS table wires it into capture::record in Task 7."
+            );
+        }
         let mut next_id = 1_u64;
         self.write_line(&codex_initialize_line()).await?;
         self.codex_reply(next_id).await?;
@@ -920,36 +942,37 @@ mod tests {
     #[cfg(windows)]
     use super::record;
     use crate::capture::test_support::{config, fixture_path};
-    use crate::capture::{CaptureOperation, ClaudeCaptureOperation, ClaudeRunScript, sanitize_dir};
-    #[cfg(windows)]
-    use crate::capture::{CodexCaptureOperation, CodexRunScript};
+    use crate::capture::{
+        CaptureOperation, ClaudeCaptureOperation, ClaudeRunScript, CodexCaptureOperation,
+        CodexRunScript, sanitize_dir,
+    };
 
     const APPROVAL_MARKER_NAME: &str = "capture-marker.txt";
 
-    /// Break caught: a driving failure is discarded after a paid provider run, leaving no
-    /// reviewable transcript even though the child was safely stopped before reply.
+    /// Break caught: a driving failure is discarded after a provider spawn, leaving no
+    /// quarantine trail even though the child was safely stopped before ever being written to.
     ///
-    /// The original trigger here was the deleted Claude approval validator's "unexpected tool or
-    /// order" bail (`capture::approval::claude`, removed by the task that ported `approval` to
-    /// `record/scenarios/claude.rs`). That validator, and every other frame check it made, is
-    /// gone — `claude_run` no longer inspects approval content at all, so it cannot be
-    /// re-triggered, and the old fixture (which waited for a reply `claude_run` no longer sends)
-    /// would just hang until the test's own timeout instead of failing. The fixture and
-    /// assertions below moved to a failure mode that still exists post-deletion — the provider's
-    /// stdout ending before a terminal `result` frame ever arrives — because what this test
-    /// actually proves (a driver failure quarantines its partial evidence instead of losing it)
-    /// is unrelated to which specific error produced the failure.
+    /// Retargeted by the task that made `claude_run` an unconditional fail-fast bail (every
+    /// `ClaudeRunScript` is ported to `record/scenarios/claude.rs`, so nothing here drives a real
+    /// turn any more — see `claude_run`'s own doc comment). The original trigger — a fixture
+    /// stopping before a terminal `result` frame, after partial transcript content — is no longer
+    /// reachable at all: `claude_run` now bails before writing a single line, so there is no
+    /// transcript left to preserve. What this test proves instead, and what still matters, is
+    /// that the fail-fast bail is STILL correctly classified as a driver failure and STILL
+    /// quarantines rather than silently discarding: the spawned child is killed, no `capture.json`
+    /// is published, and a `partial-capture.json` is written (with zero events, since nothing was
+    /// ever sent or received) that the sanitizer still refuses to treat as complete.
     #[tokio::test]
-    async fn recorder_quarantines_partial_approval_evidence_after_cleanup() {
+    async fn recorder_quarantines_evidence_after_claude_run_fail_fast() {
         let raw = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let request = RunRequest {
-            prompt: "scenario:capture-protocol-violation".into(),
+            prompt: "capture".into(),
             cwd: cwd.path().display().to_string(),
             ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
         };
         let mut session = RecordingSession::start(config(
-            "claude-approval-partial",
+            "claude-fail-fast",
             fixture_path("fake-claude"),
             CaptureOperation::Claude(ClaudeCaptureOperation::Run {
                 request,
@@ -966,7 +989,8 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "Claude stopped before the expected terminal result. Retry with a current CLI version."
+            "Claude run scenarios are ported to record/scenarios/claude.rs and are not driven \
+             from here any more; the SCENARIOS table wires them into capture::record in Task 7."
         );
         assert!(!process_is_live(pid), "provider child {pid} remains live");
         assert!(!cwd.path().join(APPROVAL_MARKER_NAME).exists());
@@ -980,23 +1004,8 @@ mod tests {
         assert_eq!(partial["failure_class"], "driver_error");
         let events = partial["events"].as_array().unwrap();
         assert!(
-            events.iter().any(|event| {
-                event["channel"] == "stdout"
-                    && event["payload"]
-                        .as_str()
-                        .is_some_and(|payload| payload.contains("toolu_bash"))
-            }),
-            "the transcript recorded before the failure must survive in the quarantine: {events:?}"
-        );
-        let stdin_events: Vec<_> = events
-            .iter()
-            .filter(|event| event["channel"] == "stdin")
-            .collect();
-        assert_eq!(
-            stdin_events.len(),
-            1,
-            "claude_run answers nothing any more, so only the initial user line reaches stdin: \
-             {stdin_events:?}"
+            events.is_empty(),
+            "the fail-fast bail must write nothing to the child's stdin before erroring: {events:?}"
         );
 
         let staging = raw
@@ -1008,6 +1017,47 @@ mod tests {
             "unexpected sanitizer error: {sanitize_error}"
         );
         assert!(!staging.exists());
+    }
+
+    /// Break caught: `codex_run`'s fail-fast for an already-ported script (`FreshText`/`Resume`/
+    /// `Steer`/`Interruption`) regresses to driving a real turn again through this stripped-down
+    /// body — the live-traffic hazard `codex_run`'s own doc comment describes: `capture::record()`
+    /// still falls back to this exact path for every Codex `Run` operation until the SCENARIOS
+    /// table is wired in (Task 7), and `comet-provider-capture.rs` still constructs and dispatches
+    /// all six `CodexRunScript` values, so a regression here would silently mis-drive a real,
+    /// token-spending capture (see `codex_run`'s doc comment for the specific mislabeling each
+    /// script would produce). Covers `Resume` — the sharpest case, since its old branch chose
+    /// `thread/resume` vs `thread/start` on `script`, the exact selection now bailed out before it
+    /// can run.
+    #[tokio::test]
+    async fn recorder_bails_before_a_ported_codex_script_reaches_the_old_driver() {
+        let raw = tempfile::tempdir().unwrap();
+        let request = RunRequest {
+            prompt: "capture".into(),
+            cwd: std::env::temp_dir().display().to_string(),
+            ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
+        };
+        let mut session = RecordingSession::start(config(
+            "codex-fail-fast",
+            fixture_path("fake-codex"),
+            CaptureOperation::Codex(CodexCaptureOperation::Run {
+                request,
+                script: CodexRunScript::Resume,
+            }),
+            raw.path(),
+        ))
+        .await
+        .unwrap();
+        let pid = session.child_id().expect("spawned child id");
+
+        let error = session.finish().await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Codex Resume is ported to record/scenarios/codex.rs and is not driven from here \
+             any more; the SCENARIOS table wires it into capture::record in Task 7."
+        );
+        assert!(!process_is_live(pid), "provider child {pid} remains live");
     }
 
     /// Break caught: a directory containing a successful-looking `capture.json` can bypass the

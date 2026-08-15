@@ -330,7 +330,13 @@ fn main() {
         capture_on_request(&mut stdin, &turn_line, &tid, json!(401), false);
     } else if turn_line.contains("scenario:capture-approval") {
         capture_approval(&mut stdin, &tid);
-    } else if turn_line.contains("scenario:capture-fresh") {
+    } else if turn_line.contains("scenario:capture-fresh")
+        // Additive alongside the `scenario:capture-fresh` test marker, same
+        // rationale as the `steer`/`interrupt` branches below — the real
+        // production prompt from `record/scenarios/codex.rs`'s
+        // `fresh_text_request`.
+        || turn_line.contains("Reply with the single word capture.")
+    {
         simple_completed(&tid);
     } else if turn_line.contains("scenario:happy") {
         happy(&turn_line, &thread_line, &tid);
