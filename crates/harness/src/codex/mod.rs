@@ -26,7 +26,7 @@
 //!   escalating to SIGTERM → SIGKILL if the child is unresponsive; the stream
 //!   always ends with `Done { status: Interrupted }`.
 
-mod approval;
+pub(crate) mod approval;
 mod catalog;
 pub(crate) mod discovery;
 mod normalize;

@@ -1,7 +1,7 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail};
-use comet_proto::{ReasoningLevel, RunRequest, RuntimeMode};
+use comet_proto::{ApprovalDecision, ReasoningLevel, RunRequest, RuntimeMode};
 use serde_json::{Value, json};
 
 use crate::capture::record::provider::CaptureProvider;
@@ -441,14 +441,23 @@ pub(in crate::capture::record) fn approval_launch(
     ))
 }
 
+/// Shared by `approval_on_request_request` and `approval_on_request`'s own
+/// grant-time recheck (below): both need `input.approval_target`, and
+/// duplicating the "needs an --approval-target" error text in two places
+/// would let them drift.
+#[allow(dead_code)]
+fn require_approval_target(input: &ScenarioInput) -> anyhow::Result<PathBuf> {
+    input
+        .approval_target
+        .clone()
+        .ok_or_else(|| anyhow!("The approval-on-request scenario needs an --approval-target."))
+}
+
 // Called once by `approval_on_request_launch`, once by `approval_on_request`
 // — see the note on `fresh_text_request` above.
 #[allow(dead_code)]
 fn approval_on_request_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
-    let target = input
-        .approval_target
-        .clone()
-        .ok_or_else(|| anyhow!("The approval-on-request scenario needs an --approval-target."))?;
+    let target = require_approval_target(input)?;
     Ok(cheap_codex_request(
         &crate::capture::approval::approval_on_request_prompt(&target),
         input,
@@ -487,6 +496,13 @@ pub(in crate::capture::record) fn approval_on_request_launch(
 /// `codex_approval_ids`, and everything upstream of them) did. Shared by both
 /// scenario bodies below because recognizing "this is an approval request"
 /// does not depend on which of the two scenarios is running.
+///
+/// Answering *every* recognized method unconditionally — rather than only
+/// the one each scenario expects — is deliberate, not an oversight: an
+/// approval left unanswered blocks the turn until the recorder's own hard
+/// timeout kills it, destroying a paid-for capture. Per design §3.2 that is
+/// the exact outcome a driver must avoid; auto-answering (subject to the
+/// grant-time recheck in `answer_every_approval` below) is the safe failure.
 #[allow(dead_code)]
 fn pending_approval(frame: &Value) -> Option<Value> {
     let method = frame["method"].as_str()?;
@@ -497,32 +513,30 @@ fn pending_approval(frame: &Value) -> Option<Value> {
     (!id.is_null()).then(|| id.clone())
 }
 
-/// The `accept` reply for one approval request.
-///
-/// Production builds this envelope in `codex::rpc::RpcClient::respond`
-/// (`crates/harness/src/codex/rpc.rs:105-108`:
-/// `json!({"jsonrpc":"2.0","id":id,"result":result})`), and maps a real
-/// "allow" decision to the literal `"accept"` in
-/// `codex::approval::decision_literal`
-/// (`crates/harness/src/codex/approval.rs:256-265`:
-/// `ApprovalDecision::Allow | ApprovalDecision::AllowForSession => "accept"`).
-/// Neither is reachable from here: `codex/mod.rs` declares `mod approval;`
-/// and `mod rpc;` with no visibility keyword, so both stay private to
-/// `crate::codex` and its descendants — unlike `claude::wire`'s line
-/// builders, which `record/scenarios/claude.rs`'s `approval` calls directly
-/// (`control_response_line`/`allow_response` are `pub`). There is no
-/// crate-external production helper to route this through, so the envelope
-/// is hand-written here, pinned to both file:line above so a future reader
-/// can check it hasn't drifted.
+/// The reply for one approval request: the JSON-RPC envelope every scenario
+/// in this file hand-builds (same as `rpc_request` for a request line), but
+/// the `"decision"` literal itself — the one piece production owns and the
+/// one piece that can silently drift — routed through the real
+/// `codex::approval::decision_literal` (`crates/harness/src/codex/approval.rs:256`),
+/// the same function `codex/mod.rs:1343`'s `handle_server_request` calls for
+/// a real "allow"/"decline" reply. `codex::approval` is `pub(crate)`
+/// specifically so this can reach it — see that module declaration's own
+/// comment in `codex/mod.rs`.
 #[allow(dead_code)]
-fn accept_response(id: Value) -> String {
-    json!({"jsonrpc": "2.0", "id": id, "result": {"decision": "accept"}}).to_string()
+fn decision_response(id: Value, decision: &ApprovalDecision) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {"decision": crate::codex::approval::decision_literal(decision)},
+    })
+    .to_string()
 }
 
 /// Pump frames, answering every approval request `pending_approval`
 /// recognizes, until the provider's own terminal turn notification ends the
 /// loop. Shared by `approval` and `approval_on_request`, which differ only in
-/// which request they start (see each function's own doc comment).
+/// which request they start and which `recheck` they pass (see each
+/// function's own doc comment).
 ///
 /// No count, no order, no item-type check, no command-text check: the
 /// deleted `CodexApprovalState`/`CodexOnRequestState` and the validators that
@@ -534,8 +548,19 @@ fn accept_response(id: Value) -> String {
 /// paid-for capture. Per design §3.2, only driving survives here: notice a
 /// request, answer it, keep going, and stop only when the provider itself
 /// says the turn is over.
+///
+/// `recheck` is the one exception, and it is not a frame validator: it
+/// re-verifies the pre-spawn fence's environment guarantee — the cwd or
+/// approval target the fence validated before spawn — still holds at the
+/// exact moment a write is about to be granted, closing the TOCTOU window
+/// between spawn and this grant. `recheck` never reads the frame; it reads
+/// the filesystem. On failure this declines the write instead of aborting
+/// the capture: no unsafe write is granted, and the tape survives.
 #[allow(dead_code)]
-async fn answer_every_approval(session: &mut Session<CodexProvider>) -> anyhow::Result<()> {
+async fn answer_every_approval(
+    session: &mut Session<CodexProvider>,
+    mut recheck: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     loop {
         let Some(frame) = session.next_frame().await? else {
             return protocol_stopped("Codex", "an approval request or a turn end");
@@ -544,7 +569,13 @@ async fn answer_every_approval(session: &mut Session<CodexProvider>) -> anyhow::
             return Ok(());
         }
         if let Some(id) = pending_approval(&frame) {
-            session.send(&accept_response(id)).await?;
+            let decision = match recheck() {
+                Ok(()) => ApprovalDecision::Allow,
+                Err(err) => ApprovalDecision::Deny {
+                    message: err.to_string(),
+                },
+            };
+            session.send(&decision_response(id, &decision)).await?;
         }
     }
 }
@@ -554,6 +585,13 @@ async fn answer_every_approval(session: &mut Session<CodexProvider>) -> anyhow::
 /// until the turn ends. Ported from `recording.rs`'s deleted `codex_run`
 /// `CodexRunScript::Approval` arm, minus every validator listed on
 /// `answer_every_approval`'s doc comment.
+///
+/// The grant-time recheck re-verifies the cwd's identity against
+/// `session.fence.approval_cwd_identity` — the value the (not-yet-wired,
+/// Task 8) pre-spawn fence records — with `require_marker_absent: true`,
+/// matching what the deleted `codex_run` checked immediately before
+/// accepting. Unlike that deleted code, a mismatch here declines the grant
+/// instead of aborting the whole capture.
 #[allow(dead_code)]
 pub(in crate::capture::record) async fn approval(
     session: &mut Session<CodexProvider>,
@@ -563,20 +601,31 @@ pub(in crate::capture::record) async fn approval(
     let request = approval_request(input);
     let thread_id = start_thread(session, &request).await?;
     start_turn(session, &request, &thread_id).await?;
-    answer_every_approval(session).await
+    let cwd = PathBuf::from(&request.cwd);
+    let expected_cwd_identity = session.fence.approval_cwd_identity.clone();
+    answer_every_approval(session, move || {
+        crate::capture::approval::validate_ordinary_approval_cwd(
+            &cwd,
+            expected_cwd_identity.as_ref(),
+            true,
+        )
+        .map(|_identity| ())
+    })
+    .await
 }
 
 /// Same shape as [`approval`], differing only in which request it starts
 /// (`approval_on_request_request`, built from `input.approval_target` rather
-/// than `input.cwd`) and therefore which approval method Codex ends up
-/// asking about (`item/commandExecution/requestApproval` rather than
+/// than `input.cwd`), which approval method Codex ends up asking about
+/// (`item/commandExecution/requestApproval` rather than
 /// `item/fileChange/requestApproval`) — `answer_every_approval` does not need
-/// to know which one it is answering. Ported from `recording.rs`'s deleted
-/// `codex_run` `CodexRunScript::ApprovalOnRequest` arm, minus every validator
-/// listed on `answer_every_approval`'s doc comment, including the mid-loop
-/// `require_empty_approval_target` recheck: decision #6 in the stage plan
-/// scopes the surviving pre-spawn fence to checks that "run before spawn,"
-/// and a recheck from inside this frame loop runs after it.
+/// to know which one it is answering — and which grant-time recheck it
+/// passes: `require_empty_approval_target` against
+/// `session.fence.approval_target_identity`, matching what the deleted
+/// `codex_run` checked immediately before accepting an on-request approval.
+/// Ported from `recording.rs`'s deleted `codex_run` `CodexRunScript::ApprovalOnRequest`
+/// arm, minus every validator listed on `answer_every_approval`'s doc
+/// comment.
 #[allow(dead_code)]
 pub(in crate::capture::record) async fn approval_on_request(
     session: &mut Session<CodexProvider>,
@@ -586,7 +635,16 @@ pub(in crate::capture::record) async fn approval_on_request(
     let request = approval_on_request_request(input)?;
     let thread_id = start_thread(session, &request).await?;
     start_turn(session, &request, &thread_id).await?;
-    answer_every_approval(session).await
+    let target = require_approval_target(input)?;
+    let expected_target_identity = session.fence.approval_target_identity.clone();
+    answer_every_approval(session, move || {
+        crate::capture::approval::require_empty_approval_target(
+            &target,
+            expected_target_identity.as_ref(),
+        )
+        .map(|_identity| ())
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1053,27 +1111,62 @@ mod tests {
         );
     }
 
+    /// Parses every stdin line as JSON and splits it into the `turn/start` request (used to pin
+    /// prompt/mode/model/target) and the approval decisions (anything carrying
+    /// `result.decision`), in send order. Shared by every test below so the parsing itself can't
+    /// drift between them.
+    fn turn_start_and_decisions(capture: &crate::capture::RawCapture) -> (Value, Vec<Value>) {
+        let stdin: Vec<Value> = channel_payloads(capture, Channel::Stdin)
+            .into_iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let turn_start = stdin
+            .iter()
+            .find(|line| line["method"] == "turn/start")
+            .cloned()
+            .expect("a turn/start line was sent");
+        let decisions = stdin
+            .into_iter()
+            .filter(|line| {
+                line.get("result")
+                    .is_some_and(|r| r.get("decision").is_some())
+            })
+            .collect();
+        (turn_start, decisions)
+    }
+
     /// The validator deletion, proven: a fake Codex that raises two
-    /// `.../requestApproval` requests in a row for each scenario — neither checked for count,
-    /// order or item shape — must have both answered with an `accept` reply carrying that
-    /// request's own id. The deleted `CodexApprovalState`/`CodexOnRequestState` and the
-    /// validators that threaded them would have bailed the instant a second, unaccounted-for
-    /// request id showed up (or, for `approval`, the instant anything but the single reviewed
-    /// file-change request appeared at all); `pending_approval` has no such bookkeeping, so it
-    /// just keeps answering.
+    /// `item/fileChange/requestApproval` requests in a row — neither checked for count, order or
+    /// item shape — must have both answered with an `accept` reply carrying that request's own
+    /// id. The deleted `CodexApprovalState` and the validators that threaded it would have
+    /// bailed the instant anything but the single reviewed file-change request appeared;
+    /// `pending_approval` has no such bookkeeping, so it just keeps answering.
     ///
-    /// Parameterized over both scenarios: `approval` against `fake-codex`'s
-    /// `capture_approval_two_requests` (dispatched on a substring of the real
-    /// `codex_approval_prompt` text), `approval_on_request` against
-    /// `capture_approval_on_request_two_requests` (dispatched on a substring of the real
-    /// `approval_on_request_prompt` text) — both additive branches, same rationale as
-    /// `fake_codex.rs`'s `steer`/`interrupt` branches matching `steer_request`/
-    /// `interruption_request`'s real production text.
+    /// Also pins the two things nothing else in this file's tests catch (`approval_launch_uses_
+    /// the_production_run_launch` builds its "expected" from the same `approval_request` call,
+    /// so it cannot tell a wrong runtime mode from a right one — see this test's own
+    /// falsification note in the task report):
+    /// - `RuntimeMode::ApprovalRequired` reaching the wire as `"approvalPolicy":"untrusted"` —
+    ///   checked against a literal, not by calling `approval_request` again, so a production
+    ///   regression to any other mode can't satisfy its own assertion.
+    /// - the grant-time cwd recheck passing (not declining) when the cwd never changed, using a
+    ///   real `DirectoryIdentity` computed the same way the (not-yet-wired) pre-spawn fence
+    ///   would.
+    ///
+    /// Dispatched in `fake_codex.rs` on a substring of the real `codex_approval_prompt` text —
+    /// same rationale as the `steer`/`interrupt` branches matching their scenarios' real prompts.
     #[tokio::test]
-    async fn codex_approval_scenarios_answer_every_request_they_see() {
+    async fn codex_approval_scenario_answers_every_request_it_sees() {
         let raw = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let cwd_identity =
+            crate::capture::approval::validate_ordinary_approval_cwd(cwd.path(), None, false)
+                .unwrap();
+        let input = ScenarioInput {
+            cwd: Some(cwd.path().into()),
+            ..ScenarioInput::default()
+        };
         let executable = fixture_path("fake-codex");
-        let input = ScenarioInput::default();
         let launch = approval_launch(&input, &executable).unwrap();
         let cfg = config(
             "codex-approval",
@@ -1084,7 +1177,11 @@ mod tests {
             }),
             raw.path(),
         );
-        let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
+        let fence = FenceOutcome {
+            approval_cwd_identity: Some(cwd_identity),
+            ..FenceOutcome::none()
+        };
+        let mut session = Session::start(CodexProvider::new(), &cfg, launch, fence)
             .await
             .unwrap();
         // Bounded, like `record/scenarios/claude.rs`'s equivalent test: the fixture reads a
@@ -1101,11 +1198,21 @@ mod tests {
         .unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let capture = session.finish(deadline).await.unwrap();
-        let decisions: Vec<Value> = channel_payloads(&capture, Channel::Stdin)
-            .into_iter()
-            .filter(|line| line.contains("\"decision\""))
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+
+        let (turn_start, decisions) = turn_start_and_decisions(&capture);
+        assert_eq!(
+            turn_start["params"],
+            crate::codex::turn_start_params(
+                &approval_request(&input),
+                "th-1",
+                &approval_request(&input).prompt
+            )
+        );
+        assert_eq!(
+            turn_start["params"]["approvalPolicy"], "untrusted",
+            "ApprovalRequired must reach the wire as the untrusted policy, or Codex never asks \
+             and the capture is worthless: {turn_start:?}"
+        );
         assert_eq!(
             decisions
                 .iter()
@@ -1118,16 +1225,93 @@ mod tests {
             decisions
                 .iter()
                 .all(|reply| reply["result"]["decision"] == "accept"),
-            "every reply must accept: {decisions:?}"
+            "the grant-time cwd recheck must pass for a cwd that never changed: {decisions:?}"
         );
         assert_eq!(capture.exit_code, Some(0));
+    }
 
+    /// The grant-time recheck, proven: when `session.fence.approval_cwd_identity` names a
+    /// *different* directory than the one this capture actually runs against — simulating the
+    /// cwd having been swapped out from under the fence between pre-spawn validation and this
+    /// grant — every approval must be declined, not accepted, and the capture must still run to
+    /// completion. This is strictly better than the deleted `codex_run`'s behavior, which
+    /// `bail!`ed on exactly this mismatch and discarded the whole recording.
+    #[tokio::test]
+    async fn codex_approval_declines_a_grant_when_the_cwd_identity_no_longer_matches() {
         let raw = tempfile::tempdir().unwrap();
-        let executable = fixture_path("fake-codex");
+        let cwd = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mismatched_identity =
+            crate::capture::approval::validate_ordinary_approval_cwd(elsewhere.path(), None, false)
+                .unwrap();
         let input = ScenarioInput {
-            approval_target: Some(std::path::PathBuf::from("target-dir")),
+            cwd: Some(cwd.path().into()),
             ..ScenarioInput::default()
         };
+        let executable = fixture_path("fake-codex");
+        let launch = approval_launch(&input, &executable).unwrap();
+        let cfg = config(
+            "codex-approval-cwd-mismatch",
+            executable,
+            CaptureOperation::Codex(CodexCaptureOperation::Run {
+                request: approval_request(&input),
+                script: CodexRunScript::Approval,
+            }),
+            raw.path(),
+        );
+        let fence = FenceOutcome {
+            approval_cwd_identity: Some(mismatched_identity),
+            ..FenceOutcome::none()
+        };
+        let mut session = Session::start(CodexProvider::new(), &cfg, launch, fence)
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            approval(&mut session, &input),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let capture = session.finish(deadline).await.unwrap();
+
+        let (_turn_start, decisions) = turn_start_and_decisions(&capture);
+        assert_eq!(
+            decisions.len(),
+            2,
+            "both requests must still be answered: {decisions:?}"
+        );
+        assert!(
+            decisions
+                .iter()
+                .all(|reply| reply["result"]["decision"] == "decline"),
+            "a cwd identity mismatch must decline the write, not grant it: {decisions:?}"
+        );
+        assert_eq!(
+            capture.exit_code,
+            Some(0),
+            "the recording must survive a declined grant, not be discarded"
+        );
+    }
+
+    /// Same shape as `codex_approval_scenario_answers_every_request_it_sees`, for
+    /// `approval_on_request`. The prompt-text substring check pins `input.approval_target`
+    /// specifically: `input.cwd` (defaulted to the system temp dir here) and `approval_target`
+    /// (an isolated tempdir) are never equal, so a scenario that read the wrong field would send
+    /// a prompt without the target's own path in it.
+    #[tokio::test]
+    async fn codex_on_request_approval_scenario_answers_every_request_it_sees() {
+        let raw = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let target_identity =
+            crate::capture::approval::require_empty_approval_target(target.path(), None).unwrap();
+        let input = ScenarioInput {
+            approval_target: Some(target.path().into()),
+            ..ScenarioInput::default()
+        };
+        let executable = fixture_path("fake-codex");
         let launch = approval_on_request_launch(&input, &executable).unwrap();
         let cfg = config(
             "codex-approval-on-request",
@@ -1138,7 +1322,12 @@ mod tests {
             }),
             raw.path(),
         );
-        let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
+        let fence = FenceOutcome {
+            approval_target: Some(target.path().into()),
+            approval_target_identity: Some(target_identity),
+            ..FenceOutcome::none()
+        };
+        let mut session = Session::start(CodexProvider::new(), &cfg, launch, fence)
             .await
             .unwrap();
         tokio::time::timeout(
@@ -1150,11 +1339,23 @@ mod tests {
         .unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let capture = session.finish(deadline).await.unwrap();
-        let decisions: Vec<Value> = channel_payloads(&capture, Channel::Stdin)
-            .into_iter()
-            .filter(|line| line.contains("\"decision\""))
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+
+        let (turn_start, decisions) = turn_start_and_decisions(&capture);
+        assert_eq!(
+            turn_start["params"],
+            crate::codex::turn_start_params(
+                &approval_on_request_request(&input).unwrap(),
+                "th-1",
+                &approval_on_request_request(&input).unwrap().prompt
+            )
+        );
+        assert!(
+            turn_start["params"]["input"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(&target.path().display().to_string()),
+            "the sent prompt must carry input.approval_target's own path, not input.cwd's: {turn_start:?}"
+        );
         assert_eq!(
             decisions
                 .iter()
@@ -1167,8 +1368,72 @@ mod tests {
             decisions
                 .iter()
                 .all(|reply| reply["result"]["decision"] == "accept"),
-            "every reply must accept: {decisions:?}"
+            "the grant-time target recheck must pass for a target that stayed empty: {decisions:?}"
         );
         assert_eq!(capture.exit_code, Some(0));
+    }
+
+    /// Same shape as `codex_approval_declines_a_grant_when_the_cwd_identity_no_longer_matches`,
+    /// for `approval_on_request`'s `require_empty_approval_target` recheck.
+    #[tokio::test]
+    async fn codex_on_request_approval_declines_a_grant_when_the_target_identity_no_longer_matches()
+    {
+        let raw = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mismatched_identity =
+            crate::capture::approval::require_empty_approval_target(elsewhere.path(), None)
+                .unwrap();
+        let input = ScenarioInput {
+            approval_target: Some(target.path().into()),
+            ..ScenarioInput::default()
+        };
+        let executable = fixture_path("fake-codex");
+        let launch = approval_on_request_launch(&input, &executable).unwrap();
+        let cfg = config(
+            "codex-approval-on-request-target-mismatch",
+            executable,
+            CaptureOperation::Codex(CodexCaptureOperation::Run {
+                request: approval_on_request_request(&input).unwrap(),
+                script: CodexRunScript::ApprovalOnRequest,
+            }),
+            raw.path(),
+        );
+        let fence = FenceOutcome {
+            approval_target: Some(target.path().into()),
+            approval_target_identity: Some(mismatched_identity),
+            ..FenceOutcome::none()
+        };
+        let mut session = Session::start(CodexProvider::new(), &cfg, launch, fence)
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            approval_on_request(&mut session, &input),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let capture = session.finish(deadline).await.unwrap();
+
+        let (_turn_start, decisions) = turn_start_and_decisions(&capture);
+        assert_eq!(
+            decisions.len(),
+            2,
+            "both requests must still be answered: {decisions:?}"
+        );
+        assert!(
+            decisions
+                .iter()
+                .all(|reply| reply["result"]["decision"] == "decline"),
+            "a target identity mismatch must decline the write, not grant it: {decisions:?}"
+        );
+        assert_eq!(
+            capture.exit_code,
+            Some(0),
+            "the recording must survive a declined grant, not be discarded"
+        );
     }
 }

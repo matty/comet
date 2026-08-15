@@ -50,11 +50,15 @@ fn provider_display_name(provider: Provider) -> &'static str {
 /// `capture/safety.rs`'s checks.
 pub(super) struct FenceOutcome {
     pub(super) approval_target: Option<PathBuf>,
-    // Read by the approval scenarios' own driving (re-checking identity
-    // mid-run), added in Tasks 4 and 6 — not by anything in this task.
-    #[allow(dead_code)]
+    // Read by `record/scenarios/codex.rs`'s `approval_on_request`, as the
+    // expected identity for its grant-time `require_empty_approval_target`
+    // recheck (Task 6). Claude's `approval` (Task 4) needs no such recheck —
+    // it has no filesystem identity to protect the way a Codex approval
+    // target does — so this stays Codex-only.
     pub(super) approval_target_identity: Option<DirectoryIdentity>,
-    #[allow(dead_code)]
+    // Read by `record/scenarios/codex.rs`'s `approval`, as the expected
+    // identity for its grant-time `validate_ordinary_approval_cwd` recheck
+    // (Task 6). Same Codex-only note as above.
     pub(super) approval_cwd_identity: Option<DirectoryIdentity>,
     pub(super) trusted_powershell: Option<FileIdentity>,
 }
