@@ -1,3 +1,9 @@
+//! Recording, sanitizing and reading provider captures.
+//!
+//! Test tooling. Nothing here is on Comet's runtime path — the launch types
+//! that are live in [`crate::launch`], which this module consumes rather than
+//! owns.
+
 mod approval;
 mod checklist;
 mod corpus;

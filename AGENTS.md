@@ -124,6 +124,11 @@ grep the decode sources — that is what the machine was doing anyway, less accu
 **Its blind spot is absence.** It reports fields that are present; a capability no capture ever
 exercised cannot appear in it at all. Procedure is in `docs/testing/provider-captures.md`.
 
+`crates/harness/src/capture/` is test tooling and nothing in it is on the runtime path. The
+one thing production shares with it is `crates/harness/src/launch.rs` — the process-launch
+description both use. Keep it that way: a production type that drifts into `capture/` makes
+the boundary unreadable, which is how a design doc came to record the opposite of the truth.
+
 ## The gpui fork rev is load-bearing
 
 `gpui` comes from `wingleeio/zed` at a pinned rev, not from crates.io. Comet depends on

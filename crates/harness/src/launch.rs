@@ -1,8 +1,8 @@
 //! How Comet launches a provider CLI.
 //!
 //! These live here rather than in `capture` because production owns them:
-//! `claude::run_launch`, `codex::run_launch`, and the three discovery launches
-//! all return or build a [`LaunchDescriptor`], none of them under `cfg(test)`.
+//! `claude::run_launch`, `codex::run_launch`, and the discovery launches
+//! all return or build a `LaunchDescriptor`, none of them under `cfg(test)`.
 //! They sat in `capture/types.rs` until 2026-08-15, which is why a design doc
 //! once recorded that nothing on the runtime path touched `capture`.
 
