@@ -35,14 +35,17 @@ pub(in crate::capture) const APPROVAL_MARKER_CONTENT: &str = "capture\n";
 
 /// The literal command a marker-write approval asks the model to run, platform-specific. Stays
 /// here rather than moving into either provider's scenario module (unlike `codex_approval_prompt`/
-/// `approval_on_request_prompt`, which did) for two reasons: `approval_on_request_prompt`
+/// `approval_on_request_prompt`, which did) because `approval_on_request_prompt`
 /// (`record/scenarios/codex.rs`) embeds this command's own output verbatim into its prompt text,
-/// so the two are more one shared primitive than one owning the other; and
-/// `crates/harness/tests/fixtures/fake_codex.rs` imports this function directly
-/// (`comet_harness::capture::approval_marker_command`) to reconstruct the exact command a real
-/// model's exec call would produce, which requires it to stay reachable from a test binary outside
-/// `capture::record` — the one genuinely external consumer this module's public surface still has.
-pub fn approval_marker_command(target: &Path) -> String {
+/// so the two are more one shared primitive than one owning the other.
+///
+/// `crates/harness/tests/fixtures/fake_codex.rs` used to import this directly
+/// (`comet_harness::capture::approval_marker_command`), to reconstruct the exact command a real
+/// model's exec call would produce for its own now-deleted `capture-onrequest-*`/
+/// `capture-approval-*` scenario branches — the sweep that deleted them (their only callers)
+/// removed that import too, so `pub(in crate::capture)` is now correct: nothing outside this
+/// crate's `capture` module needs to reach this function any more.
+pub(in crate::capture) fn approval_marker_command(target: &Path) -> String {
     #[cfg(windows)]
     {
         let path = target

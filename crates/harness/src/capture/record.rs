@@ -103,8 +103,9 @@ async fn record_codex(
 ///
 /// This is the pre-spawn fence decision #6 in the stage plan requires stay —
 /// `crate::capture::safety`'s checks ran inside `recording.rs`'s
-/// `RecordingSession::start` before this task deleted that file; this is
-/// their new home, run before `Session::start` is even called.
+/// `RecordingSession::start` before the neutral-recorder stage's Task 7
+/// deleted that file; this is their new home, run before `Session::start`
+/// is even called.
 fn codex_fence(
     spec: &ScenarioSpec,
     config: &CaptureConfig,

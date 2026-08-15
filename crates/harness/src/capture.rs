@@ -25,7 +25,6 @@ mod types;
 pub use allowlist::{Allowlist, allows, allows_prefix, named_kind};
 pub use corpus::{Frame, corpus_frame, frame};
 pub use record::{Requirements, SCENARIOS, ScenarioSpec, record, scenario};
-pub use safety::approval_marker_command;
 pub use sanitize::{
     NovelPath, SanitizationError, SanitizationReport, render_novel_paths_report, sanitize_dir,
 };
