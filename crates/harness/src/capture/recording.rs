@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -349,57 +348,20 @@ impl RecordingSession {
         request: RunRequest,
         script: ClaudeRunScript,
     ) -> anyhow::Result<()> {
-        // `fresh-text`/`attachment`/`resume` are ported to
-        // `record/scenarios/claude.rs` (including the attachment's
-        // must-inline-an-image check); only `Approval`, `Checklist` and
-        // `ChecklistResume` still reach this function, and none of them
-        // needs that check, so the line is built directly through the
-        // production helpers with no script-specific branch left here.
+        // `fresh-text`/`attachment`/`resume`/`checklist`/`checklist-resume`
+        // are all ported to `record/scenarios/claude.rs` (including the
+        // attachment's must-inline-an-image check); only `Approval` still
+        // needs script-specific handling here, so the line is built directly
+        // through the production helpers with no script-specific branch left
+        // for building it.
         let images = crate::claude::load_image_blocks(&request.attachments).await;
         let line = crate::claude::wire::user_message_line_with_images(&request.prompt, &images);
         self.write_line(&line).await?;
         let mut approval = ClaudeApprovalState::default();
-        // The task ids this run confirmed a CREATE and an UPDATE for, so a
-        // capture whose model ignored the instructions cannot be promoted as
-        // evidence of a checklist. Keyed off `tool_use_result`, not the prose
-        // the model sees, for the same reason the decode is.
-        //
-        // Sets rather than a counter, and separated by operation: a plain
-        // count is satisfied by the same update repeated, which proves neither
-        // that a list was built nor that anything moved. `checklist` needs two
-        // distinct tasks created and one driven; `checklist-resume` needs an
-        // update for a task it never created, which is the entire point of
-        // that scenario and is invisible to a counter.
-        let mut created: BTreeSet<String> = BTreeSet::new();
-        let mut updated: BTreeSet<String> = BTreeSet::new();
         while let Some(line) = self.next_stdout().await? {
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
-            if matches!(
-                script,
-                ClaudeRunScript::Checklist | ClaudeRunScript::ChecklistResume
-            ) && value["type"] == "user"
-            {
-                let result = &value["tool_use_result"];
-                // A failed call changed nothing. `TaskUpdate` reports it as
-                // `success: false`; `TaskCreate` has no such field, so absent
-                // is not failure there — only an explicit `false` is.
-                let failed = result.get("success").and_then(Value::as_bool) == Some(false);
-                let block_errored = value["message"]["content"]
-                    .as_array()
-                    .is_some_and(|blocks| blocks.iter().any(|b| b["is_error"] == true));
-                if !failed && !block_errored {
-                    if let Some(id) = result["task"]["id"].as_str() {
-                        created.insert(id.to_owned());
-                    }
-                    if result.get("statusChange").is_some()
-                        && let Some(id) = result["taskId"].as_str()
-                    {
-                        updated.insert(id.to_owned());
-                    }
-                }
-            }
             if matches!(script, ClaudeRunScript::Approval) {
                 let frame = crate::claude::wire::parse_frame(&line)
                     .map_err(|_| anyhow!("Claude approval capture received malformed JSON."))?;
@@ -436,52 +398,6 @@ impl RecordingSession {
                     bail!(
                         "Claude approval capture did not observe the exact successful Bash and bounded Write approval."
                     );
-                }
-                // `Resume` itself is ported to `record/scenarios/claude.rs`,
-                // where the new `resume` body sends the line and waits for
-                // the terminal frame with no session-identity check at all —
-                // the abort-on-mismatch class this stage's design removes
-                // (§3.2). `ChecklistResume` is not yet ported (Task 3), so
-                // its check stays here until then.
-                if matches!(script, ClaudeRunScript::ChecklistResume)
-                    && value["session_id"].as_str() != request.resume.as_deref()
-                {
-                    bail!("Claude resume capture returned a different session identifier.");
-                }
-                // Each scenario asserts the SHAPE its name claims, not a
-                // volume of frames. A run that skipped a step proves less than
-                // its scenario says, and promoting it would put a claim on
-                // evidence that does not carry it.
-                match script {
-                    // Two distinct tasks created, and one of them driven —
-                    // enough to show a list being built and moving.
-                    ClaudeRunScript::Checklist => {
-                        if created.len() < 2 || updated.is_empty() {
-                            bail!(
-                                "Claude checklist capture created {} task(s) and updated {}; \
-                                 needed 2 distinct creates and at least 1 update.",
-                                created.len(),
-                                updated.len()
-                            );
-                        }
-                    }
-                    // The resumed run must move a task it did NOT create. That
-                    // is the whole observation, and a count cannot express it:
-                    // a resumed run that created its own tasks first would
-                    // satisfy any threshold while proving the opposite.
-                    ClaudeRunScript::ChecklistResume => {
-                        let inherited: Vec<_> = updated.difference(&created).collect();
-                        if inherited.is_empty() {
-                            bail!(
-                                "Claude checklist-resume capture updated no task it had not \
-                                 created (created {:?}, updated {:?}); the scenario exists to \
-                                 record a mutation for an id this process never saw.",
-                                created,
-                                updated
-                            );
-                        }
-                    }
-                    _ => {}
                 }
                 return Ok(());
             }

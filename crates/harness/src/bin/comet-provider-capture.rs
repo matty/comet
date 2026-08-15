@@ -239,12 +239,9 @@ fn capture_config_with_env(
                     "Describe the attached image in one short sentence.".to_owned(),
                     ClaudeRunScript::Attachment,
                 ),
-                "checklist" => (
-                    comet_harness::capture::claude_checklist_prompt(),
-                    ClaudeRunScript::Checklist,
-                ),
+                "checklist" => (claude_checklist_prompt(), ClaudeRunScript::Checklist),
                 "checklist-resume" => (
-                    comet_harness::capture::claude_checklist_resume_prompt(),
+                    claude_checklist_resume_prompt(),
                     ClaudeRunScript::ChecklistResume,
                 ),
                 _ => unreachable!(),
@@ -429,6 +426,39 @@ fn canonical_scenario_name(name: &str) -> &'static str {
         "interruption" => "interruption",
         _ => unreachable!("only matched scenario names reach this helper"),
     }
+}
+
+/// Owed to Task 7: a literal duplicate of
+/// `capture::record::scenarios::claude::claude_checklist_prompt`, which is
+/// private to that module (decision "the scenario owns its prompt"). This
+/// binary still builds its own `CaptureConfig` by hand and cannot yet reach
+/// the scenario table (`SCENARIOS` has no `checklist` row until Task 7 wires
+/// this binary to look scenarios up by name instead of constructing them
+/// here), so until that rewiring lands, keeping this binary compiling means
+/// keeping a second copy of the prompt text rather than exposing the private
+/// helper across a boundary that is about to disappear.
+fn claude_checklist_prompt() -> String {
+    concat!(
+        r#"Use ToolSearch exactly once with input {"query":"select:TaskCreate,TaskUpdate","max_results":5}. "#,
+        r#"Then use TaskCreate exactly twice, first with input {"subject":"Alpha step","description":"The first step"} "#,
+        r#"and then with input {"subject":"Beta step","description":"The second step"}. "#,
+        r#"Then use TaskUpdate exactly once with input {"taskId":"1","status":"in_progress","activeForm":"Working the first step"}. "#,
+        r#"Then use TaskUpdate exactly once with input {"taskId":"1","status":"completed"}. "#,
+        r#"Do nothing else, and reply with the single word capture."#,
+    )
+    .to_owned()
+}
+
+/// See `claude_checklist_prompt`'s doc comment — same duplication, owed to
+/// the same task.
+fn claude_checklist_resume_prompt() -> String {
+    concat!(
+        r#"Use ToolSearch exactly once with input {"query":"select:TaskUpdate","max_results":5}. "#,
+        r#"Then use TaskUpdate exactly once with input {"taskId":"2","status":"in_progress","activeForm":"Working the second step"}. "#,
+        r#"Then use TaskUpdate exactly once with input {"taskId":"2","status":"completed"}. "#,
+        r#"Do not create any task. Do nothing else, and reply with the single word resumed."#,
+    )
+    .to_owned()
 }
 
 fn cheap_claude_request(prompt: &str, cwd: PathBuf, mode: RuntimeMode) -> RunRequest {

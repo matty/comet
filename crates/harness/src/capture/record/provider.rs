@@ -53,6 +53,18 @@ pub(super) trait CaptureProvider: Sized {
     /// scenario sends one. It belongs to the run scenario bodies that need a
     /// thread (Task 5) — a handshake that branches per scenario would not be
     /// a seam member.
+    ///
+    /// **The scenario body calls this, not the recorder.** `record_generic`
+    /// (`record.rs`) never calls a seam member unconditionally: every
+    /// discovery body and every Codex run body opens with
+    /// `Self::handshake(session, input).await?` itself; a Claude run body
+    /// calls nothing, because Comet's own run path sends the user turn as its
+    /// first stdin line and no `control_request`/`initialize` at all
+    /// (`crate::claude::mod.rs`'s run driver). Calling this unconditionally
+    /// from the recorder would put a line on the tape the product never
+    /// sends — the one thing a capture must never do. The provider still owns
+    /// *how* to handshake, which is what keeps this a seam member; the
+    /// scenario owns *whether*.
     async fn handshake(
         session: &mut Session<Self>,
         input: &super::scenarios::ScenarioInput,

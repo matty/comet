@@ -10,7 +10,6 @@
 
 mod allowlist;
 mod approval;
-mod checklist;
 mod corpus;
 mod filesystem;
 mod record;
@@ -26,7 +25,6 @@ pub use approval::{
     approval_marker_command, approval_on_request_prompt, claude_approval_prompt,
     codex_approval_prompt,
 };
-pub use checklist::{claude_checklist_prompt, claude_checklist_resume_prompt};
 pub use corpus::{Frame, corpus_frame, frame};
 pub use record::record;
 pub use sanitize::{

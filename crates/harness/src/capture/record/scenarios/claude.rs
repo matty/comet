@@ -239,6 +239,144 @@ pub(in crate::capture::record) async fn attachment(
     session.wait_for_turn_end().await
 }
 
+/// Prompt for `checklist`: create two tasks, then drive the first through
+/// both transitions. Moved here, unchanged in substance, from the deleted
+/// `capture/checklist.rs` — decision "the scenario owns its prompt" moves
+/// prompt text out of the binary and into the scenario body that sends it.
+///
+/// Opens with `ToolSearch` because the task tools are *deferred* on at least
+/// one machine — captured 2026-08-13, where the model reached them through
+/// `{"query":"select:TaskCreate,TaskUpdate","total_deferred_tools":45}`. On an
+/// installation that lists them eagerly the search is a harmless extra frame;
+/// without it, on one that does not, the run produces no checklist at all.
+#[allow(dead_code)]
+fn claude_checklist_prompt() -> String {
+    concat!(
+        r#"Use ToolSearch exactly once with input {"query":"select:TaskCreate,TaskUpdate","max_results":5}. "#,
+        r#"Then use TaskCreate exactly twice, first with input {"subject":"Alpha step","description":"The first step"} "#,
+        r#"and then with input {"subject":"Beta step","description":"The second step"}. "#,
+        r#"Then use TaskUpdate exactly once with input {"taskId":"1","status":"in_progress","activeForm":"Working the first step"}. "#,
+        r#"Then use TaskUpdate exactly once with input {"taskId":"1","status":"completed"}. "#,
+        r#"Do nothing else, and reply with the single word capture."#,
+    )
+    .to_owned()
+}
+
+/// Prompt for `checklist-resume`: continue the SAME list from a second
+/// process. Task 2 was created by the first process, so a run driven by this
+/// prompt updates an id it has never seen — the case the whole scenario
+/// exists to record. It deliberately does not create anything: a `TaskCreate`
+/// here would give the resumed process a subject of its own and destroy the
+/// evidence.
+#[allow(dead_code)]
+fn claude_checklist_resume_prompt() -> String {
+    concat!(
+        r#"Use ToolSearch exactly once with input {"query":"select:TaskUpdate","max_results":5}. "#,
+        r#"Then use TaskUpdate exactly once with input {"taskId":"2","status":"in_progress","activeForm":"Working the second step"}. "#,
+        r#"Then use TaskUpdate exactly once with input {"taskId":"2","status":"completed"}. "#,
+        r#"Do not create any task. Do nothing else, and reply with the single word resumed."#,
+    )
+    .to_owned()
+}
+
+// Called once by `checklist_launch`, once by `checklist` — see the note on
+// `fresh_text_request` above; the same "stays pure, so the two calls can't
+// disagree" reasoning applies here.
+#[allow(dead_code)]
+fn checklist_request(input: &ScenarioInput) -> RunRequest {
+    cheap_claude_request(
+        &claude_checklist_prompt(),
+        input,
+        RuntimeMode::AutoAcceptEdits,
+    )
+}
+
+/// SPAWN for `checklist`: an ordinary run launch, built from the same request
+/// `checklist` replays as its wire line.
+#[allow(dead_code)]
+pub(in crate::capture::record) fn checklist_launch(
+    input: &ScenarioInput,
+    executable: &Path,
+) -> anyhow::Result<LaunchDescriptor> {
+    Ok(crate::claude::run_launch(
+        executable,
+        &checklist_request(input),
+    ))
+}
+
+/// Send the checklist prompt and wait for the turn to end. Nothing here
+/// inspects what the model actually did with the task tools — no
+/// created/updated task-id accounting, no bail on a mutation count the
+/// prompt asked for but the model did not produce.
+///
+/// That accounting used to live in `recording.rs`'s `claude_run` (the
+/// `created`/`updated` `BTreeSet`s and their `bail!`s, requiring 4 confirmed
+/// mutations here and 2 for `checklist-resume`) and is deleted by this task,
+/// closing `docs/debt/` D61. Per design §3.2
+/// (`2026-08-14-provider-capture-simplification-design.md`): a pre-spawn
+/// guard protects the machine; a frame check that aborts protects only a
+/// scenario's tidiness, and does it by destroying evidence already paid for
+/// in tokens. A model that ignores this prompt and creates no task does not
+/// produce a failed capture — it produces a recording of a model ignoring
+/// instructions, which is itself evidence of the CLI's real behavior under
+/// this prompt, and the deleted guard threw it away along with the tokens
+/// that paid for it.
+#[allow(dead_code)]
+pub(in crate::capture::record) async fn checklist(
+    session: &mut Session<ClaudeProvider>,
+    input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    let line = claude_user_line(&checklist_request(input), false).await?;
+    session.send(&line).await?;
+    session.wait_for_turn_end().await
+}
+
+// Called once by `checklist_resume_launch`, once by `checklist_resume` — see
+// the note on `fresh_text_request` above.
+#[allow(dead_code)]
+fn checklist_resume_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
+    let resume_id = input
+        .resume_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("The checklist-resume scenario needs a --resume-id."))?;
+    let mut request = cheap_claude_request(
+        &claude_checklist_resume_prompt(),
+        input,
+        RuntimeMode::AutoAcceptEdits,
+    );
+    request.resume = Some(resume_id);
+    Ok(request)
+}
+
+/// SPAWN for `checklist-resume`: the id reaches the CLI as `--resume=<id>` on
+/// the launch, never as part of the wire line the body sends — same split as
+/// `resume_launch` above.
+#[allow(dead_code)]
+pub(in crate::capture::record) fn checklist_resume_launch(
+    input: &ScenarioInput,
+    executable: &Path,
+) -> anyhow::Result<LaunchDescriptor> {
+    Ok(crate::claude::run_launch(
+        executable,
+        &checklist_resume_request(input)?,
+    ))
+}
+
+/// No session-identity check against `input.resume_id` — the abort-on-mismatch
+/// class this stage's design removes (§3.2), same as `resume` above. The old
+/// `recording.rs::claude_run` checked `value["session_id"] == request.resume`
+/// before returning; a Claude bug that returned the wrong session id would
+/// still be worth recording, not a reason to throw the capture away.
+#[allow(dead_code)]
+pub(in crate::capture::record) async fn checklist_resume(
+    session: &mut Session<ClaudeProvider>,
+    input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    let line = claude_user_line(&checklist_resume_request(input)?, false).await?;
+    session.send(&line).await?;
+    session.wait_for_turn_end().await
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -476,5 +614,112 @@ mod tests {
             serde_json::from_str(channel_payloads(&capture, Channel::Stdin)[0]).unwrap();
         assert_eq!(first["message"]["content"][0]["type"], "image");
         assert_eq!(first["message"]["content"][1]["type"], "text");
+    }
+
+    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for `checklist`.
+    #[test]
+    fn checklist_launch_uses_the_production_run_launch() {
+        let exe = absolute_program("claude");
+        let input = ScenarioInput::default();
+
+        let launch = checklist_launch(&input, &exe).unwrap();
+        let expected = crate::claude::run_launch(&exe, &checklist_request(&input));
+
+        assert_eq!(
+            CommandSnapshot::from_launch(&launch),
+            CommandSnapshot::from_launch(&expected)
+        );
+    }
+
+    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for
+    /// `checklist-resume`.
+    #[test]
+    fn checklist_resume_launch_uses_the_production_run_launch() {
+        let exe = absolute_program("claude");
+        let input = ScenarioInput {
+            resume_id: Some("session-abc".into()),
+            ..ScenarioInput::default()
+        };
+
+        let launch = checklist_resume_launch(&input, &exe).unwrap();
+        let expected = crate::claude::run_launch(&exe, &checklist_resume_request(&input).unwrap());
+
+        assert_eq!(
+            CommandSnapshot::from_launch(&launch),
+            CommandSnapshot::from_launch(&expected)
+        );
+    }
+
+    /// Break caught: same as `resume_launch_passes_the_resume_id_as_a_launch_argument`, for
+    /// `checklist-resume` — a mislabeled capture that silently starts a fresh session under the
+    /// `checklist-resume` name instead of resuming one.
+    #[test]
+    fn checklist_resume_launch_passes_the_resume_id_as_a_launch_argument() {
+        let exe = absolute_program("claude");
+        let input = ScenarioInput {
+            resume_id: Some("session-abc".into()),
+            ..ScenarioInput::default()
+        };
+
+        let launch = checklist_resume_launch(&input, &exe).unwrap();
+        let snapshot = CommandSnapshot::from_launch(&launch);
+
+        assert!(
+            snapshot
+                .args
+                .iter()
+                .any(|arg| arg == "--resume=session-abc"),
+            "checklist-resume launch must carry --resume=<id>: {:?}",
+            snapshot.args
+        );
+    }
+
+    /// The evidence guard's removal, proven: a fake Claude that answers the real checklist
+    /// prompt with plain text and never calls `TaskCreate` at all must still produce a
+    /// successful capture holding every frame. The deleted `recording.rs` guard bailed here —
+    /// "Claude checklist capture created 0 task(s) and updated 0; needed 2 distinct creates and
+    /// at least 1 update" — because it inspected what the model did with the prompt instead of
+    /// only recording it. See `checklist`'s own doc comment for why that inspection is gone.
+    #[tokio::test]
+    async fn checklist_capture_records_a_run_that_created_no_tasks() {
+        let raw = tempfile::tempdir().unwrap();
+        let executable = fixture_path("fake-claude");
+        let input = ScenarioInput::default();
+        let launch = checklist_launch(&input, &executable).unwrap();
+        let cfg = config(
+            "claude-checklist",
+            executable,
+            CaptureOperation::Claude(ClaudeCaptureOperation::Run {
+                request: checklist_request(&input),
+                script: ClaudeRunScript::Checklist,
+            }),
+            raw.path(),
+        );
+        let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
+            .await
+            .unwrap();
+
+        checklist(&mut session, &input).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let capture = session.finish(deadline).await.unwrap();
+
+        let stdout = channel_payloads(&capture, Channel::Stdout);
+        // The init frame's advertised tool list still names `TaskCreate` (the
+        // CLI offers it whether or not the model uses it) — the check is for
+        // an actual `tool_use` call, not the substring, so it does not
+        // false-positive on that list.
+        assert!(
+            !stdout
+                .iter()
+                .any(|line| line.contains(r#""name":"TaskCreate""#)),
+            "fixture must reply without ever calling TaskCreate: {stdout:?}"
+        );
+        assert!(
+            stdout
+                .iter()
+                .any(|line| line.contains(r#""type":"result""#)),
+            "capture must still hold a terminal frame: {stdout:?}"
+        );
+        assert_eq!(capture.exit_code, Some(0));
     }
 }

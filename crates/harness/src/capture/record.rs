@@ -141,14 +141,14 @@ type ScenarioBodyFn<P> = for<'a> fn(
 /// deadline firing) — the `drive_completed` distinction `recording.rs` made
 /// with a boolean, carried here by which branch of this match runs.
 ///
-/// Deliberately does NOT call `P::handshake` — see the amendment on
-/// `CaptureProvider`'s doc comment ("the scenario body calls the handshake;
-/// the recorder does not"). Whether a scenario handshakes at all is a
-/// scenario decision: every discovery body and every Codex run body opens
-/// with `P::handshake(session, input).await?` itself; a Claude run body
-/// calls nothing, because a real Claude run sends no handshake and this
-/// function calling one unconditionally would put a line on the tape the
-/// product never sends.
+/// Deliberately does NOT call `P::handshake` — see `CaptureProvider::handshake`'s
+/// own doc comment ("the scenario body calls this, not the recorder").
+/// Whether a scenario handshakes at all is a scenario decision: every
+/// discovery body and every Codex run body opens with
+/// `P::handshake(session, input).await?` itself; a Claude run body calls
+/// nothing, because a real Claude run sends no handshake and this function
+/// calling one unconditionally would put a line on the tape the product
+/// never sends.
 ///
 /// `deadline` is computed once, right after spawn, and passed into both the
 /// outer `timeout_at` wrapping the body *and* into [`Session::finish`], so

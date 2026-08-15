@@ -152,6 +152,14 @@ fn main() {
         happy();
     } else if first.contains("scenario:subagent-failed") {
         subagent_failed();
+    } else if first.contains("TaskCreate exactly twice") {
+        // The real `capture/record/scenarios/claude.rs` `checklist` prompt
+        // (matched by a substring unique to it, not a `scenario:` tag —
+        // this scenario proves the neutral recorder against the exact wire
+        // line the production `checklist` scenario sends, not a stand-in).
+        // A model that ignores the tool instructions entirely: the run the
+        // deleted `recording.rs` evidence guard used to bail on.
+        checklist_no_tasks();
     } else if first.contains("scenario:checklist") {
         checklist();
     } else if first.contains("scenario:askuser") {
@@ -384,6 +392,24 @@ fn checklist() {
     );
     emit(
         r#"{"type":"result","subtype":"success","result":"planned","errors":[],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30000,"cache_creation_input_tokens":75},"session_id":"sess-checklist","total_cost_usd":0.01}"#,
+    );
+}
+
+/// A checklist run that ignored the tool instructions entirely: a plain text
+/// reply, no `TaskCreate`/`TaskUpdate` call anywhere. Proves the neutral
+/// recorder's `checklist` scenario (`capture/record/scenarios/claude.rs`)
+/// still returns a successful capture holding every frame — the case the now
+/// deleted `recording.rs` evidence guard used to bail on, with "created 0
+/// task(s) and updated 0; needed 2 distinct creates and at least 1 update".
+fn checklist_no_tasks() {
+    emit(
+        r#"{"type":"system","subtype":"init","model":"claude-haiku-4-5-20251001","tools":["Bash","TaskCreate","TaskUpdate"],"cwd":"/tmp","session_id":"sess-checklist-no-tasks"}"#,
+    );
+    emit(
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"capture"}]}}"#,
+    );
+    emit(
+        r#"{"type":"result","subtype":"success","result":"capture","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-checklist-no-tasks"}"#,
     );
 }
 
