@@ -103,6 +103,17 @@ pub enum ClaudeCaptureOperation {
     },
 }
 
+/// One entry per Claude run scenario `recording.rs` still drives.
+///
+/// `FreshText`, `Attachment` and `Resume` no longer have any script-specific
+/// behavior in `recording.rs::claude_run` — their driving moved to
+/// `record/scenarios/claude.rs`'s `fresh_text`/`attachment`/`resume`, which
+/// the SCENARIOS table does not yet dispatch to (Task 7). The three variants
+/// stay here only because `comet-provider-capture.rs` still constructs them
+/// and routes them through `capture::record()`'s fallback to
+/// `recording::record()` until that rewiring lands; `claude_run` treats them
+/// as the plain case (no branch matches them at all). `Approval`, `Checklist`
+/// and `ChecklistResume` are still driven here for real.
 #[derive(Clone, Copy, Debug)]
 pub enum ClaudeRunScript {
     FreshText,

@@ -31,9 +31,10 @@ use crate::launch::LaunchDescriptor;
 #[derive(Clone, Debug, Default)]
 pub struct ScenarioInput {
     pub cwd: Option<PathBuf>,
-    // Read starting with the scenarios that need them: `resume_id` in the
-    // resume tasks (2, 5), `attachment` in the Claude run tasks (2),
-    // `approval_target` in the approval tasks (4, 6).
+    // Read by the scenarios that need them (`resume`/`attachment` in Tasks 2,
+    // 3, 5; `approval_target` in Tasks 4, 6) — but only the SCENARIOS table
+    // wiring in Task 7 makes those scenarios reachable from production code,
+    // so the read stays invisible to dead-code analysis until then.
     #[allow(dead_code)]
     pub resume_id: Option<String>,
     #[allow(dead_code)]

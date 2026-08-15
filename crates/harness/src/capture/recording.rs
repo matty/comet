@@ -349,7 +349,14 @@ impl RecordingSession {
         request: RunRequest,
         script: ClaudeRunScript,
     ) -> anyhow::Result<()> {
-        let line = claude_user_line(&request, script).await?;
+        // `fresh-text`/`attachment`/`resume` are ported to
+        // `record/scenarios/claude.rs` (including the attachment's
+        // must-inline-an-image check); only `Approval`, `Checklist` and
+        // `ChecklistResume` still reach this function, and none of them
+        // needs that check, so the line is built directly through the
+        // production helpers with no script-specific branch left here.
+        let images = crate::claude::load_image_blocks(&request.attachments).await;
+        let line = crate::claude::wire::user_message_line_with_images(&request.prompt, &images);
         self.write_line(&line).await?;
         let mut approval = ClaudeApprovalState::default();
         // The task ids this run confirmed a CREATE and an UPDATE for, so a
@@ -430,10 +437,14 @@ impl RecordingSession {
                         "Claude approval capture did not observe the exact successful Bash and bounded Write approval."
                     );
                 }
-                if matches!(
-                    script,
-                    ClaudeRunScript::Resume | ClaudeRunScript::ChecklistResume
-                ) && value["session_id"].as_str() != request.resume.as_deref()
+                // `Resume` itself is ported to `record/scenarios/claude.rs`,
+                // where the new `resume` body sends the line and waits for
+                // the terminal frame with no session-identity check at all —
+                // the abort-on-mismatch class this stage's design removes
+                // (§3.2). `ChecklistResume` is not yet ported (Task 3), so
+                // its check stays here until then.
+                if matches!(script, ClaudeRunScript::ChecklistResume)
+                    && value["session_id"].as_str() != request.resume.as_deref()
                 {
                     bail!("Claude resume capture returned a different session identifier.");
                 }
@@ -1049,19 +1060,6 @@ fn persist_immutable_bytes(directory: &Path, bytes: &[u8]) -> std::io::Result<()
     result
 }
 
-async fn claude_user_line(request: &RunRequest, script: ClaudeRunScript) -> anyhow::Result<String> {
-    let images = crate::claude::load_image_blocks(&request.attachments).await;
-    if matches!(script, ClaudeRunScript::Attachment) && images.is_empty() {
-        bail!(
-            "The selected attachment could not be inlined. Use a supported image under 5 MiB and retry."
-        );
-    }
-    Ok(crate::claude::wire::user_message_line_with_images(
-        &request.prompt,
-        &images,
-    ))
-}
-
 fn codex_initialize_line() -> String {
     json!({
         "jsonrpc": "2.0",
@@ -1121,52 +1119,6 @@ mod tests {
     const APPROVAL_MARKER_NAME: &str = "capture-marker.txt";
 
     #[test]
-    fn claude_capture_uses_the_run_command_builder() {
-        let request = contract_request();
-        let exe = absolute_program("claude");
-        let launch = crate::claude::run_launch(&exe, &request);
-        let snapshot = CommandSnapshot::from_launch(&launch);
-
-        assert_eq!(snapshot.program, exe.display().to_string());
-        assert_eq!(
-            &snapshot.args[..18],
-            [
-                "--print",
-                "--input-format",
-                "stream-json",
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--include-partial-messages",
-                "--permission-prompt-tool",
-                "stdio",
-                "--model",
-                "claude-sonnet-5[1m]",
-                "--effort",
-                "xhigh",
-                "--permission-mode",
-                "bypassPermissions",
-                "--dangerously-skip-permissions",
-                "--resume=session-to-resume",
-                "--settings",
-            ]
-        );
-        assert_eq!(snapshot.args.len(), 19);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&snapshot.args[18]).unwrap(),
-            json!({"alwaysThinkingEnabled": true, "fastMode": true})
-        );
-        assert_eq!(snapshot.cwd.as_deref(), Some(request.cwd.as_str()));
-        assert!(snapshot.configured_env.is_empty(), "PATH is never captured");
-        assert_eq!(snapshot.stdin, StdioMode::Piped);
-        assert_eq!(snapshot.stdout, StdioMode::Piped);
-        assert_eq!(snapshot.stderr, StdioMode::Piped);
-        assert!(snapshot.kill_on_drop);
-        #[cfg(windows)]
-        assert_eq!(snapshot.creation_flags, 0);
-    }
-
-    #[test]
     fn codex_capture_uses_the_run_command_builder() {
         let request = contract_request();
         let exe = absolute_program("codex");
@@ -1183,87 +1135,6 @@ mod tests {
         assert!(snapshot.kill_on_drop);
         #[cfg(windows)]
         assert_eq!(snapshot.creation_flags, 0);
-    }
-
-    /// Break caught: a Claude run driver invents its own initial wire line instead of recording
-    /// the exact provider-specific user message it writes through the production run launch.
-    #[tokio::test]
-    async fn recorder_claude_run_records_the_exact_initial_write() {
-        let raw = tempfile::tempdir().unwrap();
-        let request = RunRequest {
-            prompt: "scenario:happy".into(),
-            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
-        };
-        let capture = record(config(
-            "claude-fresh-text",
-            fixture_path("fake-claude"),
-            CaptureOperation::Claude(ClaudeCaptureOperation::Run {
-                request,
-                script: ClaudeRunScript::FreshText,
-            }),
-            raw.path(),
-        ))
-        .await
-        .unwrap();
-
-        let writes = channel_payloads(&capture, Channel::Stdin);
-        assert_eq!(writes.len(), 1);
-        assert_eq!(
-            serde_json::from_str::<Value>(writes[0]).unwrap(),
-            json!({
-                "type": "user",
-                "message": {"role": "user", "content": "scenario:happy"},
-                "parent_tool_use_id": null,
-            })
-        );
-        assert_eq!(capture.exit_code, Some(0));
-    }
-
-    #[tokio::test]
-    async fn capture_attachment_line_uses_the_production_image_helpers() {
-        let temp = tempfile::tempdir().unwrap();
-        let image = temp.path().join("tiny.png");
-        std::fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
-        let request = RunRequest {
-            prompt: "describe".into(),
-            attachments: vec![image.display().to_string()],
-            ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
-        };
-        let production_images = crate::claude::load_image_blocks(&request.attachments).await;
-        assert_eq!(
-            super::claude_user_line(&request, ClaudeRunScript::Attachment)
-                .await
-                .unwrap(),
-            crate::claude::wire::user_message_line_with_images(&request.prompt, &production_images)
-        );
-    }
-
-    #[tokio::test]
-    async fn claude_attachment_capture_requires_inline_image_before_text() {
-        let raw = tempfile::tempdir().unwrap();
-        let files = tempfile::tempdir().unwrap();
-        let image = files.path().join("tiny.png");
-        std::fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
-        let request = RunRequest {
-            prompt: "scenario:attachment".into(),
-            attachments: vec![image.display().to_string()],
-            ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
-        };
-        let capture = record(config(
-            "claude-attachment",
-            fixture_path("fake-claude"),
-            CaptureOperation::Claude(ClaudeCaptureOperation::Run {
-                request,
-                script: ClaudeRunScript::Attachment,
-            }),
-            raw.path(),
-        ))
-        .await
-        .unwrap();
-        let first: serde_json::Value =
-            serde_json::from_str(channel_payloads(&capture, Channel::Stdin)[0]).unwrap();
-        assert_eq!(first["message"]["content"][0]["type"], "image");
-        assert_eq!(first["message"]["content"][1]["type"], "text");
     }
 
     #[test]
@@ -1433,28 +1304,6 @@ mod tests {
             "partial evidence bypassed explicit rejection: {error:?}"
         );
         assert!(!staging.exists());
-    }
-
-    #[tokio::test]
-    async fn strict_resume_cannot_be_relabelled_success() {
-        let raw = tempfile::tempdir().unwrap();
-        let claude_request = RunRequest {
-            prompt: "scenario:happy".into(),
-            resume: Some("different-session".into()),
-            ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
-        };
-        let error = record(config(
-            "claude-resume",
-            fixture_path("fake-claude"),
-            CaptureOperation::Claude(ClaudeCaptureOperation::Run {
-                request: claude_request,
-                script: ClaudeRunScript::Resume,
-            }),
-            raw.path(),
-        ))
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("different session identifier"));
     }
 
     #[cfg(windows)]

@@ -47,7 +47,12 @@ pub(super) trait CaptureProvider: Sized {
     fn frame(line: &str) -> Option<Value>;
 
     /// HANDSHAKE. Claude's `control_request`/`initialize`; Codex's
-    /// `initialized` + `thread/start`.
+    /// `initialize` → await reply → `initialized`, in that order.
+    ///
+    /// `thread/start` is NOT part of the Codex handshake: no discovery
+    /// scenario sends one. It belongs to the run scenario bodies that need a
+    /// thread (Task 5) — a handshake that branches per scenario would not be
+    /// a seam member.
     async fn handshake(
         session: &mut Session<Self>,
         input: &super::scenarios::ScenarioInput,
@@ -55,9 +60,11 @@ pub(super) trait CaptureProvider: Sized {
 
     /// TURN-COMPLETE. Which frame means "stop recording".
     ///
-    /// Unused by production code until a run scenario needs
-    /// [`Session::wait_for_turn_end`] (Tasks 2 and 5); covered directly by
-    /// each provider's own unit tests in the meantime.
+    /// Unused by production code until the SCENARIOS table wires a run
+    /// scenario's `body` in (Task 7); Tasks 2, 3 and 5 write the callers
+    /// (`Session::wait_for_turn_end`) in the meantime, exercised only by each
+    /// scenario file's own tests. Covered directly by each provider's own
+    /// unit tests as well.
     #[allow(dead_code)]
     fn turn_complete(frame: &Value) -> bool;
 }

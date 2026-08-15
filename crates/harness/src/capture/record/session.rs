@@ -261,8 +261,10 @@ impl<P: CaptureProvider> Session<P> {
 
     /// Pump frames until `P::turn_complete`.
     ///
-    /// Unused by any scenario this task ports (discovery starts no turn);
-    /// the run-scenario tasks (2, 5) are its first callers.
+    /// Unused by production code until the SCENARIOS table wires a run
+    /// scenario's `body` in (Task 7); the run-scenario bodies written in
+    /// Tasks 2, 3 and 5 are its callers in the meantime, exercised only by
+    /// each scenario file's own tests.
     #[allow(dead_code)]
     pub(super) async fn wait_for_turn_end(&mut self) -> anyhow::Result<()> {
         while let Some(frame) = self.next_frame().await? {
