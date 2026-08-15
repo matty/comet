@@ -810,7 +810,8 @@ mod tests {
     /// Ported from `recording.rs` (name kept). Now end-to-end: drives `steer` and `interruption`
     /// against `fake-codex`'s real `steer`/`interrupt` branches — reachable through the ported
     /// scenarios' own production prompts, per the additive match `fake_codex.rs` gained alongside
-    /// this task — and asserts the exact `turn/steer`/`turn/interrupt` line each one puts on the
+    /// the neutral-recorder stage's port of these scenarios — and asserts the exact
+    /// `turn/steer`/`turn/interrupt` line each one puts on the
     /// wire matches `crate::codex::turn_steer_params`/`turn_interrupt_params` computed
     /// independently. The pre-port version only checked those two production functions against
     /// themselves, never against anything `codex_run` actually sent.

@@ -26,6 +26,11 @@
 //!   escalating to SIGTERM → SIGKILL if the child is unresponsive; the stream
 //!   always ends with `Done { status: Interrupted }`.
 
+// `pub(crate)`, not private: `capture::record::scenarios::codex`'s approval reply builder calls
+// `approval::decision_literal` directly, so the capture recorder sends the exact same "decision"
+// string production's own `handle_server_request` does, instead of a second hand-copied literal
+// that could drift. Narrowing this back to private breaks that build — see `decision_response`'s
+// doc comment in `capture/record/scenarios/codex.rs`.
 pub(crate) mod approval;
 mod catalog;
 pub(crate) mod discovery;
