@@ -44,6 +44,7 @@ use comet_syntax::LanguageId as Lang;
 // ---------------------------------------------------------------------------
 
 pub const FILE_HEADER_HEIGHT: f32 = 36.0;
+const STICKY_FILE_HEADER_BLUR: f32 = 16.0;
 pub const HUNK_HEADER_HEIGHT: f32 = 28.0;
 pub const DIFF_LINE_HEIGHT: f32 = 21.0;
 pub const NOTICE_HEIGHT: f32 = 24.0;
@@ -2014,13 +2015,16 @@ impl Changes {
         let sticky = presentation == FileHeaderPresentation::Sticky;
         // The sticky copy floats over scrolling rows, so its wash has to be
         // opaque — the row version's translucent ink would let diff lines
-        // read straight through it.
-        let rest_bg = if sticky {
+        // read straight through it. Under a glass theme the frost applied by
+        // `render_sticky_file_header` does that job instead, so the wash stays
+        // translucent and the header keeps matching its in-list twin.
+        let opaque_sticky = sticky && !theme.is_glass();
+        let rest_bg = if opaque_sticky {
             crate::theme::flatten(crate::theme::ink(0.025), theme.bg)
         } else {
             crate::theme::ink(0.025)
         };
-        let hover_bg = if sticky {
+        let hover_bg = if opaque_sticky {
             crate::theme::flatten(crate::theme::ink(0.05), theme.bg)
         } else {
             crate::theme::ink(0.05)
@@ -2167,6 +2171,10 @@ impl Changes {
             theme,
             cx,
         );
+        // Match the translucent in-list header without letting diff text show
+        // sharply through the overlay. Frosted is a pass-through on opaque
+        // platforms, where render_file_header keeps the solid fallback.
+        let header = crate::frost::frosted(0.0, STICKY_FILE_HEADER_BLUR, header);
 
         Some(
             div()
