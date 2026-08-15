@@ -96,6 +96,13 @@ frames still prove what the scenario is for:
 
 Do not edit staged output by hand.
 
+Before promoting, also check
+[`docs/debt/D73-tool-argument-union-paths.md`](../debt/D73-tool-argument-union-paths.md): seven
+paths on `claude.txt` are allowlisted as a union across today's five known tools rather than
+reviewed per tool, and that page must be settled — not merely re-read — before the next capture is
+promoted to the corpus. A new capture is exactly the event that could exercise a sixth, unreviewed
+tool (including a third-party MCP tool) through one of those already-approved paths.
+
 ## Promote
 
 Copy the reviewed `manifest.json` and `events.jsonl` pair into the observed version/scenario

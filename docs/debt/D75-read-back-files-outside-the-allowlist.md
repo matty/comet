@@ -30,15 +30,28 @@ Read directly, `read-back-run-journal.jsonl` and `read-back-doc-snapshot.json` c
   removed from `events.jsonl` everywhere else (`.mcp_servers[].name`, `.tools[]`, and the same
   family of installed-tooling identity Task 1 excluded).
 
-## Why this is not the leak this stage exists to close
+## Why this is not the leak this stage exists to close today — but the roster is not structurally safe
 
 The stage's own motivating incident — the recording user's OS build, installed plugin names and
 versions, subagent roster, MCP connector identity — was about identity: whose machine, whose
-plugins, whose agents, whose servers. Nothing in these two files is machine, user, path, plugin,
-or MCP identity. The earlier hand-sanitizing pass did substitute cwd/home, and replaced session,
-task, tool, message, and device ids with reused placeholders, and dropped `mcp__*` entries from the
-tools list. What survives is model-authored prose and a **generic** built-in agent-type name, not
-anyone's configuration.
+plugins, whose agents, whose servers. The earlier hand-sanitizing pass did substitute cwd/home, and
+replaced session, task, tool, message, and device ids with reused placeholders. What survives
+besides those is model-authored prose, a **generic** built-in agent-type name (`agentType:
+"general-purpose"`), and the roster named in the inventory above: `read-back-run-journal.jsonl`'s
+`sessionStarted.tools` publishes all ~35 tool names verbatim.
+
+That roster is not a fixed, generic Comet catalog — `tools` on `SessionStarted` is populated from
+the same place the raw provider frame's `.tools[]` is (`crates/harness/src/claude/wire.rs:46`,
+plumbed through `normalize.rs:756`): whatever the Claude Code process itself reported at `init`,
+including any `mcp__<server>__<tool>` entries an MCP connection would add. In *this* capture it is
+verified safe on both counts — none of the 35 names carries an `mcp__` prefix, and this run's raw
+frames (`events.jsonl` sequence 4) show `"mcp_servers":[]`, so there was nothing to leak. But that
+is a fact about this one recording, not a property the read-back format enforces: a future
+subagent capture taken from a session with an MCP server connected would carry that server's
+identity in this same field, unredacted, the same way the raw wire frame did before Task 2 closed
+it there. So the roster is not machine, user, or path identity, but it is not categorically free of
+MCP identity either — it is free of it here, by the coincidence of what this particular run had
+connected.
 
 ## Why it is still worth a row
 
