@@ -379,16 +379,19 @@ pub enum SendButtonMode {
     Stop,
 }
 
+/// What the composer holds that a send could carry. A staged image or diff
+/// comment counts: both synthesize their own prompt body, so either alone is
+/// a legal send — and during a live run has to read as Steer, not Stop.
+pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> bool {
+    !text.trim().is_empty() || attachments > 0 || comments > 0
+}
+
 pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
     match (run_live, has_text) {
         (false, _) => SendButtonMode::Send,
         (true, true) => SendButtonMode::Steer,
         (true, false) => SendButtonMode::Stop,
     }
-}
-
-pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> bool {
-    !text.trim().is_empty() || attachments > 0 || comments > 0
 }
 
 pub fn assemble_user_message(
@@ -7146,6 +7149,30 @@ mod tests {
         assert_eq!(m.progress(180.0), 1.0);
         let mid = m.progress(90.0);
         assert!(mid > 0.0 && mid < 1.0);
+    }
+
+    #[test]
+    fn staged_comments_alone_are_content() {
+        assert!(!composer_has_content("   ", 0, 0));
+        assert!(composer_has_content("hi", 0, 0));
+        assert!(composer_has_content("", 1, 0));
+        assert!(composer_has_content("", 0, 1));
+    }
+
+    #[test]
+    fn a_comment_only_stage_steers_a_live_run_instead_of_stopping_it() {
+        let live = true;
+        let comment_only = composer_has_content("", 0, 2);
+        assert_eq!(
+            send_button_mode(live, comment_only),
+            SendButtonMode::Steer,
+            "comment-only submit must steer, not interrupt the run"
+        );
+        // Nothing staged at all is still the stop square.
+        assert_eq!(
+            send_button_mode(live, composer_has_content("", 0, 0)),
+            SendButtonMode::Stop
+        );
     }
 
     #[test]
