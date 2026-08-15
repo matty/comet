@@ -20,7 +20,7 @@ mod surface;
 mod test_support;
 mod types;
 
-pub use allowlist::{Allowlist, allows, named_kind};
+pub use allowlist::{Allowlist, allows, allows_prefix, named_kind};
 pub use approval::{
     approval_marker_command, approval_on_request_prompt, claude_approval_prompt,
     codex_approval_prompt,
@@ -32,7 +32,8 @@ pub use sanitize::{
     NovelPath, SanitizationError, SanitizationReport, render_novel_paths_report, sanitize_dir,
 };
 pub use surface::{
-    Direction, FieldObservation, FrameRef, SurfaceError, observe_corpus, observed_field_lines,
+    Direction, FieldObservation, FrameRef, MAP_PATHS, SurfaceError, observe_corpus,
+    observed_field_lines,
 };
 pub use types::{
     CaptureConfig, CaptureEvent, CaptureOperation, CaptureScenario, Channel,

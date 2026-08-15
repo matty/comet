@@ -44,7 +44,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use comet_harness::capture::{Provider, allows};
+use comet_harness::capture::{MAP_PATHS, Provider, allows, allows_prefix};
 use serde_json::Value;
 
 /// One committed scalar that is neither on its provider's allowlist nor
@@ -131,6 +131,119 @@ fn every_committed_value_is_allowlisted_or_a_placeholder() {
         report.push(format!("  {escape}"));
     }
     panic!("{}", report.join("\n"));
+}
+
+/// The same total property, in key position: every object key committed at a
+/// **map path** is either a prefix of an allowlisted path or a placeholder.
+///
+/// Split from the scalar property rather than folded into it because the two
+/// answer different questions. A key that is a *field name* is published on
+/// purpose — `observed-fields.json` is a snapshot of exactly those names, and
+/// this walk must not be read as licensing their redaction. A key that is
+/// *data* is an identifier the archive has no more business publishing than a
+/// value, and until the key rule landed nothing checked it: `collect_scalars`
+/// visits `String`/`Number` leaves, so an MCP server name in key position was
+/// invisible to every test in this file.
+#[test]
+fn every_committed_map_key_is_allowlisted_or_a_placeholder() {
+    let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    let mut escapes = Vec::new();
+    let mut scenario_count = 0u64;
+
+    for provider_dir in subdirectories(&corpus_root) {
+        for version_dir in subdirectories(&provider_dir) {
+            for scenario_dir in subdirectories(&version_dir) {
+                let events_path = scenario_dir.join("events.jsonl");
+                if !events_path.is_file() {
+                    continue;
+                }
+                scenario_count += 1;
+                let scenario = scenario_dir
+                    .strip_prefix(&corpus_root)
+                    .unwrap_or(scenario_dir.as_path())
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let (provider, placeholders) = manifest_provider_and_placeholders(
+                    &scenario_dir.join("manifest.json"),
+                    &scenario,
+                );
+                let text = std::fs::read_to_string(&events_path)
+                    .unwrap_or_else(|error| panic!("{scenario}: events.jsonl unreadable: {error}"));
+                for line in text.lines() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let event: Value = serde_json::from_str(line)
+                        .unwrap_or_else(|error| panic!("{scenario}: invalid event line: {error}"));
+                    let sequence = event["sequence"].as_u64().unwrap_or_default();
+                    let Some(payload) = event["payload"].as_str() else {
+                        continue;
+                    };
+                    let Ok(payload) = serde_json::from_str::<Value>(payload) else {
+                        continue;
+                    };
+                    let mut keys = Vec::new();
+                    collect_map_keys(&payload, "", &mut keys);
+                    for (parent_path, key) in keys {
+                        let formed = format!("{parent_path}.{key}");
+                        if allows_prefix(provider, &formed) || placeholders.contains(&key) {
+                            continue;
+                        }
+                        escapes.push(Escape {
+                            scenario: scenario.clone(),
+                            sequence,
+                            // The map position, never the key: this message
+                            // lands in terminals and PR bodies, and naming the
+                            // key would republish the identifier the failure
+                            // is complaining about.
+                            path: format!("{parent_path}.{{}}"),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        scenario_count > 0,
+        "found no events.jsonl under {} -- corpus walk is broken, not just empty",
+        corpus_root.display()
+    );
+    assert!(
+        escapes.is_empty(),
+        "{} map key(s) are committed verbatim at a path the allowlist does not license \
+         (keys withheld deliberately -- open the named frame locally):\n  {}",
+        escapes.len(),
+        escapes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+}
+
+/// Every `(parent_path, key)` pair sitting at a declared map path. Mirrors
+/// `sanitize_value_tree`'s own array/object path arithmetic, the same way
+/// `collect_scalars` does.
+fn collect_map_keys(value: &Value, path: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::Array(items) => {
+            let child_path = format!("{path}[]");
+            for item in items {
+                collect_map_keys(item, &child_path, out);
+            }
+        }
+        Value::Object(object) => {
+            let is_map = MAP_PATHS.contains(&path);
+            for (key, child) in object {
+                if is_map {
+                    out.push((path.to_owned(), key.clone()));
+                }
+                collect_map_keys(child, &format!("{path}.{key}"), out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The reciprocity that survives Task 5's manifest-reconstruction gap

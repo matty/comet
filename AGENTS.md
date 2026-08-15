@@ -110,6 +110,12 @@ standing rule is "nothing decodes it, so it goes," not "nothing recognized it as
 a path to one of those files is a decision to publish that field's values forever, in this public
 repository, and `docs/testing/provider-captures.md` is the review procedure for making that call.
 
+**Field names are published on purpose; map keys are not.** A key that names a field survives
+sanitizing — `observed-fields.json` is a snapshot of exactly those names. A key that *is* data,
+under a path declared in `surface::MAP_PATHS`, redacts by default like a value. Declaring a new
+map is one edit serving both: the surface snapshot stops recording the key as a field, and the
+sanitizer stops publishing it. A map nobody declared still publishes its keys (D77).
+
 `crates/harness/tests/corpus/observed-fields.json` is a generated snapshot of every field the
 promoted corpus shows, per provider and direction. It exists for one reason: a newly promoted
 capture, or a new CLI version's added field, **fails the suite** instead of arriving unnoticed.

@@ -10,6 +10,18 @@
 //! `allowlist/codex.txt`, one full dotted path per line, reviewed by hand.
 //! Adding a line is a decision to publish that field's values forever.
 //!
+//! **Keys split two ways, and only one of them redacts.** A key that is a
+//! *field name* survives: `tests/corpus/observed-fields.json` is a snapshot of
+//! exactly those names, so redacting them would blank the evidence the corpus
+//! exists to hold. A key that is *data* — one under a path declared in
+//! `surface::MAP_PATHS`, where the key is a model id rather than a field —
+//! goes through `allows_prefix` and redacts by default like any value. Before
+//! that rule (finding 1, PR #66), an object keyed by anything identifying rode
+//! into the archive verbatim while its value was dutifully redacted beside it,
+//! and no test could see it: `allowlist_property.rs` walks scalars, and the
+//! surface snapshot collapses a map key to `{}` by design. What is still open
+//! is a map at an *undeclared* path — `docs/debt/README.md` D77.
+//!
 //! **Standing rule (adopted 2026-08-15): a field nothing decodes defaults to
 //! redacted.** A path no code reads gains nothing from surviving verbatim, so
 //! it does not belong on the list even when its sampled values look dull.
@@ -78,6 +90,38 @@ pub fn allows(provider: Provider, path: &str) -> bool {
         Provider::Claude => claude_paths().contains(path),
         Provider::Codex => codex_paths().contains(path),
     }
+}
+
+/// Whether `path` names a *position on the way to* something allowlisted —
+/// either a listed path itself, or a proper prefix of one at a segment
+/// boundary.
+///
+/// This is the question a **map key** asks, and only a map key: the keys under
+/// a path declared in `surface::MAP_PATHS` are data (a model id, and whatever a
+/// future provider keys a map by), so they get the same default-deny treatment
+/// as a value. `.modelUsage.claude-haiku-4-5-20251001` is a prefix of two
+/// listed paths and its key therefore survives; a second model id nobody has
+/// reviewed is a prefix of nothing and its key is replaced.
+///
+/// Ordinary object keys never reach this function. A field *name* is published
+/// deliberately — `tests/corpus/observed-fields.json` is a snapshot of exactly
+/// those names, and redacting them would blank the evidence the corpus exists
+/// to hold. The distinction this draws is name-versus-data, not key-versus-value.
+///
+/// Boundary matching is the point of the `is_boundary` check: `.mcp` must not
+/// pass because `.mcp_servers[].status` happens to start with those bytes.
+/// A `[` boundary counts as well as a `.`, so `.mcp_servers` is a prefix of
+/// `.mcp_servers[].status`.
+pub fn allows_prefix(provider: Provider, path: &str) -> bool {
+    let paths = match provider {
+        Provider::Claude => claude_paths(),
+        Provider::Codex => codex_paths(),
+    };
+    paths.iter().any(|listed| {
+        listed
+            .strip_prefix(path)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.') || rest.starts_with('['))
+    })
 }
 
 /// The full leaf-to-name table `named_kind` is driven off. A `const` table
@@ -167,6 +211,40 @@ mod tests {
     fn the_lists_are_independent() {
         assert!(allows(Provider::Claude, ".mcp_servers[].status"));
         assert!(!allows(Provider::Codex, ".mcp_servers[].status"));
+    }
+
+    /// `allows_prefix` answers about positions on the way to a listed path,
+    /// and only at a segment boundary. The `.mcp` case is the one that matters:
+    /// a plain `starts_with` would call it a prefix of `.mcp_servers[].status`
+    /// and license a map key spelled `mcp`.
+    #[test]
+    fn allows_prefix_matches_only_at_a_segment_boundary() {
+        assert!(allows(Provider::Claude, ".mcp_servers[].status"));
+
+        assert!(
+            allows_prefix(Provider::Claude, ".mcp_servers"),
+            "a path an allowlisted path descends from is a prefix"
+        );
+        assert!(
+            allows_prefix(Provider::Claude, ".mcp_servers[].status"),
+            "a listed path is a prefix of itself"
+        );
+        assert!(
+            !allows_prefix(Provider::Claude, ".mcp"),
+            "a partial segment is not a prefix"
+        );
+        assert!(!allows_prefix(Provider::Claude, ".nobody.wrote.this"));
+
+        // The live case: `.modelUsage`'s two literal lines are what keep the
+        // committed archive's model-id key readable.
+        assert!(allows_prefix(
+            Provider::Claude,
+            ".modelUsage.claude-haiku-4-5-20251001"
+        ));
+        assert!(!allows_prefix(
+            Provider::Claude,
+            ".modelUsage.some-unreviewed-model"
+        ));
     }
 
     /// Six names, no more, no fewer — pinned by counting the table `named_kind`

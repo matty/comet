@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::allowlist::{allows, named_kind};
+use super::allowlist::{allows, allows_prefix, named_kind};
 use super::filesystem::has_windows_reparse_point;
+use super::surface;
 use super::types::{Channel, PartialRawCapture, Provider, RawCapture};
 
 #[derive(Clone, Debug)]
@@ -34,17 +35,21 @@ pub struct SanitizationReport {
 /// list this exists to keep short and actionable. See the doc comment on
 /// `is_mcp_tool_identity` for the reviewed reasoning behind that exception.
 ///
-/// `path` itself can carry a map key verbatim — Claude's `.modelUsage` is
-/// keyed by model id (`.modelUsage.claude-haiku-4-5-20251001…`, see
-/// `allowlist/claude.txt`'s two literal lines for it), so that id rides
-/// through this struct's `path` field on any run where `.modelUsage` itself
-/// is withheld. That is safe, not an oversight: an object key is never a
-/// *value* the redactor withholds (`sanitize_scalar` only ever inspects
-/// `Value::String`/`Value::Number` leaves, not the keys above them), and
-/// `validate_key` rejects the whole capture outright if any key contains a
-/// redaction root, an absolute path, or a secret-shaped string. So a key
-/// that reaches this struct has already passed the same fail-closed scan a
-/// value would.
+/// `path` can name a **field**, and field names are published deliberately —
+/// `tests/corpus/observed-fields.json` is a snapshot of exactly those names.
+/// What it can never name is a **map key**: a key under one of
+/// `surface::MAP_PATHS` is data, so an unreviewed one is replaced before the
+/// path is built, and the entry it produces reads `.modelUsage.{}` with the
+/// key counted as a withheld value. `.modelUsage.claude-haiku-4-5-20251001`
+/// still appears verbatim, because those two literal lines are on
+/// `allowlist/claude.txt` and a listed path is a decision to publish.
+///
+/// An earlier version of this comment argued no key needed redacting at all,
+/// on the grounds that `validate_key` fail-closed-scans every one. That scan
+/// is a *blocklist* — redaction roots, absolute paths, secret shapes — which
+/// is the thing this whole module replaced in value position, and it has
+/// nothing to say about a key that names a machine, an account or a
+/// connector. Keys are now default-deny wherever they are data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NovelPath {
     pub path: String,
@@ -79,6 +84,8 @@ pub enum SanitizationError {
     SecretLikeValue { location: String },
     #[error("capture contains a sensitive object key at {location}")]
     SensitiveObjectKey { location: String },
+    #[error("capture contains an object key that would impersonate a nested path at {location}")]
+    AmbiguousObjectKey { location: String },
     #[error("capture channel contains unparseable structured JSON at sequence {sequence}")]
     UnparseableStructuredPayload { sequence: u64 },
     #[error("Claude capture command has invalid resume arguments at {location}")]
@@ -628,20 +635,53 @@ impl Redactor {
                 Ok(())
             }
             Value::Object(object) => {
-                let keys: Vec<String> = object.keys().cloned().collect();
-                for (index, child_key) in keys.into_iter().enumerate() {
+                // Keys under a declared map path are data, not field names, so
+                // they redact by the same default-deny rule as a value. The
+                // object is rebuilt rather than mutated in place because a
+                // redacted key is a *rename*, and remove-then-insert on the
+                // map being iterated is order-dependent under serde_json's
+                // `preserve_order` feature. Rebuilding in iteration order is
+                // correct whichever backend is compiled in.
+                let is_map = surface::MAP_PATHS.contains(&path);
+                let mut rebuilt = serde_json::Map::with_capacity(object.len());
+                for (index, (child_key, mut child)) in
+                    std::mem::take(object).into_iter().enumerate()
+                {
                     let child_location = format!("{location}.object[{index}]");
                     self.validate_key(&child_key, &child_location)?;
-                    let child_path = format!("{path}.{child_key}");
-                    let child = object.get_mut(&child_key).expect("key came from object");
+                    let candidate_path = format!("{path}.{child_key}");
+                    let key_survives = !is_map || allows_prefix(provider, &candidate_path);
+                    let (child_key, child_path) = if key_survives {
+                        (child_key, candidate_path)
+                    } else {
+                        // Reported at the map-key *position* (`surface.rs`'s
+                        // own `{}` notation), never at the key itself: a
+                        // report that named the path verbatim would republish
+                        // exactly the identifier this branch just withheld.
+                        // The key rides through as the withheld *value*, which
+                        // `novel_paths` reduces to a count and a shape.
+                        self.record_novel(
+                            &format!("{path}.{{}}"),
+                            &Value::String(child_key.clone()),
+                        );
+                        // Generic `<Vn>`, not a named group: a map key is not
+                        // one of the six kinds anything reads, and the same
+                        // identifier appearing elsewhere as a value still
+                        // shares its placeholder, so joins survive.
+                        let placeholder = self.resolve(&Value::String(child_key), None);
+                        let child_path = format!("{path}.{placeholder}");
+                        (placeholder, child_path)
+                    };
                     self.sanitize_value_tree(
-                        child,
+                        &mut child,
                         provider,
                         &child_path,
                         &child_key,
                         &child_location,
                     )?;
+                    rebuilt.insert(child_key, child);
                 }
+                *object = rebuilt;
                 Ok(())
             }
             Value::String(_) | Value::Number(_) => {
@@ -794,7 +834,25 @@ impl Redactor {
         Ok(())
     }
 
+    /// A key is rejected outright if it carries a path delimiter, before any
+    /// allowlist question is asked of it.
+    ///
+    /// Paths are built by joining keys with `.`, so a key that contains one is
+    /// indistinguishable from nesting: a root-level `{"result.platformOs": …}`
+    /// builds `.result.platformOs`, matches that listed path, and publishes
+    /// whatever the provider put there. `[` and `]` do the same for the array
+    /// marker. Rejecting is the fail-closed answer and matches how this
+    /// sanitizer already treats an unrecognized absolute path — a capture that
+    /// hits it stops rather than being quietly reshaped. No key in any promoted
+    /// capture contains one of these; if a real provider ever emits a dotted
+    /// key, that is a design question about path encoding, not something to
+    /// escape past on the day it arrives.
     fn validate_key(&mut self, key: &str, location: &str) -> Result<(), SanitizationError> {
+        if key.contains(['.', '[', ']']) {
+            return Err(SanitizationError::AmbiguousObjectKey {
+                location: location.to_owned(),
+            });
+        }
         let mut sanitized = key.to_owned();
         self.sanitize_paths_and_validate(&mut sanitized, location)?;
         if sanitized != key {
@@ -1090,15 +1148,19 @@ fn describe_shape(values: &[Value]) -> String {
 /// after a sanitize run reads as "nothing happened here," not as "everything
 /// was already on the allowlist."
 ///
-/// The header promises no *value* appears below, not that nothing sensitive-
-/// looking can -- a `path` entry can itself carry a map key verbatim (see
-/// `NovelPath`'s doc comment for the `.modelUsage` example and why that is
-/// safe). Keep that distinction in the wording if this changes: "no
-/// withheld values" is the guarantee this module actually enforces, and
-/// widening it to "nothing withheld" would overstate what `record_novel`
-/// and `describe_shape` do.
+/// The header promises no *withheld* value or key appears below. It does not
+/// promise the paths themselves are contentless: a path names **field names**,
+/// which the corpus publishes on purpose (`observed-fields.json` is a snapshot
+/// of exactly those). A withheld map key is the one thing that could have made
+/// that distinction leak, and it is reported at its position (`.modelUsage.{}`)
+/// rather than spelled -- see `NovelPath`'s doc comment. Keep the wording
+/// honest if this changes: "nothing withheld appears below" is what
+/// `record_novel` and `describe_shape` actually enforce, and "nothing
+/// identifying appears below" would overstate it.
 pub fn render_novel_paths_report(novel_paths: &[NovelPath]) -> String {
-    let header = "Novel paths withheld by the allowlist (no withheld values appear below; a path may still include a map key, e.g. a model id):";
+    let header = "Novel paths withheld by the allowlist (nothing withheld appears below -- \
+                  a withheld map key is counted at its position, e.g. `.modelUsage.{}`, \
+                  never spelled):";
     if novel_paths.is_empty() {
         return format!("{header}\n  (none -- every field on the wire was already allowlisted)");
     }
@@ -1779,5 +1841,109 @@ mod tests {
     fn a_builtin_tool_name_on_the_same_path_survives() {
         let out = sanitize_value(json!({"request": {"tool_name": "Bash"}}), Provider::Claude);
         assert_eq!(out["request"]["tool_name"], "Bash");
+    }
+
+    /// A **field name** survives even when its value does not, and that is the
+    /// deliberate half of the key rule rather than an oversight:
+    /// `tests/corpus/observed-fields.json` is a snapshot of field names, and a
+    /// sanitizer that redacted them would blank the evidence the corpus exists
+    /// to hold. Pinned so a later tightening of the key rule cannot quietly
+    /// swallow the whole surface map.
+    #[test]
+    fn an_unlisted_field_keeps_its_name_and_loses_its_value() {
+        let out = sanitize_value(json!({"somethingBrandNew": "secret-ish"}), Provider::Claude);
+        let object = out.as_object().expect("an object came in");
+        assert!(
+            object.contains_key("somethingBrandNew"),
+            "a field name is published deliberately; only its value redacts"
+        );
+        assert_ne!(out["somethingBrandNew"], "secret-ish");
+    }
+
+    /// The finding this fix exists for. A key under a declared map path
+    /// (`surface::MAP_PATHS`) is data, not a field name, so an unreviewed one
+    /// is replaced — the same default-deny every value gets. Before this, a
+    /// map keyed by anything identifying (an MCP server name, an account, a
+    /// machine) rode into the committed archive verbatim while its value was
+    /// dutifully redacted beside it.
+    #[test]
+    fn an_unreviewed_map_key_is_redacted() {
+        let out = sanitize_value(
+            json!({"modelUsage": {"private-local-model-id": {"provider": "anthropic"}}}),
+            Provider::Claude,
+        );
+        let keys: Vec<&String> = out["modelUsage"]
+            .as_object()
+            .expect("modelUsage stays an object")
+            .keys()
+            .collect();
+        assert_eq!(keys.len(), 1);
+        assert_ne!(
+            keys[0], "private-local-model-id",
+            "an unreviewed map key must not survive"
+        );
+        assert!(
+            keys[0].starts_with('<') && keys[0].ends_with('>'),
+            "it must be a placeholder, got {:?}",
+            keys[0]
+        );
+    }
+
+    /// The other half: a map key that IS on the allowlist survives, because a
+    /// listed path is a decision to publish. Both `.modelUsage.
+    /// claude-haiku-4-5-20251001.*` lines in `allowlist/claude.txt` depend on
+    /// this, and so does the committed archive — this test is what makes
+    /// "the key fix churns no evidence" checkable rather than asserted.
+    #[test]
+    fn a_reviewed_map_key_survives() {
+        let out = sanitize_value(
+            json!({"modelUsage": {"claude-haiku-4-5-20251001": {"provider": "anthropic"}}}),
+            Provider::Claude,
+        );
+        assert_eq!(
+            out["modelUsage"]["claude-haiku-4-5-20251001"]["provider"],
+            "anthropic"
+        );
+    }
+
+    /// The report is pasted into terminals and PR bodies, so a withheld key
+    /// must be as absent from it as a withheld value. It is named at the map
+    /// *position* (`surface.rs`'s own `{}` notation) and counted, never
+    /// spelled.
+    #[test]
+    fn the_report_never_names_a_withheld_map_key() {
+        let report = sanitize_value_reporting(
+            json!({"modelUsage": {"private-local-model-id": {"provider": "anthropic"}}}),
+            Provider::Claude,
+        );
+        let rendered = render_novel_paths_report(&report.novel_paths);
+        assert!(
+            !rendered.contains("private-local-model-id"),
+            "the report must never carry a withheld key:\n{rendered}"
+        );
+        assert!(
+            report
+                .novel_paths
+                .iter()
+                .any(|novel| novel.path == ".modelUsage.{}"),
+            "the withheld key must still be reported at its map position: {:?}",
+            report.novel_paths
+        );
+    }
+
+    /// A key carrying a path delimiter is rejected before any allowlist
+    /// question is asked of it. Without this, a root-level key spelled
+    /// `result.platformOs` builds exactly the dotted path `codex.txt` lists
+    /// and publishes whatever the provider put there.
+    #[test]
+    fn a_key_that_impersonates_a_nested_path_rejects() {
+        let outcome = try_sanitize_value(
+            json!({"result.platformOs": "LEAKED-LOCAL-VALUE"}),
+            Provider::Codex,
+        );
+        assert!(
+            matches!(outcome, Err(SanitizationError::AmbiguousObjectKey { .. })),
+            "a dotted key must reject the capture, got {outcome:?}"
+        );
     }
 }

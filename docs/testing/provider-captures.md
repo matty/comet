@@ -121,6 +121,18 @@ either at an allowlisted path or is a placeholder, with no exception. That prope
 The manual review above decides what belongs on the allowlist; this test is what actually stops an
 escape from being promoted, and it fails loudly, over the whole corpus, if one gets through.
 
+Its sibling `every_committed_map_key_is_allowlisted_or_a_placeholder` does the same in key
+position, and the two are not interchangeable: the scalar property walks `String`/`Number` leaves,
+so an identifier sitting in an object *key* was invisible to it. A rogue key planted under
+`.modelUsage` with no scalars beneath it fails the key property while the scalar property, the
+manifest-token property and the field snapshot all stay green.
+
+**When a report row names a key rather than a field, the object is a map and belongs in
+`surface::MAP_PATHS`.** That is the triage step for a novel map: the declaration is one edit, and
+it decides both questions at once — the field snapshot stops recording the key as a field name,
+and the sanitizer stops publishing it. Until it is declared, the keys ride through
+([D77](../debt/README.md)).
+
 Before committing, deliberately break each new contract once, observe a meaningful named failure,
 restore it, and rerun green. Finish with the repository gate from `AGENTS.md`.
 
