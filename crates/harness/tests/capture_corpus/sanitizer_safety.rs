@@ -1,8 +1,20 @@
+//! Fail-closed guarantees the allowlist does not itself provide.
+//!
+//! `allowlist_property.rs`'s total property (every committed scalar is
+//! either allowlisted or a placeholder) subsumed most of what used to live
+//! here: an absolute path or a secret-looking string on a path nobody
+//! allowlisted is now redacted unconditionally, by construction, so a test
+//! that fed one through a single unlisted field and asserted rejection was
+//! testing blocklist-era machinery that no longer runs. What is left is
+//! everything the allowlist genuinely does not reach: staging/output-path
+//! safety (independent of any capture content), and the two checks that run
+//! *regardless* of whether a path is on the list -- a credential-shaped
+//! field name, and a credential-shaped value riding a path the list would
+//! otherwise keep verbatim.
+
 use super::support::*;
 
-use std::path::PathBuf;
-
-use comet_harness::capture::{SanitizationError, sanitize_dir};
+use comet_harness::capture::{Provider, SanitizationError, allows, sanitize_dir};
 use serde_json::Value;
 
 /// Break caught: accepting non-JSON structured-channel frames makes user and assistant content
@@ -22,27 +34,6 @@ fn sanitizer_rejects_unparseable_stdout_before_writing_staging() {
         error,
         SanitizationError::UnparseableStructuredPayload { sequence: 1 }
     ));
-    assert!(!output.exists());
-}
-
-/// Break caught: validating only event payloads lets a secret-like provider version or platform
-/// metadata leak through the deterministic manifest.
-#[test]
-fn sanitizer_scans_every_manifest_string_before_writing_staging() {
-    let temp = tempfile::tempdir().unwrap();
-    let raw = write_raw_capture(temp.path(), "unsafe-metadata", &[r#"{"level":"debug"}"#]);
-    let mut capture: Value =
-        serde_json::from_slice(&std::fs::read(raw.join("capture.json")).unwrap()).unwrap();
-    capture["cli_version"] = Value::String("sk-proj-version-secret".into());
-    std::fs::write(
-        raw.join("capture.json"),
-        serde_json::to_vec_pretty(&capture).unwrap(),
-    )
-    .unwrap();
-    let output = staging_dir(temp.path(), "unsafe-metadata");
-
-    let error = sanitize_dir(&raw, &output).unwrap_err();
-    assert!(matches!(error, SanitizationError::SecretLikeValue { .. }));
     assert!(!output.exists());
 }
 
@@ -82,142 +73,13 @@ fn sanitizer_rejects_parent_traversal_after_the_staging_directory() {
     );
 }
 
-/// Break caught: weakening the post-redaction scan permits an absolute machine path not covered
-/// by the explicit HOME/REPO/CWD/TEMP allowlist to enter staging.
-#[test]
-fn sanitizer_rejects_unknown_unix_drive_unc_and_verbatim_windows_paths() {
-    let cases = [
-        ("unix", r#"{"path":"/srv/private/secret.txt"}"#),
-        ("drive", r#"{"path":"D:\\private\\secret.txt"}"#),
-        ("unc", r#"{"path":"\\\\server\\share\\secret.txt"}"#),
-        (
-            "verbatim-windows",
-            r#"{"path":"\\\\?\\D:\\private\\secret.txt"}"#,
-        ),
-    ];
-
-    for (name, payload) in cases {
-        let temp = tempfile::tempdir().unwrap();
-        let raw = write_raw_capture(temp.path(), name, &[payload]);
-        let output = staging_dir(temp.path(), name);
-        let error = sanitize_dir(&raw, &output).unwrap_err();
-        assert!(
-            matches!(error, SanitizationError::UnrecognizedAbsolutePath { .. }),
-            "{name} returned {error:?}"
-        );
-        assert!(!output.exists(), "{name} wrote rejected staging output");
-    }
-}
-
-/// Break caught: substring replacement can treat an allowlisted root as a prefix of a different
-/// absolute path, hide its drive/root marker, and let the unknown path escape rejection.
-#[test]
-fn sanitizer_does_not_allow_path_prefix_collisions() {
-    let temp = tempfile::tempdir().unwrap();
-    let cwd = PathBuf::from(r"D:\allowed\repo");
-    let raw = write_raw_capture(
-        temp.path(),
-        "path-prefix-collision",
-        &[&format!(
-            r#"{{"path":{}}}"#,
-            serde_json::to_string(r"D:\allowed\repo-other\secret.txt").unwrap()
-        )],
-    );
-    let mut capture: Value =
-        serde_json::from_slice(&std::fs::read(raw.join("capture.json")).unwrap()).unwrap();
-    capture["command"]["cwd"] = Value::String(cwd.display().to_string());
-    capture["redaction_roots"]["cwd"] = Value::String(cwd.display().to_string());
-    std::fs::write(
-        raw.join("capture.json"),
-        serde_json::to_vec_pretty(&capture).unwrap(),
-    )
-    .unwrap();
-
-    let error = sanitize_dir(&raw, &staging_dir(temp.path(), "path-prefix-collision")).unwrap_err();
-    assert!(matches!(
-        error,
-        SanitizationError::UnrecognizedAbsolutePath { .. }
-    ));
-}
-
-/// Break caught: textual prefix replacement can bless an allowed root followed by `..`, and a
-/// detector that recognizes only backslash UNC paths misses the equivalent forward-slash form.
-#[test]
-fn sanitizer_rejects_allowlist_traversal_and_forward_slash_unc_paths() {
-    for (name, path) in [
-        (
-            "allowlist-traversal",
-            r"D:\allowed\repo\..\private\secret.txt",
-        ),
-        ("forward-unc", "//server/share/private/secret.txt"),
-    ] {
-        let temp = tempfile::tempdir().unwrap();
-        let raw = write_raw_capture(
-            temp.path(),
-            name,
-            &[&format!(
-                r#"{{"path":{}}}"#,
-                serde_json::to_string(path).unwrap()
-            )],
-        );
-        let mut capture: Value =
-            serde_json::from_slice(&std::fs::read(raw.join("capture.json")).unwrap()).unwrap();
-        capture["command"]["cwd"] = Value::String(r"D:\allowed\repo".into());
-        capture["redaction_roots"]["cwd"] = Value::String(r"D:\allowed\repo".into());
-        std::fs::write(
-            raw.join("capture.json"),
-            serde_json::to_vec_pretty(&capture).unwrap(),
-        )
-        .unwrap();
-
-        let error = sanitize_dir(&raw, &staging_dir(temp.path(), name)).unwrap_err();
-        assert!(
-            matches!(error, SanitizationError::UnrecognizedAbsolutePath { .. }),
-            "{name} returned {error:?}"
-        );
-    }
-}
-
-/// Break caught: treating credential-bearing field names or recognizable token/key material as
-/// ordinary strings can publish a usable credential in a sanitized artifact.
-#[test]
-fn sanitizer_rejects_secret_fields_provider_tokens_and_private_keys() {
-    let cases = [
-        (
-            "authorization",
-            r#"{"authorization":"Bearer definitely-not-for-review"}"#,
-        ),
-        ("api-key", r#"{"apiKey":"value-without-a-token-prefix"}"#),
-        (
-            "anthropic-token",
-            r#"{"message":"sk-ant-api03-secretvalue"}"#,
-        ),
-        ("openai-token", r#"{"message":"sk-proj-secretvalue"}"#),
-        (
-            "private-key",
-            r#"{"message":"-----BEGIN OPENSSH PRIVATE KEY-----"}"#,
-        ),
-    ];
-
-    for (name, payload) in cases {
-        let temp = tempfile::tempdir().unwrap();
-        let raw = write_raw_capture(temp.path(), name, &[payload]);
-        let error = sanitize_dir(&raw, &staging_dir(temp.path(), name)).unwrap_err();
-        assert!(
-            matches!(
-                error,
-                SanitizationError::SecretLikeField { .. }
-                    | SanitizationError::SecretLikeValue { .. }
-            ),
-            "{name} returned {error:?}"
-        );
-        assert!(!error.to_string().contains("secretvalue"));
-        assert!(!error.to_string().contains("definitely-not-for-review"));
-    }
-}
-
 /// Break caught: validating only JSON values lets sensitive object keys through, while building
 /// an error location from an untrusted key repeats the secret in diagnostics.
+///
+/// Not subsumed by the allowlist: `validate_key` runs on every object key
+/// during the walk, independent of whether the key's own *value* ends up on
+/// an allowed path or not -- a key can be rejected even where the value
+/// beside it would have passed.
 #[test]
 fn sanitizer_rejects_sensitive_object_keys_without_echoing_them() {
     for (name, raw_key) in [
@@ -244,6 +106,11 @@ fn sanitizer_rejects_sensitive_object_keys_without_echoing_them() {
 
 /// Break caught: sanitizing a clone of an allowlisted path key and discarding the clone permits
 /// the original machine-specific key to serialize unchanged.
+///
+/// Same mechanism as above, at the case where the key itself collides with a
+/// known local root: a key can never be silently rewritten (only kept or
+/// rejected), so a key that only *partially* matches a redaction root must
+/// reject rather than publish the fragment left over from the record.
 #[test]
 fn sanitizer_rejects_allowlisted_path_keys_without_echoing_them() {
     let temp = tempfile::tempdir().unwrap();
@@ -266,123 +133,103 @@ fn sanitizer_rejects_allowlisted_path_keys_without_echoing_them() {
     assert!(!output.exists());
 }
 
-/// Break caught: credential fields with opaque values bypass prefix scanning, while an overbroad
-/// `token` name rule would incorrectly reject ordinary numeric usage counters.
+/// An allowlisted path is a decision about the *field*, not a licence for
+/// whatever a provider happens to put in it: `sanitize_scalar` runs every
+/// kept string through the same fail-closed secret scan a redacted value
+/// never needs, specifically because being on the list means the value
+/// survives verbatim and therefore must not be allowed to smuggle a
+/// credential through. Mirrors `sanitize.rs`'s own inline unit test
+/// `a_credential_in_an_allowlisted_value_still_rejects`, through the full
+/// `sanitize_dir` file pipeline this file's other tests exercise.
 #[test]
-fn sanitizer_rejects_opaque_credential_fields_but_keeps_token_counters() {
+fn sanitizer_rejects_a_credential_riding_an_allowlisted_path() {
+    for (name, provider, allowed_path, payload) in [
+        (
+            "claude-type",
+            Provider::Claude,
+            ".type",
+            r#"{"type":"sk-ant-api03-should-not-survive-allowlisting"}"#,
+        ),
+        (
+            "codex-method",
+            Provider::Codex,
+            ".method",
+            r#"{"method":"sk-proj-should-not-survive-allowlisting"}"#,
+        ),
+    ] {
+        assert!(
+            allows(provider, allowed_path),
+            "{name}: {allowed_path} must actually be on the allowlist for this test to mean anything"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let raw = write_raw_capture(temp.path(), name, &[payload]);
+        let path = raw.join("capture.json");
+        let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        capture["provider"] = Value::String(match provider {
+            Provider::Claude => "claude".into(),
+            Provider::Codex => "codex".into(),
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+        let error = sanitize_dir(&raw, &staging_dir(temp.path(), name)).unwrap_err();
+        assert!(
+            matches!(error, SanitizationError::SecretLikeValue { .. }),
+            "{name} returned {error:?}"
+        );
+        assert!(!error.to_string().contains("should-not-survive"), "{name}");
+    }
+}
+
+/// Field-name credential detection (`is_secret_field`) runs before the path
+/// allowlist is even consulted -- a credential-shaped field name is rejected
+/// wherever it appears, allowlisted path or not, so this is not a check the
+/// allowlist subsumes. The numeric-counter carve-out is the one deliberate
+/// exception in that same check (a `token`-suffixed field holding a *number*
+/// is a usage count, not a credential); it is pinned here too since nothing
+/// else in this file exercises it after this trim.
+#[test]
+fn sanitizer_rejects_secret_field_names_regardless_of_path_and_still_permits_numeric_counters() {
     for field in [
-        "token",
-        "refreshToken",
-        "sessionToken",
-        "clientSecret",
-        "privateKey",
         "authorization",
         "apiKey",
-        "anthropicApiKey",
-        "openai_api_key",
+        "refreshToken",
+        "proxyAuthorization",
     ] {
         let temp = tempfile::tempdir().unwrap();
-        let payload = serde_json::json!({field: "opaque-value"}).to_string();
+        let payload =
+            serde_json::json!({field: "opaque-value-not-a-recognizable-prefix"}).to_string();
         let raw = write_raw_capture(temp.path(), field, &[&payload]);
         let error = sanitize_dir(&raw, &staging_dir(temp.path(), field)).unwrap_err();
         assert!(
             matches!(error, SanitizationError::SecretLikeField { .. }),
             "{field} returned {error:?}"
         );
+        assert!(!error.to_string().contains("opaque-value"), "{field}");
     }
 
     let temp = tempfile::tempdir().unwrap();
     let raw = write_raw_capture(
         temp.path(),
         "token-counters",
-        &[
-            r#"{"usage":{"input_tokens":10,"outputTokens":20,"max_tokens":30,"totalTokenCount":60}}"#,
-        ],
+        &[r#"{"usage":{"input_tokens":10,"outputTokens":20,"totalTokenCount":60}}"#],
     );
-    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "token-counters")).unwrap();
-    assert_eq!(
-        sanitized_payloads(&report.events_bytes)[0]["usage"],
-        serde_json::json!({
-            "input_tokens": 10,
-            "outputTokens": 20,
-            "max_tokens": 30,
-            "totalTokenCount": 60
-        })
-    );
-}
+    // A numeric counter under a token-shaped name is not a credential -- the
+    // capture must sanitize cleanly rather than reject (what its redacted
+    // value becomes is the allowlist's concern, covered by
+    // `allowlist_property.rs`, not this file's).
+    sanitize_dir(&raw, &staging_dir(temp.path(), "token-counters")).unwrap();
 
-/// Break caught: Codex's documented token-usage notification wraps numeric counters in a
-/// `tokenUsage` object, which an otherwise-correct credential family check mistakes for a token.
-#[test]
-fn sanitizer_accepts_only_the_codex_token_usage_notification_object() {
     let temp = tempfile::tempdir().unwrap();
-    let payload = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-secret","turnId":"turn-secret","tokenUsage":{"total":{"inputTokens":20,"outputTokens":3},"last":{"inputTokens":10,"cachedInputTokens":4,"outputTokens":3,"reasoningOutputTokens":0,"totalTokens":13},"modelContextWindow":200000}}}"#;
-    let raw = write_raw_capture(temp.path(), "codex-token-usage", &[payload]);
-    let path = raw.join("capture.json");
-    let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    capture["provider"] = Value::String("codex".into());
-    std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
-    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "codex-token-usage")).unwrap();
-    let got = sanitized_payloads(&report.events_bytes);
-    assert_eq!(got[0]["params"]["threadId"], "<THREAD_ID_1>");
-    assert_eq!(got[0]["params"]["turnId"], "<TURN_ID_1>");
-    assert_eq!(got[0]["params"]["tokenUsage"]["last"]["inputTokens"], 10);
-
-    for (name, provider, method) in [
-        (
-            "claude-token-usage-object",
-            "claude",
-            "thread/tokenUsage/updated",
-        ),
-        ("codex-wrong-method-token-usage", "codex", "thread/other"),
-    ] {
-        let raw = write_raw_capture(temp.path(), name, &[payload]);
-        let path = raw.join("capture.json");
-        let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        capture["provider"] = Value::String(provider.into());
-        let mut value: Value = capture["events"][0]["payload"]
-            .as_str()
-            .and_then(|payload| serde_json::from_str(payload).ok())
-            .unwrap();
-        value["method"] = Value::String(method.into());
-        capture["events"][0]["payload"] = Value::String(value.to_string());
-        std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
-        assert!(matches!(
-            sanitize_dir(&raw, &staging_dir(temp.path(), name)),
-            Err(SanitizationError::SecretLikeField { .. })
-        ));
-    }
-
-    for (name, payload) in [
-        (
-            "codex-root-token-usage",
-            r#"{"method":"thread/tokenUsage/updated","tokenUsage":{"total":{"inputTokens":20}},"params":{"threadId":"thread-secret","turnId":"turn-secret"}}"#,
-        ),
-        (
-            "codex-nested-token-usage",
-            r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-secret","turnId":"turn-secret","wrapper":{"tokenUsage":{"total":{"inputTokens":20}}}}}"#,
-        ),
-        (
-            "codex-scalar-token-usage",
-            r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-secret","turnId":"turn-secret","tokenUsage":"opaque-secret"}}"#,
-        ),
-        (
-            "codex-token-usage-nested-credential",
-            r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-secret","turnId":"turn-secret","tokenUsage":{"total":{"inputTokens":20,"accessToken":"opaque-secret"}}}}"#,
-        ),
-        (
-            "codex-token-usage-nonnumeric-counter",
-            r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-secret","turnId":"turn-secret","tokenUsage":{"total":{"inputTokens":"opaque-secret"}}}}"#,
-        ),
-    ] {
-        let raw = write_raw_capture(temp.path(), name, &[payload]);
-        let path = raw.join("capture.json");
-        let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        capture["provider"] = Value::String("codex".into());
-        std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
-        assert!(matches!(
-            sanitize_dir(&raw, &staging_dir(temp.path(), name)),
-            Err(SanitizationError::SecretLikeField { .. })
-        ));
-    }
+    let raw = write_raw_capture(
+        temp.path(),
+        "string-token-counter",
+        &[r#"{"usage":{"input_tokens":"opaque-value"}}"#],
+    );
+    // The same field name holding a *string* is not a counter -- the
+    // exception must not cover an opaque string riding a token-shaped name.
+    assert!(matches!(
+        sanitize_dir(&raw, &staging_dir(temp.path(), "string-token-counter")),
+        Err(SanitizationError::SecretLikeField { .. })
+    ));
 }
