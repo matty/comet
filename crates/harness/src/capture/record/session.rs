@@ -51,11 +51,13 @@ pub(super) struct FenceOutcome {
     pub(super) approval_target: Option<PathBuf>,
     // Read by `record/scenarios/codex.rs`'s `approval_on_request`, as the
     // expected identity for its grant-time `require_empty_approval_target`
-    // recheck. Claude's `approval` needs no such recheck — its scenario body
-    // (`record/scenarios/claude.rs`) grants the model's marker Write
-    // unconditionally, and nothing in Claude's fence ever computes a
-    // `DirectoryIdentity` to compare it against, unlike a Codex approval
-    // target — so this stays Codex-only.
+    // recheck. Claude has no pre-spawn fence to record an identity from in
+    // the first place (`record.rs::record_claude`'s doc comment) — its
+    // `approval` scenario body (`record/scenarios/claude.rs`) still rechecks
+    // at grant time, via `claude_marker_grant`, but that check recomputes a
+    // fresh marker-shape/cwd match directly against the live filesystem
+    // rather than comparing against an identity captured earlier, so this
+    // field stays Codex-only.
     pub(super) approval_target_identity: Option<DirectoryIdentity>,
     // Read by `record/scenarios/codex.rs`'s `approval`, as the expected
     // identity for its grant-time `validate_ordinary_approval_cwd` recheck.
@@ -664,7 +666,7 @@ mod tests {
     use crate::capture::record::scenarios::ScenarioInput;
     use crate::capture::test_support::{config, find_named_file, fixture_path};
 
-    /// The new behavior this task adds: `next_frame` records a non-JSON
+    /// The new behavior the neutral-recorder stage adds: `next_frame` records a non-JSON
     /// stdout line (on the stdout channel) and keeps pumping instead of
     /// erroring, then still returns the real frame that follows it.
     #[tokio::test]
@@ -959,8 +961,9 @@ mod tests {
         );
     }
 
-    /// Break caught: `start` stops calling `fence.recheck` at all (e.g. the call this task added
-    /// right after `create_dir_all` is deleted, or never wired in the first place). Every other
+    /// Break caught: `start` stops calling `fence.recheck` at all (e.g. the call the
+    /// neutral-recorder stage added right after `create_dir_all` is deleted, or never wired in
+    /// the first place). Every other
     /// test in this file uses `FenceOutcome::none()`, whose `recheck` is always `None`, so none of
     /// them can tell whether `start` actually invokes a `Some(recheck)` it was handed — this
     /// drives that invocation directly and observably, independent of `record::codex_fence`'s own

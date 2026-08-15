@@ -364,7 +364,11 @@ fn checklist_no_tasks() {
         r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"capture"}]}}"#,
     );
     emit(
-        r#"{"type":"result","subtype":"success","result":"capture","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-checklist-no-tasks"}"#,
+        // Same non-flat shape as `happy()`'s own result frame — reintroducing
+        // the flat `{input_tokens, output_tokens}`-only shape in a new
+        // scenario is exactly what this slice's finding (both fake CLIs
+        // emitted unrealistically flat frames) exists to stop.
+        r#"{"type":"result","subtype":"success","result":"capture","errors":[],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30000,"cache_creation_input_tokens":75},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":10,"outputTokens":20,"contextWindow":200000}},"session_id":"sess-checklist-no-tasks","total_cost_usd":0.01}"#,
     );
 }
 
@@ -561,26 +565,48 @@ fn approval(stdin: &mut StdinLock<'_>) {
 fn capture_non_frame_tolerance() {
     emit("not json, a progress line");
     emit(
-        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-tolerance"}"#,
+        // Same non-flat shape as `happy()`'s own result frame — reintroducing
+        // the flat `{input_tokens, output_tokens}`-only shape in a new
+        // scenario is exactly what this slice's finding (both fake CLIs
+        // emitted unrealistically flat frames) exists to stop.
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30000,"cache_creation_input_tokens":75},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":10,"outputTokens":20,"contextWindow":200000}},"session_id":"sess-tolerance","total_cost_usd":0.01}"#,
     );
 }
 
-/// Two `can_use_tool` requests, each read back before the next is emitted —
-/// a ping-pong round trip — followed by a terminal `result`. Drives
-/// `record/scenarios/claude.rs`'s `approval` scenario body, which (unlike
-/// the deleted `recording.rs` validators this replaces) does not care which
-/// tool is named or in what order; it only has to answer both.
+/// Three `can_use_tool` requests, each read back before the next is
+/// emitted — a ping-pong round trip — followed by a terminal `result`.
+/// Drives `record/scenarios/claude.rs`'s `approval` scenario body against its
+/// real grant-time check, `claude_marker_grant`: the first two requests are
+/// exactly the marker Bash command and the marker Write into THIS process's
+/// own cwd (`std::env::current_dir()` — the fixture is the only thing that
+/// can say which directory it was actually started in, same rationale as
+/// `command_reply` above), so both must be granted; the third is a Write to
+/// a file the scenario never asked for, so it must be declined — and the run
+/// must still reach its terminal frame rather than being aborted.
 fn approval_two_requests(stdin: &mut StdinLock<'_>) {
+    let escape = |value: String| value.replace('\\', "\\\\").replace('"', "\\\"");
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let marker = escape(cwd.join("capture-marker.txt").display().to_string());
+    let unexpected = escape(cwd.join("unexpected.txt").display().to_string());
+
     emit(
         r#"{"type":"control_request","request_id":"approval-req-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"printf capture"},"description":"printf capture","tool_use_id":"toolu_approval_1"}}"#,
     );
     let _ = read_line(stdin);
-    emit(
-        r#"{"type":"control_request","request_id":"approval-req-2","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"capture-marker.txt","content":"capture\n"},"description":"capture-marker.txt","tool_use_id":"toolu_approval_2"}}"#,
-    );
+    emit(&format!(
+        r#"{{"type":"control_request","request_id":"approval-req-2","request":{{"subtype":"can_use_tool","tool_name":"Write","input":{{"file_path":"{marker}","content":"capture\n"}},"description":"capture-marker.txt","tool_use_id":"toolu_approval_2"}}}}"#
+    ));
+    let _ = read_line(stdin);
+    emit(&format!(
+        r#"{{"type":"control_request","request_id":"approval-req-3","request":{{"subtype":"can_use_tool","tool_name":"Write","input":{{"file_path":"{unexpected}","content":"surprise\n"}},"description":"unexpected.txt","tool_use_id":"toolu_approval_3"}}}}"#
+    ));
     let _ = read_line(stdin);
     emit(
-        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-approval-two"}"#,
+        // Same non-flat shape as `happy()`'s own result frame — reintroducing
+        // the flat `{input_tokens, output_tokens}`-only shape in a new
+        // scenario is exactly what this slice's finding (both fake CLIs
+        // emitted unrealistically flat frames) exists to stop.
+        r#"{"type":"result","subtype":"success","result":"capture","errors":[],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30000,"cache_creation_input_tokens":75},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":10,"outputTokens":20,"contextWindow":200000}},"session_id":"sess-approval-two","total_cost_usd":0.01}"#,
     );
 }
 

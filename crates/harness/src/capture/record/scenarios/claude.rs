@@ -1,7 +1,7 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use comet_proto::{ReasoningLevel, RunRequest, RuntimeMode};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::capture::record::provider::CaptureProvider;
 use crate::capture::record::providers::claude::ClaudeProvider;
@@ -297,7 +297,7 @@ pub(in crate::capture::record) fn checklist_launch(
 /// `created`/`updated` `BTreeSet`s and their `bail!`s, requiring at least 2
 /// distinct confirmed creates and 1 confirmed update here, and for
 /// `checklist-resume` at least 1 confirmed update to an id it had not itself
-/// created) and is deleted by this task, closing `docs/debt/` D61. Per
+/// created) and is deleted by the neutral-recorder stage, closing `docs/debt/` D61. Per
 /// design §3.2
 /// (`2026-08-14-provider-capture-simplification-design.md`): a pre-spawn
 /// guard protects the machine; a frame check that aborts protects only a
@@ -360,11 +360,9 @@ pub(in crate::capture::record) async fn checklist_resume(
 }
 
 /// The exact Bash command the `approval` prompt below asks Claude to run
-/// once. Nothing checks that Claude actually used it any more — the deleted
-/// `strict_claude_approval_block`/`validate_claude_marker_input` did — so
-/// this constant now has exactly one reader, `claude_approval_prompt`, and
-/// exists only so the prompt text and the instruction it gives don't drift
-/// apart as two separate literals.
+/// once. Read by two things that must not drift apart: `claude_approval_prompt`
+/// (the instruction text) and `claude_marker_grant` below (the grant-time
+/// check that a Bash request is the one thing this scenario expects to run).
 const CLAUDE_APPROVAL_COMMAND: &str = "printf capture";
 
 /// Prompt for `approval`: ask for one Bash approval, then one Write
@@ -414,54 +412,122 @@ pub(in crate::capture::record) fn approval_launch(
 }
 
 /// Recognizes a Claude `can_use_tool` control request and returns its
-/// request id together with the tool input to reflect back unmodified. Every
+/// request id, the tool it names, and the input it is asking to run. Every
 /// other frame — the Bash/Write `tool_use` frames leading up to it, the
 /// plain assistant text, anything else — returns `None` and is simply left
 /// unanswered.
 ///
 /// This is the surviving half of the deleted `observe_claude_approval_frame`:
-/// noticing that a frame is (or is not) an approval request is driving, not
-/// validating, so nothing here checks the tool name, the request order, or
-/// the shape of the surrounding transcript the way the deleted
-/// `ClaudeApprovalState`/`validate_claude_marker_input`/
-/// `strict_claude_approval_block` did — see `approval`'s own doc comment.
-fn pending_approval(frame: &Value) -> Option<(String, Value)> {
+/// noticing that a frame IS an approval request is driving, not validating,
+/// so nothing here checks request order, request-id uniqueness, or the shape
+/// of the surrounding transcript the way the deleted
+/// `ClaudeApprovalState`/`strict_claude_approval_block` did. Deciding whether
+/// the named tool and input actually get granted is a separate question,
+/// answered at grant time by `claude_marker_grant` below — see `approval`'s
+/// own doc comment for why that split exists.
+fn pending_approval(frame: &Value) -> Option<(String, String, Value)> {
     if frame["type"] != "control_request" || frame["request"]["subtype"] != "can_use_tool" {
         return None;
     }
     let request_id = frame["request_id"].as_str()?.to_owned();
-    Some((request_id, frame["request"]["input"].clone()))
+    let tool_name = frame["request"]["tool_name"].as_str()?.to_owned();
+    Some((request_id, tool_name, frame["request"]["input"].clone()))
 }
 
-/// The allow reply for one approval request, built through the production
-/// response shape — `crate::claude::wire::{control_response_line,
-/// allow_response}`, the same helpers Comet's own approval driver
-/// (`claude/mod.rs`) calls for a real "always allow" decision — and echoing
-/// the request's own input back unmodified, exactly as that driver does.
-fn allow_response(request_id: &str, input: Value) -> String {
-    crate::claude::wire::control_response_line(
-        request_id,
-        crate::claude::wire::allow_response(input),
-    )
+/// The one check that survives from the deleted validators, run at GRANT
+/// TIME rather than as a frame check that aborts: the request must be
+/// exactly the marker Bash command, or exactly the marker Write into the
+/// scenario's own cwd. Everything else is refused.
+///
+/// This is Task 6's Codex precedent, applied to Claude: a check that runs
+/// before a write is actually granted protects the machine, not evidence
+/// tidiness, so design §3.2's "delete every frame check that aborts" does
+/// not reach it — but per that same precedent it DECLINES an unrecognized
+/// request rather than aborting the capture (see `answer_every_approval` in
+/// `record/scenarios/codex.rs`). Claude has no pre-spawn fence to recheck an
+/// identity against (`record.rs::record_claude`'s doc comment), so unlike
+/// Codex's grant-time rechecks this does not compare against an identity
+/// captured earlier — it recomputes, fresh, the same bounded shape the
+/// deleted `validate_claude_marker_input` checked: the Write's input must
+/// equal `{file_path: <cwd>/capture-marker.txt, content: "capture\n"}`
+/// exactly, AND the marker's canonical parent must equal the scenario's own
+/// canonical cwd — the same escape check the deleted code made, so a `../`
+/// or symlinked `file_path` cannot walk the write out of cwd.
+fn claude_marker_grant(tool_name: &str, input: &Value, cwd: &Path) -> anyhow::Result<()> {
+    if tool_name == "Bash" {
+        if input == &json!({"command": CLAUDE_APPROVAL_COMMAND}) {
+            return Ok(());
+        }
+        anyhow::bail!("Claude approval request was not the expected marker command.");
+    }
+    if tool_name == "Write" {
+        let expected_path = cwd.join(APPROVAL_MARKER_NAME);
+        let expected = json!({
+            "file_path": expected_path.display().to_string(),
+            "content": APPROVAL_MARKER_CONTENT,
+        });
+        if input != &expected {
+            anyhow::bail!("Claude approval request was not the expected marker write.");
+        }
+        let canonical_cwd = std::fs::canonicalize(cwd)
+            .map_err(|_| anyhow::anyhow!("Claude approval capture cwd could not be validated."))?;
+        let canonical_parent = expected_path
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Claude approval request marker parent could not be validated.")
+            })?;
+        if canonical_parent != canonical_cwd {
+            anyhow::bail!("Claude approval request escaped the configured cwd.");
+        }
+        return Ok(());
+    }
+    anyhow::bail!("Claude approval request used an unexpected tool.");
+}
+
+/// The reply for one `can_use_tool` request: allow — echoing the request's
+/// own input back unmodified, exactly as Comet's own approval driver
+/// (`claude/mod.rs`) does for a real "always allow" decision — when
+/// `claude_marker_grant` accepts it, deny with its error text otherwise.
+/// Built through the production response shape,
+/// `crate::claude::wire::{control_response_line, allow_response,
+/// deny_response}`.
+fn decision_response(request_id: &str, tool_name: &str, input: &Value, cwd: &Path) -> String {
+    let response = match claude_marker_grant(tool_name, input, cwd) {
+        Ok(()) => crate::claude::wire::allow_response(input.clone()),
+        Err(err) => crate::claude::wire::deny_response(err.to_string()),
+    };
+    crate::claude::wire::control_response_line(request_id, response)
 }
 
 /// Send the approval prompt, then answer every `can_use_tool` request the
 /// model makes until the turn ends.
 ///
-/// No count, no order, no tool-name check, no exact-marker-input check: the
-/// deleted `ClaudeApprovalState`/`observe_claude_approval_frame`/
-/// `validate_claude_marker_input`/`strict_claude_approval_block` enforced an
-/// exact "one Bash, then one bounded Write" contract and bailed on any
-/// deviation — a model that used a different tool, asked twice, asked out of
-/// order, or never asked at all used to make the whole paid-for capture
-/// unrecoverable, discarding tokens already spent. Per design §3.2, only
-/// driving survives here: notice a request, answer it, keep going, and stop
-/// only when the provider itself says the turn is over.
+/// No count, no order, no request-id bookkeeping: the deleted
+/// `ClaudeApprovalState`/`observe_claude_approval_frame`/
+/// `strict_claude_approval_block` enforced an exact "one Bash, then one
+/// bounded Write" contract and bailed — discarding a real, paid-for capture —
+/// on a model that used a different tool, asked twice, asked out of order, or
+/// never asked at all.
+///
+/// One check DOES survive, at `claude_marker_grant` above — and it is not
+/// the class design §3.2 removes, because it runs before a write is actually
+/// granted, not after one already happened. This matters live: Claude's
+/// `--permission-prompt-tool stdio` (`RuntimeMode::ApprovalRequired`, wired
+/// in `claude/mod.rs`) asks this driver to approve or deny EVERY tool call,
+/// and this provider has no pre-spawn fence at all
+/// (`record.rs::record_claude`'s doc comment) — replying `allow`
+/// unconditionally, as this function used to, would let a live `approval`
+/// capture run against an arbitrary operator cwd grant an arbitrary Write or
+/// Bash. A mismatch here DECLINES the grant and keeps recording — never
+/// `bail!`, which would throw away tokens already spent.
 pub(in crate::capture::record) async fn approval(
     session: &mut Session<ClaudeProvider>,
     input: &ScenarioInput,
 ) -> anyhow::Result<()> {
-    let line = claude_user_line(&approval_request(input), false).await?;
+    let request = approval_request(input);
+    let cwd = PathBuf::from(&request.cwd);
+    let line = claude_user_line(&request, false).await?;
     session.send(&line).await?;
     loop {
         let Some(frame) = session.next_frame().await? else {
@@ -470,9 +536,14 @@ pub(in crate::capture::record) async fn approval(
         if ClaudeProvider::turn_complete(&frame) {
             return Ok(());
         }
-        if let Some((request_id, tool_input)) = pending_approval(&frame) {
+        if let Some((request_id, tool_name, tool_input)) = pending_approval(&frame) {
             session
-                .send(&allow_response(&request_id, tool_input))
+                .send(&decision_response(
+                    &request_id,
+                    &tool_name,
+                    &tool_input,
+                    &cwd,
+                ))
                 .await?;
         }
     }
@@ -830,13 +901,57 @@ mod tests {
         );
     }
 
-    /// The validator deletion, proven: a fake Claude that raises two `can_use_tool` requests in a
-    /// row — one Bash, one Write, neither checked for order, count or content — must have both
-    /// answered with an allow reply carrying that request's own id. The deleted
-    /// `ClaudeApprovalState`/`observe_claude_approval_frame`/`validate_claude_marker_input`/
-    /// `strict_claude_approval_block` would have bailed the instant a second, unaccounted-for
-    /// request id showed up; `pending_approval` has no such bookkeeping, so it just keeps
-    /// answering.
+    /// Unit-level coverage of `claude_marker_grant` itself, independent of any process spawn:
+    /// the expected marker Bash command and the expected marker Write into `cwd` are the only two
+    /// requests it accepts; a different command, a Write to a different path, a Write whose
+    /// content does not match, and any other tool are all refused.
+    #[test]
+    fn claude_marker_grant_accepts_only_the_expected_marker_command_or_write() {
+        let cwd = tempfile::tempdir().unwrap();
+        assert!(
+            claude_marker_grant(
+                "Bash",
+                &json!({"command": CLAUDE_APPROVAL_COMMAND}),
+                cwd.path()
+            )
+            .is_ok()
+        );
+        assert!(
+            claude_marker_grant("Bash", &json!({"command": "echo pwned"}), cwd.path()).is_err()
+        );
+        let expected_write = json!({
+            "file_path": cwd.path().join(APPROVAL_MARKER_NAME).display().to_string(),
+            "content": APPROVAL_MARKER_CONTENT,
+        });
+        assert!(claude_marker_grant("Write", &expected_write, cwd.path()).is_ok());
+        let wrong_path = json!({
+            "file_path": cwd.path().join("unexpected.txt").display().to_string(),
+            "content": APPROVAL_MARKER_CONTENT,
+        });
+        assert!(claude_marker_grant("Write", &wrong_path, cwd.path()).is_err());
+        let wrong_content = json!({
+            "file_path": cwd.path().join(APPROVAL_MARKER_NAME).display().to_string(),
+            "content": "not the marker\n",
+        });
+        assert!(claude_marker_grant("Write", &wrong_content, cwd.path()).is_err());
+        assert!(
+            claude_marker_grant("Read", &json!({"file_path": "whatever"}), cwd.path()).is_err()
+        );
+    }
+
+    /// The validator deletion, proven end to end, in both directions: a fake Claude that raises
+    /// three `can_use_tool` requests in a row — none checked for order or count — must have every
+    /// one of them answered. The deleted `ClaudeApprovalState`/`observe_claude_approval_frame`/
+    /// `validate_claude_marker_input`/`strict_claude_approval_block` would have bailed the instant
+    /// a second, unaccounted-for request id showed up; `pending_approval` has no such bookkeeping,
+    /// so it just keeps answering.
+    ///
+    /// This is also the CRITICAL fix's own proof, in both directions: the first two requests are
+    /// exactly the marker Bash command and the marker Write into this scenario's own cwd, so both
+    /// must be GRANTED; the third is a Write to a file the scenario never asked for, so it must be
+    /// DECLINED — and, unlike the deleted validators (which `bail!`ed and discarded the whole
+    /// paid-for capture on exactly this kind of mismatch), the run must still reach its terminal
+    /// frame.
     #[tokio::test]
     async fn claude_approval_scenario_answers_every_request_it_sees() {
         let raw = tempfile::tempdir().unwrap();
@@ -867,8 +982,8 @@ mod tests {
         let stdin = channel_payloads(&capture, Channel::Stdin);
         assert_eq!(
             stdin.len(),
-            3,
-            "one user line, then one allow reply per request: {stdin:?}"
+            4,
+            "one user line, then one reply per request: {stdin:?}"
         );
         let replies: Vec<Value> = stdin[1..]
             .iter()
@@ -879,17 +994,36 @@ mod tests {
                 .iter()
                 .map(|reply| reply["response"]["request_id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["approval-req-1", "approval-req-2"],
-            "both approval requests must be answered, in the order they arrived: {replies:?}"
+            ["approval-req-1", "approval-req-2", "approval-req-3"],
+            "every approval request must be answered, in the order they arrived: {replies:?}"
+        );
+        let behaviors: Vec<&str> = replies
+            .iter()
+            .map(|reply| reply["response"]["response"]["behavior"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            behaviors,
+            ["allow", "allow", "deny"],
+            "the two expected marker requests must be granted and the unexpected write declined: \
+             {replies:?}"
         );
         assert!(
-            replies.iter().all(|reply| {
-                reply["response"]["response"]["behavior"] == "allow"
-                    && reply["response"]["response"]["updatedInput"].is_object()
-            }),
-            "every reply must allow, echoing the request's own input back: {replies:?}"
+            replies[..2]
+                .iter()
+                .all(|reply| reply["response"]["response"]["updatedInput"].is_object()),
+            "a granted reply must echo the request's own input back: {replies:?}"
         );
-        assert_eq!(capture.exit_code, Some(0));
+        assert!(
+            replies[2]["response"]["response"]["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "a declined reply must carry a message: {replies:?}"
+        );
+        assert_eq!(
+            capture.exit_code,
+            Some(0),
+            "the recording must survive a declined grant, not be discarded"
+        );
     }
 
     /// The table's `runtime_mode` and the body's own `RunRequest.runtime_mode` are two separate

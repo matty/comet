@@ -64,10 +64,15 @@ async fn record_claude(
             .or_else(crate::claude::resolve_claude_executable),
     )?;
     let launch = (spec.launch)(&input, &executable)?;
-    // Claude has no pre-spawn fence today: `approval` (its only scenario
-    // with an approval surface) protects no filesystem identity the way a
-    // Codex approval target or cwd does — see `record/scenarios/claude.rs`'s
-    // `approval` doc comment.
+    // Claude has no pre-spawn fence: nothing here validates an environment
+    // before spawn the way `codex_fence` below does for Codex. Claude's
+    // `approval` DOES grant a filesystem write — a Bash command or a Write
+    // into cwd — so it is protected the same way Task 6 protects Codex's
+    // grant-time rechecks: `record/scenarios/claude.rs`'s `approval` body
+    // recomputes a marker-shape check (`claude_marker_grant`) immediately
+    // before answering each request, and DECLINES — without aborting the
+    // capture — anything that does not match. See that function's own doc
+    // comment.
     record_generic(
         ClaudeProvider,
         config,
@@ -514,10 +519,15 @@ mod tests {
         assert_eq!(capture.exit_code, Some(0));
     }
 
-    /// Break caught: the hard-timeout branch returns before killing and reaping the child, or the
-    /// exit wait's own budget silently outlives the configured timeout. Drives a REAL timeout
-    /// through `record()` — not a hand-copied reproduction of its own timeout-handling code —
-    /// using a fixture that receives the discovery initialize request and genuinely never replies.
+    /// Break caught: the hard-timeout branch failing to persist a partial capture under
+    /// `PartialFailureClass::Timeout`, or the exit wait's own budget silently outliving the
+    /// configured timeout. Does NOT catch a dropped `terminate_and_reap()` call on this branch —
+    /// `Session`'s own `Drop` impl (`record/session.rs`) kills and reaps the child in the
+    /// background regardless of whether that call ran, and nothing here observes the live process
+    /// the way `record/session.rs`'s `wait_error_retains_child_for_cleanup_and_quarantine` does.
+    /// Drives a REAL timeout through `record()` — not a hand-copied reproduction of its own
+    /// timeout-handling code — using a fixture that receives the discovery initialize request and
+    /// genuinely never replies.
     #[tokio::test]
     async fn recorder_timeout_kills_and_reaps_the_child() {
         let raw = tempfile::tempdir().unwrap();
