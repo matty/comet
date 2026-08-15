@@ -8,6 +8,7 @@
 //! compiles into the binary. Moving it behind a crate boundary is deferred
 //! until the recorder is provider-neutral.
 
+mod allowlist;
 mod approval;
 mod checklist;
 mod corpus;
@@ -19,6 +20,7 @@ mod surface;
 mod test_support;
 mod types;
 
+pub use allowlist::{Allowlist, allows, named_kind};
 pub use approval::{
     approval_marker_command, approval_on_request_prompt, claude_approval_prompt,
     codex_approval_prompt,
