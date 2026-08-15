@@ -14,7 +14,7 @@ mod scenarios;
 mod session;
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::Path;
 use std::pin::Pin;
 
 use provider::CaptureProvider;
@@ -25,116 +25,104 @@ use session::{FenceOutcome, Session};
 
 use crate::capture::types::{
     CaptureConfig, CaptureOperation, ClaudeCaptureOperation, CodexCaptureOperation,
-    PartialFailureClass, RawCapture,
+    PartialFailureClass, Provider, RawCapture,
 };
 use crate::launch::LaunchDescriptor;
 
 /// Record one explicitly selected provider scenario into ignored raw
 /// storage.
 pub async fn record(config: CaptureConfig) -> anyhow::Result<RawCapture> {
-    match config.scenario.operation.clone() {
+    let (provider_str, name, input) = match config.scenario.operation.clone() {
         CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery) => {
-            record_claude_model_discovery(&config, ScenarioInput::default()).await
+            ("claude", "model-discovery", ScenarioInput::default())
         }
-        CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscoveryAt { cwd }) => {
-            record_claude_model_discovery(
-                &config,
-                ScenarioInput {
-                    cwd: Some(cwd),
-                    ..ScenarioInput::default()
-                },
-            )
-            .await
-        }
-        CaptureOperation::Claude(ClaudeCaptureOperation::CommandDiscovery { cwd }) => {
-            record_claude_command_discovery(&config, cwd).await
-        }
-        CaptureOperation::Codex(CodexCaptureOperation::ModelDiscovery) => {
-            record_codex_model_discovery(
-                &config,
-                ScenarioInput {
-                    codex_home: config.codex_home.clone(),
-                    ..ScenarioInput::default()
-                },
-            )
-            .await
-        }
-        CaptureOperation::Codex(CodexCaptureOperation::ModelDiscoveryAt { cwd }) => {
-            record_codex_model_discovery(
-                &config,
-                ScenarioInput {
-                    cwd: Some(cwd),
-                    codex_home: config.codex_home.clone(),
-                    ..ScenarioInput::default()
-                },
-            )
-            .await
-        }
+        CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscoveryAt { cwd }) => (
+            "claude",
+            "model-discovery-project-cwd",
+            ScenarioInput {
+                cwd: Some(cwd),
+                ..ScenarioInput::default()
+            },
+        ),
+        CaptureOperation::Claude(ClaudeCaptureOperation::CommandDiscovery { cwd }) => (
+            "claude",
+            "command-discovery",
+            ScenarioInput {
+                cwd: Some(cwd),
+                ..ScenarioInput::default()
+            },
+        ),
+        CaptureOperation::Codex(CodexCaptureOperation::ModelDiscovery) => (
+            "codex",
+            "model-discovery",
+            ScenarioInput {
+                codex_home: config.codex_home.clone(),
+                ..ScenarioInput::default()
+            },
+        ),
+        CaptureOperation::Codex(CodexCaptureOperation::ModelDiscoveryAt { cwd }) => (
+            "codex",
+            "model-discovery-project-cwd",
+            ScenarioInput {
+                cwd: Some(cwd),
+                codex_home: config.codex_home.clone(),
+                ..ScenarioInput::default()
+            },
+        ),
         // Run scenarios: not yet ported (Tasks 2-6). `recording::record`
         // still owns their spawn, drive and finish end to end.
-        _ => crate::capture::recording::record(config).await,
+        _ => return crate::capture::recording::record(config).await,
+    };
+    // The canonical name picked above must be a real row: this is the table
+    // `record()` actually dispatches through, not a name that merely looks
+    // right in a match arm — see the amendment on `CaptureProvider`'s doc
+    // comment for why `launch` moved here.
+    let spec = scenarios::scenario(provider_str, name)
+        .unwrap_or_else(|| panic!("{provider_str}/{name} must be registered in SCENARIOS"));
+    match &spec.body {
+        scenarios::ScenarioBody::Claude(body) => {
+            record_claude(&config, spec.launch, input, *body).await
+        }
+        scenarios::ScenarioBody::Codex(body) => {
+            record_codex(&config, spec.launch, input, *body).await
+        }
     }
 }
 
-async fn record_claude_model_discovery(
+type LaunchFn = fn(&ScenarioInput, &Path) -> anyhow::Result<LaunchDescriptor>;
+
+async fn record_claude(
     config: &CaptureConfig,
+    launch: LaunchFn,
     input: ScenarioInput,
+    body: ScenarioBodyFn<ClaudeProvider>,
 ) -> anyhow::Result<RawCapture> {
     let executable = session::resolve_executable(
-        ClaudeProvider::NAME,
+        Provider::Claude,
         config
             .executable
             .clone()
             .or_else(crate::claude::resolve_claude_executable),
     )?;
-    let launch = ClaudeProvider::launch(&input, &executable)?;
-    record_generic(ClaudeProvider, config, launch, input, |s, i| {
-        Box::pin(scenarios::claude::model_discovery(s, i))
-    })
-    .await
+    let launch = launch(&input, &executable)?;
+    record_generic(ClaudeProvider, config, launch, input, body).await
 }
 
-async fn record_claude_command_discovery(
+async fn record_codex(
     config: &CaptureConfig,
-    cwd: PathBuf,
-) -> anyhow::Result<RawCapture> {
-    let executable = session::resolve_executable(
-        ClaudeProvider::NAME,
-        config
-            .executable
-            .clone()
-            .or_else(crate::claude::resolve_claude_executable),
-    )?;
-    // Command discovery needs the non-bare launch; the trait's `launch`
-    // member always builds the bare (model-discovery) one, so this scenario
-    // bypasses it and builds its own — see the task report for why.
-    let launch = crate::claude::commands::command_discovery_launch(&executable, &cwd);
-    let input = ScenarioInput {
-        cwd: Some(cwd),
-        ..ScenarioInput::default()
-    };
-    record_generic(ClaudeProvider, config, launch, input, |s, i| {
-        Box::pin(scenarios::claude::command_discovery(s, i))
-    })
-    .await
-}
-
-async fn record_codex_model_discovery(
-    config: &CaptureConfig,
+    launch: LaunchFn,
     input: ScenarioInput,
+    body: ScenarioBodyFn<CodexProvider>,
 ) -> anyhow::Result<RawCapture> {
     let executable = session::resolve_executable(
-        CodexProvider::NAME,
+        Provider::Codex,
         config
             .executable
             .clone()
             .or_else(crate::codex::resolve_codex_executable),
     )?;
-    let launch = CodexProvider::launch(&input, &executable)?;
-    record_generic(CodexProvider::new(), config, launch, input, |s, i| {
-        Box::pin(scenarios::codex::model_discovery(s, i))
-    })
-    .await
+    let launch = launch(&input, &executable)?;
+    record_generic(CodexProvider::new(), config, launch, input, body).await
 }
 
 /// A scenario body: given a spawned, hand-shaken session, drive it and
@@ -145,14 +133,21 @@ type ScenarioBodyFn<P> = for<'a> fn(
 ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
 
 /// The provider-neutral orchestration shared by every scenario: spawn,
-/// handshake, drive the scenario body, finish — all under one configurable
-/// timeout. A failure or timeout during handshake/drive never reaches
-/// [`Session::finish`] (which classifies its own failures as
-/// [`PartialFailureClass::ProcessError`]); this function still owns
-/// `&mut session` at that point and classifies explicitly instead
-/// (`DriverError` for a driving failure, `Timeout` for the configurable
-/// timeout firing) — the `drive_completed` distinction `recording.rs` made
-/// with a boolean, carried here by which branch of this match runs.
+/// handshake, drive the scenario body, finish — all under one shared
+/// deadline. A failure or timeout during handshake/drive never reaches
+/// [`Session::finish`]; this function still owns `&mut session` at that
+/// point and classifies explicitly (`DriverError` for a driving failure,
+/// `Timeout` for the deadline firing) — the `drive_completed` distinction
+/// `recording.rs` made with a boolean, carried here by which branch of this
+/// match runs.
+///
+/// `deadline` is computed once, right after spawn, and passed into both the
+/// outer `timeout_at` wrapping handshake+body *and* into
+/// [`Session::finish`], so the exit wait shares the same clock as driving
+/// instead of getting a fresh, unrelated budget — `recording.rs`'s original
+/// `finish` wrapped drive *and* the exit wait in one `timeout(self.timeout,
+/// …)`, and splitting that into two functions must not silently narrow what
+/// the configured timeout covers.
 async fn record_generic<P: CaptureProvider>(
     provider: P,
     config: &CaptureConfig,
@@ -161,14 +156,14 @@ async fn record_generic<P: CaptureProvider>(
     body: ScenarioBodyFn<P>,
 ) -> anyhow::Result<RawCapture> {
     let mut session = Session::start(provider, config, launch, FenceOutcome::none()).await?;
-    let timeout = session.timeout;
-    let outcome = tokio::time::timeout(timeout, async {
+    let deadline = tokio::time::Instant::now() + session.timeout;
+    let outcome = tokio::time::timeout_at(deadline, async {
         P::handshake(&mut session, &input).await?;
         body(&mut session, &input).await
     })
     .await;
     match outcome {
-        Ok(Ok(())) => session.finish().await,
+        Ok(Ok(())) => session.finish(deadline).await,
         Ok(Err(err)) => {
             session.terminate_and_reap().await;
             session
@@ -183,7 +178,7 @@ async fn record_generic<P: CaptureProvider>(
                 .await;
             anyhow::bail!(
                 "Capture timed out after {} seconds. The provider was stopped; retry with --timeout-seconds up to 300.",
-                timeout.as_secs_f64()
+                session.timeout.as_secs_f64()
             )
         }
     }
@@ -191,13 +186,14 @@ async fn record_generic<P: CaptureProvider>(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::PathBuf;
+    use std::time::Duration;
 
     use serde_json::json;
 
     use super::*;
     use crate::capture::test_support::{absolute_program, channel_payloads, config, fixture_path};
-    use crate::capture::types::{Channel, CommandSnapshot, Provider};
+    use crate::capture::types::{Channel, CommandSnapshot};
     use crate::launch::StdioMode;
 
     #[test]
@@ -463,5 +459,80 @@ mod tests {
         assert_eq!(lines[3]["params"]["cursor"], "2\"\\ opaque");
         assert_eq!(lines[4]["params"]["cursor"], "4\"\\ opaque");
         assert_eq!(capture.exit_code, Some(0));
+    }
+
+    /// Break caught: the hard-timeout branch returns before killing and reaping the child, or the
+    /// exit wait's own budget silently outlives the configured timeout. Drives a REAL timeout
+    /// through `record()` — not a hand-copied reproduction of its own timeout-handling code —
+    /// using a fixture that receives the discovery initialize request and genuinely never replies.
+    #[tokio::test]
+    async fn recorder_timeout_kills_and_reaps_the_child() {
+        let raw = tempfile::tempdir().unwrap();
+        let mut cfg = config(
+            "claude-timeout",
+            fixture_path("fake-claude-discovery-stall"),
+            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
+            raw.path(),
+        );
+        cfg.timeout = Duration::from_millis(100);
+
+        let error = record(cfg).await.unwrap_err();
+
+        assert!(error.to_string().contains("timed out"), "{error}");
+        let directory = only_raw_subdirectory(raw.path());
+        let partial: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.join("partial-capture.json"))
+                .expect("timeout partial evidence"),
+        )
+        .unwrap();
+        assert_eq!(partial["failure_class"], "timeout");
+    }
+
+    /// Break caught: `record`'s `Ok(Err(err))` branch (a driving failure with the child still
+    /// alive) replaces the driving error with something else, or classifies the partial capture
+    /// as anything but `DriverError`. With the timeout test above, this closes out coverage of all
+    /// three `PartialFailureClass` variants through production code: `ProcessError` is
+    /// `Session`-level and covered by `wait_error_retains_child_for_cleanup_and_quarantine`.
+    #[tokio::test]
+    async fn record_reports_the_driving_error_and_classifies_it_as_driver_error() {
+        let raw = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let error = record(config(
+            "claude-driver-error",
+            fixture_path("fake-claude-discovery-stall"),
+            CaptureOperation::Claude(ClaudeCaptureOperation::CommandDiscovery {
+                cwd: cwd.path().into(),
+            }),
+            raw.path(),
+        ))
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("stopped before the expected"),
+            "{error}"
+        );
+        let directory = only_raw_subdirectory(raw.path());
+        let partial: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.join("partial-capture.json"))
+                .expect("driver-error partial evidence"),
+        )
+        .unwrap();
+        assert_eq!(partial["failure_class"], "driver_error");
+    }
+
+    fn only_raw_subdirectory(raw_root: &Path) -> PathBuf {
+        let mut entries: Vec<_> = std::fs::read_dir(raw_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected exactly one raw capture directory"
+        );
+        entries.remove(0)
     }
 }

@@ -12,7 +12,7 @@ pub(super) mod claude;
 pub(super) mod codex;
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use comet_proto::RuntimeMode;
@@ -21,6 +21,7 @@ use super::providers::claude::ClaudeProvider;
 use super::providers::codex::CodexProvider;
 use super::session::Session;
 use crate::capture::Provider;
+use crate::launch::LaunchDescriptor;
 
 /// The parameters a scenario body reads to vary its behavior without owning
 /// its own copy of `CaptureConfig`. Deliberately minimal: a run scenario
@@ -73,39 +74,30 @@ impl Requirements {
     }
 }
 
-// Not constructed by production code until the task that rewires the
-// binary to read this table by name (Task 7, closing D60); `record.rs`
-// still dispatches each discovery scenario by matching `CaptureOperation`
-// directly. Exercised directly by this file's own tests in the meantime.
-#[allow(dead_code)]
 pub struct ScenarioSpec {
     pub name: &'static str,
     #[allow(dead_code)] // Read starting when the binary reports it in --help (Task 7).
     pub purpose: &'static str,
     pub provider: Provider,
     /// `None` for discovery scenarios, which start no turn.
+    #[allow(dead_code)] // Read starting when the binary validates against it (Task 7).
     pub runtime_mode: Option<RuntimeMode>,
+    #[allow(dead_code)] // Read starting when the binary validates against it (Task 7).
     pub requirements: Requirements,
-    // `record.rs` still dispatches by matching `CaptureOperation` directly
-    // and calls each scenario function by name; it does not yet read this
-    // table to find its body. That wiring is Task 7's (closing D60), same as
-    // `scenario()` below.
-    #[allow(dead_code)]
+    /// SPAWN, per row — not a provider trait member. See the amendment on
+    /// `CaptureProvider`'s doc comment for why: which launch a scenario
+    /// needs varies per scenario as well as per provider.
+    pub(super) launch: fn(&ScenarioInput, &Path) -> anyhow::Result<LaunchDescriptor>,
     pub(super) body: ScenarioBody,
 }
 
 type BoxedFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
 
-// Not read yet — see the comment on `ScenarioSpec::body` above.
-#[allow(dead_code)]
 pub(super) enum ScenarioBody {
     Claude(for<'a> fn(&'a mut Session<ClaudeProvider>, &'a ScenarioInput) -> BoxedFuture<'a>),
     Codex(for<'a> fn(&'a mut Session<CodexProvider>, &'a ScenarioInput) -> BoxedFuture<'a>),
 }
 
-// Not read by `record.rs` until Task 7; exercised directly by this file's
-// own tests below.
-#[allow(dead_code)]
 pub const SCENARIOS: &[ScenarioSpec] = &[
     ScenarioSpec {
         name: "model-discovery",
@@ -113,6 +105,7 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Claude,
         runtime_mode: None,
         requirements: Requirements::discovery(),
+        launch: claude::model_discovery_launch,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::model_discovery(s, i))),
     },
     ScenarioSpec {
@@ -121,6 +114,7 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Claude,
         runtime_mode: None,
         requirements: Requirements::discovery(),
+        launch: claude::model_discovery_launch,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::model_discovery(s, i))),
     },
     ScenarioSpec {
@@ -132,6 +126,7 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
             needs_cwd: true,
             ..Requirements::discovery()
         },
+        launch: claude::model_discovery_launch,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::model_discovery(s, i))),
     },
     ScenarioSpec {
@@ -143,6 +138,9 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
             needs_cwd: true,
             ..Requirements::discovery()
         },
+        // Visibly different from the `model-discovery` rows above: this is
+        // the whole point of `launch` living on the row, not the provider.
+        launch: claude::command_discovery_launch,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::command_discovery(s, i))),
     },
     ScenarioSpec {
@@ -151,6 +149,7 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Codex,
         runtime_mode: None,
         requirements: Requirements::discovery(),
+        launch: codex::model_discovery_launch,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::model_discovery(s, i))),
     },
     ScenarioSpec {
@@ -159,6 +158,7 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Codex,
         runtime_mode: None,
         requirements: Requirements::discovery(),
+        launch: codex::model_discovery_launch,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::model_discovery(s, i))),
     },
     ScenarioSpec {
@@ -170,6 +170,7 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
             needs_cwd: true,
             ..Requirements::discovery()
         },
+        launch: codex::model_discovery_launch,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::model_discovery(s, i))),
     },
     ScenarioSpec {
@@ -181,16 +182,13 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
             needs_empty_codex_home: true,
             ..Requirements::discovery()
         },
+        launch: codex::model_discovery_launch,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::model_discovery(s, i))),
     },
 ];
 
 /// Look up a scenario by the exact provider and name strings the binary's
 /// `--help` and argument parsing use (`"claude"` | `"codex"`).
-///
-/// Not called by `record.rs` until Task 7; exercised directly by this
-/// file's own tests in the meantime.
-#[allow(dead_code)]
 pub fn scenario(provider: &str, name: &str) -> Option<&'static ScenarioSpec> {
     SCENARIOS.iter().find(|spec| {
         let spec_provider = match spec.provider {

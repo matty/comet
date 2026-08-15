@@ -20,12 +20,29 @@ use super::provider::CaptureProvider;
 use crate::capture::approval::{DirectoryIdentity, FileIdentity, repository_root};
 use crate::capture::types::{
     CaptureConfig, CaptureEvent, Channel, CommandSnapshot, PartialFailureClass, PartialOutcome,
-    PartialRawCapture, PlatformMetadata, RawCapture, RedactionRoots,
+    PartialRawCapture, PlatformMetadata, Provider, RawCapture, RedactionRoots,
 };
 use crate::launch::LaunchDescriptor;
 
 const READER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// The fixed safety bound on the final exit wait, nested inside whichever
+/// comes first: this or the scenario's own configured `timeout`. See
+/// `Session::wait_for_exit`'s doc comment for why both exist and why only
+/// one of them is ever the reason a wait fails as `Timeout`.
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The capitalized name user-facing copy calls the provider by. Kept
+/// separate from `CaptureProvider::NAME` (lowercase, for the raw directory
+/// name and internal tracing) rather than adding a second trait constant —
+/// this is presentation, not identity, and it is a free function of the
+/// four-member seam's own `Provider` return value, not something a provider
+/// needs to declare for itself.
+fn provider_display_name(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "Claude",
+        Provider::Codex => "Codex",
+    }
+}
 
 /// What the pre-spawn fence validated and needs to survive into the raw
 /// capture's redaction roots. Today (discovery only) it is always
@@ -111,7 +128,7 @@ impl<P: CaptureProvider> Session<P> {
             tracing::debug!(provider = P::NAME, cli = %launch.program.display(), %err, "capture provider spawn failed");
             anyhow!(
                 "The {} CLI could not be started. Check --executable and try again.",
-                P::NAME
+                provider_display_name(P::provider())
             )
         })?;
         let stdin = child.stdin.take().ok_or_else(|| {
@@ -190,7 +207,8 @@ impl<P: CaptureProvider> Session<P> {
     /// Write one line to stdin, recording it as a stdin event first.
     pub(super) async fn send(&mut self, line: &str) -> anyhow::Result<()> {
         let Some(stdin) = self.stdin.as_mut() else {
-            return protocol_stopped::<()>(P::NAME, "stdin channel").map(|_| ());
+            return protocol_stopped::<()>(provider_display_name(P::provider()), "stdin channel")
+                .map(|_| ());
         };
         push_event(&self.events, Channel::Stdin, line.to_owned());
         stdin.write_all(line.as_bytes()).await.map_err(|err| {
@@ -238,7 +256,7 @@ impl<P: CaptureProvider> Session<P> {
                 return Ok(value);
             }
         }
-        protocol_stopped(P::NAME, expected)
+        protocol_stopped(provider_display_name(P::provider()), expected)
     }
 
     /// Pump frames until `P::turn_complete`.
@@ -252,34 +270,52 @@ impl<P: CaptureProvider> Session<P> {
                 return Ok(());
             }
         }
-        protocol_stopped(P::NAME, "turn completion")
+        protocol_stopped(provider_display_name(P::provider()), "turn completion")
     }
 
-    async fn wait_for_exit(&mut self) -> anyhow::Result<Option<i32>> {
+    /// Wait for the child to exit, bounded by whichever comes first:
+    /// `deadline` (the scenario's overall configured timeout — the same
+    /// deadline `record_generic` used for handshake and the scenario body,
+    /// passed through here so the exit wait shares its clock instead of
+    /// getting a fresh, unrelated budget) or the fixed [`CLEANUP_TIMEOUT`]
+    /// safety bound. Which one actually fires is exactly what decides
+    /// [`Session::finish`]'s classification: the deadline firing is
+    /// [`PartialFailureClass::Timeout`] (the user's configured budget ran
+    /// out); [`CLEANUP_TIMEOUT`] firing while budget remained, or a genuine
+    /// I/O error reading the exit status, is
+    /// [`PartialFailureClass::ProcessError`] (the process itself is the
+    /// problem, not the clock).
+    async fn wait_for_exit(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<i32>, ExitWait> {
         #[cfg(test)]
         if std::mem::take(&mut self.wait_error_once) {
-            bail!("The provider ended but its exit status could not be read. Retry the capture.");
+            return Err(ExitWait::failed(
+                "The provider ended but its exit status could not be read. Retry the capture.",
+            ));
         }
         let Some(child) = self.child.as_mut() else {
             return Ok(None);
         };
-        match tokio::time::timeout(CLEANUP_TIMEOUT, child.wait()).await {
+        let cleanup_deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
+        let bound = deadline.min(cleanup_deadline);
+        let bound_is_the_configured_deadline = bound == deadline;
+        match tokio::time::timeout_at(bound, child.wait()).await {
             Ok(Ok(status)) => {
                 self.child.take();
                 Ok(status.code())
             }
             Ok(Err(err)) => {
                 tracing::debug!(provider = P::NAME, %err, "capture child wait failed");
-                bail!(
-                    "The provider ended but its exit status could not be read. Retry the capture."
-                )
+                Err(ExitWait::failed(
+                    "The provider ended but its exit status could not be read. Retry the capture.",
+                ))
             }
-            Err(_) => {
-                self.terminate_and_reap().await;
-                bail!(
-                    "The provider did not exit after its final response. It was stopped; retry the capture."
-                )
-            }
+            Err(_) if bound_is_the_configured_deadline => Err(ExitWait::TimedOut),
+            Err(_) => Err(ExitWait::failed(
+                "The provider did not exit after its final response. It was stopped; retry the capture.",
+            )),
         }
     }
 
@@ -353,26 +389,63 @@ impl<P: CaptureProvider> Session<P> {
     /// persist. On failure or timeout: terminate, reap, persist the partial.
     ///
     /// Called only after driving (handshake + scenario body) has already
-    /// completed without error — a driving failure or the overall
-    /// configurable timeout is classified by the caller (`record()`), which
-    /// still owns `&mut self` at that point and never reaches `finish`.
-    /// Failure here is therefore always [`PartialFailureClass::ProcessError`].
-    pub(super) async fn finish(mut self) -> anyhow::Result<RawCapture> {
+    /// completed without error — a driving failure is classified by the
+    /// caller (`record_generic`'s `Ok(Err(err))` branch: `DriverError`),
+    /// which still owns `&mut self` at that point and never reaches `finish`.
+    /// `deadline` is the SAME configured-timeout deadline that bounded
+    /// driving: `recording.rs`'s original `finish` wrapped drive *and* the
+    /// exit wait in one `timeout(self.timeout, …)`, and a budget that
+    /// stopped covering the exit wait once this became two functions was
+    /// exactly the regression a review caught — the exit wait would run for
+    /// up to a fresh, unrelated `CLEANUP_TIMEOUT` (5s) past the caller's own
+    /// configured budget, and misreport `ProcessError` where the true cause
+    /// was the timeout.
+    pub(super) async fn finish(
+        mut self,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<RawCapture> {
         self.stdin.take();
-        match self.wait_for_exit().await {
+        match self.wait_for_exit(deadline).await {
             Ok(exit_code) => {
                 self.finish_readers().await;
                 let capture = self.raw_capture(exit_code);
                 persist_raw_capture(&capture).await?;
                 Ok(capture)
             }
-            Err(err) => {
+            Err(ExitWait::TimedOut) => {
+                self.terminate_and_reap().await;
+                self.persist_partial_after_failure(PartialFailureClass::Timeout)
+                    .await;
+                bail!(
+                    "Capture timed out after {} seconds. The provider was stopped; retry with --timeout-seconds up to 300.",
+                    self.timeout.as_secs_f64()
+                )
+            }
+            Err(ExitWait::Failed(err)) => {
                 self.terminate_and_reap().await;
                 self.persist_partial_after_failure(PartialFailureClass::ProcessError)
                     .await;
                 Err(err)
             }
         }
+    }
+}
+
+/// The two ways [`Session::wait_for_exit`] can end without a clean exit
+/// code, kept distinct because [`Session::finish`] classifies them
+/// differently.
+enum ExitWait {
+    /// The shared configured-timeout deadline fired.
+    TimedOut,
+    /// Something about the process itself — an I/O error reading its exit
+    /// status, or it simply not exiting within [`CLEANUP_TIMEOUT`] of the
+    /// deadline still having budget left.
+    Failed(anyhow::Error),
+}
+
+impl ExitWait {
+    fn failed(message: &str) -> Self {
+        Self::Failed(anyhow!("{message}"))
     }
 }
 
@@ -491,12 +564,13 @@ pub(super) async fn probe_version(executable: &Path) -> String {
 }
 
 pub(super) fn resolve_executable(
-    provider_name: &str,
+    provider: Provider,
     resolved: Option<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
     resolved.ok_or_else(|| {
         anyhow!(
-            "The {provider_name} CLI was not found. Install it or pass --executable with its path."
+            "The {} CLI was not found. Install it or pass --executable with its path.",
+            provider_display_name(provider)
         )
     })
 }
@@ -600,7 +674,8 @@ mod tests {
         let frame = session.next_frame().await.unwrap().expect("a real frame");
         assert_eq!(frame["type"], "result");
 
-        let capture = session.finish().await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let capture = session.finish(deadline).await.unwrap();
         assert!(
             capture.events.iter().any(|event| {
                 event.channel == Channel::Stdout && event.payload == "not json, a progress line"
@@ -688,6 +763,36 @@ mod tests {
         assert_eq!(capture.events[0].payload, "late observed frame");
     }
 
+    /// Break caught: `finish`'s exit wait uses a budget disconnected from the shared `deadline` it
+    /// was passed, silently giving the process up to `CLEANUP_TIMEOUT` (5s) past the caller's own
+    /// configured timeout and misclassifying the eventual result as `ProcessError` instead of
+    /// `Timeout` — the exact regression a review caught when driving and the exit wait split into
+    /// two functions. The child here never exits; the deadline is far shorter than
+    /// `CLEANUP_TIMEOUT`, so only honoring it (not just the fixed 5s bound) makes this fail fast.
+    #[tokio::test]
+    async fn finish_shares_the_configured_deadline_with_the_exit_wait() {
+        let raw = tempfile::tempdir().unwrap();
+        let executable = fixture_path("fake-claude-discovery-stall");
+        let input = ScenarioInput::default();
+        let launch =
+            crate::capture::record::scenarios::claude::model_discovery_launch(&input, &executable)
+                .unwrap();
+        let cfg = config(
+            "claude-finish-deadline",
+            executable,
+            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
+            raw.path(),
+        );
+        let session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+
+        let error = session.finish(deadline).await.unwrap_err();
+
+        assert!(error.to_string().contains("timed out"), "{error}");
+    }
+
     /// Break caught: a child-wait I/O error discards the only child handle before the outer
     /// failure cleanup can attempt kill/reap and finalize the partial transcript.
     #[tokio::test]
@@ -695,7 +800,9 @@ mod tests {
         let raw = tempfile::tempdir().unwrap();
         let executable = fixture_path("fake-claude");
         let input = ScenarioInput::default();
-        let launch = ClaudeProvider::launch(&input, &executable).unwrap();
+        let launch =
+            crate::capture::record::scenarios::claude::model_discovery_launch(&input, &executable)
+                .unwrap();
         let cfg = config(
             "claude-wait-error",
             executable,
@@ -712,7 +819,8 @@ mod tests {
             .unwrap();
         session.wait_error_once = true;
 
-        let error = session.finish().await.unwrap_err();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let error = session.finish(deadline).await.unwrap_err();
 
         assert!(error.to_string().contains("exit status could not be read"));
         assert!(!process_is_live(pid), "provider child {pid} remains live");
@@ -727,57 +835,6 @@ mod tests {
                 .as_array()
                 .is_some_and(|events| { events.iter().any(|event| event["channel"] == "stdout") })
         );
-    }
-
-    /// Break caught: the hard-timeout branch returns before killing and reaping the child. Uses a
-    /// real spawned child that hangs before reading anything (the interrupt fixture never gets a
-    /// first stdin line here), so the kill/reap is exercised on a genuinely live process; the
-    /// never-resolving `drive` future mirrors `record.rs`'s own outer timeout wrap.
-    #[tokio::test]
-    async fn recorder_timeout_kills_and_reaps_the_child() {
-        let raw = tempfile::tempdir().unwrap();
-        let executable = fixture_path("fake-claude");
-        let request = RunRequest {
-            prompt: "scenario:interrupt".into(),
-            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
-        };
-        let launch = crate::claude::run_launch(&executable, &request);
-        let mut cfg = config(
-            "claude-timeout",
-            executable,
-            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
-            raw.path(),
-        );
-        cfg.timeout = Duration::from_millis(100);
-        let timeout = cfg.timeout;
-
-        let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
-            .await
-            .unwrap();
-        let pid = session.child_id().expect("spawned child id");
-
-        let result: anyhow::Result<()> = match tokio::time::timeout(
-            timeout,
-            std::future::pending::<anyhow::Result<()>>(),
-        )
-        .await
-        {
-            Ok(inner) => inner,
-            Err(_) => {
-                session.terminate_and_reap().await;
-                session
-                    .persist_partial_after_failure(PartialFailureClass::Timeout)
-                    .await;
-                Err(anyhow!(
-                    "Capture timed out after {} seconds. The provider was stopped; retry with --timeout-seconds up to 300.",
-                    timeout.as_secs_f64()
-                ))
-            }
-        };
-
-        let error = result.unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-        assert!(!process_is_live(pid), "provider child {pid} remains live");
     }
 
     /// Break caught: drop delegates `wait()` to the originating Tokio runtime, whose shutdown
@@ -831,7 +888,9 @@ mod tests {
         let raw = tempfile::tempdir().unwrap();
         let missing = raw.path().join("missing-provider-executable");
         let input = ScenarioInput::default();
-        let launch = ClaudeProvider::launch(&input, &missing).unwrap();
+        let launch =
+            crate::capture::record::scenarios::claude::model_discovery_launch(&input, &missing)
+                .unwrap();
         let cfg = config(
             "claude-pre-spawn-failure",
             missing,
@@ -848,16 +907,34 @@ mod tests {
 
     /// Break caught: failure to quarantine evidence replaces the safe protocol error with a raw
     /// storage error that may disclose a local path or provider value.
+    ///
+    /// The driving failure here is real, not hand-typed: the stall fixture's
+    /// non-bare (command-discovery) path exits without ever answering the
+    /// initialize request, so `handshake` genuinely returns the "stopped
+    /// before the expected reply" error `record_generic`'s `Ok(Err(err))`
+    /// branch would forward — this test proves persistence failing to
+    /// quarantine (because a partial file already exists) does not replace
+    /// *that* error with a raw storage error, not a synthetic stand-in.
     #[tokio::test]
     async fn partial_persistence_failure_preserves_the_original_safe_error() {
         let raw = tempfile::tempdir().unwrap();
-        let executable = fixture_path("fake-claude");
-        let input = ScenarioInput::default();
-        let launch = ClaudeProvider::launch(&input, &executable).unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let executable = fixture_path("fake-claude-discovery-stall");
+        let input = ScenarioInput {
+            cwd: Some(cwd.path().into()),
+            ..ScenarioInput::default()
+        };
+        let launch = crate::capture::record::scenarios::claude::command_discovery_launch(
+            &input,
+            &executable,
+        )
+        .unwrap();
         let cfg = config(
             "claude-partial-write-failure",
             executable,
-            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
+            CaptureOperation::Claude(ClaudeCaptureOperation::CommandDiscovery {
+                cwd: cwd.path().into(),
+            }),
             raw.path(),
         );
         let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
@@ -870,17 +947,16 @@ mod tests {
         )
         .unwrap();
 
-        // A synthetic, controlled driving failure: which scenario produced it does not matter
-        // here — what matters is that persistence failing to quarantine (because a partial file
-        // already exists) does not replace this safe error with a raw storage error.
-        let original_error = anyhow!("synthetic driver failure: capture scenario aborted");
+        let error = ClaudeProvider::handshake(&mut session, &input)
+            .await
+            .unwrap_err();
         session.terminate_and_reap().await;
         session
             .persist_partial_after_failure(PartialFailureClass::DriverError)
             .await;
-        let error = original_error.to_string();
+        let error = error.to_string();
 
-        assert_eq!(error, "synthetic driver failure: capture scenario aborted");
+        assert!(error.contains("stopped before the expected"), "{error}");
         assert!(!error.contains(&directory.display().to_string()));
         assert_eq!(
             std::fs::read(directory.join("partial-capture.json")).unwrap(),

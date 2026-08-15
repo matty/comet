@@ -1,17 +1,15 @@
-use std::path::Path;
-
 use serde_json::Value;
 
 use crate::capture::Provider;
 use crate::capture::record::provider::CaptureProvider;
 use crate::capture::record::scenarios::ScenarioInput;
 use crate::capture::record::session::Session;
-use crate::launch::LaunchDescriptor;
 
 /// Claude's control-channel initialize handshake, verbatim from
 /// `recording.rs`'s `CLAUDE_INITIALIZE_LINE`. Shared by every Claude
 /// discovery scenario: model discovery and command discovery differ only in
-/// which launch builder they use, never in this line.
+/// which launch builder they use (see `scenarios::claude::*_launch`), never
+/// in this line.
 const CLAUDE_INITIALIZE_LINE: &str = r#"{"type":"control_request","request_id":"comet-discovery-1","request":{"subtype":"initialize"}}"#;
 
 pub(in crate::capture::record) struct ClaudeProvider;
@@ -21,13 +19,6 @@ impl CaptureProvider for ClaudeProvider {
 
     fn provider() -> Provider {
         Provider::Claude
-    }
-
-    fn launch(input: &ScenarioInput, executable: &Path) -> anyhow::Result<LaunchDescriptor> {
-        let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
-        Ok(crate::claude::discovery::model_discovery_launch(
-            executable, &cwd,
-        ))
     }
 
     fn frame(line: &str) -> Option<Value> {

@@ -1,13 +1,9 @@
-use std::path::Path;
-
-use anyhow::anyhow;
 use serde_json::{Value, json};
 
 use crate::capture::Provider;
 use crate::capture::record::provider::CaptureProvider;
 use crate::capture::record::scenarios::ScenarioInput;
 use crate::capture::record::session::Session;
-use crate::launch::LaunchDescriptor;
 
 /// Codex's `initialized` notification, verbatim from `recording.rs`'s
 /// `CODEX_INITIALIZED_LINE`. Sent once, right after the `initialize` reply,
@@ -45,21 +41,6 @@ impl CaptureProvider for CodexProvider {
 
     fn provider() -> Provider {
         Provider::Codex
-    }
-
-    fn launch(input: &ScenarioInput, executable: &Path) -> anyhow::Result<LaunchDescriptor> {
-        let home = input
-            .codex_home
-            .clone()
-            .or_else(crate::codex::discovery::codex_home)
-            .ok_or_else(|| {
-                anyhow!("Codex home could not be found. Pass --codex-home and try again.")
-            })?;
-        let home = super::super::session::absolute_from_parent(home)?;
-        let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
-        Ok(crate::codex::discovery::discovery_launch(
-            executable, &home, &cwd,
-        ))
     }
 
     fn frame(line: &str) -> Option<Value> {

@@ -908,49 +908,27 @@ fn select_launch(
     executable: &std::path::Path,
 ) -> anyhow::Result<LaunchDescriptor> {
     match &config.scenario.operation {
-        CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery) => Ok(
-            crate::claude::discovery::model_discovery_launch(executable, &std::env::temp_dir()),
-        ),
-        CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscoveryAt { cwd }) => Ok(
-            crate::claude::discovery::model_discovery_launch(executable, cwd),
-        ),
-        CaptureOperation::Claude(ClaudeCaptureOperation::CommandDiscovery { cwd }) => Ok(
-            crate::claude::commands::command_discovery_launch(executable, cwd),
-        ),
         CaptureOperation::Claude(ClaudeCaptureOperation::Run { request, .. }) => {
             Ok(crate::claude::run_launch(executable, request))
-        }
-        CaptureOperation::Codex(CodexCaptureOperation::ModelDiscovery) => {
-            let home = config
-                .codex_home
-                .clone()
-                .or_else(crate::codex::discovery::codex_home)
-                .ok_or_else(|| {
-                    anyhow!("Codex home could not be found. Pass --codex-home and try again.")
-                })?;
-            let home = absolute_from_parent(home)?;
-            Ok(crate::codex::discovery::discovery_launch(
-                executable,
-                &home,
-                &std::env::temp_dir(),
-            ))
-        }
-        CaptureOperation::Codex(CodexCaptureOperation::ModelDiscoveryAt { cwd }) => {
-            let home = config
-                .codex_home
-                .clone()
-                .or_else(crate::codex::discovery::codex_home)
-                .ok_or_else(|| {
-                    anyhow!("Codex home could not be found. Pass --codex-home and try again.")
-                })?;
-            let home = absolute_from_parent(home)?;
-            Ok(crate::codex::discovery::discovery_launch(
-                executable, &home, cwd,
-            ))
         }
         CaptureOperation::Codex(CodexCaptureOperation::Run { request, .. }) => {
             Ok(crate::codex::run_launch(executable, request))
         }
+        // Discovery never reaches here — see the matching guard in `drive`.
+        // Dead at the earliest point rather than late: a discovery config
+        // that somehow arrived would otherwise resolve the executable,
+        // build a launch, and spawn a real provider process before this
+        // function even got a chance to say no.
+        CaptureOperation::Claude(
+            ClaudeCaptureOperation::ModelDiscovery
+            | ClaudeCaptureOperation::ModelDiscoveryAt { .. }
+            | ClaudeCaptureOperation::CommandDiscovery { .. },
+        )
+        | CaptureOperation::Codex(
+            CodexCaptureOperation::ModelDiscovery | CodexCaptureOperation::ModelDiscoveryAt { .. },
+        ) => unreachable!(
+            "discovery operations are routed to capture::record before reaching select_launch"
+        ),
     }
 }
 
@@ -966,18 +944,6 @@ fn resolve_executable(provider: Provider, configured: Option<&PathBuf>) -> anyho
                 "The {} CLI was not found. Install it or pass --executable with its path.",
                 provider_name(provider)
             )
-        })
-}
-
-fn absolute_from_parent(path: PathBuf) -> anyhow::Result<PathBuf> {
-    if path.is_absolute() {
-        return Ok(path);
-    }
-    std::env::current_dir()
-        .map(|cwd| cwd.join(path))
-        .map_err(|err| {
-            tracing::debug!(%err, "capture could not resolve a relative Codex home");
-            anyhow!("Codex home could not be resolved. Pass an absolute --codex-home path.")
         })
 }
 
@@ -1142,7 +1108,7 @@ mod tests {
     use comet_proto::{ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel};
     use serde_json::{Value, json};
 
-    use super::{RecordingSession, persist_immutable_bytes, record};
+    use super::{RecordingSession, record};
     use crate::capture::test_support::{
         absolute_program, channel_payloads, config, contract_request, fixture_path,
     };
@@ -1467,25 +1433,6 @@ mod tests {
             "partial evidence bypassed explicit rejection: {error:?}"
         );
         assert!(!staging.exists());
-    }
-
-    /// Break caught: retrying persistence can overwrite the first failure transcript or expose a
-    /// half-written JSON document under its final name.
-    #[test]
-    fn partial_capture_publication_is_atomic_and_immutable() {
-        let directory = tempfile::Builder::new()
-            .prefix("comet partial evidence ' ")
-            .tempdir()
-            .unwrap();
-        persist_immutable_bytes(directory.path(), br#"{"first":true}"#).unwrap();
-        let destination = directory.path().join("partial-capture.json");
-        assert_eq!(std::fs::read(&destination).unwrap(), br#"{"first":true}"#);
-        assert!(!directory.path().join(".partial-capture.json.tmp").exists());
-
-        let error = persist_immutable_bytes(directory.path(), br#"{"second":true}"#).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(std::fs::read(destination).unwrap(), br#"{"first":true}"#);
-        assert!(!directory.path().join(".partial-capture.json.tmp").exists());
     }
 
     #[tokio::test]
