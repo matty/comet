@@ -158,16 +158,15 @@ fn sanitizer_uses_only_captured_redaction_roots_after_filesystem_changes() {
 /// Break caught: manifest accounting can silently omit a redaction category or count definitions
 /// rather than actual replacements, preventing a reviewer from auditing what changed.
 ///
-/// Under the allowlist, none of the four fields this scenario redacts is one of the six named
-/// identifier kinds (`session_id` is Claude's real wire casing — see the fix report on this
-/// test — not the `sessionId` `named_kind` matches), so every one of them numbers into the
-/// generic `v` bucket. That collapse is real and is not what this test is guarding: its property
-/// is that the *count* reflects every replacement, including reused ones, not just the distinct
-/// placeholders minted. `session_id` repeats the identical value `"same-session"` across both
-/// events, so it must count twice (2 occurrences) while only contributing one placeholder to
-/// `placeholders` — a naive implementation that counted only new-placeholder creations would
-/// undercount at 5 instead of 6, and that gap is exactly the "count definitions rather than
-/// actual replacements" bug this test was written to catch.
+/// `session_id` is Claude's real wire spelling (snake_case) and `named_kind` normalizes before
+/// comparing, so it resolves to the named `SESSION` group; the other three redacted fields
+/// (`.message.content` x2, `level`, the bare `.message`) aren't one of the six identifier kinds
+/// and fall into the generic `v` bucket. This exercises both accounting paths at once and pins
+/// the property the old blocklist-vocabulary version of this test also pinned: the *count*
+/// reflects every replacement, including reused ones, not just the distinct placeholders minted.
+/// `session_id` repeats the identical value `"same-session"` across both events, so it
+/// contributes one placeholder (`<SESSION_1>`) but must count twice — a naive implementation
+/// that counted only new-placeholder creation would report 1, not 2.
 #[test]
 fn sanitizer_manifest_accounts_for_placeholder_definitions_and_counts() {
     let temp = tempfile::tempdir().unwrap();
@@ -192,18 +191,20 @@ fn sanitizer_manifest_accounts_for_placeholder_definitions_and_counts() {
         manifest["purpose"],
         "capture Claude's token-free model initialize reply"
     );
-    // 6 occurrences (session_id x2 sharing one value, the two distinct prompt texts, and the
-    // two unlisted event-3 fields), collapsed into 5 distinct placeholders below -- the
-    // occurrence/placeholder gap is what this test exists to pin.
-    assert_eq!(manifest["redaction_counts"]["v"], 6);
+    // session_id: 2 occurrences (one distinct value) into the named SESSION group; the two
+    // distinct prompt texts plus the two unlisted event-3 fields: 4 occurrences into the
+    // generic bucket. 6 total occurrences, 5 distinct placeholders -- the occurrence/placeholder
+    // gap is what this test exists to pin.
+    assert_eq!(manifest["redaction_counts"]["session"], 2);
+    assert_eq!(manifest["redaction_counts"]["v"], 4);
     assert_eq!(
         manifest["placeholders"],
         serde_json::json!([
+            {"placeholder": "<SESSION_1>", "kind": "session"},
             {"placeholder": "<V1>", "kind": "v"},
             {"placeholder": "<V2>", "kind": "v"},
             {"placeholder": "<V3>", "kind": "v"},
-            {"placeholder": "<V4>", "kind": "v"},
-            {"placeholder": "<V5>", "kind": "v"}
+            {"placeholder": "<V4>", "kind": "v"}
         ])
     );
     assert_eq!(

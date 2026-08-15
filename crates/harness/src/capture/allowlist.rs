@@ -24,6 +24,7 @@
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
+use super::sanitize::normalize_field;
 use super::types::Provider;
 
 const CLAUDE_TXT: &str = include_str!("allowlist/claude.txt");
@@ -71,16 +72,28 @@ pub fn allows(provider: Provider, path: &str) -> bool {
 /// itself into its name set, instead of a second hardcoded leaf list that
 /// could drift from the `match` arms — see that test's doc comment for why
 /// the drift risk is the point.
+///
+/// **Keys are already `normalize_field`-normalized** (lowercase, no
+/// underscores) — not the raw wire spelling. Claude spells these snake_case
+/// (`session_id`) and Codex camelCase (`threadId`); a table keyed on one
+/// literal spelling silently matched nothing for the other provider, which
+/// is exactly the bug `named_kind` had until this fix (`session_id` covered
+/// 642 Claude occurrences and the `"sessionId"` entry covered 5; three of
+/// the nine leaves — `toolUseId`, `parentToolUseId`, `requestId` — matched
+/// *zero*, because Claude never emits those camelCase spellings at all).
+/// `only_the_six_identifier_kinds_are_named`'s "keys already normalized"
+/// assertion is what stops a future editor from adding a raw, unnormalized
+/// spelling back in.
 const NAMED_LEAVES: &[(&str, &str)] = &[
-    ("sessionId", "SESSION"),
-    ("threadId", "THREAD"),
-    ("turnId", "TURN"),
-    ("expectedTurnId", "TURN"),
-    ("toolUseId", "TOOL_USE"),
-    ("parentToolUseId", "TOOL_USE"),
-    ("itemId", "TOOL_USE"),
+    ("sessionid", "SESSION"),
+    ("threadid", "THREAD"),
+    ("turnid", "TURN"),
+    ("expectedturnid", "TURN"),
+    ("tooluseid", "TOOL_USE"),
+    ("parenttooluseid", "TOOL_USE"),
+    ("itemid", "TOOL_USE"),
     ("uuid", "MACHINE"),
-    ("requestId", "REQUEST"),
+    ("requestid", "REQUEST"),
 ];
 
 /// The readable name for an identifier leaf, or `None` if it is not one of
@@ -88,10 +101,17 @@ const NAMED_LEAVES: &[(&str, &str)] = &[
 /// …) rather than named — a lookup table keyed on field name, not a
 /// taxonomy, and capped at six on purpose: a kind that is not read does not
 /// get a name.
+///
+/// `leaf` is normalized before lookup — the same `normalize_field` the
+/// sanitizer's own scan uses — so `session_id` (Claude's real wire spelling)
+/// and a hypothetical `sessionId` both resolve to the one `sessionid` table
+/// entry. Route through the shared function rather than duplicating its
+/// rule: two copies of a normalization rule is how they drift.
 pub fn named_kind(leaf: &str) -> Option<&'static str> {
+    let normalized = normalize_field(leaf);
     NAMED_LEAVES
         .iter()
-        .find(|(name, _)| *name == leaf)
+        .find(|(name, _)| *name == normalized.as_str())
         .map(|(_, kind)| *kind)
 }
 
@@ -170,6 +190,126 @@ mod tests {
 
         assert_eq!(named_kind("id"), None, "a bare id is numbered, not named");
         assert_eq!(named_kind("costUSD"), None);
+    }
+
+    /// `named_kind` normalizes the incoming leaf before comparing it against
+    /// `NAMED_LEAVES`, so a table key that is *not itself* already normalized
+    /// can never be reached by that comparison — `normalize_field("agent_id")`
+    /// is `"agentid"`, which would never equal a stored `"agent_id"` entry.
+    /// A future editor adding a leaf with its raw wire spelling (underscores,
+    /// mixed case) would silently write a dead row rather than a working one.
+    /// This pins every table key to its own normalized form so that mistake
+    /// is a test failure, not a silent no-op.
+    #[test]
+    fn named_leaves_are_already_normalized() {
+        for &(leaf, kind) in NAMED_LEAVES {
+            assert_eq!(
+                normalize_field(leaf),
+                leaf,
+                "NAMED_LEAVES entry {leaf:?} (-> {kind}) is not already normalized"
+            );
+        }
+    }
+
+    /// The bug the coordinator found: `named_kind`'s table was keyed on one
+    /// literal spelling per leaf (all camelCase), so a leaf whose real wire
+    /// spelling differs matched nothing at all — three of the original nine
+    /// leaves (`toolUseId`, `parentToolUseId`, `requestId`) matched *zero*
+    /// occurrences anywhere in the committed corpus, and `sessionId` matched
+    /// 5 of Claude's 647 session ids because Claude spells it `session_id`.
+    /// Vocabulary tests (`only_the_six_identifier_kinds_are_named`) can't
+    /// catch this — they only check that the table's *shape* is six names,
+    /// never that each name actually matches something real. This walks the
+    /// real committed corpus (reading only; nothing here writes to it) and
+    /// fails if any of the six names covers zero occurrences.
+    #[test]
+    fn every_named_leaf_matches_something_in_the_committed_corpus() {
+        let mut occurrences: std::collections::BTreeMap<&'static str, u64> =
+            std::collections::BTreeMap::new();
+        for events_path in corpus_events_files() {
+            let text = std::fs::read_to_string(&events_path)
+                .unwrap_or_else(|error| panic!("{}: {error}", events_path.display()));
+            for line in text.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let event: serde_json::Value = serde_json::from_str(line)
+                    .unwrap_or_else(|error| panic!("{}: {error}", events_path.display()));
+                let Some(payload) = event["payload"].as_str() else {
+                    continue;
+                };
+                // Non-JSON stderr prose has no keys to count; anything else
+                // unparseable would be a corpus-integrity bug this test isn't
+                // responsible for catching.
+                let Ok(payload) = serde_json::from_str::<serde_json::Value>(payload) else {
+                    continue;
+                };
+                count_named_leaves(&payload, &mut occurrences);
+            }
+        }
+
+        for name in [
+            "SESSION", "THREAD", "TURN", "TOOL_USE", "MACHINE", "REQUEST",
+        ] {
+            let count = occurrences.get(name).copied().unwrap_or(0);
+            assert!(
+                count > 0,
+                "named kind {name} matches nothing in the committed corpus \
+                 (counts: {occurrences:?})"
+            );
+        }
+    }
+
+    fn count_named_leaves(
+        value: &serde_json::Value,
+        counts: &mut std::collections::BTreeMap<&'static str, u64>,
+    ) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, child) in object {
+                    if let Some(kind) = named_kind(key) {
+                        *counts.entry(kind).or_default() += 1;
+                    }
+                    count_named_leaves(child, counts);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    count_named_leaves(item, counts);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn corpus_events_files() -> Vec<std::path::PathBuf> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+        let mut files = Vec::new();
+        for provider in subdirectories(&root) {
+            for version in subdirectories(&provider) {
+                for scenario in subdirectories(&version) {
+                    let events = scenario.join("events.jsonl");
+                    if events.is_file() {
+                        files.push(events);
+                    }
+                }
+            }
+        }
+        assert!(
+            !files.is_empty(),
+            "found no events.jsonl under {} -- corpus walk is broken, not just empty",
+            root.display()
+        );
+        files
+    }
+
+    fn subdirectories(parent: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(parent)
+            .unwrap_or_else(|error| panic!("{}: {error}", parent.display()))
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect()
     }
 
     /// Adjudicated 2026-08-15, in two rounds. These paths were on the

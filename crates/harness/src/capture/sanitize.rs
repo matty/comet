@@ -866,7 +866,11 @@ impl Redactor {
     }
 }
 
-fn normalize_field(field: &str) -> String {
+/// `pub(crate)`, not private: `allowlist::named_kind` routes leaf lookup through
+/// this same rule (see its doc comment), so Claude's `session_id` and Codex's
+/// `sessionId` — if it ever used that spelling — collapse to one entry instead
+/// of needing a copy of this function that can drift from this one.
+pub(crate) fn normalize_field(field: &str) -> String {
     field
         .chars()
         .filter(|character| character.is_ascii_alphanumeric())
