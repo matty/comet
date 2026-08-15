@@ -29,8 +29,8 @@ pub use sanitize::{
     NovelPath, SanitizationError, SanitizationReport, render_novel_paths_report, sanitize_dir,
 };
 pub use surface::{
-    Direction, FieldObservation, FrameRef, MAP_PATHS, SurfaceError, observe_corpus,
-    observed_field_lines,
+    Direction, FieldObservation, FrameRef, MAP_PATHS, SurfaceError, VOCABULARY_PATHS,
+    observe_corpus, observe_vocabulary, observed_field_lines,
 };
 pub use types::{
     CaptureConfig, CaptureEvent, Channel, CommandSnapshot, PlatformMetadata, Provider, RawCapture,

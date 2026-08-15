@@ -80,7 +80,72 @@ pub enum SurfaceError {
 /// already agreed is data.
 pub const MAP_PATHS: &[&str] = &[".modelUsage"];
 
+/// Discriminator paths whose observed *values* form a provider's vocabulary —
+/// not every field, only the ones whose few distinct values answer "what
+/// kinds of thing does this harness say" (design §3.5, SNAPSHOT). `.type`
+/// names a frame's own kind, `.subtype` narrows a `system` frame, `.event.type`
+/// narrows a streamed `stream_event`, and the remaining two name which tool
+/// ran.
+///
+/// Declared rather than inferred, for the reason [`MAP_PATHS`] is: "this
+/// field has few distinct values" is a property of a small corpus, not of
+/// the protocol, and a set built by scanning today's captures for
+/// low-cardinality fields would silently stop growing the day a genuinely
+/// new value arrived — inference already trusts whatever it has seen.
+///
+/// Found by grepping the committed corpus, not guessed:
+///
+/// - `.type`, `.subtype` — Claude's `system`/`result`/`assistant`/… frame
+///   kind and its `init`/`success`/`hook_started`/… narrowing, both at the
+///   frame root.
+/// - `.event.type` — the frame kind carried inside a streamed
+///   `stream_event`'s `event` object (`content_block_start`,
+///   `message_delta`, …); distinct from `.type` because a `stream_event`
+///   frame's own `.type` is always the literal string `stream_event`.
+/// - `.message.content[].name` — a tool's name in a buffered `assistant`
+///   message's content array. Observed values include `Bash`, `Write`,
+///   `Skill`, `TaskCreate`, `ToolSearch`, `Agent`.
+/// - `.event.content_block.name` — the same tool name, streamed: it appears
+///   on the `content_block_start` event that precedes the buffered form
+///   above, with the identical vocabulary.
+///
+/// **No Codex tool-name path is declared.** Codex's turn items carry a kind
+/// at `.params.item.type` (`agentMessage`, `reasoning`, `userMessage`, …),
+/// but no scenario in the committed corpus exercises a Codex tool call — no
+/// `command_execution`, no MCP tool item, anywhere in `codex/0.147.0/` — so
+/// there is no real dotted form to read off the evidence. Declaring one
+/// without a capture backing it is exactly the guess this list exists to
+/// refuse; this is the archive's blind spot (design §5) made visible here
+/// rather than papered over.
+pub const VOCABULARY_PATHS: &[&str] = &[
+    ".type",
+    ".subtype",
+    ".event.type",
+    ".message.content[].name",
+    ".event.content_block.name",
+];
+
+/// Distinct scalar values seen at each [`VOCABULARY_PATHS`] entry, keyed by
+/// `(provider, version)` — the same granularity [`FieldObservation`] carries,
+/// so a sheet can show exactly one version's vocabulary without a sibling
+/// version's values leaking in.
+type Vocabulary = BTreeMap<(String, String), BTreeMap<String, BTreeSet<String>>>;
+
 pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, SurfaceError> {
+    Ok(walk_corpus(corpus_root)?.0)
+}
+
+/// The value vocabulary for every version in the corpus. Walks the same
+/// evidence [`observe_corpus`] does — see [`walk_corpus`] — so a value
+/// collected here is a value some promoted capture actually contains.
+pub fn observe_vocabulary(corpus_root: &Path) -> Result<Vocabulary, SurfaceError> {
+    Ok(walk_corpus(corpus_root)?.1)
+}
+
+/// The one pass over the archive both [`observe_corpus`] and
+/// [`observe_vocabulary`] read from, so the field inventory and the value
+/// vocabulary don't each re-walk the corpus independently.
+fn walk_corpus(corpus_root: &Path) -> Result<(Vec<FieldObservation>, Vocabulary), SurfaceError> {
     let scenarios = promoted_scenarios(corpus_root)?;
     if scenarios.is_empty() {
         return Err(SurfaceError::EmptyCorpus {
@@ -90,6 +155,7 @@ pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, Surfa
 
     let mut inventory: BTreeMap<(String, String, Direction, String), FieldObservation> =
         BTreeMap::new();
+    let mut vocabulary: Vocabulary = BTreeMap::new();
     for scenario in scenarios {
         let events =
             std::fs::read_to_string(scenario.directory.join("events.jsonl")).map_err(|_| {
@@ -128,6 +194,7 @@ pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, Surfa
             };
             let mut visit = Visit {
                 inventory: &mut inventory,
+                vocabulary: &mut vocabulary,
                 scenario: &scenario,
                 direction,
                 sequence,
@@ -136,7 +203,7 @@ pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, Surfa
         }
     }
 
-    Ok(inventory.into_values().collect())
+    Ok((inventory.into_values().collect(), vocabulary))
 }
 
 struct PromotedScenario {
@@ -195,6 +262,7 @@ fn file_name(path: &Path) -> String {
 
 struct Visit<'a> {
     inventory: &'a mut BTreeMap<(String, String, Direction, String), FieldObservation>,
+    vocabulary: &'a mut Vocabulary,
     scenario: &'a PromotedScenario,
     direction: Direction,
     sequence: u64,
@@ -225,6 +293,17 @@ impl Visit<'_> {
                     self.walk(child, child_path);
                 }
             }
+            // A leaf. Only a declared discriminator path's value is worth
+            // remembering, and only as a scalar — `Object` and `Array`
+            // already matched above and can never reach here, so a shape
+            // change at a declared path (the value stops being a leaf)
+            // silently stops contributing to the vocabulary instead of
+            // being stringified into it.
+            scalar if VOCABULARY_PATHS.contains(&path.as_str()) => {
+                if let Some(value) = scalar_string(scalar) {
+                    self.record_vocabulary(&path, value);
+                }
+            }
             _ => {}
         }
     }
@@ -248,6 +327,32 @@ impl Visit<'_> {
                     sequence: self.sequence,
                 },
             });
+    }
+
+    fn record_vocabulary(&mut self, path: &str, value: String) {
+        self.vocabulary
+            .entry((
+                self.scenario.provider.clone(),
+                self.scenario.version.clone(),
+            ))
+            .or_default()
+            .entry(path.to_owned())
+            .or_default()
+            .insert(value);
+    }
+}
+
+/// A JSON scalar's value as vocabulary text, or `None` for `null` — which is
+/// "no value", not a value worth recording. `Object` and `Array` are
+/// unreachable through [`Visit::walk`]'s leaf arm but are handled here too,
+/// so this function stays correct on its own terms rather than by relying on
+/// its one caller.
+fn scalar_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        Value::Null | Value::Object(_) | Value::Array(_) => None,
     }
 }
 

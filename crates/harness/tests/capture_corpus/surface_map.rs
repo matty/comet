@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use comet_harness::capture::{Direction, FieldObservation, observe_corpus};
+use comet_harness::capture::{Direction, FieldObservation, observe_corpus, observe_vocabulary};
 use serde_json::{Value, json};
 
 /// Writes one scenario directory: the frames, each payload a JSON string
@@ -325,4 +325,86 @@ fn an_empty_or_missing_corpus_root_is_an_error_not_an_empty_inventory() {
 
     let empty = tempfile::tempdir().unwrap();
     assert!(observe_corpus(empty.path()).is_err());
+}
+
+/// Break caught: the value vocabulary is what turns "a `.type` field exists"
+/// into "this harness emits `system`, `assistant`, `result`" (design §3.5).
+/// Three frames whose `.type` differs must all show up as three distinct
+/// values, and a field that varies just as much but is not on
+/// `VOCABULARY_PATHS` must not contribute anything — collecting every path
+/// would make the vocabulary indistinguishable from the field inventory
+/// `observe_corpus` already provides.
+#[test]
+fn vocabulary_collects_declared_paths_only() {
+    let root = tempfile::tempdir().unwrap();
+    write_scenario(
+        root.path(),
+        "claude",
+        "2.1.229",
+        "checklist",
+        &[
+            (
+                1,
+                "stdout",
+                json!({"type": "system", "undeclared": "alpha"}),
+            ),
+            (
+                2,
+                "stdout",
+                json!({"type": "assistant", "undeclared": "beta"}),
+            ),
+            (
+                3,
+                "stdout",
+                json!({"type": "result", "undeclared": "gamma"}),
+            ),
+        ],
+    );
+
+    let vocabulary = observe_vocabulary(root.path()).unwrap();
+    let claude = vocabulary
+        .get(&("claude".to_string(), "2.1.229".to_string()))
+        .unwrap_or_else(|| panic!("no vocabulary for claude/2.1.229: {vocabulary:?}"));
+
+    assert_eq!(
+        claude.get(".type").cloned().unwrap_or_default(),
+        BTreeSet::from([
+            "system".to_string(),
+            "assistant".to_string(),
+            "result".to_string(),
+        ]),
+        "all three .type values must be collected: {claude:?}"
+    );
+    assert!(
+        !claude.contains_key(".undeclared"),
+        "an undeclared path must not appear in the vocabulary: {claude:?}"
+    );
+}
+
+/// Break caught: an object or array sitting at a declared path is a shape
+/// change worth noticing on its own, not a value to stringify into the
+/// vocabulary — stringifying it would either panic reaching for a string or
+/// silently print `{...}`/`[...]` as if that were one more discriminator
+/// value.
+#[test]
+fn vocabulary_ignores_a_non_scalar_at_a_declared_path() {
+    let root = tempfile::tempdir().unwrap();
+    write_scenario(
+        root.path(),
+        "claude",
+        "2.1.229",
+        "checklist",
+        &[(1, "stdout", json!({"type": {"nested": "shape-change"}}))],
+    );
+
+    let vocabulary = observe_vocabulary(root.path()).unwrap();
+    let has_type_value = vocabulary
+        .get(&("claude".to_string(), "2.1.229".to_string()))
+        .and_then(|paths| paths.get(".type"))
+        .is_some_and(|values| !values.is_empty());
+
+    assert!(
+        !has_type_value,
+        "a non-scalar at a declared path must not become a vocabulary value: {vocabulary:?}"
+    );
 }
