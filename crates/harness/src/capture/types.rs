@@ -27,7 +27,8 @@ pub struct CommandSnapshot {
 }
 
 impl CommandSnapshot {
-    #[allow(dead_code)] // Task 2 capture drivers consume this API.
+    // The capture recorder is the only caller; see `recording.rs`.
+    #[allow(dead_code)]
     pub(crate) fn from_launch(launch: &LaunchDescriptor) -> Self {
         const CAPTURED_ENV: &[&str] = &["CODEX_HOME"];
 

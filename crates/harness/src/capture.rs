@@ -1,8 +1,12 @@
 //! Recording, sanitizing and reading provider captures.
 //!
-//! Test tooling. Nothing here is on Comet's runtime path — the launch types
-//! that are live in [`crate::launch`], which this module consumes rather than
-//! owns.
+//! Test tooling: nothing here is on Comet's runtime path. The launch types
+//! that *do* sit on it live in [`crate::launch`], which this module consumes
+//! rather than owns.
+//!
+//! The module is nonetheless unconditionally `pub`, not `cfg(test)`, so it
+//! compiles into the binary. Moving it behind a crate boundary is deferred
+//! until the recorder is provider-neutral.
 
 mod approval;
 mod checklist;
