@@ -66,21 +66,33 @@ pub fn allows(provider: Provider, path: &str) -> bool {
     }
 }
 
+/// The full leaf-to-name table `named_kind` is driven off. A `const` table
+/// rather than a bare `match` so the test below can collapse the table
+/// itself into its name set, instead of a second hardcoded leaf list that
+/// could drift from the `match` arms — see that test's doc comment for why
+/// the drift risk is the point.
+const NAMED_LEAVES: &[(&str, &str)] = &[
+    ("sessionId", "SESSION"),
+    ("threadId", "THREAD"),
+    ("turnId", "TURN"),
+    ("expectedTurnId", "TURN"),
+    ("toolUseId", "TOOL_USE"),
+    ("parentToolUseId", "TOOL_USE"),
+    ("itemId", "TOOL_USE"),
+    ("uuid", "MACHINE"),
+    ("requestId", "REQUEST"),
+];
+
 /// The readable name for an identifier leaf, or `None` if it is not one of
 /// the six kinds actually read. Everything else is numbered (`<V1>`, `<V2>`,
 /// …) rather than named — a lookup table keyed on field name, not a
 /// taxonomy, and capped at six on purpose: a kind that is not read does not
 /// get a name.
 pub fn named_kind(leaf: &str) -> Option<&'static str> {
-    match leaf {
-        "sessionId" => Some("SESSION"),
-        "threadId" => Some("THREAD"),
-        "turnId" | "expectedTurnId" => Some("TURN"),
-        "toolUseId" | "parentToolUseId" | "itemId" => Some("TOOL_USE"),
-        "uuid" => Some("MACHINE"),
-        "requestId" => Some("REQUEST"),
-        _ => None,
-    }
+    NAMED_LEAVES
+        .iter()
+        .find(|(name, _)| *name == leaf)
+        .map(|(_, kind)| *kind)
 }
 
 #[cfg(test)]
@@ -124,42 +136,37 @@ mod tests {
         assert!(!allows(Provider::Codex, ".mcp_servers[].status"));
     }
 
-    /// Six names, no more, no fewer — pinned by counting, not sampling.
+    /// Six names, no more, no fewer — pinned by counting the table `named_kind`
+    /// is actually driven off, not a second hardcoded leaf list.
     ///
-    /// The original body asserted three positives and two negatives and
-    /// never counted, so a seventh name reachable through one of the nine
-    /// recognized leaves (for example, splitting `itemId` off from
-    /// `toolUseId`/`parentToolUseId` into its own `"ITEM"` name) would pass
-    /// unchanged — none of the five point-checks touch that leaf. This
-    /// version collapses every recognized leaf's result into a set and
-    /// pins the set itself, so a new distinct name shows up as a cardinality
-    /// change regardless of which leaf introduces it.
+    /// The prior body asserted three positives and two negatives over a
+    /// hardcoded nine-leaf list and never counted, so a seventh name
+    /// reachable through a *new* leaf (for example, `"agentId" =>
+    /// Some("AGENT")` added to the `match`) would pass unchanged — the
+    /// hardcoded list never learns about a leaf it doesn't already name.
+    /// This version collapses `NAMED_LEAVES` itself — the table `named_kind`
+    /// reads from — so a seventh distinct name is a cardinality change no
+    /// matter which leaf introduces it, and the leaf/name pairing is closed
+    /// by the round-trip loop below.
     #[test]
     fn only_the_six_identifier_kinds_are_named() {
-        const RECOGNIZED_LEAVES: &[&str] = &[
-            "sessionId",
-            "threadId",
-            "turnId",
-            "expectedTurnId",
-            "toolUseId",
-            "parentToolUseId",
-            "itemId",
-            "uuid",
-            "requestId",
-        ];
-
-        let names: BTreeSet<&str> = RECOGNIZED_LEAVES
-            .iter()
-            .filter_map(|leaf| named_kind(leaf))
-            .collect();
+        let names: BTreeSet<&str> = NAMED_LEAVES.iter().map(|(_, kind)| *kind).collect();
 
         assert_eq!(
             names,
             BTreeSet::from([
                 "SESSION", "THREAD", "TURN", "TOOL_USE", "MACHINE", "REQUEST"
             ]),
-            "named_kind's recognized leaves must collapse into exactly these six names"
+            "NAMED_LEAVES must collapse into exactly these six names"
         );
+
+        for (leaf, kind) in NAMED_LEAVES {
+            assert_eq!(
+                named_kind(leaf),
+                Some(*kind),
+                "named_kind must answer exactly what its own table says for {leaf}"
+            );
+        }
 
         assert_eq!(named_kind("id"), None, "a bare id is numbered, not named");
         assert_eq!(named_kind("costUSD"), None);
@@ -198,9 +205,12 @@ mod tests {
             ".message.content[].input.description"
         ));
 
-        // Decision 1's `.plugins[]` prefix, pinned at a leaf round 1 didn't
-        // separately name (only `.name` and `.source` were).
+        // Decision 1's `.plugins[]` prefix, pinned at leaves round 1 didn't
+        // separately name (only `.name` and `.source` were). `.path` holds a
+        // filesystem path and was excluded only by the generator's prefix
+        // rule until this line gave it its own test.
         assert!(!allows(Provider::Claude, ".plugins[].version"));
+        assert!(!allows(Provider::Claude, ".plugins[].path"));
 
         // Round 1 — local-tooling / configuration identity, same class as
         // the three findings this stage exists to fix.
@@ -282,7 +292,6 @@ mod tests {
         // discovery.rs:188-190` documents `agents`, `account`, `commands`
         // and `output_style` as deliberately unmodelled, so nothing downstream
         // reads any of these.
-        assert!(!allows(Provider::Claude, ".hook_name"));
         assert!(!allows(
             Provider::Claude,
             ".response.response.account.tokenSource"
@@ -293,9 +302,27 @@ mod tests {
         ));
         assert!(!allows(Provider::Claude, ".output_style"));
         assert!(!allows(Provider::Claude, ".response.response.output_style"));
+        // `.terminal_slash_commands[]` is a subset of the already-excluded
+        // `.slash_commands[]` catalog (`commands`, unmodelled per the anchor
+        // above), distinguished only by an unverified assumption — round 1's
+        // keep-ruling on it was reversed on that basis.
+        assert!(!allows(Provider::Claude, ".terminal_slash_commands[]"));
+
+        // Round 2 — NOT the standing rule above: `.hook_name` is the
+        // user-authored matcher half of a hook definition read out of
+        // `settings.json`, not one of discovery.rs's four unmodelled
+        // fields. It is excluded as user-authored configuration text, the
+        // same class as the command/content/description fields above.
+        assert!(!allows(Provider::Claude, ".hook_name"));
+
+        // Round 2 — NOT the standing rule either: both of these ARE read —
+        // `.message.content[].input.query` feeds `ToolCall::WebSearch` at
+        // `crates/harness/src/claude/normalize.rs:414`. They are excluded
+        // as free-form user-authored search text, the same class as the
+        // command/content/description fields above, not because nothing
+        // downstream reads them.
         assert!(!allows(Provider::Claude, ".message.content[].input.query"));
         assert!(!allows(Provider::Claude, ".tool_use_result.query"));
-        assert!(!allows(Provider::Claude, ".terminal_slash_commands[]"));
 
         // Round 2 — the standing rule applied on the codex side:
         // `crates/harness/src/codex/normalize.rs:426` reads only

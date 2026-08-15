@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use super::allowlist::{allows, named_kind};
 use super::filesystem::has_windows_reparse_point;
 use super::types::{Channel, PartialRawCapture, Provider, RawCapture};
 
@@ -65,81 +66,23 @@ pub enum SanitizationError {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum RedactionKind {
-    ClaudeRequestId,
-    CodexRpcId,
-    SessionId,
-    ThreadId,
-    TurnId,
-    ToolUseId,
-    UserText,
-    AssistantProse,
-    ProviderProse,
-    MachineId,
-    AttachmentBytes,
-    ClaudeMemoryPath,
-    ClaudeMessageId,
-    ClaudeThinkingSignature,
-    CodexMcpServerName,
-    CodexThreadPath,
-}
-
-impl RedactionKind {
-    fn placeholder_name(self) -> &'static str {
-        match self {
-            Self::ClaudeRequestId => "CLAUDE_REQUEST_ID",
-            Self::CodexRpcId => "CODEX_RPC_ID",
-            Self::SessionId => "SESSION_ID",
-            Self::ThreadId => "THREAD_ID",
-            Self::TurnId => "TURN_ID",
-            Self::ToolUseId => "TOOL_USE_ID",
-            Self::UserText => "USER_TEXT",
-            Self::AssistantProse => "ASSISTANT_PROSE",
-            Self::ProviderProse => "PROVIDER_PROSE",
-            Self::MachineId => "MACHINE_ID",
-            Self::AttachmentBytes => "ATTACHMENT_BYTES",
-            Self::ClaudeMemoryPath => "CLAUDE_MEMORY_PATH",
-            Self::ClaudeMessageId => "CLAUDE_MESSAGE_ID",
-            Self::ClaudeThinkingSignature => "CLAUDE_THINKING_SIGNATURE",
-            Self::CodexMcpServerName => "CODEX_MCP_SERVER_NAME",
-            Self::CodexThreadPath => "CODEX_THREAD_PATH",
-        }
-    }
-
-    fn manifest_name(self) -> &'static str {
-        match self {
-            Self::ClaudeRequestId => "claude_request_id",
-            Self::CodexRpcId => "codex_rpc_id",
-            Self::SessionId => "session_id",
-            Self::ThreadId => "thread_id",
-            Self::TurnId => "turn_id",
-            Self::ToolUseId => "tool_use_id",
-            Self::UserText => "user_text",
-            Self::AssistantProse => "assistant_prose",
-            Self::ProviderProse => "provider_prose",
-            Self::MachineId => "machine_id",
-            Self::AttachmentBytes => "attachment_bytes",
-            Self::ClaudeMemoryPath => "claude_memory_path",
-            Self::ClaudeMessageId => "claude_message_id",
-            Self::ClaudeThinkingSignature => "claude_thinking_signature",
-            Self::CodexMcpServerName => "codex_mcp_server_name",
-            Self::CodexThreadPath => "codex_thread_path",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct SemanticValue {
-    original: Value,
-    placeholder: String,
-}
-
+/// Per-capture redaction state: which values have already been assigned a
+/// placeholder, and the counters that feed the manifest.
+///
+/// Numbering is keyed on the original value, not on a counter, so equal
+/// values collide into the same placeholder deliberately — a join that held
+/// on the wire still holds in the archive. `named` groups are the six
+/// identifier kinds from `allowlist::named_kind` (plus the internal `PROSE`
+/// group for non-JSON stderr payloads); `generic` is the numbered fallback
+/// (`<V1>`, `<V2>`, …) for every other unlisted scalar. Both are `Vec`, not
+/// `HashMap`, because encounter order is what makes a run byte-deterministic
+/// — the publication tests assert on that determinism directly.
 #[derive(Default)]
 struct Redactor {
-    semantics: BTreeMap<RedactionKind, Vec<SemanticValue>>,
-    counts: BTreeMap<String, u64>,
     paths: Vec<PathRedaction>,
+    named: BTreeMap<&'static str, Vec<(Value, String)>>,
+    generic: Vec<(Value, String)>,
+    counts: BTreeMap<String, u64>,
 }
 
 #[derive(Clone)]
@@ -147,50 +90,6 @@ struct PathRedaction {
     values: Vec<String>,
     placeholder: &'static str,
     kind: &'static str,
-}
-
-#[derive(Clone, Copy, Default)]
-enum Speaker {
-    #[default]
-    Unknown,
-    User,
-    Assistant,
-}
-
-#[derive(Clone, Copy, Default)]
-struct SemanticContext {
-    claude_capture: bool,
-    json_root: bool,
-    speaker: Speaker,
-    codex_turn_input: bool,
-    codex_assistant_prose: bool,
-    codex_assistant_prose_array: bool,
-    discovery_metadata: bool,
-    codex_catalog: bool,
-    codex_root_notification: CodexNotification,
-    codex_direct_params: CodexNotification,
-    availability_nux: bool,
-    claude_memory_paths: bool,
-    claude_tool_use: bool,
-    claude_tool_input: bool,
-    entity: Entity,
-}
-
-#[derive(Clone, Copy, Default, Eq, PartialEq)]
-enum CodexNotification {
-    #[default]
-    None,
-    TokenUsage,
-    McpStartupStatus,
-}
-
-#[derive(Clone, Copy, Default)]
-enum Entity {
-    #[default]
-    None,
-    Thread,
-    Turn,
-    Item,
 }
 
 /// Convert one raw capture into reviewable staging artifacts.
@@ -219,11 +118,6 @@ pub fn sanitize_dir(
     let capture: RawCapture = serde_json::from_slice(&bytes)
         .map_err(|source| SanitizationError::InvalidRaw { source })?;
     let mut redactor = Redactor::new(&capture);
-    let semantic_context = SemanticContext {
-        claude_capture: capture.provider == Provider::Claude,
-        json_root: true,
-        ..SemanticContext::default()
-    };
 
     let mut payloads = Vec::with_capacity(capture.events.len());
     for event in &capture.events {
@@ -239,41 +133,23 @@ pub fn sanitize_dir(
             }
         }
     }
-    for payload in &payloads {
-        match payload {
-            Payload::Json(value) => {
-                redactor.collect_semantics(value, semantic_context);
-            }
-            Payload::Text(text) => {
-                redactor.register(RedactionKind::ProviderProse, &Value::String(text.clone()));
-            }
-        }
-    }
 
-    let mut command = serde_json::to_value(&capture.command)
-        .map_err(|source| SanitizationError::EncodeOutput { source })?;
-    if capture.provider == Provider::Claude {
-        redactor.sanitize_claude_resume_argv(&mut command, &capture.scenario)?;
-    }
-    redactor.sanitize_nonsemantic_value(&mut command, "command")?;
-
+    // Events are sanitized before `command`, deliberately: the Claude resume
+    // argv below needs the session id's placeholder already assigned, and a
+    // session id normally first appears inside an event payload, not in
+    // `command` itself.
     let mut events_bytes = Vec::new();
     for (event, payload) in capture.events.iter().zip(&mut payloads) {
         let payload = match payload {
             Payload::Json(value) => {
-                redactor.sanitize_json(value, semantic_context, "event.payload")?;
+                redactor.sanitize_value_tree(value, capture.provider, "", "", "event.payload")?;
                 serde_json::to_string(value)
                     .map_err(|source| SanitizationError::EncodeOutput { source })?
             }
             Payload::Text(text) => {
-                let mut value = Value::String(text.clone());
-                redactor.replace_semantic(RedactionKind::ProviderProse, &mut value);
-                *text = value
-                    .as_str()
-                    .expect("text replacement stays a string")
-                    .to_owned();
-                redactor.sanitize_string(text, "event.payload")?;
-                text.clone()
+                let placeholder = redactor.placeholder_for_prose(text);
+                *text = placeholder.clone();
+                placeholder
             }
         };
         let line = SanitizedEvent {
@@ -285,6 +161,13 @@ pub fn sanitize_dir(
             .map_err(|source| SanitizationError::EncodeOutput { source })?;
         events_bytes.push(b'\n');
     }
+
+    let mut command = serde_json::to_value(&capture.command)
+        .map_err(|source| SanitizationError::EncodeOutput { source })?;
+    if capture.provider == Provider::Claude {
+        redactor.sanitize_claude_resume_argv(&mut command, &capture.scenario)?;
+    }
+    redactor.sanitize_nonsemantic_value(&mut command, "command")?;
 
     let mut cli_version = capture.cli_version.clone();
     redactor.sanitize_paths_and_validate(&mut cli_version, "cli_version")?;
@@ -654,94 +537,158 @@ impl Redactor {
             .sort_by_key(|path| std::cmp::Reverse(path.values.first().map_or(0, String::len)));
     }
 
-    fn collect_semantics(&mut self, value: &Value, context: SemanticContext) {
-        if context.codex_assistant_prose_array && value.is_string() {
-            self.register(RedactionKind::AssistantProse, value);
-            return;
-        }
-        match value {
-            Value::Array(values) => {
-                for value in values {
-                    self.collect_semantics(value, descendant_context(context));
-                }
-            }
-            Value::Object(object) => {
-                let context = object_context(object, context);
-                for (key, value) in object {
-                    if let Some(kind) = semantic_kind(object, key, value, context) {
-                        self.register(kind, value);
-                    } else {
-                        self.collect_semantics(value, child_context(context, key));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn register(&mut self, kind: RedactionKind, original: &Value) {
-        if !matches!(original, Value::String(_) | Value::Number(_)) {
-            return;
-        }
-        let values = self.semantics.entry(kind).or_default();
-        if values.iter().any(|value| value.original == *original) {
-            return;
-        }
-        values.push(SemanticValue {
-            original: original.clone(),
-            placeholder: format!("<{}_{}>", kind.placeholder_name(), values.len() + 1),
-        });
-    }
-
-    fn sanitize_json(
+    /// The allowlist walker. For each scalar (`String`/`Number`) at dotted
+    /// path `path`: if its field name looks credential-shaped, reject the
+    /// whole capture regardless of allow status — `is_secret_field` is a
+    /// tripwire independent of the allowlist, because a name like
+    /// `apiKey`/`authorization` showing up anywhere is itself the alarm.
+    /// Otherwise, if `path` is on the provider's allowlist, keep the value
+    /// verbatim and run the fail-closed scan over it — an allowlisted path
+    /// is a decision about the *field*, not a licence for whatever a
+    /// provider happens to put in it. If it is not allowed, replace it with
+    /// a placeholder. `Bool`/`Null` are never redacted: they carry no
+    /// free-form data.
+    ///
+    /// `Array`/`Object` recurse; an array element's path grows `[]` (never
+    /// an index, so every element of an array shares one allowlist
+    /// decision) and its `key` stays the containing field's key, so
+    /// `is_secret_field`/`named_kind` still see a meaningful field name for
+    /// each scalar inside e.g. `"tags": ["sk-ant-…"]`.
+    fn sanitize_value_tree(
         &mut self,
         value: &mut Value,
-        context: SemanticContext,
+        provider: Provider,
+        path: &str,
+        key: &str,
         location: &str,
     ) -> Result<(), SanitizationError> {
-        if context.codex_assistant_prose_array && value.is_string() {
-            self.replace_semantic(RedactionKind::AssistantProse, value);
-        }
         match value {
-            Value::Array(values) => {
-                for (index, value) in values.iter_mut().enumerate() {
-                    self.sanitize_json(
-                        value,
-                        descendant_context(context),
+            Value::Array(items) => {
+                let child_path = format!("{path}[]");
+                for (index, item) in items.iter_mut().enumerate() {
+                    self.sanitize_value_tree(
+                        item,
+                        provider,
+                        &child_path,
+                        key,
                         &format!("{location}[{index}]"),
                     )?;
                 }
+                Ok(())
             }
             Value::Object(object) => {
-                let context = object_context(object, context);
                 let keys: Vec<String> = object.keys().cloned().collect();
-                for (index, key) in keys.into_iter().enumerate() {
+                for (index, child_key) in keys.into_iter().enumerate() {
                     let child_location = format!("{location}.object[{index}]");
-                    self.validate_key(&key, &child_location)?;
-                    if is_secret_field(&key, &object[&key])
-                        && !is_codex_token_usage_object(&key, &object[&key], context)
-                    {
-                        return Err(SanitizationError::SecretLikeField {
-                            location: child_location,
-                        });
-                    }
-                    let kind = semantic_kind(object, &key, &object[&key], context);
-                    let child = object.get_mut(&key).expect("key came from object");
-                    if let Some(kind) = kind {
-                        self.replace_semantic(kind, child);
-                    } else if is_protocol_discriminator(&key) {
-                        if let Value::String(text) = child {
-                            self.sanitize_paths_and_validate(text, &child_location)?;
-                        }
-                    } else {
-                        self.sanitize_json(child, child_context(context, &key), &child_location)?;
-                    }
+                    self.validate_key(&child_key, &child_location)?;
+                    let child_path = format!("{path}.{child_key}");
+                    let child = object.get_mut(&child_key).expect("key came from object");
+                    self.sanitize_value_tree(
+                        child,
+                        provider,
+                        &child_path,
+                        &child_key,
+                        &child_location,
+                    )?;
+                }
+                Ok(())
+            }
+            Value::String(_) | Value::Number(_) => {
+                self.sanitize_scalar(value, provider, path, key, location)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn sanitize_scalar(
+        &mut self,
+        value: &mut Value,
+        provider: Provider,
+        path: &str,
+        key: &str,
+        location: &str,
+    ) -> Result<(), SanitizationError> {
+        if is_secret_field(key, value) {
+            return Err(SanitizationError::SecretLikeField {
+                location: location.to_owned(),
+            });
+        }
+        if allows(provider, path) && !is_mcp_tool_identity(value) {
+            if let Value::String(text) = value {
+                if contains_absolute_path(text) {
+                    return Err(SanitizationError::UnrecognizedAbsolutePath {
+                        location: location.to_owned(),
+                    });
+                }
+                if contains_secret_value(text) {
+                    return Err(SanitizationError::SecretLikeValue {
+                        location: location.to_owned(),
+                    });
                 }
             }
-            Value::String(text) => self.sanitize_string(text, location)?,
-            _ => {}
+            return Ok(());
         }
+        let placeholder = self.placeholder_for(key, value);
+        *value = Value::String(placeholder);
         Ok(())
+    }
+
+    /// The placeholder for `value` under `key`'s named group —
+    /// `named_kind(key)` if it is one of the six identifier leaves
+    /// (`<SESSION_1>`, …), otherwise the generic `<V1>` fallback.
+    fn placeholder_for(&mut self, key: &str, value: &Value) -> String {
+        self.resolve(value, named_kind(key))
+    }
+
+    /// The single stderr-prose placeholder group: non-JSON payloads (always
+    /// `Channel::Stderr`; anything else fails the capture earlier) collapse
+    /// to `<PROSE_n>`, with equal text sharing a number like every other
+    /// group.
+    fn placeholder_for_prose(&mut self, text: &str) -> String {
+        self.resolve(&Value::String(text.to_owned()), Some("PROSE"))
+    }
+
+    /// Identity comes from the value, not from a kind: `resolve` first
+    /// searches *every* group — named and generic — for `value`, regardless
+    /// of `fallback_group`, so a value already redacted under one field's
+    /// name (say `sessionId`) reuses that exact placeholder when the same
+    /// literal value shows up again under an unrelated field (say `echo`).
+    /// Only a genuinely new value gets a fresh placeholder, assigned into
+    /// `fallback_group` (or the generic `<V n>` fallback when `None`) using
+    /// that group's own next number.
+    ///
+    /// Encounter order, not a `HashMap`, is what makes this deterministic:
+    /// both `named` and `generic` are `Vec`s scanned linearly, so the same
+    /// capture always numbers the same way — the property the publication
+    /// tests assert on as byte determinism.
+    fn resolve(&mut self, value: &Value, fallback_group: Option<&'static str>) -> String {
+        for (&name, group) in &self.named {
+            if let Some((_, placeholder)) = group.iter().find(|(known, _)| known == value) {
+                let placeholder = placeholder.clone();
+                *self.counts.entry(name.to_ascii_lowercase()).or_default() += 1;
+                return placeholder;
+            }
+        }
+        if let Some((_, placeholder)) = self.generic.iter().find(|(known, _)| known == value) {
+            let placeholder = placeholder.clone();
+            *self.counts.entry("v".to_owned()).or_default() += 1;
+            return placeholder;
+        }
+        match fallback_group {
+            Some(name) => {
+                let group = self.named.entry(name).or_default();
+                let placeholder = format!("<{name}_{}>", group.len() + 1);
+                group.push((value.clone(), placeholder.clone()));
+                *self.counts.entry(name.to_ascii_lowercase()).or_default() += 1;
+                placeholder
+            }
+            None => {
+                let placeholder = format!("<V{}>", self.generic.len() + 1);
+                self.generic.push((value.clone(), placeholder.clone()));
+                *self.counts.entry("v".to_owned()).or_default() += 1;
+                placeholder
+            }
+        }
     }
 
     fn sanitize_nonsemantic_value(
@@ -782,22 +729,6 @@ impl Redactor {
             });
         }
         Ok(())
-    }
-
-    fn replace_semantic(&mut self, kind: RedactionKind, value: &mut Value) {
-        let Some(replacement) = self
-            .semantics
-            .get(&kind)
-            .and_then(|values| values.iter().find(|known| known.original == *value))
-            .map(|known| known.placeholder.clone())
-        else {
-            return;
-        };
-        *value = Value::String(replacement);
-        *self
-            .counts
-            .entry(kind.manifest_name().to_owned())
-            .or_default() += 1;
     }
 
     /// Scenarios whose argv may legitimately carry `--resume=<id>`.
@@ -860,16 +791,12 @@ impl Redactor {
                 location: "command.args".to_owned(),
             });
         };
-        let Some([session]) = self
-            .semantics
-            .get(&RedactionKind::SessionId)
-            .map(Vec::as_slice)
-        else {
+        let Some([(original, placeholder)]) = self.named.get("SESSION").map(Vec::as_slice) else {
             return Err(SanitizationError::InvalidClaudeResumeCommand {
                 location: "command.args".to_owned(),
             });
         };
-        let Some(original) = session.original.as_str().filter(|value| !value.is_empty()) else {
+        let Some(original) = original.as_str().filter(|value| !value.is_empty()) else {
             return Err(SanitizationError::InvalidClaudeResumeCommand {
                 location: "command.args".to_owned(),
             });
@@ -879,20 +806,9 @@ impl Redactor {
                 location: "command.args".to_owned(),
             });
         }
-        args[index] = Value::String(format!("--resume={}", session.placeholder));
-        *self
-            .counts
-            .entry(RedactionKind::SessionId.manifest_name().to_owned())
-            .or_default() += 1;
+        args[index] = Value::String(format!("--resume={placeholder}"));
+        *self.counts.entry("session".to_owned()).or_default() += 1;
         Ok(())
-    }
-
-    fn sanitize_string(
-        &mut self,
-        text: &mut String,
-        location: &str,
-    ) -> Result<(), SanitizationError> {
-        self.sanitize_paths_and_validate(text, location)
     }
 
     fn sanitize_paths_and_validate(
@@ -932,13 +848,20 @@ impl Redactor {
 
     fn placeholder_definitions(&self) -> Vec<Value> {
         let mut definitions = Vec::new();
-        for (kind, values) in &self.semantics {
-            for value in values {
+        for (name, values) in &self.named {
+            let kind = name.to_ascii_lowercase();
+            for (_, placeholder) in values {
                 definitions.push(json!({
-                    "placeholder": value.placeholder,
-                    "kind": kind.manifest_name(),
+                    "placeholder": placeholder,
+                    "kind": kind,
                 }));
             }
+        }
+        for (_, placeholder) in &self.generic {
+            definitions.push(json!({
+                "placeholder": placeholder,
+                "kind": "v",
+            }));
         }
         for path in &self.paths {
             if self.counts.contains_key(path.kind) {
@@ -952,290 +875,12 @@ impl Redactor {
     }
 }
 
-fn object_context(
-    object: &serde_json::Map<String, Value>,
-    mut context: SemanticContext,
-) -> SemanticContext {
-    let marker = object
-        .get("role")
-        .or_else(|| object.get("type"))
-        .and_then(Value::as_str);
-    context.speaker = match marker {
-        Some("user") => Speaker::User,
-        Some("assistant") => Speaker::Assistant,
-        _ => context.speaker,
-    };
-    if object
-        .get("method")
-        .and_then(Value::as_str)
-        .is_some_and(|method| matches!(method, "turn/start" | "turn/steer"))
-    {
-        context.codex_turn_input = true;
-    }
-    if context.json_root && !context.claude_capture {
-        context.codex_root_notification = match object.get("method").and_then(Value::as_str) {
-            Some("thread/tokenUsage/updated") => CodexNotification::TokenUsage,
-            Some("mcpServer/startupStatus/updated") => CodexNotification::McpStartupStatus,
-            _ => CodexNotification::None,
-        };
-    }
-    if object
-        .get("method")
-        .and_then(Value::as_str)
-        .is_some_and(|method| {
-            method.starts_with("item/agentMessage/")
-                || method.starts_with("item/reasoning/")
-                || method.starts_with("item/plan/")
-        })
-    {
-        context.codex_assistant_prose = true;
-    }
-    context.speaker = match marker {
-        Some("userMessage" | "user_message") => Speaker::User,
-        Some("agentMessage" | "agent_message" | "reasoning") => Speaker::Assistant,
-        _ => context.speaker,
-    };
-    if context.claude_capture && object.get("type").and_then(Value::as_str) == Some("tool_use") {
-        context.claude_tool_use = true;
-    }
-    context
-}
-
-fn semantic_kind(
-    object: &serde_json::Map<String, Value>,
-    key: &str,
-    value: &Value,
-    context: SemanticContext,
-) -> Option<RedactionKind> {
-    if !matches!(value, Value::String(_) | Value::Number(_)) {
-        return None;
-    }
-    if context.claude_memory_paths && value.as_str().is_some_and(|value| !value.is_empty()) {
-        return Some(RedactionKind::ClaudeMemoryPath);
-    }
-    let normalized = normalize_field(key);
-    if context.codex_direct_params == CodexNotification::McpStartupStatus
-        && normalized == "name"
-        && value.as_str().is_some_and(|value| !value.is_empty())
-    {
-        return Some(RedactionKind::CodexMcpServerName);
-    }
-    if !context.claude_capture
-        && matches!(context.entity, Entity::Thread)
-        && normalized == "path"
-        && value.as_str().is_some_and(|value| !value.is_empty())
-    {
-        return Some(RedactionKind::CodexThreadPath);
-    }
-    match normalized.as_str() {
-        "requestid" => return Some(RedactionKind::ClaudeRequestId),
-        "sessionid" => return Some(RedactionKind::SessionId),
-        "threadid" => return Some(RedactionKind::ThreadId),
-        "turnid" | "expectedturnid" => return Some(RedactionKind::TurnId),
-        "tooluseid" | "parenttooluseid" | "itemid" => {
-            return Some(RedactionKind::ToolUseId);
-        }
-        "hookid" => return Some(RedactionKind::ToolUseId),
-        "uuid" | "pid" | "servername" | "installationid" => {
-            return Some(RedactionKind::MachineId);
-        }
-        "id" if object.contains_key("jsonrpc") => return Some(RedactionKind::CodexRpcId),
-        "id" if !context.claude_capture
-            && context.json_root
-            && !object.contains_key("method")
-            && (object.contains_key("result") || object.contains_key("error")) =>
-        {
-            return Some(RedactionKind::CodexRpcId);
-        }
-        "id" if matches!(context.entity, Entity::Thread) => {
-            return Some(RedactionKind::ThreadId);
-        }
-        "id" if matches!(context.entity, Entity::Turn) => return Some(RedactionKind::TurnId),
-        "id" if matches!(context.entity, Entity::Item) => {
-            return Some(RedactionKind::ToolUseId);
-        }
-        "id" if context.claude_capture
-            && object.get("type").and_then(Value::as_str) == Some("message")
-            && object.get("role").and_then(Value::as_str) == Some("assistant") =>
-        {
-            return Some(RedactionKind::ClaudeMessageId);
-        }
-        "id" if object.get("type").and_then(Value::as_str) == Some("tool_use") => {
-            return Some(RedactionKind::ToolUseId);
-        }
-        "id" if object
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(is_tool_item_type) =>
-        {
-            return Some(RedactionKind::ToolUseId);
-        }
-        "data" if object.get("type").and_then(Value::as_str) == Some("base64") => {
-            return Some(RedactionKind::AttachmentBytes);
-        }
-        "signature"
-            if context.claude_capture
-                && value.as_str().is_some_and(|value| !value.is_empty())
-                && object
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| matches!(kind, "thinking" | "signature_delta")) =>
-        {
-            return Some(RedactionKind::ClaudeThinkingSignature);
-        }
-        "prompt" => return Some(RedactionKind::UserText),
-        "content" | "text" if matches!(context.speaker, Speaker::User) => {
-            return Some(RedactionKind::UserText);
-        }
-        "content" | "text"
-            if matches!(context.speaker, Speaker::Assistant) && !context.claude_tool_input =>
-        {
-            return Some(RedactionKind::AssistantProse);
-        }
-        "text"
-            if context.codex_turn_input
-                && object.get("type").and_then(Value::as_str) == Some("text") =>
-        {
-            return Some(RedactionKind::UserText);
-        }
-        "text" if object.get("type").and_then(Value::as_str) == Some("text_delta") => {
-            return Some(RedactionKind::AssistantProse);
-        }
-        "partialjson"
-            if context.claude_capture
-                && object.get("type").and_then(Value::as_str) == Some("input_json_delta")
-                && value.as_str().is_some_and(|value| !value.is_empty()) =>
-        {
-            return Some(RedactionKind::AssistantProse);
-        }
-        "delta" | "textdelta" if context.codex_assistant_prose => {
-            return Some(RedactionKind::AssistantProse);
-        }
-        "thinking" => return Some(RedactionKind::AssistantProse),
-        "result" if object.get("type").and_then(Value::as_str) == Some("result") => {
-            return Some(RedactionKind::AssistantProse);
-        }
-        "description" if context.discovery_metadata => {
-            return Some(RedactionKind::ProviderProse);
-        }
-        "argumenthint"
-            if context.discovery_metadata
-                && value.as_str().is_some_and(|value| !value.is_empty()) =>
-        {
-            return Some(RedactionKind::ProviderProse);
-        }
-        "description" if context.codex_catalog => {
-            return Some(RedactionKind::ProviderProse);
-        }
-        "message" if context.availability_nux => {
-            return Some(RedactionKind::ProviderProse);
-        }
-        "message"
-            if object.contains_key("level")
-                && value.as_str().is_some_and(|value| !value.is_empty()) =>
-        {
-            return Some(RedactionKind::ProviderProse);
-        }
-        "output" | "stdout" | "stderr"
-            if object.get("subtype").and_then(Value::as_str) == Some("hook_response") =>
-        {
-            return Some(RedactionKind::ProviderProse);
-        }
-        _ => {}
-    }
-    None
-}
-
-fn child_context(mut context: SemanticContext, key: &str) -> SemanticContext {
-    let normalized = normalize_field(key);
-    context.codex_direct_params = if context.json_root && normalized == "params" {
-        context.codex_root_notification
-    } else {
-        CodexNotification::None
-    };
-    context.codex_root_notification = CodexNotification::None;
-    context.json_root = false;
-    context.entity = match normalized.as_str() {
-        "thread" => Entity::Thread,
-        "turn" => Entity::Turn,
-        "item" => Entity::Item,
-        "turns" if !context.claude_capture && matches!(context.entity, Entity::Thread) => {
-            Entity::Turn
-        }
-        "items" if !context.claude_capture && matches!(context.entity, Entity::Turn) => {
-            Entity::Item
-        }
-        _ => Entity::None,
-    };
-    if matches!(normalized.as_str(), "commands" | "agents" | "models") {
-        context.discovery_metadata = true;
-    }
-    if normalized == "data" {
-        context.codex_catalog = true;
-    }
-    if normalized == "availabilitynux" {
-        context.availability_nux = true;
-    }
-    if normalized == "memorypaths" {
-        context.claude_memory_paths = true;
-    }
-    if normalized == "input" && context.claude_tool_use {
-        context.claude_tool_input = true;
-    }
-    if !context.claude_capture
-        && normalized == "summary"
-        && matches!(context.speaker, Speaker::Assistant)
-    {
-        context.codex_assistant_prose_array = true;
-    }
-    context
-}
-
-fn descendant_context(mut context: SemanticContext) -> SemanticContext {
-    context.json_root = false;
-    context.codex_root_notification = CodexNotification::None;
-    context.codex_direct_params = CodexNotification::None;
-    context
-}
-
-fn is_tool_item_type(item_type: &str) -> bool {
-    matches!(
-        item_type,
-        "commandExecution"
-            | "command_execution"
-            | "fileChange"
-            | "file_change"
-            | "mcpToolCall"
-            | "mcp_tool_call"
-            | "webSearch"
-            | "web_search"
-            | "dynamicToolCall"
-            | "dynamic_tool_call"
-    )
-}
-
 fn normalize_field(field: &str) -> String {
     field
         .chars()
         .filter(|character| character.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
-}
-
-fn is_protocol_discriminator(field: &str) -> bool {
-    matches!(
-        normalize_field(field).as_str(),
-        "type"
-            | "subtype"
-            | "method"
-            | "role"
-            | "jsonrpc"
-            | "name"
-            | "status"
-            | "kind"
-            | "channel"
-            | "level"
-    )
 }
 
 fn is_secret_field(field: &str, value: &Value) -> bool {
@@ -1269,10 +914,20 @@ fn is_secret_field(field: &str, value: &Value) -> bool {
         || normalized == "secret"
 }
 
-fn is_codex_token_usage_object(field: &str, value: &Value, context: SemanticContext) -> bool {
-    context.codex_direct_params == CodexNotification::TokenUsage
-        && normalize_field(field) == "tokenusage"
-        && value.is_object()
+/// A decision this task owns, not Task 1's path review: the tool-name-at-
+/// invocation family (`.message.content[].name`, `.event.content_block.name`,
+/// `.request.tool_name`, `.last_tool_name`, `.request.display_name`,
+/// `.message.content[].content[].tool_name`, `.tool_use_result.matches[]`) is
+/// allowlisted, and every sampled value today is a built-in tool name
+/// (`Read`, `Bash`, `TaskCreate`). An MCP invocation puts
+/// `mcp__<server>__<tool>` in that same field, embedding the server identity
+/// `.mcp_servers[].name` and `.tools[]` were both excluded to protect —
+/// closing those paths and leaving this one open would undo the fix. A path
+/// decision can't express "this field, except when the value looks like
+/// this", so the exception lives at the value, checked after the path is
+/// already known to be allowed.
+fn is_mcp_tool_identity(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| text.starts_with("mcp__"))
 }
 
 fn is_token_counter_field(field: &str) -> bool {
@@ -1674,5 +1329,137 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(std::fs::read(path).unwrap(), b"replacement owner");
+    }
+
+    use std::path::PathBuf;
+
+    use serde_json::{Value, json};
+
+    use super::{Redactor, SanitizationError, SanitizationReport};
+    use crate::capture::types::Provider;
+
+    /// Runs one JSON value through the allowlist redactor without touching the
+    /// filesystem, for the `Ok` case. Panics on the credential-rejection case;
+    /// use `try_sanitize_value` there.
+    fn sanitize_value(value: Value, provider: Provider) -> Value {
+        try_sanitize_value(value, provider).expect("test value expected to sanitize cleanly")
+    }
+
+    /// Same as `sanitize_value`, but hands back the `Result` so a test can
+    /// assert on the rejection path (a credential riding an allowlisted path).
+    fn try_sanitize_value(value: Value, provider: Provider) -> Result<Value, SanitizationError> {
+        let mut value = value;
+        let mut redactor = Redactor::default();
+        redactor.sanitize_value_tree(&mut value, provider, "", "", "value")?;
+        Ok(value)
+    }
+
+    /// Same walk as `sanitize_value`, but returns a `SanitizationReport` —
+    /// `events_bytes` holds the single sanitized value and `manifest_bytes`
+    /// the placeholder/count accounting, so Task 3's novel-path report can
+    /// exercise this without a full `sanitize_dir` round trip.
+    fn sanitize_value_reporting(value: Value, provider: Provider) -> SanitizationReport {
+        let mut value = value;
+        let mut redactor = Redactor::default();
+        redactor
+            .sanitize_value_tree(&mut value, provider, "", "", "value")
+            .expect("test value expected to sanitize cleanly");
+        let events_bytes = serde_json::to_vec(&value).expect("sanitized value encodes");
+        let manifest_bytes = serde_json::to_vec(&json!({
+            "placeholders": redactor.placeholder_definitions(),
+            "redaction_counts": redactor.counts,
+        }))
+        .expect("manifest encodes");
+        SanitizationReport {
+            events_path: PathBuf::new(),
+            manifest_path: PathBuf::new(),
+            events_bytes,
+            manifest_bytes,
+        }
+    }
+
+    /// Exercises `sanitize_value_reporting` so it is not dead code before Task 3
+    /// gives it a real caller; also documents its filesystem-free contract.
+    #[test]
+    fn sanitize_value_reporting_produces_a_report_without_touching_the_filesystem() {
+        let report = sanitize_value_reporting(json!({"method": "turn/completed"}), Provider::Codex);
+        assert!(!report.events_bytes.is_empty());
+        assert!(!report.manifest_bytes.is_empty());
+    }
+
+    /// Equal values share a placeholder number, so a join that was true on the
+    /// wire is still true in the archive. This is the property that lets the
+    /// taxonomy go: identity comes from the value, not from a kind.
+    #[test]
+    fn equal_values_share_a_placeholder_and_distinct_values_do_not() {
+        let out = sanitize_value(
+            json!({
+                "sessionId": "abc", "echo": "abc", "other": "xyz"
+            }),
+            Provider::Claude,
+        );
+        assert_eq!(out["sessionId"], out["echo"]);
+        assert_ne!(out["sessionId"], out["other"]);
+    }
+
+    /// A field nobody has considered arrives redacted, not verbatim. This is
+    /// the whole difference from the blocklist.
+    #[test]
+    fn an_unlisted_field_is_replaced_by_default() {
+        let out = sanitize_value(json!({"somethingBrandNew": "secret-ish"}), Provider::Claude);
+        assert_ne!(out["somethingBrandNew"], "secret-ish");
+    }
+
+    /// An allowlisted value survives byte-for-byte.
+    #[test]
+    fn a_listed_field_survives_verbatim() {
+        let out = sanitize_value(json!({"method": "turn/completed"}), Provider::Codex);
+        assert_eq!(out["method"], "turn/completed");
+    }
+
+    /// Six kinds read by name; everything else numbered.
+    #[test]
+    fn identifiers_are_named_and_everything_else_is_numbered() {
+        let out = sanitize_value(json!({"sessionId": "s", "costUSD": "c"}), Provider::Claude);
+        assert_eq!(out["sessionId"], "<SESSION_1>");
+        assert_eq!(out["costUSD"], "<V1>");
+    }
+
+    /// An allowlisted path is still not a licence to publish a credential.
+    #[test]
+    fn a_credential_in_an_allowlisted_value_still_rejects() {
+        let err = try_sanitize_value(json!({"method": "sk-ant-live-key"}), Provider::Codex);
+        assert!(
+            err.is_err(),
+            "an allowlisted path carrying a token must reject"
+        );
+    }
+
+    /// The tool-name-at-invocation family (`.request.tool_name` among them,
+    /// per `crates/harness/src/capture/allowlist/claude.txt`) holds a
+    /// built-in tool name on every capture in the corpus today, but an MCP
+    /// invocation puts `mcp__<server>__<tool>` there instead — embedding the
+    /// same server identity `.mcp_servers[].name` and `.tools[]` were both
+    /// excluded to protect. A path decision cannot fix this: the path is
+    /// legitimately allowlisted for the `Bash`/`Read`/… case. This is a
+    /// value-level exception layered on top of the allowlist.
+    #[test]
+    fn an_mcp_tool_name_is_redacted_even_on_an_allowlisted_path() {
+        let out = sanitize_value(
+            json!({"request": {"tool_name": "mcp__claude_ai_Gmail__search_threads"}}),
+            Provider::Claude,
+        );
+        assert_ne!(
+            out["request"]["tool_name"],
+            "mcp__claude_ai_Gmail__search_threads"
+        );
+    }
+
+    /// The same allowlisted path with a built-in tool name is untouched —
+    /// the exception is scoped to the `mcp__` prefix, not the whole path.
+    #[test]
+    fn a_builtin_tool_name_on_the_same_path_survives() {
+        let out = sanitize_value(json!({"request": {"tool_name": "Bash"}}), Provider::Claude);
+        assert_eq!(out["request"]["tool_name"], "Bash");
     }
 }
