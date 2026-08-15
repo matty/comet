@@ -21,10 +21,7 @@ mod test_support;
 mod types;
 
 pub use allowlist::{Allowlist, allows, allows_prefix, named_kind};
-pub use approval::{
-    approval_marker_command, approval_on_request_prompt, claude_approval_prompt,
-    codex_approval_prompt,
-};
+pub use approval::{approval_marker_command, approval_on_request_prompt, codex_approval_prompt};
 pub use corpus::{Frame, corpus_frame, frame};
 pub use record::record;
 pub use sanitize::{

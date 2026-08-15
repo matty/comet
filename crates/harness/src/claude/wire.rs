@@ -290,7 +290,16 @@ pub(crate) struct MessageFrame {
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct MessageBody {
+    /// `"user"` or `"assistant"`. Decoded because every `assistant`/`user`
+    /// frame carries it on the wire, but nothing reads it: the frame's own
+    /// `type` (`Frame::Assistant` vs `Frame::User`) already tells every
+    /// caller which one this is. The deleted `capture::approval::claude`
+    /// validators were the one place that cross-checked this against the
+    /// frame type as an extra safety margin; nothing replaces that check —
+    /// see `record::scenarios::claude::approval`'s doc comment for why. Do
+    /// not "use" it.
     #[serde(default)]
+    #[allow(dead_code)]
     pub role: String,
     /// Either a plain string or an array of content blocks.
     #[serde(default)]
@@ -397,7 +406,17 @@ pub(crate) struct ControlRequestBody {
     pub tool_name: String,
     #[serde(default)]
     pub input: Value,
+    /// Which `tool_use` block this approval request answers. Decoded because
+    /// it's on the wire, but no production path reads it any more: the
+    /// deleted `capture::approval::claude` validators were the sole
+    /// consumer, correlating it against a tracked `tool_use` id before
+    /// replying; the surviving driving half
+    /// (`record::scenarios::claude::pending_approval`) replies by
+    /// `request_id` alone, echoing the request's own `input` back
+    /// unmodified. Do not "use" it — see `description`'s doc comment below
+    /// for the same rule.
     #[serde(default)]
+    #[allow(dead_code)]
     pub tool_use_id: String,
     /// The CLI's own one-line rendering of the request ("hello.txt", "Write
     /// \"one\" to a.txt"). Provider prose.

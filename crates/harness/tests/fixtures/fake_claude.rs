@@ -160,6 +160,13 @@ fn main() {
         // A model that ignores the tool instructions entirely: the run the
         // deleted `recording.rs` evidence guard used to bail on.
         checklist_no_tasks();
+    } else if first.contains("Use Bash exactly once with input") {
+        // The real `capture/record/scenarios/claude.rs` `approval` prompt
+        // (matched by a substring unique to it, same pattern as the
+        // checklist branch above). Two `can_use_tool` requests, so a test
+        // can prove the neutral recorder answers every request it sees, not
+        // just the first.
+        approval_two_requests(&mut stdin);
     } else if first.contains("scenario:checklist") {
         checklist();
     } else if first.contains("scenario:askuser") {
@@ -228,6 +235,8 @@ fn main() {
         capture_approval(&mut stdin);
     } else if first.contains("scenario:capture-non-frame-tolerance") {
         capture_non_frame_tolerance();
+    } else if first.contains("scenario:capture-protocol-violation") {
+        capture_protocol_violation();
     } else if first.contains("scenario:approval") {
         approval(&mut stdin);
     } else {
@@ -608,6 +617,37 @@ fn capture_non_frame_tolerance() {
     emit(
         r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-tolerance"}"#,
     );
+}
+
+/// Two `can_use_tool` requests, each read back before the next is emitted —
+/// same ping-pong shape as `capture_approval` below — followed by a terminal
+/// `result`. Drives `record/scenarios/claude.rs`'s `approval` scenario body,
+/// which (unlike the deleted `recording.rs` validators this replaces) does
+/// not care which tool is named or in what order; it only has to answer
+/// both.
+fn approval_two_requests(stdin: &mut StdinLock<'_>) {
+    emit(
+        r#"{"type":"control_request","request_id":"approval-req-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"printf capture"},"description":"printf capture","tool_use_id":"toolu_approval_1"}}"#,
+    );
+    let _ = read_line(stdin);
+    emit(
+        r#"{"type":"control_request","request_id":"approval-req-2","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"capture-marker.txt","content":"capture\n"},"description":"capture-marker.txt","tool_use_id":"toolu_approval_2"}}"#,
+    );
+    let _ = read_line(stdin);
+    emit(
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-approval-two"}"#,
+    );
+}
+
+/// A Bash tool_use/tool_result pair, then the process exits with no terminal
+/// `result` frame at all — a bare protocol violation, not a judgment about
+/// which tool ran or in what order. Exists for
+/// `recording.rs`'s `recorder_quarantines_partial_approval_evidence_after_cleanup`:
+/// proving a driving failure still quarantines its partial evidence no
+/// longer needs (and, now that `claude_run` never answers a control request,
+/// cannot use) an approval-specific validator to produce the failure.
+fn capture_protocol_violation() {
+    emit_bash_neighborhood("toolu_bash", "printf capture", false, "capture");
 }
 
 fn capture_approval(stdin: &mut StdinLock<'_>) {

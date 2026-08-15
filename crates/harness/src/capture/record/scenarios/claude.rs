@@ -1,11 +1,13 @@
 use std::path::Path;
 
 use comet_proto::{ReasoningLevel, RunRequest, RuntimeMode};
+use serde_json::Value;
 
+use crate::capture::approval::{APPROVAL_MARKER_CONTENT, APPROVAL_MARKER_NAME};
 use crate::capture::record::provider::CaptureProvider;
 use crate::capture::record::providers::claude::ClaudeProvider;
 use crate::capture::record::scenarios::ScenarioInput;
-use crate::capture::record::session::Session;
+use crate::capture::record::session::{Session, protocol_stopped};
 use crate::launch::LaunchDescriptor;
 
 /// SPAWN for `model-discovery` and its `-neutral-cwd`/`-project-cwd`
@@ -379,6 +381,131 @@ pub(in crate::capture::record) async fn checklist_resume(
     session.wait_for_turn_end().await
 }
 
+/// The exact Bash command the `approval` prompt below asks Claude to run
+/// once. Nothing checks that Claude actually used it any more — the deleted
+/// `strict_claude_approval_block`/`validate_claude_marker_input` did — so
+/// this constant now has exactly one reader, `claude_approval_prompt`, and
+/// exists only so the prompt text and the instruction it gives don't drift
+/// apart as two separate literals.
+#[allow(dead_code)]
+const CLAUDE_APPROVAL_COMMAND: &str = "printf capture";
+
+/// Prompt for `approval`: ask for one Bash approval, then one Write
+/// approval, so the capture records a real `can_use_tool` round trip for
+/// each. Moved here, unchanged in substance, from the deleted
+/// `capture/approval/common.rs::claude_approval_prompt` — decision "the
+/// scenario owns its prompt" moves prompt text out of the binary and into
+/// the scenario body that sends it, same as `claude_checklist_prompt` above.
+/// `APPROVAL_MARKER_NAME`/`APPROVAL_MARKER_CONTENT` stay defined in
+/// `capture::approval::common` rather than moving here too, because Codex's
+/// `codex_approval_prompt` and `validate_ordinary_approval_marker` (both
+/// still driven from `recording.rs`) read the same two constants; only this
+/// function's own home moved.
+#[allow(dead_code)]
+fn claude_approval_prompt(cwd: &Path) -> String {
+    let marker = cwd.join(APPROVAL_MARKER_NAME);
+    format!(
+        "Use Bash exactly once with input {{\"command\":{}}}. Wait for it to finish successfully. Then use Write exactly once with input {{\"file_path\":{},\"content\":{}}}.",
+        serde_json::to_string(CLAUDE_APPROVAL_COMMAND).expect("static command serializes"),
+        serde_json::to_string(&marker.display().to_string()).expect("path serializes"),
+        serde_json::to_string(APPROVAL_MARKER_CONTENT).expect("static content serializes"),
+    )
+}
+
+// Called once by `approval_launch`, once by `approval` — see the note on
+// `fresh_text_request` above; the same "stays pure, so the two calls can't
+// disagree" reasoning applies here.
+#[allow(dead_code)]
+fn approval_request(input: &ScenarioInput) -> RunRequest {
+    let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
+    cheap_claude_request(
+        &claude_approval_prompt(&cwd),
+        input,
+        RuntimeMode::ApprovalRequired,
+    )
+}
+
+/// SPAWN for `approval`: an ordinary run launch, built from the same request
+/// `approval` replays as its wire line.
+#[allow(dead_code)]
+pub(in crate::capture::record) fn approval_launch(
+    input: &ScenarioInput,
+    executable: &Path,
+) -> anyhow::Result<LaunchDescriptor> {
+    Ok(crate::claude::run_launch(
+        executable,
+        &approval_request(input),
+    ))
+}
+
+/// Recognizes a Claude `can_use_tool` control request and returns its
+/// request id together with the tool input to reflect back unmodified. Every
+/// other frame — the Bash/Write `tool_use` frames leading up to it, the
+/// plain assistant text, anything else — returns `None` and is simply left
+/// unanswered.
+///
+/// This is the surviving half of the deleted `observe_claude_approval_frame`:
+/// noticing that a frame is (or is not) an approval request is driving, not
+/// validating, so nothing here checks the tool name, the request order, or
+/// the shape of the surrounding transcript the way the deleted
+/// `ClaudeApprovalState`/`validate_claude_marker_input`/
+/// `strict_claude_approval_block` did — see `approval`'s own doc comment.
+#[allow(dead_code)]
+fn pending_approval(frame: &Value) -> Option<(String, Value)> {
+    if frame["type"] != "control_request" || frame["request"]["subtype"] != "can_use_tool" {
+        return None;
+    }
+    let request_id = frame["request_id"].as_str()?.to_owned();
+    Some((request_id, frame["request"]["input"].clone()))
+}
+
+/// The allow reply for one approval request, built through the production
+/// response shape — `crate::claude::wire::{control_response_line,
+/// allow_response}`, the same helpers Comet's own approval driver
+/// (`claude/mod.rs`) calls for a real "always allow" decision — and echoing
+/// the request's own input back unmodified, exactly as that driver does.
+#[allow(dead_code)]
+fn allow_response(request_id: &str, input: Value) -> String {
+    crate::claude::wire::control_response_line(
+        request_id,
+        crate::claude::wire::allow_response(input),
+    )
+}
+
+/// Send the approval prompt, then answer every `can_use_tool` request the
+/// model makes until the turn ends.
+///
+/// No count, no order, no tool-name check, no exact-marker-input check: the
+/// deleted `ClaudeApprovalState`/`observe_claude_approval_frame`/
+/// `validate_claude_marker_input`/`strict_claude_approval_block` enforced an
+/// exact "one Bash, then one bounded Write" contract and bailed on any
+/// deviation — a model that used a different tool, asked twice, asked out of
+/// order, or never asked at all used to make the whole paid-for capture
+/// unrecoverable, discarding tokens already spent. Per design §3.2, only
+/// driving survives here: notice a request, answer it, keep going, and stop
+/// only when the provider itself says the turn is over.
+#[allow(dead_code)]
+pub(in crate::capture::record) async fn approval(
+    session: &mut Session<ClaudeProvider>,
+    input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    let line = claude_user_line(&approval_request(input), false).await?;
+    session.send(&line).await?;
+    loop {
+        let Some(frame) = session.next_frame().await? else {
+            return protocol_stopped("Claude", "an approval request or a turn end");
+        };
+        if ClaudeProvider::turn_complete(&frame) {
+            return Ok(());
+        }
+        if let Some((request_id, tool_input)) = pending_approval(&frame) {
+            session
+                .send(&allow_response(&request_id, tool_input))
+                .await?;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -738,6 +865,91 @@ mod tests {
                 .iter()
                 .any(|line| line.contains(r#""type":"result""#)),
             "capture must still hold a terminal frame: {stdout:?}"
+        );
+        assert_eq!(capture.exit_code, Some(0));
+    }
+
+    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for `approval`.
+    #[test]
+    fn approval_launch_uses_the_production_run_launch() {
+        let exe = absolute_program("claude");
+        let input = ScenarioInput::default();
+
+        let launch = approval_launch(&input, &exe).unwrap();
+        let expected = crate::claude::run_launch(&exe, &approval_request(&input));
+
+        assert_eq!(
+            CommandSnapshot::from_launch(&launch),
+            CommandSnapshot::from_launch(&expected)
+        );
+    }
+
+    /// The validator deletion, proven: a fake Claude that raises two `can_use_tool` requests in a
+    /// row — one Bash, one Write, neither checked for order, count or content — must have both
+    /// answered with an allow reply carrying that request's own id. The deleted
+    /// `ClaudeApprovalState`/`observe_claude_approval_frame`/`validate_claude_marker_input`/
+    /// `strict_claude_approval_block` would have bailed the instant a second, unaccounted-for
+    /// request id showed up; `pending_approval` has no such bookkeeping, so it just keeps
+    /// answering.
+    #[tokio::test]
+    async fn claude_approval_scenario_answers_every_request_it_sees() {
+        let raw = tempfile::tempdir().unwrap();
+        let executable = fixture_path("fake-claude");
+        let input = ScenarioInput::default();
+        let launch = approval_launch(&input, &executable).unwrap();
+        let cfg = config(
+            "claude-approval",
+            executable,
+            CaptureOperation::Claude(ClaudeCaptureOperation::Run {
+                request: approval_request(&input),
+                script: ClaudeRunScript::Approval,
+            }),
+            raw.path(),
+        );
+        let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
+            .await
+            .unwrap();
+
+        // Bounded, unlike the other scenario tests in this file: the fixture below
+        // (`approval_two_requests`) reads a reply off stdin before emitting its next line, so a
+        // driver that stops answering does not error, it blocks forever. Wrapping the call keeps
+        // that failure a fast, legible timeout instead of a hung test process.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            approval(&mut session, &input),
+        )
+        .await
+        .expect(
+            "approval must answer every request instead of leaving the fixture blocked on a reply",
+        )
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let capture = session.finish(deadline).await.unwrap();
+
+        let stdin = channel_payloads(&capture, Channel::Stdin);
+        assert_eq!(
+            stdin.len(),
+            3,
+            "one user line, then one allow reply per request: {stdin:?}"
+        );
+        let replies: Vec<Value> = stdin[1..]
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            replies
+                .iter()
+                .map(|reply| reply["response"]["request_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["approval-req-1", "approval-req-2"],
+            "both approval requests must be answered, in the order they arrived: {replies:?}"
+        );
+        assert!(
+            replies.iter().all(|reply| {
+                reply["response"]["response"]["behavior"] == "allow"
+                    && reply["response"]["response"]["updatedInput"].is_object()
+            }),
+            "every reply must allow, echoing the request's own input back: {replies:?}"
         );
         assert_eq!(capture.exit_code, Some(0));
     }

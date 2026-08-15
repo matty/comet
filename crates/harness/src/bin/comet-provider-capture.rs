@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use comet_harness::capture::{
@@ -227,10 +227,7 @@ fn capture_config_with_env(
                     "Reply with the single word capture.".to_owned(),
                     ClaudeRunScript::FreshText,
                 ),
-                "approval" => (
-                    comet_harness::capture::claude_approval_prompt(&cwd),
-                    ClaudeRunScript::Approval,
-                ),
+                "approval" => (claude_approval_prompt(&cwd), ClaudeRunScript::Approval),
                 "resume" => (
                     "Reply with the single word resumed.".to_owned(),
                     ClaudeRunScript::Resume,
@@ -459,6 +456,22 @@ fn claude_checklist_resume_prompt() -> String {
         r#"Do not create any task. Do nothing else, and reply with the single word resumed."#,
     )
     .to_owned()
+}
+
+/// Owed to Task 7 — see `claude_checklist_prompt`'s doc comment for why this
+/// binary keeps its own copy rather than reaching across a boundary about to
+/// disappear. A literal duplicate of
+/// `capture::record::scenarios::claude::claude_approval_prompt`, moved there
+/// (and out of the now-deleted `capture::approval::claude`) by the task that
+/// ported the `approval` scenario.
+fn claude_approval_prompt(cwd: &Path) -> String {
+    let marker = cwd.join("capture-marker.txt");
+    format!(
+        "Use Bash exactly once with input {{\"command\":{}}}. Wait for it to finish successfully. Then use Write exactly once with input {{\"file_path\":{},\"content\":{}}}.",
+        serde_json::to_string("printf capture").expect("static command serializes"),
+        serde_json::to_string(&marker.display().to_string()).expect("path serializes"),
+        serde_json::to_string("capture\n").expect("static content serializes"),
+    )
 }
 
 fn cheap_claude_request(prompt: &str, cwd: PathBuf, mode: RuntimeMode) -> RunRequest {

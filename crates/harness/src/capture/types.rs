@@ -105,16 +105,18 @@ pub enum ClaudeCaptureOperation {
 
 /// One entry per Claude run scenario `recording.rs` still drives.
 ///
-/// `FreshText`, `Attachment`, `Resume`, `Checklist` and `ChecklistResume` no
-/// longer have any script-specific behavior in `recording.rs::claude_run` —
-/// their driving moved to `record/scenarios/claude.rs`'s
-/// `fresh_text`/`attachment`/`resume`/`checklist`/`checklist_resume`, which
-/// the SCENARIOS table does not yet dispatch to (Task 7). The five variants
-/// stay here only because `comet-provider-capture.rs` still constructs them
-/// and routes them through `capture::record()`'s fallback to
-/// `recording::record()` until that rewiring lands; `claude_run` treats them
-/// as the plain case (no branch matches them at all). `Approval` is the only
-/// one still driven here for real.
+/// None of the six variants has any script-specific behavior in
+/// `recording.rs::claude_run` any more — every scenario's driving moved to
+/// `record/scenarios/claude.rs`'s `fresh_text`/`attachment`/`resume`/
+/// `checklist`/`checklist_resume`/`approval`, which the SCENARIOS table does
+/// not yet dispatch to (Task 7). `Approval` was the last holdout (its
+/// `ClaudeApprovalState` accounting and frame validators, deleted along with
+/// `capture/approval/claude.rs`); now all six stay here only because
+/// `comet-provider-capture.rs` still constructs them and routes them through
+/// `capture::record()`'s fallback to `recording::record()` until that
+/// rewiring lands, and `claude_run` treats every one of them as the plain
+/// case (no branch matches on `script` at all — the field is read only by
+/// the `Run` variant's own match arm in `drive`, then ignored).
 #[derive(Clone, Copy, Debug)]
 pub enum ClaudeRunScript {
     FreshText,

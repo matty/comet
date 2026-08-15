@@ -14,19 +14,18 @@ use comet_proto::RunRequest;
 #[cfg(test)]
 use super::SanitizationError;
 use super::approval::{
-    ClaudeApprovalState, CodexApprovalState, CodexOnRequestState, DirectoryIdentity, FileIdentity,
-    approval_marker_command, observe_claude_approval_frame, observe_codex_approval_file_item,
-    observe_codex_approval_routine_item, observe_codex_approval_turn_started, repository_root,
-    require_empty_approval_target, resolve_trusted_powershell,
-    validate_codex_approval_command_event, validate_codex_approval_lifecycle,
-    validate_codex_approval_request, validate_codex_on_request_approval, validate_on_request_item,
-    validate_on_request_preflight, validate_ordinary_approval_cwd,
-    validate_ordinary_approval_marker,
+    CodexApprovalState, CodexOnRequestState, DirectoryIdentity, FileIdentity,
+    approval_marker_command, observe_codex_approval_file_item, observe_codex_approval_routine_item,
+    observe_codex_approval_turn_started, repository_root, require_empty_approval_target,
+    resolve_trusted_powershell, validate_codex_approval_command_event,
+    validate_codex_approval_lifecycle, validate_codex_approval_request,
+    validate_codex_on_request_approval, validate_on_request_item, validate_on_request_preflight,
+    validate_ordinary_approval_cwd, validate_ordinary_approval_marker,
 };
 use super::types::{
     CaptureConfig, CaptureEvent, CaptureOperation, Channel, ClaudeCaptureOperation,
-    ClaudeRunScript, CodexCaptureOperation, CodexRunScript, CommandSnapshot, PartialFailureClass,
-    PartialOutcome, PartialRawCapture, PlatformMetadata, Provider, RawCapture, RedactionRoots,
+    CodexCaptureOperation, CodexRunScript, CommandSnapshot, PartialFailureClass, PartialOutcome,
+    PartialRawCapture, PlatformMetadata, Provider, RawCapture, RedactionRoots,
 };
 use crate::launch::LaunchDescriptor;
 
@@ -318,8 +317,8 @@ impl RecordingSession {
 
     async fn drive(&mut self, operation: CaptureOperation) -> anyhow::Result<()> {
         match operation {
-            CaptureOperation::Claude(ClaudeCaptureOperation::Run { request, script }) => {
-                self.claude_run(request, script).await
+            CaptureOperation::Claude(ClaudeCaptureOperation::Run { request, .. }) => {
+                self.claude_run(request).await
             }
             CaptureOperation::Codex(CodexCaptureOperation::Run { request, script }) => {
                 self.codex_run(request, script).await
@@ -343,61 +342,28 @@ impl RecordingSession {
         }
     }
 
-    async fn claude_run(
-        &mut self,
-        request: RunRequest,
-        script: ClaudeRunScript,
-    ) -> anyhow::Result<()> {
-        // `fresh-text`/`attachment`/`resume`/`checklist`/`checklist-resume`
-        // are all ported to `record/scenarios/claude.rs` (including the
-        // attachment's must-inline-an-image check); only `Approval` still
-        // needs script-specific handling here, so the line is built directly
-        // through the production helpers with no script-specific branch left
-        // for building it.
+    async fn claude_run(&mut self, request: RunRequest) -> anyhow::Result<()> {
+        // Every Claude run script — `fresh-text`/`attachment`/`resume`/
+        // `checklist`/`checklist-resume`/`approval` — is ported to
+        // `record/scenarios/claude.rs` (including the attachment's
+        // must-inline-an-image check and, as of this task, the approval
+        // driving loop). `Approval` was the last one with script-specific
+        // handling left here (the `ClaudeApprovalState` accounting and its
+        // frame validators, deleted along with `capture/approval/claude.rs`
+        // per design §3.2), so this function is now the same
+        // "write the line, wait for the terminal result" shape for every
+        // script, still driven here only until the SCENARIOS table wires
+        // these scenarios in (Task 7).
         let images = crate::claude::load_image_blocks(&request.attachments).await;
         let line = crate::claude::wire::user_message_line_with_images(&request.prompt, &images);
         self.write_line(&line).await?;
-        let mut approval = ClaudeApprovalState::default();
         while let Some(line) = self.next_stdout().await? {
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
-            if matches!(script, ClaudeRunScript::Approval) {
-                let frame = crate::claude::wire::parse_frame(&line)
-                    .map_err(|_| anyhow!("Claude approval capture received malformed JSON."))?;
-                if value["type"] == "control_response"
-                    && approval.bash_tool_id.is_some()
-                    && !approval.bash_succeeded
-                {
-                    bail!("Claude approval capture observed an approval response for Bash.");
-                }
-                if let Some((request_id, original_input)) =
-                    observe_claude_approval_frame(&frame, Path::new(&request.cwd), &mut approval)?
-                {
-                    let response = json!({
-                        "type": "control_response",
-                        "response": {
-                            "subtype": "success",
-                            "request_id": request_id,
-                            "response": {
-                                "behavior": "allow",
-                                "updatedInput": original_input,
-                            },
-                        },
-                    });
-                    self.write_line(&response.to_string()).await?;
-                }
-            }
             if value["type"] == "result" {
                 if value["subtype"] != "success" {
                     bail!("Claude ended the capture without a successful terminal result.");
-                }
-                if matches!(script, ClaudeRunScript::Approval)
-                    && (!approval.bash_succeeded || !approval.write_approved)
-                {
-                    bail!(
-                        "Claude approval capture did not observe the exact successful Bash and bounded Write approval."
-                    );
                 }
                 return Ok(());
             }
@@ -1102,14 +1068,25 @@ mod tests {
         assert_eq!(capture.exit_code, Some(0));
     }
 
-    /// Break caught: a fail-closed approval deviation is discarded after a paid provider run,
-    /// leaving no reviewable transcript even though the child was safely stopped before reply.
+    /// Break caught: a driving failure is discarded after a paid provider run, leaving no
+    /// reviewable transcript even though the child was safely stopped before reply.
+    ///
+    /// The original trigger here was the deleted Claude approval validator's "unexpected tool or
+    /// order" bail (`capture::approval::claude`, removed by the task that ported `approval` to
+    /// `record/scenarios/claude.rs`). That validator, and every other frame check it made, is
+    /// gone — `claude_run` no longer inspects approval content at all, so it cannot be
+    /// re-triggered, and the old fixture (which waited for a reply `claude_run` no longer sends)
+    /// would just hang until the test's own timeout instead of failing. The fixture and
+    /// assertions below moved to a failure mode that still exists post-deletion — the provider's
+    /// stdout ending before a terminal `result` frame ever arrives — because what this test
+    /// actually proves (a driver failure quarantines its partial evidence instead of losing it)
+    /// is unrelated to which specific error produced the failure.
     #[tokio::test]
     async fn recorder_quarantines_partial_approval_evidence_after_cleanup() {
         let raw = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let request = RunRequest {
-            prompt: "scenario:capture-approval-unexpected-second".into(),
+            prompt: "scenario:capture-protocol-violation".into(),
             cwd: cwd.path().display().to_string(),
             ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
         };
@@ -1131,7 +1108,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "Claude approval request used an unexpected tool or order."
+            "Claude stopped before the expected terminal result. Retry with a current CLI version."
         );
         assert!(!process_is_live(pid), "provider child {pid} remains live");
         assert!(!cwd.path().join(APPROVAL_MARKER_NAME).exists());
@@ -1144,29 +1121,25 @@ mod tests {
         assert_eq!(partial["outcome"], "incomplete");
         assert_eq!(partial["failure_class"], "driver_error");
         let events = partial["events"].as_array().unwrap();
-        assert!(events.iter().any(|event| {
-            event["channel"] == "stdout"
-                && event["payload"].as_str().is_some_and(|payload| {
-                    payload.contains("bad-read") && payload.contains("capture-marker.txt")
-                })
-        }));
-        assert!(events.iter().any(|event| {
-            event["channel"] == "stdin"
-                && event["payload"]
-                    .as_str()
-                    .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
-                    .is_some_and(|payload| {
-                        payload["response"]["request_id"] == "good-write"
-                            && payload["response"]["response"]["behavior"] == "allow"
-                    })
-        }));
-        assert!(!events.iter().any(|event| {
-            event["channel"] == "stdin"
-                && event["payload"]
-                    .as_str()
-                    .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
-                    .is_some_and(|payload| payload["response"]["request_id"] == "bad-read")
-        }));
+        assert!(
+            events.iter().any(|event| {
+                event["channel"] == "stdout"
+                    && event["payload"]
+                        .as_str()
+                        .is_some_and(|payload| payload.contains("toolu_bash"))
+            }),
+            "the transcript recorded before the failure must survive in the quarantine: {events:?}"
+        );
+        let stdin_events: Vec<_> = events
+            .iter()
+            .filter(|event| event["channel"] == "stdin")
+            .collect();
+        assert_eq!(
+            stdin_events.len(),
+            1,
+            "claude_run answers nothing any more, so only the initial user line reaches stdin: \
+             {stdin_events:?}"
+        );
 
         let staging = raw
             .path()

@@ -8,21 +8,15 @@ use anyhow::{anyhow, bail};
 use crate::capture::filesystem::has_windows_reparse_point;
 use crate::capture::{CaptureConfig, CaptureOperation, CodexCaptureOperation, CodexRunScript};
 
-pub(super) const CLAUDE_APPROVAL_COMMAND: &str = "printf capture";
 pub(super) const CODEX_APPROVAL_COMMAND: &str = "echo capture";
-pub(super) const APPROVAL_MARKER_NAME: &str = "capture-marker.txt";
-pub(super) const APPROVAL_MARKER_CONTENT: &str = "capture\n";
+// `pub(in crate::capture)`, not `pub(super)`: Task 4 moved `claude_approval_prompt` (the sole
+// other consumer of these two constants) out to
+// `capture::record::scenarios::claude`, which needs to read them from there. Everything else
+// that reads them — `codex_approval_prompt` and `validate_ordinary_approval_marker` below — is
+// still local to this module, so only the visibility widens, not the constants' home.
+pub(in crate::capture) const APPROVAL_MARKER_NAME: &str = "capture-marker.txt";
+pub(in crate::capture) const APPROVAL_MARKER_CONTENT: &str = "capture\n";
 pub(super) const APPROVAL_MARKER_ADD_DIFF: &str = APPROVAL_MARKER_CONTENT;
-
-pub fn claude_approval_prompt(cwd: &Path) -> String {
-    let marker = cwd.join(APPROVAL_MARKER_NAME);
-    format!(
-        "Use Bash exactly once with input {{\"command\":{}}}. Wait for it to finish successfully. Then use Write exactly once with input {{\"file_path\":{},\"content\":{}}}.",
-        serde_json::to_string(CLAUDE_APPROVAL_COMMAND).expect("static command serializes"),
-        serde_json::to_string(&marker.display().to_string()).expect("path serializes"),
-        serde_json::to_string(APPROVAL_MARKER_CONTENT).expect("static content serializes"),
-    )
-}
 
 pub fn codex_approval_prompt(cwd: &Path) -> String {
     let marker = cwd.join(APPROVAL_MARKER_NAME);
