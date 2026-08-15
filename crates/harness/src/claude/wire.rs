@@ -406,15 +406,18 @@ pub(crate) struct ControlRequestBody {
     pub tool_name: String,
     #[serde(default)]
     pub input: Value,
-    /// Which `tool_use` block this approval request answers. Decoded because
-    /// it's on the wire, but no production path reads it any more: the
-    /// deleted `capture::approval::claude` validators were the sole
-    /// consumer, correlating it against a tracked `tool_use` id before
+    /// Which `tool_use` block this approval request answers. The sole
+    /// *production* consumer was the deleted `capture::approval::claude`
+    /// validators, correlating it against a tracked `tool_use` id before
     /// replying; the surviving driving half
     /// (`record::scenarios::claude::pending_approval`) replies by
     /// `request_id` alone, echoing the request's own `input` back
-    /// unmodified. Do not "use" it — see `description`'s doc comment below
-    /// for the same rule.
+    /// unmodified, so it does not need this field.
+    ///
+    /// Decoded for exactly one consumer, and it is a test:
+    /// `a_can_use_tool_request_decodes_the_fields_a_card_needs` (below)
+    /// asserts it is non-empty and joins it against the committed corpus's
+    /// `tool_result` id. Do not "use" it.
     #[serde(default)]
     #[allow(dead_code)]
     pub tool_use_id: String,
