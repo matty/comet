@@ -88,12 +88,20 @@ so an added or removed scenario cannot pass silently.
 
 ## D61 — the checklist evidence guard encoded a prompt's content, from a different file
 
-**The bug.** `recording.rs`'s Claude run loop required 4 confirmed task
-mutations (2 creates, 2 updates) to accept a `checklist` capture and 2 to accept
-a `checklist-resume` capture. Those counts were correct only because
-`capture/checklist.rs`'s prompt happened to ask the model for exactly that many
-— two facts in two files, agreeing today, with nothing enforcing that they keep
-agreeing. Worse, per the design's own safety principle: a model that ignored
+**The bug.** `recording.rs`'s Claude run loop required `created.len() >= 2 &&
+!updated.is_empty()` to accept a `checklist` capture — two distinct confirmed
+creates plus at least one confirmed update — and a non-empty
+`updated.difference(&created)` to accept a `checklist-resume` capture, i.e. at
+least one update to a task the process had never created. Those thresholds were
+correct only because `capture/checklist.rs`'s prompt happened to ask the model
+for exactly that much — two facts in two files, agreeing today, with nothing
+enforcing that they keep agreeing.
+
+**And the row that filed this said "4 and 2".** Those were the *prompt's*
+tool-call counts, not the predicate's, and they were quoted onward into a plan
+and a doc comment before anyone read the deleted code. Quoting a threshold from
+a prompt rather than from the code is the same mistake one level up, which is
+why the predicate is written out above rather than summarized. Worse, per the design's own safety principle: a model that ignored
 the instructions and did nothing produced *a recording of a model ignoring
 instructions*, which is real evidence of real CLI behavior, and the guard threw
 that recording away rather than keep it — reacting to a frame's content and
