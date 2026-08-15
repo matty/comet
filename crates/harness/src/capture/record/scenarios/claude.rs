@@ -2,6 +2,7 @@ use std::path::Path;
 
 use comet_proto::{ReasoningLevel, RunRequest, RuntimeMode};
 
+use crate::capture::record::provider::CaptureProvider;
 use crate::capture::record::providers::claude::ClaudeProvider;
 use crate::capture::record::scenarios::ScenarioInput;
 use crate::capture::record::session::Session;
@@ -35,15 +36,16 @@ pub(in crate::capture::record) fn command_discovery_launch(
     ))
 }
 
-/// Model discovery's entire drive is the handshake: `record()` already ran
-/// it before calling this body, so there is nothing left to do here. Kept as
-/// its own function (rather than folded away) because it is a named row in
-/// [`super::SCENARIOS`], not because its body is nontrivial.
+/// Model discovery's entire drive IS the handshake — the body calls it
+/// itself (per the amendment "the scenario body calls the handshake; the
+/// recorder does not": `record_generic` no longer calls `P::handshake` for
+/// any scenario). Kept as its own named function, rather than a bare call
+/// inlined elsewhere, because it is a named row in [`super::SCENARIOS`].
 pub(in crate::capture::record) async fn model_discovery(
-    _session: &mut Session<ClaudeProvider>,
-    _input: &ScenarioInput,
+    session: &mut Session<ClaudeProvider>,
+    input: &ScenarioInput,
 ) -> anyhow::Result<()> {
-    Ok(())
+    ClaudeProvider::handshake(session, input).await
 }
 
 /// Command discovery's driving is identical to model discovery's — the
@@ -51,10 +53,10 @@ pub(in crate::capture::record) async fn model_discovery(
 /// `record()` selects (`command_discovery_launch` vs `model_discovery_launch`
 /// picks `--bare` or not), never in what happens after spawn.
 pub(in crate::capture::record) async fn command_discovery(
-    _session: &mut Session<ClaudeProvider>,
-    _input: &ScenarioInput,
+    session: &mut Session<ClaudeProvider>,
+    input: &ScenarioInput,
 ) -> anyhow::Result<()> {
-    Ok(())
+    ClaudeProvider::handshake(session, input).await
 }
 
 // Below this point: `fresh-text`, `resume` and `attachment`. None of the
@@ -110,6 +112,14 @@ async fn claude_user_line(request: &RunRequest, require_image: bool) -> anyhow::
     ))
 }
 
+// `fresh_text_launch` and `fresh_text` (and the matching pairs for `resume`
+// and `attachment` below) each call this a second time rather than sharing
+// one computed value — the launch-on-the-row design (see the amendment on
+// `ScenarioSpec::launch`) means the launch and the body are built by two
+// separate calls with no shared state between them. The two calls cannot
+// diverge only because this stays a pure function of `input`: a future field
+// that reads something else (the clock, an env var, a counter) would make
+// the launch and the wire line disagree about what request was sent.
 #[allow(dead_code)]
 fn fresh_text_request(input: &ScenarioInput) -> RunRequest {
     cheap_claude_request(
@@ -145,6 +155,9 @@ pub(in crate::capture::record) async fn fresh_text(
     session.wait_for_turn_end().await
 }
 
+// Called once by `resume_launch`, once by `resume` — see the note on
+// `fresh_text_request` above; the same "stays pure, so the two calls can't
+// disagree" reasoning applies here.
 #[allow(dead_code)]
 fn resume_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
     let resume_id = input
@@ -184,6 +197,8 @@ pub(in crate::capture::record) async fn resume(
     session.wait_for_turn_end().await
 }
 
+// Called once by `attachment_launch`, once by `attachment` — see the note on
+// `fresh_text_request` above.
 #[allow(dead_code)]
 fn attachment_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
     let attachment = input
@@ -226,6 +241,8 @@ pub(in crate::capture::record) async fn attachment(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use serde_json::{Value, json};
 
     use super::*;
@@ -284,8 +301,95 @@ mod tests {
         assert_eq!(snapshot.creation_flags, 0);
     }
 
+    /// Break caught: `fresh_text_launch` stops calling the production `crate::claude::run_launch`
+    /// and hand-builds (or hand-edits) a `LaunchDescriptor` instead — the same class of hole Task
+    /// 1's `command_discovery_launch` bypass would have shipped had it gone unnoticed.
+    /// `claude_capture_uses_the_run_command_builder` above only proves `run_launch` itself is
+    /// right; it never calls `fresh_text_launch`, so it cannot catch this.
+    #[test]
+    fn fresh_text_launch_uses_the_production_run_launch() {
+        let exe = absolute_program("claude");
+        let input = ScenarioInput::default();
+
+        let launch = fresh_text_launch(&input, &exe).unwrap();
+        let expected = crate::claude::run_launch(&exe, &fresh_text_request(&input));
+
+        assert_eq!(
+            CommandSnapshot::from_launch(&launch),
+            CommandSnapshot::from_launch(&expected)
+        );
+    }
+
+    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for `resume`.
+    #[test]
+    fn resume_launch_uses_the_production_run_launch() {
+        let exe = absolute_program("claude");
+        let input = ScenarioInput {
+            resume_id: Some("session-abc".into()),
+            ..ScenarioInput::default()
+        };
+
+        let launch = resume_launch(&input, &exe).unwrap();
+        let expected = crate::claude::run_launch(&exe, &resume_request(&input).unwrap());
+
+        assert_eq!(
+            CommandSnapshot::from_launch(&launch),
+            CommandSnapshot::from_launch(&expected)
+        );
+    }
+
+    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for `attachment`.
+    #[test]
+    fn attachment_launch_uses_the_production_run_launch() {
+        let exe = absolute_program("claude");
+        let input = ScenarioInput {
+            attachment: Some(PathBuf::from("tiny.png")),
+            ..ScenarioInput::default()
+        };
+
+        let launch = attachment_launch(&input, &exe).unwrap();
+        let expected = crate::claude::run_launch(&exe, &attachment_request(&input).unwrap());
+
+        assert_eq!(
+            CommandSnapshot::from_launch(&launch),
+            CommandSnapshot::from_launch(&expected)
+        );
+    }
+
+    /// Break caught: `resume_request` stops setting `request.resume`, so the launch silently
+    /// starts a fresh session under the `resume` scenario name instead of resuming one — a
+    /// mislabeled capture the parity test above cannot catch, because it builds "expected" from
+    /// the same `resume_request` call. This is a pre-spawn check on the built launch descriptor,
+    /// not a frame check, so it is not the class of check this stage's design removes.
+    #[test]
+    fn resume_launch_passes_the_resume_id_as_a_launch_argument() {
+        let exe = absolute_program("claude");
+        let input = ScenarioInput {
+            resume_id: Some("session-abc".into()),
+            ..ScenarioInput::default()
+        };
+
+        let launch = resume_launch(&input, &exe).unwrap();
+        let snapshot = CommandSnapshot::from_launch(&launch);
+
+        assert!(
+            snapshot
+                .args
+                .iter()
+                .any(|arg| arg == "--resume=session-abc"),
+            "resume launch must carry --resume=<id>: {:?}",
+            snapshot.args
+        );
+    }
+
     /// Break caught: a Claude run driver invents its own initial wire line instead of recording
     /// the exact provider-specific user message it writes through the production run launch.
+    ///
+    /// `fresh_text`'s real prompt ("Reply with the single word capture.") matches no branch in
+    /// `fake_claude.rs`, so this exercises the fixture's generic `error_during_execution` result,
+    /// not a modelled success transcript — the assertions below only need a single stdin write and
+    /// *a* terminal `result` frame, both of which that fallback still produces. Noted here so the
+    /// next reader does not assume this proves a modelled multi-frame run; it does not.
     #[tokio::test]
     async fn recorder_claude_run_records_the_exact_initial_write() {
         let raw = tempfile::tempdir().unwrap();

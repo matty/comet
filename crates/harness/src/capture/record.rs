@@ -133,21 +133,29 @@ type ScenarioBodyFn<P> = for<'a> fn(
 ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
 
 /// The provider-neutral orchestration shared by every scenario: spawn,
-/// handshake, drive the scenario body, finish — all under one shared
-/// deadline. A failure or timeout during handshake/drive never reaches
-/// [`Session::finish`]; this function still owns `&mut session` at that
-/// point and classifies explicitly (`DriverError` for a driving failure,
-/// `Timeout` for the deadline firing) — the `drive_completed` distinction
-/// `recording.rs` made with a boolean, carried here by which branch of this
-/// match runs.
+/// drive the scenario body, finish — all under one shared deadline. A
+/// failure or timeout during drive never reaches [`Session::finish`]; this
+/// function still owns `&mut session` at that point and classifies
+/// explicitly (`DriverError` for a driving failure, `Timeout` for the
+/// deadline firing) — the `drive_completed` distinction `recording.rs` made
+/// with a boolean, carried here by which branch of this match runs.
+///
+/// Deliberately does NOT call `P::handshake` — see the amendment on
+/// `CaptureProvider`'s doc comment ("the scenario body calls the handshake;
+/// the recorder does not"). Whether a scenario handshakes at all is a
+/// scenario decision: every discovery body and every Codex run body opens
+/// with `P::handshake(session, input).await?` itself; a Claude run body
+/// calls nothing, because a real Claude run sends no handshake and this
+/// function calling one unconditionally would put a line on the tape the
+/// product never sends.
 ///
 /// `deadline` is computed once, right after spawn, and passed into both the
-/// outer `timeout_at` wrapping handshake+body *and* into
-/// [`Session::finish`], so the exit wait shares the same clock as driving
-/// instead of getting a fresh, unrelated budget — `recording.rs`'s original
-/// `finish` wrapped drive *and* the exit wait in one `timeout(self.timeout,
-/// …)`, and splitting that into two functions must not silently narrow what
-/// the configured timeout covers.
+/// outer `timeout_at` wrapping the body *and* into [`Session::finish`], so
+/// the exit wait shares the same clock as driving instead of getting a
+/// fresh, unrelated budget — `recording.rs`'s original `finish` wrapped
+/// drive *and* the exit wait in one `timeout(self.timeout, …)`, and
+/// splitting that into two functions must not silently narrow what the
+/// configured timeout covers.
 async fn record_generic<P: CaptureProvider>(
     provider: P,
     config: &CaptureConfig,
@@ -157,11 +165,7 @@ async fn record_generic<P: CaptureProvider>(
 ) -> anyhow::Result<RawCapture> {
     let mut session = Session::start(provider, config, launch, FenceOutcome::none()).await?;
     let deadline = tokio::time::Instant::now() + session.timeout;
-    let outcome = tokio::time::timeout_at(deadline, async {
-        P::handshake(&mut session, &input).await?;
-        body(&mut session, &input).await
-    })
-    .await;
+    let outcome = tokio::time::timeout_at(deadline, body(&mut session, &input)).await;
     match outcome {
         Ok(Ok(())) => session.finish(deadline).await,
         Ok(Err(err)) => {

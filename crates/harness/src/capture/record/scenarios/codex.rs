@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::{anyhow, bail};
 use serde_json::Value;
 
+use crate::capture::record::provider::CaptureProvider;
 use crate::capture::record::providers::codex::{CodexProvider, rpc_request};
 use crate::capture::record::scenarios::ScenarioInput;
 use crate::capture::record::session::Session;
@@ -30,13 +31,18 @@ pub(in crate::capture::record) fn model_discovery_launch(
     ))
 }
 
-/// The cursor-paginated `model/list` loop, run after `record()`'s generic
-/// handshake. Every page is recorded — `recording.rs:488-506`'s loop, moved
-/// unchanged.
+/// The handshake, then the cursor-paginated `model/list` loop. Per the
+/// amendment "the scenario body calls the handshake; the recorder does
+/// not" — `record_generic` no longer calls `P::handshake` for any scenario,
+/// so every Codex body (discovery here; run bodies from Task 5 on) opens
+/// with it directly, since Codex's app-server protocol genuinely requires
+/// `initialize`/`initialized` before any request. The pagination loop itself
+/// is `recording.rs:488-506`'s loop, moved unchanged.
 pub(in crate::capture::record) async fn model_discovery(
     session: &mut Session<CodexProvider>,
-    _input: &ScenarioInput,
+    input: &ScenarioInput,
 ) -> anyhow::Result<()> {
+    CodexProvider::handshake(session, input).await?;
     let mut cursor: Option<String> = None;
     for _ in 0..20_u64 {
         let id = session.provider.next_id();
