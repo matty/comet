@@ -178,7 +178,10 @@ pub(in crate::capture) fn require_empty_approval_target(
 /// branch (`crate::codex::normalize_run_request`) — a shape this very
 /// function already rejects via `repository_root`, so the condition the
 /// assertion guarded against is now structurally unreachable rather than
-/// merely re-checked.
+/// merely re-checked. The other half of what the deleted assertion covered —
+/// `RunRequest::for_session`'s `RuntimeMode -> SandboxLevel` mapping itself
+/// regressing, independent of any cwd — is restored as a narrower debug
+/// assertion in `record::scenarios::codex::approval_on_request_request`.
 pub(in crate::capture) fn validate_on_request_preflight(
     cwd: &Path,
     approval_target: Option<&Path>,

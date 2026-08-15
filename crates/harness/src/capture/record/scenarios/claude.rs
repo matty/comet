@@ -889,4 +889,50 @@ mod tests {
         );
         assert_eq!(capture.exit_code, Some(0));
     }
+
+    /// The table's `runtime_mode` and the body's own `RunRequest.runtime_mode` are two separate
+    /// homes for one fact — the row drives fence selection in `record::codex_fence`
+    /// (Codex; Claude has none), the request builder drives what actually reaches the wire. Task
+    /// 7's own `comet-provider-capture.rs::scenario_names_own_their_runtime_modes` reads only
+    /// `spec.runtime_mode` and cannot see the two drift apart.
+    ///
+    /// Break caught: a `*_request` builder's `RuntimeMode` literal is edited (or a copy/paste
+    /// leaves it stale) while the table's `runtime_mode` field is not — the row would still
+    /// select the right fence and print the right `--help` text while sending the wrong mode on
+    /// the wire.
+    #[test]
+    fn every_claude_run_rows_declared_mode_matches_its_request_builder() {
+        let plain = ScenarioInput::default();
+        let with_resume = ScenarioInput {
+            resume_id: Some("session-abc".into()),
+            ..ScenarioInput::default()
+        };
+        let with_attachment = ScenarioInput {
+            attachment: Some(PathBuf::from("tiny.png")),
+            ..ScenarioInput::default()
+        };
+        for (name, mode) in [
+            ("fresh-text", fresh_text_request(&plain).runtime_mode),
+            ("approval", approval_request(&plain).runtime_mode),
+            ("resume", resume_request(&with_resume).unwrap().runtime_mode),
+            (
+                "attachment",
+                attachment_request(&with_attachment).unwrap().runtime_mode,
+            ),
+            ("checklist", checklist_request(&plain).runtime_mode),
+            (
+                "checklist-resume",
+                checklist_resume_request(&with_resume).unwrap().runtime_mode,
+            ),
+        ] {
+            let spec = crate::capture::record::scenarios::scenario("claude", name)
+                .unwrap_or_else(|| panic!("missing claude/{name}"));
+            assert_eq!(
+                spec.runtime_mode,
+                Some(mode),
+                "claude/{name}: table says {:?}, request builder says {mode:?}",
+                spec.runtime_mode
+            );
+        }
+    }
 }

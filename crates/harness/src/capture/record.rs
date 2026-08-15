@@ -614,6 +614,11 @@ mod tests {
     /// the same way, through `record()` itself, to prove the `fresh-text`
     /// row's `body` genuinely calls `CodexProvider::handshake` before
     /// anything scenario-specific.
+    ///
+    /// Break caught, verified by falsification: removing the `CodexProvider::handshake(...)`
+    /// call from `record/scenarios/codex.rs`'s `fresh_text` body fails loudly — `fake-codex`
+    /// expects `initialize` first and the whole capture errors: "Codex stopped before the
+    /// expected JSON-RPC reply." Restored after confirming.
     #[tokio::test]
     async fn record_codex_run_sends_the_initialize_handshake_first() {
         let raw = tempfile::tempdir().unwrap();
@@ -689,6 +694,83 @@ mod tests {
 
         let error = recheck().unwrap_err();
         assert!(error.to_string().contains("empty"), "{error}");
+    }
+
+    /// The grant-time rechecks in `record/scenarios/codex.rs`'s `approval`/`approval_on_request`
+    /// (`answer_every_approval`'s `recheck` closures) read `session.fence.approval_cwd_identity`/
+    /// `approval_target_identity` as `Option<&DirectoryIdentity>`, and `None` is not a failure
+    /// there — `validate_ordinary_approval_cwd`/`require_empty_approval_target` both treat `None`
+    /// as "no expected identity to compare against" and silently degrade to an emptiness/marker
+    /// check with no identity comparison at all (see `.agents/rules/optional-wire-fields.md`).
+    /// Every existing test for those scenarios hand-builds `FenceOutcome{ ..: Some(...) }` and
+    /// never calls `codex_fence` at all, so nothing before this test proved `codex_fence` itself
+    /// populates the field the grant-time recheck depends on.
+    ///
+    /// Break caught: `codex_fence` starts returning `None` for `approval_target_identity` on the
+    /// `approval-on-request` row (e.g. the `identity` binding stops being threaded into the
+    /// `FenceOutcome` literal) — the pre-spawn fence would still run and still succeed, `--help`
+    /// and dispatch would look untouched, and only the identity half of the grant-time protection
+    /// would be silently gone.
+    #[tokio::test]
+    async fn codex_fence_populates_the_approval_target_identity_for_on_request() {
+        let raw = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let target = tempfile::Builder::new()
+            .prefix("comet-fence-identity-target-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let mut cfg = config(
+            "approval-on-request",
+            fixture_path("fake-codex"),
+            "codex",
+            raw.path(),
+        );
+        cfg.cwd = Some(cwd.path().into());
+        cfg.approval_target = Some(target.path().into());
+        let spec = scenario("codex", "approval-on-request").unwrap();
+        let input = ScenarioInput {
+            cwd: cfg.cwd.clone(),
+            approval_target: cfg.approval_target.clone(),
+            ..ScenarioInput::default()
+        };
+        let executable = fixture_path("fake-codex");
+        let launch = (spec.launch)(&input, &executable).unwrap();
+
+        let fence = codex_fence(spec, &cfg, &launch).unwrap();
+
+        assert!(
+            fence.approval_target_identity.is_some(),
+            "approval-on-request's fence must record an expected target identity for the \
+             grant-time recheck to compare against"
+        );
+    }
+
+    /// Same concern as `codex_fence_populates_the_approval_target_identity_for_on_request`, for
+    /// `approval`'s `approval_cwd_identity`. Windows-only, matching every other test in this crate
+    /// that goes through `resolve_trusted_powershell` — it fails closed on every other platform
+    /// (see that function's own doc comment), so this would never reach the assertion elsewhere.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn codex_fence_populates_the_approval_cwd_identity_for_approval() {
+        let raw = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut cfg = config("approval", fixture_path("fake-codex"), "codex", raw.path());
+        cfg.cwd = Some(cwd.path().into());
+        let spec = scenario("codex", "approval").unwrap();
+        let input = ScenarioInput {
+            cwd: cfg.cwd.clone(),
+            ..ScenarioInput::default()
+        };
+        let executable = fixture_path("fake-codex");
+        let launch = (spec.launch)(&input, &executable).unwrap();
+
+        let fence = codex_fence(spec, &cfg, &launch).unwrap();
+
+        assert!(
+            fence.approval_cwd_identity.is_some(),
+            "approval's fence must record an expected cwd identity for the grant-time recheck \
+             to compare against"
+        );
     }
 
     fn only_raw_subdirectory(raw_root: &Path) -> PathBuf {

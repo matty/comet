@@ -26,7 +26,6 @@ pub struct CommandSnapshot {
 
 impl CommandSnapshot {
     // The capture recorder is the only caller; see `record/session.rs`.
-    #[allow(dead_code)]
     pub(crate) fn from_launch(launch: &LaunchDescriptor) -> Self {
         const CAPTURED_ENV: &[&str] = &["CODEX_HOME"];
 

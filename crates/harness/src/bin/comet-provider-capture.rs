@@ -12,10 +12,17 @@ fn provider_key(provider: Provider) -> &'static str {
     }
 }
 
+/// The column budget a wrapped scenario line stays under, prefix included —
+/// matched to the hand-typed text this replaced, which broke around 90-95
+/// characters.
+const SCENARIO_LINE_WIDTH: usize = 92;
+
 /// Generated from [`SCENARIOS`] rather than hand-typed, so a new or renamed
 /// row cannot leave `--help` behind — closing D60 (the scenario name living
 /// in the help text, `supported_pair()`, and the dispatch `match` as three
-/// unsynchronized copies; there is now exactly one, this table).
+/// unsynchronized copies; there is now exactly one, this table). Wraps long
+/// per-provider lists onto continuation lines indented to align under the
+/// first name, the same shape the hand-typed text used.
 fn scenario_help_lines() -> String {
     let mut lines = String::new();
     for provider in [Provider::Claude, Provider::Codex] {
@@ -24,11 +31,27 @@ fn scenario_help_lines() -> String {
             .filter(|spec| spec.provider == provider)
             .map(|spec| spec.name)
             .collect();
-        lines.push_str(&format!(
-            "  {:<7} {}\n",
-            format!("{}:", provider_key(provider)),
-            names.join(", ")
-        ));
+        let prefix = format!("  {:<7} ", format!("{}:", provider_key(provider)));
+        let indent = " ".repeat(prefix.len());
+        let mut current = prefix;
+        let mut line_has_word = false;
+        for (index, name) in names.iter().enumerate() {
+            let word = if index + 1 == names.len() {
+                (*name).to_owned()
+            } else {
+                format!("{name},")
+            };
+            if line_has_word && current.len() + word.len() > SCENARIO_LINE_WIDTH {
+                lines.push_str(current.trim_end());
+                lines.push('\n');
+                current = indent.clone();
+            }
+            current.push_str(&word);
+            current.push(' ');
+            line_has_word = true;
+        }
+        lines.push_str(current.trim_end());
+        lines.push('\n');
     }
     lines
 }
@@ -539,33 +562,58 @@ mod tests {
         }
     }
 
-    /// Closes D60: the `--help` scenario list is generated from `SCENARIOS`, not hand-typed, so
-    /// this test guards the generation rather than duplicating it — an added, removed or renamed
-    /// row cannot leave `--help` behind. Also resolves every advertised `(provider, name)` pair
-    /// through `scenario()` and checks the row's own declared `provider` field agrees with which
-    /// provider it was found under.
+    /// Reconstructs the comma-separated scenario list `scenario_help_lines` prints for one
+    /// provider, joining its wrapped continuation lines back into one logical list — `--help`
+    /// wraps a long provider's names across several physical lines (see `SCENARIO_LINE_WIDTH`),
+    /// so a test that only inspected the first matching line would silently stop checking after
+    /// the wrap point.
+    fn advertised_scenario_names(help: &str, prefix: &str) -> Vec<String> {
+        let lines: Vec<&str> = help.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(prefix))
+            .unwrap_or_else(|| panic!("--help has no scenario line starting with {prefix:?}"));
+        let mut joined = lines[start]
+            .trim_start()
+            .strip_prefix(prefix)
+            .unwrap()
+            .to_owned();
+        for line in &lines[start + 1..] {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with("claude:") || trimmed.starts_with("codex:")
+            {
+                break;
+            }
+            joined.push(' ');
+            joined.push_str(trimmed);
+        }
+        joined
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Closes D60: the `--help` scenario list is generated from `SCENARIOS`, not hand-typed. This
+    /// test parses the printed `--help` text and compares it against `SCENARIOS` computed
+    /// directly — it therefore checks `scenario_help_lines` against the table, not the table
+    /// against itself; a `SCENARIOS` row that is simply wrong (missing, misnamed, wrong provider
+    /// field) is `every_scenario_name_the_binary_advertises_is_in_the_table`'s and
+    /// `every_row_s_declared_provider_matches_its_body_variant`'s job (`record/scenarios.rs`), not
+    /// this one's. Also resolves every advertised `(provider, name)` pair through `scenario()`.
     ///
-    /// Break caught: add a row to `SCENARIOS` whose declared `provider` disagrees with the
-    /// provider it is filed under in the table (`scenario_help_lines` groups by `spec.provider`,
-    /// so a wrong `provider` field would print the name under the wrong provider's line, or
-    /// `scenario(provider, name)` would fail to resolve it under the provider `--help` advertised).
+    /// Break caught, verified by falsification: `scenario_help_lines` silently drops a row (e.g.
+    /// `names.pop()` before joining) — `--help` and SCENARIOS diverge for claude: left has 9
+    /// names, right (the real table) has 10, and `checklist-resume` is the one missing. Restored
+    /// after confirming.
     #[test]
     fn every_help_text_scenario_is_a_table_row_and_dispatches() {
         let help = help_text();
         for provider in [Provider::Claude, Provider::Codex] {
             let key = provider_key(provider);
             let prefix = format!("{key}:");
-            let line = help
-                .lines()
-                .find(|line| line.trim_start().starts_with(&prefix))
-                .unwrap_or_else(|| panic!("--help has no scenario line for {key}"));
-            let advertised: Vec<&str> = line
-                .trim_start()
-                .strip_prefix(&prefix)
-                .unwrap()
-                .split(',')
-                .map(str::trim)
-                .collect();
+            let advertised = advertised_scenario_names(&help, &prefix);
             let table: Vec<&str> = SCENARIOS
                 .iter()
                 .filter(|spec| spec.provider == provider)
@@ -589,6 +637,12 @@ mod tests {
     /// `Requirements` demand — restores what Task 2 broke: the binary routed every ported
     /// scenario into a dead end, and this is the CLI-level proof that every name is reachable
     /// again, not just the ones a hand test happens to cover.
+    ///
+    /// Break caught, verified by falsification: a `Requirements` gate stops being read (e.g.
+    /// `needs_resume_id` hardcoded to `true`) — every row this test builds with only what its own
+    /// `Requirements` says it needs fails immediately: "claude/model-discovery: The
+    /// model-discovery scenario needs --resume-id with a provider session/thread id." Restored
+    /// after confirming.
     #[test]
     fn every_registered_scenario_builds_a_valid_capture_config() {
         let cwd = tempfile::tempdir().unwrap();

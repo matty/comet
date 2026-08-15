@@ -432,6 +432,20 @@ fn require_approval_target(input: &ScenarioInput) -> anyhow::Result<PathBuf> {
 // Called once by `approval_on_request_launch`, once by `approval_on_request`
 // — see the note on `fresh_text_request` above.
 fn approval_on_request_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
+    // `validate_on_request_preflight`'s doc comment explains why the deleted `recording.rs`
+    // assertion against `normalize_run_request`'s cwd-dependent sandbox escalation is not ported:
+    // the fence's own `repository_root` check makes that escalation unreachable for this
+    // scenario's cwd. This narrower debug assertion restores the other half of what that
+    // assertion covered — `RunRequest::for_session`'s `RuntimeMode -> SandboxLevel` mapping
+    // itself changing underneath this scenario, independent of any particular cwd.
+    // `comet_proto::agent::tests::for_session_pairs_the_sandbox_with_the_mode` already guards the
+    // mapping directly; this is defense in depth for the one caller whose safety depends on it.
+    debug_assert_eq!(
+        RunRequest::for_session(RuntimeMode::AutoAcceptEdits).sandbox,
+        comet_proto::SandboxLevel::WorkspaceWrite,
+        "approval-on-request depends on AutoAcceptEdits mapping to workspace-write; Codex's \
+         on-request approval path is unreachable under any other sandbox"
+    );
     let target = require_approval_target(input)?;
     Ok(cheap_codex_request(
         &crate::capture::approval::approval_on_request_prompt(&target),
@@ -558,11 +572,11 @@ async fn answer_every_approval(
 /// `answer_every_approval`'s doc comment.
 ///
 /// The grant-time recheck re-verifies the cwd's identity against
-/// `session.fence.approval_cwd_identity` — the value the (not-yet-wired,
-/// Task 8) pre-spawn fence records — with `require_marker_absent: true`,
-/// matching what the deleted `codex_run` checked immediately before
-/// accepting. Unlike that deleted code, a mismatch here declines the grant
-/// instead of aborting the whole capture.
+/// `session.fence.approval_cwd_identity` — the value `record::codex_fence`
+/// records before spawn — with `require_marker_absent: true`, matching what
+/// the deleted `codex_run` checked immediately before accepting. Unlike that
+/// deleted code, a mismatch here declines the grant instead of aborting the
+/// whole capture.
 pub(in crate::capture::record) async fn approval(
     session: &mut Session<CodexProvider>,
     input: &ScenarioInput,
@@ -1069,7 +1083,7 @@ mod tests {
     ///   checked against a literal, not by calling `approval_request` again, so a production
     ///   regression to any other mode can't satisfy its own assertion.
     /// - the grant-time cwd recheck passing (not declining) when the cwd never changed, using a
-    ///   real `DirectoryIdentity` computed the same way the (not-yet-wired) pre-spawn fence
+    ///   real `DirectoryIdentity` computed the same way `record::codex_fence`'s pre-spawn check
     ///   would.
     ///
     /// Dispatched in `fake_codex.rs` on a substring of the real `codex_approval_prompt` text —
@@ -1332,5 +1346,51 @@ mod tests {
             Some(0),
             "the recording must survive a declined grant, not be discarded"
         );
+    }
+
+    /// The Codex counterpart of `record/scenarios/claude.rs`'s
+    /// `every_claude_run_rows_declared_mode_matches_its_request_builder` — see that test's own
+    /// doc comment for why this needs its own check independent of
+    /// `comet-provider-capture.rs::scenario_names_own_their_runtime_modes`, which reads only
+    /// `spec.runtime_mode`. Codex `approval` is the sharpest case here: `codex_fence` selects the
+    /// trusted-PowerShell/cwd-identity fence off `spec.runtime_mode ==
+    /// Some(RuntimeMode::ApprovalRequired)`, but the wire mode Codex actually receives comes from
+    /// `approval_request`'s own `cheap_codex_request` call — a drift here would leave the fence
+    /// running for a turn that (if the mode drifted to `AutoAcceptEdits`) Codex would never ask an
+    /// approval for at all, exactly the failure `approval_on_request`'s own hardcoded
+    /// `AutoAcceptEdits` documents on the table row.
+    #[test]
+    fn every_codex_run_rows_declared_mode_matches_its_request_builder() {
+        let plain = ScenarioInput::default();
+        let with_resume = ScenarioInput {
+            resume_id: Some("resume-abc".into()),
+            ..ScenarioInput::default()
+        };
+        let with_target = ScenarioInput {
+            approval_target: Some(PathBuf::from("target-dir")),
+            ..ScenarioInput::default()
+        };
+        for (name, mode) in [
+            ("fresh-text", fresh_text_request(&plain).runtime_mode),
+            ("approval", approval_request(&plain).runtime_mode),
+            (
+                "approval-on-request",
+                approval_on_request_request(&with_target)
+                    .unwrap()
+                    .runtime_mode,
+            ),
+            ("resume", resume_request(&with_resume).unwrap().runtime_mode),
+            ("steer", steer_request(&plain).runtime_mode),
+            ("interruption", interruption_request(&plain).runtime_mode),
+        ] {
+            let spec = crate::capture::record::scenarios::scenario("codex", name)
+                .unwrap_or_else(|| panic!("missing codex/{name}"));
+            assert_eq!(
+                spec.runtime_mode,
+                Some(mode),
+                "codex/{name}: table says {:?}, request builder says {mode:?}",
+                spec.runtime_mode
+            );
+        }
     }
 }

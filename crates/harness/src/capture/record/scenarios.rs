@@ -394,8 +394,11 @@ mod tests {
         }
     }
 
-    /// Break caught: a run row is miscategorized as free (missing from the
-    /// token-spend acknowledgment gate) or never starts a turn at all.
+    /// Break caught, verified by falsification: a run row is miscategorized as free (missing
+    /// from the token-spend acknowledgment gate) or never starts a turn at all — setting
+    /// `steer`'s `runtime_mode` to `None` while leaving `Requirements::run()`'s
+    /// `spends_tokens: true` in place fails with "steer spends tokens but sets no runtime mode".
+    /// Restored after confirming.
     #[test]
     fn run_rows_spend_tokens_and_start_a_turn() {
         for spec in SCENARIOS
