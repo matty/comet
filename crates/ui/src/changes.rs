@@ -187,8 +187,8 @@ fn sources_match_diff_with<'a>(
             .and_then(|line_number| line_number.checked_sub(1))
             .and_then(|line_index| lines.and_then(|lines| lines.get(line_index).copied()))
     }
-    let old_lines = old_text.map(|source| split_lines(source));
-    let new_lines = new_text.map(|source| split_lines(source));
+    let old_lines = old_text.map(&mut split_lines);
+    let new_lines = new_text.map(split_lines);
     file.hunks
         .iter()
         .flat_map(|hunk| &hunk.lines)

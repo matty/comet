@@ -1975,9 +1975,10 @@ mod tests {
         }
 
         fn capabilities(&self) -> comet_proto::HarnessCapabilities {
-            let mut capabilities = comet_proto::HarnessCapabilities::default();
-            capabilities.supports_steering = true;
-            capabilities
+            comet_proto::HarnessCapabilities {
+                supports_steering: true,
+                ..Default::default()
+            }
         }
 
         async fn models(&self) -> Result<comet_proto::ModelCatalog, comet_harness::HarnessError> {
