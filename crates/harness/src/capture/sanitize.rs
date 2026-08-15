@@ -33,6 +33,18 @@ pub struct SanitizationReport {
 /// it here would file a settled decision back under "novel" and dilute the
 /// list this exists to keep short and actionable. See the doc comment on
 /// `is_mcp_tool_identity` for the reviewed reasoning behind that exception.
+///
+/// `path` itself can carry a map key verbatim — Claude's `.modelUsage` is
+/// keyed by model id (`.modelUsage.claude-haiku-4-5-20251001…`, see
+/// `allowlist/claude.txt`'s two literal lines for it), so that id rides
+/// through this struct's `path` field on any run where `.modelUsage` itself
+/// is withheld. That is safe, not an oversight: an object key is never a
+/// *value* the redactor withholds (`sanitize_scalar` only ever inspects
+/// `Value::String`/`Value::Number` leaves, not the keys above them), and
+/// `validate_key` rejects the whole capture outright if any key contains a
+/// redaction root, an absolute path, or a secret-shaped string. So a key
+/// that reaches this struct has already passed the same fail-closed scan a
+/// value would.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NovelPath {
     pub path: String,
@@ -1077,8 +1089,16 @@ fn describe_shape(values: &[Value]) -> String {
 /// carries). An empty report still prints a sentence, not silence -- silence
 /// after a sanitize run reads as "nothing happened here," not as "everything
 /// was already on the allowlist."
+///
+/// The header promises no *value* appears below, not that nothing sensitive-
+/// looking can -- a `path` entry can itself carry a map key verbatim (see
+/// `NovelPath`'s doc comment for the `.modelUsage` example and why that is
+/// safe). Keep that distinction in the wording if this changes: "no
+/// withheld values" is the guarantee this module actually enforces, and
+/// widening it to "nothing withheld" would overstate what `record_novel`
+/// and `describe_shape` do.
 pub fn render_novel_paths_report(novel_paths: &[NovelPath]) -> String {
-    let header = "Novel paths withheld by the allowlist (no withheld values are shown below):";
+    let header = "Novel paths withheld by the allowlist (no withheld values appear below; a path may still include a map key, e.g. a model id):";
     if novel_paths.is_empty() {
         return format!("{header}\n  (none -- every field on the wire was already allowlisted)");
     }
@@ -1517,7 +1537,7 @@ mod tests {
 
     use serde_json::{Value, json};
 
-    use super::{Redactor, SanitizationError, SanitizationReport};
+    use super::{Redactor, SanitizationError, SanitizationReport, render_novel_paths_report};
     use crate::capture::types::Provider;
 
     /// Runs one JSON value through the allowlist redactor without touching the
@@ -1630,6 +1650,61 @@ mod tests {
         assert_eq!(
             entry.distinct_values, 2,
             "two distinct strings, three occurrences"
+        );
+    }
+
+    /// `render_novel_paths_report` is the thing that actually gets pasted
+    /// into a terminal or a PR body -- `NovelPath`'s `Debug` output is not
+    /// what a reviewer reads. An empty list must still say something
+    /// meaningful, not silently return an empty string (silence after a
+    /// sanitize run reads as "nothing happened," not as "everything was
+    /// already allowed").
+    #[test]
+    fn render_novel_paths_report_says_something_meaningful_when_empty() {
+        let rendered = render_novel_paths_report(&[]);
+        assert!(
+            !rendered.trim().is_empty(),
+            "an empty report must not be an empty string"
+        );
+        assert!(
+            rendered.to_ascii_lowercase().contains("none")
+                || rendered.to_ascii_lowercase().contains("already"),
+            "the empty case must say why the list is empty, not just print the header: {rendered:?}"
+        );
+    }
+
+    /// The rendered report, not `NovelPath`'s `Debug` form, is the thing
+    /// that lands in a terminal or a PR body -- this exercises both shape
+    /// forms (`describe_shape`'s single-length and ranged-length branches)
+    /// and asserts the actual withheld strings are absent from the render,
+    /// not just from a struct nobody prints directly. Also checks the
+    /// header is present and both paths are named, so a future edit can't
+    /// satisfy "no values leak" by returning an empty or path-less string.
+    #[test]
+    fn render_novel_paths_report_names_paths_and_shapes_but_never_a_value() {
+        let report = sanitize_value_reporting(
+            json!({
+                "fixed": "abcdefgh",
+                "ranged": ["short", "a much longer withheld value than the other one"]
+            }),
+            Provider::Codex,
+        );
+        let rendered = render_novel_paths_report(&report.novel_paths);
+
+        assert!(rendered.contains("Novel paths withheld"), "{rendered}");
+        assert!(rendered.contains(".fixed"), "{rendered}");
+        assert!(rendered.contains(".ranged[]"), "{rendered}");
+        // ".fixed" has one value, length 8: the single-length branch.
+        assert!(rendered.contains("string len 8"), "{rendered}");
+        // ".ranged[]" has two distinct lengths (5 and 47): the ranged branch.
+        // Checking the prefix rather than a hardcoded upper bound keeps this
+        // test from silently drifting if the sample sentence is edited.
+        assert!(rendered.contains("string len 5-"), "{rendered}");
+        assert!(!rendered.contains("abcdefgh"), "{rendered}");
+        assert!(!rendered.contains("short"), "{rendered}");
+        assert!(
+            !rendered.contains("a much longer withheld value"),
+            "{rendered}"
         );
     }
 
