@@ -417,6 +417,18 @@ pub(in crate::capture::record) fn approval_launch(
 /// plain assistant text, anything else — returns `None` and is simply left
 /// unanswered.
 ///
+/// A `can_use_tool` request whose `tool_name` is missing or not a string is
+/// still recognized here, with an empty tool name standing in for it: it is
+/// a real request the CLI is blocked on a reply for, so it must not fall
+/// into the same `None` bucket as a frame that was never an approval request
+/// at all. An empty tool name matches neither `claude_marker_grant`'s
+/// `"Bash"` nor `"Write"` arm, so it lands in that function's catch-all —
+/// declined, same as any other tool this scenario doesn't recognize. Before
+/// this, a missing/non-string `tool_name` returned `None` here, the request
+/// went unanswered, and the CLI blocked forever on a reply that never came —
+/// burning the run to the recorder timeout and losing the capture, the exact
+/// outcome the decline path exists to prevent.
+///
 /// This is the surviving half of the deleted `observe_claude_approval_frame`:
 /// noticing that a frame IS an approval request is driving, not validating,
 /// so nothing here checks request order, request-id uniqueness, or the shape
@@ -430,7 +442,10 @@ fn pending_approval(frame: &Value) -> Option<(String, String, Value)> {
         return None;
     }
     let request_id = frame["request_id"].as_str()?.to_owned();
-    let tool_name = frame["request"]["tool_name"].as_str()?.to_owned();
+    let tool_name = frame["request"]["tool_name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
     Some((request_id, tool_name, frame["request"]["input"].clone()))
 }
 
@@ -450,9 +465,18 @@ fn pending_approval(frame: &Value) -> Option<(String, String, Value)> {
 /// captured earlier — it recomputes, fresh, the same bounded shape the
 /// deleted `validate_claude_marker_input` checked: the Write's input must
 /// equal `{file_path: <cwd>/capture-marker.txt, content: "capture\n"}`
-/// exactly, AND the marker's canonical parent must equal the scenario's own
-/// canonical cwd — the same escape check the deleted code made, so a `../`
-/// or symlinked `file_path` cannot walk the write out of cwd.
+/// exactly.
+///
+/// What actually stops a `../` or symlinked `file_path` from walking the
+/// write out of `cwd` is the byte-for-byte equality against `expected_path`
+/// in the `Write` arm below, which admits no traversal at all — `file_path`
+/// must match exactly before the canonicalize comparison that follows it
+/// ever runs. That canonicalize comparison is a faithful port of the
+/// deleted pre-stage check, kept for behavioural continuity, but it cannot
+/// fail in practice: `expected_path` is `cwd.join(APPROVAL_MARKER_NAME)`, so
+/// `expected_path.parent()` is `cwd` itself, and canonicalizing that against
+/// a canonicalized `cwd` compares one path to itself. It is inherited from
+/// the deleted code and inert here, not a second line of defense.
 fn claude_marker_grant(tool_name: &str, input: &Value, cwd: &Path) -> anyhow::Result<()> {
     if tool_name == "Bash" {
         if input == &json!({"command": CLAUDE_APPROVAL_COMMAND}) {
@@ -964,7 +988,7 @@ mod tests {
             .unwrap();
 
         // Bounded, unlike the other scenario tests in this file: the fixture below
-        // (`approval_two_requests`) reads a reply off stdin before emitting its next line, so a
+        // (`approval_three_requests`) reads a reply off stdin before emitting its next line, so a
         // driver that stops answering does not error, it blocks forever. Wrapping the call keeps
         // that failure a fast, legible timeout instead of a hung test process.
         tokio::time::timeout(
@@ -1023,6 +1047,128 @@ mod tests {
             capture.exit_code,
             Some(0),
             "the recording must survive a declined grant, not be discarded"
+        );
+    }
+
+    /// Unit-level coverage of the bug itself: a `can_use_tool` frame whose `tool_name` is
+    /// missing entirely, or present but not a string, used to make `pending_approval` return
+    /// `None` — the same bucket as a frame that was never an approval request at all — which
+    /// left the request unanswered. This asserts the frame is still recognized (`Some`, not
+    /// `None`) and that feeding its output through `decision_response` produces a decline, not
+    /// a hang.
+    #[test]
+    fn pending_approval_folds_a_missing_or_non_string_tool_name_into_a_decline() {
+        let missing = json!({
+            "type": "control_request",
+            "request_id": "cr-missing",
+            "request": {"subtype": "can_use_tool", "input": {"command": "echo hi"}},
+        });
+        let (request_id, tool_name, input) = pending_approval(&missing)
+            .expect("a can_use_tool frame with a request_id must be recognized even without a usable tool_name");
+        assert_eq!(request_id, "cr-missing");
+        let cwd = tempfile::tempdir().unwrap();
+        let reply = decision_response(&request_id, &tool_name, &input, cwd.path());
+        assert!(
+            reply.contains(r#""behavior":"deny""#),
+            "a missing tool_name must be declined, not silently dropped: {reply}"
+        );
+
+        let non_string = json!({
+            "type": "control_request",
+            "request_id": "cr-non-string",
+            "request": {"subtype": "can_use_tool", "tool_name": 7, "input": {}},
+        });
+        let (request_id, tool_name, input) = pending_approval(&non_string).expect(
+            "a non-string tool_name must also be recognized, not treated as no request at all",
+        );
+        let reply = decision_response(&request_id, &tool_name, &input, cwd.path());
+        assert!(
+            reply.contains(r#""behavior":"deny""#),
+            "a non-string tool_name must be declined, not silently dropped: {reply}"
+        );
+    }
+
+    /// End-to-end proof of the same bug, against a real spawned fake-claude: before the fix,
+    /// `fake-claude`'s `approval_missing_tool_name` blocks on `read_line` waiting for a reply to
+    /// its single, `tool_name`-less `can_use_tool` request, and `pending_approval` returning
+    /// `None` for it means that reply never comes — the capture hangs to the timeout instead of
+    /// reaching its terminal frame. This drives a real `Session` with a custom wire line (not the
+    /// production `approval_request` prompt, so it reaches fake-claude's dedicated branch rather
+    /// than `approval_three_requests`) through the same recognize-then-answer loop `approval`
+    /// itself runs, and asserts the run completes with a decline and a terminal frame instead of
+    /// blocking forever.
+    #[tokio::test]
+    async fn claude_approval_declines_a_request_missing_tool_name_instead_of_hanging() {
+        let raw = tempfile::tempdir().unwrap();
+        let executable = fixture_path("fake-claude");
+        let input = ScenarioInput::default();
+        let launch = approval_launch(&input, &executable).unwrap();
+        let cfg = config("approval", executable, "claude", raw.path());
+        let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
+            .await
+            .unwrap();
+
+        let request = RunRequest {
+            prompt: "scenario:approval-missing-tool-name".into(),
+            model: Some(CHEAP_MODEL.into()),
+            reasoning: Some(ReasoningLevel::Low),
+            cwd: std::env::temp_dir().display().to_string(),
+            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
+        };
+        let cwd = PathBuf::from(&request.cwd);
+        let line = claude_user_line(&request, false).await.unwrap();
+        session.send(&line).await.unwrap();
+
+        // Bounded for the same reason as `claude_approval_scenario_answers_every_request_it_sees`
+        // above: the fixture blocks on a reply before it emits its next line, so a driver that
+        // stops answering hangs the test process rather than failing fast.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let frame = session
+                    .next_frame()
+                    .await
+                    .unwrap()
+                    .expect("a reply or a turn end");
+                if ClaudeProvider::turn_complete(&frame) {
+                    return;
+                }
+                if let Some((request_id, tool_name, tool_input)) = pending_approval(&frame) {
+                    session
+                        .send(&decision_response(
+                            &request_id,
+                            &tool_name,
+                            &tool_input,
+                            &cwd,
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+        })
+        .await
+        .expect(
+            "a missing tool_name must still be answered, not leave the fixture blocked on a \
+             reply forever",
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let capture = session.finish(deadline).await.unwrap();
+
+        let stdin = channel_payloads(&capture, Channel::Stdin);
+        assert_eq!(
+            stdin.len(),
+            2,
+            "one user line, then one decline reply: {stdin:?}"
+        );
+        let reply: Value = serde_json::from_str(stdin[1]).unwrap();
+        assert_eq!(
+            reply["response"]["response"]["behavior"], "deny",
+            "the missing-tool_name request must be declined: {reply:?}"
+        );
+        assert_eq!(
+            capture.exit_code,
+            Some(0),
+            "the run must still reach its terminal frame instead of hanging to the recorder timeout"
         );
     }
 

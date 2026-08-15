@@ -163,10 +163,21 @@ fn main() {
     } else if first.contains("Use Bash exactly once with input") {
         // The real `capture/record/scenarios/claude.rs` `approval` prompt
         // (matched by a substring unique to it, same pattern as the
-        // checklist branch above). Two `can_use_tool` requests, so a test
+        // checklist branch above). Three `can_use_tool` requests, so a test
         // can prove the neutral recorder answers every request it sees, not
         // just the first.
-        approval_two_requests(&mut stdin);
+        approval_three_requests(&mut stdin);
+    } else if first.contains("scenario:approval-missing-tool-name") {
+        // A dedicated, custom-prompted scenario (not one of the real
+        // production prompts — the test that drives this builds its own wire
+        // line) whose single `can_use_tool` request has no `tool_name` at
+        // all. Before the fix this drove, `pending_approval` treated that as
+        // "not an approval request", never replied, and this `read_line`
+        // blocked forever waiting for an answer that never came — exactly
+        // the hang the fix exists to prevent. Checked before the generic
+        // `scenario:approval` branch below since this tag contains that
+        // substring too.
+        approval_missing_tool_name(&mut stdin);
     } else if first.contains("scenario:checklist") {
         checklist();
     } else if first.contains("scenario:askuser") {
@@ -577,15 +588,31 @@ fn capture_non_frame_tolerance() {
 /// emitted — a ping-pong round trip — followed by a terminal `result`.
 /// Drives `record/scenarios/claude.rs`'s `approval` scenario body against its
 /// real grant-time check, `claude_marker_grant`: the first two requests are
-/// exactly the marker Bash command and the marker Write into THIS process's
-/// own cwd (`std::env::current_dir()` — the fixture is the only thing that
-/// can say which directory it was actually started in, same rationale as
-/// `command_reply` above), so both must be granted; the third is a Write to
-/// a file the scenario never asked for, so it must be declined — and the run
-/// must still reach its terminal frame rather than being aborted.
-fn approval_two_requests(stdin: &mut StdinLock<'_>) {
+/// exactly the marker Bash command and the marker Write into the scenario's
+/// own cwd, so both must be granted; the third is a Write to a file the
+/// scenario never asked for, so it must be declined — and the run must still
+/// reach its terminal frame rather than being aborted.
+///
+/// The marker path is built from `std::env::temp_dir()`, not
+/// `std::env::current_dir()`: `approval_request` (the production side, in
+/// `record/scenarios/claude.rs`) derives the scenario's cwd the same way
+/// when `ScenarioInput::default()` leaves `cwd` unset, and that value is
+/// passed to this child process unresolved, as the literal string, via
+/// `LaunchDescriptor::cwd`/`Command::current_dir`. On macOS the two derivations
+/// disagree: the kernel resolves `TMPDIR`'s `/var/folders/...` symlink to
+/// `/private/var/folders/...` when the child actually `chdir`s into it, so
+/// `current_dir()` returns the resolved path while the production side's
+/// `claude_marker_grant` still compares against the unresolved
+/// `std::env::temp_dir()` string — a real Claude model never hits this,
+/// because it only ever echoes the literal path text from the prompt, but
+/// this fixture computing its own answer independently made the two
+/// diverge. Matching `temp_dir()` here (same env var, same process
+/// inheritance, no `chdir` resolution involved on either side) keeps this
+/// fixture and the production check deriving the identical unresolved
+/// string on every platform.
+fn approval_three_requests(stdin: &mut StdinLock<'_>) {
     let escape = |value: String| value.replace('\\', "\\\\").replace('"', "\\\"");
-    let cwd = std::env::current_dir().unwrap_or_default();
+    let cwd = std::env::temp_dir();
     let marker = escape(cwd.join("capture-marker.txt").display().to_string());
     let unexpected = escape(cwd.join("unexpected.txt").display().to_string());
 
@@ -607,6 +634,23 @@ fn approval_two_requests(stdin: &mut StdinLock<'_>) {
         // scenario is exactly what this slice's finding (both fake CLIs
         // emitted unrealistically flat frames) exists to stop.
         r#"{"type":"result","subtype":"success","result":"capture","errors":[],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30000,"cache_creation_input_tokens":75},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":10,"outputTokens":20,"contextWindow":200000}},"session_id":"sess-approval-two","total_cost_usd":0.01}"#,
+    );
+}
+
+/// A single `can_use_tool` request with no `tool_name` field at all,
+/// followed by a terminal `result`. Reads the reply back before emitting the
+/// terminal frame, exactly like `approval_three_requests` above, so a driver
+/// that leaves this request unanswered blocks here forever instead of
+/// failing loudly — reproducing the hang `pending_approval`'s fix (missing
+/// `tool_name` folded into the decline arm, not treated as "not an approval
+/// request") exists to prevent.
+fn approval_missing_tool_name(stdin: &mut StdinLock<'_>) {
+    emit(
+        r#"{"type":"control_request","request_id":"approval-missing-1","request":{"subtype":"can_use_tool","input":{"command":"echo hi"},"description":"no tool name","tool_use_id":"toolu_approval_missing"}}"#,
+    );
+    let _ = read_line(stdin);
+    emit(
+        r#"{"type":"result","subtype":"success","result":"capture","errors":[],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30000,"cache_creation_input_tokens":75},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":10,"outputTokens":20,"contextWindow":200000}},"session_id":"sess-approval-missing-tool-name","total_cost_usd":0.01}"#,
     );
 }
 
