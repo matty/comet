@@ -125,8 +125,9 @@ async fn record_codex(
     record_generic(CodexProvider::new(), config, launch, input, body).await
 }
 
-/// A scenario body: given a spawned, hand-shaken session, drive it and
-/// report whether the scenario completed.
+/// A scenario body: given a freshly spawned session, drive it (handshaking
+/// first if this scenario needs one — see `record_generic`'s doc comment)
+/// and report whether the scenario completed.
 type ScenarioBodyFn<P> = for<'a> fn(
     &'a mut Session<P>,
     &'a ScenarioInput,
