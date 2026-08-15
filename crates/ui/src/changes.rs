@@ -1068,6 +1068,8 @@ struct HoverRow {
 struct CommentDraft {
     key: comet_proto::ServerRef,
     path: String,
+    /// The file's pre-rename path, when it moved — carried onto the comment so
+    /// an `Old`-side citation names the file that line lives in.
     old_path: Option<String>,
     side: CommentSide,
     line: u32,
@@ -1228,9 +1230,7 @@ impl Changes {
 
     /// Reconcile parsed content with the currently-resolved diff.
     fn sync(&mut self, cx: &mut Context<Self>) {
-        let selected = self.state.read(cx).selected_chat.clone();
-        let owner = self.draft.as_ref().map(|draft| draft.key.clone());
-        discard_stale_draft(&mut self.draft, owner.as_ref(), selected.as_ref());
+        self.discard_stale_draft(cx);
         // The watch follows the selected chat's host device (idempotent when
         // the target is unchanged); a boot-deferred attempt retries here too.
         self.ensure_watch(cx);
@@ -1469,6 +1469,15 @@ impl Changes {
             .into_iter()
             .filter(|comment| comment.path == path)
             .collect()
+    }
+
+    fn discard_stale_draft(&mut self, cx: &mut Context<Self>) {
+        let selected = self.state.read(cx).selected_chat.clone();
+        let owner = self.draft.as_ref().map(|draft| draft.key.clone());
+        if discard_stale_draft(&mut self.draft, owner.as_ref(), selected.as_ref()) {
+            self.sync_comment_rows(cx);
+            cx.notify();
+        }
     }
 
     fn draft_anchor(&self) -> Option<(String, CommentSide, u32)> {
@@ -1876,12 +1885,10 @@ impl Changes {
                     .as_ref()
                     .filter(|draft| draft.path == file_diff.path)
                 {
+                    // Header cites the same path the staged card and the
+                    // prompt bullet will.
                     Some(draft) => render_comment_draft(
-                        draft
-                            .old_path
-                            .as_deref()
-                            .filter(|_| draft.side == CommentSide::Old)
-                            .unwrap_or(&draft.path),
+                        draft_cite_path(draft),
                         draft.line,
                         draft.input.clone(),
                         &theme,
@@ -2422,6 +2429,14 @@ fn render_comment_card(
 
 fn comment_accent_bar(color: gpui::Hsla) -> gpui::Div {
     div().w(px(ACCENT_BAR_WIDTH)).h_full().flex_none().bg(color)
+}
+
+/// Mirrors [`DiffComment::cite_path`] for the not-yet-staged note.
+fn draft_cite_path(draft: &CommentDraft) -> &str {
+    match draft.side {
+        CommentSide::Old => draft.old_path.as_deref().unwrap_or(&draft.path),
+        CommentSide::New => &draft.path,
+    }
 }
 
 /// Fixed height, so an open draft never fights the fold tween.
