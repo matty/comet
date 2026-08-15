@@ -185,7 +185,7 @@ mod tests {
     /// placeholder — the sanitizer redacts every `String` scalar on an
     /// unlisted path regardless of whether the original value was empty.
     /// "Empty decodes as absent" can never again be demonstrated from
-    /// committed evidence once its path is excluded; see `docs/debt/D73` for
+    /// committed evidence once its path is excluded; see `docs/debt/D74` for
     /// the general shape of this trade.
     #[test]
     fn an_empty_argument_hint_is_absent_not_blank() {

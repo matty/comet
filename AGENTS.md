@@ -102,6 +102,14 @@ inherited the wrong number.
 
 ## What the providers send
 
+Sanitizing a capture for the corpus runs on an **allowlist**, not a blocklist.
+`crates/harness/src/capture/allowlist/{claude,codex}.txt` name every dotted key path whose value
+may survive; everything else becomes a numbered placeholder, and equal values share a number so
+joins across frames still work. **A field nothing on the list names is redacted by default** — the
+standing rule is "nothing decodes it, so it goes," not "nothing recognized it as sensitive." Adding
+a path to one of those files is a decision to publish that field's values forever, in this public
+repository, and `docs/testing/provider-captures.md` is the review procedure for making that call.
+
 `crates/harness/tests/corpus/observed-fields.json` is a generated snapshot of every field the
 promoted corpus shows, per provider and direction. It exists for one reason: a newly promoted
 capture, or a new CLI version's added field, **fails the suite** instead of arriving unnoticed.
