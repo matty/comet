@@ -24,6 +24,12 @@ List the supported scenarios and options without contacting a provider:
 cargo run -p comet-harness --bin comet-provider-capture -- --help
 ```
 
+That text is generated, not hand-maintained: `crates/harness/src/capture/record/scenarios.rs`'s
+`SCENARIOS` table is the single place a scenario's name, provider, purpose and argument
+requirements are declared, and both `--help` and `record()`'s own dispatch read it. There is no
+scenario name or flag requirement to keep in sync with this document — if `--help` and this
+procedure ever disagree, `--help` is current and this file is stale.
+
 **What actually makes the corpus safe to commit is `comet-provider-sanitize`'s allowlist, not a
 review step downstream of it.** `crates/harness/src/capture/allowlist/{claude,codex}.txt` name
 every dotted key path whose value may survive sanitizing, one file per provider. Everything not

@@ -143,6 +143,17 @@ one thing production shares with it is `crates/harness/src/launch.rs` — the pr
 description both use. Keep it that way: a production type that drifts into `capture/` makes
 the boundary unreadable, which is how a design doc came to record the opposite of the truth.
 
+Inside `capture/`, the recorder itself is provider-neutral. The seam is four members — spawn,
+framing, handshake, turn-complete — but only three of them live on
+`capture::record::provider::CaptureProvider` (framing, handshake, turn-complete). Spawn lives on
+each row's `launch` field in `capture::record::scenarios::SCENARIOS` instead: which launch a
+scenario needs varies per scenario as well as per provider (Claude alone needs three — bare model
+discovery, non-bare command discovery, and a run), which a provider-level `spawn` method could not
+express without a bypass. **Do not move it back onto the trait** — a first draft did exactly that
+and it could not tell `command-discovery` from `model-discovery`. Every scenario — discovery and
+run alike, for both providers — is a plain function registered as one row in that same table, the
+one `record()` dispatches from and `comet-provider-capture --help` renders.
+
 ## The gpui fork rev is load-bearing
 
 `gpui` comes from `wingleeio/zed` at a pinned rev, not from crates.io. Comet depends on

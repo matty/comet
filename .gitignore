@@ -15,3 +15,11 @@ edge/dist/
 # Leaked by 	empfile::tempdir() when TMPDIR resolves inside the checkout —
 # the codex suite's logged-in CODEX_HOME fixture creates one per run.
 .tmp*/
+
+# Leaked by the neutral-recorder capture fence tests when a hard kill (test
+# failure, Ctrl-C) skips their own tempdir cleanup. They live in the checkout
+# root on purpose — the fence under test rejects an in-temp target, so these
+# have to be created outside `std::env::temp_dir()`.
+comet-cli-approval-target-*/
+comet-fence-recheck-target-*/
+comet-fence-identity-target-*/
