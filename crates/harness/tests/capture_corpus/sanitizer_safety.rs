@@ -467,13 +467,26 @@ fn sanitizer_enforces_the_exact_claude_resume_command_grammar() {
     }
 }
 
-/// Break caught: the function demands exactly one `SESSION`-named semantic
-/// before it will treat a resume argv as legitimate. A capture whose events
-/// carry two distinct session ids (e.g. a resumed run whose events still
-/// include the ancestor session alongside the current one) must reject
-/// rather than guess which one the resume argument refers to.
+/// **Reverses an earlier ruling, deliberately.** This test previously asserted
+/// that a capture carrying two distinct session ids must *reject*, on the
+/// stated grounds that the sanitizer would otherwise "guess which one the
+/// resume argument refers to". There is no guess to make: the argv names one
+/// id literally, and `sanitize_claude_resume_argv` now looks that value up
+/// among the placeholders the events were already assigned.
+///
+/// The old rule rejected the exact shape the `resume` scenario exists to
+/// record — a resumed run whose frames still carry the ancestor session
+/// alongside the current one — with an error naming invalid resume arguments,
+/// which points a reader at the argv rather than at the second id. It survived
+/// only because Claude reuses one session id across a resume today, so the
+/// committed corpus never produced a second. A capture that spawns a subagent
+/// would.
+///
+/// What the reversal must not cost is the safety property underneath, and does
+/// not: the raw id still never survives, and an argv naming an id the events
+/// never carried still rejects (below).
 #[test]
-fn sanitizer_requires_the_claude_resume_command_to_map_the_sole_session_semantic() {
+fn a_resume_argv_maps_its_own_id_when_the_capture_holds_two_sessions() {
     let temp = tempfile::tempdir().unwrap();
     let raw = write_raw_capture(
         temp.path(),
@@ -491,13 +504,50 @@ fn sanitizer_requires_the_claude_resume_command_to_map_the_sole_session_semantic
     std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
     let output = staging_dir(temp.path(), "multiple-session-semantics");
 
+    let report = sanitize_dir(&raw, &output).expect("two session ids must not reject the capture");
+
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+    let argv = manifest["command"]["args"][0].as_str().unwrap();
+    assert!(
+        !argv.contains("first-session") && !argv.contains("second-session"),
+        "no raw session id may survive in argv: {argv}"
+    );
+    // The argv must carry the placeholder its *own* id was given, which is the
+    // one the first frame's `session_id` was redacted to -- not the second's.
+    let events = std::str::from_utf8(&report.events_bytes).unwrap();
+    let first_frame: Value = serde_json::from_str(events.lines().next().unwrap()).unwrap();
+    let first_payload: Value =
+        serde_json::from_str(first_frame["payload"].as_str().unwrap()).unwrap();
+    let first_placeholder = first_payload["session_id"].as_str().unwrap();
+    assert_eq!(argv, format!("--resume={first_placeholder}"));
+}
+
+/// The safety half of the reversal above: an argv naming an id no frame ever
+/// carried means the command is not what the capture claims, and that still
+/// stops promotion rather than being sanitized away.
+#[test]
+fn sanitizer_rejects_a_resume_argv_naming_a_session_id_the_events_never_carried() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "unseen-session-semantics",
+        &[r#"{"type":"system","session_id":"observed-session"}"#],
+    );
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    capture["scenario"] = Value::String("resume".into());
+    capture["command"]["args"] = serde_json::json!(["--resume=never-observed-session"]);
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+    let output = staging_dir(temp.path(), "unseen-session-semantics");
+
     let error = sanitize_dir(&raw, &output).unwrap_err();
     assert!(matches!(
         error,
         SanitizationError::InvalidClaudeResumeCommand { .. }
     ));
-    assert!(!error.to_string().contains("first-session"));
-    assert!(!error.to_string().contains("second-session"));
+    assert!(!error.to_string().contains("never-observed-session"));
+    assert!(!error.to_string().contains("observed-session"));
     assert!(!output.exists());
 }
 

@@ -404,11 +404,20 @@ mod tests {
         files
     }
 
+    /// An unreadable entry panics rather than being filtered out. Skipping one
+    /// silently would let this file's corpus walk visit a subset of the archive
+    /// and still report a green pass — a coverage test that quietly covered
+    /// less is worse than one that fails.
     fn subdirectories(parent: &std::path::Path) -> Vec<std::path::PathBuf> {
         std::fs::read_dir(parent)
             .unwrap_or_else(|error| panic!("{}: {error}", parent.display()))
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
+            .map(|entry| {
+                entry
+                    .unwrap_or_else(|error| {
+                        panic!("{}: unreadable entry: {error}", parent.display())
+                    })
+                    .path()
+            })
             .filter(|path| path.is_dir())
             .collect()
     }

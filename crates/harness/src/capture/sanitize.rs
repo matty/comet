@@ -86,6 +86,8 @@ pub enum SanitizationError {
     SensitiveObjectKey { location: String },
     #[error("capture contains an object key that would impersonate a nested path at {location}")]
     AmbiguousObjectKey { location: String },
+    #[error("capture contains a value shaped like a generated placeholder at {location}")]
+    PlaceholderShapedValue { location: String },
     #[error("capture channel contains unparseable structured JSON at sequence {sequence}")]
     UnparseableStructuredPayload { sequence: u64 },
     #[error("Claude capture command has invalid resume arguments at {location}")]
@@ -707,6 +709,11 @@ impl Redactor {
         let path_allowed = allows(provider, path);
         if path_allowed && !is_mcp_tool_identity(value) {
             if let Value::String(text) = value {
+                if is_generated_placeholder_shape(text) {
+                    return Err(SanitizationError::PlaceholderShapedValue {
+                        location: location.to_owned(),
+                    });
+                }
                 self.sanitize_paths_and_validate(text, location)?;
             }
             return Ok(());
@@ -776,16 +783,7 @@ impl Redactor {
     /// capture always numbers the same way — the property the publication
     /// tests assert on as byte determinism.
     fn resolve(&mut self, value: &Value, fallback_group: Option<&'static str>) -> String {
-        for (&name, group) in &self.named {
-            if let Some((_, placeholder)) = group.iter().find(|(known, _)| known == value) {
-                let placeholder = placeholder.clone();
-                *self.counts.entry(name.to_ascii_lowercase()).or_default() += 1;
-                return placeholder;
-            }
-        }
-        if let Some((_, placeholder)) = self.generic.iter().find(|(known, _)| known == value) {
-            let placeholder = placeholder.clone();
-            *self.counts.entry("v".to_owned()).or_default() += 1;
+        if let Some(placeholder) = self.existing_placeholder(value) {
             return placeholder;
         }
         match fallback_group {
@@ -803,6 +801,26 @@ impl Redactor {
                 placeholder
             }
         }
+    }
+
+    /// The placeholder `value` was already assigned, in whichever group it
+    /// landed in, counting the reuse — or `None` if this sanitizer has never
+    /// seen the value. Never allocates a new placeholder, which is what makes
+    /// it usable as a *lookup* by callers that must not invent one.
+    fn existing_placeholder(&mut self, value: &Value) -> Option<String> {
+        for (&name, group) in &self.named {
+            if let Some((_, placeholder)) = group.iter().find(|(known, _)| known == value) {
+                let placeholder = placeholder.clone();
+                *self.counts.entry(name.to_ascii_lowercase()).or_default() += 1;
+                return Some(placeholder);
+            }
+        }
+        if let Some((_, placeholder)) = self.generic.iter().find(|(known, _)| known == value) {
+            let placeholder = placeholder.clone();
+            *self.counts.entry("v".to_owned()).or_default() += 1;
+            return Some(placeholder);
+        }
+        None
     }
 
     fn sanitize_nonsemantic_value(
@@ -918,28 +936,34 @@ impl Redactor {
             .as_str()
             .and_then(|arg| arg.strip_prefix("--resume="))
             .filter(|session_id| !session_id.is_empty())
+            .map(str::to_owned)
         else {
             return Err(SanitizationError::InvalidClaudeResumeCommand {
                 location: "command.args".to_owned(),
             });
         };
-        let Some([(original, placeholder)]) = self.named.get("SESSION").map(Vec::as_slice) else {
+        // Looked up by the value in argv, not by reading whatever single
+        // entry the SESSION group happens to hold. The requirement is
+        // unchanged — this id must be one the events already redacted, so a
+        // capture whose argv disagrees with its own frames still stops — but
+        // reading the group directly made two ordinary captures fail with a
+        // message about invalid resume arguments:
+        //
+        //   * the id first appearing under a key `named_kind` does not name
+        //     (it takes the generic `<Vn>` group, and nothing ever populates
+        //     SESSION), and
+        //   * any capture holding a *second* distinct session id, which a
+        //     resume that spawns a subagent produces — the old code required
+        //     the group to be exactly one element long.
+        //
+        // Neither is reachable in the committed corpus, which is why both
+        // survived to be found by review rather than by a red test.
+        let Some(placeholder) = self.existing_placeholder(&Value::String(raw_session_id)) else {
             return Err(SanitizationError::InvalidClaudeResumeCommand {
                 location: "command.args".to_owned(),
             });
         };
-        let Some(original) = original.as_str().filter(|value| !value.is_empty()) else {
-            return Err(SanitizationError::InvalidClaudeResumeCommand {
-                location: "command.args".to_owned(),
-            });
-        };
-        if raw_session_id != original {
-            return Err(SanitizationError::InvalidClaudeResumeCommand {
-                location: "command.args".to_owned(),
-            });
-        }
         args[index] = Value::String(format!("--resume={placeholder}"));
-        *self.counts.entry("session".to_owned()).or_default() += 1;
         Ok(())
     }
 
@@ -1083,6 +1107,43 @@ fn is_secret_field(field: &str, value: &Value) -> bool {
 /// present and deliberately undecoded, so by the standing "nothing decodes
 /// it" rule it should not have been on the list regardless of the prefix
 /// gap.
+/// Whether `text` is shaped like a placeholder this sanitizer *generates* —
+/// `<V12>`, or a named group with a trailing number (`<SESSION_1>`,
+/// `<PROSE_3>`).
+///
+/// A literal of that shape surviving on an allowlisted path is not safe to
+/// keep, because placeholder identity is the archive's join key: equal
+/// placeholder means equal original. An allowlisted `"<V1>"` sitting beside a
+/// withheld value that was independently assigned `<V1>` reads as a join
+/// between two things that were never equal. It cannot be fixed by reserving
+/// the name at generation time either — the colliding literal can arrive in a
+/// frame *after* the number was handed out — so the capture is rejected and
+/// the collision never enters the archive.
+///
+/// The seven path-root placeholders `Redactor::new` writes (`<HOME>`,
+/// `<CODEX_HOME>`, `<TRUSTED_POWERSHELL>`, …) are deliberately **not** this
+/// shape: none ends in `_<digits>`. That matters because
+/// `sanitize_paths_and_validate` legitimately puts them *inside* allowlisted
+/// strings, and the archive re-pass documented in `provider-captures.md`
+/// feeds text already carrying them back through. Rejecting those would break
+/// a workflow that is working; rejecting a numbered one catches a genuine
+/// ambiguity.
+fn is_generated_placeholder_shape(text: &str) -> bool {
+    let Some(inner) = text
+        .strip_prefix('<')
+        .and_then(|text| text.strip_suffix('>'))
+    else {
+        return false;
+    };
+    let numbered_generic = inner.strip_prefix('V').is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    let numbered_named = inner.rsplit_once('_').is_some_and(|(name, number)| {
+        !name.is_empty() && !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    numbered_generic || numbered_named
+}
+
 fn is_mcp_tool_identity(value: &Value) -> bool {
     value.as_str().is_some_and(|text| text.starts_with("mcp__"))
 }
@@ -1599,7 +1660,10 @@ mod tests {
 
     use serde_json::{Value, json};
 
-    use super::{Redactor, SanitizationError, SanitizationReport, render_novel_paths_report};
+    use super::{
+        Redactor, SanitizationError, SanitizationReport, is_generated_placeholder_shape,
+        render_novel_paths_report,
+    };
     use crate::capture::types::Provider;
 
     /// Runs one JSON value through the allowlist redactor without touching the
@@ -1928,6 +1992,131 @@ mod tests {
                 .any(|novel| novel.path == ".modelUsage.{}"),
             "the withheld key must still be reported at its map position: {:?}",
             report.novel_paths
+        );
+    }
+
+    /// Placeholder identity is the archive's join key — equal placeholder
+    /// means equal original — so a literal already shaped like a generated
+    /// placeholder cannot be allowed to survive beside one. Here `.method` is
+    /// allowlisted and holds `<V1>`, while `.mystery` is withheld and would be
+    /// independently assigned `<V1>`: two values that were never equal reading
+    /// as joined.
+    #[test]
+    fn a_placeholder_shaped_literal_on_an_allowlisted_path_rejects() {
+        let outcome = try_sanitize_value(
+            json!({"method": "<V1>", "mystery": "genuinely-different"}),
+            Provider::Codex,
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(SanitizationError::PlaceholderShapedValue { .. })
+            ),
+            "a generated-placeholder-shaped literal must reject, got {outcome:?}"
+        );
+    }
+
+    /// The seven path-root placeholders are deliberately not that shape, and
+    /// must keep riding through allowlisted strings: `sanitize_paths_and_
+    /// validate` writes them there itself, and the archive re-pass documented
+    /// in `provider-captures.md` feeds text already carrying them back in.
+    /// Rejecting those would break a workflow that works.
+    #[test]
+    fn a_path_root_placeholder_is_not_a_generated_shape() {
+        for root in [
+            "<CWD>",
+            "<REPO>",
+            "<HOME>",
+            "<TEMP>",
+            "<CODEX_HOME>",
+            "<APPROVAL_TARGET>",
+            "<TRUSTED_POWERSHELL>",
+        ] {
+            assert!(
+                !is_generated_placeholder_shape(root),
+                "{root} must not read as a generated placeholder"
+            );
+        }
+        for generated in ["<V1>", "<V42>", "<SESSION_1>", "<PROSE_3>", "<TOOL_USE_12>"] {
+            assert!(
+                is_generated_placeholder_shape(generated),
+                "{generated} must read as a generated placeholder"
+            );
+        }
+    }
+
+    /// A resumed capture whose session id first appears under a key
+    /// `named_kind` does not name takes the generic `<Vn>` group, so nothing
+    /// ever populates `named["SESSION"]`. Reading that group directly rejected
+    /// the whole capture with a message about invalid resume arguments;
+    /// looking the argv value up wherever it landed replaces it correctly.
+    #[test]
+    fn a_resume_argv_resolves_a_session_id_first_seen_under_an_unnamed_key() {
+        let mut redactor = Redactor::default();
+        let mut payload = json!({"echo": "sess-abc", "session_id": "sess-abc"});
+        redactor
+            .sanitize_value_tree(&mut payload, Provider::Claude, "", "", "value")
+            .expect("the payload sanitizes");
+        let mut command = json!({"args": ["--resume=sess-abc"]});
+
+        redactor
+            .sanitize_claude_resume_argv(&mut command, "resume")
+            .expect("a session id seen under any key still resolves");
+
+        let redacted = command["args"][0].as_str().expect("argv stays a string");
+        assert_ne!(redacted, "--resume=sess-abc", "the raw id must not survive");
+        assert_eq!(
+            redacted,
+            format!("--resume={}", payload["session_id"].as_str().unwrap()),
+            "argv must carry the same placeholder the events got, or the join breaks"
+        );
+    }
+
+    /// The likelier trigger of the same bug: a resume that spawns a subagent
+    /// carries a second distinct session id, and the old code required the
+    /// SESSION group to be exactly one element long.
+    #[test]
+    fn a_resume_argv_resolves_when_the_capture_holds_two_session_ids() {
+        let mut redactor = Redactor::default();
+        let mut payload =
+            json!({"session_id": "sess-parent", "child": {"session_id": "sess-child"}});
+        redactor
+            .sanitize_value_tree(&mut payload, Provider::Claude, "", "", "value")
+            .expect("the payload sanitizes");
+        let mut command = json!({"args": ["--resume=sess-parent"]});
+
+        redactor
+            .sanitize_claude_resume_argv(&mut command, "resume")
+            .expect("a second session id must not reject the capture");
+
+        assert_eq!(
+            command["args"][0].as_str().unwrap(),
+            format!("--resume={}", payload["session_id"].as_str().unwrap()),
+            "argv must resolve to the parent's placeholder, not the child's"
+        );
+    }
+
+    /// The requirement that made the old lookup worth having is unchanged: an
+    /// argv id the events never carried means the command is not what the
+    /// capture claims, and that still stops promotion rather than being
+    /// sanitized away.
+    #[test]
+    fn a_resume_argv_naming_an_unseen_session_id_still_rejects() {
+        let mut redactor = Redactor::default();
+        let mut payload = json!({"session_id": "sess-abc"});
+        redactor
+            .sanitize_value_tree(&mut payload, Provider::Claude, "", "", "value")
+            .expect("the payload sanitizes");
+        let mut command = json!({"args": ["--resume=sess-never-observed"]});
+
+        let outcome = redactor.sanitize_claude_resume_argv(&mut command, "resume");
+
+        assert!(
+            matches!(
+                outcome,
+                Err(SanitizationError::InvalidClaudeResumeCommand { .. })
+            ),
+            "an argv id absent from the events must reject, got {outcome:?}"
         );
     }
 

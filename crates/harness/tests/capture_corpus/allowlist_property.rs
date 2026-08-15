@@ -538,11 +538,17 @@ fn manifest_provider_and_placeholders(
     (provider, placeholders)
 }
 
+/// An unreadable entry panics rather than being filtered out. Every property in
+/// this file is total over the corpus, and a walk that silently skipped a
+/// subtree would report the property as holding over evidence it never read.
 fn subdirectories(parent: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(parent)
         .unwrap_or_else(|error| panic!("{}: {error}", parent.display()))
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| panic!("{}: unreadable entry: {error}", parent.display()))
+                .path()
+        })
         .filter(|path| path.is_dir())
         .collect()
 }
