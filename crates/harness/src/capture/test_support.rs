@@ -5,7 +5,7 @@ use comet_proto::{ReasoningLevel, RunRequest, RuntimeMode};
 use serde_json::json;
 
 use super::approval::repository_root;
-use super::{CaptureConfig, CaptureOperation, CaptureScenario, Channel, RawCapture};
+use super::{CaptureConfig, Channel, RawCapture};
 
 pub(super) fn contract_request() -> RunRequest {
     let mut request = RunRequest {
@@ -96,20 +96,26 @@ pub(super) fn isolated_approval_target(prefix: &str) -> Option<tempfile::TempDir
     None
 }
 
+/// A minimal [`CaptureConfig`] for tests that drive `Session::start` or a
+/// scenario body directly. `name` need only match a real `SCENARIOS` row
+/// name for the tests that call `record()` itself (which looks the row up
+/// by name) — every other test call site uses it purely as a label for the
+/// raw capture directory and `capture.scenario`.
 pub(super) fn config(
     name: &'static str,
     executable: PathBuf,
-    operation: CaptureOperation,
+    provider: &'static str,
     raw_root: &Path,
 ) -> CaptureConfig {
     CaptureConfig {
-        scenario: CaptureScenario {
-            name,
-            purpose: "local recorder test",
-            operation,
-        },
+        provider,
+        scenario_name: name,
+        purpose: "local recorder test",
         executable: Some(executable),
         codex_home: None,
+        cwd: None,
+        resume_id: None,
+        attachment: None,
         approval_target: None,
         raw_root: raw_root.into(),
         timeout: Duration::from_secs(5),

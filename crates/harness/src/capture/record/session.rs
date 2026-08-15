@@ -45,22 +45,31 @@ fn provider_display_name(provider: Provider) -> &'static str {
 }
 
 /// What the pre-spawn fence validated and needs to survive into the raw
-/// capture's redaction roots. Today (discovery only) it is always
-/// [`FenceOutcome::none`]; the approval tasks populate it from
-/// `capture/safety.rs`'s checks.
+/// capture's redaction roots, plus (for the one scenario that needs it) a
+/// closure that re-runs the identity check right before spawn.
 pub(super) struct FenceOutcome {
     pub(super) approval_target: Option<PathBuf>,
     // Read by `record/scenarios/codex.rs`'s `approval_on_request`, as the
     // expected identity for its grant-time `require_empty_approval_target`
-    // recheck (Task 6). Claude's `approval` (Task 4) needs no such recheck —
-    // it has no filesystem identity to protect the way a Codex approval
-    // target does — so this stays Codex-only.
+    // recheck. Claude's `approval` needs no such recheck — it has no
+    // filesystem identity to protect the way a Codex approval target does —
+    // so this stays Codex-only.
     pub(super) approval_target_identity: Option<DirectoryIdentity>,
     // Read by `record/scenarios/codex.rs`'s `approval`, as the expected
-    // identity for its grant-time `validate_ordinary_approval_cwd` recheck
-    // (Task 6). Same Codex-only note as above.
+    // identity for its grant-time `validate_ordinary_approval_cwd` recheck.
+    // Same Codex-only note as above.
     pub(super) approval_cwd_identity: Option<DirectoryIdentity>,
     pub(super) trusted_powershell: Option<FileIdentity>,
+    /// Re-validates the identity captured above, right before spawn — the
+    /// TOCTOU window between `record.rs` building this `FenceOutcome` (which
+    /// can involve real filesystem I/O) and `Session::start` actually
+    /// launching the child (after `create_dir_all`, `probe_version`'s own
+    /// subprocess round trip, and everything else `start` does first). Only
+    /// `record::record_codex`'s `approval-on-request` fence sets this today
+    /// — see its own doc comment for why the ordinary `approval` fence does
+    /// not need a second check here (its protection continues at grant
+    /// time, inside the scenario body, via `approval_cwd_identity` above).
+    pub(super) recheck: Option<Box<dyn FnOnce() -> anyhow::Result<()> + Send>>,
 }
 
 impl FenceOutcome {
@@ -70,6 +79,7 @@ impl FenceOutcome {
             approval_target_identity: None,
             approval_cwd_identity: None,
             trusted_powershell: None,
+            recheck: None,
         }
     }
 }
@@ -102,7 +112,7 @@ impl<P: CaptureProvider> Session<P> {
         provider: P,
         config: &CaptureConfig,
         launch: LaunchDescriptor,
-        fence: FenceOutcome,
+        mut fence: FenceOutcome,
     ) -> anyhow::Result<Self> {
         let command = CommandSnapshot::from_launch(&launch);
         let cli_version = probe_version(&launch.program).await;
@@ -118,7 +128,7 @@ impl<P: CaptureProvider> Session<P> {
         let directory = config.raw_root.join(format!(
             "{}-{}-{}",
             P::NAME,
-            config.scenario.name,
+            config.scenario_name,
             uuid::Uuid::new_v4()
         ));
         tokio::fs::create_dir_all(&directory).await.map_err(|err| {
@@ -127,6 +137,12 @@ impl<P: CaptureProvider> Session<P> {
                 "Raw capture storage could not be created. Check --raw-root permissions and try again."
             )
         })?;
+
+        // The TOCTOU recheck, immediately before spawn — see `FenceOutcome::recheck`'s own doc
+        // comment for why this window exists and why only `approval-on-request` populates it.
+        if let Some(recheck) = fence.recheck.take() {
+            recheck()?;
+        }
 
         let mut child = launch.command().spawn().map_err(|err| {
             tracing::debug!(provider = P::NAME, cli = %launch.program.display(), %err, "capture provider spawn failed");
@@ -187,8 +203,8 @@ impl<P: CaptureProvider> Session<P> {
             directory,
             cli_version,
             captured_at_unix_ms,
-            scenario: config.scenario.name.into(),
-            purpose: config.scenario.purpose.into(),
+            scenario: config.scenario_name.into(),
+            purpose: config.purpose.into(),
             command,
             fence,
             child: Some(child),
@@ -264,12 +280,6 @@ impl<P: CaptureProvider> Session<P> {
     }
 
     /// Pump frames until `P::turn_complete`.
-    ///
-    /// Unused by production code until the SCENARIOS table wires a run
-    /// scenario's `body` in (Task 7); the run-scenario bodies written in
-    /// Tasks 2, 3 and 5 are its callers in the meantime, exercised only by
-    /// each scenario file's own tests.
-    #[allow(dead_code)]
     pub(super) async fn wait_for_turn_end(&mut self) -> anyhow::Result<()> {
         while let Some(frame) = self.next_frame().await? {
             if P::turn_complete(&frame) {
@@ -651,7 +661,6 @@ mod tests {
     use crate::capture::record::providers::claude::ClaudeProvider;
     use crate::capture::record::scenarios::ScenarioInput;
     use crate::capture::test_support::{config, find_named_file, fixture_path};
-    use crate::capture::types::{CaptureOperation, ClaudeCaptureOperation};
 
     /// The new behavior this task adds: `next_frame` records a non-JSON
     /// stdout line (on the stdout channel) and keeps pumping instead of
@@ -668,7 +677,7 @@ mod tests {
         let cfg = config(
             "claude-non-frame-tolerance",
             executable,
-            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
+            "claude",
             raw.path(),
         );
         let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
@@ -783,12 +792,7 @@ mod tests {
         let launch =
             crate::capture::record::scenarios::claude::model_discovery_launch(&input, &executable)
                 .unwrap();
-        let cfg = config(
-            "claude-finish-deadline",
-            executable,
-            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
-            raw.path(),
-        );
+        let cfg = config("claude-finish-deadline", executable, "claude", raw.path());
         let session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
             .await
             .unwrap();
@@ -809,12 +813,7 @@ mod tests {
         let launch =
             crate::capture::record::scenarios::claude::model_discovery_launch(&input, &executable)
                 .unwrap();
-        let cfg = config(
-            "claude-wait-error",
-            executable,
-            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
-            raw.path(),
-        );
+        let cfg = config("claude-wait-error", executable, "claude", raw.path());
         let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
             .await
             .unwrap();
@@ -854,12 +853,7 @@ mod tests {
             ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
         };
         let launch = crate::claude::run_launch(&executable, &request);
-        let cfg = config(
-            "claude-drop",
-            executable,
-            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
-            raw.path(),
-        );
+        let cfg = config("claude-drop", executable, "claude", raw.path());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -897,12 +891,7 @@ mod tests {
         let launch =
             crate::capture::record::scenarios::claude::model_discovery_launch(&input, &missing)
                 .unwrap();
-        let cfg = config(
-            "claude-pre-spawn-failure",
-            missing,
-            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
-            raw.path(),
-        );
+        let cfg = config("claude-pre-spawn-failure", missing, "claude", raw.path());
         let result = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none()).await;
         let error = result
             .err()
@@ -938,9 +927,7 @@ mod tests {
         let cfg = config(
             "claude-partial-write-failure",
             executable,
-            CaptureOperation::Claude(ClaudeCaptureOperation::CommandDiscovery {
-                cwd: cwd.path().into(),
-            }),
+            "claude",
             raw.path(),
         );
         let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
@@ -967,6 +954,82 @@ mod tests {
         assert_eq!(
             std::fs::read(directory.join("partial-capture.json")).unwrap(),
             b"existing quarantine"
+        );
+    }
+
+    /// Break caught: `start` stops calling `fence.recheck` at all (e.g. the call this task added
+    /// right after `create_dir_all` is deleted, or never wired in the first place). Every other
+    /// test in this file uses `FenceOutcome::none()`, whose `recheck` is always `None`, so none of
+    /// them can tell whether `start` actually invokes a `Some(recheck)` it was handed — this
+    /// drives that invocation directly and observably, independent of `record::codex_fence`'s own
+    /// construction of the closure (covered separately in `record.rs`'s tests).
+    #[tokio::test]
+    async fn start_runs_the_fence_recheck_after_directory_creation_and_before_spawn() {
+        let raw = tempfile::tempdir().unwrap();
+        let executable = fixture_path("fake-claude");
+        let input = ScenarioInput::default();
+        let launch =
+            crate::capture::record::scenarios::claude::model_discovery_launch(&input, &executable)
+                .unwrap();
+        let cfg = config(
+            "claude-fence-recheck-runs",
+            executable,
+            "claude",
+            raw.path(),
+        );
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        let fence = FenceOutcome {
+            recheck: Some(Box::new(move || {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            })),
+            ..FenceOutcome::none()
+        };
+
+        let session = Session::start(ClaudeProvider, &cfg, launch, fence)
+            .await
+            .unwrap();
+
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "Session::start must run a Some(recheck) it was handed"
+        );
+        drop(session);
+    }
+
+    /// Break caught: `start` runs `fence.recheck` but ignores its `Err`, spawning the provider
+    /// anyway instead of aborting before it — the TOCTOU protection `FenceOutcome::recheck` exists
+    /// for would then be advisory only.
+    #[tokio::test]
+    async fn start_aborts_before_spawn_when_the_fence_recheck_fails() {
+        let raw = tempfile::tempdir().unwrap();
+        let executable = fixture_path("fake-claude");
+        let input = ScenarioInput::default();
+        let launch =
+            crate::capture::record::scenarios::claude::model_discovery_launch(&input, &executable)
+                .unwrap();
+        let cfg = config(
+            "claude-fence-recheck-aborts",
+            executable,
+            "claude",
+            raw.path(),
+        );
+        let fence = FenceOutcome {
+            recheck: Some(Box::new(|| {
+                anyhow::bail!("synthetic recheck failure — the target changed underneath us")
+            })),
+            ..FenceOutcome::none()
+        };
+
+        let error = match Session::start(ClaudeProvider, &cfg, launch, fence).await {
+            Ok(_) => panic!("a failing recheck must abort before spawn"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("synthetic recheck failure"),
+            "{error}"
         );
     }
 

@@ -71,12 +71,5 @@ pub(super) trait CaptureProvider: Sized {
     ) -> anyhow::Result<()>;
 
     /// TURN-COMPLETE. Which frame means "stop recording".
-    ///
-    /// Unused by production code until the SCENARIOS table wires a run
-    /// scenario's `body` in (Task 7); Tasks 2, 3 and 5 write the callers
-    /// (`Session::wait_for_turn_end`) in the meantime, exercised only by each
-    /// scenario file's own tests. Covered directly by each provider's own
-    /// unit tests as well.
-    #[allow(dead_code)]
     fn turn_complete(frame: &Value) -> bool;
 }

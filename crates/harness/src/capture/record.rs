@@ -1,12 +1,10 @@
 //! The provider-neutral capture recorder.
 //!
-//! `record()` is the entry point: it dispatches a [`CaptureConfig`] onto
-//! either the new [`Session`]/[`CaptureProvider`] machinery (currently: the
-//! four discovery scenarios) or, for everything not yet ported, the
-//! still-live `capture::recording` module. Both halves compile and both are
-//! exercised — the standing hazard while this split exists is a scenario
-//! left behind in *both* places, which is why each porting task deletes the
-//! arm it moves out of `recording.rs`, not merely copies it.
+//! `record()` is the entry point: it looks `(config.provider,
+//! config.scenario_name)` up in [`scenarios::SCENARIOS`] and dispatches
+//! straight to the [`Session`]/[`CaptureProvider`] machinery. There is no
+//! second path any more — every scenario, discovery and run alike, is a
+//! table row.
 
 mod provider;
 mod providers;
@@ -14,86 +12,47 @@ mod scenarios;
 mod session;
 
 use std::future::Future;
-use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use provider::CaptureProvider;
 use providers::claude::ClaudeProvider;
 use providers::codex::CodexProvider;
-use scenarios::ScenarioInput;
+pub use scenarios::{Requirements, SCENARIOS, ScenarioSpec, scenario};
+use scenarios::{ScenarioBody, ScenarioInput};
 use session::{FenceOutcome, Session};
 
-use crate::capture::types::{
-    CaptureConfig, CaptureOperation, ClaudeCaptureOperation, CodexCaptureOperation,
-    PartialFailureClass, Provider, RawCapture,
-};
+use crate::capture::types::{CaptureConfig, PartialFailureClass, Provider, RawCapture};
 use crate::launch::LaunchDescriptor;
 
 /// Record one explicitly selected provider scenario into ignored raw
-/// storage.
+/// storage. `config.provider`/`config.scenario_name` must name a row in
+/// [`SCENARIOS`] — the binary only ever reaches this after `scenario()`
+/// resolved the same pair, so a caller that violates it is a programming
+/// error, not a user-facing one.
 pub async fn record(config: CaptureConfig) -> anyhow::Result<RawCapture> {
-    let (provider_str, name, input) = match config.scenario.operation.clone() {
-        CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery) => {
-            ("claude", "model-discovery", ScenarioInput::default())
-        }
-        CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscoveryAt { cwd }) => (
-            "claude",
-            "model-discovery-project-cwd",
-            ScenarioInput {
-                cwd: Some(cwd),
-                ..ScenarioInput::default()
-            },
-        ),
-        CaptureOperation::Claude(ClaudeCaptureOperation::CommandDiscovery { cwd }) => (
-            "claude",
-            "command-discovery",
-            ScenarioInput {
-                cwd: Some(cwd),
-                ..ScenarioInput::default()
-            },
-        ),
-        CaptureOperation::Codex(CodexCaptureOperation::ModelDiscovery) => (
-            "codex",
-            "model-discovery",
-            ScenarioInput {
-                codex_home: config.codex_home.clone(),
-                ..ScenarioInput::default()
-            },
-        ),
-        CaptureOperation::Codex(CodexCaptureOperation::ModelDiscoveryAt { cwd }) => (
-            "codex",
-            "model-discovery-project-cwd",
-            ScenarioInput {
-                cwd: Some(cwd),
-                codex_home: config.codex_home.clone(),
-                ..ScenarioInput::default()
-            },
-        ),
-        // Run scenarios: not yet ported (Tasks 2-6). `recording::record`
-        // still owns their spawn, drive and finish end to end.
-        _ => return crate::capture::recording::record(config).await,
+    let spec = scenario(config.provider, config.scenario_name).unwrap_or_else(|| {
+        panic!(
+            "{}/{} must be registered in SCENARIOS",
+            config.provider, config.scenario_name
+        )
+    });
+    let input = ScenarioInput {
+        cwd: config.cwd.clone(),
+        resume_id: config.resume_id.clone(),
+        attachment: config.attachment.clone(),
+        codex_home: config.codex_home.clone(),
+        approval_target: config.approval_target.clone(),
     };
-    // The canonical name picked above must be a real row: this is the table
-    // `record()` actually dispatches through, not a name that merely looks
-    // right in a match arm — see the amendment on `CaptureProvider`'s doc
-    // comment for why `launch` moved here.
-    let spec = scenarios::scenario(provider_str, name)
-        .unwrap_or_else(|| panic!("{provider_str}/{name} must be registered in SCENARIOS"));
     match &spec.body {
-        scenarios::ScenarioBody::Claude(body) => {
-            record_claude(&config, spec.launch, input, *body).await
-        }
-        scenarios::ScenarioBody::Codex(body) => {
-            record_codex(&config, spec.launch, input, *body).await
-        }
+        ScenarioBody::Claude(body) => record_claude(&config, spec, input, *body).await,
+        ScenarioBody::Codex(body) => record_codex(&config, spec, input, *body).await,
     }
 }
 
-type LaunchFn = fn(&ScenarioInput, &Path) -> anyhow::Result<LaunchDescriptor>;
-
 async fn record_claude(
     config: &CaptureConfig,
-    launch: LaunchFn,
+    spec: &ScenarioSpec,
     input: ScenarioInput,
     body: ScenarioBodyFn<ClaudeProvider>,
 ) -> anyhow::Result<RawCapture> {
@@ -104,13 +63,25 @@ async fn record_claude(
             .clone()
             .or_else(crate::claude::resolve_claude_executable),
     )?;
-    let launch = launch(&input, &executable)?;
-    record_generic(ClaudeProvider, config, launch, input, body).await
+    let launch = (spec.launch)(&input, &executable)?;
+    // Claude has no pre-spawn fence today: `approval` (its only scenario
+    // with an approval surface) protects no filesystem identity the way a
+    // Codex approval target or cwd does — see `record/scenarios/claude.rs`'s
+    // `approval` doc comment.
+    record_generic(
+        ClaudeProvider,
+        config,
+        launch,
+        input,
+        body,
+        FenceOutcome::none(),
+    )
+    .await
 }
 
 async fn record_codex(
     config: &CaptureConfig,
-    launch: LaunchFn,
+    spec: &ScenarioSpec,
     input: ScenarioInput,
     body: ScenarioBodyFn<CodexProvider>,
 ) -> anyhow::Result<RawCapture> {
@@ -121,8 +92,85 @@ async fn record_codex(
             .clone()
             .or_else(crate::codex::resolve_codex_executable),
     )?;
-    let launch = launch(&input, &executable)?;
-    record_generic(CodexProvider::new(), config, launch, input, body).await
+    let launch = (spec.launch)(&input, &executable)?;
+    let fence = codex_fence(spec, config, &launch)?;
+    record_generic(CodexProvider::new(), config, launch, input, body, fence).await
+}
+
+/// Builds the pre-spawn fence for the two Codex scenarios that need one.
+/// Every other scenario (every Claude row, and every Codex row but
+/// `approval`/`approval-on-request`) gets [`FenceOutcome::none`].
+///
+/// This is the pre-spawn fence decision #6 in the stage plan requires stay —
+/// `crate::capture::approval`'s checks ran inside `recording.rs`'s
+/// `RecordingSession::start` before this task deleted that file; this is
+/// their new home, run before `Session::start` is even called.
+fn codex_fence(
+    spec: &ScenarioSpec,
+    config: &CaptureConfig,
+    launch: &LaunchDescriptor,
+) -> anyhow::Result<FenceOutcome> {
+    let launch_cwd = || -> anyhow::Result<PathBuf> {
+        launch.cwd.clone().ok_or_else(|| {
+            anyhow::anyhow!("Codex approval capture requires a resolved working directory.")
+        })
+    };
+
+    if spec.requirements.needs_approval_target {
+        // `approval-on-request`: a non-repository cwd and an empty,
+        // identity-stable, isolated approval target. Checked once here
+        // (matching `record_codex`'s own call), and RECHECKED right before
+        // spawn (`FenceOutcome::recheck`, run inside `Session::start`) — the
+        // window between this call (which can involve real filesystem I/O)
+        // and the eventual spawn (after directory creation and a
+        // `--version` probe) is exactly the race
+        // `crate::capture::approval::validate_on_request_preflight`'s
+        // doc comment and `docs/testing/provider-captures.md` describe.
+        let cwd = launch_cwd()?;
+        let target = config.approval_target.clone();
+        let identity =
+            crate::capture::approval::validate_on_request_preflight(&cwd, target.as_deref())?;
+        let recheck_cwd = cwd.clone();
+        let recheck_target = target.clone();
+        let recheck_identity = identity.clone();
+        return Ok(FenceOutcome {
+            approval_target: target,
+            approval_target_identity: identity,
+            approval_cwd_identity: None,
+            trusted_powershell: None,
+            recheck: Some(Box::new(move || {
+                let spawn_identity = crate::capture::approval::validate_on_request_preflight(
+                    &recheck_cwd,
+                    recheck_target.as_deref(),
+                )?;
+                if spawn_identity != recheck_identity {
+                    anyhow::bail!(
+                        "Codex on-request approval target changed identity before provider spawn."
+                    );
+                }
+                Ok(())
+            })),
+        });
+    }
+
+    if spec.runtime_mode == Some(comet_proto::RuntimeMode::ApprovalRequired) {
+        // `approval`: a trusted, protected-root PowerShell (Windows only —
+        // fails closed elsewhere, see `resolve_trusted_powershell`'s own
+        // doc comment) and a cwd whose identity `record::scenarios::codex::approval`
+        // rechecks at every grant, via `approval_cwd_identity` below.
+        let cwd = launch_cwd()?;
+        let trusted = crate::capture::approval::resolve_trusted_powershell(&cwd, &config.raw_root)?;
+        let identity = crate::capture::approval::validate_ordinary_approval_cwd(&cwd, None, true)?;
+        return Ok(FenceOutcome {
+            approval_target: None,
+            approval_target_identity: None,
+            approval_cwd_identity: Some(identity),
+            trusted_powershell: Some(trusted),
+            recheck: None,
+        });
+    }
+
+    Ok(FenceOutcome::none())
 }
 
 /// A scenario body: given a freshly spawned session, drive it (handshaking
@@ -163,8 +211,9 @@ async fn record_generic<P: CaptureProvider>(
     launch: LaunchDescriptor,
     input: ScenarioInput,
     body: ScenarioBodyFn<P>,
+    fence: FenceOutcome,
 ) -> anyhow::Result<RawCapture> {
-    let mut session = Session::start(provider, config, launch, FenceOutcome::none()).await?;
+    let mut session = Session::start(provider, config, launch, fence).await?;
     let deadline = tokio::time::Instant::now() + session.timeout;
     let outcome = tokio::time::timeout_at(deadline, body(&mut session, &input)).await;
     match outcome {
@@ -191,7 +240,7 @@ async fn record_generic<P: CaptureProvider>(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use serde_json::json;
@@ -338,9 +387,9 @@ mod tests {
     async fn recorder_claude_model_discovery_keeps_all_channels_and_monotonic_sequence() {
         let raw = tempfile::tempdir().unwrap();
         let capture = record(config(
-            "claude-model-discovery",
+            "model-discovery",
             fixture_path("fake-claude"),
-            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
+            "claude",
             raw.path(),
         ))
         .await
@@ -378,16 +427,14 @@ mod tests {
     async fn recorder_claude_command_discovery_uses_non_bare_initialize() {
         let raw = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let capture = record(config(
-            "claude-command-discovery",
+        let mut cfg = config(
+            "command-discovery",
             fixture_path("fake-claude"),
-            CaptureOperation::Claude(ClaudeCaptureOperation::CommandDiscovery {
-                cwd: cwd.path().into(),
-            }),
+            "claude",
             raw.path(),
-        ))
-        .await
-        .unwrap();
+        );
+        cfg.cwd = Some(cwd.path().into());
+        let capture = record(cfg).await.unwrap();
 
         assert!(!capture.command.args.iter().any(|arg| arg == "--bare"));
         assert_eq!(
@@ -403,9 +450,9 @@ mod tests {
     async fn recorder_persists_structured_host_platform() {
         let raw = tempfile::tempdir().unwrap();
         let capture = record(config(
-            "claude-platform",
+            "model-discovery-neutral-cwd",
             fixture_path("fake-claude"),
-            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
+            "claude",
             raw.path(),
         ))
         .await
@@ -427,7 +474,7 @@ mod tests {
                 .unwrap();
         assert_eq!(persisted["platform"]["os"], std::env::consts::OS);
         assert_eq!(persisted["platform"]["arch"], std::env::consts::ARCH);
-        assert_eq!(persisted["scenario"], "claude-platform");
+        assert_eq!(persisted["scenario"], "model-discovery-neutral-cwd");
         assert_eq!(persisted["purpose"], "local recorder test");
         assert!(persisted["captured_at_unix_ms"].as_i64().is_some());
         assert_eq!(
@@ -443,9 +490,9 @@ mod tests {
         let raw = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let mut cfg = config(
-            "codex-model-discovery",
+            "model-discovery",
             fixture_path("fake-codex"),
-            CaptureOperation::Codex(CodexCaptureOperation::ModelDiscovery),
+            "codex",
             raw.path(),
         );
         cfg.codex_home = Some(home.path().into());
@@ -474,9 +521,9 @@ mod tests {
     async fn recorder_timeout_kills_and_reaps_the_child() {
         let raw = tempfile::tempdir().unwrap();
         let mut cfg = config(
-            "claude-timeout",
+            "model-discovery",
             fixture_path("fake-claude-discovery-stall"),
-            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
+            "claude",
             raw.path(),
         );
         cfg.timeout = Duration::from_millis(100);
@@ -502,16 +549,14 @@ mod tests {
     async fn record_reports_the_driving_error_and_classifies_it_as_driver_error() {
         let raw = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let error = record(config(
-            "claude-driver-error",
+        let mut cfg = config(
+            "command-discovery",
             fixture_path("fake-claude-discovery-stall"),
-            CaptureOperation::Claude(ClaudeCaptureOperation::CommandDiscovery {
-                cwd: cwd.path().into(),
-            }),
+            "claude",
             raw.path(),
-        ))
-        .await
-        .unwrap_err();
+        );
+        cfg.cwd = Some(cwd.path().into());
+        let error = record(cfg).await.unwrap_err();
 
         assert!(
             error.to_string().contains("stopped before the expected"),
@@ -524,6 +569,126 @@ mod tests {
         )
         .unwrap();
         assert_eq!(partial["failure_class"], "driver_error");
+    }
+
+    /// Break caught: `record_generic` calls `P::handshake` unconditionally —
+    /// putting a `control_request`/`initialize` line on the tape before a
+    /// real Claude run's first line, which the product itself never sends
+    /// (`crates/harness/src/claude/mod.rs`'s run driver). The scenario-level
+    /// tests in `record/scenarios/claude.rs` construct a `Session` directly
+    /// and call the scenario body themselves, so none of them can catch a
+    /// regression in `record_generic` — only driving through the real public
+    /// entry point, with a scenario the SCENARIOS table now actually wires
+    /// up, can.
+    #[tokio::test]
+    async fn record_claude_run_sends_no_handshake_before_the_user_turn() {
+        let raw = tempfile::tempdir().unwrap();
+        let capture = record(config(
+            "fresh-text",
+            fixture_path("fake-claude"),
+            "claude",
+            raw.path(),
+        ))
+        .await
+        .unwrap();
+
+        let stdin = channel_payloads(&capture, Channel::Stdin);
+        assert_eq!(
+            stdin.len(),
+            1,
+            "a Claude run sends exactly one initial line: {stdin:?}"
+        );
+        assert!(
+            !stdin[0].contains("control_request") && !stdin[0].contains("initialize"),
+            "no control_request/initialize line may precede the user turn: {stdin:?}"
+        );
+        let first: serde_json::Value = serde_json::from_str(stdin[0]).unwrap();
+        assert_eq!(
+            first["type"], "user",
+            "the first (and only) line must be the user turn: {stdin:?}"
+        );
+        assert_eq!(capture.exit_code, Some(0));
+    }
+
+    /// The Codex counterpart: a real Codex run DOES handshake first — driven
+    /// the same way, through `record()` itself, to prove the `fresh-text`
+    /// row's `body` genuinely calls `CodexProvider::handshake` before
+    /// anything scenario-specific.
+    #[tokio::test]
+    async fn record_codex_run_sends_the_initialize_handshake_first() {
+        let raw = tempfile::tempdir().unwrap();
+        let capture = record(config(
+            "fresh-text",
+            fixture_path("fake-codex"),
+            "codex",
+            raw.path(),
+        ))
+        .await
+        .unwrap();
+
+        let stdin = channel_payloads(&capture, Channel::Stdin);
+        let methods: Vec<_> = stdin
+            .iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|line| line["method"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            methods[..2],
+            ["initialize".to_owned(), "initialized".to_owned()],
+            "a Codex run must handshake before anything else: {methods:?}"
+        );
+        assert_eq!(capture.exit_code, Some(0));
+    }
+
+    /// The recheck closure `codex_fence` builds for `approval-on-request`, proven directly:
+    /// building the fence once, then mutating the approval target's emptiness before calling the
+    /// returned `recheck`, must make `recheck` itself fail — independent of whether
+    /// `Session::start` remembers to call it at all (that wiring is
+    /// `record/session.rs`'s own `start_runs_the_fence_recheck_after_directory_creation_and_before_spawn`/
+    /// `start_aborts_before_spawn_when_the_fence_recheck_fails`).
+    ///
+    /// Break caught: `codex_fence`'s `recheck` closure stops re-running
+    /// `validate_on_request_preflight` against live filesystem state — e.g. it captures and
+    /// replays the first check's `Ok` result instead of calling the function again.
+    #[tokio::test]
+    async fn codex_fence_recheck_catches_a_target_that_stopped_being_empty() {
+        let raw = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        // Outside the system temp tree, unlike a plain `tempfile::tempdir()` — the fence itself
+        // rejects an in-temp target, and this test needs the fence to accept it going in so the
+        // *recheck*, not the initial check, is what's being proven.
+        let target = tempfile::Builder::new()
+            .prefix("comet-fence-recheck-target-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let mut cfg = config(
+            "approval-on-request",
+            fixture_path("fake-codex"),
+            "codex",
+            raw.path(),
+        );
+        cfg.cwd = Some(cwd.path().into());
+        cfg.approval_target = Some(target.path().into());
+        let spec = scenario("codex", "approval-on-request").unwrap();
+        let input = ScenarioInput {
+            cwd: cfg.cwd.clone(),
+            approval_target: cfg.approval_target.clone(),
+            ..ScenarioInput::default()
+        };
+        let executable = fixture_path("fake-codex");
+        let launch = (spec.launch)(&input, &executable).unwrap();
+
+        let fence = codex_fence(spec, &cfg, &launch).unwrap();
+        let recheck = fence
+            .recheck
+            .expect("approval-on-request must build a recheck closure");
+
+        // The race the recheck exists to close: the target stops being empty after the fence was
+        // built but before spawn.
+        std::fs::write(target.path().join("appeared-after-fence.txt"), "hostile").unwrap();
+
+        let error = recheck().unwrap_err();
+        assert!(error.to_string().contains("empty"), "{error}");
     }
 
     fn only_raw_subdirectory(raw_root: &Path) -> PathBuf {

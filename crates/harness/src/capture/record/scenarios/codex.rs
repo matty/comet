@@ -71,18 +71,15 @@ fn codex_model_list_line(id: u64, cursor: Option<&str>) -> String {
     rpc_request(id, "model/list", Value::Object(params))
 }
 
-// Below this point: `fresh-text`, `resume`, `steer` and `interruption`. None
-// of the four is reachable from production code yet — the SCENARIOS table
-// only gains their rows in Task 7 — so every item down to the test module
-// carries `#[allow(dead_code)]`, exercised meanwhile only by this file's own
-// tests. Same shape as `record/scenarios/claude.rs`'s equivalent section.
+// Below this point: `fresh-text`, `resume`, `steer`, `interruption`,
+// `approval` and `approval-on-request`. Every one of these is a registered
+// row in `super::SCENARIOS` and reachable through `record()`.
 
 /// The model every non-discovery Codex scenario runs against: cheap and
 /// fast, mirroring `record/scenarios/claude.rs`'s `CHEAP_MODEL`. Ported from
 /// `comet-provider-capture.rs`'s `cheap_codex_request` — decision "the
 /// scenario owns its prompt" moves the choice out of the binary along with
 /// the prompt text itself.
-#[allow(dead_code)]
 const CHEAP_MODEL: &str = "gpt-5.6-luna";
 
 /// The `RunRequest` every non-discovery Codex scenario in this file starts
@@ -93,7 +90,6 @@ const CHEAP_MODEL: &str = "gpt-5.6-luna";
 /// (launch builder and scenario body alike) sees the same normalized value
 /// and the linked-worktree sandbox escalation (D13) can never disagree
 /// between the two.
-#[allow(dead_code)]
 fn cheap_codex_request(prompt: &str, input: &ScenarioInput, mode: RuntimeMode) -> RunRequest {
     let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
     let request = RunRequest {
@@ -109,7 +105,6 @@ fn cheap_codex_request(prompt: &str, input: &ScenarioInput, mode: RuntimeMode) -
 /// Start a brand-new thread and return its id. Shared by every scenario here
 /// except `resume`, which needs `thread/resume` instead — see
 /// [`resume_thread`].
-#[allow(dead_code)]
 async fn start_thread(
     session: &mut Session<CodexProvider>,
     request: &RunRequest,
@@ -145,7 +140,6 @@ async fn start_thread(
 /// "thread/resume"` bail) — the one piece of that branch that was driving a
 /// real promise about the evidence, not merely validating a frame's shape,
 /// so it survives the port.
-#[allow(dead_code)]
 async fn resume_thread(
     session: &mut Session<CodexProvider>,
     request: &RunRequest,
@@ -181,7 +175,6 @@ async fn resume_thread(
 /// via the production `turn/start` builder. No reply wait — `recording.rs`'s
 /// `codex_run` never waited for `turn/start`'s own reply either; the frame
 /// loop that follows picks up `turn/started` and everything after it.
-#[allow(dead_code)]
 async fn start_turn(
     session: &mut Session<CodexProvider>,
     request: &RunRequest,
@@ -207,7 +200,6 @@ async fn start_turn(
 /// steer or an interruption. Driving, not validating: nothing here inspects
 /// anything else about the frame the way the deleted code's per-script
 /// terminal-frame bail did.
-#[allow(dead_code)]
 async fn wait_for_turn_started(session: &mut Session<CodexProvider>) -> anyhow::Result<String> {
     session
         .wait_for("a turn/started notification", |frame| {
@@ -225,7 +217,6 @@ async fn wait_for_turn_started(session: &mut Session<CodexProvider>) -> anyhow::
 // `record/scenarios/claude.rs`'s `fresh_text_request` doc comment for why
 // this stays a pure function of `input`: the two calls cannot diverge only
 // because nothing here reads anything but `input`.
-#[allow(dead_code)]
 fn fresh_text_request(input: &ScenarioInput) -> RunRequest {
     cheap_codex_request(
         "Reply with the single word capture.",
@@ -236,7 +227,6 @@ fn fresh_text_request(input: &ScenarioInput) -> RunRequest {
 
 /// SPAWN for `fresh-text`: an ordinary run launch, built from the same
 /// request `fresh_text` replays as its wire line.
-#[allow(dead_code)]
 pub(in crate::capture::record) fn fresh_text_launch(
     input: &ScenarioInput,
     executable: &Path,
@@ -251,7 +241,6 @@ pub(in crate::capture::record) fn fresh_text_launch(
 /// whichever terminal frame Codex sends. No bail on the terminal frame's
 /// type — see `recording.rs`'s `codex_run` doc comment on why that check is
 /// deleted, not ported.
-#[allow(dead_code)]
 pub(in crate::capture::record) async fn fresh_text(
     session: &mut Session<CodexProvider>,
     input: &ScenarioInput,
@@ -265,7 +254,6 @@ pub(in crate::capture::record) async fn fresh_text(
 
 // Called once by `resume_launch`, once by `resume` — see the note on
 // `fresh_text_request` above.
-#[allow(dead_code)]
 fn resume_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
     let resume_id = input
         .resume_id
@@ -285,7 +273,6 @@ fn resume_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
 /// launch argument; the thread id lives entirely on the wire (`thread/resume`,
 /// built by `resume_thread`). See `crate::codex::run_launch`, which never
 /// reads `request.resume`.
-#[allow(dead_code)]
 pub(in crate::capture::record) fn resume_launch(
     input: &ScenarioInput,
     executable: &Path,
@@ -296,7 +283,6 @@ pub(in crate::capture::record) fn resume_launch(
     ))
 }
 
-#[allow(dead_code)]
 pub(in crate::capture::record) async fn resume(
     session: &mut Session<CodexProvider>,
     input: &ScenarioInput,
@@ -310,7 +296,6 @@ pub(in crate::capture::record) async fn resume(
 
 // Called once by `steer_launch`, once by `steer` — see the note on
 // `fresh_text_request` above.
-#[allow(dead_code)]
 fn steer_request(input: &ScenarioInput) -> RunRequest {
     cheap_codex_request(
         "Begin a short response, then accept the follow-up instruction.",
@@ -321,7 +306,6 @@ fn steer_request(input: &ScenarioInput) -> RunRequest {
 
 /// SPAWN for `steer`: an ordinary run launch, built from the same request
 /// `steer` replays as its wire line.
-#[allow(dead_code)]
 pub(in crate::capture::record) fn steer_launch(
     input: &ScenarioInput,
     executable: &Path,
@@ -333,7 +317,6 @@ pub(in crate::capture::record) fn steer_launch(
 /// constant — like `record/scenarios/claude.rs`'s `CLAUDE_APPROVAL_COMMAND`
 /// — so the driving code and its own test can't drift into two separate
 /// string literals.
-#[allow(dead_code)]
 const STEER_MESSAGE: &str = "Capture steering message.";
 
 /// Start a fresh thread and turn, wait for the turn to be genuinely under
@@ -345,7 +328,6 @@ const STEER_MESSAGE: &str = "Capture steering message.";
 /// removes (§3.2): a Codex rejection of the steer, or a turn that failed or
 /// aborted instead of completing under it, is itself the evidence a capture
 /// exists to record, not a reason to discard it.
-#[allow(dead_code)]
 pub(in crate::capture::record) async fn steer(
     session: &mut Session<CodexProvider>,
     input: &ScenarioInput,
@@ -368,7 +350,6 @@ pub(in crate::capture::record) async fn steer(
 
 // Called once by `interruption_launch`, once by `interruption` — see the
 // note on `fresh_text_request` above.
-#[allow(dead_code)]
 fn interruption_request(input: &ScenarioInput) -> RunRequest {
     cheap_codex_request(
         "Count upward slowly and keep working until interrupted.",
@@ -379,7 +360,6 @@ fn interruption_request(input: &ScenarioInput) -> RunRequest {
 
 /// SPAWN for `interruption`: an ordinary run launch, built from the same
 /// request `interruption` replays as its wire line.
-#[allow(dead_code)]
 pub(in crate::capture::record) fn interruption_launch(
     input: &ScenarioInput,
     executable: &Path,
@@ -395,7 +375,6 @@ pub(in crate::capture::record) fn interruption_launch(
 /// No bail on the terminal frame being `turn/aborted` specifically —
 /// `recording.rs`'s deleted `codex_run` required exactly that, which is the
 /// same removed validator class `steer`'s doc comment explains.
-#[allow(dead_code)]
 pub(in crate::capture::record) async fn interruption(
     session: &mut Session<CodexProvider>,
     input: &ScenarioInput,
@@ -418,7 +397,6 @@ pub(in crate::capture::record) async fn interruption(
 
 // Called once by `approval_launch`, once by `approval` — see the note on
 // `fresh_text_request` above.
-#[allow(dead_code)]
 fn approval_request(input: &ScenarioInput) -> RunRequest {
     let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
     cheap_codex_request(
@@ -430,7 +408,6 @@ fn approval_request(input: &ScenarioInput) -> RunRequest {
 
 /// SPAWN for `approval`: an ordinary run launch, built from the same request
 /// `approval` replays as its wire line.
-#[allow(dead_code)]
 pub(in crate::capture::record) fn approval_launch(
     input: &ScenarioInput,
     executable: &Path,
@@ -445,7 +422,6 @@ pub(in crate::capture::record) fn approval_launch(
 /// grant-time recheck (below): both need `input.approval_target`, and
 /// duplicating the "needs an --approval-target" error text in two places
 /// would let them drift.
-#[allow(dead_code)]
 fn require_approval_target(input: &ScenarioInput) -> anyhow::Result<PathBuf> {
     input
         .approval_target
@@ -455,7 +431,6 @@ fn require_approval_target(input: &ScenarioInput) -> anyhow::Result<PathBuf> {
 
 // Called once by `approval_on_request_launch`, once by `approval_on_request`
 // — see the note on `fresh_text_request` above.
-#[allow(dead_code)]
 fn approval_on_request_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
     let target = require_approval_target(input)?;
     Ok(cheap_codex_request(
@@ -467,7 +442,6 @@ fn approval_on_request_request(input: &ScenarioInput) -> anyhow::Result<RunReque
 
 /// SPAWN for `approval-on-request`: an ordinary run launch, built from the
 /// same request `approval_on_request` replays as its wire line.
-#[allow(dead_code)]
 pub(in crate::capture::record) fn approval_on_request_launch(
     input: &ScenarioInput,
     executable: &Path,
@@ -503,7 +477,6 @@ pub(in crate::capture::record) fn approval_on_request_launch(
 /// timeout kills it, destroying a paid-for capture. Per design §3.2 that is
 /// the exact outcome a driver must avoid; auto-answering (subject to the
 /// grant-time recheck in `answer_every_approval` below) is the safe failure.
-#[allow(dead_code)]
 fn pending_approval(frame: &Value) -> Option<Value> {
     let method = frame["method"].as_str()?;
     if !method.ends_with("/requestApproval") {
@@ -522,7 +495,6 @@ fn pending_approval(frame: &Value) -> Option<Value> {
 /// a real "allow"/"decline" reply. `codex::approval` is `pub(crate)`
 /// specifically so this can reach it — see that module declaration's own
 /// comment in `codex/mod.rs`.
-#[allow(dead_code)]
 fn decision_response(id: Value, decision: &ApprovalDecision) -> String {
     json!({
         "jsonrpc": "2.0",
@@ -556,7 +528,6 @@ fn decision_response(id: Value, decision: &ApprovalDecision) -> String {
 /// between spawn and this grant. `recheck` never reads the frame; it reads
 /// the filesystem. On failure this declines the write instead of aborting
 /// the capture: no unsafe write is granted, and the tape survives.
-#[allow(dead_code)]
 async fn answer_every_approval(
     session: &mut Session<CodexProvider>,
     mut recheck: impl FnMut() -> anyhow::Result<()>,
@@ -592,7 +563,6 @@ async fn answer_every_approval(
 /// matching what the deleted `codex_run` checked immediately before
 /// accepting. Unlike that deleted code, a mismatch here declines the grant
 /// instead of aborting the whole capture.
-#[allow(dead_code)]
 pub(in crate::capture::record) async fn approval(
     session: &mut Session<CodexProvider>,
     input: &ScenarioInput,
@@ -626,7 +596,6 @@ pub(in crate::capture::record) async fn approval(
 /// Ported from `recording.rs`'s deleted `codex_run` `CodexRunScript::ApprovalOnRequest`
 /// arm, minus every validator listed on `answer_every_approval`'s doc
 /// comment.
-#[allow(dead_code)]
 pub(in crate::capture::record) async fn approval_on_request(
     session: &mut Session<CodexProvider>,
     input: &ScenarioInput,
@@ -656,9 +625,7 @@ mod tests {
     use crate::capture::test_support::{
         absolute_program, channel_payloads, config, contract_request, fixture_path,
     };
-    use crate::capture::types::{
-        CaptureOperation, Channel, CodexCaptureOperation, CodexRunScript, CommandSnapshot,
-    };
+    use crate::capture::types::{Channel, CommandSnapshot};
     use crate::launch::StdioMode;
 
     #[test]
@@ -761,15 +728,7 @@ mod tests {
         let executable = fixture_path("fake-codex");
         let input = ScenarioInput::default();
         let launch = fresh_text_launch(&input, &executable).unwrap();
-        let cfg = config(
-            "codex-fresh-text",
-            executable,
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request: fresh_text_request(&input),
-                script: CodexRunScript::FreshText,
-            }),
-            raw.path(),
-        );
+        let cfg = config("fresh-text", executable, "codex", raw.path());
         let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
             .await
             .unwrap();
@@ -818,15 +777,7 @@ mod tests {
         let raw = tempfile::tempdir().unwrap();
         let executable = fixture_path("fake-codex");
         let launch = steer_launch(&input, &executable).unwrap();
-        let cfg = config(
-            "codex-steer",
-            executable,
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request: steer_request(&input),
-                script: CodexRunScript::Steer,
-            }),
-            raw.path(),
-        );
+        let cfg = config("steer", executable, "codex", raw.path());
         let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
             .await
             .unwrap();
@@ -850,15 +801,7 @@ mod tests {
         let raw = tempfile::tempdir().unwrap();
         let executable = fixture_path("fake-codex");
         let launch = interruption_launch(&input, &executable).unwrap();
-        let cfg = config(
-            "codex-interruption",
-            executable,
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request: interruption_request(&input),
-                script: CodexRunScript::Interruption,
-            }),
-            raw.path(),
-        );
+        let cfg = config("interruption", executable, "codex", raw.path());
         let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
             .await
             .unwrap();
@@ -918,15 +861,7 @@ mod tests {
 
         let executable = fixture_path("fake-codex");
         let launch = crate::codex::run_launch(&executable, &request);
-        let cfg = config(
-            "codex-linked-worktree",
-            executable,
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request: request.clone(),
-                script: CodexRunScript::FreshText,
-            }),
-            raw.path(),
-        );
+        let cfg = config("codex-linked-worktree", executable, "codex", raw.path());
         let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
             .await
             .unwrap();
@@ -1007,15 +942,7 @@ mod tests {
             ..ScenarioInput::default()
         };
         let launch = resume_launch(&input, &executable).unwrap();
-        let cfg = config(
-            "codex-resume",
-            executable,
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request: resume_request(&input).unwrap(),
-                script: CodexRunScript::Resume,
-            }),
-            raw.path(),
-        );
+        let cfg = config("resume", executable, "codex", raw.path());
         let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
             .await
             .unwrap();
@@ -1045,15 +972,7 @@ mod tests {
             ..ScenarioInput::default()
         };
         let launch = resume_launch(&input, &executable).unwrap();
-        let cfg = config(
-            "codex-resume-success",
-            executable,
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request: resume_request(&input).unwrap(),
-                script: CodexRunScript::Resume,
-            }),
-            raw.path(),
-        );
+        let cfg = config("codex-resume-success", executable, "codex", raw.path());
         let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
             .await
             .unwrap();
@@ -1168,15 +1087,7 @@ mod tests {
         };
         let executable = fixture_path("fake-codex");
         let launch = approval_launch(&input, &executable).unwrap();
-        let cfg = config(
-            "codex-approval",
-            executable,
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request: approval_request(&input),
-                script: CodexRunScript::Approval,
-            }),
-            raw.path(),
-        );
+        let cfg = config("approval", executable, "codex", raw.path());
         let fence = FenceOutcome {
             approval_cwd_identity: Some(cwd_identity),
             ..FenceOutcome::none()
@@ -1253,10 +1164,7 @@ mod tests {
         let cfg = config(
             "codex-approval-cwd-mismatch",
             executable,
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request: approval_request(&input),
-                script: CodexRunScript::Approval,
-            }),
+            "codex",
             raw.path(),
         );
         let fence = FenceOutcome {
@@ -1313,15 +1221,7 @@ mod tests {
         };
         let executable = fixture_path("fake-codex");
         let launch = approval_on_request_launch(&input, &executable).unwrap();
-        let cfg = config(
-            "codex-approval-on-request",
-            executable,
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request: approval_on_request_request(&input).unwrap(),
-                script: CodexRunScript::ApprovalOnRequest,
-            }),
-            raw.path(),
-        );
+        let cfg = config("approval-on-request", executable, "codex", raw.path());
         let fence = FenceOutcome {
             approval_target: Some(target.path().into()),
             approval_target_identity: Some(target_identity),
@@ -1393,10 +1293,7 @@ mod tests {
         let cfg = config(
             "codex-approval-on-request-target-mismatch",
             executable,
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request: approval_on_request_request(&input).unwrap(),
-                script: CodexRunScript::ApprovalOnRequest,
-            }),
+            "codex",
             raw.path(),
         );
         let fence = FenceOutcome {

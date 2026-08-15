@@ -13,7 +13,6 @@ mod approval;
 mod corpus;
 mod filesystem;
 mod record;
-mod recording;
 mod sanitize;
 mod surface;
 #[cfg(test)]
@@ -23,7 +22,7 @@ mod types;
 pub use allowlist::{Allowlist, allows, allows_prefix, named_kind};
 pub use approval::{approval_marker_command, approval_on_request_prompt, codex_approval_prompt};
 pub use corpus::{Frame, corpus_frame, frame};
-pub use record::record;
+pub use record::{Requirements, SCENARIOS, ScenarioSpec, record, scenario};
 pub use sanitize::{
     NovelPath, SanitizationError, SanitizationReport, render_novel_paths_report, sanitize_dir,
 };
@@ -32,7 +31,6 @@ pub use surface::{
     observed_field_lines,
 };
 pub use types::{
-    CaptureConfig, CaptureEvent, CaptureOperation, CaptureScenario, Channel,
-    ClaudeCaptureOperation, ClaudeRunScript, CodexCaptureOperation, CodexRunScript,
-    CommandSnapshot, PlatformMetadata, Provider, RawCapture, RedactionRoots,
+    CaptureConfig, CaptureEvent, Channel, CommandSnapshot, PlatformMetadata, Provider, RawCapture,
+    RedactionRoots,
 };

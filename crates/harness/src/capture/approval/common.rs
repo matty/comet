@@ -6,7 +6,6 @@ use std::ffi::OsString;
 use anyhow::{anyhow, bail};
 
 use crate::capture::filesystem::has_windows_reparse_point;
-use crate::capture::{CaptureConfig, CaptureOperation, CodexCaptureOperation, CodexRunScript};
 
 pub(super) const CODEX_APPROVAL_COMMAND: &str = "echo capture";
 // `pub(in crate::capture)`, not `pub(super)`: Task 4 moved `claude_approval_prompt` (the sole
@@ -161,33 +160,38 @@ pub(in crate::capture) fn require_empty_approval_target(
     Ok(identity)
 }
 
+/// The `approval-on-request` fence: a non-repository, non-worktree `cwd`,
+/// and an `approval_target` that stays empty, identity-stable, and isolated
+/// from both `cwd` and the system temp tree. Returns `Ok(None)` when
+/// `approval_target` is absent — every scenario but `approval-on-request`.
+///
+/// Pre-Task-7 this read `CaptureOperation::Codex(CodexCaptureOperation::Run
+/// { request, script })` off a `CaptureConfig` to decide whether it applied,
+/// and additionally asserted `request.runtime_mode`/`request.sandbox` stayed
+/// `AutoAcceptEdits`/`WorkspaceWrite` after `crate::codex::normalize_run_request`.
+/// That assertion is dropped, not ported: it defended against a caller-built
+/// `RunRequest` disagreeing with what the CLI arguments said, which could
+/// happen when the binary built the request by hand from flags. Since
+/// `record::scenarios::codex::approval_on_request_request` is the only
+/// builder of that request now, and it hardcodes both fields, normalization
+/// can only ever escalate `sandbox` for a linked worktree on a slash-named
+/// branch (`crate::codex::normalize_run_request`) — a shape this very
+/// function already rejects via `repository_root`, so the condition the
+/// assertion guarded against is now structurally unreachable rather than
+/// merely re-checked.
 pub(in crate::capture) fn validate_on_request_preflight(
-    config: &CaptureConfig,
+    cwd: &Path,
+    approval_target: Option<&Path>,
 ) -> anyhow::Result<Option<DirectoryIdentity>> {
-    let CaptureOperation::Codex(CodexCaptureOperation::Run { request, script }) =
-        &config.scenario.operation
-    else {
+    let Some(target) = approval_target else {
         return Ok(None);
     };
-    if !matches!(script, CodexRunScript::ApprovalOnRequest) {
-        return Ok(None);
-    }
-    if request.runtime_mode != comet_proto::RuntimeMode::AutoAcceptEdits
-        || request.sandbox != comet_proto::SandboxLevel::WorkspaceWrite
-    {
-        bail!("Codex on-request capture requires workspace-write/on-request runtime settings.");
-    }
-    let cwd = Path::new(&request.cwd);
     let cwd = std::fs::canonicalize(cwd).map_err(|_| {
         anyhow!("Codex on-request capture requires an accessible non-repository cwd.")
     })?;
     if repository_root(&cwd).is_some() {
         bail!("Codex on-request capture requires a non-repository, non-worktree cwd.");
     }
-    let target = config
-        .approval_target
-        .as_deref()
-        .ok_or_else(|| anyhow!("Codex on-request capture requires a validated approval target."))?;
     let identity = directory_identity(target)?;
     if identity.canonical.starts_with(&cwd) || cwd.starts_with(&identity.canonical) {
         bail!("Codex on-request approval target must remain isolated from the cwd.");
@@ -432,17 +436,12 @@ mod tests {
     #[cfg(not(windows))]
     use std::path::Path;
 
-    use comet_proto::{RunRequest, RuntimeMode};
-
     #[cfg(windows)]
     use super::APPROVAL_MARKER_NAME;
-    #[cfg(windows)]
     use crate::capture::record;
-    use crate::capture::recording::start_for_preflight_test;
     use crate::capture::test_support::{
         config, fixture_path, isolated_approval_target, isolated_tempdir,
     };
-    use crate::capture::{CaptureOperation, CodexCaptureOperation, CodexRunScript};
 
     #[cfg(windows)]
     #[test]
@@ -525,22 +524,9 @@ mod tests {
         let raw = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         std::fs::write(cwd.path().join(APPROVAL_MARKER_NAME), "capture\n").unwrap();
-        let request = RunRequest {
-            prompt: "scenario:capture-approval".into(),
-            cwd: cwd.path().display().to_string(),
-            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
-        };
-        let error = record(config(
-            "codex-approval-precreated-marker",
-            fixture_path("fake-codex"),
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request,
-                script: CodexRunScript::Approval,
-            }),
-            raw.path(),
-        ))
-        .await
-        .unwrap_err();
+        let mut cfg = config("approval", fixture_path("fake-codex"), "codex", raw.path());
+        cfg.cwd = Some(cwd.path().into());
+        let error = record(cfg).await.unwrap_err();
         assert!(
             error.to_string().contains("marker must be absent"),
             "{error}"
@@ -561,22 +547,15 @@ mod tests {
             let Some(target) = isolated_approval_target("comet-onrequest-target-") else {
                 return;
             };
-            let request = RunRequest {
-                prompt: "scenario:capture-onrequest-destructive".into(),
-                cwd: cwd.path().display().to_string(),
-                ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
-            };
-            let mut capture_config = config(
-                "codex-approval-on-request-repository",
+            let mut cfg = config(
+                "approval-on-request",
                 fixture_path("fake-codex"),
-                CaptureOperation::Codex(CodexCaptureOperation::Run {
-                    request,
-                    script: CodexRunScript::ApprovalOnRequest,
-                }),
+                "codex",
                 raw.path(),
             );
-            capture_config.approval_target = Some(target.path().into());
-            let error = match start_for_preflight_test(capture_config).await {
+            cfg.cwd = Some(cwd.path().into());
+            cfg.approval_target = Some(target.path().into());
+            let error = match record(cfg).await {
                 Ok(_) => panic!("repository cwd must fail before spawn"),
                 Err(error) => error,
             };
@@ -592,22 +571,15 @@ mod tests {
             return;
         };
         std::fs::write(target.path().join("appeared-after-config.txt"), "hostile").unwrap();
-        let request = RunRequest {
-            prompt: "scenario:capture-onrequest-destructive".into(),
-            cwd: cwd.path().display().to_string(),
-            ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
-        };
-        let mut capture_config = config(
-            "codex-approval-on-request-raced-before-spawn",
+        let mut cfg = config(
+            "approval-on-request",
             fixture_path("fake-codex"),
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request,
-                script: CodexRunScript::ApprovalOnRequest,
-            }),
+            "codex",
             raw.path(),
         );
-        capture_config.approval_target = Some(target.path().into());
-        let error = match start_for_preflight_test(capture_config).await {
+        cfg.cwd = Some(cwd.path().into());
+        cfg.approval_target = Some(target.path().into());
+        let error = match record(cfg).await {
             Ok(_) => panic!("nonempty target must fail before spawn"),
             Err(error) => error,
         };

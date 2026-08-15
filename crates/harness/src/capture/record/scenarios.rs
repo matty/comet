@@ -4,9 +4,9 @@
 //!
 //! Closes D60 (the scenario name living in three unsynchronized places: the
 //! binary's help text, its `supported_pair()`, and its dispatch `match`) —
-//! all three are read off this table starting in the task that rewires the
-//! binary. This task populates only the discovery rows; the run-scenario
-//! tasks add the rest.
+//! `comet-provider-capture.rs` generates its `--help` text and validates its
+//! arguments off this table, and `record()` dispatches off it directly by
+//! `(provider, name)`. There is no other place a scenario's name is spelled.
 
 pub(super) mod claude;
 pub(super) mod codex;
@@ -31,26 +31,29 @@ use crate::launch::LaunchDescriptor;
 #[derive(Clone, Debug, Default)]
 pub struct ScenarioInput {
     pub cwd: Option<PathBuf>,
-    // Read by the scenarios that need them (`resume`/`attachment` in Tasks 2,
-    // 3, 5; `approval_target` in Tasks 4, 6) — but only the SCENARIOS table
-    // wiring in Task 7 makes those scenarios reachable from production code,
-    // so the read stays invisible to dead-code analysis until then.
-    #[allow(dead_code)]
     pub resume_id: Option<String>,
-    #[allow(dead_code)]
     pub attachment: Option<PathBuf>,
     pub codex_home: Option<PathBuf>,
-    #[allow(dead_code)]
     pub approval_target: Option<PathBuf>,
 }
 
-/// What the binary must have collected before this scenario may run.
+/// What the binary must have collected before this scenario may run — read
+/// by `comet-provider-capture.rs`'s argument validation, which looks the row
+/// up by `(provider, name)` and checks each flag against what was supplied
+/// instead of hand-coding a per-scenario `if` chain.
 ///
-/// Populated for every row now, per decision "one scenario table" — but read
-/// starting only in the task that rewires `comet-provider-capture.rs` to
-/// validate against it (closing D60), so every field but `spends_tokens`
-/// (asserted directly by this file's own test) is unread until then.
-#[allow(dead_code)]
+/// `needs_cwd` is not "may I pass --cwd" (every scenario tolerates the
+/// flag); it is "does this scenario's behavior vary by cwd at all". False
+/// only for the cwd-independent discovery aliases (`model-discovery`,
+/// `model-discovery-neutral-cwd`, and Codex's `model-discovery-logged-out`)
+/// — those always run from a neutral temp directory regardless of what
+/// `--cwd` names, which is the entire reason `model-discovery-neutral-cwd`
+/// is a distinct scenario from `model-discovery-project-cwd`. True
+/// everywhere else, including every run scenario: an omitted `--cwd` still
+/// resolves to the caller's current directory for those, not a temp
+/// directory, so `model-discovery-project-cwd`'s point (capturing discovery
+/// from the selected project directory) survives being run with no explicit
+/// `--cwd` at all.
 #[derive(Clone, Copy, Debug)]
 pub struct Requirements {
     pub spends_tokens: bool,
@@ -62,7 +65,6 @@ pub struct Requirements {
 }
 
 impl Requirements {
-    #[allow(dead_code)] // See the container-level note above.
     const fn discovery() -> Self {
         Self {
             spends_tokens: false,
@@ -73,17 +75,27 @@ impl Requirements {
             needs_empty_codex_home: false,
         }
     }
+
+    /// Every non-discovery scenario: spends tokens, and — unlike the
+    /// cwd-independent discovery aliases — does read `--cwd`.
+    const fn run() -> Self {
+        Self {
+            spends_tokens: true,
+            needs_cwd: true,
+            needs_resume_id: false,
+            needs_attachment: false,
+            needs_approval_target: false,
+            needs_empty_codex_home: false,
+        }
+    }
 }
 
 pub struct ScenarioSpec {
     pub name: &'static str,
-    #[allow(dead_code)] // Read starting when the binary reports it in --help (Task 7).
     pub purpose: &'static str,
     pub provider: Provider,
     /// `None` for discovery scenarios, which start no turn.
-    #[allow(dead_code)] // Read starting when the binary validates against it (Task 7).
     pub runtime_mode: Option<RuntimeMode>,
-    #[allow(dead_code)] // Read starting when the binary validates against it (Task 7).
     pub requirements: Requirements,
     /// SPAWN, per row — not a provider trait member. See the amendment on
     /// `CaptureProvider`'s doc comment for why: which launch a scenario
@@ -186,6 +198,133 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         launch: codex::model_discovery_launch,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::model_discovery(s, i))),
     },
+    ScenarioSpec {
+        name: "fresh-text",
+        purpose: "capture a plain Claude text turn",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements::run(),
+        launch: claude::fresh_text_launch,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::fresh_text(s, i))),
+    },
+    ScenarioSpec {
+        name: "approval",
+        purpose: "capture a Claude run that answers Bash and Write approval requests",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::ApprovalRequired),
+        requirements: Requirements::run(),
+        launch: claude::approval_launch,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::approval(s, i))),
+    },
+    ScenarioSpec {
+        name: "resume",
+        purpose: "capture a Claude run resuming an existing session",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements {
+            needs_resume_id: true,
+            ..Requirements::run()
+        },
+        launch: claude::resume_launch,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::resume(s, i))),
+    },
+    ScenarioSpec {
+        name: "attachment",
+        purpose: "capture a Claude run with an inlined image attachment",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements {
+            needs_attachment: true,
+            ..Requirements::run()
+        },
+        launch: claude::attachment_launch,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::attachment(s, i))),
+    },
+    ScenarioSpec {
+        name: "checklist",
+        purpose: "capture a Claude run driving TaskCreate/TaskUpdate",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements::run(),
+        launch: claude::checklist_launch,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::checklist(s, i))),
+    },
+    ScenarioSpec {
+        name: "checklist-resume",
+        purpose: "capture a Claude run resuming and continuing a checklist from a second process",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements {
+            needs_resume_id: true,
+            ..Requirements::run()
+        },
+        launch: claude::checklist_resume_launch,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::checklist_resume(s, i))),
+    },
+    ScenarioSpec {
+        name: "fresh-text",
+        purpose: "capture a plain Codex text turn",
+        provider: Provider::Codex,
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements::run(),
+        launch: codex::fresh_text_launch,
+        body: ScenarioBody::Codex(|s, i| Box::pin(codex::fresh_text(s, i))),
+    },
+    ScenarioSpec {
+        name: "approval",
+        purpose: "capture a Codex run that answers file-change approval requests",
+        provider: Provider::Codex,
+        runtime_mode: Some(RuntimeMode::ApprovalRequired),
+        requirements: Requirements::run(),
+        launch: codex::approval_launch,
+        body: ScenarioBody::Codex(|s, i| Box::pin(codex::approval(s, i))),
+    },
+    ScenarioSpec {
+        name: "approval-on-request",
+        purpose: "capture a Codex run that answers command-execution approval requests \
+                   against an external target",
+        provider: Provider::Codex,
+        // AutoAcceptEdits, not ApprovalRequired: `approval-on-request` records Codex's
+        // "on-request" approval path, which the production runtime enters under auto-accept —
+        // see `record::scenarios::codex::approval_on_request_request`.
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements {
+            needs_approval_target: true,
+            ..Requirements::run()
+        },
+        launch: codex::approval_on_request_launch,
+        body: ScenarioBody::Codex(|s, i| Box::pin(codex::approval_on_request(s, i))),
+    },
+    ScenarioSpec {
+        name: "resume",
+        purpose: "capture a Codex run resuming an existing thread",
+        provider: Provider::Codex,
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements {
+            needs_resume_id: true,
+            ..Requirements::run()
+        },
+        launch: codex::resume_launch,
+        body: ScenarioBody::Codex(|s, i| Box::pin(codex::resume(s, i))),
+    },
+    ScenarioSpec {
+        name: "steer",
+        purpose: "capture a Codex run receiving a mid-turn steering message",
+        provider: Provider::Codex,
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements::run(),
+        launch: codex::steer_launch,
+        body: ScenarioBody::Codex(|s, i| Box::pin(codex::steer(s, i))),
+    },
+    ScenarioSpec {
+        name: "interruption",
+        purpose: "capture a Codex run interrupted mid-turn",
+        provider: Provider::Codex,
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements::run(),
+        launch: codex::interruption_launch,
+        body: ScenarioBody::Codex(|s, i| Box::pin(codex::interruption(s, i))),
+    },
 ];
 
 /// Look up a scenario by the exact provider and name strings the binary's
@@ -204,20 +343,32 @@ pub fn scenario(provider: &str, name: &str) -> Option<&'static ScenarioSpec> {
 mod tests {
     use super::*;
 
-    /// Break caught: a discovery scenario's name drifts from what the
-    /// binary's `--help` and `supported_pair()` still advertise, or a
-    /// duplicate row shadows another provider's scenario of the same name.
+    /// Break caught: a scenario's name drifts from what the binary's
+    /// `--help` and argument validation still advertise, or a duplicate row
+    /// shadows another provider's scenario of the same name.
     #[test]
-    fn every_discovery_name_the_binary_advertises_is_in_the_table() {
+    fn every_scenario_name_the_binary_advertises_is_in_the_table() {
         for (provider, name) in [
             ("claude", "model-discovery"),
             ("claude", "model-discovery-neutral-cwd"),
             ("claude", "model-discovery-project-cwd"),
             ("claude", "command-discovery"),
+            ("claude", "fresh-text"),
+            ("claude", "approval"),
+            ("claude", "resume"),
+            ("claude", "attachment"),
+            ("claude", "checklist"),
+            ("claude", "checklist-resume"),
             ("codex", "model-discovery"),
             ("codex", "model-discovery-neutral-cwd"),
             ("codex", "model-discovery-project-cwd"),
             ("codex", "model-discovery-logged-out"),
+            ("codex", "fresh-text"),
+            ("codex", "approval"),
+            ("codex", "approval-on-request"),
+            ("codex", "resume"),
+            ("codex", "steer"),
+            ("codex", "interruption"),
         ] {
             assert!(
                 scenario(provider, name).is_some(),
@@ -226,16 +377,86 @@ mod tests {
         }
         assert!(scenario("claude", "no-such-scenario").is_none());
         assert!(scenario("codex", "model-discovery-project-cwd").is_some());
+        assert_eq!(
+            SCENARIOS.len(),
+            20,
+            "an added or removed row must update this count too"
+        );
     }
 
     #[test]
     fn discovery_rows_start_no_turn_and_spend_no_tokens() {
-        for spec in SCENARIOS {
+        for spec in SCENARIOS
+            .iter()
+            .filter(|spec| !spec.requirements.spends_tokens)
+        {
             assert_eq!(spec.runtime_mode, None, "{} sets a runtime mode", spec.name);
+        }
+    }
+
+    /// Break caught: a run row is miscategorized as free (missing from the
+    /// token-spend acknowledgment gate) or never starts a turn at all.
+    #[test]
+    fn run_rows_spend_tokens_and_start_a_turn() {
+        for spec in SCENARIOS
+            .iter()
+            .filter(|spec| spec.requirements.spends_tokens)
+        {
             assert!(
-                !spec.requirements.spends_tokens,
-                "{} is marked as spending tokens",
+                spec.runtime_mode.is_some(),
+                "{} spends tokens but sets no runtime mode",
                 spec.name
+            );
+        }
+    }
+
+    /// Break caught: `needs_cwd` regresses for a cwd-independent discovery
+    /// alias, letting a caller's `--cwd` silently start influencing
+    /// `model-discovery`/`model-discovery-neutral-cwd`/
+    /// `model-discovery-logged-out` and erasing their distinction from
+    /// `model-discovery-project-cwd`.
+    #[test]
+    fn only_the_neutral_discovery_aliases_ignore_cwd() {
+        const NEUTRAL: &[&str] = &[
+            "model-discovery",
+            "model-discovery-neutral-cwd",
+            "model-discovery-logged-out",
+        ];
+        for spec in SCENARIOS {
+            let neutral = NEUTRAL.contains(&spec.name);
+            assert_eq!(
+                spec.requirements.needs_cwd, !neutral,
+                "{:?}/{} has an unexpected needs_cwd",
+                spec.provider, spec.name
+            );
+        }
+    }
+
+    /// `ScenarioBody` is `pub(super)`, invisible outside `capture::record`,
+    /// so this is the one place that can check it: `record()` dispatches on
+    /// `spec.body`'s own variant (`ScenarioBody::Claude` → `record_claude`,
+    /// `ScenarioBody::Codex` → `record_codex`), never on the row's declared
+    /// `provider` field. A row whose `provider` disagrees with its `body`
+    /// variant would silently run under the wrong provider's launch and
+    /// session machinery — this is the falsification target the task brief
+    /// names directly ("add a row whose body is the wrong provider
+    /// variant").
+    ///
+    /// Break caught: swap one row's `body` for the other provider's variant
+    /// while leaving `provider` alone.
+    #[test]
+    fn every_row_s_declared_provider_matches_its_body_variant() {
+        for spec in SCENARIOS {
+            let body_is_claude = matches!(spec.body, ScenarioBody::Claude(_));
+            let declared_claude = spec.provider == Provider::Claude;
+            assert_eq!(
+                body_is_claude,
+                declared_claude,
+                "{:?}/{} declares provider {:?} but its body is {}",
+                spec.provider,
+                spec.name,
+                spec.provider,
+                if body_is_claude { "Claude" } else { "Codex" }
             );
         }
     }

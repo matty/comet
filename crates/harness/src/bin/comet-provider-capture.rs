@@ -1,13 +1,41 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use comet_harness::capture::{
-    CaptureConfig, CaptureOperation, CaptureScenario, ClaudeCaptureOperation, ClaudeRunScript,
-    CodexCaptureOperation, CodexRunScript, record,
-};
-use comet_proto::{ReasoningLevel, RunRequest, RuntimeMode};
+use comet_harness::capture::{CaptureConfig, Provider, SCENARIOS, record, scenario};
 
-const HELP: &str = r#"Record a raw Claude Code or Codex provider session.
+/// `"claude"` | `"codex"` — the string form every `--help` line, argument
+/// pair and `CaptureConfig::provider` value uses.
+fn provider_key(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "claude",
+        Provider::Codex => "codex",
+    }
+}
+
+/// Generated from [`SCENARIOS`] rather than hand-typed, so a new or renamed
+/// row cannot leave `--help` behind — closing D60 (the scenario name living
+/// in the help text, `supported_pair()`, and the dispatch `match` as three
+/// unsynchronized copies; there is now exactly one, this table).
+fn scenario_help_lines() -> String {
+    let mut lines = String::new();
+    for provider in [Provider::Claude, Provider::Codex] {
+        let names: Vec<&str> = SCENARIOS
+            .iter()
+            .filter(|spec| spec.provider == provider)
+            .map(|spec| spec.name)
+            .collect();
+        lines.push_str(&format!(
+            "  {:<7} {}\n",
+            format!("{}:", provider_key(provider)),
+            names.join(", ")
+        ));
+    }
+    lines
+}
+
+fn help_text() -> String {
+    format!(
+        r#"Record a raw Claude Code or Codex provider session.
 
 Usage:
   comet-provider-capture <PROVIDER> <SCENARIO> [OPTIONS]
@@ -17,13 +45,7 @@ Providers:
   codex     Codex app-server JSON-RPC
 
 Scenarios:
-  claude: model-discovery, model-discovery-neutral-cwd, model-discovery-project-cwd,
-          command-discovery, fresh-text, approval, resume, attachment, checklist,
-          checklist-resume
-  codex:  model-discovery, model-discovery-neutral-cwd, model-discovery-project-cwd,
-          model-discovery-logged-out, fresh-text, approval, approval-on-request, resume, steer,
-          interruption
-
+{}
 Options:
   --executable <PATH>              Override the provider executable
   --codex-home <PATH>              Override CODEX_HOME for Codex discovery
@@ -35,7 +57,10 @@ Options:
   --resume-id <ID>                 Provider session/thread id required by resume
   --attachment <PATH>              Image path required by Claude attachment
   -h, --help                       Print help without looking up a provider
-"#;
+"#,
+        scenario_help_lines()
+    )
+}
 
 #[derive(Default)]
 struct Args {
@@ -81,7 +106,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-h" | "--help" => {
-                print!("{HELP}");
+                print!("{}", help_text());
                 return Ok(None);
             }
             "--acknowledge-token-spend" => parsed.acknowledge_token_spend = true,
@@ -124,6 +149,14 @@ fn value(arguments: &mut impl Iterator<Item = String>, option: &str) -> Result<S
     })
 }
 
+/// Look the row up, then check each `Requirements` flag against what was
+/// supplied — the per-scenario `if` chain and the `ClaudeRunScript`/
+/// `CodexRunScript` construction this replaced both collapse into this one
+/// table-driven validation, and the scenario's own body (in
+/// `comet-harness`) is what turns the result into wire traffic. This binary
+/// never builds a prompt, a `RunRequest`, or a runtime mode — see
+/// `record::scenarios::{claude,codex}` for those; decision "the scenario
+/// owns its prompt".
 fn capture_config(args: Args) -> Result<CaptureConfig, String> {
     capture_config_with_env(args, |name| std::env::var_os(name).is_some())
 }
@@ -133,20 +166,21 @@ fn capture_config_with_env(
     env_present: impl Fn(&str) -> bool,
 ) -> Result<CaptureConfig, String> {
     let provider = args.provider.as_deref().unwrap_or_default();
-    let scenario = args.scenario.as_deref().unwrap_or_default();
-    if !supported_pair(provider, scenario) {
+    let scenario_name = args.scenario.as_deref().unwrap_or_default();
+    let Some(spec) = scenario(provider, scenario_name) else {
         return Err(match provider {
             "claude" | "codex" => format!(
-                "Scenario {scenario:?} is not supported for {provider}. Run with --help to see the valid pairs."
+                "Scenario {scenario_name:?} is not supported for {provider}. Run with --help to see the valid pairs."
             ),
             _ => "Provider must be claude or codex. Run with --help to see the valid pairs.".into(),
         });
-    }
-    let discovery = is_discovery_pair(provider, scenario);
-    if scenario != "approval-on-request" && args.approval_target.is_some() {
+    };
+    let requirements = spec.requirements;
+
+    if args.approval_target.is_some() && !requirements.needs_approval_target {
         return Err("--approval-target is only valid for codex approval-on-request.".into());
     }
-    if !discovery && !args.acknowledge_token_spend {
+    if requirements.spends_tokens && !args.acknowledge_token_spend {
         return Err(
             "This scenario can spend provider tokens. Re-run with --acknowledge-token-spend after checking the selected provider and scenario."
                 .into(),
@@ -154,23 +188,39 @@ fn capture_config_with_env(
     }
     let timeout_seconds = args
         .timeout_seconds
-        .unwrap_or(if discovery { 30 } else { 120 });
+        .unwrap_or(if requirements.spends_tokens { 120 } else { 30 });
     if !(1..=300).contains(&timeout_seconds) {
         return Err("--timeout-seconds must be from 1 through 300.".into());
     }
-    let cwd = resolve_existing_directory(args.cwd.as_deref(), "--cwd")?;
-    let approval_target = if scenario == "approval-on-request" {
+
+    // Every scenario tolerates `--cwd`; only scenarios whose behavior varies
+    // by cwd resolve and validate it (see `Requirements::needs_cwd`'s own
+    // doc comment). An omitted `--cwd` still resolves to the caller's
+    // current directory here, exactly as it always has — the scenario body
+    // only falls back to a neutral temp directory when this binary hands it
+    // `None`, which happens only for the cwd-independent discovery aliases.
+    let cwd = if requirements.needs_cwd {
+        Some(resolve_existing_directory(args.cwd.as_deref(), "--cwd")?)
+    } else {
+        None
+    };
+
+    let approval_target = if requirements.needs_approval_target {
+        let cwd = cwd
+            .as_deref()
+            .expect("needs_approval_target implies needs_cwd");
         Some(validate_approval_target(
             args.approval_target.as_deref().ok_or_else(|| {
                 "The approval-on-request scenario needs --approval-target with an empty external directory."
                     .to_owned()
             })?,
-            &cwd,
+            cwd,
         )?)
     } else {
         None
     };
-    if scenario == "model-discovery-logged-out" {
+
+    if requirements.needs_empty_codex_home {
         if ["OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"]
             .into_iter()
             .any(env_present)
@@ -196,318 +246,40 @@ fn capture_config_with_env(
         }
     }
 
-    let scenario = match (provider, scenario) {
-        ("claude", "model-discovery") => CaptureScenario {
-            name: "model-discovery",
-            purpose: "capture Claude's token-free model initialize reply",
-            operation: CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
-        },
-        ("claude", "model-discovery-neutral-cwd") => CaptureScenario {
-            name: "model-discovery-neutral-cwd",
-            purpose: "capture Claude model discovery from a neutral working directory",
-            operation: CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
-        },
-        ("claude", "model-discovery-project-cwd") => CaptureScenario {
-            name: "model-discovery-project-cwd",
-            purpose: "capture Claude model discovery from the selected project directory",
-            operation: CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscoveryAt { cwd }),
-        },
-        ("claude", "command-discovery") => CaptureScenario {
-            name: "command-discovery",
-            purpose: "capture Claude's cwd-scoped command initialize reply",
-            operation: CaptureOperation::Claude(ClaudeCaptureOperation::CommandDiscovery { cwd }),
-        },
-        (
-            "claude",
-            name @ ("fresh-text" | "approval" | "resume" | "attachment" | "checklist"
-            | "checklist-resume"),
-        ) => {
-            let (prompt, script) = match name {
-                "fresh-text" => (
-                    "Reply with the single word capture.".to_owned(),
-                    ClaudeRunScript::FreshText,
-                ),
-                "approval" => (claude_approval_prompt(&cwd), ClaudeRunScript::Approval),
-                "resume" => (
-                    "Reply with the single word resumed.".to_owned(),
-                    ClaudeRunScript::Resume,
-                ),
-                "attachment" => (
-                    "Describe the attached image in one short sentence.".to_owned(),
-                    ClaudeRunScript::Attachment,
-                ),
-                "checklist" => (claude_checklist_prompt(), ClaudeRunScript::Checklist),
-                "checklist-resume" => (
-                    claude_checklist_resume_prompt(),
-                    ClaudeRunScript::ChecklistResume,
-                ),
-                _ => unreachable!(),
-            };
-            let mode = claude_runtime_mode(script);
-            let mut request = cheap_claude_request(&prompt, cwd, mode);
-            if matches!(
-                script,
-                ClaudeRunScript::Resume | ClaudeRunScript::ChecklistResume
-            ) {
-                request.resume = Some(args.resume_id.clone().ok_or_else(|| {
-                    "The resume scenario needs --resume-id with a Claude session id.".to_owned()
-                })?);
-            }
-            if matches!(script, ClaudeRunScript::Attachment) {
-                request.attachments.push(
-                    args.attachment
-                        .clone()
-                        .ok_or_else(|| {
-                            "The attachment scenario needs --attachment with an image path."
-                                .to_owned()
-                        })?
-                        .display()
-                        .to_string(),
-                );
-            }
-            CaptureScenario {
-                name: canonical_scenario_name(name),
-                purpose: "capture one bounded Claude run script",
-                operation: CaptureOperation::Claude(ClaudeCaptureOperation::Run {
-                    request,
-                    script,
-                }),
-            }
-        }
-        ("codex", "model-discovery") => CaptureScenario {
-            name: "model-discovery",
-            purpose: "capture Codex initialize and paged model/list replies",
-            operation: CaptureOperation::Codex(CodexCaptureOperation::ModelDiscovery),
-        },
-        ("codex", "model-discovery-neutral-cwd") => CaptureScenario {
-            name: "model-discovery-neutral-cwd",
-            purpose: "capture Codex model discovery from a neutral working directory",
-            operation: CaptureOperation::Codex(CodexCaptureOperation::ModelDiscovery),
-        },
-        ("codex", "model-discovery-project-cwd") => CaptureScenario {
-            name: "model-discovery-project-cwd",
-            purpose: "capture Codex model discovery from the selected project directory",
-            operation: CaptureOperation::Codex(CodexCaptureOperation::ModelDiscoveryAt { cwd }),
-        },
-        ("codex", "model-discovery-logged-out") => CaptureScenario {
-            name: "model-discovery-logged-out",
-            purpose: "capture Codex model discovery with an isolated empty Codex home",
-            operation: CaptureOperation::Codex(CodexCaptureOperation::ModelDiscovery),
-        },
-        (
-            "codex",
-            name @ ("fresh-text"
-            | "approval"
-            | "approval-on-request"
-            | "resume"
-            | "steer"
-            | "interruption"),
-        ) => {
-            let (prompt, script) = match name {
-                "fresh-text" => (
-                    "Reply with the single word capture.".to_owned(),
-                    CodexRunScript::FreshText,
-                ),
-                "approval" => (
-                    comet_harness::capture::codex_approval_prompt(&cwd),
-                    CodexRunScript::Approval,
-                ),
-                "approval-on-request" => (
-                    comet_harness::capture::approval_on_request_prompt(
-                        approval_target.as_deref().expect("validated target"),
-                    ),
-                    CodexRunScript::ApprovalOnRequest,
-                ),
-                "resume" => (
-                    "Reply with the single word resumed.".to_owned(),
-                    CodexRunScript::Resume,
-                ),
-                "steer" => (
-                    "Begin a short response, then accept the follow-up instruction.".to_owned(),
-                    CodexRunScript::Steer,
-                ),
-                "interruption" => (
-                    "Count upward slowly and keep working until interrupted.".to_owned(),
-                    CodexRunScript::Interruption,
-                ),
-                _ => unreachable!(),
-            };
-            let mode = codex_runtime_mode(script);
-            let mut request = cheap_codex_request(&prompt, cwd, mode);
-            if matches!(script, CodexRunScript::Resume) {
-                request.resume = Some(args.resume_id.clone().ok_or_else(|| {
-                    "The resume scenario needs --resume-id with a Codex thread id.".to_owned()
-                })?);
-            }
-            CaptureScenario {
-                name: canonical_scenario_name(name),
-                purpose: "capture one bounded Codex run script",
-                operation: CaptureOperation::Codex(CodexCaptureOperation::Run { request, script }),
-            }
-        }
-        _ => unreachable!("provider/scenario pair was validated"),
+    let resume_id = if requirements.needs_resume_id {
+        Some(args.resume_id.clone().ok_or_else(|| {
+            format!(
+                "The {} scenario needs --resume-id with a provider session/thread id.",
+                spec.name
+            )
+        })?)
+    } else {
+        None
+    };
+
+    let attachment = if requirements.needs_attachment {
+        Some(args.attachment.clone().ok_or_else(|| {
+            "The attachment scenario needs --attachment with an image path.".to_owned()
+        })?)
+    } else {
+        None
     };
 
     Ok(CaptureConfig {
-        scenario,
+        provider: provider_key(spec.provider),
+        scenario_name: spec.name,
+        purpose: spec.purpose,
         executable: args.executable,
         codex_home: args.codex_home,
+        cwd,
+        resume_id,
+        attachment,
         approval_target,
         raw_root: args
             .raw_root
             .unwrap_or_else(|| PathBuf::from(".comet-provider-captures").join("raw")),
         timeout: Duration::from_secs(timeout_seconds),
     })
-}
-
-fn supported_pair(provider: &str, scenario: &str) -> bool {
-    matches!(
-        (provider, scenario),
-        (
-            "claude",
-            "model-discovery"
-                | "model-discovery-neutral-cwd"
-                | "model-discovery-project-cwd"
-                | "command-discovery"
-                | "fresh-text"
-                | "approval"
-                | "resume"
-                | "attachment"
-                | "checklist"
-                | "checklist-resume"
-        ) | (
-            "codex",
-            "model-discovery"
-                | "model-discovery-neutral-cwd"
-                | "model-discovery-project-cwd"
-                | "model-discovery-logged-out"
-                | "fresh-text"
-                | "approval"
-                | "approval-on-request"
-                | "resume"
-                | "steer"
-                | "interruption"
-        )
-    )
-}
-
-fn is_discovery_pair(provider: &str, scenario: &str) -> bool {
-    matches!(
-        (provider, scenario),
-        (
-            "claude",
-            "model-discovery"
-                | "model-discovery-neutral-cwd"
-                | "model-discovery-project-cwd"
-                | "command-discovery"
-        ) | (
-            "codex",
-            "model-discovery"
-                | "model-discovery-neutral-cwd"
-                | "model-discovery-project-cwd"
-                | "model-discovery-logged-out"
-        )
-    )
-}
-
-fn canonical_scenario_name(name: &str) -> &'static str {
-    match name {
-        "fresh-text" => "fresh-text",
-        "approval" => "approval",
-        "approval-on-request" => "approval-on-request",
-        "resume" => "resume",
-        "attachment" => "attachment",
-        "checklist" => "checklist",
-        "checklist-resume" => "checklist-resume",
-        "steer" => "steer",
-        "interruption" => "interruption",
-        _ => unreachable!("only matched scenario names reach this helper"),
-    }
-}
-
-/// Owed to Task 7: a literal duplicate of
-/// `capture::record::scenarios::claude::claude_checklist_prompt`, which is
-/// private to that module (decision "the scenario owns its prompt"). This
-/// binary still builds its own `CaptureConfig` by hand and cannot yet reach
-/// the scenario table (`SCENARIOS` has no `checklist` row until Task 7 wires
-/// this binary to look scenarios up by name instead of constructing them
-/// here), so until that rewiring lands, keeping this binary compiling means
-/// keeping a second copy of the prompt text rather than exposing the private
-/// helper across a boundary that is about to disappear.
-fn claude_checklist_prompt() -> String {
-    concat!(
-        r#"Use ToolSearch exactly once with input {"query":"select:TaskCreate,TaskUpdate","max_results":5}. "#,
-        r#"Then use TaskCreate exactly twice, first with input {"subject":"Alpha step","description":"The first step"} "#,
-        r#"and then with input {"subject":"Beta step","description":"The second step"}. "#,
-        r#"Then use TaskUpdate exactly once with input {"taskId":"1","status":"in_progress","activeForm":"Working the first step"}. "#,
-        r#"Then use TaskUpdate exactly once with input {"taskId":"1","status":"completed"}. "#,
-        r#"Do nothing else, and reply with the single word capture."#,
-    )
-    .to_owned()
-}
-
-/// See `claude_checklist_prompt`'s doc comment — same duplication, owed to
-/// the same task.
-fn claude_checklist_resume_prompt() -> String {
-    concat!(
-        r#"Use ToolSearch exactly once with input {"query":"select:TaskUpdate","max_results":5}. "#,
-        r#"Then use TaskUpdate exactly once with input {"taskId":"2","status":"in_progress","activeForm":"Working the second step"}. "#,
-        r#"Then use TaskUpdate exactly once with input {"taskId":"2","status":"completed"}. "#,
-        r#"Do not create any task. Do nothing else, and reply with the single word resumed."#,
-    )
-    .to_owned()
-}
-
-/// Owed to Task 7 — see `claude_checklist_prompt`'s doc comment for why this
-/// binary keeps its own copy rather than reaching across a boundary about to
-/// disappear. A literal duplicate of
-/// `capture::record::scenarios::claude::claude_approval_prompt`, moved there
-/// (and out of the now-deleted `capture::approval::claude`) by the task that
-/// ported the `approval` scenario.
-fn claude_approval_prompt(cwd: &Path) -> String {
-    let marker = cwd.join("capture-marker.txt");
-    format!(
-        "Use Bash exactly once with input {{\"command\":{}}}. Wait for it to finish successfully. Then use Write exactly once with input {{\"file_path\":{},\"content\":{}}}.",
-        serde_json::to_string("printf capture").expect("static command serializes"),
-        serde_json::to_string(&marker.display().to_string()).expect("path serializes"),
-        serde_json::to_string("capture\n").expect("static content serializes"),
-    )
-}
-
-fn cheap_claude_request(prompt: &str, cwd: PathBuf, mode: RuntimeMode) -> RunRequest {
-    RunRequest {
-        prompt: prompt.into(),
-        model: Some("claude-haiku-4-5-20251001".into()),
-        reasoning: Some(ReasoningLevel::Low),
-        cwd: cwd.display().to_string(),
-        ..RunRequest::for_session(mode)
-    }
-}
-
-fn claude_runtime_mode(script: ClaudeRunScript) -> RuntimeMode {
-    if matches!(script, ClaudeRunScript::Approval) {
-        RuntimeMode::ApprovalRequired
-    } else {
-        RuntimeMode::AutoAcceptEdits
-    }
-}
-
-fn codex_runtime_mode(script: CodexRunScript) -> RuntimeMode {
-    if matches!(script, CodexRunScript::Approval) {
-        RuntimeMode::ApprovalRequired
-    } else {
-        RuntimeMode::AutoAcceptEdits
-    }
-}
-
-fn cheap_codex_request(prompt: &str, cwd: PathBuf, mode: RuntimeMode) -> RunRequest {
-    RunRequest {
-        prompt: prompt.into(),
-        model: Some("gpt-5.6-luna".into()),
-        reasoning: Some(ReasoningLevel::Low),
-        cwd: cwd.display().to_string(),
-        ..RunRequest::for_session(mode)
-    }
 }
 
 fn resolve_existing_directory(
@@ -570,6 +342,8 @@ fn exit_with(message: &str) -> ! {
 
 #[cfg(test)]
 mod tests {
+    use comet_proto::RuntimeMode;
+
     use super::*;
 
     fn token_free_args(provider: &str, scenario: &str, codex_home: Option<PathBuf>) -> Args {
@@ -586,7 +360,7 @@ mod tests {
     /// corpus even though each observation is a token-free production discovery handshake.
     #[test]
     fn supports_every_token_free_discovery_observation() {
-        for (provider, scenario) in [
+        for (provider, scenario_name) in [
             ("claude", "model-discovery-neutral-cwd"),
             ("claude", "model-discovery-project-cwd"),
             ("claude", "command-discovery"),
@@ -595,8 +369,8 @@ mod tests {
             ("codex", "model-discovery-logged-out"),
         ] {
             assert!(
-                supported_pair(provider, scenario),
-                "missing token-free capture pair {provider}/{scenario}"
+                scenario(provider, scenario_name).is_some(),
+                "missing token-free capture pair {provider}/{scenario_name}"
             );
         }
     }
@@ -606,7 +380,7 @@ mod tests {
     #[test]
     fn configures_every_token_free_discovery_without_spend_acknowledgment() {
         let empty_home = tempfile::tempdir().unwrap();
-        for (provider, scenario, codex_home) in [
+        for (provider, scenario_name, codex_home) in [
             ("claude", "model-discovery-neutral-cwd", None),
             ("claude", "model-discovery-project-cwd", None),
             ("claude", "command-discovery", None),
@@ -626,9 +400,9 @@ mod tests {
                 Some(empty_home.path().into()),
             ),
         ] {
-            let config = capture_config(token_free_args(provider, scenario, codex_home))
-                .unwrap_or_else(|error| panic!("{provider}/{scenario}: {error}"));
-            assert_eq!(config.scenario.name, scenario);
+            let config = capture_config(token_free_args(provider, scenario_name, codex_home))
+                .unwrap_or_else(|error| panic!("{provider}/{scenario_name}: {error}"));
+            assert_eq!(config.scenario_name, scenario_name);
         }
     }
 
@@ -686,53 +460,45 @@ mod tests {
         let mut args = token_free_args("claude", "model-discovery-project-cwd", None);
         args.cwd = Some(PathBuf::from("."));
         let config = capture_config(args).unwrap();
-        let CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscoveryAt { cwd }) =
-            config.scenario.operation
-        else {
-            panic!("wrong operation");
-        };
+        let cwd = config
+            .cwd
+            .expect("model-discovery-project-cwd must resolve a cwd");
         assert!(cwd.is_absolute());
         assert!(cwd.is_dir());
         #[cfg(windows)]
         assert!(!cwd.as_os_str().to_string_lossy().starts_with(r"\\?\"));
     }
 
+    /// Break caught: a run scenario's runtime mode drifts from what the table declares — most
+    /// importantly Codex `approval` staying `ApprovalRequired` (load-bearing: under
+    /// `AutoAcceptEdits`, Codex never asks and the capture records nothing) while
+    /// `approval-on-request` stays `AutoAcceptEdits` (Codex's on-request approval path is entered
+    /// under auto-accept, not approval-required).
     #[test]
     fn scenario_names_own_their_runtime_modes() {
-        assert_eq!(
-            codex_runtime_mode(CodexRunScript::ApprovalOnRequest),
-            RuntimeMode::AutoAcceptEdits
-        );
-        for (provider, scenario, expected) in [
+        for (provider, name, expected) in [
             ("claude", "fresh-text", RuntimeMode::AutoAcceptEdits),
             ("claude", "approval", RuntimeMode::ApprovalRequired),
             ("claude", "resume", RuntimeMode::AutoAcceptEdits),
             ("claude", "attachment", RuntimeMode::AutoAcceptEdits),
+            ("claude", "checklist", RuntimeMode::AutoAcceptEdits),
+            ("claude", "checklist-resume", RuntimeMode::AutoAcceptEdits),
             ("codex", "fresh-text", RuntimeMode::AutoAcceptEdits),
             ("codex", "approval", RuntimeMode::ApprovalRequired),
+            ("codex", "approval-on-request", RuntimeMode::AutoAcceptEdits),
             ("codex", "resume", RuntimeMode::AutoAcceptEdits),
             ("codex", "steer", RuntimeMode::AutoAcceptEdits),
             ("codex", "interruption", RuntimeMode::AutoAcceptEdits),
         ] {
-            let mut args = token_free_args(provider, scenario, None);
-            args.acknowledge_token_spend = true;
-            args.resume_id = Some("resume-id".into());
-            args.attachment = Some(PathBuf::from("image.png"));
-            let config = capture_config(args).unwrap();
-            let mode = match config.scenario.operation {
-                CaptureOperation::Claude(ClaudeCaptureOperation::Run { request, .. })
-                | CaptureOperation::Codex(CodexCaptureOperation::Run { request, .. }) => {
-                    request.runtime_mode
-                }
-                _ => panic!("{provider}/{scenario} did not configure a run"),
-            };
-            assert_eq!(mode, expected, "{provider}/{scenario}");
+            let spec =
+                scenario(provider, name).unwrap_or_else(|| panic!("missing {provider}/{name}"));
+            assert_eq!(spec.runtime_mode, Some(expected), "{provider}/{name}");
         }
     }
 
     #[test]
     fn on_request_requires_a_bounded_external_empty_target() {
-        assert!(!supported_pair("claude", "approval-on-request"));
+        assert!(scenario("claude", "approval-on-request").is_none());
         let mut unused = token_free_args("codex", "model-discovery", None);
         unused.approval_target = Some(PathBuf::from("."));
         assert!(capture_config(unused).unwrap_err().contains("only valid"));
@@ -770,6 +536,91 @@ mod tests {
             assert!(!prompt.contains("cmd.exe /C"));
         } else {
             assert!(prompt.contains("'/capture targets/O'\\''Brien/approval-marker.txt'"));
+        }
+    }
+
+    /// Closes D60: the `--help` scenario list is generated from `SCENARIOS`, not hand-typed, so
+    /// this test guards the generation rather than duplicating it — an added, removed or renamed
+    /// row cannot leave `--help` behind. Also resolves every advertised `(provider, name)` pair
+    /// through `scenario()` and checks the row's own declared `provider` field agrees with which
+    /// provider it was found under.
+    ///
+    /// Break caught: add a row to `SCENARIOS` whose declared `provider` disagrees with the
+    /// provider it is filed under in the table (`scenario_help_lines` groups by `spec.provider`,
+    /// so a wrong `provider` field would print the name under the wrong provider's line, or
+    /// `scenario(provider, name)` would fail to resolve it under the provider `--help` advertised).
+    #[test]
+    fn every_help_text_scenario_is_a_table_row_and_dispatches() {
+        let help = help_text();
+        for provider in [Provider::Claude, Provider::Codex] {
+            let key = provider_key(provider);
+            let prefix = format!("{key}:");
+            let line = help
+                .lines()
+                .find(|line| line.trim_start().starts_with(&prefix))
+                .unwrap_or_else(|| panic!("--help has no scenario line for {key}"));
+            let advertised: Vec<&str> = line
+                .trim_start()
+                .strip_prefix(&prefix)
+                .unwrap()
+                .split(',')
+                .map(str::trim)
+                .collect();
+            let table: Vec<&str> = SCENARIOS
+                .iter()
+                .filter(|spec| spec.provider == provider)
+                .map(|spec| spec.name)
+                .collect();
+            assert_eq!(advertised, table, "--help and SCENARIOS diverge for {key}");
+            assert!(!table.is_empty(), "{key} advertises no scenarios");
+            for name in table {
+                let spec = scenario(key, name)
+                    .unwrap_or_else(|| panic!("{key}/{name} is advertised but does not resolve"));
+                assert_eq!(
+                    spec.provider, provider,
+                    "{key}/{name} resolved under the wrong provider"
+                );
+            }
+        }
+    }
+
+    /// Every one of the 20 `(provider, name)` pairs in `SCENARIOS` must build a valid
+    /// `CaptureConfig` through this binary's own argument validation, given whatever its
+    /// `Requirements` demand — restores what Task 2 broke: the binary routed every ported
+    /// scenario into a dead end, and this is the CLI-level proof that every name is reachable
+    /// again, not just the ones a hand test happens to cover.
+    #[test]
+    fn every_registered_scenario_builds_a_valid_capture_config() {
+        let cwd = tempfile::tempdir().unwrap();
+        // `validate_approval_target` rejects anything under the system temp tree, so a plain
+        // `tempfile::tempdir()` will not do here; the checkout root is outside it.
+        let target = tempfile::Builder::new()
+            .prefix("comet-cli-approval-target-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let empty_codex_home = tempfile::tempdir().unwrap();
+        let attachment = tempfile::tempdir().unwrap().path().join("image.png");
+        for spec in SCENARIOS {
+            let provider = provider_key(spec.provider);
+            let mut args = token_free_args(provider, spec.name, None);
+            args.cwd = Some(cwd.path().into());
+            args.acknowledge_token_spend = spec.requirements.spends_tokens;
+            if spec.requirements.needs_resume_id {
+                args.resume_id = Some("resume-id".into());
+            }
+            if spec.requirements.needs_attachment {
+                args.attachment = Some(attachment.clone());
+            }
+            if spec.requirements.needs_approval_target {
+                args.approval_target = Some(target.path().into());
+            }
+            if spec.requirements.needs_empty_codex_home {
+                args.codex_home = Some(empty_codex_home.path().into());
+            }
+            let config = capture_config(args)
+                .unwrap_or_else(|error| panic!("{provider}/{}: {error}", spec.name));
+            assert_eq!(config.provider, provider);
+            assert_eq!(config.scenario_name, spec.name);
         }
     }
 }
