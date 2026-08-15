@@ -8,6 +8,7 @@
 //! compiles into the binary. Moving it behind a crate boundary is deferred
 //! until the recorder is provider-neutral.
 
+mod allowlist;
 mod approval;
 mod checklist;
 mod corpus;
@@ -19,6 +20,7 @@ mod surface;
 mod test_support;
 mod types;
 
+pub use allowlist::{Allowlist, allows, allows_prefix, named_kind};
 pub use approval::{
     approval_marker_command, approval_on_request_prompt, claude_approval_prompt,
     codex_approval_prompt,
@@ -26,9 +28,12 @@ pub use approval::{
 pub use checklist::{claude_checklist_prompt, claude_checklist_resume_prompt};
 pub use corpus::{Frame, corpus_frame, frame};
 pub use recording::record;
-pub use sanitize::{SanitizationError, SanitizationReport, sanitize_dir};
+pub use sanitize::{
+    NovelPath, SanitizationError, SanitizationReport, render_novel_paths_report, sanitize_dir,
+};
 pub use surface::{
-    Direction, FieldObservation, FrameRef, SurfaceError, observe_corpus, observed_field_lines,
+    Direction, FieldObservation, FrameRef, MAP_PATHS, SurfaceError, observe_corpus,
+    observed_field_lines,
 };
 pub use types::{
     CaptureConfig, CaptureEvent, CaptureOperation, CaptureScenario, Channel,

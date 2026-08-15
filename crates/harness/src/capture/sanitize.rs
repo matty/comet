@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use super::allowlist::{allows, allows_prefix, named_kind};
 use super::filesystem::has_windows_reparse_point;
+use super::surface;
 use super::types::{Channel, PartialRawCapture, Provider, RawCapture};
 
 #[derive(Clone, Debug)]
@@ -13,6 +15,49 @@ pub struct SanitizationReport {
     pub manifest_path: PathBuf,
     pub events_bytes: Vec<u8>,
     pub manifest_bytes: Vec<u8>,
+    /// Every dotted path the allowlist withheld a value for, sorted by path.
+    /// The allowlist's fail-closed default is only useful if what it
+    /// withholds is visible: this is that visibility, without ever
+    /// reproducing what was withheld. See `NovelPath` for what each entry
+    /// carries and, just as importantly, what it deliberately does not.
+    pub novel_paths: Vec<NovelPath>,
+}
+
+/// One path the allowlist withheld a value for, described without
+/// reproducing the value: just enough shape to triage whether the path
+/// looks safe to add to the allowlist, never enough to read what a
+/// withheld field actually said.
+///
+/// Deliberately excludes the `mcp__` exception (`is_mcp_tool_identity`):
+/// that path *is* on the allowlist and its withholding is an already-
+/// reviewed, documented rule, not something nobody has considered. Naming
+/// it here would file a settled decision back under "novel" and dilute the
+/// list this exists to keep short and actionable. See the doc comment on
+/// `is_mcp_tool_identity` for the reviewed reasoning behind that exception.
+///
+/// `path` can name a **field**, and field names are published deliberately —
+/// `tests/corpus/observed-fields.json` is a snapshot of exactly those names.
+/// What it can never name is a **map key**: a key under one of
+/// `surface::MAP_PATHS` is data, so an unreviewed one is replaced before the
+/// path is built, and the entry it produces reads `.modelUsage.{}` with the
+/// key counted as a withheld value. `.modelUsage.claude-haiku-4-5-20251001`
+/// still appears verbatim, because those two literal lines are on
+/// `allowlist/claude.txt` and a listed path is a decision to publish.
+///
+/// An earlier version of this comment argued no key needed redacting at all,
+/// on the grounds that `validate_key` fail-closed-scans every one. That scan
+/// is a *blocklist* — redaction roots, absolute paths, secret shapes — which
+/// is the thing this whole module replaced in value position, and it has
+/// nothing to say about a key that names a machine, an account or a
+/// connector. Keys are now default-deny wherever they are data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NovelPath {
+    pub path: String,
+    pub distinct_values: usize,
+    /// The JSON type and, for strings, a length or length range —
+    /// `"string len 8-42"`, `"number"`, `"bool"` — computed from the
+    /// withheld values but never equal to any of them.
+    pub shape: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +84,10 @@ pub enum SanitizationError {
     SecretLikeValue { location: String },
     #[error("capture contains a sensitive object key at {location}")]
     SensitiveObjectKey { location: String },
+    #[error("capture contains an object key that would impersonate a nested path at {location}")]
+    AmbiguousObjectKey { location: String },
+    #[error("capture contains a value shaped like a generated placeholder at {location}")]
+    PlaceholderShapedValue { location: String },
     #[error("capture channel contains unparseable structured JSON at sequence {sequence}")]
     UnparseableStructuredPayload { sequence: u64 },
     #[error("Claude capture command has invalid resume arguments at {location}")]
@@ -65,81 +114,30 @@ pub enum SanitizationError {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum RedactionKind {
-    ClaudeRequestId,
-    CodexRpcId,
-    SessionId,
-    ThreadId,
-    TurnId,
-    ToolUseId,
-    UserText,
-    AssistantProse,
-    ProviderProse,
-    MachineId,
-    AttachmentBytes,
-    ClaudeMemoryPath,
-    ClaudeMessageId,
-    ClaudeThinkingSignature,
-    CodexMcpServerName,
-    CodexThreadPath,
-}
-
-impl RedactionKind {
-    fn placeholder_name(self) -> &'static str {
-        match self {
-            Self::ClaudeRequestId => "CLAUDE_REQUEST_ID",
-            Self::CodexRpcId => "CODEX_RPC_ID",
-            Self::SessionId => "SESSION_ID",
-            Self::ThreadId => "THREAD_ID",
-            Self::TurnId => "TURN_ID",
-            Self::ToolUseId => "TOOL_USE_ID",
-            Self::UserText => "USER_TEXT",
-            Self::AssistantProse => "ASSISTANT_PROSE",
-            Self::ProviderProse => "PROVIDER_PROSE",
-            Self::MachineId => "MACHINE_ID",
-            Self::AttachmentBytes => "ATTACHMENT_BYTES",
-            Self::ClaudeMemoryPath => "CLAUDE_MEMORY_PATH",
-            Self::ClaudeMessageId => "CLAUDE_MESSAGE_ID",
-            Self::ClaudeThinkingSignature => "CLAUDE_THINKING_SIGNATURE",
-            Self::CodexMcpServerName => "CODEX_MCP_SERVER_NAME",
-            Self::CodexThreadPath => "CODEX_THREAD_PATH",
-        }
-    }
-
-    fn manifest_name(self) -> &'static str {
-        match self {
-            Self::ClaudeRequestId => "claude_request_id",
-            Self::CodexRpcId => "codex_rpc_id",
-            Self::SessionId => "session_id",
-            Self::ThreadId => "thread_id",
-            Self::TurnId => "turn_id",
-            Self::ToolUseId => "tool_use_id",
-            Self::UserText => "user_text",
-            Self::AssistantProse => "assistant_prose",
-            Self::ProviderProse => "provider_prose",
-            Self::MachineId => "machine_id",
-            Self::AttachmentBytes => "attachment_bytes",
-            Self::ClaudeMemoryPath => "claude_memory_path",
-            Self::ClaudeMessageId => "claude_message_id",
-            Self::ClaudeThinkingSignature => "claude_thinking_signature",
-            Self::CodexMcpServerName => "codex_mcp_server_name",
-            Self::CodexThreadPath => "codex_thread_path",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct SemanticValue {
-    original: Value,
-    placeholder: String,
-}
-
+/// Per-capture redaction state: which values have already been assigned a
+/// placeholder, and the counters that feed the manifest.
+///
+/// Numbering is keyed on the original value, not on a counter, so equal
+/// values collide into the same placeholder deliberately — a join that held
+/// on the wire still holds in the archive. `named` groups are the six
+/// identifier kinds from `allowlist::named_kind` (plus the internal `PROSE`
+/// group for non-JSON stderr payloads); `generic` is the numbered fallback
+/// (`<V1>`, `<V2>`, …) for every other unlisted scalar. Both are `Vec`, not
+/// `HashMap`, because encounter order is what makes a run byte-deterministic
+/// — the publication tests assert on that determinism directly.
 #[derive(Default)]
 struct Redactor {
-    semantics: BTreeMap<RedactionKind, Vec<SemanticValue>>,
-    counts: BTreeMap<String, u64>,
     paths: Vec<PathRedaction>,
+    named: BTreeMap<&'static str, Vec<(Value, String)>>,
+    generic: Vec<(Value, String)>,
+    counts: BTreeMap<String, u64>,
+    /// Distinct raw values seen at each path the allowlist withheld,
+    /// keyed by dotted path (`BTreeMap` for path-sorted, deterministic
+    /// iteration). Never leaves this struct as raw values -- `novel_paths`
+    /// reduces each entry to a count and a shape before it becomes a
+    /// `NovelPath`. Excludes the `mcp__` exception deliberately; see
+    /// `NovelPath`'s doc comment.
+    novel: BTreeMap<String, Vec<Value>>,
 }
 
 #[derive(Clone)]
@@ -147,50 +145,6 @@ struct PathRedaction {
     values: Vec<String>,
     placeholder: &'static str,
     kind: &'static str,
-}
-
-#[derive(Clone, Copy, Default)]
-enum Speaker {
-    #[default]
-    Unknown,
-    User,
-    Assistant,
-}
-
-#[derive(Clone, Copy, Default)]
-struct SemanticContext {
-    claude_capture: bool,
-    json_root: bool,
-    speaker: Speaker,
-    codex_turn_input: bool,
-    codex_assistant_prose: bool,
-    codex_assistant_prose_array: bool,
-    discovery_metadata: bool,
-    codex_catalog: bool,
-    codex_root_notification: CodexNotification,
-    codex_direct_params: CodexNotification,
-    availability_nux: bool,
-    claude_memory_paths: bool,
-    claude_tool_use: bool,
-    claude_tool_input: bool,
-    entity: Entity,
-}
-
-#[derive(Clone, Copy, Default, Eq, PartialEq)]
-enum CodexNotification {
-    #[default]
-    None,
-    TokenUsage,
-    McpStartupStatus,
-}
-
-#[derive(Clone, Copy, Default)]
-enum Entity {
-    #[default]
-    None,
-    Thread,
-    Turn,
-    Item,
 }
 
 /// Convert one raw capture into reviewable staging artifacts.
@@ -219,11 +173,6 @@ pub fn sanitize_dir(
     let capture: RawCapture = serde_json::from_slice(&bytes)
         .map_err(|source| SanitizationError::InvalidRaw { source })?;
     let mut redactor = Redactor::new(&capture);
-    let semantic_context = SemanticContext {
-        claude_capture: capture.provider == Provider::Claude,
-        json_root: true,
-        ..SemanticContext::default()
-    };
 
     let mut payloads = Vec::with_capacity(capture.events.len());
     for event in &capture.events {
@@ -239,41 +188,23 @@ pub fn sanitize_dir(
             }
         }
     }
-    for payload in &payloads {
-        match payload {
-            Payload::Json(value) => {
-                redactor.collect_semantics(value, semantic_context);
-            }
-            Payload::Text(text) => {
-                redactor.register(RedactionKind::ProviderProse, &Value::String(text.clone()));
-            }
-        }
-    }
 
-    let mut command = serde_json::to_value(&capture.command)
-        .map_err(|source| SanitizationError::EncodeOutput { source })?;
-    if capture.provider == Provider::Claude {
-        redactor.sanitize_claude_resume_argv(&mut command, &capture.scenario)?;
-    }
-    redactor.sanitize_nonsemantic_value(&mut command, "command")?;
-
+    // Events are sanitized before `command`, deliberately: the Claude resume
+    // argv below needs the session id's placeholder already assigned, and a
+    // session id normally first appears inside an event payload, not in
+    // `command` itself.
     let mut events_bytes = Vec::new();
     for (event, payload) in capture.events.iter().zip(&mut payloads) {
         let payload = match payload {
             Payload::Json(value) => {
-                redactor.sanitize_json(value, semantic_context, "event.payload")?;
+                redactor.sanitize_value_tree(value, capture.provider, "", "", "event.payload")?;
                 serde_json::to_string(value)
                     .map_err(|source| SanitizationError::EncodeOutput { source })?
             }
             Payload::Text(text) => {
-                let mut value = Value::String(text.clone());
-                redactor.replace_semantic(RedactionKind::ProviderProse, &mut value);
-                *text = value
-                    .as_str()
-                    .expect("text replacement stays a string")
-                    .to_owned();
-                redactor.sanitize_string(text, "event.payload")?;
-                text.clone()
+                let placeholder = redactor.placeholder_for_prose(text);
+                *text = placeholder.clone();
+                placeholder
             }
         };
         let line = SanitizedEvent {
@@ -285,6 +216,13 @@ pub fn sanitize_dir(
             .map_err(|source| SanitizationError::EncodeOutput { source })?;
         events_bytes.push(b'\n');
     }
+
+    let mut command = serde_json::to_value(&capture.command)
+        .map_err(|source| SanitizationError::EncodeOutput { source })?;
+    if capture.provider == Provider::Claude {
+        redactor.sanitize_claude_resume_argv(&mut command, &capture.scenario)?;
+    }
+    redactor.sanitize_nonsemantic_value(&mut command, "command")?;
 
     let mut cli_version = capture.cli_version.clone();
     redactor.sanitize_paths_and_validate(&mut cli_version, "cli_version")?;
@@ -303,6 +241,10 @@ pub fn sanitize_dir(
         }
         seen
     });
+    // Computed before `redactor.counts` is moved into the manifest below --
+    // `novel_paths` only borrows, but the borrow checker won't let it borrow
+    // the whole `Redactor` after one of its fields has been partially moved.
+    let novel_paths = redactor.novel_paths();
     let manifest = json!({
         "schema_version": 1,
         "source": "capture.json",
@@ -338,6 +280,7 @@ pub fn sanitize_dir(
         manifest_path,
         events_bytes,
         manifest_bytes,
+        novel_paths,
     })
 }
 
@@ -654,94 +597,230 @@ impl Redactor {
             .sort_by_key(|path| std::cmp::Reverse(path.values.first().map_or(0, String::len)));
     }
 
-    fn collect_semantics(&mut self, value: &Value, context: SemanticContext) {
-        if context.codex_assistant_prose_array && value.is_string() {
-            self.register(RedactionKind::AssistantProse, value);
-            return;
-        }
-        match value {
-            Value::Array(values) => {
-                for value in values {
-                    self.collect_semantics(value, descendant_context(context));
-                }
-            }
-            Value::Object(object) => {
-                let context = object_context(object, context);
-                for (key, value) in object {
-                    if let Some(kind) = semantic_kind(object, key, value, context) {
-                        self.register(kind, value);
-                    } else {
-                        self.collect_semantics(value, child_context(context, key));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn register(&mut self, kind: RedactionKind, original: &Value) {
-        if !matches!(original, Value::String(_) | Value::Number(_)) {
-            return;
-        }
-        let values = self.semantics.entry(kind).or_default();
-        if values.iter().any(|value| value.original == *original) {
-            return;
-        }
-        values.push(SemanticValue {
-            original: original.clone(),
-            placeholder: format!("<{}_{}>", kind.placeholder_name(), values.len() + 1),
-        });
-    }
-
-    fn sanitize_json(
+    /// The allowlist walker. For each scalar (`String`/`Number`) at dotted
+    /// path `path`: if its field name looks credential-shaped, reject the
+    /// whole capture regardless of allow status — `is_secret_field` is a
+    /// tripwire independent of the allowlist, because a name like
+    /// `apiKey`/`authorization` showing up anywhere is itself the alarm.
+    /// Otherwise, if `path` is on the provider's allowlist, keep the value
+    /// verbatim and run the fail-closed scan over it — an allowlisted path
+    /// is a decision about the *field*, not a licence for whatever a
+    /// provider happens to put in it. If it is not allowed, replace it with
+    /// a placeholder. `Bool`/`Null` are never redacted: they carry no
+    /// free-form data.
+    ///
+    /// `Array`/`Object` recurse; an array element's path grows `[]` (never
+    /// an index, so every element of an array shares one allowlist
+    /// decision) and its `key` stays the containing field's key, so
+    /// `is_secret_field`/`named_kind` still see a meaningful field name for
+    /// each scalar inside e.g. `"tags": ["sk-ant-…"]`.
+    fn sanitize_value_tree(
         &mut self,
         value: &mut Value,
-        context: SemanticContext,
+        provider: Provider,
+        path: &str,
+        key: &str,
         location: &str,
     ) -> Result<(), SanitizationError> {
-        if context.codex_assistant_prose_array && value.is_string() {
-            self.replace_semantic(RedactionKind::AssistantProse, value);
-        }
         match value {
-            Value::Array(values) => {
-                for (index, value) in values.iter_mut().enumerate() {
-                    self.sanitize_json(
-                        value,
-                        descendant_context(context),
+            Value::Array(items) => {
+                let child_path = format!("{path}[]");
+                for (index, item) in items.iter_mut().enumerate() {
+                    self.sanitize_value_tree(
+                        item,
+                        provider,
+                        &child_path,
+                        key,
                         &format!("{location}[{index}]"),
                     )?;
                 }
+                Ok(())
             }
             Value::Object(object) => {
-                let context = object_context(object, context);
-                let keys: Vec<String> = object.keys().cloned().collect();
-                for (index, key) in keys.into_iter().enumerate() {
+                // Keys under a declared map path are data, not field names, so
+                // they redact by the same default-deny rule as a value. The
+                // object is rebuilt rather than mutated in place because a
+                // redacted key is a *rename*, and remove-then-insert on the
+                // map being iterated is order-dependent under serde_json's
+                // `preserve_order` feature. Rebuilding in iteration order is
+                // correct whichever backend is compiled in.
+                let is_map = surface::MAP_PATHS.contains(&path);
+                let mut rebuilt = serde_json::Map::with_capacity(object.len());
+                for (index, (child_key, mut child)) in
+                    std::mem::take(object).into_iter().enumerate()
+                {
                     let child_location = format!("{location}.object[{index}]");
-                    self.validate_key(&key, &child_location)?;
-                    if is_secret_field(&key, &object[&key])
-                        && !is_codex_token_usage_object(&key, &object[&key], context)
-                    {
-                        return Err(SanitizationError::SecretLikeField {
-                            location: child_location,
-                        });
-                    }
-                    let kind = semantic_kind(object, &key, &object[&key], context);
-                    let child = object.get_mut(&key).expect("key came from object");
-                    if let Some(kind) = kind {
-                        self.replace_semantic(kind, child);
-                    } else if is_protocol_discriminator(&key) {
-                        if let Value::String(text) = child {
-                            self.sanitize_paths_and_validate(text, &child_location)?;
-                        }
+                    self.validate_key(&child_key, &child_location)?;
+                    let candidate_path = format!("{path}.{child_key}");
+                    let key_survives = !is_map || allows_prefix(provider, &candidate_path);
+                    let (child_key, child_path) = if key_survives {
+                        (child_key, candidate_path)
                     } else {
-                        self.sanitize_json(child, child_context(context, &key), &child_location)?;
-                    }
+                        // Reported at the map-key *position* (`surface.rs`'s
+                        // own `{}` notation), never at the key itself: a
+                        // report that named the path verbatim would republish
+                        // exactly the identifier this branch just withheld.
+                        // The key rides through as the withheld *value*, which
+                        // `novel_paths` reduces to a count and a shape.
+                        self.record_novel(
+                            &format!("{path}.{{}}"),
+                            &Value::String(child_key.clone()),
+                        );
+                        // Generic `<Vn>`, not a named group: a map key is not
+                        // one of the six kinds anything reads, and the same
+                        // identifier appearing elsewhere as a value still
+                        // shares its placeholder, so joins survive.
+                        let placeholder = self.resolve(&Value::String(child_key), None);
+                        let child_path = format!("{path}.{placeholder}");
+                        (placeholder, child_path)
+                    };
+                    self.sanitize_value_tree(
+                        &mut child,
+                        provider,
+                        &child_path,
+                        &child_key,
+                        &child_location,
+                    )?;
+                    rebuilt.insert(child_key, child);
                 }
+                *object = rebuilt;
+                Ok(())
             }
-            Value::String(text) => self.sanitize_string(text, location)?,
-            _ => {}
+            Value::String(_) | Value::Number(_) => {
+                self.sanitize_scalar(value, provider, path, key, location)
+            }
+            _ => Ok(()),
         }
+    }
+
+    fn sanitize_scalar(
+        &mut self,
+        value: &mut Value,
+        provider: Provider,
+        path: &str,
+        key: &str,
+        location: &str,
+    ) -> Result<(), SanitizationError> {
+        if is_secret_field(key, value) {
+            return Err(SanitizationError::SecretLikeField {
+                location: location.to_owned(),
+            });
+        }
+        let path_allowed = allows(provider, path);
+        if path_allowed && !is_mcp_tool_identity(value) {
+            if let Value::String(text) = value {
+                if is_generated_placeholder_shape(text) {
+                    return Err(SanitizationError::PlaceholderShapedValue {
+                        location: location.to_owned(),
+                    });
+                }
+                self.sanitize_paths_and_validate(text, location)?;
+            }
+            return Ok(());
+        }
+        if !path_allowed {
+            self.record_novel(path, value);
+        }
+        let placeholder = self.placeholder_for(key, value);
+        *value = Value::String(placeholder);
         Ok(())
+    }
+
+    /// Records one occurrence of a withheld value at `path`, for the novel-
+    /// path report. Only called for paths that are not on the allowlist at
+    /// all -- an `mcp__` value on an allowed path never reaches here (see
+    /// `sanitize_scalar`). Deduplicates by value equality, so a path seen in
+    /// many frames with the same literal value counts once, and the same
+    /// path with genuinely different values counts each of them -- that is
+    /// what `distinct_values` means.
+    fn record_novel(&mut self, path: &str, value: &Value) {
+        let seen = self.novel.entry(path.to_owned()).or_default();
+        if !seen.iter().any(|known| known == value) {
+            seen.push(value.clone());
+        }
+    }
+
+    /// Reduces the accumulated withheld values into the report shape: one
+    /// `NovelPath` per path, sorted by path (inherited from `BTreeMap`'s
+    /// iteration order), holding a count and a shape but never a value.
+    fn novel_paths(&self) -> Vec<NovelPath> {
+        self.novel
+            .iter()
+            .map(|(path, values)| NovelPath {
+                path: path.clone(),
+                distinct_values: values.len(),
+                shape: describe_shape(values),
+            })
+            .collect()
+    }
+
+    /// The placeholder for `value` under `key`'s named group —
+    /// `named_kind(key)` if it is one of the six identifier leaves
+    /// (`<SESSION_1>`, …), otherwise the generic `<V1>` fallback.
+    fn placeholder_for(&mut self, key: &str, value: &Value) -> String {
+        self.resolve(value, named_kind(key))
+    }
+
+    /// The single stderr-prose placeholder group: non-JSON payloads (always
+    /// `Channel::Stderr`; anything else fails the capture earlier) collapse
+    /// to `<PROSE_n>`, with equal text sharing a number like every other
+    /// group.
+    fn placeholder_for_prose(&mut self, text: &str) -> String {
+        self.resolve(&Value::String(text.to_owned()), Some("PROSE"))
+    }
+
+    /// Identity comes from the value, not from a kind: `resolve` first
+    /// searches *every* group — named and generic — for `value`, regardless
+    /// of `fallback_group`, so a value already redacted under one field's
+    /// name (say `sessionId`) reuses that exact placeholder when the same
+    /// literal value shows up again under an unrelated field (say `echo`).
+    /// Only a genuinely new value gets a fresh placeholder, assigned into
+    /// `fallback_group` (or the generic `<V n>` fallback when `None`) using
+    /// that group's own next number.
+    ///
+    /// Encounter order, not a `HashMap`, is what makes this deterministic:
+    /// both `named` and `generic` are `Vec`s scanned linearly, so the same
+    /// capture always numbers the same way — the property the publication
+    /// tests assert on as byte determinism.
+    fn resolve(&mut self, value: &Value, fallback_group: Option<&'static str>) -> String {
+        if let Some(placeholder) = self.existing_placeholder(value) {
+            return placeholder;
+        }
+        match fallback_group {
+            Some(name) => {
+                let group = self.named.entry(name).or_default();
+                let placeholder = format!("<{name}_{}>", group.len() + 1);
+                group.push((value.clone(), placeholder.clone()));
+                *self.counts.entry(name.to_ascii_lowercase()).or_default() += 1;
+                placeholder
+            }
+            None => {
+                let placeholder = format!("<V{}>", self.generic.len() + 1);
+                self.generic.push((value.clone(), placeholder.clone()));
+                *self.counts.entry("v".to_owned()).or_default() += 1;
+                placeholder
+            }
+        }
+    }
+
+    /// The placeholder `value` was already assigned, in whichever group it
+    /// landed in, counting the reuse — or `None` if this sanitizer has never
+    /// seen the value. Never allocates a new placeholder, which is what makes
+    /// it usable as a *lookup* by callers that must not invent one.
+    fn existing_placeholder(&mut self, value: &Value) -> Option<String> {
+        for (&name, group) in &self.named {
+            if let Some((_, placeholder)) = group.iter().find(|(known, _)| known == value) {
+                let placeholder = placeholder.clone();
+                *self.counts.entry(name.to_ascii_lowercase()).or_default() += 1;
+                return Some(placeholder);
+            }
+        }
+        if let Some((_, placeholder)) = self.generic.iter().find(|(known, _)| known == value) {
+            let placeholder = placeholder.clone();
+            *self.counts.entry("v".to_owned()).or_default() += 1;
+            return Some(placeholder);
+        }
+        None
     }
 
     fn sanitize_nonsemantic_value(
@@ -773,7 +852,25 @@ impl Redactor {
         Ok(())
     }
 
+    /// A key is rejected outright if it carries a path delimiter, before any
+    /// allowlist question is asked of it.
+    ///
+    /// Paths are built by joining keys with `.`, so a key that contains one is
+    /// indistinguishable from nesting: a root-level `{"result.platformOs": …}`
+    /// builds `.result.platformOs`, matches that listed path, and publishes
+    /// whatever the provider put there. `[` and `]` do the same for the array
+    /// marker. Rejecting is the fail-closed answer and matches how this
+    /// sanitizer already treats an unrecognized absolute path — a capture that
+    /// hits it stops rather than being quietly reshaped. No key in any promoted
+    /// capture contains one of these; if a real provider ever emits a dotted
+    /// key, that is a design question about path encoding, not something to
+    /// escape past on the day it arrives.
     fn validate_key(&mut self, key: &str, location: &str) -> Result<(), SanitizationError> {
+        if key.contains(['.', '[', ']']) {
+            return Err(SanitizationError::AmbiguousObjectKey {
+                location: location.to_owned(),
+            });
+        }
         let mut sanitized = key.to_owned();
         self.sanitize_paths_and_validate(&mut sanitized, location)?;
         if sanitized != key {
@@ -782,22 +879,6 @@ impl Redactor {
             });
         }
         Ok(())
-    }
-
-    fn replace_semantic(&mut self, kind: RedactionKind, value: &mut Value) {
-        let Some(replacement) = self
-            .semantics
-            .get(&kind)
-            .and_then(|values| values.iter().find(|known| known.original == *value))
-            .map(|known| known.placeholder.clone())
-        else {
-            return;
-        };
-        *value = Value::String(replacement);
-        *self
-            .counts
-            .entry(kind.manifest_name().to_owned())
-            .or_default() += 1;
     }
 
     /// Scenarios whose argv may legitimately carry `--resume=<id>`.
@@ -855,44 +936,35 @@ impl Redactor {
             .as_str()
             .and_then(|arg| arg.strip_prefix("--resume="))
             .filter(|session_id| !session_id.is_empty())
+            .map(str::to_owned)
         else {
             return Err(SanitizationError::InvalidClaudeResumeCommand {
                 location: "command.args".to_owned(),
             });
         };
-        let Some([session]) = self
-            .semantics
-            .get(&RedactionKind::SessionId)
-            .map(Vec::as_slice)
-        else {
+        // Looked up by the value in argv, not by reading whatever single
+        // entry the SESSION group happens to hold. The requirement is
+        // unchanged — this id must be one the events already redacted, so a
+        // capture whose argv disagrees with its own frames still stops — but
+        // reading the group directly made two ordinary captures fail with a
+        // message about invalid resume arguments:
+        //
+        //   * the id first appearing under a key `named_kind` does not name
+        //     (it takes the generic `<Vn>` group, and nothing ever populates
+        //     SESSION), and
+        //   * any capture holding a *second* distinct session id, which a
+        //     resume that spawns a subagent produces — the old code required
+        //     the group to be exactly one element long.
+        //
+        // Neither is reachable in the committed corpus, which is why both
+        // survived to be found by review rather than by a red test.
+        let Some(placeholder) = self.existing_placeholder(&Value::String(raw_session_id)) else {
             return Err(SanitizationError::InvalidClaudeResumeCommand {
                 location: "command.args".to_owned(),
             });
         };
-        let Some(original) = session.original.as_str().filter(|value| !value.is_empty()) else {
-            return Err(SanitizationError::InvalidClaudeResumeCommand {
-                location: "command.args".to_owned(),
-            });
-        };
-        if raw_session_id != original {
-            return Err(SanitizationError::InvalidClaudeResumeCommand {
-                location: "command.args".to_owned(),
-            });
-        }
-        args[index] = Value::String(format!("--resume={}", session.placeholder));
-        *self
-            .counts
-            .entry(RedactionKind::SessionId.manifest_name().to_owned())
-            .or_default() += 1;
+        args[index] = Value::String(format!("--resume={placeholder}"));
         Ok(())
-    }
-
-    fn sanitize_string(
-        &mut self,
-        text: &mut String,
-        location: &str,
-    ) -> Result<(), SanitizationError> {
-        self.sanitize_paths_and_validate(text, location)
     }
 
     fn sanitize_paths_and_validate(
@@ -932,13 +1004,20 @@ impl Redactor {
 
     fn placeholder_definitions(&self) -> Vec<Value> {
         let mut definitions = Vec::new();
-        for (kind, values) in &self.semantics {
-            for value in values {
+        for (name, values) in &self.named {
+            let kind = name.to_ascii_lowercase();
+            for (_, placeholder) in values {
                 definitions.push(json!({
-                    "placeholder": value.placeholder,
-                    "kind": kind.manifest_name(),
+                    "placeholder": placeholder,
+                    "kind": kind,
                 }));
             }
+        }
+        for (_, placeholder) in &self.generic {
+            definitions.push(json!({
+                "placeholder": placeholder,
+                "kind": "v",
+            }));
         }
         for path in &self.paths {
             if self.counts.contains_key(path.kind) {
@@ -952,269 +1031,11 @@ impl Redactor {
     }
 }
 
-fn object_context(
-    object: &serde_json::Map<String, Value>,
-    mut context: SemanticContext,
-) -> SemanticContext {
-    let marker = object
-        .get("role")
-        .or_else(|| object.get("type"))
-        .and_then(Value::as_str);
-    context.speaker = match marker {
-        Some("user") => Speaker::User,
-        Some("assistant") => Speaker::Assistant,
-        _ => context.speaker,
-    };
-    if object
-        .get("method")
-        .and_then(Value::as_str)
-        .is_some_and(|method| matches!(method, "turn/start" | "turn/steer"))
-    {
-        context.codex_turn_input = true;
-    }
-    if context.json_root && !context.claude_capture {
-        context.codex_root_notification = match object.get("method").and_then(Value::as_str) {
-            Some("thread/tokenUsage/updated") => CodexNotification::TokenUsage,
-            Some("mcpServer/startupStatus/updated") => CodexNotification::McpStartupStatus,
-            _ => CodexNotification::None,
-        };
-    }
-    if object
-        .get("method")
-        .and_then(Value::as_str)
-        .is_some_and(|method| {
-            method.starts_with("item/agentMessage/")
-                || method.starts_with("item/reasoning/")
-                || method.starts_with("item/plan/")
-        })
-    {
-        context.codex_assistant_prose = true;
-    }
-    context.speaker = match marker {
-        Some("userMessage" | "user_message") => Speaker::User,
-        Some("agentMessage" | "agent_message" | "reasoning") => Speaker::Assistant,
-        _ => context.speaker,
-    };
-    if context.claude_capture && object.get("type").and_then(Value::as_str) == Some("tool_use") {
-        context.claude_tool_use = true;
-    }
-    context
-}
-
-fn semantic_kind(
-    object: &serde_json::Map<String, Value>,
-    key: &str,
-    value: &Value,
-    context: SemanticContext,
-) -> Option<RedactionKind> {
-    if !matches!(value, Value::String(_) | Value::Number(_)) {
-        return None;
-    }
-    if context.claude_memory_paths && value.as_str().is_some_and(|value| !value.is_empty()) {
-        return Some(RedactionKind::ClaudeMemoryPath);
-    }
-    let normalized = normalize_field(key);
-    if context.codex_direct_params == CodexNotification::McpStartupStatus
-        && normalized == "name"
-        && value.as_str().is_some_and(|value| !value.is_empty())
-    {
-        return Some(RedactionKind::CodexMcpServerName);
-    }
-    if !context.claude_capture
-        && matches!(context.entity, Entity::Thread)
-        && normalized == "path"
-        && value.as_str().is_some_and(|value| !value.is_empty())
-    {
-        return Some(RedactionKind::CodexThreadPath);
-    }
-    match normalized.as_str() {
-        "requestid" => return Some(RedactionKind::ClaudeRequestId),
-        "sessionid" => return Some(RedactionKind::SessionId),
-        "threadid" => return Some(RedactionKind::ThreadId),
-        "turnid" | "expectedturnid" => return Some(RedactionKind::TurnId),
-        "tooluseid" | "parenttooluseid" | "itemid" => {
-            return Some(RedactionKind::ToolUseId);
-        }
-        "hookid" => return Some(RedactionKind::ToolUseId),
-        "uuid" | "pid" | "servername" | "installationid" => {
-            return Some(RedactionKind::MachineId);
-        }
-        "id" if object.contains_key("jsonrpc") => return Some(RedactionKind::CodexRpcId),
-        "id" if !context.claude_capture
-            && context.json_root
-            && !object.contains_key("method")
-            && (object.contains_key("result") || object.contains_key("error")) =>
-        {
-            return Some(RedactionKind::CodexRpcId);
-        }
-        "id" if matches!(context.entity, Entity::Thread) => {
-            return Some(RedactionKind::ThreadId);
-        }
-        "id" if matches!(context.entity, Entity::Turn) => return Some(RedactionKind::TurnId),
-        "id" if matches!(context.entity, Entity::Item) => {
-            return Some(RedactionKind::ToolUseId);
-        }
-        "id" if context.claude_capture
-            && object.get("type").and_then(Value::as_str) == Some("message")
-            && object.get("role").and_then(Value::as_str) == Some("assistant") =>
-        {
-            return Some(RedactionKind::ClaudeMessageId);
-        }
-        "id" if object.get("type").and_then(Value::as_str) == Some("tool_use") => {
-            return Some(RedactionKind::ToolUseId);
-        }
-        "id" if object
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(is_tool_item_type) =>
-        {
-            return Some(RedactionKind::ToolUseId);
-        }
-        "data" if object.get("type").and_then(Value::as_str) == Some("base64") => {
-            return Some(RedactionKind::AttachmentBytes);
-        }
-        "signature"
-            if context.claude_capture
-                && value.as_str().is_some_and(|value| !value.is_empty())
-                && object
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| matches!(kind, "thinking" | "signature_delta")) =>
-        {
-            return Some(RedactionKind::ClaudeThinkingSignature);
-        }
-        "prompt" => return Some(RedactionKind::UserText),
-        "content" | "text" if matches!(context.speaker, Speaker::User) => {
-            return Some(RedactionKind::UserText);
-        }
-        "content" | "text"
-            if matches!(context.speaker, Speaker::Assistant) && !context.claude_tool_input =>
-        {
-            return Some(RedactionKind::AssistantProse);
-        }
-        "text"
-            if context.codex_turn_input
-                && object.get("type").and_then(Value::as_str) == Some("text") =>
-        {
-            return Some(RedactionKind::UserText);
-        }
-        "text" if object.get("type").and_then(Value::as_str) == Some("text_delta") => {
-            return Some(RedactionKind::AssistantProse);
-        }
-        "partialjson"
-            if context.claude_capture
-                && object.get("type").and_then(Value::as_str) == Some("input_json_delta")
-                && value.as_str().is_some_and(|value| !value.is_empty()) =>
-        {
-            return Some(RedactionKind::AssistantProse);
-        }
-        "delta" | "textdelta" if context.codex_assistant_prose => {
-            return Some(RedactionKind::AssistantProse);
-        }
-        "thinking" => return Some(RedactionKind::AssistantProse),
-        "result" if object.get("type").and_then(Value::as_str) == Some("result") => {
-            return Some(RedactionKind::AssistantProse);
-        }
-        "description" if context.discovery_metadata => {
-            return Some(RedactionKind::ProviderProse);
-        }
-        "argumenthint"
-            if context.discovery_metadata
-                && value.as_str().is_some_and(|value| !value.is_empty()) =>
-        {
-            return Some(RedactionKind::ProviderProse);
-        }
-        "description" if context.codex_catalog => {
-            return Some(RedactionKind::ProviderProse);
-        }
-        "message" if context.availability_nux => {
-            return Some(RedactionKind::ProviderProse);
-        }
-        "message"
-            if object.contains_key("level")
-                && value.as_str().is_some_and(|value| !value.is_empty()) =>
-        {
-            return Some(RedactionKind::ProviderProse);
-        }
-        "output" | "stdout" | "stderr"
-            if object.get("subtype").and_then(Value::as_str) == Some("hook_response") =>
-        {
-            return Some(RedactionKind::ProviderProse);
-        }
-        _ => {}
-    }
-    None
-}
-
-fn child_context(mut context: SemanticContext, key: &str) -> SemanticContext {
-    let normalized = normalize_field(key);
-    context.codex_direct_params = if context.json_root && normalized == "params" {
-        context.codex_root_notification
-    } else {
-        CodexNotification::None
-    };
-    context.codex_root_notification = CodexNotification::None;
-    context.json_root = false;
-    context.entity = match normalized.as_str() {
-        "thread" => Entity::Thread,
-        "turn" => Entity::Turn,
-        "item" => Entity::Item,
-        "turns" if !context.claude_capture && matches!(context.entity, Entity::Thread) => {
-            Entity::Turn
-        }
-        "items" if !context.claude_capture && matches!(context.entity, Entity::Turn) => {
-            Entity::Item
-        }
-        _ => Entity::None,
-    };
-    if matches!(normalized.as_str(), "commands" | "agents" | "models") {
-        context.discovery_metadata = true;
-    }
-    if normalized == "data" {
-        context.codex_catalog = true;
-    }
-    if normalized == "availabilitynux" {
-        context.availability_nux = true;
-    }
-    if normalized == "memorypaths" {
-        context.claude_memory_paths = true;
-    }
-    if normalized == "input" && context.claude_tool_use {
-        context.claude_tool_input = true;
-    }
-    if !context.claude_capture
-        && normalized == "summary"
-        && matches!(context.speaker, Speaker::Assistant)
-    {
-        context.codex_assistant_prose_array = true;
-    }
-    context
-}
-
-fn descendant_context(mut context: SemanticContext) -> SemanticContext {
-    context.json_root = false;
-    context.codex_root_notification = CodexNotification::None;
-    context.codex_direct_params = CodexNotification::None;
-    context
-}
-
-fn is_tool_item_type(item_type: &str) -> bool {
-    matches!(
-        item_type,
-        "commandExecution"
-            | "command_execution"
-            | "fileChange"
-            | "file_change"
-            | "mcpToolCall"
-            | "mcp_tool_call"
-            | "webSearch"
-            | "web_search"
-            | "dynamicToolCall"
-            | "dynamic_tool_call"
-    )
-}
-
-fn normalize_field(field: &str) -> String {
+/// `pub(crate)`, not private: `allowlist::named_kind` routes leaf lookup through
+/// this same rule (see its doc comment), so Claude's `session_id` and Codex's
+/// `sessionId` — if it ever used that spelling — collapse to one entry instead
+/// of needing a copy of this function that can drift from this one.
+pub(crate) fn normalize_field(field: &str) -> String {
     field
         .chars()
         .filter(|character| character.is_ascii_alphanumeric())
@@ -1222,22 +1043,17 @@ fn normalize_field(field: &str) -> String {
         .collect()
 }
 
-fn is_protocol_discriminator(field: &str) -> bool {
-    matches!(
-        normalize_field(field).as_str(),
-        "type"
-            | "subtype"
-            | "method"
-            | "role"
-            | "jsonrpc"
-            | "name"
-            | "status"
-            | "kind"
-            | "channel"
-            | "level"
-    )
-}
-
+/// `sanitize_scalar`'s call site only ever passes a `String`/`Number` value —
+/// the allowlist walker checks this once per scalar, not once per object key
+/// the way the old blocklist did, so `{"apiKey": {"a": "b"}}` no longer trips
+/// this check on the `apiKey` object itself. That is deliberate, not a
+/// narrowing bug: an object-valued field is walked into regardless (its
+/// contents still redact under the same rules, since default-deny already
+/// covers any path nobody put on the allowlist), so nothing escapes — this
+/// is very likely what made `is_codex_token_usage_object`'s old
+/// object-shaped bypass unnecessary. `sanitize_nonsemantic_value`'s call
+/// site (the `command`/`platform` metadata scan) still passes object- and
+/// array-valued fields, so this function itself stays general.
 fn is_secret_field(field: &str, value: &Value) -> bool {
     let normalized = normalize_field(field);
     if is_token_counter_field(&normalized) {
@@ -1269,10 +1085,174 @@ fn is_secret_field(field: &str, value: &Value) -> bool {
         || normalized == "secret"
 }
 
-fn is_codex_token_usage_object(field: &str, value: &Value, context: SemanticContext) -> bool {
-    context.codex_direct_params == CodexNotification::TokenUsage
-        && normalize_field(field) == "tokenusage"
-        && value.is_object()
+/// A decision this task owns, not Task 1's path review: the tool-name-at-
+/// invocation family (`.message.content[].name`, `.event.content_block.name`,
+/// `.request.tool_name`, `.last_tool_name`,
+/// `.message.content[].content[].tool_name`, `.tool_use_result.matches[]`) is
+/// allowlisted, and every sampled value today is a built-in tool name
+/// (`Read`, `Bash`, `TaskCreate`). An MCP invocation puts
+/// `mcp__<server>__<tool>` in that same field, embedding the server identity
+/// `.mcp_servers[].name` and `.tools[]` were both excluded to protect —
+/// closing those paths and leaving this one open would undo the fix. A path
+/// decision can't express "this field, except when the value looks like
+/// this", so the exception lives at the value, checked after the path is
+/// already known to be allowed.
+///
+/// `.request.display_name` was originally in this family and is deliberately
+/// no longer allowlisted at all (review finding, 2026-08-15): it exists to
+/// hold a *friendly rendering*, not the raw name, so an MCP tool's friendly
+/// rendering can plausibly read `create_issue (linear)` — naming
+/// the server while never containing the literal `mcp__` prefix this check
+/// matches on. `crates/harness/src/claude/wire.rs:694` records the field as
+/// present and deliberately undecoded, so by the standing "nothing decodes
+/// it" rule it should not have been on the list regardless of the prefix
+/// gap.
+/// Whether `text` is shaped like a placeholder this sanitizer *generates* —
+/// `<V12>`, or a named group with a trailing number (`<SESSION_1>`,
+/// `<PROSE_3>`).
+///
+/// A literal of that shape surviving on an allowlisted path is not safe to
+/// keep, because placeholder identity is the archive's join key: equal
+/// placeholder means equal original. An allowlisted `"<V1>"` sitting beside a
+/// withheld value that was independently assigned `<V1>` reads as a join
+/// between two things that were never equal. It cannot be fixed by reserving
+/// the name at generation time either — the colliding literal can arrive in a
+/// frame *after* the number was handed out — so the capture is rejected and
+/// the collision never enters the archive.
+///
+/// The seven path-root placeholders `Redactor::new` writes (`<HOME>`,
+/// `<CODEX_HOME>`, `<TRUSTED_POWERSHELL>`, …) are deliberately **not** this
+/// shape: none ends in `_<digits>`. That matters because
+/// `sanitize_paths_and_validate` legitimately puts them *inside* allowlisted
+/// strings, and the archive re-pass documented in `provider-captures.md`
+/// feeds text already carrying them back through. Rejecting those would break
+/// a workflow that is working; rejecting a numbered one catches a genuine
+/// ambiguity.
+fn is_generated_placeholder_shape(text: &str) -> bool {
+    let Some(inner) = text
+        .strip_prefix('<')
+        .and_then(|text| text.strip_suffix('>'))
+    else {
+        return false;
+    };
+    let numbered_generic = inner.strip_prefix('V').is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    let numbered_named = inner.rsplit_once('_').is_some_and(|(name, number)| {
+        !name.is_empty() && !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    numbered_generic || numbered_named
+}
+
+fn is_mcp_tool_identity(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| text.starts_with("mcp__"))
+}
+
+/// The type-and-length summary a `NovelPath` reports instead of a value:
+/// `"string len 8"` (or `"string len 8-42"` when lengths vary across the
+/// distinct values seen), `"number"`, `"bool"`. String length is counted in
+/// `char`s, not bytes, so it reflects what a reader would see rather than a
+/// UTF-8 encoding detail. `"mixed"` covers the case (not reachable through
+/// `sanitize_scalar` today, since only `String`/`Number` scalars are ever
+/// redacted) where a path's withheld values are not all the same JSON type.
+fn describe_shape(values: &[Value]) -> String {
+    let mut all_string = true;
+    let mut all_number = true;
+    let mut all_bool = true;
+    let mut min_len = usize::MAX;
+    let mut max_len = 0usize;
+    for value in values {
+        match value {
+            Value::String(text) => {
+                all_number = false;
+                all_bool = false;
+                let len = text.chars().count();
+                min_len = min_len.min(len);
+                max_len = max_len.max(len);
+            }
+            Value::Number(_) => {
+                all_string = false;
+                all_bool = false;
+            }
+            Value::Bool(_) => {
+                all_string = false;
+                all_number = false;
+            }
+            _ => {
+                all_string = false;
+                all_number = false;
+                all_bool = false;
+            }
+        }
+    }
+    if values.is_empty() {
+        "empty".to_owned()
+    } else if all_string {
+        if min_len == max_len {
+            format!("string len {min_len}")
+        } else {
+            format!("string len {min_len}-{max_len}")
+        }
+    } else if all_number {
+        "number".to_owned()
+    } else if all_bool {
+        "bool".to_owned()
+    } else {
+        "mixed".to_owned()
+    }
+}
+
+/// Renders the novel-path report for a terminal: a one-line header stating
+/// what the list is and that nothing on it is a value, then one aligned row
+/// per path, sorted (the order `SanitizationReport::novel_paths` already
+/// carries). An empty report still prints a sentence, not silence -- silence
+/// after a sanitize run reads as "nothing happened here," not as "everything
+/// was already on the allowlist."
+///
+/// The header promises no *withheld* value or key appears below. It does not
+/// promise the paths themselves are contentless: a path names **field names**,
+/// which the corpus publishes on purpose (`observed-fields.json` is a snapshot
+/// of exactly those). A withheld map key is the one thing that could have made
+/// that distinction leak, and it is reported at its position (`.modelUsage.{}`)
+/// rather than spelled -- see `NovelPath`'s doc comment. Keep the wording
+/// honest if this changes: "nothing withheld appears below" is what
+/// `record_novel` and `describe_shape` actually enforce, and "nothing
+/// identifying appears below" would overstate it.
+pub fn render_novel_paths_report(novel_paths: &[NovelPath]) -> String {
+    let header = "Novel paths withheld by the allowlist (nothing withheld appears below -- \
+                  a withheld map key is counted at its position, e.g. `.modelUsage.{}`, \
+                  never spelled):";
+    if novel_paths.is_empty() {
+        return format!("{header}\n  (none -- every field on the wire was already allowlisted)");
+    }
+    let path_width = novel_paths
+        .iter()
+        .map(|entry| entry.path.chars().count())
+        .max()
+        .unwrap_or(0);
+    let count_width = novel_paths
+        .iter()
+        .map(|entry| count_label(entry.distinct_values).chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines = vec![header.to_owned()];
+    for entry in novel_paths {
+        let count_label = count_label(entry.distinct_values);
+        lines.push(format!(
+            "  {path:<path_width$}  {count_label:<count_width$}  {shape}",
+            path = entry.path,
+            shape = entry.shape,
+        ));
+    }
+    lines.join("\n")
+}
+
+fn count_label(distinct_values: usize) -> String {
+    if distinct_values == 1 {
+        "1 distinct value".to_owned()
+    } else {
+        format!("{distinct_values} distinct values")
+    }
 }
 
 fn is_token_counter_field(field: &str) -> bool {
@@ -1674,5 +1654,485 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(std::fs::read(path).unwrap(), b"replacement owner");
+    }
+
+    use std::path::PathBuf;
+
+    use serde_json::{Value, json};
+
+    use super::{
+        Redactor, SanitizationError, SanitizationReport, is_generated_placeholder_shape,
+        render_novel_paths_report,
+    };
+    use crate::capture::types::Provider;
+
+    /// Runs one JSON value through the allowlist redactor without touching the
+    /// filesystem, for the `Ok` case. Panics on the credential-rejection case;
+    /// use `try_sanitize_value` there.
+    fn sanitize_value(value: Value, provider: Provider) -> Value {
+        try_sanitize_value(value, provider).expect("test value expected to sanitize cleanly")
+    }
+
+    /// Same as `sanitize_value`, but hands back the `Result` so a test can
+    /// assert on the rejection path (a credential riding an allowlisted path).
+    fn try_sanitize_value(value: Value, provider: Provider) -> Result<Value, SanitizationError> {
+        let mut value = value;
+        let mut redactor = Redactor::default();
+        redactor.sanitize_value_tree(&mut value, provider, "", "", "value")?;
+        Ok(value)
+    }
+
+    /// Same walk as `sanitize_value`, but returns a `SanitizationReport` —
+    /// `events_bytes` holds the single sanitized value and `manifest_bytes`
+    /// the placeholder/count accounting, so Task 3's novel-path report can
+    /// exercise this without a full `sanitize_dir` round trip.
+    fn sanitize_value_reporting(value: Value, provider: Provider) -> SanitizationReport {
+        let mut value = value;
+        let mut redactor = Redactor::default();
+        redactor
+            .sanitize_value_tree(&mut value, provider, "", "", "value")
+            .expect("test value expected to sanitize cleanly");
+        let events_bytes = serde_json::to_vec(&value).expect("sanitized value encodes");
+        let novel_paths = redactor.novel_paths();
+        let manifest_bytes = serde_json::to_vec(&json!({
+            "placeholders": redactor.placeholder_definitions(),
+            "redaction_counts": redactor.counts,
+        }))
+        .expect("manifest encodes");
+        SanitizationReport {
+            events_path: PathBuf::new(),
+            manifest_path: PathBuf::new(),
+            events_bytes,
+            manifest_bytes,
+            novel_paths,
+        }
+    }
+
+    /// Exercises `sanitize_value_reporting` so it is not dead code before Task 3
+    /// gives it a real caller; also documents its filesystem-free contract.
+    #[test]
+    fn sanitize_value_reporting_produces_a_report_without_touching_the_filesystem() {
+        let report = sanitize_value_reporting(json!({"method": "turn/completed"}), Provider::Codex);
+        assert!(!report.events_bytes.is_empty());
+        assert!(!report.manifest_bytes.is_empty());
+    }
+
+    /// The report names every path the allowlist withheld, with how many
+    /// distinct values it had and their shape -- enough to decide whether a
+    /// field is safe to allow without reading its contents.
+    #[test]
+    fn the_report_names_every_withheld_path_and_never_a_value() {
+        let report = sanitize_value_reporting(
+            json!({"method": "turn/completed", "mystery": "abcdefgh", "count": 7}),
+            Provider::Codex,
+        );
+        let paths: Vec<&str> = report.novel_paths.iter().map(|n| n.path.as_str()).collect();
+        assert!(paths.contains(&".mystery"));
+        assert!(paths.contains(&".count"));
+        assert!(!paths.contains(&".method"), "an allowed path is not novel");
+        assert!(
+            !format!("{:?}", report.novel_paths).contains("abcdefgh"),
+            "the report must never carry a withheld value"
+        );
+    }
+
+    /// Design decision (Task 3): a value withheld only because of the `mcp__`
+    /// exception (`is_mcp_tool_identity`) does not appear in `novel_paths`.
+    /// The path itself is on the allowlist and the exception is already
+    /// reviewed and documented (see `NovelPath`'s doc comment) -- it is not
+    /// something nobody has considered, so filing it under "novel" would
+    /// dilute the list this report exists to keep short and actionable. The
+    /// same allowlisted path with a non-`mcp__` value is genuinely not novel
+    /// either, for the ordinary reason (it is simply allowed).
+    #[test]
+    fn an_mcp_tool_identity_exception_is_not_reported_as_novel() {
+        let report = sanitize_value_reporting(
+            json!({"request": {"tool_name": "mcp__linear__create_issue"}}),
+            Provider::Claude,
+        );
+        let paths: Vec<&str> = report.novel_paths.iter().map(|n| n.path.as_str()).collect();
+        assert!(
+            !paths.contains(&".request.tool_name"),
+            "an mcp__ exception on an allowed path is a reviewed rule, not a novel path"
+        );
+    }
+
+    /// The same path seen with the same value across many occurrences (many
+    /// frames, or an array of equal elements) counts as one distinct value,
+    /// not one per occurrence -- `distinct_values` means distinct, not a
+    /// running total. A genuinely different value at the same path adds to
+    /// the count.
+    #[test]
+    fn distinct_values_deduplicates_repeated_occurrences_at_the_same_path() {
+        let report = sanitize_value_reporting(
+            json!({"items": [{"mystery": "same"}, {"mystery": "same"}, {"mystery": "different"}]}),
+            Provider::Codex,
+        );
+        let entry = report
+            .novel_paths
+            .iter()
+            .find(|n| n.path == ".items[].mystery")
+            .expect("array elements share one allowlist path, and it is novel");
+        assert_eq!(
+            entry.distinct_values, 2,
+            "two distinct strings, three occurrences"
+        );
+    }
+
+    /// `render_novel_paths_report` is the thing that actually gets pasted
+    /// into a terminal or a PR body -- `NovelPath`'s `Debug` output is not
+    /// what a reviewer reads. An empty list must still say something
+    /// meaningful, not silently return an empty string (silence after a
+    /// sanitize run reads as "nothing happened," not as "everything was
+    /// already allowed").
+    #[test]
+    fn render_novel_paths_report_says_something_meaningful_when_empty() {
+        let rendered = render_novel_paths_report(&[]);
+        assert!(
+            !rendered.trim().is_empty(),
+            "an empty report must not be an empty string"
+        );
+        assert!(
+            rendered.to_ascii_lowercase().contains("none")
+                || rendered.to_ascii_lowercase().contains("already"),
+            "the empty case must say why the list is empty, not just print the header: {rendered:?}"
+        );
+    }
+
+    /// The rendered report, not `NovelPath`'s `Debug` form, is the thing
+    /// that lands in a terminal or a PR body -- this exercises both shape
+    /// forms (`describe_shape`'s single-length and ranged-length branches)
+    /// and asserts the actual withheld strings are absent from the render,
+    /// not just from a struct nobody prints directly. Also checks the
+    /// header is present and both paths are named, so a future edit can't
+    /// satisfy "no values leak" by returning an empty or path-less string.
+    #[test]
+    fn render_novel_paths_report_names_paths_and_shapes_but_never_a_value() {
+        let report = sanitize_value_reporting(
+            json!({
+                "fixed": "abcdefgh",
+                "ranged": ["short", "a much longer withheld value than the other one"]
+            }),
+            Provider::Codex,
+        );
+        let rendered = render_novel_paths_report(&report.novel_paths);
+
+        assert!(rendered.contains("Novel paths withheld"), "{rendered}");
+        assert!(rendered.contains(".fixed"), "{rendered}");
+        assert!(rendered.contains(".ranged[]"), "{rendered}");
+        // ".fixed" has one value, length 8: the single-length branch.
+        assert!(rendered.contains("string len 8"), "{rendered}");
+        // ".ranged[]" has two distinct lengths (5 and 47): the ranged branch.
+        // Checking the prefix rather than a hardcoded upper bound keeps this
+        // test from silently drifting if the sample sentence is edited.
+        assert!(rendered.contains("string len 5-"), "{rendered}");
+        assert!(!rendered.contains("abcdefgh"), "{rendered}");
+        assert!(!rendered.contains("short"), "{rendered}");
+        assert!(
+            !rendered.contains("a much longer withheld value"),
+            "{rendered}"
+        );
+    }
+
+    /// Equal values share a placeholder number, so a join that was true on the
+    /// wire is still true in the archive. This is the property that lets the
+    /// taxonomy go: identity comes from the value, not from a kind.
+    #[test]
+    fn equal_values_share_a_placeholder_and_distinct_values_do_not() {
+        let out = sanitize_value(
+            json!({
+                "sessionId": "abc", "echo": "abc", "other": "xyz"
+            }),
+            Provider::Claude,
+        );
+        assert_eq!(out["sessionId"], out["echo"]);
+        assert_ne!(out["sessionId"], out["other"]);
+    }
+
+    /// A field nobody has considered arrives redacted, not verbatim. This is
+    /// the whole difference from the blocklist.
+    #[test]
+    fn an_unlisted_field_is_replaced_by_default() {
+        let out = sanitize_value(json!({"somethingBrandNew": "secret-ish"}), Provider::Claude);
+        assert_ne!(out["somethingBrandNew"], "secret-ish");
+    }
+
+    /// An allowlisted value survives byte-for-byte.
+    #[test]
+    fn a_listed_field_survives_verbatim() {
+        let out = sanitize_value(json!({"method": "turn/completed"}), Provider::Codex);
+        assert_eq!(out["method"], "turn/completed");
+    }
+
+    /// Six kinds read by name; everything else numbered.
+    #[test]
+    fn identifiers_are_named_and_everything_else_is_numbered() {
+        let out = sanitize_value(json!({"sessionId": "s", "costUSD": "c"}), Provider::Claude);
+        assert_eq!(out["sessionId"], "<SESSION_1>");
+        assert_eq!(out["costUSD"], "<V1>");
+    }
+
+    /// An allowlisted path is still not a licence to publish a credential.
+    #[test]
+    fn a_credential_in_an_allowlisted_value_still_rejects() {
+        let err = try_sanitize_value(json!({"method": "sk-ant-live-key"}), Provider::Codex);
+        assert!(
+            err.is_err(),
+            "an allowlisted path carrying a token must reject"
+        );
+    }
+
+    /// The tool-name-at-invocation family (`.request.tool_name` among them,
+    /// per `crates/harness/src/capture/allowlist/claude.txt`) holds a
+    /// built-in tool name on every capture in the corpus today, but an MCP
+    /// invocation puts `mcp__<server>__<tool>` there instead — embedding the
+    /// same server identity `.mcp_servers[].name` and `.tools[]` were both
+    /// excluded to protect. A path decision cannot fix this: the path is
+    /// legitimately allowlisted for the `Bash`/`Read`/… case. This is a
+    /// value-level exception layered on top of the allowlist.
+    #[test]
+    fn an_mcp_tool_name_is_redacted_even_on_an_allowlisted_path() {
+        let out = sanitize_value(
+            json!({"request": {"tool_name": "mcp__linear__create_issue"}}),
+            Provider::Claude,
+        );
+        assert_ne!(out["request"]["tool_name"], "mcp__linear__create_issue");
+    }
+
+    /// The same allowlisted path with a built-in tool name is untouched —
+    /// the exception is scoped to the `mcp__` prefix, not the whole path.
+    #[test]
+    fn a_builtin_tool_name_on_the_same_path_survives() {
+        let out = sanitize_value(json!({"request": {"tool_name": "Bash"}}), Provider::Claude);
+        assert_eq!(out["request"]["tool_name"], "Bash");
+    }
+
+    /// A **field name** survives even when its value does not, and that is the
+    /// deliberate half of the key rule rather than an oversight:
+    /// `tests/corpus/observed-fields.json` is a snapshot of field names, and a
+    /// sanitizer that redacted them would blank the evidence the corpus exists
+    /// to hold. Pinned so a later tightening of the key rule cannot quietly
+    /// swallow the whole surface map.
+    #[test]
+    fn an_unlisted_field_keeps_its_name_and_loses_its_value() {
+        let out = sanitize_value(json!({"somethingBrandNew": "secret-ish"}), Provider::Claude);
+        let object = out.as_object().expect("an object came in");
+        assert!(
+            object.contains_key("somethingBrandNew"),
+            "a field name is published deliberately; only its value redacts"
+        );
+        assert_ne!(out["somethingBrandNew"], "secret-ish");
+    }
+
+    /// The finding this fix exists for. A key under a declared map path
+    /// (`surface::MAP_PATHS`) is data, not a field name, so an unreviewed one
+    /// is replaced — the same default-deny every value gets. Before this, a
+    /// map keyed by anything identifying (an MCP server name, an account, a
+    /// machine) rode into the committed archive verbatim while its value was
+    /// dutifully redacted beside it.
+    #[test]
+    fn an_unreviewed_map_key_is_redacted() {
+        let out = sanitize_value(
+            json!({"modelUsage": {"private-local-model-id": {"provider": "anthropic"}}}),
+            Provider::Claude,
+        );
+        let keys: Vec<&String> = out["modelUsage"]
+            .as_object()
+            .expect("modelUsage stays an object")
+            .keys()
+            .collect();
+        assert_eq!(keys.len(), 1);
+        assert_ne!(
+            keys[0], "private-local-model-id",
+            "an unreviewed map key must not survive"
+        );
+        assert!(
+            keys[0].starts_with('<') && keys[0].ends_with('>'),
+            "it must be a placeholder, got {:?}",
+            keys[0]
+        );
+    }
+
+    /// The other half: a map key that IS on the allowlist survives, because a
+    /// listed path is a decision to publish. Both `.modelUsage.
+    /// claude-haiku-4-5-20251001.*` lines in `allowlist/claude.txt` depend on
+    /// this, and so does the committed archive — this test is what makes
+    /// "the key fix churns no evidence" checkable rather than asserted.
+    #[test]
+    fn a_reviewed_map_key_survives() {
+        let out = sanitize_value(
+            json!({"modelUsage": {"claude-haiku-4-5-20251001": {"provider": "anthropic"}}}),
+            Provider::Claude,
+        );
+        assert_eq!(
+            out["modelUsage"]["claude-haiku-4-5-20251001"]["provider"],
+            "anthropic"
+        );
+    }
+
+    /// The report is pasted into terminals and PR bodies, so a withheld key
+    /// must be as absent from it as a withheld value. It is named at the map
+    /// *position* (`surface.rs`'s own `{}` notation) and counted, never
+    /// spelled.
+    #[test]
+    fn the_report_never_names_a_withheld_map_key() {
+        let report = sanitize_value_reporting(
+            json!({"modelUsage": {"private-local-model-id": {"provider": "anthropic"}}}),
+            Provider::Claude,
+        );
+        let rendered = render_novel_paths_report(&report.novel_paths);
+        assert!(
+            !rendered.contains("private-local-model-id"),
+            "the report must never carry a withheld key:\n{rendered}"
+        );
+        assert!(
+            report
+                .novel_paths
+                .iter()
+                .any(|novel| novel.path == ".modelUsage.{}"),
+            "the withheld key must still be reported at its map position: {:?}",
+            report.novel_paths
+        );
+    }
+
+    /// Placeholder identity is the archive's join key — equal placeholder
+    /// means equal original — so a literal already shaped like a generated
+    /// placeholder cannot be allowed to survive beside one. Here `.method` is
+    /// allowlisted and holds `<V1>`, while `.mystery` is withheld and would be
+    /// independently assigned `<V1>`: two values that were never equal reading
+    /// as joined.
+    #[test]
+    fn a_placeholder_shaped_literal_on_an_allowlisted_path_rejects() {
+        let outcome = try_sanitize_value(
+            json!({"method": "<V1>", "mystery": "genuinely-different"}),
+            Provider::Codex,
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(SanitizationError::PlaceholderShapedValue { .. })
+            ),
+            "a generated-placeholder-shaped literal must reject, got {outcome:?}"
+        );
+    }
+
+    /// The seven path-root placeholders are deliberately not that shape, and
+    /// must keep riding through allowlisted strings: `sanitize_paths_and_
+    /// validate` writes them there itself, and the archive re-pass documented
+    /// in `provider-captures.md` feeds text already carrying them back in.
+    /// Rejecting those would break a workflow that works.
+    #[test]
+    fn a_path_root_placeholder_is_not_a_generated_shape() {
+        for root in [
+            "<CWD>",
+            "<REPO>",
+            "<HOME>",
+            "<TEMP>",
+            "<CODEX_HOME>",
+            "<APPROVAL_TARGET>",
+            "<TRUSTED_POWERSHELL>",
+        ] {
+            assert!(
+                !is_generated_placeholder_shape(root),
+                "{root} must not read as a generated placeholder"
+            );
+        }
+        for generated in ["<V1>", "<V42>", "<SESSION_1>", "<PROSE_3>", "<TOOL_USE_12>"] {
+            assert!(
+                is_generated_placeholder_shape(generated),
+                "{generated} must read as a generated placeholder"
+            );
+        }
+    }
+
+    /// A resumed capture whose session id first appears under a key
+    /// `named_kind` does not name takes the generic `<Vn>` group, so nothing
+    /// ever populates `named["SESSION"]`. Reading that group directly rejected
+    /// the whole capture with a message about invalid resume arguments;
+    /// looking the argv value up wherever it landed replaces it correctly.
+    #[test]
+    fn a_resume_argv_resolves_a_session_id_first_seen_under_an_unnamed_key() {
+        let mut redactor = Redactor::default();
+        let mut payload = json!({"echo": "sess-abc", "session_id": "sess-abc"});
+        redactor
+            .sanitize_value_tree(&mut payload, Provider::Claude, "", "", "value")
+            .expect("the payload sanitizes");
+        let mut command = json!({"args": ["--resume=sess-abc"]});
+
+        redactor
+            .sanitize_claude_resume_argv(&mut command, "resume")
+            .expect("a session id seen under any key still resolves");
+
+        let redacted = command["args"][0].as_str().expect("argv stays a string");
+        assert_ne!(redacted, "--resume=sess-abc", "the raw id must not survive");
+        assert_eq!(
+            redacted,
+            format!("--resume={}", payload["session_id"].as_str().unwrap()),
+            "argv must carry the same placeholder the events got, or the join breaks"
+        );
+    }
+
+    /// The likelier trigger of the same bug: a resume that spawns a subagent
+    /// carries a second distinct session id, and the old code required the
+    /// SESSION group to be exactly one element long.
+    #[test]
+    fn a_resume_argv_resolves_when_the_capture_holds_two_session_ids() {
+        let mut redactor = Redactor::default();
+        let mut payload =
+            json!({"session_id": "sess-parent", "child": {"session_id": "sess-child"}});
+        redactor
+            .sanitize_value_tree(&mut payload, Provider::Claude, "", "", "value")
+            .expect("the payload sanitizes");
+        let mut command = json!({"args": ["--resume=sess-parent"]});
+
+        redactor
+            .sanitize_claude_resume_argv(&mut command, "resume")
+            .expect("a second session id must not reject the capture");
+
+        assert_eq!(
+            command["args"][0].as_str().unwrap(),
+            format!("--resume={}", payload["session_id"].as_str().unwrap()),
+            "argv must resolve to the parent's placeholder, not the child's"
+        );
+    }
+
+    /// The requirement that made the old lookup worth having is unchanged: an
+    /// argv id the events never carried means the command is not what the
+    /// capture claims, and that still stops promotion rather than being
+    /// sanitized away.
+    #[test]
+    fn a_resume_argv_naming_an_unseen_session_id_still_rejects() {
+        let mut redactor = Redactor::default();
+        let mut payload = json!({"session_id": "sess-abc"});
+        redactor
+            .sanitize_value_tree(&mut payload, Provider::Claude, "", "", "value")
+            .expect("the payload sanitizes");
+        let mut command = json!({"args": ["--resume=sess-never-observed"]});
+
+        let outcome = redactor.sanitize_claude_resume_argv(&mut command, "resume");
+
+        assert!(
+            matches!(
+                outcome,
+                Err(SanitizationError::InvalidClaudeResumeCommand { .. })
+            ),
+            "an argv id absent from the events must reject, got {outcome:?}"
+        );
+    }
+
+    /// A key carrying a path delimiter is rejected before any allowlist
+    /// question is asked of it. Without this, a root-level key spelled
+    /// `result.platformOs` builds exactly the dotted path `codex.txt` lists
+    /// and publishes whatever the provider put there.
+    #[test]
+    fn a_key_that_impersonates_a_nested_path_rejects() {
+        let outcome = try_sanitize_value(
+            json!({"result.platformOs": "LEAKED-LOCAL-VALUE"}),
+            Provider::Codex,
+        );
+        assert!(
+            matches!(outcome, Err(SanitizationError::AmbiguousObjectKey { .. })),
+            "a dotted key must reject the capture, got {outcome:?}"
+        );
     }
 }

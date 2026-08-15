@@ -44,9 +44,12 @@ fn sanitizer_is_byte_deterministic_and_uses_encounter_order() {
     assert_eq!(first.events_bytes, second.events_bytes);
     assert_eq!(first.manifest_bytes, second.manifest_bytes);
 
+    // `.message.content` (a bare string, not the `.message.content[].type` array-element form)
+    // is not on the allowlist, so it numbers into the generic bucket -- the placeholder names
+    // changed, not the property this test proves, which is the two-run byte comparison above.
     let payloads = sanitized_payloads(&first.events_bytes);
-    assert_eq!(payloads[0]["message"]["content"], "<USER_TEXT_1>");
-    assert_eq!(payloads[1]["message"]["content"], "<USER_TEXT_2>");
+    assert_eq!(payloads[0]["message"]["content"], "<V1>");
+    assert_eq!(payloads[1]["message"]["content"], "<V2>");
 }
 
 /// Break caught: deriving manifest metadata from the raw directory makes byte-identical captures
@@ -103,6 +106,14 @@ fn sanitizer_reports_busy_without_stealing_an_existing_publication_lock() {
 
 /// Break caught: deriving repository/home/temp roots during sanitization makes identical raw bytes
 /// produce different artifacts when the checkout or host environment changes after capture.
+///
+/// Under the allowlist an *unlisted* field like the old `"note"` no longer partially substitutes
+/// a captured root into its value -- it's replaced whole, root and all, same as anything else
+/// not on the list. Partial substitution only still happens for a value at an *allowlisted*
+/// path, so this carries the captured repo root inside `.claude_code_version` (a plain string on
+/// `claude.txt`) instead: root substitution still runs before the fail-closed scan even on a
+/// kept path (`Redactor::sanitize_scalar` calls `sanitize_paths_and_validate`, not a bare
+/// `contains_absolute_path` check), which is what makes the root's replacement observable here.
 #[test]
 fn sanitizer_uses_only_captured_redaction_roots_after_filesystem_changes() {
     let temp = tempfile::tempdir().unwrap();
@@ -113,7 +124,7 @@ fn sanitizer_uses_only_captured_redaction_roots_after_filesystem_changes() {
         temp.path(),
         "captured-roots",
         &[&format!(
-            r#"{{"note":{}}}"#,
+            r#"{{"claude_code_version":{}}}"#,
             serde_json::to_string(&format!("repo {}\\Cargo.toml", repo.display())).unwrap()
         )],
     );
@@ -139,13 +150,77 @@ fn sanitizer_uses_only_captured_redaction_roots_after_filesystem_changes() {
     assert_eq!(first.events_bytes, second.events_bytes);
     assert_eq!(first.manifest_bytes, second.manifest_bytes);
     assert_eq!(
-        sanitized_payloads(&first.events_bytes)[0]["note"],
+        sanitized_payloads(&first.events_bytes)[0]["claude_code_version"],
         "repo <REPO>\\Cargo.toml"
     );
 }
 
+/// Break caught: `cwd`/`repo`/`home`/`temp` are proven above, but
+/// `Redactor::new` (`sanitize.rs:538-552`) wires three more roots the same
+/// way -- `codex_home`, `approval_target`, and `trusted_powershell`, each
+/// derived by `recording.rs` for a Codex or approval capture -- and nothing
+/// exercised them: each of the three could be deleted from `Redactor::new`
+/// without failing anything before this test.
+#[test]
+fn sanitizer_substitutes_the_codex_and_approval_specific_redaction_roots() {
+    let cases = [
+        (
+            "codex-home-root",
+            "codex_home",
+            r"C:\captured-codex-home",
+            "<CODEX_HOME>",
+        ),
+        (
+            "approval-target-root",
+            "approval_target",
+            r"C:\captured-approval-target",
+            "<APPROVAL_TARGET>",
+        ),
+        (
+            "trusted-powershell-root",
+            "trusted_powershell",
+            r"C:\captured-trusted.ps1",
+            "<TRUSTED_POWERSHELL>",
+        ),
+    ];
+
+    for (name, root_key, root_value, placeholder) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let raw = write_raw_capture(
+            temp.path(),
+            name,
+            &[&format!(
+                r#"{{"claude_code_version":{}}}"#,
+                serde_json::to_string(&format!("root {root_value}\\extra")).unwrap()
+            )],
+        );
+        let capture_path = raw.join("capture.json");
+        let mut capture: Value =
+            serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+        capture["redaction_roots"][root_key] = Value::String(root_value.into());
+        std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+        let report = sanitize_dir(&raw, &staging_dir(temp.path(), name)).unwrap();
+        assert_eq!(
+            sanitized_payloads(&report.events_bytes)[0]["claude_code_version"],
+            format!("root {placeholder}\\extra"),
+            "{name}"
+        );
+    }
+}
+
 /// Break caught: manifest accounting can silently omit a redaction category or count definitions
 /// rather than actual replacements, preventing a reviewer from auditing what changed.
+///
+/// `session_id` is Claude's real wire spelling (snake_case) and `named_kind` normalizes before
+/// comparing, so it resolves to the named `SESSION` group; the other three redacted fields
+/// (`.message.content` x2, `level`, the bare `.message`) aren't one of the six identifier kinds
+/// and fall into the generic `v` bucket. This exercises both accounting paths at once and pins
+/// the property the old blocklist-vocabulary version of this test also pinned: the *count*
+/// reflects every replacement, including reused ones, not just the distinct placeholders minted.
+/// `session_id` repeats the identical value `"same-session"` across both events, so it
+/// contributes one placeholder (`<SESSION_1>`) but must count twice — a naive implementation
+/// that counted only new-placeholder creation would report 1, not 2.
 #[test]
 fn sanitizer_manifest_accounts_for_placeholder_definitions_and_counts() {
     let temp = tempfile::tempdir().unwrap();
@@ -170,16 +245,20 @@ fn sanitizer_manifest_accounts_for_placeholder_definitions_and_counts() {
         manifest["purpose"],
         "capture Claude's token-free model initialize reply"
     );
-    assert_eq!(manifest["redaction_counts"]["session_id"], 2);
-    assert_eq!(manifest["redaction_counts"]["user_text"], 2);
-    assert_eq!(manifest["redaction_counts"]["provider_prose"], 1);
+    // session_id: 2 occurrences (one distinct value) into the named SESSION group; the two
+    // distinct prompt texts plus the two unlisted event-3 fields: 4 occurrences into the
+    // generic bucket. 6 total occurrences, 5 distinct placeholders -- the occurrence/placeholder
+    // gap is what this test exists to pin.
+    assert_eq!(manifest["redaction_counts"]["session"], 2);
+    assert_eq!(manifest["redaction_counts"]["v"], 4);
     assert_eq!(
         manifest["placeholders"],
         serde_json::json!([
-            {"placeholder": "<SESSION_ID_1>", "kind": "session_id"},
-            {"placeholder": "<USER_TEXT_1>", "kind": "user_text"},
-            {"placeholder": "<USER_TEXT_2>", "kind": "user_text"},
-            {"placeholder": "<PROVIDER_PROSE_1>", "kind": "provider_prose"}
+            {"placeholder": "<SESSION_1>", "kind": "session"},
+            {"placeholder": "<V1>", "kind": "v"},
+            {"placeholder": "<V2>", "kind": "v"},
+            {"placeholder": "<V3>", "kind": "v"},
+            {"placeholder": "<V4>", "kind": "v"}
         ])
     );
     assert_eq!(

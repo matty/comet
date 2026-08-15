@@ -23,7 +23,7 @@
       "low",
       "--permission-mode",
       "acceptEdits",
-      "--resume=<SESSION_ID_1>"
+      "--resume=<SESSION_1>"
     ],
     "configured_env": {},
     "creation_flags": 0,
@@ -38,260 +38,744 @@
   "normalized_cli_version": "2.1.228 (Claude Code)",
   "placeholders": [
     {
-      "kind": "session_id",
-      "placeholder": "<SESSION_ID_1>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_1>"
     },
     {
-      "kind": "tool_use_id",
-      "placeholder": "<TOOL_USE_ID_1>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_2>"
     },
     {
-      "kind": "user_text",
-      "placeholder": "<USER_TEXT_1>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_3>"
     },
     {
-      "kind": "user_text",
-      "placeholder": "<USER_TEXT_2>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_4>"
     },
     {
-      "kind": "user_text",
-      "placeholder": "<USER_TEXT_3>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_5>"
     },
     {
-      "kind": "assistant_prose",
-      "placeholder": "<ASSISTANT_PROSE_1>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_6>"
     },
     {
-      "kind": "assistant_prose",
-      "placeholder": "<ASSISTANT_PROSE_2>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_7>"
     },
     {
-      "kind": "assistant_prose",
-      "placeholder": "<ASSISTANT_PROSE_3>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_8>"
     },
     {
-      "kind": "assistant_prose",
-      "placeholder": "<ASSISTANT_PROSE_4>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_9>"
     },
     {
-      "kind": "assistant_prose",
-      "placeholder": "<ASSISTANT_PROSE_5>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_10>"
     },
     {
-      "kind": "assistant_prose",
-      "placeholder": "<ASSISTANT_PROSE_6>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_11>"
     },
     {
-      "kind": "assistant_prose",
-      "placeholder": "<ASSISTANT_PROSE_7>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_12>"
     },
     {
-      "kind": "assistant_prose",
-      "placeholder": "<ASSISTANT_PROSE_8>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_13>"
     },
     {
-      "kind": "assistant_prose",
-      "placeholder": "<ASSISTANT_PROSE_9>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_14>"
     },
     {
-      "kind": "assistant_prose",
-      "placeholder": "<ASSISTANT_PROSE_10>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_15>"
     },
     {
-      "kind": "assistant_prose",
-      "placeholder": "<ASSISTANT_PROSE_11>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_16>"
     },
     {
-      "kind": "assistant_prose",
-      "placeholder": "<ASSISTANT_PROSE_12>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_17>"
     },
     {
-      "kind": "assistant_prose",
-      "placeholder": "<ASSISTANT_PROSE_13>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_18>"
     },
     {
-      "kind": "provider_prose",
-      "placeholder": "<PROVIDER_PROSE_1>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_19>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_1>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_20>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_2>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_21>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_3>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_22>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_4>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_23>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_5>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_24>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_6>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_25>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_7>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_26>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_8>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_27>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_9>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_28>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_10>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_29>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_11>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_30>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_12>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_31>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_13>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_32>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_14>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_33>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_15>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_34>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_16>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_35>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_17>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_36>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_18>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_37>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_19>"
+      "kind": "machine",
+      "placeholder": "<MACHINE_38>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_20>"
+      "kind": "prose",
+      "placeholder": "<PROSE_1>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_21>"
+      "kind": "session",
+      "placeholder": "<SESSION_1>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_22>"
+      "kind": "v",
+      "placeholder": "<V1>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_23>"
+      "kind": "v",
+      "placeholder": "<V2>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_24>"
+      "kind": "v",
+      "placeholder": "<V3>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_25>"
+      "kind": "v",
+      "placeholder": "<V4>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_26>"
+      "kind": "v",
+      "placeholder": "<V5>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_27>"
+      "kind": "v",
+      "placeholder": "<V6>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_28>"
+      "kind": "v",
+      "placeholder": "<V7>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_29>"
+      "kind": "v",
+      "placeholder": "<V8>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_30>"
+      "kind": "v",
+      "placeholder": "<V9>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_31>"
+      "kind": "v",
+      "placeholder": "<V10>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_32>"
+      "kind": "v",
+      "placeholder": "<V11>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_33>"
+      "kind": "v",
+      "placeholder": "<V12>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_34>"
+      "kind": "v",
+      "placeholder": "<V13>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_35>"
+      "kind": "v",
+      "placeholder": "<V14>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_36>"
+      "kind": "v",
+      "placeholder": "<V15>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_37>"
+      "kind": "v",
+      "placeholder": "<V16>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_38>"
+      "kind": "v",
+      "placeholder": "<V17>"
     },
     {
-      "kind": "claude_memory_path",
-      "placeholder": "<CLAUDE_MEMORY_PATH_1>"
+      "kind": "v",
+      "placeholder": "<V18>"
     },
     {
-      "kind": "claude_message_id",
-      "placeholder": "<CLAUDE_MESSAGE_ID_1>"
+      "kind": "v",
+      "placeholder": "<V19>"
     },
     {
-      "kind": "claude_message_id",
-      "placeholder": "<CLAUDE_MESSAGE_ID_2>"
+      "kind": "v",
+      "placeholder": "<V20>"
     },
     {
-      "kind": "claude_thinking_signature",
-      "placeholder": "<CLAUDE_THINKING_SIGNATURE_1>"
+      "kind": "v",
+      "placeholder": "<V21>"
     },
     {
-      "kind": "claude_thinking_signature",
-      "placeholder": "<CLAUDE_THINKING_SIGNATURE_2>"
+      "kind": "v",
+      "placeholder": "<V22>"
     },
     {
-      "kind": "cwd_path",
-      "placeholder": "<CWD>"
+      "kind": "v",
+      "placeholder": "<V23>"
     },
     {
-      "kind": "home_path",
-      "placeholder": "<HOME>"
+      "kind": "v",
+      "placeholder": "<V24>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V25>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V26>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V27>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V28>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V29>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V30>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V31>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V32>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V33>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V34>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V35>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V36>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V37>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V38>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V39>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V40>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V41>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V42>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V43>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V44>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V45>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V46>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V47>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V48>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V49>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V50>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V51>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V52>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V53>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V54>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V55>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V56>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V57>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V58>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V59>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V60>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V61>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V62>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V63>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V64>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V65>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V66>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V67>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V68>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V69>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V70>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V71>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V72>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V73>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V74>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V75>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V76>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V77>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V78>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V79>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V80>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V81>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V82>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V83>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V84>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V85>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V86>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V87>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V88>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V89>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V90>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V91>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V92>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V93>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V94>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V95>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V96>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V97>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V98>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V99>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V100>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V101>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V102>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V103>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V104>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V105>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V106>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V107>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V108>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V109>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V110>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V111>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V112>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V113>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V114>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V115>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V116>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V117>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V118>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V119>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V120>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V121>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V122>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V123>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V124>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V125>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V126>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V127>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V128>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V129>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V130>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V131>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V132>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V133>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V134>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V135>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V136>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V137>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V138>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V139>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V140>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V141>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V142>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V143>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V144>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V145>"
     }
   ],
   "platform": {
@@ -301,17 +785,10 @@
   "provider": "claude",
   "purpose": "capture one bounded Claude run script",
   "redaction_counts": {
-    "assistant_prose": 18,
-    "claude_memory_path": 1,
-    "claude_message_id": 6,
-    "claude_thinking_signature": 4,
-    "cwd_path": 2,
-    "home_path": 4,
-    "machine_id": 38,
-    "provider_prose": 1,
-    "session_id": 39,
-    "tool_use_id": 3,
-    "user_text": 3
+    "machine": 38,
+    "prose": 1,
+    "session": 39,
+    "v": 239
   },
   "scenario": "resume",
   "schema_version": 1,

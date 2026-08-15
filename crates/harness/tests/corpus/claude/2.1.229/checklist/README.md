@@ -20,16 +20,29 @@ item it has no subject for.
 
 `"Alpha step"`, `"Beta step"`, `"Working the first step"`. That is not incidental phrasing.
 
-**`comet-provider-sanitize` does not redact model prose inside tool inputs or results** — a
-`TaskCreate` input's `subject` and `description`, and a `TaskUpdate`'s `activeForm`, survive
-verbatim, as anyone can confirm by reading `events.jsonl`. It redacts `thinking` blocks and
-typed identifiers, and has no rule for these. On a real session those fields would carry
-whatever the operator's work is about.
+**Keep it that way regardless of what the sanitizer does.** Under the earlier blocklist, a
+`TaskCreate` input's `subject` and `description`, and a `TaskUpdate`'s `activeForm`, had no
+matching redaction rule and survived verbatim — `docs/debt/README.md`'s **D64** named that gap.
+The allowlist-sanitizer stage closed the general mechanism: none of `.message.content[].
+input.subject`, `.description`, or `.activeForm` is on
+`crates/harness/src/capture/allowlist/claude.txt`, so a field nothing on that list names now
+defaults to redacted rather than surviving by omission. Confirm it yourself in `events.jsonl`:
+sequence 55's `subject` reads `<V210>` and its `description` `<V209>`, and sequence 88's
+`activeForm` reads `<V240>` — not the prompt text.
 
-The scenario prompts in `crates/harness/src/capture/checklist.rs` therefore keep every task
-subject meaningless. **Do not "improve" them into something descriptive**, and do not re-record
-this pair from an ad-hoc prompt. `docs/debt/README.md` **D64** tracks the sanitizer gap; until it
-closes, the prompt is the control.
+That closure is not a reason to relax the prompt. The scenario prompts in
+`crates/harness/src/capture/checklist.rs` still keep every task subject meaningless, on purpose:
+writing something descriptive here would mean trusting the sanitizer to keep catching it forever,
+and `docs/debt/D73-tool-argument-union-paths.md` already names a live way that trust can be
+misplaced — several of these same tool-argument paths
+(`.message.content[].input.status`/`.taskId`/`.type` and their `tool_use_result` siblings) are
+allowlisted as a *union* across today's five known tools, and a future, unreviewed tool (including
+a third-party MCP tool) landing content on one of those already-approved paths would not be caught
+by anything that reviews paths rather than values. A synthetic subject has nothing in it worth
+catching either way, whatever a future capture lands on a neighboring field.
+
+**Do not "improve" them into something descriptive**, and do not re-record this pair from an
+ad-hoc prompt.
 
 ## Assertions
 

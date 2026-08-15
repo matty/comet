@@ -23,6 +23,12 @@ fn payload(scenario: &str, sequence: u64) -> Value {
 /// before the `model/list` response — which is why ID-based reply matching in
 /// `crates/harness/src/codex/discovery.rs` must skip notifications rather than
 /// take the next frame.
+///
+/// The literal request ids (`1`, `2`) were incidental to that claim, and
+/// `.id` is not on `codex.txt` (the allowlist-sanitizer stage), so the
+/// archive now holds placeholders there. What actually matters — that
+/// `initialize` and `model/list` are two DIFFERENT replies, not the same
+/// frame read twice — survives as an inequality instead of an equality.
 #[test]
 fn codex_discovery_interleaves_a_notification_before_the_model_list_reply() {
     let initialize = payload(CODEX_MODEL_DISCOVERY, 2);
@@ -33,12 +39,22 @@ fn codex_discovery_interleaves_a_notification_before_the_model_list_reply() {
         corpus_frame(CODEX_MODEL_DISCOVERY, 2).channel,
         comet_harness::capture::Channel::Stdout
     );
-    assert_eq!(initialize["id"], 1);
+    assert!(
+        !initialize["id"].is_null(),
+        "initialize must carry a request id"
+    );
     assert!(initialize["result"].is_object());
 
     assert_eq!(notification["method"], "remoteControl/status/changed");
 
-    assert_eq!(model_list["id"], 2);
+    assert!(
+        !model_list["id"].is_null(),
+        "model/list must carry a request id"
+    );
+    assert_ne!(
+        initialize["id"], model_list["id"],
+        "initialize and model/list must be answers to two different requests"
+    );
     assert!(model_list["result"]["data"].is_array());
 }
 

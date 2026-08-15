@@ -678,6 +678,18 @@ mod tests {
 
     /// A `can_use_tool` request carries request id, tool, input, description,
     /// and additional ignored fields.
+    ///
+    /// Neither `.request.tool_use_id` nor `.request.description` is on
+    /// `claude.txt` (the allowlist-sanitizer stage), so the archive no longer
+    /// holds their literal text. Never hardcode a placeholder token as the
+    /// expected value — coupling a test to the sanitizer's own vocabulary is
+    /// exactly what broke here (`"<TOOL_USE_ID_4>"` was the OLD blocklist's
+    /// name for this value; the new one is a completely different string).
+    /// What actually matters, and what a card renders off of, is JOIN
+    /// semantics: this approval request's `tool_use_id` must be the same
+    /// identifier the eventual `tool_result` answers. Frame 104 in this same
+    /// capture is that result, so the join is asserted directly instead of
+    /// pinning either side's literal value.
     #[test]
     fn a_can_use_tool_request_decodes_the_fields_a_card_needs() {
         let line = corpus_frame("claude/2.1.228/approval", 102).payload;
@@ -686,10 +698,31 @@ mod tests {
         };
         assert_eq!(req.request.subtype, "can_use_tool");
         assert_eq!(req.request.tool_name, "Write");
-        assert_eq!(req.request.tool_use_id, "<TOOL_USE_ID_4>");
+        assert!(
+            !req.request.tool_use_id.is_empty(),
+            "a can_use_tool request must name the tool_use it approves"
+        );
+        assert!(
+            req.request
+                .description
+                .as_deref()
+                .is_some_and(|text| !text.is_empty()),
+            "the request must carry a non-empty description for the approval card"
+        );
+
+        let result_line = corpus_frame("claude/2.1.228/approval", 104).payload;
+        let Frame::User(result_frame) = parse_frame(&result_line).unwrap() else {
+            panic!("expected a user frame");
+        };
+        let tool_result_id = result_frame
+            .message
+            .blocks()
+            .next()
+            .expect("a tool_result content block")
+            .tool_use_id;
         assert_eq!(
-            req.request.description.as_deref(),
-            Some("capture-marker.txt")
+            req.request.tool_use_id, tool_result_id,
+            "the approval and its eventual result must key on the same tool_use_id"
         );
         // permission_suggestions and display_name are present on this captured frame and
         // deliberately undecoded. Nothing
@@ -721,6 +754,17 @@ mod tests {
 
     /// A captured Bash `tool_result` user frame carries a snake_case
     /// `tool_use_result` key with the tool's typed result.
+    ///
+    /// `.tool_use_result.stdout` is deliberately excluded from `claude.txt` —
+    /// raw Bash stdout is one of the two highest-risk fields the
+    /// allowlist-sanitizer stage identified (arbitrary command output), so
+    /// its literal text (`"capture"`) is gone from the archive by design.
+    /// What this test still proves — that the SDK's camelCase `toolUseResult`
+    /// typing is wrong and the wire actually sends snake_case
+    /// `tool_use_result` (per AGENTS.md, a hand-composed fixture would not
+    /// catch that) — survives as a presence-and-shape check: the key exists,
+    /// and `stdout` decodes as a string. `interrupted` is a `Bool`, never
+    /// redacted regardless of path, so it is still asserted exactly.
     #[test]
     fn a_user_frame_decodes_the_captured_tool_use_result() {
         // Literal captured payload, per AGENTS.md: the SDK's typings declare
@@ -731,7 +775,7 @@ mod tests {
             panic!("expected a user frame");
         };
         let result = frame.tool_use_result.expect("captured frame has a result");
-        assert_eq!(result["stdout"], "capture");
+        assert!(result["stdout"].is_string(), "{result}");
         assert_eq!(result["interrupted"], false);
     }
 

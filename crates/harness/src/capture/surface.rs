@@ -65,7 +65,14 @@ pub enum SurfaceError {
 /// key set looks perfectly stable — and a wrong guess silently renames a field.
 /// An undeclared map shows up in the snapshot as a field with an obviously
 /// data-shaped name, which triage catches and adds here.
-const MAP_PATHS: &[&str] = &[".modelUsage"];
+///
+/// **`sanitize.rs` reads this same list**, so one declaration decides both
+/// questions a map key raises: this module stops recording it as a field name,
+/// and the sanitizer stops publishing it verbatim. They must not drift — a
+/// path declared here but not there would redact a key the snapshot still
+/// expects to see, and the reverse publishes an identifier the snapshot has
+/// already agreed is data.
+pub const MAP_PATHS: &[&str] = &[".modelUsage"];
 
 pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, SurfaceError> {
     let scenarios = promoted_scenarios(corpus_root)?;
