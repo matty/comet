@@ -391,12 +391,17 @@ fn is_mcp_tool_identity(value: &Value) -> bool {
 /// committed corpus still carried the *old* blocklist-era typed names
 /// (`<SESSION_ID_1>`, `<CLAUDE_THINKING_SIGNATURE_1>`, ...), not the six-kind
 /// vocabulary `sanitize.rs` writes today (`<SESSION_1>`, `<MACHINE_1>`, ...).
-/// Task 5 has since run: every manifest in the corpus now uses the six-kind
-/// vocabulary, and no `SESSION_ID`/`CLAUDE_`-prefixed placeholder remains
-/// anywhere in it. Reading each manifest's own list, rather than hardcoding
-/// either vocabulary, is what let this property hold across that
-/// sanitizer-vocabulary change without editing the test, and is what lets it
-/// keep holding across whatever the vocabulary becomes next.
+/// Task 5 has since run: every *manifest* in the corpus now uses the
+/// six-kind vocabulary, and no `SESSION_ID`/`CLAUDE_`-prefixed placeholder
+/// remains in any of them. That is a claim about manifests, not the whole
+/// corpus directory — `claude/2.1.229/subagent/read-back-run-journal.jsonl`
+/// still holds `<SESSION_ID_1>` twice, hand-sanitized under the old
+/// vocabulary and never in `sanitize_dir`'s remit at all (see `D75` in
+/// `docs/debt/README.md`), so it has no manifest of its own for this
+/// function to read regardless. Reading each manifest's own list, rather
+/// than hardcoding either vocabulary, is what let this property hold across
+/// that sanitizer-vocabulary change without editing the test, and is what
+/// lets it keep holding across whatever the vocabulary becomes next.
 fn manifest_provider_and_placeholders(
     manifest_path: &Path,
     scenario: &str,

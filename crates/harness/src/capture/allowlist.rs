@@ -509,12 +509,11 @@ mod tests {
 
         // Final review (2026-08-15) — reverses an earlier keep-ruling.
         // `.tool_use_result.pin.id` and `.pin.name` are already excluded;
-        // `.pin.ref` was kept as the odd one out. In the corpus it reads
-        // `"pin":{"id":"<V245>","name":"<V245>","ref":"18303e"}` -- its two
-        // sibling identity fields are redacted and this one alone was
-        // published verbatim. Nothing decodes it and no test references it,
-        // so by the standing "nothing decodes it" rule, and because it is
-        // the only opaque identifier left among the surviving literals
+        // `.pin.ref` was kept as the odd one out. It holds a short opaque
+        // hex reference, the same shape as its two now-redacted siblings.
+        // Nothing decodes it and no test references it, so by the standing
+        // "nothing decodes it" rule, and because it was the only opaque
+        // identifier left among the surviving literals
         // (`allowlist_property.rs`'s own documented blind spot -- it only
         // ever inspects a scalar it is about to call an escape, never one an
         // allowed path keeps), it should not have been kept regardless of
