@@ -81,7 +81,7 @@ pub fn allows(provider: Provider, path: &str) -> bool {
 /// 642 Claude occurrences and the `"sessionId"` entry covered 5; three of
 /// the nine leaves — `toolUseId`, `parentToolUseId`, `requestId` — matched
 /// *zero*, because Claude never emits those camelCase spellings at all).
-/// `only_the_six_identifier_kinds_are_named`'s "keys already normalized"
+/// `named_leaves_are_already_normalized`'s "keys already normalized"
 /// assertion is what stops a future editor from adding a raw, unnormalized
 /// spelling back in.
 const NAMED_LEAVES: &[(&str, &str)] = &[
@@ -222,6 +222,14 @@ mod tests {
     /// never that each name actually matches something real. This walks the
     /// real committed corpus (reading only; nothing here writes to it) and
     /// fails if any of the six names covers zero occurrences.
+    ///
+    /// Counted per **leaf** (the normalized wire key, e.g. `parenttooluseid`),
+    /// not per kind: `TOOL_USE` has three leaves feeding it
+    /// (`toolUseId`/`parentToolUseId`/`itemId`), and counting only the kind
+    /// would let a leaf that matches nothing hide behind a sibling that
+    /// matches plenty — a tenth leaf spelled `parenttoolusid` (missing the
+    /// second `e`) would still leave `TOOL_USE`'s total above zero. Asserting
+    /// each leaf's own count is what makes the test's name true.
     #[test]
     fn every_named_leaf_matches_something_in_the_committed_corpus() {
         let mut occurrences: std::collections::BTreeMap<&'static str, u64> =
@@ -248,13 +256,11 @@ mod tests {
             }
         }
 
-        for name in [
-            "SESSION", "THREAD", "TURN", "TOOL_USE", "MACHINE", "REQUEST",
-        ] {
-            let count = occurrences.get(name).copied().unwrap_or(0);
+        for &(leaf, kind) in NAMED_LEAVES {
+            let count = occurrences.get(leaf).copied().unwrap_or(0);
             assert!(
                 count > 0,
-                "named kind {name} matches nothing in the committed corpus \
+                "named leaf {leaf:?} (-> {kind}) matches nothing in the committed corpus \
                  (counts: {occurrences:?})"
             );
         }
@@ -267,8 +273,12 @@ mod tests {
         match value {
             serde_json::Value::Object(object) => {
                 for (key, child) in object {
-                    if let Some(kind) = named_kind(key) {
-                        *counts.entry(kind).or_default() += 1;
+                    let normalized = normalize_field(key);
+                    if let Some(&(leaf, _)) = NAMED_LEAVES
+                        .iter()
+                        .find(|(leaf, _)| *leaf == normalized.as_str())
+                    {
+                        *counts.entry(leaf).or_default() += 1;
                     }
                     count_named_leaves(child, counts);
                 }
@@ -473,5 +483,15 @@ mod tests {
             ".params.rateLimits.credits.balance"
         ));
         assert!(!allows(Provider::Codex, ".params.rateLimits.planType"));
+
+        // Task 2 review (2026-08-15) — `.request.display_name` exists to hold
+        // a *friendly rendering*, not the raw tool name: an MCP invocation's
+        // friendly rendering can plausibly read `search_threads
+        // (claude_ai_Gmail)`, naming the server while never containing the
+        // literal `mcp__` prefix `is_mcp_tool_identity` matches on. Nothing
+        // decodes it (`crates/harness/src/claude/wire.rs:694` records it as
+        // present and deliberately undecoded), so the standing "nothing
+        // decodes it" rule excludes it regardless of the prefix-check gap.
+        assert!(!allows(Provider::Claude, ".request.display_name"));
     }
 }

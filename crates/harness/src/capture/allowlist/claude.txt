@@ -48,7 +48,6 @@
 .rate_limit_info.overageStatus
 .rate_limit_info.rateLimitType
 .rate_limit_info.status
-.request.display_name
 .request.permission_suggestions[].destination
 .request.permission_suggestions[].mode
 .request.permission_suggestions[].type

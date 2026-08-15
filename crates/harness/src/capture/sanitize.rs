@@ -878,6 +878,17 @@ pub(crate) fn normalize_field(field: &str) -> String {
         .collect()
 }
 
+/// `sanitize_scalar`'s call site only ever passes a `String`/`Number` value —
+/// the allowlist walker checks this once per scalar, not once per object key
+/// the way the old blocklist did, so `{"apiKey": {"a": "b"}}` no longer trips
+/// this check on the `apiKey` object itself. That is deliberate, not a
+/// narrowing bug: an object-valued field is walked into regardless (its
+/// contents still redact under the same rules, since default-deny already
+/// covers any path nobody put on the allowlist), so nothing escapes — this
+/// is very likely what made `is_codex_token_usage_object`'s old
+/// object-shaped bypass unnecessary. `sanitize_nonsemantic_value`'s call
+/// site (the `command`/`platform` metadata scan) still passes object- and
+/// array-valued fields, so this function itself stays general.
 fn is_secret_field(field: &str, value: &Value) -> bool {
     let normalized = normalize_field(field);
     if is_token_counter_field(&normalized) {
@@ -911,7 +922,7 @@ fn is_secret_field(field: &str, value: &Value) -> bool {
 
 /// A decision this task owns, not Task 1's path review: the tool-name-at-
 /// invocation family (`.message.content[].name`, `.event.content_block.name`,
-/// `.request.tool_name`, `.last_tool_name`, `.request.display_name`,
+/// `.request.tool_name`, `.last_tool_name`,
 /// `.message.content[].content[].tool_name`, `.tool_use_result.matches[]`) is
 /// allowlisted, and every sampled value today is a built-in tool name
 /// (`Read`, `Bash`, `TaskCreate`). An MCP invocation puts
@@ -921,6 +932,16 @@ fn is_secret_field(field: &str, value: &Value) -> bool {
 /// decision can't express "this field, except when the value looks like
 /// this", so the exception lives at the value, checked after the path is
 /// already known to be allowed.
+///
+/// `.request.display_name` was originally in this family and is deliberately
+/// no longer allowlisted at all (review finding, 2026-08-15): it exists to
+/// hold a *friendly rendering*, not the raw name, so an MCP tool's friendly
+/// rendering can plausibly read `search_threads (claude_ai_Gmail)` — naming
+/// the server while never containing the literal `mcp__` prefix this check
+/// matches on. `crates/harness/src/claude/wire.rs:694` records the field as
+/// present and deliberately undecoded, so by the standing "nothing decodes
+/// it" rule it should not have been on the list regardless of the prefix
+/// gap.
 fn is_mcp_tool_identity(value: &Value) -> bool {
     value.as_str().is_some_and(|text| text.starts_with("mcp__"))
 }
