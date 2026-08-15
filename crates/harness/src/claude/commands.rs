@@ -63,7 +63,7 @@ async fn read_commands(exe: &Path, cwd: &Path) -> Result<Vec<AgentCommand>, Disc
 }
 
 /// Select the exact launch used for Claude command discovery.
-pub(crate) fn command_discovery_launch(exe: &Path, cwd: &Path) -> crate::capture::LaunchDescriptor {
+pub(crate) fn command_discovery_launch(exe: &Path, cwd: &Path) -> crate::launch::LaunchDescriptor {
     super::discovery::claude_initialize_launch(exe, COMMAND_ARGS, cwd)
 }
 

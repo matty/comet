@@ -23,7 +23,5 @@ pub use surface::{
 pub use types::{
     CaptureConfig, CaptureEvent, CaptureOperation, CaptureScenario, Channel,
     ClaudeCaptureOperation, ClaudeRunScript, CodexCaptureOperation, CodexRunScript,
-    CommandSnapshot, PlatformMetadata, Provider, RawCapture, RedactionRoots, StdioMode,
+    CommandSnapshot, PlatformMetadata, Provider, RawCapture, RedactionRoots,
 };
-
-pub(crate) use types::LaunchDescriptor;
