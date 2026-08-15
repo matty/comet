@@ -103,6 +103,71 @@ fn inventory_records_direction_and_the_first_frame() {
     );
 }
 
+/// Break caught (§2.1, the defect this stage exists to fix): the inventory
+/// keyed on `(provider, direction, path)` alone merges every version of a
+/// provider into one set. A field only one version emits is easy to get
+/// right by accident (the paths never collide), so the real probe is a field
+/// **both** versions emit at the same path: without `version` in the key,
+/// `or_insert_with` only records the first scenario that reaches it, so the
+/// second version's observation is silently dropped and a per-version filter
+/// would wrongly report the field absent from whichever version lost the
+/// race.
+#[test]
+fn inventory_keeps_two_versions_of_one_provider_apart() {
+    let root = tempfile::tempdir().unwrap();
+    write_scenario(
+        root.path(),
+        "claude",
+        "1.0.0",
+        "alpha",
+        &[(1, "stdout", json!({"onlyOld": 1, "shared": "old-value"}))],
+    );
+    write_scenario(
+        root.path(),
+        "claude",
+        "2.0.0",
+        "alpha",
+        &[(1, "stdout", json!({"onlyNew": 1, "shared": "new-value"}))],
+    );
+
+    let observations = observe_corpus(root.path()).unwrap();
+
+    let old_field = find(&observations, ".onlyOld");
+    assert_eq!(old_field.version, "1.0.0");
+    let new_field = find(&observations, ".onlyNew");
+    assert_eq!(new_field.version, "2.0.0");
+
+    assert!(
+        !observations
+            .iter()
+            .any(|observation| observation.path == ".onlyOld" && observation.version == "2.0.0"),
+        "a field only 1.0.0 emitted must not appear under 2.0.0"
+    );
+    assert!(
+        !observations
+            .iter()
+            .any(|observation| observation.path == ".onlyNew" && observation.version == "1.0.0"),
+        "a field only 2.0.0 emitted must not appear under 1.0.0"
+    );
+
+    // The real probe: a field both versions emit at the same path must yield
+    // two observations, not one first-scenario-wins entry.
+    let shared: Vec<&FieldObservation> = observations
+        .iter()
+        .filter(|observation| observation.path == ".shared")
+        .collect();
+    let shared_versions: BTreeSet<&str> = shared
+        .iter()
+        .map(|observation| observation.version.as_str())
+        .collect();
+    assert_eq!(
+        shared_versions,
+        BTreeSet::from(["1.0.0", "2.0.0"]),
+        "a field shared by both versions must be observed under each, not merged into one \
+         first-scenario-wins entry: {shared:?}"
+    );
+}
+
 /// Break caught: a map keyed on data reports each key as a field, so the
 /// snapshot grows a row per model id and the real field
 /// (`.modelUsage.{}.costUSD`) is never named. Observed for real:

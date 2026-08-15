@@ -41,6 +41,12 @@ pub struct FrameRef {
 #[derive(Clone, Debug)]
 pub struct FieldObservation {
     pub provider: String,
+    /// The CLI version the observation came from — a directory name under
+    /// `provider/` in the corpus, e.g. `2.1.229`. Carried so the inventory can
+    /// be filtered to exactly one version's surface; without it, the same
+    /// field seen in two versions collapses into a single entry and a sheet
+    /// can no longer show what changed between them (§2.1).
+    pub version: String,
     /// Dotted path from the frame root. `[]` is an array element and `{}` is a
     /// map entry, so `.modelUsage.{}.costUSD` names a field and not a model id.
     pub path: String,
@@ -82,7 +88,8 @@ pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, Surfa
         });
     }
 
-    let mut inventory: BTreeMap<(String, Direction, String), FieldObservation> = BTreeMap::new();
+    let mut inventory: BTreeMap<(String, String, Direction, String), FieldObservation> =
+        BTreeMap::new();
     for scenario in scenarios {
         let events =
             std::fs::read_to_string(scenario.directory.join("events.jsonl")).map_err(|_| {
@@ -137,6 +144,7 @@ struct PromotedScenario {
     /// `provider/version/scenario`.
     label: String,
     provider: String,
+    version: String,
 }
 
 fn promoted_scenarios(corpus_root: &Path) -> Result<Vec<PromotedScenario>, SurfaceError> {
@@ -159,6 +167,7 @@ fn promoted_scenarios(corpus_root: &Path) -> Result<Vec<PromotedScenario>, Surfa
                 scenarios.push(PromotedScenario {
                     label: format!("{provider_name}/{version_name}/{scenario_name}"),
                     provider: provider_name.clone(),
+                    version: version_name.clone(),
                     directory: scenario,
                 });
             }
@@ -185,7 +194,7 @@ fn file_name(path: &Path) -> String {
 }
 
 struct Visit<'a> {
-    inventory: &'a mut BTreeMap<(String, Direction, String), FieldObservation>,
+    inventory: &'a mut BTreeMap<(String, String, Direction, String), FieldObservation>,
     scenario: &'a PromotedScenario,
     direction: Direction,
     sequence: u64,
@@ -223,6 +232,7 @@ impl Visit<'_> {
     fn record(&mut self, path: &str) {
         let key = (
             self.scenario.provider.clone(),
+            self.scenario.version.clone(),
             self.direction,
             path.to_owned(),
         );
@@ -230,6 +240,7 @@ impl Visit<'_> {
             .entry(key)
             .or_insert_with(|| FieldObservation {
                 provider: self.scenario.provider.clone(),
+                version: self.scenario.version.clone(),
                 path: path.to_owned(),
                 direction: self.direction,
                 first_seen: FrameRef {
