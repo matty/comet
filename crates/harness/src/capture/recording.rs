@@ -54,7 +54,6 @@ fn capture_redaction_roots(
     }
 }
 
-const CLAUDE_INITIALIZE_LINE: &str = r#"{"type":"control_request","request_id":"comet-discovery-1","request":{"subtype":"initialize"}}"#;
 const CODEX_INITIALIZED_LINE: &str = r#"{"jsonrpc":"2.0","method":"initialized"}"#;
 const READER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -320,35 +319,29 @@ impl RecordingSession {
 
     async fn drive(&mut self, operation: CaptureOperation) -> anyhow::Result<()> {
         match operation {
-            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery)
-            | CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscoveryAt { .. })
-            | CaptureOperation::Claude(ClaudeCaptureOperation::CommandDiscovery { .. }) => {
-                self.claude_initialize().await
-            }
             CaptureOperation::Claude(ClaudeCaptureOperation::Run { request, script }) => {
                 self.claude_run(request, script).await
-            }
-            CaptureOperation::Codex(CodexCaptureOperation::ModelDiscovery)
-            | CaptureOperation::Codex(CodexCaptureOperation::ModelDiscoveryAt { .. }) => {
-                self.codex_model_discovery().await
             }
             CaptureOperation::Codex(CodexCaptureOperation::Run { request, script }) => {
                 self.codex_run(request, script).await
             }
+            // Discovery is recorded through `capture::record` (the
+            // `record/` module) before a `RecordingSession` is ever built;
+            // `capture::record::record` routes every discovery operation
+            // there and only falls back to `recording::record` (this type)
+            // for a `Run` operation. See that module's dispatch.
+            CaptureOperation::Claude(
+                ClaudeCaptureOperation::ModelDiscovery
+                | ClaudeCaptureOperation::ModelDiscoveryAt { .. }
+                | ClaudeCaptureOperation::CommandDiscovery { .. },
+            )
+            | CaptureOperation::Codex(
+                CodexCaptureOperation::ModelDiscovery
+                | CodexCaptureOperation::ModelDiscoveryAt { .. },
+            ) => unreachable!(
+                "discovery operations are routed to capture::record before reaching RecordingSession::drive"
+            ),
         }
-    }
-
-    async fn claude_initialize(&mut self) -> anyhow::Result<()> {
-        self.write_line(CLAUDE_INITIALIZE_LINE).await?;
-        while let Some(line) = self.next_stdout().await? {
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if value["type"] == "control_response" {
-                return Ok(());
-            }
-        }
-        protocol_stopped("Claude", "initialize reply")
     }
 
     async fn claude_run(
@@ -483,25 +476,6 @@ impl RecordingSession {
             }
         }
         protocol_stopped("Claude", "terminal result")
-    }
-
-    async fn codex_model_discovery(&mut self) -> anyhow::Result<()> {
-        self.write_line(&codex_initialize_line()).await?;
-        self.codex_reply(1).await?;
-        self.write_line(CODEX_INITIALIZED_LINE).await?;
-
-        let mut cursor: Option<String> = None;
-        for page in 0..20_u64 {
-            let id = page + 2;
-            self.write_line(&codex_model_list_line(id, cursor.as_deref()))
-                .await?;
-            let reply = self.codex_reply(id).await?;
-            cursor = reply["result"]["nextCursor"].as_str().map(str::to_owned);
-            if cursor.is_none() {
-                return Ok(());
-            }
-        }
-        bail!("Codex returned too many model pages. Update the CLI or retry the capture later.")
     }
 
     async fn codex_run(
@@ -1139,14 +1113,6 @@ fn codex_initialize_line() -> String {
     .to_string()
 }
 
-fn codex_model_list_line(id: u64, cursor: Option<&str>) -> String {
-    let mut params = serde_json::Map::new();
-    if let Some(cursor) = cursor {
-        params.insert("cursor".into(), cursor.into());
-    }
-    rpc_request(id, "model/list", Value::Object(params))
-}
-
 fn rpc_request(id: u64, method: &str, params: Value) -> String {
     json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string()
 }
@@ -1173,21 +1139,16 @@ pub(super) async fn failed_session_stdin(config: CaptureConfig) -> (String, Vec<
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
     use comet_proto::{ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel};
     use serde_json::{Value, json};
 
-    use super::{LaunchDescriptor, RecordingSession, persist_immutable_bytes, record};
+    use super::{RecordingSession, persist_immutable_bytes, record};
     use crate::capture::test_support::{
-        absolute_program, channel_payloads, config, contract_request, find_named_file, fixture_path,
+        absolute_program, channel_payloads, config, contract_request, fixture_path,
     };
     use crate::capture::{
         CaptureOperation, Channel, ClaudeCaptureOperation, ClaudeRunScript, CodexCaptureOperation,
-        CodexRunScript, CommandSnapshot, Provider, sanitize_dir,
+        CodexRunScript, CommandSnapshot, sanitize_dir,
     };
     use crate::launch::StdioMode;
 
@@ -1256,271 +1217,6 @@ mod tests {
         assert!(snapshot.kill_on_drop);
         #[cfg(windows)]
         assert_eq!(snapshot.creation_flags, 0);
-    }
-
-    #[test]
-    fn claude_model_discovery_capture_uses_the_initialize_builder() {
-        let exe = absolute_program("claude");
-        let cwd = std::env::temp_dir();
-        let launch = crate::claude::discovery::model_discovery_launch(&exe, &cwd);
-        let snapshot = CommandSnapshot::from_launch(&launch);
-
-        assert_eq!(snapshot.program, exe.display().to_string());
-        assert_eq!(
-            snapshot.args,
-            [
-                "--print",
-                "--input-format",
-                "stream-json",
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--bare",
-            ]
-        );
-        assert_eq!(
-            snapshot.cwd.as_deref(),
-            Some(cwd.to_string_lossy().as_ref())
-        );
-        assert!(snapshot.configured_env.is_empty(), "PATH is never captured");
-        assert_eq!(snapshot.stdin, StdioMode::Piped);
-        assert_eq!(snapshot.stdout, StdioMode::Piped);
-        assert_eq!(snapshot.stderr, StdioMode::Piped);
-        assert!(snapshot.kill_on_drop);
-        #[cfg(windows)]
-        assert_eq!(snapshot.creation_flags, 0x0800_0000);
-    }
-
-    #[test]
-    fn claude_command_discovery_capture_uses_the_initialize_builder() {
-        let exe = absolute_program("claude");
-        let cwd = std::env::temp_dir().join("comet command discovery");
-        let launch = crate::claude::commands::command_discovery_launch(&exe, &cwd);
-        let snapshot = CommandSnapshot::from_launch(&launch);
-
-        assert_eq!(snapshot.program, exe.display().to_string());
-        assert_eq!(
-            snapshot.args,
-            [
-                "--print",
-                "--input-format",
-                "stream-json",
-                "--output-format",
-                "stream-json",
-                "--verbose",
-            ]
-        );
-        assert_eq!(
-            snapshot.cwd.as_deref(),
-            Some(cwd.to_string_lossy().as_ref())
-        );
-        assert!(
-            !snapshot.args.iter().any(|arg| arg == "--bare"),
-            "command discovery must not use --bare: {:?}",
-            snapshot.args
-        );
-        assert_eq!(snapshot.stdin, StdioMode::Piped);
-        assert_eq!(snapshot.stdout, StdioMode::Piped);
-        assert_eq!(snapshot.stderr, StdioMode::Piped);
-        assert!(snapshot.kill_on_drop);
-        #[cfg(windows)]
-        assert_eq!(snapshot.creation_flags, 0x0800_0000);
-    }
-
-    #[test]
-    fn codex_model_discovery_capture_uses_the_discovery_builder() {
-        let exe = absolute_program("codex");
-        let home = absolute_program("codex-home");
-        let cwd = std::env::temp_dir();
-        let launch = crate::codex::discovery::discovery_launch(&exe, &home, &cwd);
-        let snapshot = CommandSnapshot::from_launch(&launch);
-
-        assert_eq!(snapshot.program, exe.display().to_string());
-        assert_eq!(snapshot.args, ["app-server"]);
-        assert_eq!(
-            snapshot.cwd.as_deref(),
-            Some(cwd.to_string_lossy().as_ref())
-        );
-        assert_eq!(
-            snapshot
-                .configured_env
-                .get("CODEX_HOME")
-                .map(String::as_str),
-            Some(home.to_string_lossy().as_ref())
-        );
-        assert_eq!(snapshot.configured_env.len(), 1, "PATH is never captured");
-        assert_eq!(snapshot.stdin, StdioMode::Piped);
-        assert_eq!(snapshot.stdout, StdioMode::Piped);
-        assert_eq!(snapshot.stderr, StdioMode::Piped);
-        assert!(snapshot.kill_on_drop);
-        #[cfg(windows)]
-        assert_eq!(snapshot.creation_flags, 0x0800_0000);
-    }
-
-    #[test]
-    fn command_snapshot_never_records_path_or_unallowlisted_environment() {
-        let launch = LaunchDescriptor {
-            program: Path::new("provider").into(),
-            args: Vec::new(),
-            cwd: None,
-            configured_env: [
-                ("PATH".into(), "secret ambient path".into()),
-                ("UNRELATED_SECRET".into(), "must not be captured".into()),
-                ("CODEX_HOME".into(), "safe configured home".into()),
-            ]
-            .into(),
-            stdin: StdioMode::Inherit,
-            stdout: StdioMode::Null,
-            stderr: StdioMode::Piped,
-            kill_on_drop: false,
-            #[cfg(windows)]
-            creation_flags: 0,
-        };
-
-        let snapshot = CommandSnapshot::from_launch(&launch);
-
-        assert_eq!(
-            snapshot.configured_env,
-            [("CODEX_HOME".into(), "safe configured home".into())].into()
-        );
-        assert_eq!(snapshot.stdin, StdioMode::Inherit);
-        assert_eq!(snapshot.stdout, StdioMode::Null);
-        assert_eq!(snapshot.stderr, StdioMode::Piped);
-        assert!(!snapshot.kill_on_drop);
-    }
-
-    /// Break caught: selecting command discovery's non-bare launch for model discovery,
-    /// dropping a configured pipe, or allocating sequence numbers outside observer order.
-    #[tokio::test]
-    async fn recorder_claude_model_discovery_keeps_all_channels_and_monotonic_sequence() {
-        let raw = tempfile::tempdir().unwrap();
-        let capture = record(config(
-            "claude-model-discovery",
-            fixture_path("fake-claude"),
-            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
-            raw.path(),
-        ))
-        .await
-        .unwrap();
-        assert_eq!(capture.provider, Provider::Claude);
-        assert!(capture.command.args.iter().any(|arg| arg == "--bare"));
-        assert!(
-            capture
-                .events
-                .windows(2)
-                .all(|pair| pair[0].sequence < pair[1].sequence)
-        );
-        for channel in [Channel::Stdin, Channel::Stdout, Channel::Stderr] {
-            assert!(
-                capture.events.iter().any(|event| event.channel == channel),
-                "missing configured {channel:?} channel"
-            );
-        }
-        assert_eq!(
-            channel_payloads(&capture, Channel::Stdin),
-            [
-                r#"{"type":"control_request","request_id":"comet-discovery-1","request":{"subtype":"initialize"}}"#
-            ]
-        );
-        assert_eq!(capture.exit_code, Some(0));
-        assert!(capture.directory.starts_with(raw.path()));
-        let persisted: super::RawCapture =
-            serde_json::from_slice(&std::fs::read(capture.directory.join("capture.json")).unwrap())
-                .unwrap();
-        assert_eq!(persisted.events, capture.events);
-    }
-
-    /// Break caught: command discovery accidentally inherits model discovery's `--bare`.
-    #[tokio::test]
-    async fn recorder_claude_command_discovery_uses_non_bare_initialize() {
-        let raw = tempfile::tempdir().unwrap();
-        let cwd = tempfile::tempdir().unwrap();
-        let capture = record(config(
-            "claude-command-discovery",
-            fixture_path("fake-claude"),
-            CaptureOperation::Claude(ClaudeCaptureOperation::CommandDiscovery {
-                cwd: cwd.path().into(),
-            }),
-            raw.path(),
-        ))
-        .await
-        .unwrap();
-
-        assert!(!capture.command.args.iter().any(|arg| arg == "--bare"));
-        assert_eq!(
-            capture.command.cwd.as_deref(),
-            Some(cwd.path().to_string_lossy().as_ref())
-        );
-        assert_eq!(capture.exit_code, Some(0));
-    }
-
-    /// Break caught: raw evidence cannot identify the OS/architecture that produced its
-    /// provider frames, or persists prose instead of independently queryable fields.
-    #[tokio::test]
-    async fn recorder_persists_structured_host_platform() {
-        let raw = tempfile::tempdir().unwrap();
-        let capture = record(config(
-            "claude-platform",
-            fixture_path("fake-claude"),
-            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
-            raw.path(),
-        ))
-        .await
-        .unwrap();
-
-        assert_eq!(capture.platform.os, std::env::consts::OS);
-        assert_eq!(capture.platform.arch, std::env::consts::ARCH);
-        assert_eq!(capture.redaction_roots.cwd, capture.command.cwd);
-        assert_eq!(
-            capture.redaction_roots.home,
-            crate::home_dir().map(|path| path.to_string_lossy().into_owned())
-        );
-        assert_eq!(
-            capture.redaction_roots.temp,
-            Some(std::env::temp_dir().to_string_lossy().into_owned())
-        );
-        let persisted: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(capture.directory.join("capture.json")).unwrap())
-                .unwrap();
-        assert_eq!(persisted["platform"]["os"], std::env::consts::OS);
-        assert_eq!(persisted["platform"]["arch"], std::env::consts::ARCH);
-        assert_eq!(persisted["scenario"], "claude-platform");
-        assert_eq!(persisted["purpose"], "local recorder test");
-        assert!(persisted["captured_at_unix_ms"].as_i64().is_some());
-        assert_eq!(
-            persisted["redaction_roots"]["cwd"],
-            json!(capture.command.cwd)
-        );
-    }
-
-    /// Break caught: stopping after the first Codex page, failing to serialize an opaque cursor,
-    /// or omitting either half of the initialize handshake from the raw stdin record.
-    #[tokio::test]
-    async fn recorder_codex_model_discovery_records_initialize_and_every_page() {
-        let raw = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let mut config = config(
-            "codex-model-discovery",
-            fixture_path("fake-codex"),
-            CaptureOperation::Codex(CodexCaptureOperation::ModelDiscovery),
-            raw.path(),
-        );
-        config.codex_home = Some(home.path().into());
-        let capture = record(config).await.unwrap();
-
-        let stdin = channel_payloads(&capture, Channel::Stdin);
-        assert_eq!(stdin.len(), 5, "initialize, initialized, and three pages");
-        let lines: Vec<serde_json::Value> = stdin
-            .iter()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(lines[0]["method"], "initialize");
-        assert_eq!(lines[1], json!({"jsonrpc": "2.0", "method": "initialized"}));
-        assert_eq!(lines[2]["method"], "model/list");
-        assert!(lines[2]["params"].get("cursor").is_none());
-        assert_eq!(lines[3]["params"]["cursor"], "2\"\\ opaque");
-        assert_eq!(lines[4]["params"]["cursor"], "4\"\\ opaque");
-        assert_eq!(capture.exit_code, Some(0));
     }
 
     /// Break caught: a Claude run driver invents its own initial wire line instead of recording
@@ -1735,7 +1431,9 @@ mod tests {
     #[tokio::test]
     async fn sanitizer_rejects_partial_capture_even_beside_complete_shaped_raw() {
         let raw = tempfile::tempdir().unwrap();
-        let mut capture = record(config(
+        // Discovery now routes through `capture::record` (the new `record/`
+        // module), not this module's own `record` — see `drive`'s comment.
+        let mut capture = crate::capture::record(config(
             "claude-model-discovery",
             fixture_path("fake-claude"),
             CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
@@ -1788,63 +1486,6 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(destination).unwrap(), br#"{"first":true}"#);
         assert!(!directory.path().join(".partial-capture.json.tmp").exists());
-    }
-
-    /// Break caught: setup/probe/spawn errors manufacture an incomplete provider transcript even
-    /// though no provider process and therefore no observed protocol frame existed.
-    #[tokio::test]
-    async fn recorder_failure_before_spawn_creates_no_partial_capture() {
-        let raw = tempfile::tempdir().unwrap();
-        let missing = raw.path().join("missing-provider-executable");
-        let result = record(config(
-            "claude-pre-spawn-failure",
-            missing,
-            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
-            raw.path(),
-        ))
-        .await;
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("could not be started")
-        );
-        assert!(!find_named_file(raw.path(), "partial-capture.json"));
-    }
-
-    /// Break caught: failure to quarantine evidence replaces the safe protocol error with a raw
-    /// storage error that may disclose a local path or provider value.
-    #[tokio::test]
-    async fn partial_persistence_failure_preserves_the_original_safe_error() {
-        let raw = tempfile::tempdir().unwrap();
-        let cwd = tempfile::tempdir().unwrap();
-        let request = RunRequest {
-            prompt: "scenario:capture-approval-unexpected-second".into(),
-            cwd: cwd.path().display().to_string(),
-            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
-        };
-        let mut session = RecordingSession::start(config(
-            "claude-partial-write-failure",
-            fixture_path("fake-claude"),
-            CaptureOperation::Claude(ClaudeCaptureOperation::Run {
-                request,
-                script: ClaudeRunScript::Approval,
-            }),
-            raw.path(),
-        ))
-        .await
-        .unwrap();
-        let partial_path = session.directory.join("partial-capture.json");
-        std::fs::write(&partial_path, b"existing quarantine").unwrap();
-
-        let error = session.finish().await.unwrap_err().to_string();
-
-        assert_eq!(
-            error,
-            "Claude approval request used an unexpected tool or order."
-        );
-        assert!(!error.contains(&session.directory.display().to_string()));
-        assert_eq!(std::fs::read(partial_path).unwrap(), b"existing quarantine");
     }
 
     #[tokio::test]
@@ -2040,169 +1681,6 @@ mod tests {
             crate::codex::turn_start_params(&provider_request, "th-1", "scenario:capture-fresh"),
             expected_turn
         );
-    }
-
-    /// Break caught: the hard-timeout branch returns before killing and reaping the child.
-    #[tokio::test]
-    async fn recorder_timeout_kills_and_reaps_the_child() {
-        let raw = tempfile::tempdir().unwrap();
-        let request = RunRequest {
-            prompt: "scenario:interrupt".into(),
-            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
-        };
-        let mut config = config(
-            "claude-timeout",
-            fixture_path("fake-claude"),
-            CaptureOperation::Claude(ClaudeCaptureOperation::Run {
-                request,
-                script: ClaudeRunScript::FreshText,
-            }),
-            raw.path(),
-        );
-        config.timeout = Duration::from_millis(100);
-
-        let mut session = RecordingSession::start(config).await.unwrap();
-        let pid = session.child_id().expect("spawned child id");
-        let error = session.finish().await.unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-        assert!(!process_is_live(pid), "provider child {pid} remains live");
-    }
-
-    /// Break caught: an error path with no retained child returns before pending pipe readers are
-    /// drained, so the partial snapshot races and can omit the provider's final observed frame.
-    #[tokio::test]
-    async fn cleanup_without_a_child_drains_readers_before_partial_snapshot() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let reader_events = Arc::clone(&events);
-        let reader_started = Arc::new(AtomicBool::new(false));
-        let task_started = Arc::clone(&reader_started);
-        let reader = tokio::spawn(async move {
-            task_started.store(true, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            super::push_event(
-                &reader_events,
-                Channel::Stdout,
-                "late observed frame".into(),
-            );
-        });
-        while !reader_started.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
-        let (_stdout_tx, stdout_lines) = tokio::sync::mpsc::unbounded_channel();
-        let raw = tempfile::tempdir().unwrap();
-        let mut session = RecordingSession {
-            provider: Provider::Claude,
-            operation: CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
-            timeout: Duration::from_secs(1),
-            directory: raw.path().into(),
-            cli_version: "fixture".into(),
-            captured_at_unix_ms: 1,
-            scenario: "pending-reader".into(),
-            purpose: "prove cleanup ordering".into(),
-            command: CommandSnapshot {
-                program: "fake-claude".into(),
-                args: Vec::new(),
-                cwd: None,
-                configured_env: Default::default(),
-                stdin: StdioMode::Piped,
-                stdout: StdioMode::Piped,
-                stderr: StdioMode::Piped,
-                kill_on_drop: true,
-                #[cfg(windows)]
-                creation_flags: 0,
-            },
-            approval_target: None,
-            approval_target_identity: None,
-            approval_cwd_identity: None,
-            trusted_powershell: None,
-            child: None,
-            stdin: None,
-            stdout_lines,
-            readers: vec![reader],
-            events,
-            reap_notice: None,
-            wait_error_once: false,
-        };
-
-        session.terminate_and_reap().await;
-        let capture = session.raw_capture(None);
-
-        assert!(session.readers.is_empty(), "pending reader was not joined");
-        assert_eq!(capture.events.len(), 1);
-        assert_eq!(capture.events[0].payload, "late observed frame");
-    }
-
-    /// Break caught: a child-wait I/O error discards the only child handle before the outer
-    /// failure cleanup can attempt kill/reap and finalize the partial transcript.
-    #[tokio::test]
-    async fn wait_error_retains_child_for_cleanup_and_quarantine() {
-        let raw = tempfile::tempdir().unwrap();
-        let mut session = RecordingSession::start(config(
-            "claude-wait-error",
-            fixture_path("fake-claude"),
-            CaptureOperation::Claude(ClaudeCaptureOperation::ModelDiscovery),
-            raw.path(),
-        ))
-        .await
-        .unwrap();
-        let pid = session.child_id().expect("spawned child id");
-        let directory = session.directory.clone();
-        session.wait_error_once = true;
-
-        let error = session.finish().await.unwrap_err();
-
-        assert!(error.to_string().contains("exit status could not be read"));
-        assert!(session.child.is_none(), "cleanup retained the child handle");
-        assert!(!process_is_live(pid), "provider child {pid} remains live");
-        let partial: Value = serde_json::from_slice(
-            &std::fs::read(directory.join("partial-capture.json"))
-                .expect("wait-error partial evidence"),
-        )
-        .unwrap();
-        assert_eq!(partial["failure_class"], "process_error");
-        assert!(
-            partial["events"]
-                .as_array()
-                .is_some_and(|events| { events.iter().any(|event| event["channel"] == "stdout") })
-        );
-    }
-
-    /// Break caught: drop delegates `wait()` to the originating Tokio runtime, whose shutdown
-    /// cancels the task before the killed child is reaped.
-    #[test]
-    fn recorder_drop_reaper_survives_originating_runtime_shutdown() {
-        let raw = tempfile::tempdir().unwrap();
-        let request = RunRequest {
-            prompt: "scenario:interrupt".into(),
-            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
-        };
-        let config = config(
-            "claude-drop",
-            fixture_path("fake-claude"),
-            CaptureOperation::Claude(ClaudeCaptureOperation::Run {
-                request,
-                script: ClaudeRunScript::FreshText,
-            }),
-            raw.path(),
-        );
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut session = runtime.block_on(RecordingSession::start(config)).unwrap();
-        let pid = session.child_id().expect("spawned child id");
-        let (reaped_tx, reaped_rx) = std::sync::mpsc::sync_channel(1);
-        session.reap_notice = Some(reaped_tx);
-
-        runtime.block_on(async move { drop(session) });
-        drop(runtime);
-
-        assert_eq!(
-            reaped_rx.recv_timeout(Duration::from_secs(2)),
-            Ok(pid),
-            "drop reaper did not finish after its originating runtime shut down"
-        );
-        assert!(!process_is_live(pid), "provider child {pid} remains live");
     }
 
     #[cfg(unix)]

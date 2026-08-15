@@ -13,6 +13,7 @@ mod approval;
 mod checklist;
 mod corpus;
 mod filesystem;
+mod record;
 mod recording;
 mod sanitize;
 mod surface;
@@ -27,7 +28,7 @@ pub use approval::{
 };
 pub use checklist::{claude_checklist_prompt, claude_checklist_resume_prompt};
 pub use corpus::{Frame, corpus_frame, frame};
-pub use recording::record;
+pub use record::record;
 pub use sanitize::{
     NovelPath, SanitizationError, SanitizationReport, render_novel_paths_report, sanitize_dir,
 };

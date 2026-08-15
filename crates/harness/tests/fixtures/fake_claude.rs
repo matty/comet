@@ -218,6 +218,8 @@ fn main() {
         capture_destructive_write(&mut stdin);
     } else if first.contains("scenario:capture-approval") {
         capture_approval(&mut stdin);
+    } else if first.contains("scenario:capture-non-frame-tolerance") {
+        capture_non_frame_tolerance();
     } else if first.contains("scenario:approval") {
         approval(&mut stdin);
     } else {
@@ -569,6 +571,16 @@ fn approval(stdin: &mut StdinLock<'_>) {
     ));
     emit(
         r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-1"}"#,
+    );
+}
+
+/// One non-JSON progress line before the real terminal frame — the neutral
+/// recorder's `next_frame` must record it (on stdout) and skip it, not
+/// error, and must still return the frame that follows.
+fn capture_non_frame_tolerance() {
+    emit("not json, a progress line");
+    emit(
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-tolerance"}"#,
     );
 }
 
