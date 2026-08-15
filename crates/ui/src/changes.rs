@@ -998,17 +998,17 @@ pub fn flatten_rows(
 
 /// The file header that should remain visible for a logical list position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StickyFileHeader {
-    pub file_ix: usize,
-    pub header_row: usize,
-    pub next_header_row: Option<usize>,
+struct StickyFileHeader {
+    file_ix: usize,
+    header_row: usize,
+    next_header_row: Option<usize>,
 }
 
 /// Resolve a sticky file header from the current flattened row ranges.
 ///
 /// This remains independent of the rendered list so folds and diff resets
 /// cannot leave a second, stale active-file state behind.
-pub fn sticky_file_header(
+fn sticky_file_header(
     row_ranges: &[std::ops::Range<usize>],
     item_ix: usize,
     offset_in_item: f32,
@@ -1031,18 +1031,29 @@ pub fn sticky_file_header(
     })
 }
 
+/// Offset a sticky header upward as the next file header enters its slot.
+fn sticky_header_push_offset(next_header_y: Option<f32>) -> f32 {
+    next_header_y
+        .map(|y| (y - FILE_HEADER_HEIGHT).min(0.0))
+        .unwrap_or(0.0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileHeaderPresentation {
+enum FileHeaderPresentation {
     Row,
     Sticky,
 }
 
 impl FileHeaderPresentation {
-    fn element_id(self, file_ix: usize) -> SharedString {
-        let prefix = match self {
+    fn key_prefix(self) -> &'static str {
+        match self {
             Self::Row => "file-hdr",
             Self::Sticky => "sticky-file-hdr",
-        };
+        }
+    }
+
+    fn element_id(self, file_ix: usize) -> SharedString {
+        let prefix = self.key_prefix();
         SharedString::from(format!("{prefix}-{file_ix}"))
     }
 }
@@ -2000,6 +2011,20 @@ impl Changes {
         let path = file.path.clone();
         let adds = file.additions;
         let dels = file.deletions;
+        let sticky = presentation == FileHeaderPresentation::Sticky;
+        // The sticky copy floats over scrolling rows, so its wash has to be
+        // opaque — the row version's translucent ink would let diff lines
+        // read straight through it.
+        let rest_bg = if sticky {
+            crate::theme::flatten(crate::theme::ink(0.025), theme.bg)
+        } else {
+            crate::theme::ink(0.025)
+        };
+        let hover_bg = if sticky {
+            crate::theme::flatten(crate::theme::ink(0.05), theme.bg)
+        } else {
+            crate::theme::ink(0.05)
+        };
 
         // Chevron (comet checkout-diff-sidebar): chevron-right closed,
         // chevron-down open; gpui divs have no rotation transform at the
@@ -2017,7 +2042,11 @@ impl Changes {
         let chevron: AnyElement = if fold.animating() {
             chevron
                 .with_animation(
-                    SharedString::from(format!("chev-{path}-{}", fold.epoch)),
+                    SharedString::from(format!(
+                        "chev-{}-{path}-{}",
+                        presentation.key_prefix(),
+                        fold.epoch
+                    )),
                     CHEVRON.animation(),
                     |el, t| el.opacity(0.25 + 0.75 * t),
                 )
@@ -2038,15 +2067,21 @@ impl Changes {
                 presentation == FileHeaderPresentation::Row && ix > 0,
                 |el| el.border_t_1().border_color(crate::theme::hairline(0.04)),
             )
+            .when(sticky, |el| {
+                el.border_b_1()
+                    .border_color(crate::theme::hairline(0.08))
+                    .shadow_sm()
+                    .block_mouse_except_scroll()
+            })
             .flex_none()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(8.0))
             .px(px(Theme::SPACE_MD))
-            .bg(crate::theme::ink(0.025))
+            .bg(rest_bg)
             .cursor_pointer()
-            .hover(|s| s.bg(crate::theme::ink(0.05)))
+            .hover(move |s| s.bg(hover_bg))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_fold(ix, cx);
                 cx.notify();
@@ -2092,6 +2127,56 @@ impl Changes {
                 )
             })
             .into_any_element()
+    }
+
+    /// The floating copy of the active file's header, pinned to the top of the
+    /// list while that file's rows scroll under it. It reads the list's own
+    /// scroll position rather than caching an "active file", so a fold or a
+    /// diff reset cannot strand a second, stale one.
+    fn render_sticky_file_header(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let scroll_top = self.list.logical_scroll_top();
+        let sticky = sticky_file_header(
+            &self.row_ranges,
+            scroll_top.item_ix,
+            scroll_top.offset_in_item.as_f32(),
+        )?;
+        debug_assert_eq!(
+            self.rows.get(sticky.header_row),
+            Some(&DiffRow::FileHeader {
+                file: sticky.file_ix as u32,
+            })
+        );
+        let files = self.parsed.as_ref()?.files.clone();
+        let file = files.get(sticky.file_ix)?;
+        let fold = self.folds.get(&file.path).copied().unwrap_or_default();
+        let next_header_y = sticky.next_header_row.and_then(|row| {
+            let bounds = self.list.bounds_for_item(row)?;
+            let viewport = self.list.viewport_bounds();
+            Some((bounds.origin.y - viewport.origin.y).as_f32())
+        });
+        let top_offset = sticky_header_push_offset(next_header_y);
+        let header = self.render_file_header(
+            sticky.file_ix,
+            file,
+            &fold,
+            FileHeaderPresentation::Sticky,
+            theme,
+            cx,
+        );
+
+        Some(
+            div()
+                .absolute()
+                .top(px(top_offset))
+                .left_0()
+                .w_full()
+                .child(header)
+                .into_any_element(),
+        )
     }
 
     fn render_header_strip(&self, theme: &Theme) -> Option<AnyElement> {
@@ -2731,6 +2816,7 @@ impl Render for Changes {
                 .into_any_element(),
             DiffPhase::List => {
                 if self.parsed.is_some() {
+                    let sticky_header = self.render_sticky_file_header(&theme, cx);
                     div()
                         .flex_1()
                         .min_h_0()
@@ -2738,9 +2824,17 @@ impl Render for Changes {
                         .flex_col()
                         .children(self.render_header_strip(&theme))
                         .child(
-                            list(self.list.clone(), cx.processor(Self::render_row))
+                            div()
+                                .relative()
                                 .flex_1()
-                                .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
+                                .min_h_0()
+                                .overflow_hidden()
+                                .child(
+                                    list(self.list.clone(), cx.processor(Self::render_row))
+                                        .size_full()
+                                        .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
+                                )
+                                .when_some(sticky_header, |el, header| el.child(header)),
                         )
                         .into_any_element()
                 } else {
@@ -3119,6 +3213,15 @@ rename to new_name.rs
             })
         );
         assert_eq!(sticky_file_header(&ranges, 10, 0.0), None);
+    }
+
+    #[test]
+    fn sticky_header_is_pushed_by_the_next_file() {
+        assert_eq!(sticky_header_push_offset(None), 0.0);
+        assert_eq!(sticky_header_push_offset(Some(80.0)), 0.0);
+        assert_eq!(sticky_header_push_offset(Some(FILE_HEADER_HEIGHT)), 0.0);
+        assert_eq!(sticky_header_push_offset(Some(24.0)), -12.0);
+        assert_eq!(sticky_header_push_offset(Some(0.0)), -FILE_HEADER_HEIGHT);
     }
 
     #[test]
