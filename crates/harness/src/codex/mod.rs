@@ -261,19 +261,19 @@ fn service_tier(request: &RunRequest) -> Option<&str> {
 }
 
 /// Describe the exact process launch used for a Codex run.
-pub(crate) fn run_launch(exe: &Path, request: &RunRequest) -> crate::capture::LaunchDescriptor {
+pub(crate) fn run_launch(exe: &Path, request: &RunRequest) -> crate::launch::LaunchDescriptor {
     let mut configured_env = std::collections::BTreeMap::new();
     if let Some(path) = crate::child_path(exe) {
         configured_env.insert("PATH".into(), path);
     }
-    crate::capture::LaunchDescriptor {
+    crate::launch::LaunchDescriptor {
         program: exe.into(),
         args: vec!["app-server".into()],
         cwd: (!request.cwd.is_empty()).then(|| request.cwd.clone().into()),
         configured_env,
-        stdin: crate::capture::StdioMode::Piped,
-        stdout: crate::capture::StdioMode::Piped,
-        stderr: crate::capture::StdioMode::Piped,
+        stdin: crate::launch::StdioMode::Piped,
+        stdout: crate::launch::StdioMode::Piped,
+        stderr: crate::launch::StdioMode::Piped,
         kill_on_drop: true,
         #[cfg(windows)]
         creation_flags: 0,

@@ -26,10 +26,10 @@ use super::approval::{
 };
 use super::types::{
     CaptureConfig, CaptureEvent, CaptureOperation, Channel, ClaudeCaptureOperation,
-    ClaudeRunScript, CodexCaptureOperation, CodexRunScript, CommandSnapshot, LaunchDescriptor,
-    PartialFailureClass, PartialOutcome, PartialRawCapture, PlatformMetadata, Provider, RawCapture,
-    RedactionRoots,
+    ClaudeRunScript, CodexCaptureOperation, CodexRunScript, CommandSnapshot, PartialFailureClass,
+    PartialOutcome, PartialRawCapture, PlatformMetadata, Provider, RawCapture, RedactionRoots,
 };
+use crate::launch::LaunchDescriptor;
 
 fn capture_redaction_roots(
     command: &CommandSnapshot,
@@ -1187,8 +1187,9 @@ mod tests {
     };
     use crate::capture::{
         CaptureOperation, Channel, ClaudeCaptureOperation, ClaudeRunScript, CodexCaptureOperation,
-        CodexRunScript, CommandSnapshot, Provider, StdioMode, sanitize_dir,
+        CodexRunScript, CommandSnapshot, Provider, sanitize_dir,
     };
+    use crate::launch::StdioMode;
 
     const APPROVAL_MARKER_NAME: &str = "capture-marker.txt";
 

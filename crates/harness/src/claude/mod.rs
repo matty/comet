@@ -104,7 +104,7 @@ fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
 }
 
 /// Describe the exact process launch used for a Claude run.
-pub(crate) fn run_launch(exe: &Path, request: &RunRequest) -> crate::capture::LaunchDescriptor {
+pub(crate) fn run_launch(exe: &Path, request: &RunRequest) -> crate::launch::LaunchDescriptor {
     let mut args: Vec<std::ffi::OsString> = [
         "--print",
         "--input-format",
@@ -175,14 +175,14 @@ pub(crate) fn run_launch(exe: &Path, request: &RunRequest) -> crate::capture::La
     if let Some(path) = crate::child_path(exe) {
         configured_env.insert("PATH".into(), path);
     }
-    crate::capture::LaunchDescriptor {
+    crate::launch::LaunchDescriptor {
         program: exe.into(),
         args,
         cwd: (!request.cwd.is_empty()).then(|| request.cwd.clone().into()),
         configured_env,
-        stdin: crate::capture::StdioMode::Piped,
-        stdout: crate::capture::StdioMode::Piped,
-        stderr: crate::capture::StdioMode::Piped,
+        stdin: crate::launch::StdioMode::Piped,
+        stdout: crate::launch::StdioMode::Piped,
+        stderr: crate::launch::StdioMode::Piped,
         kill_on_drop: true,
         #[cfg(windows)]
         creation_flags: 0,

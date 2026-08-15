@@ -167,7 +167,7 @@ pub(crate) fn discovery_launch(
     exe: &Path,
     codex_home: &Path,
     cwd: &Path,
-) -> crate::capture::LaunchDescriptor {
+) -> crate::launch::LaunchDescriptor {
     let exe = program_path(exe);
     let mut configured_env = std::collections::BTreeMap::new();
     if let Some(path) = crate::child_path(&exe) {
@@ -176,14 +176,14 @@ pub(crate) fn discovery_launch(
     // The child is told the same home the login check just read `auth.json`
     // from. Left to the ambient environment, the two can be different homes.
     configured_env.insert("CODEX_HOME".into(), codex_home.into());
-    crate::capture::LaunchDescriptor {
+    crate::launch::LaunchDescriptor {
         program: exe,
         args: vec!["app-server".into()],
         cwd: Some(cwd.into()),
         configured_env,
-        stdin: crate::capture::StdioMode::Piped,
-        stdout: crate::capture::StdioMode::Piped,
-        stderr: crate::capture::StdioMode::Piped,
+        stdin: crate::launch::StdioMode::Piped,
+        stdout: crate::launch::StdioMode::Piped,
+        stderr: crate::launch::StdioMode::Piped,
         kill_on_drop: true,
         #[cfg(windows)]
         creation_flags: 0x0800_0000,

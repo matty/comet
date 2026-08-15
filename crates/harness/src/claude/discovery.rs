@@ -96,20 +96,20 @@ pub(crate) fn claude_initialize_launch(
     exe: &Path,
     args: &[&str],
     cwd: &Path,
-) -> crate::capture::LaunchDescriptor {
+) -> crate::launch::LaunchDescriptor {
     let exe = program_path(exe);
     let mut configured_env = std::collections::BTreeMap::new();
     if let Some(path) = crate::child_path(&exe) {
         configured_env.insert("PATH".into(), path);
     }
-    crate::capture::LaunchDescriptor {
+    crate::launch::LaunchDescriptor {
         program: exe,
         args: args.iter().map(Into::into).collect(),
         cwd: Some(cwd.into()),
         configured_env,
-        stdin: crate::capture::StdioMode::Piped,
-        stdout: crate::capture::StdioMode::Piped,
-        stderr: crate::capture::StdioMode::Piped,
+        stdin: crate::launch::StdioMode::Piped,
+        stdout: crate::launch::StdioMode::Piped,
+        stderr: crate::launch::StdioMode::Piped,
         kill_on_drop: true,
         #[cfg(windows)]
         creation_flags: 0x0800_0000,
@@ -117,7 +117,7 @@ pub(crate) fn claude_initialize_launch(
 }
 
 /// Select the exact launch used for Claude model discovery.
-pub(crate) fn model_discovery_launch(exe: &Path, cwd: &Path) -> crate::capture::LaunchDescriptor {
+pub(crate) fn model_discovery_launch(exe: &Path, cwd: &Path) -> crate::launch::LaunchDescriptor {
     claude_initialize_launch(exe, DISCOVERY_ARGS, cwd)
 }
 
@@ -130,7 +130,7 @@ pub(crate) fn build_claude_initialize_command(exe: &Path, args: &[&str], cwd: &P
 /// Spawn a selected short-lived Claude initialize launch, send one initialize,
 /// and hand back the raw `control_response` line.
 pub(super) async fn initialize_reply(
-    launch: crate::capture::LaunchDescriptor,
+    launch: crate::launch::LaunchDescriptor,
 ) -> Result<String, DiscoveryFailure> {
     let exe = launch.program.clone();
     let mut cmd = launch.command();

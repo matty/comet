@@ -1,3 +1,13 @@
+//! Recording, sanitizing and reading provider captures.
+//!
+//! Test tooling: nothing here is on Comet's runtime path. The launch types
+//! that *do* sit on it live in [`crate::launch`], which this module consumes
+//! rather than owns.
+//!
+//! The module is nonetheless unconditionally `pub`, not `cfg(test)`, so it
+//! compiles into the binary. Moving it behind a crate boundary is deferred
+//! until the recorder is provider-neutral.
+
 mod approval;
 mod checklist;
 mod corpus;
@@ -23,7 +33,5 @@ pub use surface::{
 pub use types::{
     CaptureConfig, CaptureEvent, CaptureOperation, CaptureScenario, Channel,
     ClaudeCaptureOperation, ClaudeRunScript, CodexCaptureOperation, CodexRunScript,
-    CommandSnapshot, PlatformMetadata, Provider, RawCapture, RedactionRoots, StdioMode,
+    CommandSnapshot, PlatformMetadata, Provider, RawCapture, RedactionRoots,
 };
-
-pub(crate) use types::LaunchDescriptor;
