@@ -24,88 +24,96 @@
   "normalized_cli_version": "codex-cli 0.147.0",
   "placeholders": [
     {
-      "kind": "codex_rpc_id",
-      "placeholder": "<CODEX_RPC_ID_1>"
+      "kind": "v",
+      "placeholder": "<V1>"
     },
     {
-      "kind": "codex_rpc_id",
-      "placeholder": "<CODEX_RPC_ID_2>"
+      "kind": "v",
+      "placeholder": "<V2>"
     },
     {
-      "kind": "provider_prose",
-      "placeholder": "<PROVIDER_PROSE_1>"
+      "kind": "v",
+      "placeholder": "<V3>"
     },
     {
-      "kind": "provider_prose",
-      "placeholder": "<PROVIDER_PROSE_2>"
+      "kind": "v",
+      "placeholder": "<V4>"
     },
     {
-      "kind": "provider_prose",
-      "placeholder": "<PROVIDER_PROSE_3>"
+      "kind": "v",
+      "placeholder": "<V5>"
     },
     {
-      "kind": "provider_prose",
-      "placeholder": "<PROVIDER_PROSE_4>"
+      "kind": "v",
+      "placeholder": "<V6>"
     },
     {
-      "kind": "provider_prose",
-      "placeholder": "<PROVIDER_PROSE_5>"
+      "kind": "v",
+      "placeholder": "<V7>"
     },
     {
-      "kind": "provider_prose",
-      "placeholder": "<PROVIDER_PROSE_6>"
+      "kind": "v",
+      "placeholder": "<V8>"
     },
     {
-      "kind": "provider_prose",
-      "placeholder": "<PROVIDER_PROSE_7>"
+      "kind": "v",
+      "placeholder": "<V9>"
     },
     {
-      "kind": "provider_prose",
-      "placeholder": "<PROVIDER_PROSE_8>"
+      "kind": "v",
+      "placeholder": "<V10>"
     },
     {
-      "kind": "provider_prose",
-      "placeholder": "<PROVIDER_PROSE_9>"
+      "kind": "v",
+      "placeholder": "<V11>"
     },
     {
-      "kind": "provider_prose",
-      "placeholder": "<PROVIDER_PROSE_10>"
+      "kind": "v",
+      "placeholder": "<V12>"
     },
     {
-      "kind": "provider_prose",
-      "placeholder": "<PROVIDER_PROSE_11>"
+      "kind": "v",
+      "placeholder": "<V13>"
     },
     {
-      "kind": "provider_prose",
-      "placeholder": "<PROVIDER_PROSE_12>"
+      "kind": "v",
+      "placeholder": "<V14>"
     },
     {
-      "kind": "provider_prose",
-      "placeholder": "<PROVIDER_PROSE_13>"
+      "kind": "v",
+      "placeholder": "<V15>"
     },
     {
-      "kind": "provider_prose",
-      "placeholder": "<PROVIDER_PROSE_14>"
+      "kind": "v",
+      "placeholder": "<V16>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_1>"
+      "kind": "v",
+      "placeholder": "<V17>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_2>"
+      "kind": "v",
+      "placeholder": "<V18>"
     },
     {
-      "kind": "cwd_path",
-      "placeholder": "<CWD>"
+      "kind": "v",
+      "placeholder": "<V19>"
     },
     {
-      "kind": "codex_home_path",
-      "placeholder": "<CODEX_HOME>"
+      "kind": "v",
+      "placeholder": "<V20>"
     },
     {
-      "kind": "home_path",
-      "placeholder": "<HOME>"
+      "kind": "v",
+      "placeholder": "<V21>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V22>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V23>"
     }
   ],
   "platform": {
@@ -115,12 +123,7 @@
   "provider": "codex",
   "purpose": "capture Codex model discovery from a neutral working directory",
   "redaction_counts": {
-    "codex_home_path": 2,
-    "codex_rpc_id": 2,
-    "cwd_path": 1,
-    "home_path": 1,
-    "machine_id": 2,
-    "provider_prose": 45
+    "v": 54
   },
   "scenario": "model-discovery-neutral-cwd",
   "schema_version": 1,

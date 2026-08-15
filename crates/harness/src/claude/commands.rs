@@ -151,40 +151,51 @@ mod tests {
     const COMMAND_DISCOVERY: &str = "claude/2.1.228/command-discovery";
 
     /// Command objects include `argumentHint` and may include `aliases`.
+    ///
+    /// `.response.response.commands[].name` and `.aliases[]` are not on
+    /// `claude.txt` (the allowlist-sanitizer stage excludes the whole
+    /// `commands[]` family as installed-tooling identity), so the archive no
+    /// longer holds the literal command names or alias text. The count is
+    /// what survives as evidence the decode walks the WHOLE array rather than
+    /// stopping early or truncating; the non-empty-aliases check is evidence
+    /// the decode reads a populated `aliases` list at all, distinct from
+    /// `a_command_without_aliases_decodes_to_an_empty_list` below which only
+    /// covers the absent case.
     #[test]
     fn the_captured_reply_decodes_every_command() {
         let payload = corpus_frame(COMMAND_DISCOVERY, 5).payload;
         let commands = commands_from_reply(&payload).expect("decodes");
-        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names.len(), 57, "the literal provider list is complete");
-        assert_eq!(
-            &names[..5],
-            [
-                "find-skills",
-                "commit-pr",
-                "gpui-ui",
-                "sync-upstream",
-                "verify"
-            ]
+        assert_eq!(commands.len(), 57, "the literal provider list is complete");
+        assert!(
+            commands.iter().any(|c| !c.aliases.is_empty()),
+            "at least one captured command should carry a non-empty aliases list: {commands:?}"
         );
-        let brainstorming = commands
-            .iter()
-            .find(|c| c.name == "superpowers:brainstorming")
-            .unwrap();
-        assert_eq!(brainstorming.aliases, vec!["brainstorming".to_string()]);
     }
 
     /// `argumentHint: ""` is what the CLI sends for a command that takes no
-    /// arguments — 47 of the 64 in the capture. Kept as `Some("")` it would
-    /// render an empty hint slot on most rows in the menu.
+    /// arguments, and a `description` is never usefully empty — an empty
+    /// string means the same as an absent key: nothing to show. This is
+    /// `non_empty()`'s own contract, not a fact about the provider's wire, so
+    /// it is tested here as a hand-written fixture rather than corpus
+    /// evidence.
     ///
-    /// Most captured no-argument commands carry an empty `argumentHint` string.
+    /// It CANNOT read the corpus for this: `.response.response.commands[].
+    /// argumentHint` is not on `claude.txt` (same exclusion as the test
+    /// above), so every archived `argumentHint` is now a non-empty
+    /// placeholder — the sanitizer redacts every `String` scalar on an
+    /// unlisted path regardless of whether the original value was empty.
+    /// "Empty decodes as absent" can never again be demonstrated from
+    /// committed evidence once its path is excluded; see `docs/debt/D73` for
+    /// the general shape of this trade.
     #[test]
     fn an_empty_argument_hint_is_absent_not_blank() {
-        let payload = corpus_frame(COMMAND_DISCOVERY, 5).payload;
-        let commands = commands_from_reply(&payload).unwrap();
+        let line = r#"{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"commands":[
+            {"name":"bare","description":"d","argumentHint":""},
+            {"name":"withHint","description":"d","argumentHint":"<file>"}
+        ]}}}"#;
+        let commands = commands_from_reply(line).unwrap();
         assert_eq!(commands[0].argument_hint, None);
-        assert_eq!(commands[1].argument_hint, None);
+        assert_eq!(commands[1].argument_hint.as_deref(), Some("<file>"));
     }
 
     /// Aliases are optional on the wire — most commands carry none — and the
