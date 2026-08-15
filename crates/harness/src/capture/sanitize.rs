@@ -14,6 +14,33 @@ pub struct SanitizationReport {
     pub manifest_path: PathBuf,
     pub events_bytes: Vec<u8>,
     pub manifest_bytes: Vec<u8>,
+    /// Every dotted path the allowlist withheld a value for, sorted by path.
+    /// The allowlist's fail-closed default is only useful if what it
+    /// withholds is visible: this is that visibility, without ever
+    /// reproducing what was withheld. See `NovelPath` for what each entry
+    /// carries and, just as importantly, what it deliberately does not.
+    pub novel_paths: Vec<NovelPath>,
+}
+
+/// One path the allowlist withheld a value for, described without
+/// reproducing the value: just enough shape to triage whether the path
+/// looks safe to add to the allowlist, never enough to read what a
+/// withheld field actually said.
+///
+/// Deliberately excludes the `mcp__` exception (`is_mcp_tool_identity`):
+/// that path *is* on the allowlist and its withholding is an already-
+/// reviewed, documented rule, not something nobody has considered. Naming
+/// it here would file a settled decision back under "novel" and dilute the
+/// list this exists to keep short and actionable. See the doc comment on
+/// `is_mcp_tool_identity` for the reviewed reasoning behind that exception.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NovelPath {
+    pub path: String,
+    pub distinct_values: usize,
+    /// The JSON type and, for strings, a length or length range —
+    /// `"string len 8-42"`, `"number"`, `"bool"` — computed from the
+    /// withheld values but never equal to any of them.
+    pub shape: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -83,6 +110,13 @@ struct Redactor {
     named: BTreeMap<&'static str, Vec<(Value, String)>>,
     generic: Vec<(Value, String)>,
     counts: BTreeMap<String, u64>,
+    /// Distinct raw values seen at each path the allowlist withheld,
+    /// keyed by dotted path (`BTreeMap` for path-sorted, deterministic
+    /// iteration). Never leaves this struct as raw values -- `novel_paths`
+    /// reduces each entry to a count and a shape before it becomes a
+    /// `NovelPath`. Excludes the `mcp__` exception deliberately; see
+    /// `NovelPath`'s doc comment.
+    novel: BTreeMap<String, Vec<Value>>,
 }
 
 #[derive(Clone)]
@@ -186,6 +220,10 @@ pub fn sanitize_dir(
         }
         seen
     });
+    // Computed before `redactor.counts` is moved into the manifest below --
+    // `novel_paths` only borrows, but the borrow checker won't let it borrow
+    // the whole `Redactor` after one of its fields has been partially moved.
+    let novel_paths = redactor.novel_paths();
     let manifest = json!({
         "schema_version": 1,
         "source": "capture.json",
@@ -221,6 +259,7 @@ pub fn sanitize_dir(
         manifest_path,
         events_bytes,
         manifest_bytes,
+        novel_paths,
     })
 }
 
@@ -613,15 +652,47 @@ impl Redactor {
                 location: location.to_owned(),
             });
         }
-        if allows(provider, path) && !is_mcp_tool_identity(value) {
+        let path_allowed = allows(provider, path);
+        if path_allowed && !is_mcp_tool_identity(value) {
             if let Value::String(text) = value {
                 self.sanitize_paths_and_validate(text, location)?;
             }
             return Ok(());
         }
+        if !path_allowed {
+            self.record_novel(path, value);
+        }
         let placeholder = self.placeholder_for(key, value);
         *value = Value::String(placeholder);
         Ok(())
+    }
+
+    /// Records one occurrence of a withheld value at `path`, for the novel-
+    /// path report. Only called for paths that are not on the allowlist at
+    /// all -- an `mcp__` value on an allowed path never reaches here (see
+    /// `sanitize_scalar`). Deduplicates by value equality, so a path seen in
+    /// many frames with the same literal value counts once, and the same
+    /// path with genuinely different values counts each of them -- that is
+    /// what `distinct_values` means.
+    fn record_novel(&mut self, path: &str, value: &Value) {
+        let seen = self.novel.entry(path.to_owned()).or_default();
+        if !seen.iter().any(|known| known == value) {
+            seen.push(value.clone());
+        }
+    }
+
+    /// Reduces the accumulated withheld values into the report shape: one
+    /// `NovelPath` per path, sorted by path (inherited from `BTreeMap`'s
+    /// iteration order), holding a count and a shape but never a value.
+    fn novel_paths(&self) -> Vec<NovelPath> {
+        self.novel
+            .iter()
+            .map(|(path, values)| NovelPath {
+                path: path.clone(),
+                distinct_values: values.len(),
+                shape: describe_shape(values),
+            })
+            .collect()
     }
 
     /// The placeholder for `value` under `key`'s named group —
@@ -944,6 +1015,101 @@ fn is_secret_field(field: &str, value: &Value) -> bool {
 /// gap.
 fn is_mcp_tool_identity(value: &Value) -> bool {
     value.as_str().is_some_and(|text| text.starts_with("mcp__"))
+}
+
+/// The type-and-length summary a `NovelPath` reports instead of a value:
+/// `"string len 8"` (or `"string len 8-42"` when lengths vary across the
+/// distinct values seen), `"number"`, `"bool"`. String length is counted in
+/// `char`s, not bytes, so it reflects what a reader would see rather than a
+/// UTF-8 encoding detail. `"mixed"` covers the case (not reachable through
+/// `sanitize_scalar` today, since only `String`/`Number` scalars are ever
+/// redacted) where a path's withheld values are not all the same JSON type.
+fn describe_shape(values: &[Value]) -> String {
+    let mut all_string = true;
+    let mut all_number = true;
+    let mut all_bool = true;
+    let mut min_len = usize::MAX;
+    let mut max_len = 0usize;
+    for value in values {
+        match value {
+            Value::String(text) => {
+                all_number = false;
+                all_bool = false;
+                let len = text.chars().count();
+                min_len = min_len.min(len);
+                max_len = max_len.max(len);
+            }
+            Value::Number(_) => {
+                all_string = false;
+                all_bool = false;
+            }
+            Value::Bool(_) => {
+                all_string = false;
+                all_number = false;
+            }
+            _ => {
+                all_string = false;
+                all_number = false;
+                all_bool = false;
+            }
+        }
+    }
+    if values.is_empty() {
+        "empty".to_owned()
+    } else if all_string {
+        if min_len == max_len {
+            format!("string len {min_len}")
+        } else {
+            format!("string len {min_len}-{max_len}")
+        }
+    } else if all_number {
+        "number".to_owned()
+    } else if all_bool {
+        "bool".to_owned()
+    } else {
+        "mixed".to_owned()
+    }
+}
+
+/// Renders the novel-path report for a terminal: a one-line header stating
+/// what the list is and that nothing on it is a value, then one aligned row
+/// per path, sorted (the order `SanitizationReport::novel_paths` already
+/// carries). An empty report still prints a sentence, not silence -- silence
+/// after a sanitize run reads as "nothing happened here," not as "everything
+/// was already on the allowlist."
+pub fn render_novel_paths_report(novel_paths: &[NovelPath]) -> String {
+    let header = "Novel paths withheld by the allowlist (no withheld values are shown below):";
+    if novel_paths.is_empty() {
+        return format!("{header}\n  (none -- every field on the wire was already allowlisted)");
+    }
+    let path_width = novel_paths
+        .iter()
+        .map(|entry| entry.path.chars().count())
+        .max()
+        .unwrap_or(0);
+    let count_width = novel_paths
+        .iter()
+        .map(|entry| count_label(entry.distinct_values).chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines = vec![header.to_owned()];
+    for entry in novel_paths {
+        let count_label = count_label(entry.distinct_values);
+        lines.push(format!(
+            "  {path:<path_width$}  {count_label:<count_width$}  {shape}",
+            path = entry.path,
+            shape = entry.shape,
+        ));
+    }
+    lines.join("\n")
+}
+
+fn count_label(distinct_values: usize) -> String {
+    if distinct_values == 1 {
+        "1 distinct value".to_owned()
+    } else {
+        format!("{distinct_values} distinct values")
+    }
 }
 
 fn is_token_counter_field(field: &str) -> bool {
@@ -1381,6 +1547,7 @@ mod tests {
             .sanitize_value_tree(&mut value, provider, "", "", "value")
             .expect("test value expected to sanitize cleanly");
         let events_bytes = serde_json::to_vec(&value).expect("sanitized value encodes");
+        let novel_paths = redactor.novel_paths();
         let manifest_bytes = serde_json::to_vec(&json!({
             "placeholders": redactor.placeholder_definitions(),
             "redaction_counts": redactor.counts,
@@ -1391,6 +1558,7 @@ mod tests {
             manifest_path: PathBuf::new(),
             events_bytes,
             manifest_bytes,
+            novel_paths,
         }
     }
 
@@ -1401,6 +1569,68 @@ mod tests {
         let report = sanitize_value_reporting(json!({"method": "turn/completed"}), Provider::Codex);
         assert!(!report.events_bytes.is_empty());
         assert!(!report.manifest_bytes.is_empty());
+    }
+
+    /// The report names every path the allowlist withheld, with how many
+    /// distinct values it had and their shape -- enough to decide whether a
+    /// field is safe to allow without reading its contents.
+    #[test]
+    fn the_report_names_every_withheld_path_and_never_a_value() {
+        let report = sanitize_value_reporting(
+            json!({"method": "turn/completed", "mystery": "abcdefgh", "count": 7}),
+            Provider::Codex,
+        );
+        let paths: Vec<&str> = report.novel_paths.iter().map(|n| n.path.as_str()).collect();
+        assert!(paths.contains(&".mystery"));
+        assert!(paths.contains(&".count"));
+        assert!(!paths.contains(&".method"), "an allowed path is not novel");
+        assert!(
+            !format!("{:?}", report.novel_paths).contains("abcdefgh"),
+            "the report must never carry a withheld value"
+        );
+    }
+
+    /// Design decision (Task 3): a value withheld only because of the `mcp__`
+    /// exception (`is_mcp_tool_identity`) does not appear in `novel_paths`.
+    /// The path itself is on the allowlist and the exception is already
+    /// reviewed and documented (see `NovelPath`'s doc comment) -- it is not
+    /// something nobody has considered, so filing it under "novel" would
+    /// dilute the list this report exists to keep short and actionable. The
+    /// same allowlisted path with a non-`mcp__` value is genuinely not novel
+    /// either, for the ordinary reason (it is simply allowed).
+    #[test]
+    fn an_mcp_tool_identity_exception_is_not_reported_as_novel() {
+        let report = sanitize_value_reporting(
+            json!({"request": {"tool_name": "mcp__claude_ai_Gmail__search_threads"}}),
+            Provider::Claude,
+        );
+        let paths: Vec<&str> = report.novel_paths.iter().map(|n| n.path.as_str()).collect();
+        assert!(
+            !paths.contains(&".request.tool_name"),
+            "an mcp__ exception on an allowed path is a reviewed rule, not a novel path"
+        );
+    }
+
+    /// The same path seen with the same value across many occurrences (many
+    /// frames, or an array of equal elements) counts as one distinct value,
+    /// not one per occurrence -- `distinct_values` means distinct, not a
+    /// running total. A genuinely different value at the same path adds to
+    /// the count.
+    #[test]
+    fn distinct_values_deduplicates_repeated_occurrences_at_the_same_path() {
+        let report = sanitize_value_reporting(
+            json!({"items": [{"mystery": "same"}, {"mystery": "same"}, {"mystery": "different"}]}),
+            Provider::Codex,
+        );
+        let entry = report
+            .novel_paths
+            .iter()
+            .find(|n| n.path == ".items[].mystery")
+            .expect("array elements share one allowlist path, and it is novel");
+        assert_eq!(
+            entry.distinct_values, 2,
+            "two distinct strings, three occurrences"
+        );
     }
 
     /// Equal values share a placeholder number, so a join that was true on the

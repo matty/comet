@@ -28,7 +28,9 @@ pub use approval::{
 pub use checklist::{claude_checklist_prompt, claude_checklist_resume_prompt};
 pub use corpus::{Frame, corpus_frame, frame};
 pub use recording::record;
-pub use sanitize::{SanitizationError, SanitizationReport, sanitize_dir};
+pub use sanitize::{
+    NovelPath, SanitizationError, SanitizationReport, render_novel_paths_report, sanitize_dir,
+};
 pub use surface::{
     Direction, FieldObservation, FrameRef, SurfaceError, observe_corpus, observed_field_lines,
 };

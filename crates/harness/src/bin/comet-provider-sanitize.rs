@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use comet_harness::capture::sanitize_dir;
+use comet_harness::capture::{render_novel_paths_report, sanitize_dir};
 
 const HELP: &str = r#"Sanitize one ignored raw provider capture into ignored staging.
 
@@ -29,12 +29,16 @@ fn main() {
     let raw_dir = PathBuf::from(raw_dir);
     let staging_dir = PathBuf::from(staging_dir);
     match sanitize_dir(&raw_dir, &staging_dir) {
-        Ok(report) => println!(
-            "Sanitized capture written to {} ({} event bytes, {} manifest bytes).",
-            staging_dir.display(),
-            report.events_bytes.len(),
-            report.manifest_bytes.len()
-        ),
+        Ok(report) => {
+            println!(
+                "Sanitized capture written to {} ({} event bytes, {} manifest bytes).",
+                staging_dir.display(),
+                report.events_bytes.len(),
+                report.manifest_bytes.len()
+            );
+            println!();
+            println!("{}", render_novel_paths_report(&report.novel_paths));
+        }
         Err(error) => {
             eprintln!("Sanitization failed. {error}");
             std::process::exit(2);
