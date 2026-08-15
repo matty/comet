@@ -84,8 +84,8 @@ pub const MAP_PATHS: &[&str] = &[".modelUsage"];
 /// not every field, only the ones whose few distinct values answer "what
 /// kinds of thing does this harness say" (design §3.5, SNAPSHOT). `.type`
 /// names a frame's own kind, `.subtype` narrows a `system` frame, `.event.type`
-/// narrows a streamed `stream_event`, and the remaining two name which tool
-/// ran.
+/// narrows a streamed `stream_event`, `.method` is Codex's frame kind, and the
+/// remaining two name which tool ran.
 ///
 /// Declared rather than inferred, for the reason [`MAP_PATHS`] is: "this
 /// field has few distinct values" is a property of a small corpus, not of
@@ -108,6 +108,17 @@ pub const MAP_PATHS: &[&str] = &[".modelUsage"];
 /// - `.event.content_block.name` — the same tool name, streamed: it appears
 ///   on the `content_block_start` event that precedes the buffered form
 ///   above, with the identical vocabulary.
+/// - `.method` — **not a Claude-shaped discriminator; added 2026-08-16.**
+///   Codex is JSON-RPC and carries no root `.type`/`.subtype`/`.event.type`
+///   at all, so without this path Codex's vocabulary was entirely empty
+///   despite the corpus exercising 22 distinct methods
+///   (`thread/start`, `turn/completed`, `item/agentMessage/delta`, …). This
+///   is not the archive's documented absence-blind-spot (design §5) — these
+///   captures exercised plenty; the declared set was simply Claude-shaped.
+///   Stage 3's allowlist ledger already names `.method` as "the vocabulary
+///   the stage-5 capability sheet reads" (`ledger-stage-3-allowlist.md:43`),
+///   which is why `.method` is on `allowlist/codex.txt` even though this
+///   const didn't read it until now.
 ///
 /// **No Codex tool-name path is declared.** Codex's turn items carry a kind
 /// at `.params.item.type` (`agentMessage`, `reasoning`, `userMessage`, …),
@@ -115,21 +126,25 @@ pub const MAP_PATHS: &[&str] = &[".modelUsage"];
 /// `command_execution`, no MCP tool item, anywhere in `codex/0.147.0/` — so
 /// there is no real dotted form to read off the evidence. Declaring one
 /// without a capture backing it is exactly the guess this list exists to
-/// refuse; this is the archive's blind spot (design §5) made visible here
-/// rather than papered over.
+/// refuse.
 pub const VOCABULARY_PATHS: &[&str] = &[
     ".type",
     ".subtype",
     ".event.type",
+    ".method",
     ".message.content[].name",
     ".event.content_block.name",
 ];
 
 /// Distinct scalar values seen at each [`VOCABULARY_PATHS`] entry, keyed by
-/// `(provider, version)` — the same granularity [`FieldObservation`] carries,
-/// so a sheet can show exactly one version's vocabulary without a sibling
-/// version's values leaking in.
-type Vocabulary = BTreeMap<(String, String), BTreeMap<String, BTreeSet<String>>>;
+/// `(provider, version, direction)` — matching the field inventory's key
+/// exactly, not folding direction away. For Codex `.method` the two
+/// directions are different vocabularies: what Comet can *drive* the CLI
+/// with (`thread/start`, `turn/steer`, …) versus what the CLI *emits*
+/// (`turn/completed`, `item/agentMessage/delta`, …). Merging them would
+/// misreport both — the same reasoning [`Direction`]'s own doc comment makes
+/// for fields applies with more force to a discriminator.
+type Vocabulary = BTreeMap<(String, String, Direction), BTreeMap<String, BTreeSet<String>>>;
 
 pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, SurfaceError> {
     Ok(walk_corpus(corpus_root)?.0)
@@ -334,6 +349,7 @@ impl Visit<'_> {
             .entry((
                 self.scenario.provider.clone(),
                 self.scenario.version.clone(),
+                self.direction,
             ))
             .or_default()
             .entry(path.to_owned())

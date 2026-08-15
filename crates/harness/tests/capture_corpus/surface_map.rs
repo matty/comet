@@ -363,8 +363,14 @@ fn vocabulary_collects_declared_paths_only() {
 
     let vocabulary = observe_vocabulary(root.path()).unwrap();
     let claude = vocabulary
-        .get(&("claude".to_string(), "2.1.229".to_string()))
-        .unwrap_or_else(|| panic!("no vocabulary for claude/2.1.229: {vocabulary:?}"));
+        .get(&(
+            "claude".to_string(),
+            "2.1.229".to_string(),
+            Direction::FromProvider,
+        ))
+        .unwrap_or_else(|| {
+            panic!("no vocabulary for claude/2.1.229/from-provider: {vocabulary:?}")
+        });
 
     assert_eq!(
         claude.get(".type").cloned().unwrap_or_default(),
@@ -399,12 +405,122 @@ fn vocabulary_ignores_a_non_scalar_at_a_declared_path() {
 
     let vocabulary = observe_vocabulary(root.path()).unwrap();
     let has_type_value = vocabulary
-        .get(&("claude".to_string(), "2.1.229".to_string()))
+        .get(&(
+            "claude".to_string(),
+            "2.1.229".to_string(),
+            Direction::FromProvider,
+        ))
         .and_then(|paths| paths.get(".type"))
         .is_some_and(|values| !values.is_empty());
 
     assert!(
         !has_type_value,
         "a non-scalar at a declared path must not become a vocabulary value: {vocabulary:?}"
+    );
+}
+
+/// Break caught (2026-08-16 correction): `.method` is Codex's frame-kind
+/// discriminator — Codex is JSON-RPC and carries no root `.type`, so without
+/// `.method` on `VOCABULARY_PATHS` a Codex sheet would report an empty
+/// vocabulary for a provider that actually emits two dozen distinct methods.
+/// `stdin` methods (what Comet can drive Codex with) and non-`stdin` methods
+/// (what Codex emits) must both be collected, and land under their own
+/// direction rather than one merged set.
+#[test]
+fn vocabulary_collects_method_for_codex() {
+    let root = tempfile::tempdir().unwrap();
+    write_scenario(
+        root.path(),
+        "codex",
+        "0.147.0",
+        "fresh-text",
+        &[
+            (1, "stdin", json!({"method": "initialize"})),
+            (2, "stdin", json!({"method": "turn/start"})),
+            (3, "stdout", json!({"method": "turn/started"})),
+            (4, "stdout", json!({"method": "turn/completed"})),
+        ],
+    );
+
+    let vocabulary = observe_vocabulary(root.path()).unwrap();
+    let to_provider = vocabulary
+        .get(&(
+            "codex".to_string(),
+            "0.147.0".to_string(),
+            Direction::ToProvider,
+        ))
+        .and_then(|paths| paths.get(".method"))
+        .cloned()
+        .unwrap_or_else(|| panic!("no .method vocabulary for codex to-provider: {vocabulary:?}"));
+    let from_provider = vocabulary
+        .get(&(
+            "codex".to_string(),
+            "0.147.0".to_string(),
+            Direction::FromProvider,
+        ))
+        .and_then(|paths| paths.get(".method"))
+        .cloned()
+        .unwrap_or_else(|| panic!("no .method vocabulary for codex from-provider: {vocabulary:?}"));
+
+    assert_eq!(
+        to_provider,
+        BTreeSet::from(["initialize".to_string(), "turn/start".to_string()]),
+        "stdin methods must be collected under to-provider: {to_provider:?}"
+    );
+    assert_eq!(
+        from_provider,
+        BTreeSet::from(["turn/started".to_string(), "turn/completed".to_string()]),
+        "non-stdin methods must be collected under from-provider: {from_provider:?}"
+    );
+}
+
+/// Break caught (2026-08-16 correction): a declared path seen on both
+/// directions must yield two separate vocabularies, not one merged set — for
+/// Codex `.method`, `turn/start` (sent) and `turn/started` (received) are
+/// genuinely different capabilities, and folding directions together would
+/// make a driveable method indistinguishable from an emitted one.
+#[test]
+fn vocabulary_keeps_directions_of_the_same_path_apart() {
+    let root = tempfile::tempdir().unwrap();
+    write_scenario(
+        root.path(),
+        "claude",
+        "2.1.229",
+        "checklist",
+        &[
+            (1, "stdin", json!({"type": "user"})),
+            (2, "stdout", json!({"type": "assistant"})),
+        ],
+    );
+
+    let vocabulary = observe_vocabulary(root.path()).unwrap();
+    let to_provider = vocabulary
+        .get(&(
+            "claude".to_string(),
+            "2.1.229".to_string(),
+            Direction::ToProvider,
+        ))
+        .and_then(|paths| paths.get(".type"))
+        .cloned()
+        .unwrap_or_default();
+    let from_provider = vocabulary
+        .get(&(
+            "claude".to_string(),
+            "2.1.229".to_string(),
+            Direction::FromProvider,
+        ))
+        .and_then(|paths| paths.get(".type"))
+        .cloned()
+        .unwrap_or_default();
+
+    assert_eq!(
+        to_provider,
+        BTreeSet::from(["user".to_string()]),
+        "the to-provider .type value must not include the from-provider one: {to_provider:?}"
+    );
+    assert_eq!(
+        from_provider,
+        BTreeSet::from(["assistant".to_string()]),
+        "the from-provider .type value must not include the to-provider one: {from_provider:?}"
     );
 }
