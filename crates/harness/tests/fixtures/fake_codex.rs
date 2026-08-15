@@ -336,7 +336,15 @@ fn main() {
         happy(&turn_line, &thread_line, &tid);
     } else if turn_line.contains("scenario:steer-race") {
         steer_race(&mut stdin, &tid);
-    } else if turn_line.contains("scenario:steer") {
+    } else if turn_line.contains("scenario:steer")
+        // The real capture-recorder prompt (`record/scenarios/codex.rs`'s
+        // `steer_request`), additive alongside the `scenario:steer` test
+        // marker above so the ported `steer` scenario's own tests can drive
+        // this branch through their real production request builder instead
+        // of a hand-rolled one — same rationale as `fake_claude.rs` matching
+        // a substring of Claude's real checklist prompt.
+        || turn_line.contains("Begin a short response, then accept the follow-up instruction.")
+    {
         steer(&mut stdin, &tid);
     } else if turn_line.contains("scenario:auto-reviewer") {
         auto_reviewer(&thread_line, &tid);
@@ -346,7 +354,12 @@ fn main() {
         approve(&mut stdin, &turn_line, &thread_line, &tid);
     } else if turn_line.contains("scenario:decline") {
         decline(&mut stdin, &tid);
-    } else if turn_line.contains("scenario:interrupt") {
+    } else if turn_line.contains("scenario:interrupt")
+        // Additive alongside the `scenario:interrupt` test marker, same
+        // rationale as the `steer` branch above — the real production prompt
+        // from `record/scenarios/codex.rs`'s `interruption_request`.
+        || turn_line.contains("Count upward slowly and keep working until interrupted.")
+    {
         interrupt(&mut stdin, &tid);
     } else if turn_line.contains("scenario:wedge") {
         wedge(&tid);

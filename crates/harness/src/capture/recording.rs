@@ -371,6 +371,22 @@ impl RecordingSession {
         protocol_stopped("Claude", "terminal result")
     }
 
+    /// Approval and on-request approval only, from this task onward:
+    /// `fresh-text`/`resume`/`steer`/`interruption` moved to
+    /// `record/scenarios/codex.rs`'s `fresh_text`/`resume`/`steer`/
+    /// `interruption` (not yet reachable from production code — the
+    /// SCENARIOS table only gains their rows in Task 7). Everything that
+    /// existed here only to serve those four — the `thread/resume` vs
+    /// `thread/start` selection, the resume-identity bail, the scripted
+    /// steer/interrupt send and its reply bookkeeping, and the terminal-frame
+    /// bail for anything but `Approval`/`ApprovalOnRequest` — is deleted
+    /// along with them, not merely superseded: the resume-rejection bail and
+    /// the generic "must end in turn/completed" bail were themselves exactly
+    /// the "frame check that aborts" class this stage's design removes
+    /// (§3.2), and the ported `resume`/`steer`/`interruption` reproduce the
+    /// parts of that which are driving rather than validating (see their own
+    /// doc comments). `Approval`/`ApprovalOnRequest` keep every one of their
+    /// validators untouched — Task 6's scope, not this one's.
     async fn codex_run(
         &mut self,
         request: RunRequest,
@@ -382,26 +398,14 @@ impl RecordingSession {
         next_id += 1;
         self.write_line(CODEX_INITIALIZED_LINE).await?;
 
-        let (method, thread_params) = if matches!(script, CodexRunScript::Resume) {
-            (
-                "thread/resume",
-                crate::codex::thread_resume_params(
-                    &request,
-                    request.resume.as_deref().unwrap_or_default(),
-                ),
-            )
-        } else {
-            ("thread/start", crate::codex::thread_start_params(&request))
-        };
-        self.write_line(&rpc_request(next_id, method, thread_params))
-            .await?;
+        self.write_line(&rpc_request(
+            next_id,
+            "thread/start",
+            crate::codex::thread_start_params(&request),
+        ))
+        .await?;
         let thread_reply = self.codex_reply(next_id).await?;
         next_id += 1;
-        if thread_reply.get("error").is_some() && method == "thread/resume" {
-            bail!(
-                "Codex rejected the requested thread resume; no fresh-thread fallback was recorded."
-            );
-        }
         let thread_id = thread_reply["result"]["thread"]["id"]
             .as_str()
             .unwrap_or_default()
@@ -409,23 +413,13 @@ impl RecordingSession {
         if thread_id.is_empty() {
             return protocol_stopped("Codex", "thread identifier");
         }
-        if matches!(script, CodexRunScript::Resume)
-            && request.resume.as_deref() != Some(thread_id.as_str())
-        {
-            bail!("Codex resume capture returned a different thread identifier.");
-        }
         self.write_line(&rpc_request(
             next_id,
             "turn/start",
             crate::codex::turn_start_params(&request, &thread_id, &request.prompt),
         ))
         .await?;
-        next_id += 1;
 
-        let mut active_turn = None;
-        let mut scripted_action_sent = false;
-        let mut scripted_reply_ok = false;
-        let mut scripted_request_id = None;
         let mut approval = CodexApprovalState::default();
         let mut on_request = CodexOnRequestState::default();
         let expected_on_request_command = if matches!(script, CodexRunScript::ApprovalOnRequest) {
@@ -442,16 +436,8 @@ impl RecordingSession {
                 continue;
             };
             let method = value["method"].as_str().unwrap_or_default();
-            if method == "turn/started" {
-                if matches!(script, CodexRunScript::Approval) {
-                    active_turn = Some(observe_codex_approval_turn_started(
-                        &value,
-                        &thread_id,
-                        &mut approval,
-                    )?);
-                } else {
-                    active_turn = value["params"]["turn"]["id"].as_str().map(str::to_owned);
-                }
+            if matches!(script, CodexRunScript::Approval) && method == "turn/started" {
+                observe_codex_approval_turn_started(&value, &thread_id, &mut approval)?;
             }
             if matches!(script, CodexRunScript::Approval)
                 && matches!(method, "item/started" | "item/completed")
@@ -481,46 +467,6 @@ impl RecordingSession {
                     }
                     _ => bail!("Codex approval capture observed an unreviewed item type."),
                 }
-            }
-            if !scripted_action_sent {
-                match script {
-                    CodexRunScript::Steer if active_turn.is_some() => {
-                        scripted_request_id = Some(next_id);
-                        self.write_line(&rpc_request(
-                            next_id,
-                            "turn/steer",
-                            crate::codex::turn_steer_params(
-                                &thread_id,
-                                active_turn.as_deref().unwrap_or_default(),
-                                "Capture steering message.",
-                            ),
-                        ))
-                        .await?;
-                        next_id += 1;
-                        scripted_action_sent = true;
-                    }
-                    CodexRunScript::Interruption if active_turn.is_some() => {
-                        scripted_request_id = Some(next_id);
-                        self.write_line(&rpc_request(
-                            next_id,
-                            "turn/interrupt",
-                            crate::codex::turn_interrupt_params(
-                                &thread_id,
-                                active_turn.as_deref().unwrap_or_default(),
-                            ),
-                        ))
-                        .await?;
-                        next_id += 1;
-                        scripted_action_sent = true;
-                    }
-                    _ => {}
-                }
-            }
-            if value["id"].as_u64() == scripted_request_id {
-                if value.get("error").is_some() {
-                    bail!("Codex rejected the scripted steer or interruption request.");
-                }
-                scripted_reply_ok = true;
             }
             if matches!(
                 script,
@@ -621,31 +567,13 @@ impl RecordingSession {
                             );
                         }
                     }
-                    CodexRunScript::Steer => {
-                        if method != "turn/completed"
-                            || !scripted_action_sent
-                            || !scripted_reply_ok
-                            || value["params"]["turn"]["id"].as_str() != active_turn.as_deref()
-                        {
-                            bail!(
-                                "Codex steer capture did not receive a successful steer reply before completion."
-                            );
-                        }
-                    }
-                    CodexRunScript::Interruption => {
-                        if method != "turn/aborted"
-                            || !scripted_action_sent
-                            || !scripted_reply_ok
-                            || value["params"]["turn"]["id"].as_str() != active_turn.as_deref()
-                        {
-                            bail!(
-                                "Codex interruption capture did not receive a successful interrupt reply and aborted terminal event."
-                            );
-                        }
-                    }
-                    _ if method != "turn/completed" => {
-                        bail!("Codex capture ended without a successful terminal turn.");
-                    }
+                    // `FreshText`/`Resume`/`Steer`/`Interruption`: no bail here any
+                    // more — whichever terminal frame the provider actually sent is
+                    // the capture, per this stage's design (§3.2). The old bail
+                    // ("must be exactly turn/completed", or turn/aborted with a
+                    // matching id for Steer/Interruption) was itself a frame check
+                    // that aborted a real, paid-for result instead of recording it;
+                    // their own driving now lives in `record/scenarios/codex.rs`.
                     _ => {}
                 }
                 return Ok(());
@@ -985,88 +913,18 @@ pub(super) async fn failed_session_stdin(config: CaptureConfig) -> (String, Vec<
 
 #[cfg(test)]
 mod tests {
-    use comet_proto::{ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel};
-    use serde_json::{Value, json};
+    use comet_proto::{RunRequest, RuntimeMode};
+    use serde_json::Value;
 
-    use super::{RecordingSession, record};
-    use crate::capture::test_support::{
-        absolute_program, channel_payloads, config, contract_request, fixture_path,
-    };
-    use crate::capture::{
-        CaptureOperation, Channel, ClaudeCaptureOperation, ClaudeRunScript, CodexCaptureOperation,
-        CodexRunScript, CommandSnapshot, sanitize_dir,
-    };
-    use crate::launch::StdioMode;
+    use super::RecordingSession;
+    #[cfg(windows)]
+    use super::record;
+    use crate::capture::test_support::{config, fixture_path};
+    use crate::capture::{CaptureOperation, ClaudeCaptureOperation, ClaudeRunScript, sanitize_dir};
+    #[cfg(windows)]
+    use crate::capture::{CodexCaptureOperation, CodexRunScript};
 
     const APPROVAL_MARKER_NAME: &str = "capture-marker.txt";
-
-    #[test]
-    fn codex_capture_uses_the_run_command_builder() {
-        let request = contract_request();
-        let exe = absolute_program("codex");
-        let launch = crate::codex::run_launch(&exe, &request);
-        let snapshot = CommandSnapshot::from_launch(&launch);
-
-        assert_eq!(snapshot.program, exe.display().to_string());
-        assert_eq!(snapshot.args, ["app-server"]);
-        assert_eq!(snapshot.cwd.as_deref(), Some(request.cwd.as_str()));
-        assert!(snapshot.configured_env.is_empty(), "PATH is never captured");
-        assert_eq!(snapshot.stdin, StdioMode::Piped);
-        assert_eq!(snapshot.stdout, StdioMode::Piped);
-        assert_eq!(snapshot.stderr, StdioMode::Piped);
-        assert!(snapshot.kill_on_drop);
-        #[cfg(windows)]
-        assert_eq!(snapshot.creation_flags, 0);
-    }
-
-    #[test]
-    fn capture_steer_and_interrupt_params_match_production_helpers() {
-        assert_eq!(
-            crate::codex::turn_steer_params("thread", "turn", "Capture steering message."),
-            json!({"threadId":"thread","expectedTurnId":"turn","input":[{"type":"text","text":"Capture steering message."}]})
-        );
-        assert_eq!(
-            crate::codex::turn_interrupt_params("thread", "turn"),
-            json!({"threadId":"thread","turnId":"turn"})
-        );
-    }
-
-    /// Break caught: the Codex run driver skips a handshake stage, loses the concrete run script,
-    /// or waits forever after the provider's terminal turn notification.
-    #[tokio::test]
-    async fn recorder_codex_run_records_the_explicit_script() {
-        let raw = tempfile::tempdir().unwrap();
-        let request = RunRequest {
-            prompt: "scenario:capture-fresh".into(),
-            model: Some("gpt-5.6-luna".into()),
-            cwd: std::env::temp_dir().display().to_string(),
-            sandbox: SandboxLevel::WorkspaceWrite,
-            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
-        };
-        let capture = record(config(
-            "codex-fresh-text",
-            fixture_path("fake-codex"),
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request,
-                script: CodexRunScript::FreshText,
-            }),
-            raw.path(),
-        ))
-        .await
-        .unwrap();
-
-        let stdin = channel_payloads(&capture, Channel::Stdin);
-        let methods: Vec<_> = stdin
-            .iter()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter_map(|line| line["method"].as_str().map(str::to_owned))
-            .collect();
-        assert_eq!(
-            methods,
-            ["initialize", "initialized", "thread/start", "turn/start"]
-        );
-        assert_eq!(capture.exit_code, Some(0));
-    }
 
     /// Break caught: a driving failure is discarded after a paid provider run, leaving no
     /// reviewable transcript even though the child was safely stopped before reply.
@@ -1216,156 +1074,6 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("turn lifecycle"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn codex_resume_never_falls_back_to_a_fresh_thread() {
-        let raw = tempfile::tempdir().unwrap();
-        let request = RunRequest {
-            prompt: "scenario:resumed".into(),
-            resume: Some("resume-fail".into()),
-            cwd: std::env::temp_dir().display().to_string(),
-            ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
-        };
-        let error = record(config(
-            "codex-resume",
-            fixture_path("fake-codex"),
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request,
-                script: CodexRunScript::Resume,
-            }),
-            raw.path(),
-        ))
-        .await
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("rejected the requested thread resume")
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_steer_and_interrupt_require_successful_protocol_neighborhoods() {
-        for (name, prompt, script) in [
-            ("codex-steer", "scenario:steer", CodexRunScript::Steer),
-            (
-                "codex-interruption",
-                "scenario:interrupt",
-                CodexRunScript::Interruption,
-            ),
-        ] {
-            let raw = tempfile::tempdir().unwrap();
-            let request = RunRequest {
-                prompt: prompt.into(),
-                cwd: std::env::temp_dir().display().to_string(),
-                ..RunRequest::for_session(RuntimeMode::AutoAcceptEdits)
-            };
-            record(config(
-                name,
-                fixture_path("fake-codex"),
-                CaptureOperation::Codex(CodexCaptureOperation::Run { request, script }),
-                raw.path(),
-            ))
-            .await
-            .unwrap();
-        }
-    }
-
-    /// Break caught: capture skips the production request normalization that works around
-    /// Codex's malformed workspace-write mount for linked slash-branch worktrees.
-    #[tokio::test]
-    async fn recorder_codex_run_preserves_production_linked_worktree_parameters() {
-        let raw = tempfile::tempdir().unwrap();
-        let worktree = tempfile::tempdir().unwrap();
-        let admin = tempfile::tempdir().unwrap();
-        std::fs::write(
-            worktree.path().join(".git"),
-            format!("gitdir: {}", admin.path().display()),
-        )
-        .unwrap();
-        std::fs::write(
-            admin.path().join("HEAD"),
-            "ref: refs/heads/feature/capture\n",
-        )
-        .unwrap();
-        let mut request = RunRequest {
-            prompt: "scenario:capture-fresh".into(),
-            model: Some("gpt-5.6-luna".into()),
-            reasoning: Some(ReasoningLevel::Low),
-            cwd: worktree.path().display().to_string(),
-            sandbox: SandboxLevel::WorkspaceWrite,
-            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
-        };
-        request
-            .model_options
-            .insert("serviceTier".into(), json!("fast"));
-        let provider_request = crate::codex::normalize_run_request(request.clone());
-
-        let capture = record(config(
-            "codex-linked-worktree",
-            fixture_path("fake-codex"),
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request,
-                script: CodexRunScript::FreshText,
-            }),
-            raw.path(),
-        ))
-        .await
-        .unwrap();
-
-        let stdin: Vec<serde_json::Value> = channel_payloads(&capture, Channel::Stdin)
-            .into_iter()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        let thread = stdin
-            .iter()
-            .find(|line| line["method"] == "thread/start")
-            .unwrap();
-        let expected_thread = json!({
-            "cwd": worktree.path().display().to_string(),
-            "approvalPolicy": "untrusted",
-            "sandbox": "danger-full-access",
-            "approvalsReviewer": "user",
-            "model": "gpt-5.6-luna",
-            "serviceTier": "fast",
-        });
-        assert_eq!(thread["params"], expected_thread);
-        assert_eq!(
-            crate::codex::thread_start_params(&provider_request),
-            expected_thread
-        );
-        assert_eq!(
-            crate::codex::thread_resume_params(&provider_request, "resume-thread"),
-            json!({
-                "cwd": worktree.path().display().to_string(),
-                "approvalPolicy": "untrusted",
-                "sandbox": "danger-full-access",
-                "approvalsReviewer": "user",
-                "model": "gpt-5.6-luna",
-                "serviceTier": "fast",
-                "threadId": "resume-thread",
-            })
-        );
-        let turn = stdin
-            .iter()
-            .find(|line| line["method"] == "turn/start")
-            .unwrap();
-        let expected_turn = json!({
-            "threadId": "th-1",
-            "input": [{"type": "text", "text": "scenario:capture-fresh"}],
-            "approvalPolicy": "untrusted",
-            "sandboxPolicy": {"type": "dangerFullAccess"},
-            "summary": "auto",
-            "model": "gpt-5.6-luna",
-            "effort": "low",
-            "serviceTier": "fast",
-        });
-        assert_eq!(turn["params"], expected_turn);
-        assert_eq!(
-            crate::codex::turn_start_params(&provider_request, "th-1", "scenario:capture-fresh"),
-            expected_turn
-        );
     }
 
     #[cfg(unix)]
