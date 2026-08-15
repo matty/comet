@@ -143,6 +143,12 @@ one thing production shares with it is `crates/harness/src/launch.rs` — the pr
 description both use. Keep it that way: a production type that drifts into `capture/` makes
 the boundary unreadable, which is how a design doc came to record the opposite of the truth.
 
+Inside `capture/`, the recorder itself is provider-neutral: `capture::record::provider::CaptureProvider`
+is a four-member seam (spawn, framing, handshake, turn-complete), and every scenario — discovery
+and run alike, for both providers — is a plain function registered as one row in
+`capture::record::scenarios::SCENARIOS`, the single table `record()` dispatches from and
+`comet-provider-capture --help` renders.
+
 ## The gpui fork rev is load-bearing
 
 `gpui` comes from `wingleeio/zed` at a pinned rev, not from crates.io. Comet depends on

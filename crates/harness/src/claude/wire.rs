@@ -406,10 +406,11 @@ pub(crate) struct ControlRequestBody {
     pub tool_name: String,
     #[serde(default)]
     pub input: Value,
-    /// Which `tool_use` block this approval request answers. The sole
-    /// *production* consumer was the deleted `capture::approval::claude`
-    /// validators, correlating it against a tracked `tool_use` id before
-    /// replying; the surviving driving half
+    /// Which `tool_use` block this approval request answers. The sole prior
+    /// consumer was the deleted `capture::approval::claude` validators — test
+    /// tooling under `crates/harness/src/capture/`, never on the runtime
+    /// path (see `AGENTS.md`'s "What the providers send") — correlating it
+    /// against a tracked `tool_use` id before replying; the surviving driving half
     /// (`record::scenarios::claude::pending_approval`) replies by
     /// `request_id` alone, echoing the request's own `input` back
     /// unmodified, so it does not need this field.

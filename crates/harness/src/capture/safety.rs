@@ -1,3 +1,15 @@
+//! The pre-spawn fence: design §3.2's other half.
+//!
+//! Fence the environment before spawn; then whatever happens inside the fence is safe to record.
+//! Every check in this file runs before a provider process exists, and nothing in it may read a
+//! frame — a check that inspects a frame and aborts destroys evidence already paid for (that class
+//! is deleted, not moved, per decision "delete every frame check that aborts"); a check here
+//! instead refuses to spawn at all when the environment it is about to hand a provider is not the
+//! one it was told to expect.
+//!
+//! Moved here, unchanged in behavior, from `capture/approval/{mod.rs,common.rs}` — decision 6 in
+//! the stage plan: "the pre-spawn fence stays, in a file named for what it is."
+
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
@@ -7,26 +19,29 @@ use anyhow::{anyhow, bail};
 
 use crate::capture::filesystem::has_windows_reparse_point;
 
-pub(super) const CODEX_APPROVAL_COMMAND: &str = "echo capture";
-// `pub(in crate::capture)`, not `pub(super)`: Task 4 moved `claude_approval_prompt` (the sole
-// other consumer of these two constants) out to
-// `capture::record::scenarios::claude`, which needs to read them from there. `codex_approval_prompt`
-// below is still local to this module, so only the visibility widens, not the constants' home.
+// `pub(in crate::capture)`, not `pub(super)`: both provider prompt builders that read these
+// constants — Claude's `claude_approval_prompt` (Task 4) and Codex's `codex_approval_prompt`
+// (Task 8, completing for Codex the same move Task 4 made for Claude) — live in
+// `capture::record::scenarios::{claude, codex}`, which need to read them from there. Only the
+// constants' visibility widens, not their home: `validate_ordinary_approval_cwd` below also reads
+// `APPROVAL_MARKER_NAME` for its own marker-absence check, so moving either constant into one
+// provider's scenario module would make the fence and the other provider's prompt reach across a
+// scenario boundary instead.
 // (Task 6 deleted this module's other former reader, `validate_ordinary_approval_marker` — a
 // post-completion evidence check, not a pre-spawn one, so it did not qualify for the fence this
 // module keeps under decision #6.)
 pub(in crate::capture) const APPROVAL_MARKER_NAME: &str = "capture-marker.txt";
 pub(in crate::capture) const APPROVAL_MARKER_CONTENT: &str = "capture\n";
 
-pub fn codex_approval_prompt(cwd: &Path) -> String {
-    let marker = cwd.join(APPROVAL_MARKER_NAME);
-    format!(
-        "Run the exact command {} three separate times, then add exactly one file at {} containing exactly capture followed by one newline.",
-        serde_json::to_string(CODEX_APPROVAL_COMMAND).expect("static command serializes"),
-        serde_json::to_string(&marker.display().to_string()).expect("path serializes"),
-    )
-}
-
+/// The literal command a marker-write approval asks the model to run, platform-specific. Stays
+/// here rather than moving into either provider's scenario module (unlike `codex_approval_prompt`/
+/// `approval_on_request_prompt`, which did) for two reasons: `approval_on_request_prompt`
+/// (`record/scenarios/codex.rs`) embeds this command's own output verbatim into its prompt text,
+/// so the two are more one shared primitive than one owning the other; and
+/// `crates/harness/tests/fixtures/fake_codex.rs` imports this function directly
+/// (`comet_harness::capture::approval_marker_command`) to reconstruct the exact command a real
+/// model's exec call would produce, which requires it to stay reachable from a test binary outside
+/// `capture::record` — the one genuinely external consumer this module's public surface still has.
 pub fn approval_marker_command(target: &Path) -> String {
     #[cfg(windows)]
     {
@@ -48,13 +63,6 @@ pub fn approval_marker_command(target: &Path) -> String {
             .replace('\'', "'\\''");
         format!("printf %s capture > '{path}'")
     }
-}
-
-pub fn approval_on_request_prompt(target: &Path) -> String {
-    format!(
-        "Run this exact command once and report success: {}",
-        approval_marker_command(target)
-    )
 }
 
 pub(in crate::capture) fn repository_root(start: &Path) -> Option<&Path> {

@@ -102,7 +102,7 @@ async fn record_codex(
 /// `approval`/`approval-on-request`) gets [`FenceOutcome::none`].
 ///
 /// This is the pre-spawn fence decision #6 in the stage plan requires stay —
-/// `crate::capture::approval`'s checks ran inside `recording.rs`'s
+/// `crate::capture::safety`'s checks ran inside `recording.rs`'s
 /// `RecordingSession::start` before this task deleted that file; this is
 /// their new home, run before `Session::start` is even called.
 fn codex_fence(
@@ -124,12 +124,12 @@ fn codex_fence(
         // window between this call (which can involve real filesystem I/O)
         // and the eventual spawn (after directory creation and a
         // `--version` probe) is exactly the race
-        // `crate::capture::approval::validate_on_request_preflight`'s
+        // `crate::capture::safety::validate_on_request_preflight`'s
         // doc comment and `docs/testing/provider-captures.md` describe.
         let cwd = launch_cwd()?;
         let target = config.approval_target.clone();
         let identity =
-            crate::capture::approval::validate_on_request_preflight(&cwd, target.as_deref())?;
+            crate::capture::safety::validate_on_request_preflight(&cwd, target.as_deref())?;
         let recheck_cwd = cwd.clone();
         let recheck_target = target.clone();
         let recheck_identity = identity.clone();
@@ -139,7 +139,7 @@ fn codex_fence(
             approval_cwd_identity: None,
             trusted_powershell: None,
             recheck: Some(Box::new(move || {
-                let spawn_identity = crate::capture::approval::validate_on_request_preflight(
+                let spawn_identity = crate::capture::safety::validate_on_request_preflight(
                     &recheck_cwd,
                     recheck_target.as_deref(),
                 )?;
@@ -159,8 +159,8 @@ fn codex_fence(
         // doc comment) and a cwd whose identity `record::scenarios::codex::approval`
         // rechecks at every grant, via `approval_cwd_identity` below.
         let cwd = launch_cwd()?;
-        let trusted = crate::capture::approval::resolve_trusted_powershell(&cwd, &config.raw_root)?;
-        let identity = crate::capture::approval::validate_ordinary_approval_cwd(&cwd, None, true)?;
+        let trusted = crate::capture::safety::resolve_trusted_powershell(&cwd, &config.raw_root)?;
+        let identity = crate::capture::safety::validate_ordinary_approval_cwd(&cwd, None, true)?;
         return Ok(FenceOutcome {
             approval_target: None,
             approval_target_identity: None,

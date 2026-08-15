@@ -64,3 +64,47 @@ capture never saw fire (zero `control_request`s even with
 and it was out of 0b.2's scope. The count sits on the return path and never
 delays an answer, so adding the reply later is additive.
 
+## D60 — the scenario name lived in three unsynchronized places
+
+**The bug.** `comet-provider-capture`'s `--help` text, its `supported_pair()`
+argument check, and its scenario dispatch `match` each spelled out the same set
+of `(provider, name)` pairs by hand, with nothing tying the three together.
+Adding `checklist` to two of the three (the help text and the dispatch) but not
+the third produced a binary whose `--help` advertised the scenario and whose
+argument validation refused it — *"Scenario \"checklist\" is not supported for
+claude. Run with --help to see the valid pairs."* — pointing the operator back
+at the text that had just told them otherwise.
+
+**The fix.** The provider-capture-simplification design (stage 4,
+"neutral-recorder") replaced all three copies with one:
+`crates/harness/src/capture/record/scenarios.rs`'s `SCENARIOS: &[ScenarioSpec]`
+declares each scenario's name, purpose, provider, runtime mode and argument
+requirements exactly once. `comet-provider-capture.rs` generates its `--help`
+text and validates arguments by looking a `(provider, name)` pair up in the
+table (`scenario()`), and `record()` dispatches off the same table by the same
+lookup. There is no second copy left to drift, and `scenarios.rs`'s own test
+`every_scenario_name_the_binary_advertises_is_in_the_table` pins the row count
+so an added or removed scenario cannot pass silently.
+
+## D61 — the checklist evidence guard encoded a prompt's content, from a different file
+
+**The bug.** `recording.rs`'s Claude run loop required 4 confirmed task
+mutations (2 creates, 2 updates) to accept a `checklist` capture and 2 to accept
+a `checklist-resume` capture. Those counts were correct only because
+`capture/checklist.rs`'s prompt happened to ask the model for exactly that many
+— two facts in two files, agreeing today, with nothing enforcing that they keep
+agreeing. Worse, per the design's own safety principle: a model that ignored
+the instructions and did nothing produced *a recording of a model ignoring
+instructions*, which is real evidence of real CLI behavior, and the guard threw
+that recording away rather than keep it — reacting to a frame's content and
+aborting, not driving.
+
+**The fix.** The neutral-recorder stage deletes the guard along with the rest
+of `recording.rs`, per design §3.2 ("delete every frame check that aborts").
+The ported `checklist`/`checklist-resume` scenario bodies
+(`capture/record/scenarios/claude.rs`) record whatever the model actually does,
+with no mutation count enforced. `fake_claude.rs`'s `checklist_no_tasks`
+fixture is the case the guard used to bail on — a model that replies with plain
+text and calls neither `TaskCreate` nor `TaskUpdate` — and the neutral recorder
+now returns a successful capture holding every frame, evidence intact.
+

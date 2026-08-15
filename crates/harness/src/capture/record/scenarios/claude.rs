@@ -3,11 +3,11 @@ use std::path::Path;
 use comet_proto::{ReasoningLevel, RunRequest, RuntimeMode};
 use serde_json::Value;
 
-use crate::capture::approval::{APPROVAL_MARKER_CONTENT, APPROVAL_MARKER_NAME};
 use crate::capture::record::provider::CaptureProvider;
 use crate::capture::record::providers::claude::ClaudeProvider;
 use crate::capture::record::scenarios::ScenarioInput;
 use crate::capture::record::session::{Session, protocol_stopped};
+use crate::capture::safety::{APPROVAL_MARKER_CONTENT, APPROVAL_MARKER_NAME};
 use crate::launch::LaunchDescriptor;
 
 /// SPAWN for `model-discovery` and its `-neutral-cwd`/`-project-cwd`
@@ -374,9 +374,11 @@ const CLAUDE_APPROVAL_COMMAND: &str = "printf capture";
 /// scenario owns its prompt" moves prompt text out of the binary and into
 /// the scenario body that sends it, same as `claude_checklist_prompt` above.
 /// `APPROVAL_MARKER_NAME`/`APPROVAL_MARKER_CONTENT` stay defined in
-/// `capture::approval::common` rather than moving here too, because Codex's
-/// `codex_approval_prompt` (`record/scenarios/codex.rs`'s `approval`) reads
-/// the same two constants; only this function's own home moved.
+/// `capture::safety` rather than moving here too: `validate_ordinary_approval_cwd`'s own
+/// marker-absence check reads `APPROVAL_MARKER_NAME` directly, and Codex's `codex_approval_prompt`
+/// (`record/scenarios/codex.rs`, moved there in Task 8 alongside this function) reads the same
+/// constant for its own marker path — only each provider's prompt-building function moved, not
+/// the shared name/content the fence and both prompts agree on.
 fn claude_approval_prompt(cwd: &Path) -> String {
     let marker = cwd.join(APPROVAL_MARKER_NAME);
     format!(
@@ -911,7 +913,7 @@ mod tests {
             attachment: Some(PathBuf::from("tiny.png")),
             ..ScenarioInput::default()
         };
-        for (name, mode) in [
+        let cases = [
             ("fresh-text", fresh_text_request(&plain).runtime_mode),
             ("approval", approval_request(&plain).runtime_mode),
             ("resume", resume_request(&with_resume).unwrap().runtime_mode),
@@ -924,7 +926,8 @@ mod tests {
                 "checklist-resume",
                 checklist_resume_request(&with_resume).unwrap().runtime_mode,
             ),
-        ] {
+        ];
+        for (name, mode) in cases {
             let spec = crate::capture::record::scenarios::scenario("claude", name)
                 .unwrap_or_else(|| panic!("missing claude/{name}"));
             assert_eq!(
@@ -934,5 +937,25 @@ mod tests {
                 spec.runtime_mode
             );
         }
+
+        // Coverage, not just correctness: `cases` above must name every claude row that declares
+        // a runtime_mode, not merely the ones someone remembered to add. A 13th run row with no
+        // entry here would pass the loop above vacuously and escape both this test and
+        // `comet-provider-capture.rs::scenario_names_own_their_runtime_modes`, which is the exact
+        // "second unsynchronized copy" shape this test exists to catch, one level up.
+        let covered: std::collections::BTreeSet<&str> =
+            cases.iter().map(|(name, _)| *name).collect();
+        let expected: std::collections::BTreeSet<&str> =
+            crate::capture::record::scenarios::SCENARIOS
+                .iter()
+                .filter(|spec| {
+                    spec.provider == crate::capture::Provider::Claude && spec.runtime_mode.is_some()
+                })
+                .map(|spec| spec.name)
+                .collect();
+        assert_eq!(
+            covered, expected,
+            "every claude row with Some(runtime_mode) must have a case in this test's list"
+        );
     }
 }

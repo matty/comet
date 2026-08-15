@@ -395,12 +395,32 @@ pub(in crate::capture::record) async fn interruption(
     session.wait_for_turn_end().await
 }
 
+/// The exact command the `approval` prompt below asks Codex to run three times, mirroring
+/// `record/scenarios/claude.rs`'s `CLAUDE_APPROVAL_COMMAND` — one constant so the prompt text and
+/// the instruction it gives can't drift apart as two separate literals.
+const CODEX_APPROVAL_COMMAND: &str = "echo capture";
+
+/// Prompt for `approval`: ask Codex to run a fixed, harmless command three times, so the capture
+/// records three real command-execution approval decisions in one turn. Moved here, unchanged in
+/// substance, from the deleted `capture/approval/common.rs::codex_approval_prompt` — decision "the
+/// scenario owns its prompt", completing for Codex the move Task 4 already made for Claude's
+/// `claude_approval_prompt`.
+fn codex_approval_prompt(cwd: &Path) -> String {
+    let marker = cwd.join(crate::capture::safety::APPROVAL_MARKER_NAME);
+    format!(
+        "Run the exact command {} three separate times, then add exactly one file at {} \
+         containing exactly capture followed by one newline.",
+        serde_json::to_string(CODEX_APPROVAL_COMMAND).expect("static command serializes"),
+        serde_json::to_string(&marker.display().to_string()).expect("path serializes"),
+    )
+}
+
 // Called once by `approval_launch`, once by `approval` — see the note on
 // `fresh_text_request` above.
 fn approval_request(input: &ScenarioInput) -> RunRequest {
     let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
     cheap_codex_request(
-        &crate::capture::approval::codex_approval_prompt(&cwd),
+        &codex_approval_prompt(&cwd),
         input,
         RuntimeMode::ApprovalRequired,
     )
@@ -429,6 +449,19 @@ fn require_approval_target(input: &ScenarioInput) -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow!("The approval-on-request scenario needs an --approval-target."))
 }
 
+/// Prompt for `approval-on-request`: ask Codex to run the platform-specific marker-writing
+/// command `crate::capture::safety::approval_marker_command` builds, once, so the wire records a
+/// real `item/commandExecution/requestApproval` round trip for exactly the command the fence's
+/// grant-time recheck expects. Moved here, unchanged in substance, from the deleted
+/// `capture/approval/common.rs::approval_on_request_prompt` — same rationale as
+/// `codex_approval_prompt` above.
+fn approval_on_request_prompt(target: &Path) -> String {
+    format!(
+        "Run this exact command once and report success: {}",
+        crate::capture::safety::approval_marker_command(target)
+    )
+}
+
 // Called once by `approval_on_request_launch`, once by `approval_on_request`
 // — see the note on `fresh_text_request` above.
 fn approval_on_request_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
@@ -448,7 +481,7 @@ fn approval_on_request_request(input: &ScenarioInput) -> anyhow::Result<RunReque
     );
     let target = require_approval_target(input)?;
     Ok(cheap_codex_request(
-        &crate::capture::approval::approval_on_request_prompt(&target),
+        &approval_on_request_prompt(&target),
         input,
         RuntimeMode::AutoAcceptEdits,
     ))
@@ -506,9 +539,9 @@ fn pending_approval(frame: &Value) -> Option<Value> {
 /// one piece that can silently drift — routed through the real
 /// `codex::approval::decision_literal` (`crates/harness/src/codex/approval.rs:256`),
 /// the same function `codex/mod.rs:1343`'s `handle_server_request` calls for
-/// a real "allow"/"decline" reply. `codex::approval` is `pub(crate)`
-/// specifically so this can reach it — see that module declaration's own
-/// comment in `codex/mod.rs`.
+/// a real "allow"/"decline" reply. `codex::approval` is declared
+/// `pub(crate)` (`codex/mod.rs:29`, a bare `pub(crate) mod approval;` with
+/// no comment of its own) specifically so this reply builder can reach it.
 fn decision_response(id: Value, decision: &ApprovalDecision) -> String {
     json!({
         "jsonrpc": "2.0",
@@ -588,7 +621,7 @@ pub(in crate::capture::record) async fn approval(
     let cwd = PathBuf::from(&request.cwd);
     let expected_cwd_identity = session.fence.approval_cwd_identity.clone();
     answer_every_approval(session, move || {
-        crate::capture::approval::validate_ordinary_approval_cwd(
+        crate::capture::safety::validate_ordinary_approval_cwd(
             &cwd,
             expected_cwd_identity.as_ref(),
             true,
@@ -621,7 +654,7 @@ pub(in crate::capture::record) async fn approval_on_request(
     let target = require_approval_target(input)?;
     let expected_target_identity = session.fence.approval_target_identity.clone();
     answer_every_approval(session, move || {
-        crate::capture::approval::require_empty_approval_target(
+        crate::capture::safety::require_empty_approval_target(
             &target,
             expected_target_identity.as_ref(),
         )
@@ -1044,6 +1077,38 @@ mod tests {
         );
     }
 
+    /// Ported from `comet-provider-capture.rs`'s own test module, where it covered
+    /// `approval_on_request_prompt` through the crate's public re-export
+    /// (`comet_harness::capture::approval_on_request_prompt`) back when the binary built prompts
+    /// itself. Task 7's table refactor left that re-export with no production caller, and Task 8
+    /// dropped it along with `approval_marker_command`'s two prompt-building siblings — this
+    /// scenario module is the function's home now, so the coverage moves here rather than being
+    /// lost with the re-export.
+    ///
+    /// Break caught: a future edit to `approval_marker_command`'s Windows quoting drops the
+    /// doubled single-quote escape (`replace('\'', "''")`) or the Unix branch's shell-escape
+    /// (`replace('\'', "'\\''")`), letting an apostrophe in the target path break out of the
+    /// quoted `-LiteralPath`/argument and inject a second command.
+    #[test]
+    fn on_request_command_quotes_a_target_with_spaces_and_quotes() {
+        let target = std::path::PathBuf::from(if cfg!(windows) {
+            r"C:\capture targets\O'Brien"
+        } else {
+            "/capture targets/O'Brien"
+        });
+        let prompt = approval_on_request_prompt(&target);
+        assert!(prompt.contains("approval-marker.txt"));
+        if cfg!(windows) {
+            assert!(
+                prompt
+                    .contains("-LiteralPath 'C:\\capture targets\\O''Brien\\approval-marker.txt'")
+            );
+            assert!(!prompt.contains("cmd.exe /C"));
+        } else {
+            assert!(prompt.contains("'/capture targets/O'\\''Brien/approval-marker.txt'"));
+        }
+    }
+
     /// Parses every stdin line as JSON and splits it into the `turn/start` request (used to pin
     /// prompt/mode/model/target) and the approval decisions (anything carrying
     /// `result.decision`), in send order. Shared by every test below so the parsing itself can't
@@ -1093,7 +1158,7 @@ mod tests {
         let raw = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let cwd_identity =
-            crate::capture::approval::validate_ordinary_approval_cwd(cwd.path(), None, false)
+            crate::capture::safety::validate_ordinary_approval_cwd(cwd.path(), None, false)
                 .unwrap();
         let input = ScenarioInput {
             cwd: Some(cwd.path().into()),
@@ -1167,7 +1232,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         let mismatched_identity =
-            crate::capture::approval::validate_ordinary_approval_cwd(elsewhere.path(), None, false)
+            crate::capture::safety::validate_ordinary_approval_cwd(elsewhere.path(), None, false)
                 .unwrap();
         let input = ScenarioInput {
             cwd: Some(cwd.path().into()),
@@ -1228,7 +1293,7 @@ mod tests {
         let raw = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
         let target_identity =
-            crate::capture::approval::require_empty_approval_target(target.path(), None).unwrap();
+            crate::capture::safety::require_empty_approval_target(target.path(), None).unwrap();
         let input = ScenarioInput {
             approval_target: Some(target.path().into()),
             ..ScenarioInput::default()
@@ -1296,8 +1361,7 @@ mod tests {
         let target = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         let mismatched_identity =
-            crate::capture::approval::require_empty_approval_target(elsewhere.path(), None)
-                .unwrap();
+            crate::capture::safety::require_empty_approval_target(elsewhere.path(), None).unwrap();
         let input = ScenarioInput {
             approval_target: Some(target.path().into()),
             ..ScenarioInput::default()
@@ -1370,7 +1434,7 @@ mod tests {
             approval_target: Some(PathBuf::from("target-dir")),
             ..ScenarioInput::default()
         };
-        for (name, mode) in [
+        let cases = [
             ("fresh-text", fresh_text_request(&plain).runtime_mode),
             ("approval", approval_request(&plain).runtime_mode),
             (
@@ -1382,7 +1446,8 @@ mod tests {
             ("resume", resume_request(&with_resume).unwrap().runtime_mode),
             ("steer", steer_request(&plain).runtime_mode),
             ("interruption", interruption_request(&plain).runtime_mode),
-        ] {
+        ];
+        for (name, mode) in cases {
             let spec = crate::capture::record::scenarios::scenario("codex", name)
                 .unwrap_or_else(|| panic!("missing codex/{name}"));
             assert_eq!(
@@ -1392,5 +1457,25 @@ mod tests {
                 spec.runtime_mode
             );
         }
+
+        // Coverage, not just correctness — same reasoning as
+        // `record/scenarios/claude.rs`'s `every_claude_run_rows_declared_mode_matches_its_request_builder`:
+        // `cases` above must name every codex row that declares a runtime_mode, or a 13th run row
+        // escapes both this test's loop (vacuously) and
+        // `comet-provider-capture.rs::scenario_names_own_their_runtime_modes`.
+        let covered: std::collections::BTreeSet<&str> =
+            cases.iter().map(|(name, _)| *name).collect();
+        let expected: std::collections::BTreeSet<&str> =
+            crate::capture::record::scenarios::SCENARIOS
+                .iter()
+                .filter(|spec| {
+                    spec.provider == crate::capture::Provider::Codex && spec.runtime_mode.is_some()
+                })
+                .map(|spec| spec.name)
+                .collect();
+        assert_eq!(
+            covered, expected,
+            "every codex row with Some(runtime_mode) must have a case in this test's list"
+        );
     }
 }

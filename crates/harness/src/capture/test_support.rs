@@ -4,7 +4,7 @@ use std::time::Duration;
 use comet_proto::{ReasoningLevel, RunRequest, RuntimeMode};
 use serde_json::json;
 
-use super::approval::repository_root;
+use super::safety::repository_root;
 use super::{CaptureConfig, Channel, RawCapture};
 
 pub(super) fn contract_request() -> RunRequest {

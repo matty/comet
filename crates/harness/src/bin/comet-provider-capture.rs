@@ -542,26 +542,6 @@ mod tests {
         assert!(capture_config(args).unwrap_err().contains("outside --cwd"));
     }
 
-    #[test]
-    fn on_request_command_quotes_a_target_with_spaces_and_quotes() {
-        let target = PathBuf::from(if cfg!(windows) {
-            r"C:\capture targets\O'Brien"
-        } else {
-            "/capture targets/O'Brien"
-        });
-        let prompt = comet_harness::capture::approval_on_request_prompt(&target);
-        assert!(prompt.contains("approval-marker.txt"));
-        if cfg!(windows) {
-            assert!(
-                prompt
-                    .contains("-LiteralPath 'C:\\capture targets\\O''Brien\\approval-marker.txt'")
-            );
-            assert!(!prompt.contains("cmd.exe /C"));
-        } else {
-            assert!(prompt.contains("'/capture targets/O'\\''Brien/approval-marker.txt'"));
-        }
-    }
-
     /// Reconstructs the comma-separated scenario list `scenario_help_lines` prints for one
     /// provider, joining its wrapped continuation lines back into one logical list — `--help`
     /// wraps a long provider's names across several physical lines (see `SCENARIO_LINE_WIDTH`),

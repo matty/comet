@@ -17,7 +17,7 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::mpsc;
 
 use super::provider::CaptureProvider;
-use crate::capture::approval::{DirectoryIdentity, FileIdentity, repository_root};
+use crate::capture::safety::{DirectoryIdentity, FileIdentity, repository_root};
 use crate::capture::types::{
     CaptureConfig, CaptureEvent, Channel, CommandSnapshot, PartialFailureClass, PartialOutcome,
     PartialRawCapture, PlatformMetadata, Provider, RawCapture, RedactionRoots,
@@ -51,9 +51,11 @@ pub(super) struct FenceOutcome {
     pub(super) approval_target: Option<PathBuf>,
     // Read by `record/scenarios/codex.rs`'s `approval_on_request`, as the
     // expected identity for its grant-time `require_empty_approval_target`
-    // recheck. Claude's `approval` needs no such recheck — it has no
-    // filesystem identity to protect the way a Codex approval target does —
-    // so this stays Codex-only.
+    // recheck. Claude's `approval` needs no such recheck — its scenario body
+    // (`record/scenarios/claude.rs`) grants the model's marker Write
+    // unconditionally, and nothing in Claude's fence ever computes a
+    // `DirectoryIdentity` to compare it against, unlike a Codex approval
+    // target — so this stays Codex-only.
     pub(super) approval_target_identity: Option<DirectoryIdentity>,
     // Read by `record/scenarios/codex.rs`'s `approval`, as the expected
     // identity for its grant-time `validate_ordinary_approval_cwd` recheck.
