@@ -72,7 +72,6 @@
 .timestamp
 .tool_use_result.content[].type
 .tool_use_result.matches[]
-.tool_use_result.pin.ref
 .tool_use_result.resolvedModel
 .tool_use_result.status
 .tool_use_result.statusChange.from

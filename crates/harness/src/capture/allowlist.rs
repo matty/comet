@@ -20,6 +20,19 @@
 //! `rateLimits` — every sibling field under those objects is dead weight the
 //! allowlist should not be carrying. Apply this rule on every future
 //! regeneration, not just at the paths it has already been applied to.
+//!
+//! Seven listed paths are reviewed exceptions to that rule, not oversights a
+//! future regeneration should clean up: `.apiKeySource` and the four
+//! `inference_geo` paths (`.event.message.usage.inference_geo`,
+//! `.message.usage.inference_geo`, `.tool_use_result.usage.inference_geo`,
+//! `.usage.inference_geo`) on `claude.txt`, and `.result.platformFamily` /
+//! `.result.platformOs` on `codex.txt`. Nothing decodes any of them either —
+//! they were kept by deliberate ruling anyway, on the judgment that each
+//! holds a coarse, non-identifying category (a request's auth-source kind, a
+//! geographic inference bucket, a platform family/OS string) rather than
+//! anything that names a machine, a user, or a path. Regenerating the list
+//! should neither strip these seven nor treat their survival as proof the
+//! standing rule is optional elsewhere.
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -486,12 +499,26 @@ mod tests {
 
         // Task 2 review (2026-08-15) — `.request.display_name` exists to hold
         // a *friendly rendering*, not the raw tool name: an MCP invocation's
-        // friendly rendering can plausibly read `search_threads
-        // (claude_ai_Gmail)`, naming the server while never containing the
+        // friendly rendering can plausibly read `create_issue
+        // (linear)`, naming the server while never containing the
         // literal `mcp__` prefix `is_mcp_tool_identity` matches on. Nothing
         // decodes it (`crates/harness/src/claude/wire.rs:694` records it as
         // present and deliberately undecoded), so the standing "nothing
         // decodes it" rule excludes it regardless of the prefix-check gap.
         assert!(!allows(Provider::Claude, ".request.display_name"));
+
+        // Final review (2026-08-15) — reverses an earlier keep-ruling.
+        // `.tool_use_result.pin.id` and `.pin.name` are already excluded;
+        // `.pin.ref` was kept as the odd one out. In the corpus it reads
+        // `"pin":{"id":"<V245>","name":"<V245>","ref":"18303e"}` -- its two
+        // sibling identity fields are redacted and this one alone was
+        // published verbatim. Nothing decodes it and no test references it,
+        // so by the standing "nothing decodes it" rule, and because it is
+        // the only opaque identifier left among the surviving literals
+        // (`allowlist_property.rs`'s own documented blind spot -- it only
+        // ever inspects a scalar it is about to call an escape, never one an
+        // allowed path keeps), it should not have been kept regardless of
+        // being a sibling of two excluded fields.
+        assert!(!allows(Provider::Claude, ".tool_use_result.pin.ref"));
     }
 }

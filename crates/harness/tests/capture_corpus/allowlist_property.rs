@@ -133,6 +133,127 @@ fn every_committed_value_is_allowlisted_or_a_placeholder() {
     panic!("{}", report.join("\n"));
 }
 
+/// The reciprocity that survives Task 5's manifest-reconstruction gap
+/// (docs/debt -- see the D73/D75 neighbourhood in `docs/debt/README.md` for
+/// the sibling gaps this same review pass found): every `<..._N>`/`<...>`
+/// bracket-shaped token committed anywhere in a manifest is either declared
+/// in that manifest's own `placeholders` list, or is one of the seven
+/// literal path-root placeholders `Redactor::new` writes directly
+/// (`sanitize.rs:519-553`) without ever registering them in
+/// `placeholder_definitions()` -- `<CWD>`, `<REPO>`, `<HOME>`, `<TEMP>`,
+/// `<CODEX_HOME>`, `<APPROVAL_TARGET>`, `<TRUSTED_POWERSHELL>`.
+///
+/// The second branch is a known, accepted gap, not something this test is
+/// trying to close: `claude/2.1.228/approval/manifest.json` and
+/// `codex/0.147.0/model-discovery-logged-out/manifest.json` both carry a
+/// path-root placeholder in `command`/`configured_env` that the re-sanitize
+/// pass's `placeholder_definitions()` never declared, because Task 5
+/// reconstructed their raw input from already-sanitized output -- the text
+/// already read `<CWD>`/`<HOME>`/`<CODEX_HOME>` verbatim, so the fresh
+/// redaction roots on the second pass had nothing left to match and
+/// `sanitize_paths_and_validate` counted zero occurrences. The values
+/// themselves are still safe (a placeholder token, not raw content); what is
+/// missing is only the bookkeeping that would let a reader confirm that from
+/// the manifest alone. What this test actually guards is the case that gap
+/// does *not* cover: any OTHER bracket-shaped token -- one that is not on
+/// the closed seven-item path-root list -- must still be declared, so a
+/// genuinely new kind of undeclared, unreconciled token is still caught.
+const KNOWN_UNDECLARED_PATH_ROOTS: [&str; 7] = [
+    "<CWD>",
+    "<REPO>",
+    "<HOME>",
+    "<TEMP>",
+    "<CODEX_HOME>",
+    "<APPROVAL_TARGET>",
+    "<TRUSTED_POWERSHELL>",
+];
+
+#[test]
+fn every_manifest_token_is_declared_or_a_known_path_root() {
+    let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    let mut undeclared = Vec::new();
+    let mut manifest_count = 0u64;
+
+    for provider_dir in subdirectories(&corpus_root) {
+        for version_dir in subdirectories(&provider_dir) {
+            for scenario_dir in subdirectories(&version_dir) {
+                let manifest_path = scenario_dir.join("manifest.json");
+                if !manifest_path.is_file() {
+                    continue;
+                }
+                manifest_count += 1;
+                let scenario = scenario_dir
+                    .strip_prefix(&corpus_root)
+                    .unwrap_or(scenario_dir.as_path())
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let text = std::fs::read_to_string(&manifest_path).unwrap_or_else(|error| {
+                    panic!("{scenario}: manifest.json unreadable: {error}")
+                });
+                let manifest: Value = serde_json::from_str(&text).unwrap_or_else(|error| {
+                    panic!("{scenario}: manifest.json is not valid JSON: {error}")
+                });
+                let declared: BTreeSet<&str> = manifest["placeholders"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{scenario}: manifest has no placeholders array"))
+                    .iter()
+                    .filter_map(|entry| entry["placeholder"].as_str())
+                    .collect();
+
+                let mut tokens = Vec::new();
+                collect_bracket_tokens(&manifest, &mut tokens);
+                for token in tokens {
+                    if declared.contains(token.as_str())
+                        || KNOWN_UNDECLARED_PATH_ROOTS.contains(&token.as_str())
+                    {
+                        continue;
+                    }
+                    undeclared.push(format!("{scenario}: {token}"));
+                }
+            }
+        }
+    }
+
+    assert!(
+        manifest_count > 0,
+        "found no manifest.json under {} -- corpus walk is broken, not just empty",
+        corpus_root.display()
+    );
+    assert!(
+        undeclared.is_empty(),
+        "bracket-shaped token(s) in a committed manifest are neither declared in that \
+         manifest's own placeholders list nor one of the seven known path-root literals:\n{}",
+        undeclared.join("\n")
+    );
+}
+
+/// Every string leaf in `value` that looks like a placeholder token: starts
+/// with `<`, ends with `>`, and holds no whitespace (a model-authored prose
+/// placeholder never has this shape, so this cannot mistake ordinary text
+/// for one).
+fn collect_bracket_tokens(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_bracket_tokens(item, out);
+            }
+        }
+        Value::Object(object) => {
+            for child in object.values() {
+                collect_bracket_tokens(child, out);
+            }
+        }
+        Value::String(text)
+            if text.starts_with('<')
+                && text.ends_with('>')
+                && !text.contains(char::is_whitespace) =>
+        {
+            out.push(text.clone());
+        }
+        _ => {}
+    }
+}
+
 /// One scenario's worth of frames, checked against its own provider and its
 /// own manifest's placeholder vocabulary. Failures are pushed onto `escapes`
 /// rather than panicking here, so one bad scenario does not hide every other.
@@ -266,13 +387,16 @@ fn is_mcp_tool_identity(value: &Value) -> bool {
 /// manifest recorded as actually used (`manifest["placeholders"][].placeholder`).
 ///
 /// Reading this per scenario, rather than hardcoding the current placeholder
-/// vocabulary, is deliberate: the committed corpus was sanitized by the
-/// blocklist this stage replaces, so its manifests carry the *old* typed
-/// names (`<SESSION_ID_1>`, `<CLAUDE_THINKING_SIGNATURE_1>`, ...), not the
-/// new six-kind vocabulary `sanitize.rs` writes today. Reading each
-/// manifest's own list is what lets this property hold across a
-/// sanitizer-vocabulary change without editing the test -- exactly what Task
-/// 5 needs it to do once it regenerates the corpus.
+/// vocabulary, is deliberate: before Task 5 re-sanitized the archive, the
+/// committed corpus still carried the *old* blocklist-era typed names
+/// (`<SESSION_ID_1>`, `<CLAUDE_THINKING_SIGNATURE_1>`, ...), not the six-kind
+/// vocabulary `sanitize.rs` writes today (`<SESSION_1>`, `<MACHINE_1>`, ...).
+/// Task 5 has since run: every manifest in the corpus now uses the six-kind
+/// vocabulary, and no `SESSION_ID`/`CLAUDE_`-prefixed placeholder remains
+/// anywhere in it. Reading each manifest's own list, rather than hardcoding
+/// either vocabulary, is what let this property hold across that
+/// sanitizer-vocabulary change without editing the test, and is what lets it
+/// keep holding across whatever the vocabulary becomes next.
 fn manifest_provider_and_placeholders(
     manifest_path: &Path,
     scenario: &str,
@@ -329,7 +453,7 @@ mod self_check {
             temp.path(),
             "path-equivalence",
             &[
-                r#"{"type":"user","mystery":"unlisted-value","nested":{"list":[{"unknown":"a"},{"unknown":"b"}]},"mcp_servers":[{"status":"connected"}],"request":{"tool_name":"mcp__claude_ai_Gmail__search_threads"}}"#,
+                r#"{"type":"user","mystery":"unlisted-value","nested":{"list":[{"unknown":"a"},{"unknown":"b"}]},"mcp_servers":[{"status":"connected"}],"request":{"tool_name":"mcp__linear__create_issue"}}"#,
             ],
         );
         let report = sanitize_dir(&raw, &staging_dir(temp.path(), "path-equivalence")).unwrap();
@@ -387,7 +511,7 @@ mod self_check {
         // escape (it is a placeholder, not the raw MCP identity).
         assert!(allows(Provider::Claude, ".request.tool_name"));
         let redacted_tool_name = by_path[".request.tool_name"].as_str().unwrap();
-        assert_ne!(redacted_tool_name, "mcp__claude_ai_Gmail__search_threads");
+        assert_ne!(redacted_tool_name, "mcp__linear__create_issue");
         let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
         let placeholders: BTreeSet<String> = manifest["placeholders"]
             .as_array()
@@ -439,7 +563,7 @@ mod self_check {
         );
         let empty_placeholders = BTreeSet::new();
 
-        let raw_mcp_identity = Value::String("mcp__claude_ai_Gmail__search_threads".to_owned());
+        let raw_mcp_identity = Value::String("mcp__linear__create_issue".to_owned());
         assert!(
             is_escape(
                 Provider::Claude,

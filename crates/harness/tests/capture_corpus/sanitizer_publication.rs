@@ -155,6 +155,60 @@ fn sanitizer_uses_only_captured_redaction_roots_after_filesystem_changes() {
     );
 }
 
+/// Break caught: `cwd`/`repo`/`home`/`temp` are proven above, but
+/// `Redactor::new` (`sanitize.rs:538-552`) wires three more roots the same
+/// way -- `codex_home`, `approval_target`, and `trusted_powershell`, each
+/// derived by `recording.rs` for a Codex or approval capture -- and nothing
+/// exercised them: each of the three could be deleted from `Redactor::new`
+/// without failing anything before this test.
+#[test]
+fn sanitizer_substitutes_the_codex_and_approval_specific_redaction_roots() {
+    let cases = [
+        (
+            "codex-home-root",
+            "codex_home",
+            r"C:\captured-codex-home",
+            "<CODEX_HOME>",
+        ),
+        (
+            "approval-target-root",
+            "approval_target",
+            r"C:\captured-approval-target",
+            "<APPROVAL_TARGET>",
+        ),
+        (
+            "trusted-powershell-root",
+            "trusted_powershell",
+            r"C:\captured-trusted.ps1",
+            "<TRUSTED_POWERSHELL>",
+        ),
+    ];
+
+    for (name, root_key, root_value, placeholder) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let raw = write_raw_capture(
+            temp.path(),
+            name,
+            &[&format!(
+                r#"{{"claude_code_version":{}}}"#,
+                serde_json::to_string(&format!("root {root_value}\\extra")).unwrap()
+            )],
+        );
+        let capture_path = raw.join("capture.json");
+        let mut capture: Value =
+            serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+        capture["redaction_roots"][root_key] = Value::String(root_value.into());
+        std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+        let report = sanitize_dir(&raw, &staging_dir(temp.path(), name)).unwrap();
+        assert_eq!(
+            sanitized_payloads(&report.events_bytes)[0]["claude_code_version"],
+            format!("root {placeholder}\\extra"),
+            "{name}"
+        );
+    }
+}
+
 /// Break caught: manifest accounting can silently omit a redaction category or count definitions
 /// rather than actual replacements, preventing a reviewer from auditing what changed.
 ///

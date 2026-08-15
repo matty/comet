@@ -1019,7 +1019,7 @@ fn is_secret_field(field: &str, value: &Value) -> bool {
 /// `.request.display_name` was originally in this family and is deliberately
 /// no longer allowlisted at all (review finding, 2026-08-15): it exists to
 /// hold a *friendly rendering*, not the raw name, so an MCP tool's friendly
-/// rendering can plausibly read `search_threads (claude_ai_Gmail)` — naming
+/// rendering can plausibly read `create_issue (linear)` — naming
 /// the server while never containing the literal `mcp__` prefix this check
 /// matches on. `crates/harness/src/claude/wire.rs:694` records the field as
 /// present and deliberately undecoded, so by the standing "nothing decodes
@@ -1621,7 +1621,7 @@ mod tests {
     #[test]
     fn an_mcp_tool_identity_exception_is_not_reported_as_novel() {
         let report = sanitize_value_reporting(
-            json!({"request": {"tool_name": "mcp__claude_ai_Gmail__search_threads"}}),
+            json!({"request": {"tool_name": "mcp__linear__create_issue"}}),
             Provider::Claude,
         );
         let paths: Vec<&str> = report.novel_paths.iter().map(|n| n.path.as_str()).collect();
@@ -1767,13 +1767,10 @@ mod tests {
     #[test]
     fn an_mcp_tool_name_is_redacted_even_on_an_allowlisted_path() {
         let out = sanitize_value(
-            json!({"request": {"tool_name": "mcp__claude_ai_Gmail__search_threads"}}),
+            json!({"request": {"tool_name": "mcp__linear__create_issue"}}),
             Provider::Claude,
         );
-        assert_ne!(
-            out["request"]["tool_name"],
-            "mcp__claude_ai_Gmail__search_threads"
-        );
+        assert_ne!(out["request"]["tool_name"], "mcp__linear__create_issue");
     }
 
     /// The same allowlisted path with a built-in tool name is untouched —

@@ -353,6 +353,154 @@ fn sanitizer_does_not_allow_path_prefix_collisions_on_an_allowlisted_path() {
     ));
 }
 
+/// `sanitize_claude_resume_argv` (`crates/harness/src/capture/sanitize.rs:822`)
+/// runs only for Claude captures, and only rewrites `--resume=<id>` when the
+/// id matches the sole `SESSION`-named placeholder events sanitizing already
+/// discovered. Break caught: without this, the resume identifier repeated in
+/// the launch argv (outside event JSON, so the ordinary path/value scan never
+/// sees it) would ride into the manifest verbatim instead of reusing the
+/// exact typed placeholder assigned to the same id inside the events.
+#[test]
+fn sanitizer_reuses_the_event_session_mapping_in_claude_resume_argv() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = "opaque-session-to-resume";
+    let raw = write_raw_capture(
+        temp.path(),
+        "claude-resume-argv",
+        &[&serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "session_id": session_id
+        })
+        .to_string()],
+    );
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    capture["scenario"] = Value::String("resume".into());
+    capture["command"]["args"] = serde_json::json!(["--print", format!("--resume={session_id}")]);
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "claude-resume-argv")).unwrap();
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+    assert_eq!(
+        manifest["command"]["args"],
+        serde_json::json!(["--print", "--resume=<SESSION_1>"])
+    );
+    assert_eq!(manifest["redaction_counts"]["session"], 2);
+    assert!(
+        !String::from_utf8(report.manifest_bytes)
+            .unwrap()
+            .contains(session_id)
+    );
+}
+
+/// Break caught: recognizing only the happy-path prefix lets malformed, split, duplicate, absent,
+/// or scenario-inappropriate resume arguments bypass the manifest's semantic-ID contract --
+/// `sanitize_claude_resume_argv` has seven separate fail-closed branches, and this pins six of
+/// them (a `resume`-scenario command whose argv doesn't hold exactly one valid `--resume=<id>`
+/// matching the sole `SESSION` semantic, or a non-`resume` scenario carrying `--resume` at all).
+#[test]
+fn sanitizer_enforces_the_exact_claude_resume_command_grammar() {
+    let session_id = "captured-session";
+    let cases = [
+        ("missing", "resume", serde_json::json!(["--print"])),
+        ("empty", "resume", serde_json::json!(["--resume="])),
+        (
+            "split",
+            "resume",
+            serde_json::json!(["--resume", session_id]),
+        ),
+        (
+            "duplicate",
+            "resume",
+            serde_json::json!([
+                format!("--resume={session_id}"),
+                format!("--resume={session_id}")
+            ]),
+        ),
+        (
+            "malformed",
+            "resume",
+            serde_json::json!([format!("--resume-id={session_id}")]),
+        ),
+        (
+            "mismatch",
+            "resume",
+            serde_json::json!(["--resume=another-session"]),
+        ),
+        (
+            "unexpected-nonresume",
+            "fresh-text",
+            serde_json::json!([format!("--resume={session_id}")]),
+        ),
+    ];
+
+    for (name, scenario, args) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let raw = write_raw_capture(
+            temp.path(),
+            name,
+            &[&serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "session_id": session_id
+            })
+            .to_string()],
+        );
+        let capture_path = raw.join("capture.json");
+        let mut capture: Value =
+            serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+        capture["scenario"] = Value::String(scenario.into());
+        capture["command"]["args"] = args;
+        std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+        let output = staging_dir(temp.path(), name);
+
+        let error = sanitize_dir(&raw, &output).unwrap_err();
+        assert!(
+            matches!(error, SanitizationError::InvalidClaudeResumeCommand { .. }),
+            "{name}: {error}"
+        );
+        assert!(!error.to_string().contains(session_id), "{name}");
+        assert!(!error.to_string().contains("another-session"), "{name}");
+        assert!(!output.exists(), "{name}");
+    }
+}
+
+/// Break caught: the function demands exactly one `SESSION`-named semantic
+/// before it will treat a resume argv as legitimate. A capture whose events
+/// carry two distinct session ids (e.g. a resumed run whose events still
+/// include the ancestor session alongside the current one) must reject
+/// rather than guess which one the resume argument refers to.
+#[test]
+fn sanitizer_requires_the_claude_resume_command_to_map_the_sole_session_semantic() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "multiple-session-semantics",
+        &[
+            r#"{"type":"system","session_id":"first-session"}"#,
+            r#"{"type":"result","subtype":"success","session_id":"second-session"}"#,
+        ],
+    );
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    capture["scenario"] = Value::String("resume".into());
+    capture["command"]["args"] = serde_json::json!(["--resume=first-session"]);
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+    let output = staging_dir(temp.path(), "multiple-session-semantics");
+
+    let error = sanitize_dir(&raw, &output).unwrap_err();
+    assert!(matches!(
+        error,
+        SanitizationError::InvalidClaudeResumeCommand { .. }
+    ));
+    assert!(!error.to_string().contains("first-session"));
+    assert!(!error.to_string().contains("second-session"));
+    assert!(!output.exists());
+}
+
 /// Break caught: textual prefix replacement can bless an allowed root followed by `..`, and a
 /// detector that recognizes only backslash UNC paths misses the equivalent forward-slash form.
 ///
@@ -423,4 +571,37 @@ fn sanitizer_rejects_unrecognized_absolute_path_forms_on_an_allowlisted_path() {
             "{name} returned {error:?}"
         );
     }
+}
+
+/// A genuinely non-JSON stderr line is the one payload shape the ordinary
+/// path/value walk never reaches: `sanitize_value_tree` only runs on parsed
+/// JSON, so unparseable stderr text takes the separate
+/// `placeholder_for_prose` branch (`sanitize.rs:172-199`, `721-723`)
+/// instead. That branch has to redact deliberately, not by falling through
+/// the same machinery -- nothing else in this file writes a last event that
+/// actually fails `serde_json::from_str`, so nothing previously proved raw
+/// provider stderr text (which can carry a stack trace, an environment
+/// dump, or a path) doesn't survive into the committed archive verbatim.
+#[test]
+fn sanitizer_redacts_genuinely_non_json_stderr_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let secret_looking_text = "panic at worker.rs:42: D:\\Users\\someone\\.ssh\\id_rsa not found";
+    let raw = write_raw_capture(
+        temp.path(),
+        "non-json-stderr",
+        &[r#"{"level":"debug"}"#, secret_looking_text],
+    );
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "non-json-stderr")).unwrap();
+    let events = std::str::from_utf8(&report.events_bytes).unwrap();
+    let last_line: Value = serde_json::from_str(events.lines().next_back().unwrap()).unwrap();
+
+    let payload = last_line["payload"].as_str().unwrap();
+    assert_ne!(payload, secret_looking_text);
+    assert!(
+        payload.starts_with("<PROSE_") && payload.ends_with('>'),
+        "non-JSON stderr must collapse to a PROSE placeholder, got {payload:?}"
+    );
+    assert!(!events.contains("id_rsa"));
+    assert!(!events.contains("someone"));
 }
