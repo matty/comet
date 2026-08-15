@@ -615,16 +615,7 @@ impl Redactor {
         }
         if allows(provider, path) && !is_mcp_tool_identity(value) {
             if let Value::String(text) = value {
-                if contains_absolute_path(text) {
-                    return Err(SanitizationError::UnrecognizedAbsolutePath {
-                        location: location.to_owned(),
-                    });
-                }
-                if contains_secret_value(text) {
-                    return Err(SanitizationError::SecretLikeValue {
-                        location: location.to_owned(),
-                    });
-                }
+                self.sanitize_paths_and_validate(text, location)?;
             }
             return Ok(());
         }
