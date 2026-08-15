@@ -83,9 +83,11 @@ pub const MAP_PATHS: &[&str] = &[".modelUsage"];
 /// Discriminator paths whose observed *values* form a provider's vocabulary —
 /// not every field, only the ones whose few distinct values answer "what
 /// kinds of thing does this harness say" (design §3.5, SNAPSHOT). `.type`
-/// names a frame's own kind, `.subtype` narrows a `system` frame, `.event.type`
-/// narrows a streamed `stream_event`, `.method` is Codex's frame kind, and the
-/// remaining two name which tool ran.
+/// names a frame's own kind; `.subtype` narrows it further for `system` and
+/// `result` frames; `.request.subtype` and `.response.subtype` do the same
+/// one level down, inside Claude's control-protocol envelope; `.event.type`
+/// narrows a streamed `stream_event`; `.method` is Codex's frame kind; and
+/// the remaining two name which tool ran.
 ///
 /// Declared rather than inferred, for the reason [`MAP_PATHS`] is: "this
 /// field has few distinct values" is a property of a small corpus, not of
@@ -95,9 +97,34 @@ pub const MAP_PATHS: &[&str] = &[".modelUsage"];
 ///
 /// Found by grepping the committed corpus, not guessed:
 ///
-/// - `.type`, `.subtype` — Claude's `system`/`result`/`assistant`/… frame
-///   kind and its `init`/`success`/`hook_started`/… narrowing, both at the
-///   frame root.
+/// - `.type` — Claude's frame kind: `assistant`, `control_request`,
+///   `control_response`, `rate_limit_event`, `result`, `stream_event`,
+///   `system`, `user`.
+/// - `.subtype` — narrows a `system` frame (`init`, `status`, `hook_started`,
+///   `hook_response`, `thinking_tokens`, `task_started`, `task_progress`,
+///   `task_updated`, `task_notification`, `background_tasks_changed` — ten
+///   values, 126 frames) or a `result` frame (`success` — one value, 7
+///   frames). `success` is a `result` subtype, not a `system` one; the two
+///   `.type`s never share a `.subtype` value in the committed corpus.
+/// - `.request.subtype`, `.response.subtype` — one level below `.subtype`,
+///   inside the `control_request`/`control_response` envelope's own
+///   `request`/`response` object, so a bare `.subtype` match never sees
+///   them. The control protocol is bidirectional, so both paths carry a
+///   genuinely different vocabulary per [`Direction`]: `.request.subtype`
+///   is `initialize` when Comet opens the request (`ToProvider`) and
+///   `can_use_tool` when Claude Code does (`FromProvider`);
+///   `.response.subtype` is `success` on both sides, but one `success` is
+///   Comet's reply to `can_use_tool` and the other is Claude Code's reply to
+///   `initialize` — the same string, unrelated occurrences, exactly what
+///   direction-keying exists to keep apart. `success` here is also not the
+///   `result`-frame `.subtype` above — same string, unrelated discriminator,
+///   which is exactly why leaf-name matching is refused elsewhere in this
+///   codebase. `.type` alone only says a frame is a `control_request`;
+///   `.request.subtype` says *which* request, and `can_use_tool` is the one
+///   Comet's entire approval surface hangs on — added 2026-08-16 after being
+///   missed the same way `.method` was: the declared set looked complete
+///   because Claude's sheet was non-empty without it, not because nothing
+///   was missing.
 /// - `.event.type` — the frame kind carried inside a streamed
 ///   `stream_event`'s `event` object (`content_block_start`,
 ///   `message_delta`, …); distinct from `.type` because a `stream_event`
@@ -116,9 +143,8 @@ pub const MAP_PATHS: &[&str] = &[".modelUsage"];
 ///   is not the archive's documented absence-blind-spot (design §5) — these
 ///   captures exercised plenty; the declared set was simply Claude-shaped.
 ///   Stage 3's allowlist ledger already names `.method` as "the vocabulary
-///   the stage-5 capability sheet reads" (`ledger-stage-3-allowlist.md:43`),
-///   which is why `.method` is on `allowlist/codex.txt` even though this
-///   const didn't read it until now.
+///   the stage-5 capability sheet reads", which is why `.method` is on
+///   `allowlist/codex.txt` even though this const didn't read it until now.
 ///
 /// **No Codex tool-name path is declared.** Codex's turn items carry a kind
 /// at `.params.item.type` (`agentMessage`, `reasoning`, `userMessage`, …),
@@ -130,6 +156,8 @@ pub const MAP_PATHS: &[&str] = &[".modelUsage"];
 pub const VOCABULARY_PATHS: &[&str] = &[
     ".type",
     ".subtype",
+    ".request.subtype",
+    ".response.subtype",
     ".event.type",
     ".method",
     ".message.content[].name",
@@ -144,23 +172,27 @@ pub const VOCABULARY_PATHS: &[&str] = &[
 /// (`turn/completed`, `item/agentMessage/delta`, …). Merging them would
 /// misreport both — the same reasoning [`Direction`]'s own doc comment makes
 /// for fields applies with more force to a discriminator.
-type Vocabulary = BTreeMap<(String, String, Direction), BTreeMap<String, BTreeSet<String>>>;
+pub type Vocabulary = BTreeMap<(String, String, Direction), BTreeMap<String, BTreeSet<String>>>;
 
 pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, SurfaceError> {
-    Ok(walk_corpus(corpus_root)?.0)
+    Ok(observe_surface(corpus_root)?.0)
 }
 
 /// The value vocabulary for every version in the corpus. Walks the same
-/// evidence [`observe_corpus`] does — see [`walk_corpus`] — so a value
+/// evidence [`observe_corpus`] does — see [`observe_surface`] — so a value
 /// collected here is a value some promoted capture actually contains.
 pub fn observe_vocabulary(corpus_root: &Path) -> Result<Vocabulary, SurfaceError> {
-    Ok(walk_corpus(corpus_root)?.1)
+    Ok(observe_surface(corpus_root)?.1)
 }
 
-/// The one pass over the archive both [`observe_corpus`] and
-/// [`observe_vocabulary`] read from, so the field inventory and the value
-/// vocabulary don't each re-walk the corpus independently.
-fn walk_corpus(corpus_root: &Path) -> Result<(Vec<FieldObservation>, Vocabulary), SurfaceError> {
+/// Both the field inventory and the value vocabulary from one pass over the
+/// archive. A sheet needs both, and calling [`observe_corpus`] and
+/// [`observe_vocabulary`] separately would walk the same ~800 committed
+/// frames twice for no reason — this is the entry point a renderer should
+/// use; the other two exist for a caller that only wants one half.
+pub fn observe_surface(
+    corpus_root: &Path,
+) -> Result<(Vec<FieldObservation>, Vocabulary), SurfaceError> {
     let scenarios = promoted_scenarios(corpus_root)?;
     if scenarios.is_empty() {
         return Err(SurfaceError::EmptyCorpus {

@@ -8,7 +8,9 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use comet_harness::capture::{Direction, FieldObservation, observe_corpus, observe_vocabulary};
+use comet_harness::capture::{
+    Direction, FieldObservation, observe_corpus, observe_surface, observe_vocabulary,
+};
 use serde_json::{Value, json};
 
 /// Writes one scenario directory: the frames, each payload a JSON string
@@ -395,27 +397,43 @@ fn vocabulary_collects_declared_paths_only() {
 #[test]
 fn vocabulary_ignores_a_non_scalar_at_a_declared_path() {
     let root = tempfile::tempdir().unwrap();
+    // A sibling scalar at another declared path (`.subtype`) in the same
+    // frame is the point: a fixture with only the non-scalar would pass this
+    // test even if collection were disabled outright, because an entirely
+    // empty vocabulary also satisfies "no `.type` value" (review finding,
+    // 2026-08-16 — the original fixture could not distinguish the fixed
+    // implementation from a broken one and was never actually falsified).
     write_scenario(
         root.path(),
         "claude",
         "2.1.229",
         "checklist",
-        &[(1, "stdout", json!({"type": {"nested": "shape-change"}}))],
+        &[(
+            1,
+            "stdout",
+            json!({"type": {"nested": "shape-change"}, "subtype": "init"}),
+        )],
     );
 
     let vocabulary = observe_vocabulary(root.path()).unwrap();
-    let has_type_value = vocabulary
+    let claude = vocabulary
         .get(&(
             "claude".to_string(),
             "2.1.229".to_string(),
             Direction::FromProvider,
         ))
-        .and_then(|paths| paths.get(".type"))
-        .is_some_and(|values| !values.is_empty());
+        .unwrap_or_else(|| {
+            panic!("no vocabulary for claude/2.1.229/from-provider: {vocabulary:?}")
+        });
 
+    assert_eq!(
+        claude.get(".subtype").cloned().unwrap_or_default(),
+        BTreeSet::from(["init".to_string()]),
+        "a sibling scalar at a declared path must still be collected: {claude:?}"
+    );
     assert!(
-        !has_type_value,
-        "a non-scalar at a declared path must not become a vocabulary value: {vocabulary:?}"
+        !claude.contains_key(".type") || claude[".type"].is_empty(),
+        "a non-scalar at a declared path must not become a vocabulary value: {claude:?}"
     );
 }
 
@@ -522,5 +540,97 @@ fn vocabulary_keeps_directions_of_the_same_path_apart() {
         from_provider,
         BTreeSet::from(["assistant".to_string()]),
         "the from-provider .type value must not include the to-provider one: {from_provider:?}"
+    );
+}
+
+/// Break caught (review finding, 2026-08-16): `.request.subtype` and
+/// `.response.subtype` sit one level below where `.subtype` looks, inside
+/// Claude's control-protocol envelope, so a bare `.subtype` match never sees
+/// `can_use_tool` — the discriminator Comet's entire approval surface hangs
+/// on. Reads the real committed corpus rather than a fixture, because the
+/// point is that this evidence already existed and the declared set simply
+/// hadn't caught up to it.
+///
+/// Both directions are asserted because the control protocol is
+/// bidirectional in a way most of the corpus isn't: Claude Code opens a
+/// `can_use_tool` request (received, hence `FromProvider`) and Comet opens
+/// an `initialize` request (sent, hence `ToProvider`) — the same
+/// `.request.subtype` path, genuinely different vocabularies per direction,
+/// exactly the case direction-keying exists for.
+#[test]
+fn the_promoted_corpus_yields_the_control_protocol_subtypes() {
+    let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    let vocabulary = observe_vocabulary(&corpus_root).unwrap();
+
+    let values_at = |direction: Direction, path: &str| -> BTreeSet<String> {
+        vocabulary
+            .get(&("claude".to_string(), "2.1.228".to_string(), direction))
+            .and_then(|paths| paths.get(path))
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    assert_eq!(
+        values_at(Direction::ToProvider, ".request.subtype"),
+        BTreeSet::from(["initialize".to_string()]),
+        "Comet's own control_request kind"
+    );
+    assert_eq!(
+        values_at(Direction::FromProvider, ".request.subtype"),
+        BTreeSet::from(["can_use_tool".to_string()]),
+        "Claude Code's control_request kind — the approval-surface discriminator"
+    );
+    assert_eq!(
+        values_at(Direction::ToProvider, ".response.subtype"),
+        BTreeSet::from(["success".to_string()]),
+        "Comet's reply to Claude Code's can_use_tool request"
+    );
+    assert_eq!(
+        values_at(Direction::FromProvider, ".response.subtype"),
+        BTreeSet::from(["success".to_string()]),
+        "Claude Code's reply to Comet's initialize request"
+    );
+}
+
+/// Break caught: `observe_corpus` and `observe_vocabulary` each call the
+/// same underlying walk, but a renderer needing both would walk the archive
+/// twice calling them separately. `observe_surface` is the one-call,
+/// one-walk entry point Task 3 uses; this checks it returns the same two
+/// halves the separate calls do; a divergence here would mean one of the
+/// three entry points stopped sharing the walk it's documented to share.
+#[test]
+fn surface_returns_the_same_pair_the_separate_entry_points_do() {
+    let root = tempfile::tempdir().unwrap();
+    write_scenario(
+        root.path(),
+        "claude",
+        "2.1.229",
+        "checklist",
+        &[(1, "stdout", json!({"type": "system", "subtype": "init"}))],
+    );
+
+    let (observations, vocabulary) = observe_surface(root.path()).unwrap();
+    let observations_alone = observe_corpus(root.path()).unwrap();
+    let vocabulary_alone = observe_vocabulary(root.path()).unwrap();
+
+    assert_eq!(
+        paths(&observations),
+        paths(&observations_alone),
+        "observe_surface's inventory half must match observe_corpus's"
+    );
+    assert_eq!(
+        vocabulary, vocabulary_alone,
+        "observe_surface's vocabulary half must match observe_vocabulary's"
+    );
+    assert!(
+        vocabulary
+            .get(&(
+                "claude".to_string(),
+                "2.1.229".to_string(),
+                Direction::FromProvider
+            ))
+            .is_some_and(|paths| paths.contains_key(".type")),
+        "observe_surface must actually collect vocabulary, not return an empty stand-in: \
+         {vocabulary:?}"
     );
 }
