@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail};
 use comet_proto::{ReasoningLevel, RunRequest, RuntimeMode};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::capture::record::provider::CaptureProvider;
 use crate::capture::record::providers::codex::{CodexProvider, rpc_request};
@@ -414,6 +414,179 @@ pub(in crate::capture::record) async fn interruption(
         ))
         .await?;
     session.wait_for_turn_end().await
+}
+
+// Called once by `approval_launch`, once by `approval` — see the note on
+// `fresh_text_request` above.
+#[allow(dead_code)]
+fn approval_request(input: &ScenarioInput) -> RunRequest {
+    let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
+    cheap_codex_request(
+        &crate::capture::approval::codex_approval_prompt(&cwd),
+        input,
+        RuntimeMode::ApprovalRequired,
+    )
+}
+
+/// SPAWN for `approval`: an ordinary run launch, built from the same request
+/// `approval` replays as its wire line.
+#[allow(dead_code)]
+pub(in crate::capture::record) fn approval_launch(
+    input: &ScenarioInput,
+    executable: &Path,
+) -> anyhow::Result<LaunchDescriptor> {
+    Ok(crate::codex::run_launch(
+        executable,
+        &approval_request(input),
+    ))
+}
+
+// Called once by `approval_on_request_launch`, once by `approval_on_request`
+// — see the note on `fresh_text_request` above.
+#[allow(dead_code)]
+fn approval_on_request_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
+    let target = input
+        .approval_target
+        .clone()
+        .ok_or_else(|| anyhow!("The approval-on-request scenario needs an --approval-target."))?;
+    Ok(cheap_codex_request(
+        &crate::capture::approval::approval_on_request_prompt(&target),
+        input,
+        RuntimeMode::AutoAcceptEdits,
+    ))
+}
+
+/// SPAWN for `approval-on-request`: an ordinary run launch, built from the
+/// same request `approval_on_request` replays as its wire line.
+#[allow(dead_code)]
+pub(in crate::capture::record) fn approval_on_request_launch(
+    input: &ScenarioInput,
+    executable: &Path,
+) -> anyhow::Result<LaunchDescriptor> {
+    Ok(crate::codex::run_launch(
+        executable,
+        &approval_on_request_request(input)?,
+    ))
+}
+
+/// Recognizes any Codex server request whose method ends in
+/// `/requestApproval` — `item/fileChange/requestApproval` for `approval`,
+/// `item/commandExecution/requestApproval` for `approval_on_request`, and
+/// (unreachable by any capture so far, but not excluded on purpose)
+/// `item/permissions/requestApproval` — and returns its JSON-RPC id,
+/// unmodified, to echo back in the reply. Every other frame — item lifecycle
+/// notifications, `turn/started`, anything else — returns `None` and is
+/// simply left unanswered.
+///
+/// This is the Codex counterpart of `record/scenarios/claude.rs`'s
+/// `pending_approval`: noticing that a frame is (or is not) an approval
+/// request is driving, not validating, so nothing here checks the item type,
+/// the command text, the request order, or the shape of the surrounding
+/// transcript the way the deleted `approval/codex.rs` validators
+/// (`validate_codex_approval_request`, `validate_codex_on_request_approval`,
+/// `codex_approval_ids`, and everything upstream of them) did. Shared by both
+/// scenario bodies below because recognizing "this is an approval request"
+/// does not depend on which of the two scenarios is running.
+#[allow(dead_code)]
+fn pending_approval(frame: &Value) -> Option<Value> {
+    let method = frame["method"].as_str()?;
+    if !method.ends_with("/requestApproval") {
+        return None;
+    }
+    let id = frame.get("id")?;
+    (!id.is_null()).then(|| id.clone())
+}
+
+/// The `accept` reply for one approval request.
+///
+/// Production builds this envelope in `codex::rpc::RpcClient::respond`
+/// (`crates/harness/src/codex/rpc.rs:105-108`:
+/// `json!({"jsonrpc":"2.0","id":id,"result":result})`), and maps a real
+/// "allow" decision to the literal `"accept"` in
+/// `codex::approval::decision_literal`
+/// (`crates/harness/src/codex/approval.rs:256-265`:
+/// `ApprovalDecision::Allow | ApprovalDecision::AllowForSession => "accept"`).
+/// Neither is reachable from here: `codex/mod.rs` declares `mod approval;`
+/// and `mod rpc;` with no visibility keyword, so both stay private to
+/// `crate::codex` and its descendants — unlike `claude::wire`'s line
+/// builders, which `record/scenarios/claude.rs`'s `approval` calls directly
+/// (`control_response_line`/`allow_response` are `pub`). There is no
+/// crate-external production helper to route this through, so the envelope
+/// is hand-written here, pinned to both file:line above so a future reader
+/// can check it hasn't drifted.
+#[allow(dead_code)]
+fn accept_response(id: Value) -> String {
+    json!({"jsonrpc": "2.0", "id": id, "result": {"decision": "accept"}}).to_string()
+}
+
+/// Pump frames, answering every approval request `pending_approval`
+/// recognizes, until the provider's own terminal turn notification ends the
+/// loop. Shared by `approval` and `approval_on_request`, which differ only in
+/// which request they start (see each function's own doc comment).
+///
+/// No count, no order, no item-type check, no command-text check: the
+/// deleted `CodexApprovalState`/`CodexOnRequestState` and the validators that
+/// threaded them (`observe_codex_approval_*`, `validate_codex_approval_*`,
+/// `validate_on_request_item`, `validate_codex_on_request_approval`)
+/// enforced an exact "reviewed" contract — a fixed count and order of command
+/// executions, a single bounded file-change, one sandbox failure followed by
+/// exactly one retry — and bailed on any deviation, discarding a real,
+/// paid-for capture. Per design §3.2, only driving survives here: notice a
+/// request, answer it, keep going, and stop only when the provider itself
+/// says the turn is over.
+#[allow(dead_code)]
+async fn answer_every_approval(session: &mut Session<CodexProvider>) -> anyhow::Result<()> {
+    loop {
+        let Some(frame) = session.next_frame().await? else {
+            return protocol_stopped("Codex", "an approval request or a turn end");
+        };
+        if CodexProvider::turn_complete(&frame) {
+            return Ok(());
+        }
+        if let Some(id) = pending_approval(&frame) {
+            session.send(&accept_response(id)).await?;
+        }
+    }
+}
+
+/// Start a fresh thread and turn under `RuntimeMode::ApprovalRequired`, then
+/// answer every `item/fileChange/requestApproval` request the model makes
+/// until the turn ends. Ported from `recording.rs`'s deleted `codex_run`
+/// `CodexRunScript::Approval` arm, minus every validator listed on
+/// `answer_every_approval`'s doc comment.
+#[allow(dead_code)]
+pub(in crate::capture::record) async fn approval(
+    session: &mut Session<CodexProvider>,
+    input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    CodexProvider::handshake(session, input).await?;
+    let request = approval_request(input);
+    let thread_id = start_thread(session, &request).await?;
+    start_turn(session, &request, &thread_id).await?;
+    answer_every_approval(session).await
+}
+
+/// Same shape as [`approval`], differing only in which request it starts
+/// (`approval_on_request_request`, built from `input.approval_target` rather
+/// than `input.cwd`) and therefore which approval method Codex ends up
+/// asking about (`item/commandExecution/requestApproval` rather than
+/// `item/fileChange/requestApproval`) — `answer_every_approval` does not need
+/// to know which one it is answering. Ported from `recording.rs`'s deleted
+/// `codex_run` `CodexRunScript::ApprovalOnRequest` arm, minus every validator
+/// listed on `answer_every_approval`'s doc comment, including the mid-loop
+/// `require_empty_approval_target` recheck: decision #6 in the stage plan
+/// scopes the surviving pre-spawn fence to checks that "run before spawn,"
+/// and a recheck from inside this frame loop runs after it.
+#[allow(dead_code)]
+pub(in crate::capture::record) async fn approval_on_request(
+    session: &mut Session<CodexProvider>,
+    input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    CodexProvider::handshake(session, input).await?;
+    let request = approval_on_request_request(input)?;
+    let thread_id = start_thread(session, &request).await?;
+    start_turn(session, &request, &thread_id).await?;
+    answer_every_approval(session).await
 }
 
 #[cfg(test)]
@@ -843,5 +1016,159 @@ mod tests {
             resume_line["params"],
             crate::codex::thread_resume_params(&resume_request(&input).unwrap(), "resume-success")
         );
+    }
+
+    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for `approval`.
+    #[test]
+    fn approval_launch_uses_the_production_run_launch() {
+        let exe = absolute_program("codex");
+        let input = ScenarioInput::default();
+
+        let launch = approval_launch(&input, &exe).unwrap();
+        let expected = crate::codex::run_launch(&exe, &approval_request(&input));
+
+        assert_eq!(
+            CommandSnapshot::from_launch(&launch),
+            CommandSnapshot::from_launch(&expected)
+        );
+    }
+
+    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for
+    /// `approval_on_request`.
+    #[test]
+    fn approval_on_request_launch_uses_the_production_run_launch() {
+        let exe = absolute_program("codex");
+        let input = ScenarioInput {
+            approval_target: Some(std::path::PathBuf::from("target-dir")),
+            ..ScenarioInput::default()
+        };
+
+        let launch = approval_on_request_launch(&input, &exe).unwrap();
+        let expected =
+            crate::codex::run_launch(&exe, &approval_on_request_request(&input).unwrap());
+
+        assert_eq!(
+            CommandSnapshot::from_launch(&launch),
+            CommandSnapshot::from_launch(&expected)
+        );
+    }
+
+    /// The validator deletion, proven: a fake Codex that raises two
+    /// `.../requestApproval` requests in a row for each scenario — neither checked for count,
+    /// order or item shape — must have both answered with an `accept` reply carrying that
+    /// request's own id. The deleted `CodexApprovalState`/`CodexOnRequestState` and the
+    /// validators that threaded them would have bailed the instant a second, unaccounted-for
+    /// request id showed up (or, for `approval`, the instant anything but the single reviewed
+    /// file-change request appeared at all); `pending_approval` has no such bookkeeping, so it
+    /// just keeps answering.
+    ///
+    /// Parameterized over both scenarios: `approval` against `fake-codex`'s
+    /// `capture_approval_two_requests` (dispatched on a substring of the real
+    /// `codex_approval_prompt` text), `approval_on_request` against
+    /// `capture_approval_on_request_two_requests` (dispatched on a substring of the real
+    /// `approval_on_request_prompt` text) — both additive branches, same rationale as
+    /// `fake_codex.rs`'s `steer`/`interrupt` branches matching `steer_request`/
+    /// `interruption_request`'s real production text.
+    #[tokio::test]
+    async fn codex_approval_scenarios_answer_every_request_they_see() {
+        let raw = tempfile::tempdir().unwrap();
+        let executable = fixture_path("fake-codex");
+        let input = ScenarioInput::default();
+        let launch = approval_launch(&input, &executable).unwrap();
+        let cfg = config(
+            "codex-approval",
+            executable,
+            CaptureOperation::Codex(CodexCaptureOperation::Run {
+                request: approval_request(&input),
+                script: CodexRunScript::Approval,
+            }),
+            raw.path(),
+        );
+        let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
+            .await
+            .unwrap();
+        // Bounded, like `record/scenarios/claude.rs`'s equivalent test: the fixture reads a
+        // reply off stdin before emitting its next request, so a driver that stops answering
+        // does not error, it blocks forever.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            approval(&mut session, &input),
+        )
+        .await
+        .expect(
+            "approval must answer every request instead of leaving the fixture blocked on a reply",
+        )
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let capture = session.finish(deadline).await.unwrap();
+        let decisions: Vec<Value> = channel_payloads(&capture, Channel::Stdin)
+            .into_iter()
+            .filter(|line| line.contains("\"decision\""))
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            decisions
+                .iter()
+                .map(|reply| reply["id"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!(0), json!(1)],
+            "both approval requests must be answered, in the order they arrived: {decisions:?}"
+        );
+        assert!(
+            decisions
+                .iter()
+                .all(|reply| reply["result"]["decision"] == "accept"),
+            "every reply must accept: {decisions:?}"
+        );
+        assert_eq!(capture.exit_code, Some(0));
+
+        let raw = tempfile::tempdir().unwrap();
+        let executable = fixture_path("fake-codex");
+        let input = ScenarioInput {
+            approval_target: Some(std::path::PathBuf::from("target-dir")),
+            ..ScenarioInput::default()
+        };
+        let launch = approval_on_request_launch(&input, &executable).unwrap();
+        let cfg = config(
+            "codex-approval-on-request",
+            executable,
+            CaptureOperation::Codex(CodexCaptureOperation::Run {
+                request: approval_on_request_request(&input).unwrap(),
+                script: CodexRunScript::ApprovalOnRequest,
+            }),
+            raw.path(),
+        );
+        let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            approval_on_request(&mut session, &input),
+        )
+        .await
+        .expect("approval_on_request must answer every request instead of leaving the fixture blocked on a reply")
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let capture = session.finish(deadline).await.unwrap();
+        let decisions: Vec<Value> = channel_payloads(&capture, Channel::Stdin)
+            .into_iter()
+            .filter(|line| line.contains("\"decision\""))
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            decisions
+                .iter()
+                .map(|reply| reply["id"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!(0), json!(1)],
+            "both approval requests must be answered, in the order they arrived: {decisions:?}"
+        );
+        assert!(
+            decisions
+                .iter()
+                .all(|reply| reply["result"]["decision"] == "accept"),
+            "every reply must accept: {decisions:?}"
+        );
+        assert_eq!(capture.exit_code, Some(0));
     }
 }

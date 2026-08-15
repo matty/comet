@@ -11,12 +11,13 @@ use crate::capture::{CaptureConfig, CaptureOperation, CodexCaptureOperation, Cod
 pub(super) const CODEX_APPROVAL_COMMAND: &str = "echo capture";
 // `pub(in crate::capture)`, not `pub(super)`: Task 4 moved `claude_approval_prompt` (the sole
 // other consumer of these two constants) out to
-// `capture::record::scenarios::claude`, which needs to read them from there. Everything else
-// that reads them — `codex_approval_prompt` and `validate_ordinary_approval_marker` below — is
-// still local to this module, so only the visibility widens, not the constants' home.
+// `capture::record::scenarios::claude`, which needs to read them from there. `codex_approval_prompt`
+// below is still local to this module, so only the visibility widens, not the constants' home.
+// (Task 6 deleted this module's other former reader, `validate_ordinary_approval_marker` — a
+// post-completion evidence check, not a pre-spawn one, so it did not qualify for the fence this
+// module keeps under decision #6.)
 pub(in crate::capture) const APPROVAL_MARKER_NAME: &str = "capture-marker.txt";
 pub(in crate::capture) const APPROVAL_MARKER_CONTENT: &str = "capture\n";
-pub(super) const APPROVAL_MARKER_ADD_DIFF: &str = APPROVAL_MARKER_CONTENT;
 
 pub fn codex_approval_prompt(cwd: &Path) -> String {
     let marker = cwd.join(APPROVAL_MARKER_NAME);
@@ -217,24 +218,6 @@ pub(in crate::capture) fn validate_ordinary_approval_cwd(
         bail!("Codex approval marker must be absent before file approval.");
     }
     Ok(identity)
-}
-
-pub(in crate::capture) fn validate_ordinary_approval_marker(cwd: &Path) -> anyhow::Result<()> {
-    let marker = cwd.join(APPROVAL_MARKER_NAME);
-    let metadata = std::fs::symlink_metadata(&marker)
-        .map_err(|_| anyhow!("Codex approval marker was not created."))?;
-    if !metadata.file_type().is_file()
-        || metadata.file_type().is_symlink()
-        || has_windows_reparse_point(&metadata)
-    {
-        bail!("Codex approval marker was not a regular non-reparse file.");
-    }
-    let content = std::fs::read_to_string(marker)
-        .map_err(|_| anyhow!("Codex approval marker could not be read."))?;
-    if content != APPROVAL_MARKER_CONTENT {
-        bail!("Codex approval marker did not contain the exact bounded content.");
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

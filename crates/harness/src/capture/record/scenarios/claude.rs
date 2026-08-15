@@ -398,9 +398,8 @@ const CLAUDE_APPROVAL_COMMAND: &str = "printf capture";
 /// the scenario body that sends it, same as `claude_checklist_prompt` above.
 /// `APPROVAL_MARKER_NAME`/`APPROVAL_MARKER_CONTENT` stay defined in
 /// `capture::approval::common` rather than moving here too, because Codex's
-/// `codex_approval_prompt` and `validate_ordinary_approval_marker` (both
-/// still driven from `recording.rs`) read the same two constants; only this
-/// function's own home moved.
+/// `codex_approval_prompt` (`record/scenarios/codex.rs`'s `approval`) reads
+/// the same two constants; only this function's own home moved.
 #[allow(dead_code)]
 fn claude_approval_prompt(cwd: &Path) -> String {
     let marker = cwd.join(APPROVAL_MARKER_NAME);

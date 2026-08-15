@@ -4,8 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail};
-use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::mpsc;
 
@@ -14,13 +13,8 @@ use comet_proto::RunRequest;
 #[cfg(test)]
 use super::SanitizationError;
 use super::approval::{
-    CodexApprovalState, CodexOnRequestState, DirectoryIdentity, FileIdentity,
-    approval_marker_command, observe_codex_approval_file_item, observe_codex_approval_routine_item,
-    observe_codex_approval_turn_started, repository_root, require_empty_approval_target,
-    resolve_trusted_powershell, validate_codex_approval_command_event,
-    validate_codex_approval_lifecycle, validate_codex_approval_request,
-    validate_codex_on_request_approval, validate_on_request_item, validate_on_request_preflight,
-    validate_ordinary_approval_cwd, validate_ordinary_approval_marker,
+    FileIdentity, repository_root, resolve_trusted_powershell, validate_on_request_preflight,
+    validate_ordinary_approval_cwd,
 };
 use super::types::{
     CaptureConfig, CaptureEvent, CaptureOperation, Channel, ClaudeCaptureOperation,
@@ -52,7 +46,6 @@ fn capture_redaction_roots(
     }
 }
 
-const CODEX_INITIALIZED_LINE: &str = r#"{"jsonrpc":"2.0","method":"initialized"}"#;
 const READER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -79,11 +72,15 @@ struct RecordingSession {
     purpose: String,
     command: CommandSnapshot,
     approval_target: Option<PathBuf>,
-    approval_target_identity: Option<DirectoryIdentity>,
-    approval_cwd_identity: Option<DirectoryIdentity>,
     trusted_powershell: Option<FileIdentity>,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
+    // Never read: its sole reader, `next_stdout`, was deleted along with
+    // `codex_run`'s driving body (every `CodexRunScript` now bails before
+    // reading a line). Still populated so the reader task that feeds it has
+    // somewhere to send, matching `claude_run`'s equivalent dead weight above
+    // — both disappear together when Task 7 deletes this file.
+    #[allow(dead_code)]
     stdout_lines: mpsc::UnboundedReceiver<String>,
     readers: Vec<tokio::task::JoinHandle<()>>,
     events: Arc<Mutex<Vec<CaptureEvent>>>,
@@ -114,18 +111,25 @@ impl RecordingSession {
             CaptureOperation::Claude(_) => Provider::Claude,
             CaptureOperation::Codex(_) => Provider::Codex,
         };
-        let (trusted_powershell, approval_cwd_identity) = match &config.scenario.operation {
+        // Both pre-spawn checks below still run and can still bail — nothing
+        // in this task touches the fence (decision #6 in the stage plan:
+        // "every one of those runs before spawn"). Only the *identity* they
+        // resolved stopped being stored: `codex_run`'s mid-loop rechecks
+        // against it are gone along with the rest of that function (this
+        // task's `record/scenarios/codex.rs::approval` does not repeat them
+        // — see that function's own doc comment), so nothing downstream of
+        // `start` ever reads it again.
+        let trusted_powershell = match &config.scenario.operation {
             CaptureOperation::Codex(CodexCaptureOperation::Run {
                 request,
                 script: CodexRunScript::Approval,
             }) => {
                 let cwd = Path::new(&request.cwd);
-                (
-                    Some(resolve_trusted_powershell(cwd, &config.raw_root)?),
-                    Some(validate_ordinary_approval_cwd(cwd, None, true)?),
-                )
+                let trusted = resolve_trusted_powershell(cwd, &config.raw_root)?;
+                validate_ordinary_approval_cwd(cwd, None, true)?;
+                Some(trusted)
             }
-            _ => (None, None),
+            _ => None,
         };
         let executable = resolve_executable(provider, config.executable.as_ref())?;
         let launch = select_launch(&config, &executable)?;
@@ -222,8 +226,6 @@ impl RecordingSession {
             purpose: config.scenario.purpose.into(),
             command,
             approval_target: config.approval_target,
-            approval_target_identity,
-            approval_cwd_identity,
             trusted_powershell,
             child: Some(child),
             stdin: Some(stdin),
@@ -362,287 +364,36 @@ impl RecordingSession {
         );
     }
 
-    /// Approval and on-request approval only, from this task onward:
-    /// `fresh-text`/`resume`/`steer`/`interruption` moved to
-    /// `record/scenarios/codex.rs`'s `fresh_text`/`resume`/`steer`/
-    /// `interruption`. Everything that existed here only to serve those four
-    /// — the `thread/resume` vs `thread/start` selection, the resume-identity
-    /// bail, the scripted steer/interrupt send and its reply bookkeeping, and
-    /// the terminal-frame bail for anything but `Approval`/`ApprovalOnRequest`
-    /// — is deleted along with them, not merely superseded: the
-    /// resume-rejection bail and the generic "must end in turn/completed"
-    /// bail were themselves exactly the "frame check that aborts" class this
-    /// stage's design removes (§3.2), and the ported `resume`/`steer`/
-    /// `interruption` reproduce the parts of that which are driving rather
-    /// than validating (see their own doc comments). `Approval`/
-    /// `ApprovalOnRequest` keep every one of their validators untouched —
-    /// Task 6's scope, not this one's.
+    /// Every Codex run script — `fresh-text`/`resume`/`steer`/`interruption`
+    /// (ported in the task before this one) and now `approval`/
+    /// `approval-on-request` too, i.e. every `CodexRunScript` variant — is
+    /// ported to `record/scenarios/codex.rs`. Nothing reaches this function
+    /// through a real capture any more, for the same reason `claude_run`'s
+    /// doc comment gives: `capture::record()` still falls back to
+    /// `recording::record` for every `Run` operation until the SCENARIOS
+    /// table is wired in (Task 7), and `comet-provider-capture.rs` still
+    /// constructs and dispatches all six scripts, so the fallback route stays
+    /// live traffic, not dead code — an accidental invocation here would
+    /// otherwise silently drive a duplicate, unreviewed implementation of
+    /// already-ported behavior against a real (token-spending) CLI. Bailing
+    /// immediately, before a single line reaches the child's stdin, costs
+    /// nothing: the process was already spawned by `RecordingSession::start`,
+    /// but `finish()`'s `DriverError` path (`terminate_and_reap`) kills it
+    /// having sent no prompt, so no tokens are spent.
     ///
-    /// The four ported scripts still reach this function through live
-    /// traffic: `capture::record()` falls back to `recording::record` for
-    /// every `Run` operation until the SCENARIOS table is wired in (Task 7),
-    /// and `comet-provider-capture.rs` still constructs and dispatches all
-    /// six `CodexRunScript` values, `Resume`/`Steer`/`Interruption` included.
-    /// Without an explicit bail, this stripped-down body would silently
-    /// mis-drive them: `Resume` would send `thread/start` and record a fresh
-    /// thread archived as a resume (the exact mislabeling
-    /// `codex_resume_never_falls_back_to_a_fresh_thread` exists to catch,
-    /// just reached through the fallback path that test does not cover),
-    /// `Steer`/`Interruption` would never send their action at all, and the
-    /// bare `_ => {}` in the terminal match below would let all three exit 0
-    /// — a clean-looking, wrong archive with no signal, spending real
-    /// provider tokens to produce it. Bailing first, before a single line
-    /// reaches the child's stdin, costs nothing: `RecordingSession::start`
-    /// already spawned the process, but `finish()`'s `DriverError` path
-    /// (`terminate_and_reap`) kills it having sent no prompt. This bail and
-    /// everything below it for `FreshText`/`Resume`/`Steer`/`Interruption`
-    /// disappears with the rest of `recording.rs` in Task 7.
+    /// This entire function, like `claude_run` above, is dead weight that
+    /// Task 7 deletes along with the rest of `recording.rs`. `script` is kept
+    /// (not `_script`) purely so the message below still names which script
+    /// was rejected.
     async fn codex_run(
         &mut self,
-        request: RunRequest,
+        _request: RunRequest,
         script: CodexRunScript,
     ) -> anyhow::Result<()> {
-        if matches!(
-            script,
-            CodexRunScript::FreshText
-                | CodexRunScript::Resume
-                | CodexRunScript::Steer
-                | CodexRunScript::Interruption
-        ) {
-            bail!(
-                "Codex {script:?} is ported to record/scenarios/codex.rs and is not driven from \
-                 here any more; the SCENARIOS table wires it into capture::record in Task 7."
-            );
-        }
-        let mut next_id = 1_u64;
-        self.write_line(&codex_initialize_line()).await?;
-        self.codex_reply(next_id).await?;
-        next_id += 1;
-        self.write_line(CODEX_INITIALIZED_LINE).await?;
-
-        self.write_line(&rpc_request(
-            next_id,
-            "thread/start",
-            crate::codex::thread_start_params(&request),
-        ))
-        .await?;
-        let thread_reply = self.codex_reply(next_id).await?;
-        next_id += 1;
-        let thread_id = thread_reply["result"]["thread"]["id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
-        if thread_id.is_empty() {
-            return protocol_stopped("Codex", "thread identifier");
-        }
-        self.write_line(&rpc_request(
-            next_id,
-            "turn/start",
-            crate::codex::turn_start_params(&request, &thread_id, &request.prompt),
-        ))
-        .await?;
-
-        let mut approval = CodexApprovalState::default();
-        let mut on_request = CodexOnRequestState::default();
-        let expected_on_request_command = if matches!(script, CodexRunScript::ApprovalOnRequest) {
-            Some(approval_marker_command(
-                self.approval_target.as_deref().ok_or_else(|| {
-                    anyhow!("Codex on-request capture has no validated approval target.")
-                })?,
-            ))
-        } else {
-            None
-        };
-        while let Some(line) = self.next_stdout().await? {
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            let method = value["method"].as_str().unwrap_or_default();
-            if matches!(script, CodexRunScript::Approval) && method == "turn/started" {
-                observe_codex_approval_turn_started(&value, &thread_id, &mut approval)?;
-            }
-            if matches!(script, CodexRunScript::Approval)
-                && matches!(method, "item/started" | "item/completed")
-            {
-                match value["params"]["item"]["type"].as_str() {
-                    Some("commandExecution") => validate_codex_approval_command_event(
-                        &value,
-                        method,
-                        Path::new(&request.cwd),
-                        self.trusted_powershell.as_ref().ok_or_else(|| {
-                            anyhow!("Codex approval capture has no trusted PowerShell identity.")
-                        })?,
-                        &mut approval,
-                    )?,
-                    Some("fileChange") if method == "item/started" => {
-                        observe_codex_approval_file_item(
-                            &value,
-                            Path::new(&request.cwd),
-                            &mut approval,
-                        )?
-                    }
-                    Some("fileChange") => {
-                        bail!("Codex approval capture observed an extra file-change action.")
-                    }
-                    Some("userMessage" | "reasoning" | "agentMessage") => {
-                        observe_codex_approval_routine_item(&value, method, &mut approval)?
-                    }
-                    _ => bail!("Codex approval capture observed an unreviewed item type."),
-                }
-            }
-            if matches!(
-                script,
-                CodexRunScript::Approval | CodexRunScript::ApprovalOnRequest
-            ) && method.ends_with("/requestApproval")
-            {
-                if matches!(script, CodexRunScript::Approval) {
-                    validate_codex_approval_request(
-                        &value,
-                        method,
-                        Path::new(&request.cwd),
-                        &mut approval,
-                    )?;
-                    validate_ordinary_approval_cwd(
-                        Path::new(&request.cwd),
-                        self.approval_cwd_identity.as_ref(),
-                        true,
-                    )?;
-                } else {
-                    validate_codex_on_request_approval(
-                        &value,
-                        method,
-                        expected_on_request_command
-                            .as_deref()
-                            .expect("on-request command configured"),
-                        &mut on_request,
-                    )?;
-                    let target = self.approval_target.as_deref().ok_or_else(|| {
-                        anyhow!("Codex on-request capture has no validated approval target.")
-                    })?;
-                    require_empty_approval_target(target, self.approval_target_identity.as_ref())?;
-                }
-                self.write_line(
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": value["id"],
-                        "result": {"decision": "accept"},
-                    })
-                    .to_string(),
-                )
-                .await?;
-            }
-            if matches!(script, CodexRunScript::ApprovalOnRequest)
-                && method == "item/completed"
-                && value["params"]["item"]["type"] == "commandExecution"
-            {
-                validate_on_request_item(
-                    &value,
-                    expected_on_request_command
-                        .as_deref()
-                        .expect("on-request command configured"),
-                    &mut on_request,
-                )?;
-            }
-            if matches!(method, "turn/completed" | "turn/failed" | "turn/aborted") {
-                if matches!(script, CodexRunScript::Approval) {
-                    validate_codex_approval_lifecycle(&value, &approval)?;
-                }
-                match script {
-                    CodexRunScript::Approval => {
-                        validate_ordinary_approval_cwd(
-                            Path::new(&request.cwd),
-                            self.approval_cwd_identity.as_ref(),
-                            false,
-                        )?;
-                        if method != "turn/completed"
-                            || approval.stage != 11
-                            || approval.command_items.len() != 5
-                            || approval.command_completions.len() != 4
-                            || approval.file_change_approvals != 1
-                            || !approval.routine_items.is_empty()
-                        {
-                            bail!(
-                                "Codex approval capture did not complete after the exact bounded command phase, file-change approval, and marker write."
-                            );
-                        }
-                        validate_ordinary_approval_marker(Path::new(&request.cwd))?;
-                    }
-                    CodexRunScript::ApprovalOnRequest => {
-                        if method != "turn/completed" || on_request.stage != 3 {
-                            bail!(
-                                "Codex on-request approval did not complete the required failure, approval, retry sequence."
-                            );
-                        }
-                        let target = self.approval_target.as_deref().ok_or_else(|| {
-                            anyhow!("Codex on-request capture has no validated approval target.")
-                        })?;
-                        let marker = tokio::fs::read_to_string(target.join("approval-marker.txt"))
-                            .await
-                            .map_err(|_| {
-                                anyhow!(
-                                    "Codex on-request capture did not create its bounded marker."
-                                )
-                            })?;
-                        if marker != "capture" {
-                            bail!(
-                                "Codex on-request capture marker did not contain the expected value."
-                            );
-                        }
-                    }
-                    // `FreshText`/`Resume`/`Steer`/`Interruption`: no bail here any
-                    // more — whichever terminal frame the provider actually sent is
-                    // the capture, per this stage's design (§3.2). The old bail
-                    // ("must be exactly turn/completed", or turn/aborted with a
-                    // matching id for Steer/Interruption) was itself a frame check
-                    // that aborted a real, paid-for result instead of recording it;
-                    // their own driving now lives in `record/scenarios/codex.rs`.
-                    _ => {}
-                }
-                return Ok(());
-            }
-        }
-        protocol_stopped("Codex", "terminal turn notification")
-    }
-
-    async fn codex_reply(&mut self, id: u64) -> anyhow::Result<Value> {
-        while let Some(line) = self.next_stdout().await? {
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if value["id"].as_u64() == Some(id) {
-                return Ok(value);
-            }
-        }
-        protocol_stopped("Codex", "JSON-RPC reply")
-    }
-
-    async fn write_line(&mut self, line: &str) -> anyhow::Result<()> {
-        let Some(stdin) = self.stdin.as_mut() else {
-            return protocol_stopped(provider_name(self.provider), "stdin channel");
-        };
-        push_event(&self.events, Channel::Stdin, line.to_owned());
-        stdin.write_all(line.as_bytes()).await.map_err(|err| {
-            tracing::debug!(provider = provider_name(self.provider), %err, "capture stdin write failed");
-            anyhow!(
-                "The provider stopped accepting capture input. Retry with a current CLI version."
-            )
-        })?;
-        stdin.write_all(b"\n").await.map_err(|err| {
-            tracing::debug!(provider = provider_name(self.provider), %err, "capture stdin newline write failed");
-            anyhow!(
-                "The provider stopped accepting capture input. Retry with a current CLI version."
-            )
-        })?;
-        stdin.flush().await.map_err(|err| {
-            tracing::debug!(provider = provider_name(self.provider), %err, "capture stdin flush failed");
-            anyhow!(
-                "The provider stopped accepting capture input. Retry with a current CLI version."
-            )
-        })
-    }
-
-    async fn next_stdout(&mut self) -> anyhow::Result<Option<String>> {
-        Ok(self.stdout_lines.recv().await)
+        bail!(
+            "Codex {script:?} is ported to record/scenarios/codex.rs and is not driven from here \
+             any more; the SCENARIOS table wires it into capture::record in Task 7."
+        );
     }
 
     async fn wait_for_exit(&mut self) -> anyhow::Result<Option<i32>> {
@@ -809,15 +560,6 @@ fn provider_name(provider: Provider) -> &'static str {
     }
 }
 
-fn protocol_stopped<T>(provider: &str, expected: &str) -> anyhow::Result<T> {
-    tracing::debug!(
-        provider,
-        expected,
-        "capture protocol ended before expected response"
-    );
-    bail!("{provider} stopped before the expected {expected}. Retry with a current CLI version.")
-}
-
 async fn probe_version(executable: &std::path::Path) -> String {
     let mut command = tokio::process::Command::new(executable);
     command
@@ -892,55 +634,12 @@ fn persist_immutable_bytes(directory: &Path, bytes: &[u8]) -> std::io::Result<()
     result
 }
 
-fn codex_initialize_line() -> String {
-    json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "clientInfo": {
-                "name": "comet-native",
-                "title": "Comet",
-                "version": env!("CARGO_PKG_VERSION"),
-            },
-            "capabilities": {"experimentalApi": true},
-        },
-    })
-    .to_string()
-}
-
-fn rpc_request(id: u64, method: &str, params: Value) -> String {
-    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string()
-}
-
-#[cfg(test)]
-pub(super) async fn failed_session_stdin(config: CaptureConfig) -> (String, Vec<String>) {
-    let mut session = RecordingSession::start(config).await.unwrap();
-    let result = session.finish().await;
-    let stdin = session
-        .events
-        .lock()
-        .expect("capture event lock")
-        .iter()
-        .filter(|event| event.channel == Channel::Stdin)
-        .map(|event| event.payload.clone())
-        .collect();
-    (
-        result
-            .expect_err("unsafe scenario must fail before approval")
-            .to_string(),
-        stdin,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use comet_proto::{RunRequest, RuntimeMode};
     use serde_json::Value;
 
     use super::RecordingSession;
-    #[cfg(windows)]
-    use super::record;
     use crate::capture::test_support::{config, fixture_path};
     use crate::capture::{
         CaptureOperation, ClaudeCaptureOperation, ClaudeRunScript, CodexCaptureOperation,
@@ -1101,29 +800,6 @@ mod tests {
             "partial evidence bypassed explicit rejection: {error:?}"
         );
         assert!(!staging.exists());
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn zero_approval_cannot_be_relabelled_success() {
-        let raw = tempfile::tempdir().unwrap();
-        let codex_request = RunRequest {
-            prompt: "scenario:capture-fresh".into(),
-            cwd: std::env::temp_dir().display().to_string(),
-            ..RunRequest::for_session(RuntimeMode::ApprovalRequired)
-        };
-        let error = record(config(
-            "codex-approval",
-            fixture_path("fake-codex"),
-            CaptureOperation::Codex(CodexCaptureOperation::Run {
-                request: codex_request,
-                script: CodexRunScript::Approval,
-            }),
-            raw.path(),
-        ))
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("turn lifecycle"), "{error}");
     }
 
     #[cfg(unix)]

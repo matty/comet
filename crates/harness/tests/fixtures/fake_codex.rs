@@ -330,6 +330,21 @@ fn main() {
         capture_on_request(&mut stdin, &turn_line, &tid, json!(401), false);
     } else if turn_line.contains("scenario:capture-approval") {
         capture_approval(&mut stdin, &tid);
+    } else if turn_line.contains("three separate times, then add exactly one file")
+        // The real production prompt from `record/scenarios/codex.rs`'s
+        // `approval_request` (built through `codex_approval_prompt`),
+        // additive alongside the `scenario:capture-approval` test marker
+        // above — same rationale as the `steer`/`interrupt` branches below —
+        // so the ported `approval` scenario's own tests can drive this
+        // branch through their real production request builder.
+        || turn_line.contains("Run this exact command once and report success:")
+    // Same rationale, for `approval_on_request_request`'s real production
+    // prompt (built through `approval_on_request_prompt`). The prefix is
+    // stable across platforms even though the embedded command text
+    // after it is not (`approval_marker_command` differs on Windows vs.
+    // Unix).
+    {
+        capture_approval_two_requests(&mut stdin, &tid);
     } else if turn_line.contains("scenario:capture-fresh")
         // Additive alongside the `scenario:capture-fresh` test marker, same
         // rationale as the `steer`/`interrupt` branches below — the real
@@ -387,6 +402,29 @@ fn simple_completed(tid: &str) {
         r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
     ));
     emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+}
+
+/// Two `.../requestApproval` requests, each read back before the next is
+/// emitted, then a terminal `turn/completed`. Drives
+/// `record/scenarios/codex.rs`'s `approval` and `approval_on_request`
+/// scenario bodies, which (unlike the deleted `approval/codex.rs`
+/// validators this replaces) do not care which approval method is asked
+/// about, how many command executions preceded it, or in what order; they
+/// only have to answer every `.../requestApproval` request they see. The
+/// method name here (`item/fileChange/requestApproval`) is arbitrary for
+/// this purpose — `pending_approval` in the production driver recognizes any
+/// method ending in `/requestApproval` — so one fixture body serves both
+/// dispatch branches above.
+fn capture_approval_two_requests(stdin: &mut StdinLock<'_>, tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(r#"{"id":0,"method":"item/fileChange/requestApproval","params":{"itemId":"f1"}}"#);
+    let _ = read_line(stdin);
+    emit(r#"{"id":1,"method":"item/fileChange/requestApproval","params":{"itemId":"f2"}}"#);
+    let _ = read_line(stdin);
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
 }
 

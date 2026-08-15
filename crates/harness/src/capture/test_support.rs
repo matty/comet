@@ -125,14 +125,6 @@ pub(super) fn channel_payloads(capture: &RawCapture, channel: Channel) -> Vec<&s
         .collect()
 }
 
-pub(super) fn contains_response_id(lines: &[String], id: u64) -> bool {
-    lines.iter().any(|line| {
-        serde_json::from_str::<serde_json::Value>(line)
-            .ok()
-            .is_some_and(|value| value["id"].as_u64() == Some(id))
-    })
-}
-
 pub(super) fn find_named_file(root: &Path, name: &str) -> bool {
     std::fs::read_dir(root).is_ok_and(|entries| {
         entries.filter_map(Result::ok).any(|entry| {
