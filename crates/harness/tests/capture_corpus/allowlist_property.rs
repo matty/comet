@@ -1,14 +1,37 @@
-//! Every scalar in every committed frame is either at an allowlisted path or
-//! is a placeholder.
+//! Every scalar in every committed `events.jsonl` is either at an
+//! allowlisted path or is a placeholder.
 //!
 //! This replaces thirty-one example-based tests (`sanitizer_semantics.rs`,
 //! deleted by this same change) that each asserted one particular shape gets
 //! redacted -- "does a Codex reasoning summary get typed as prose," "does a
 //! thinking signature get typed by shape." Under an allowlist those questions
 //! stop existing: unlisted means replaced, no recognition involved. What
-//! replaces them is a **total property** over the whole archive, not a
+//! replaces them is a **total property** over the frame evidence, not a
 //! sample of it -- it asserts nothing anywhere escaped, over every committed
-//! byte, and it keeps holding for captures that do not exist yet.
+//! `events.jsonl` byte, and it keeps holding for captures that do not exist
+//! yet.
+//!
+//! **Scope: `events.jsonl` only, not the whole corpus directory.** A handful
+//! of committed files were never in `sanitize_dir`'s remit and this walk does
+//! not visit them: `observed-fields.json` (a generated field-name snapshot,
+//! not evidence), each scenario's `README.md`, and
+//! `claude/2.1.229/subagent/read-back-run-journal.jsonl` /
+//! `read-back-doc-snapshot.json` (a *different* session's read-back evidence,
+//! hand-sanitized by an earlier slice to its own documented standard -- see
+//! that directory's `README.md`). A green run here certifies the frame
+//! evidence, not literally every byte under `tests/corpus/`.
+//!
+//! **What a green run does *not* certify.** This property only ever inspects
+//! the content of a scalar it is about to call an escape (an unlisted path,
+//! or the `mcp__` exception below) -- a value that is genuinely kept because
+//! its path is allowed is never inspected for what it contains. That is
+//! `sanitize_dir`'s job (the fail-closed scans in
+//! `crates/harness/src/capture/sanitize.rs`, covered by
+//! `sanitizer_safety.rs`), not this property's. A green result here means
+//! "clean at every unlisted path," on the assumption the corpus came from
+//! `sanitize_dir` and was never hand-edited afterward -- it does not mean
+//! "the archive contains no credential or path," because an allowlisted
+//! field is exactly the place this test does not look.
 //!
 //! Deliberately red at the commit that adds it. The committed corpus was
 //! sanitized by the blocklist this stage replaces, and the blocklist let
@@ -29,6 +52,12 @@ use serde_json::Value;
 /// says. Carries no value: echoing the value here would make this failure
 /// message a second copy of exactly what the allowlist exists to withhold,
 /// and this message lands in terminals and PR bodies.
+///
+/// `path` itself can still carry a map key verbatim (Claude's `.modelUsage`
+/// is keyed by model id), the same caveat `NovelPath`'s own doc comment
+/// records in `sanitize.rs` -- an object key is never a *value* this struct
+/// withholds, and `validate_key` fail-closed-scans every key before it can
+/// reach here.
 struct Escape {
     scenario: String,
     sequence: u64,
@@ -134,12 +163,7 @@ fn check_scenario(
                 let mut scalars = Vec::new();
                 collect_scalars(&value, "", &mut scalars);
                 for (path, scalar) in scalars {
-                    if allows(provider, &path) {
-                        continue;
-                    }
-                    let is_placeholder =
-                        matches!(&scalar, Value::String(text) if placeholders.contains(text));
-                    if !is_placeholder {
+                    if is_escape(provider, &path, &scalar, placeholders) {
                         escapes.push(Escape {
                             scenario: scenario.to_owned(),
                             sequence,
@@ -200,6 +224,44 @@ fn collect_scalars(value: &Value, path: &str, out: &mut Vec<(String, Value)>) {
     }
 }
 
+/// Whether the scalar at `path` counts as an escape: present verbatim, not a
+/// placeholder, at a spot the allowlist does not license.
+///
+/// Mirrors `Redactor::sanitize_scalar`'s own condition in `sanitize.rs`
+/// exactly -- `if path_allowed && !is_mcp_tool_identity(value)` -- not just
+/// `allows(provider, path)` alone. Getting this half wrong is not a
+/// hypothetical: an allowlisted path is a decision about the *field*, not a
+/// licence for whatever a provider puts in it, and six of Claude's allowed
+/// paths hold a tool name (`.event.content_block.name`, `.last_tool_name`,
+/// `.message.content[].content[].tool_name`, `.message.content[].name`,
+/// `.request.tool_name`, `.tool_use_result.matches[]`). An MCP invocation
+/// puts `mcp__<server>__<tool>` in that same field, which embeds the exact
+/// server identity `.mcp_servers[].name` and `.tools[]` are excluded to
+/// protect -- so a value shaped like that must still be a placeholder even
+/// though its path is on the list, and checking `allows` alone would call it
+/// clean. See `is_mcp_tool_identity`'s own doc comment in `sanitize.rs` for
+/// the reviewed reasoning behind the exception itself.
+fn is_escape(
+    provider: Provider,
+    path: &str,
+    scalar: &Value,
+    placeholders: &BTreeSet<String>,
+) -> bool {
+    let kept_verbatim = allows(provider, path) && !is_mcp_tool_identity(scalar);
+    if kept_verbatim {
+        return false;
+    }
+    !matches!(scalar, Value::String(text) if placeholders.contains(text))
+}
+
+/// Local mirror of the private `is_mcp_tool_identity` in `sanitize.rs` --
+/// same name, same one-line rule (a string starting with the MCP tool-name
+/// prefix), kept in lockstep by the `self_check` test below rather than by
+/// visibility this test binary cannot reach across the crate boundary.
+fn is_mcp_tool_identity(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| text.starts_with("mcp__"))
+}
+
 /// The provider and the full set of placeholder strings a scenario's own
 /// manifest recorded as actually used (`manifest["placeholders"][].placeholder`).
 ///
@@ -252,11 +314,13 @@ mod self_check {
     //! sanitizer and cross-checks every scalar's path against its real
     //! allow/placeholder outcome.
 
+    use std::collections::BTreeSet;
+
     use comet_harness::capture::{Provider, allows, sanitize_dir};
     use serde_json::Value;
 
     use super::super::support::{staging_dir, write_raw_capture};
-    use super::collect_scalars;
+    use super::{collect_scalars, is_escape};
 
     #[test]
     fn collect_scalars_paths_agree_with_the_real_sanitizer() {
@@ -265,7 +329,7 @@ mod self_check {
             temp.path(),
             "path-equivalence",
             &[
-                r#"{"type":"user","mystery":"unlisted-value","nested":{"list":[{"unknown":"a"},{"unknown":"b"}]},"mcp_servers":[{"status":"connected"}]}"#,
+                r#"{"type":"user","mystery":"unlisted-value","nested":{"list":[{"unknown":"a"},{"unknown":"b"}]},"mcp_servers":[{"status":"connected"}],"request":{"tool_name":"mcp__claude_ai_Gmail__search_threads"}}"#,
             ],
         );
         let report = sanitize_dir(&raw, &staging_dir(temp.path(), "path-equivalence")).unwrap();
@@ -316,6 +380,32 @@ mod self_check {
         assert!(allows(Provider::Claude, ".mcp_servers[].status"));
         assert_eq!(by_path[".mcp_servers[].status"].as_str(), Some("connected"));
 
+        // `.request.tool_name` is ALSO on claude.txt (the tool-name-at-
+        // invocation family), but the value it held was `mcp__...` -- the
+        // real sanitizer's `is_mcp_tool_identity` exception still redacted
+        // it despite the allowed path, and `is_escape` agrees this is not an
+        // escape (it is a placeholder, not the raw MCP identity).
+        assert!(allows(Provider::Claude, ".request.tool_name"));
+        let redacted_tool_name = by_path[".request.tool_name"].as_str().unwrap();
+        assert_ne!(redacted_tool_name, "mcp__claude_ai_Gmail__search_threads");
+        let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+        let placeholders: BTreeSet<String> = manifest["placeholders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["placeholder"].as_str())
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            !is_escape(
+                Provider::Claude,
+                ".request.tool_name",
+                by_path[".request.tool_name"],
+                &placeholders
+            ),
+            "the real sanitizer's redacted mcp__ placeholder must not read as an escape"
+        );
+
         // Sanity: every path `collect_scalars` produced agrees in aggregate
         // with `allows` on verbatim-vs-placeholder for every scalar the real
         // sanitizer touched, not just the four spot-checked above.
@@ -331,5 +421,55 @@ mod self_check {
                 );
             }
         }
+    }
+
+    /// The critical case: `is_escape` must not clear a value just because its
+    /// path is on the allowlist. Constructs the raw (unsanitized) shape
+    /// directly, rather than going through `sanitize_dir` -- the real
+    /// sanitizer would never *leave* an `mcp__` value unredacted, so proving
+    /// the property catches it requires a value that skipped sanitizing (a
+    /// hand-repaired or regression-produced archive entry), which is exactly
+    /// the scenario this test stands in for.
+    #[test]
+    fn is_escape_flags_an_mcp_tool_name_riding_an_allowlisted_path() {
+        let path = ".request.tool_name";
+        assert!(
+            allows(Provider::Claude, path),
+            "test premise: {path} must actually be on claude.txt"
+        );
+        let empty_placeholders = BTreeSet::new();
+
+        let raw_mcp_identity = Value::String("mcp__claude_ai_Gmail__search_threads".to_owned());
+        assert!(
+            is_escape(
+                Provider::Claude,
+                path,
+                &raw_mcp_identity,
+                &empty_placeholders
+            ),
+            "a raw mcp__ value at an allowlisted path must still count as an escape"
+        );
+
+        // Same path, a built-in tool name -- the exception is scoped to the
+        // `mcp__` prefix, not the whole path, so this must NOT be an escape.
+        let builtin = Value::String("Bash".to_owned());
+        assert!(!is_escape(
+            Provider::Claude,
+            path,
+            &builtin,
+            &empty_placeholders
+        ));
+
+        // The same mcp__ identity IS clean once it has actually become a
+        // placeholder the corpus's manifest recorded as used.
+        let mut known_placeholders = BTreeSet::new();
+        known_placeholders.insert("<V1>".to_owned());
+        let placeholder_value = Value::String("<V1>".to_owned());
+        assert!(!is_escape(
+            Provider::Claude,
+            path,
+            &placeholder_value,
+            &known_placeholders
+        ));
     }
 }

@@ -1,16 +1,30 @@
 //! Fail-closed guarantees the allowlist does not itself provide.
 //!
 //! `allowlist_property.rs`'s total property (every committed scalar is
-//! either allowlisted or a placeholder) subsumed most of what used to live
-//! here: an absolute path or a secret-looking string on a path nobody
-//! allowlisted is now redacted unconditionally, by construction, so a test
-//! that fed one through a single unlisted field and asserted rejection was
-//! testing blocklist-era machinery that no longer runs. What is left is
-//! everything the allowlist genuinely does not reach: staging/output-path
-//! safety (independent of any capture content), and the two checks that run
-//! *regardless* of whether a path is on the list -- a credential-shaped
-//! field name, and a credential-shaped value riding a path the list would
-//! otherwise keep verbatim.
+//! either allowlisted or a placeholder) subsumed part of what used to live
+//! here: a test that fed an absolute path or a secret-looking string through
+//! a *single unlisted field* and asserted rejection was testing blocklist-era
+//! machinery that no longer runs -- an unlisted path is now redacted
+//! unconditionally, by construction, regardless of content.
+//!
+//! What is left, and what this file now covers, is everything the allowlist
+//! genuinely does not reach:
+//!
+//! - Staging/output-path safety, independent of any capture content.
+//! - Two checks that run *regardless* of whether a path is on the list: a
+//!   credential-shaped field name, and a sensitive object key.
+//! - The fail-closed scans (`sanitize_paths_and_validate` and everything it
+//!   calls -- `contains_secret_value`, `contains_absolute_path`,
+//!   `path_occurrence_escapes_root`, `replace_path_occurrences`'s boundary
+//!   check) that still run on every value the allowlist keeps verbatim: an
+//!   allowlisted path is a decision about the *field*, not a licence for
+//!   whatever a provider puts in it, so these need coverage that lands on an
+//!   allowed path, not an unlisted one -- a value on an unlisted path never
+//!   reaches these scans at all anymore.
+//! - The same scans, run unconditionally on the six manifest metadata fields
+//!   (`command`, `cli_version`, `normalized_cli_version`, `scenario`,
+//!   `purpose`, `platform`) that never pass through the path allowlist in the
+//!   first place.
 
 use super::support::*;
 
@@ -156,6 +170,12 @@ fn sanitizer_rejects_a_credential_riding_an_allowlisted_path() {
             ".method",
             r#"{"method":"sk-proj-should-not-survive-allowlisting"}"#,
         ),
+        (
+            "claude-private-key",
+            Provider::Claude,
+            ".type",
+            r#"{"type":"-----BEGIN OPENSSH PRIVATE KEY-----"}"#,
+        ),
     ] {
         assert!(
             allows(provider, allowed_path),
@@ -232,4 +252,175 @@ fn sanitizer_rejects_secret_field_names_regardless_of_path_and_still_permits_num
         sanitize_dir(&raw, &staging_dir(temp.path(), "string-token-counter")),
         Err(SanitizationError::SecretLikeField { .. })
     ));
+}
+
+/// Break caught: validating only event payloads lets a secret-like provider version, scenario,
+/// purpose, platform, or command value leak through the deterministic manifest.
+///
+/// Not subsumed by the allowlist, and not subsumed by
+/// `sanitizer_rejects_a_credential_riding_an_allowlisted_path` above: these
+/// six manifest fields (`command`'s argv and program path, `cli_version`,
+/// `normalized_cli_version`, `scenario`, `purpose`, `platform`) never pass
+/// through the path allowlist at all -- `sanitize_dir` scans each of them
+/// directly, unconditionally, and `allowlist_property.rs` only ever reads a
+/// manifest's `provider` and `placeholders` fields, never these. The manifest
+/// is committed evidence in a public repo, so each of these six needs its own
+/// proof the fail-closed scan still runs on it.
+type ManifestMutator = fn(&mut Value);
+
+#[test]
+fn sanitizer_scans_every_manifest_string_before_writing_staging() {
+    let secret = "sk-proj-manifest-metadata-secret";
+    let mutations: [(&str, ManifestMutator); 6] = [
+        ("cli_version", |capture| {
+            capture["cli_version"] = Value::String("sk-proj-manifest-metadata-secret".into());
+        }),
+        ("scenario", |capture| {
+            capture["scenario"] = Value::String("sk-proj-manifest-metadata-secret".into());
+        }),
+        ("purpose", |capture| {
+            capture["purpose"] = Value::String("sk-proj-manifest-metadata-secret".into());
+        }),
+        ("platform", |capture| {
+            capture["platform"]["os"] = Value::String("sk-proj-manifest-metadata-secret".into());
+        }),
+        ("command_program", |capture| {
+            capture["command"]["program"] =
+                Value::String("sk-proj-manifest-metadata-secret".into());
+        }),
+        ("command_args", |capture| {
+            capture["command"]["args"] = serde_json::json!(["sk-proj-manifest-metadata-secret"]);
+        }),
+    ];
+
+    for (name, mutate) in mutations {
+        let temp = tempfile::tempdir().unwrap();
+        let raw = write_raw_capture(temp.path(), name, &[r#"{"level":"debug"}"#]);
+        let path = raw.join("capture.json");
+        let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        mutate(&mut capture);
+        std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+        let output = staging_dir(temp.path(), name);
+
+        let error = sanitize_dir(&raw, &output).unwrap_err();
+        assert!(
+            matches!(error, SanitizationError::SecretLikeValue { .. }),
+            "{name} returned {error:?}"
+        );
+        assert!(!error.to_string().contains(secret), "{name}");
+        assert!(!output.exists(), "{name}");
+    }
+}
+
+/// Break caught: substring replacement can treat an allowlisted root as a prefix of a different
+/// absolute path, hide its drive/root marker, and let the unknown path escape rejection.
+///
+/// Runs on `.type`, an allowlisted field, not an unlisted one -- the earlier
+/// version of this test used an unlisted `.path` field, which the allowlist
+/// itself now redacts wholesale regardless of content, so it no longer
+/// exercises `replace_path_occurrences`'s boundary check at all (the code
+/// this test exists to pin never runs on a value that gets replaced
+/// unconditionally). Landing the same payload on an allowed field is what
+/// makes this test still mean something.
+#[test]
+fn sanitizer_does_not_allow_path_prefix_collisions_on_an_allowlisted_path() {
+    assert!(allows(Provider::Claude, ".type"));
+
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = std::path::PathBuf::from(r"D:\allowed\repo");
+    let raw = write_raw_capture(
+        temp.path(),
+        "path-prefix-collision",
+        &[&format!(
+            r#"{{"type":{}}}"#,
+            serde_json::to_string(r"D:\allowed\repo-other\secret.txt").unwrap()
+        )],
+    );
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(raw.join("capture.json")).unwrap()).unwrap();
+    capture["command"]["cwd"] = Value::String(cwd.display().to_string());
+    capture["redaction_roots"]["cwd"] = Value::String(cwd.display().to_string());
+    std::fs::write(
+        raw.join("capture.json"),
+        serde_json::to_vec_pretty(&capture).unwrap(),
+    )
+    .unwrap();
+
+    let error = sanitize_dir(&raw, &staging_dir(temp.path(), "path-prefix-collision")).unwrap_err();
+    assert!(matches!(
+        error,
+        SanitizationError::UnrecognizedAbsolutePath { .. }
+    ));
+}
+
+/// Break caught: textual prefix replacement can bless an allowed root followed by `..`, and a
+/// detector that recognizes only backslash UNC paths misses the equivalent forward-slash form.
+///
+/// Same adaptation as the prefix-collision test above: lands on `.type`
+/// (allowlisted) rather than the unlisted `.path` the earlier version used,
+/// so `path_occurrence_escapes_root`'s traversal check actually runs.
+#[test]
+fn sanitizer_rejects_allowlist_traversal_on_an_allowlisted_path() {
+    assert!(allows(Provider::Claude, ".type"));
+
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "allowlist-traversal",
+        &[&format!(
+            r#"{{"type":{}}}"#,
+            serde_json::to_string(r"D:\allowed\repo\..\private\secret.txt").unwrap()
+        )],
+    );
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(raw.join("capture.json")).unwrap()).unwrap();
+    capture["command"]["cwd"] = Value::String(r"D:\allowed\repo".into());
+    capture["redaction_roots"]["cwd"] = Value::String(r"D:\allowed\repo".into());
+    std::fs::write(
+        raw.join("capture.json"),
+        serde_json::to_vec_pretty(&capture).unwrap(),
+    )
+    .unwrap();
+
+    let error = sanitize_dir(&raw, &staging_dir(temp.path(), "allowlist-traversal")).unwrap_err();
+    assert!(matches!(
+        error,
+        SanitizationError::UnrecognizedAbsolutePath { .. }
+    ));
+}
+
+/// Break caught: weakening the post-redaction scan permits an absolute machine path not covered
+/// by the explicit HOME/REPO/CWD/TEMP allowlist to enter staging, in any of the forms
+/// `contains_absolute_path` recognizes beyond a plain drive letter -- unix, backslash UNC,
+/// forward-slash UNC, and the `\\?\` verbatim-Windows prefix.
+///
+/// Runs on `.type` (allowlisted), for the same reason the two tests above do:
+/// an unlisted field is now wholesale-redacted regardless of content, so it
+/// no longer exercises this scan.
+#[test]
+fn sanitizer_rejects_unrecognized_absolute_path_forms_on_an_allowlisted_path() {
+    assert!(allows(Provider::Claude, ".type"));
+
+    let cases = [
+        ("unix", r#"{"type":"/srv/private/secret.txt"}"#),
+        ("unc", r#"{"type":"\\\\server\\share\\secret.txt"}"#),
+        (
+            "forward-unc",
+            r#"{"type":"//server/share/private/secret.txt"}"#,
+        ),
+        (
+            "verbatim-windows",
+            r#"{"type":"\\\\?\\D:\\private\\secret.txt"}"#,
+        ),
+    ];
+
+    for (name, payload) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let raw = write_raw_capture(temp.path(), name, &[payload]);
+        let error = sanitize_dir(&raw, &staging_dir(temp.path(), name)).unwrap_err();
+        assert!(
+            matches!(error, SanitizationError::UnrecognizedAbsolutePath { .. }),
+            "{name} returned {error:?}"
+        );
+    }
 }
