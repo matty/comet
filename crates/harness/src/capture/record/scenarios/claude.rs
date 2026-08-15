@@ -310,9 +310,11 @@ pub(in crate::capture::record) fn checklist_launch(
 /// prompt asked for but the model did not produce.
 ///
 /// That accounting used to live in `recording.rs`'s `claude_run` (the
-/// `created`/`updated` `BTreeSet`s and their `bail!`s, requiring 4 confirmed
-/// mutations here and 2 for `checklist-resume`) and is deleted by this task,
-/// closing `docs/debt/` D61. Per design §3.2
+/// `created`/`updated` `BTreeSet`s and their `bail!`s, requiring at least 2
+/// distinct confirmed creates and 1 confirmed update here, and for
+/// `checklist-resume` at least 1 confirmed update to an id it had not itself
+/// created) and is deleted by this task, closing `docs/debt/` D61. Per
+/// design §3.2
 /// (`2026-08-14-provider-capture-simplification-design.md`): a pre-spawn
 /// guard protects the machine; a frame check that aborts protects only a
 /// scenario's tidiness, and does it by destroying evidence already paid for
@@ -704,6 +706,23 @@ mod tests {
         let capture = session.finish(deadline).await.unwrap();
 
         let stdout = channel_payloads(&capture, Channel::Stdout);
+        // The fixture is selected by matching a substring of the real
+        // `claude_checklist_prompt()` text (`fake_claude.rs`'s
+        // `"TaskCreate exactly twice"` branch), not a `scenario:` tag. If
+        // that prompt is ever reworded, the match silently fails and
+        // dispatch falls through to the fixture's generic
+        // `error_during_execution` reply — which also has no `TaskCreate`
+        // call, also carries a `result` frame, and also exits 0, so every
+        // assertion below would keep passing while asserting nothing about
+        // `checklist_no_tasks()` at all. `sess-checklist-no-tasks` exists
+        // only in that scenario, so this fails loudly instead.
+        assert!(
+            stdout
+                .iter()
+                .any(|line| line.contains("sess-checklist-no-tasks")),
+            "the fake-claude checklist_no_tasks() branch must have run, not the \
+             error_during_execution fallthrough: {stdout:?}"
+        );
         // The init frame's advertised tool list still names `TaskCreate` (the
         // CLI offers it whether or not the model uses it) — the check is for
         // an actual `tool_use` call, not the substring, so it does not
