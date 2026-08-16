@@ -6,7 +6,7 @@
 //! green suite. Sequence numbers alone are not evidence; these tests assert what
 //! the frames actually contain.
 
-use comet_harness::capture::{Channel, corpus_frame};
+use comet_harness::capture::{Channel, corpus_frame, corpus_frame_where};
 use serde_json::Value;
 
 const CODEX_MODEL_DISCOVERY: &str = "codex/0.147.0/model-discovery";
@@ -44,11 +44,26 @@ fn payload(scenario: &str, sequence: u64) -> Value {
 /// is a re-capture rather than an edit here. **Restore the equality when
 /// stage 6 re-records Codex**, and add the property test that would have
 /// caught it: every request id in a Codex capture appears on both channels.
+///
+/// The initialize reply itself stays pinned to sequence 2: it is the direct
+/// synchronous response to the initialize request at sequence 1, and nothing
+/// unsolicited can land before the very first reply. The notification and
+/// the model/list reply are both found by predicate instead — a live run on
+/// 2026-08-16 put the notification at a different sequence on two otherwise
+/// identical runs, and the model/list reply's own sequence shifts with it.
 #[test]
 fn codex_discovery_interleaves_a_notification_before_the_model_list_reply() {
     let initialize = payload(CODEX_MODEL_DISCOVERY, 2);
-    let notification = payload(CODEX_MODEL_DISCOVERY, 3);
-    let model_list = payload(CODEX_MODEL_DISCOVERY, 6);
+    let notification = corpus_frame_where(
+        CODEX_MODEL_DISCOVERY,
+        "a remoteControl/status/changed notification",
+        |value| value["method"] == "remoteControl/status/changed",
+    );
+    let model_list = corpus_frame_where(
+        CODEX_MODEL_DISCOVERY,
+        "a reply whose result carries a model list (result.data is an array)",
+        |value| value["result"]["data"].is_array(),
+    );
 
     assert_eq!(
         corpus_frame(CODEX_MODEL_DISCOVERY, 2).channel,
@@ -60,43 +75,79 @@ fn codex_discovery_interleaves_a_notification_before_the_model_list_reply() {
     );
     assert!(initialize["result"].is_object());
 
-    assert_eq!(notification["method"], "remoteControl/status/changed");
+    assert_eq!(notification.value["method"], "remoteControl/status/changed");
 
     assert!(
-        !model_list["id"].is_null(),
+        !model_list.value["id"].is_null(),
         "model/list must carry a request id"
     );
     assert_ne!(
-        initialize["id"], model_list["id"],
+        initialize["id"], model_list.value["id"],
         "initialize and model/list must be answers to two different requests"
     );
-    assert!(model_list["result"]["data"].is_array());
+    assert!(model_list.value["result"]["data"].is_array());
+
+    assert!(
+        notification.sequence < model_list.sequence,
+        "the notification must be interleaved before the model/list reply: \
+         notification at {}, model/list reply at {}",
+        notification.sequence,
+        model_list.sequence
+    );
 }
 
 /// Codex acknowledged the bounded steer request before completing the same
 /// active turn, and the reply's `turnId` joins the request's `expectedTurnId`.
+///
+/// `steer`'s own capture puts `remoteControl/status/changed` at sequence 5,
+/// well before any of these three frames — but that position is exactly what
+/// varies capture to capture, so every frame recorded after it, not only the
+/// notification itself, is at risk of a shifted sequence on a re-capture.
+/// All three are found by predicate rather than pinned.
 #[test]
 fn codex_acknowledges_a_steer_before_completing_the_same_turn() {
-    let request = payload(CODEX_STEER, 19);
-    let reply = payload(CODEX_STEER, 20);
-    let completion = payload(CODEX_STEER, 56);
+    let request = corpus_frame_where(CODEX_STEER, "method == turn/steer", |value| {
+        value["method"] == "turn/steer"
+    });
+    let reply = corpus_frame_where(
+        CODEX_STEER,
+        "a reply whose result carries turnId (the steer acknowledgement)",
+        |value| value["result"]["turnId"].is_string(),
+    );
+    let completion = corpus_frame_where(CODEX_STEER, "method == turn/completed", |value| {
+        value["method"] == "turn/completed"
+    });
 
-    assert_eq!(request["method"], "turn/steer");
-    assert_eq!(corpus_frame(CODEX_STEER, 19).channel, Channel::Stdin);
+    assert_eq!(request.value["method"], "turn/steer");
+    assert_eq!(request.channel, Channel::Stdin);
     assert!(
-        request["params"]["expectedTurnId"].is_string(),
-        "the steer request must name a turn: {request}"
+        request.value["params"]["expectedTurnId"].is_string(),
+        "the steer request must name a turn: {}",
+        request.value
     );
-    assert_eq!(reply["id"], request["id"]);
-    assert!(reply["result"].is_object());
+    assert_eq!(reply.value["id"], request.value["id"]);
+    assert!(reply.value["result"].is_object());
     assert_eq!(
-        reply["result"]["turnId"],
-        request["params"]["expectedTurnId"]
+        reply.value["result"]["turnId"],
+        request.value["params"]["expectedTurnId"]
     );
-    assert_eq!(completion["method"], "turn/completed");
+    assert_eq!(completion.value["method"], "turn/completed");
     assert_eq!(
-        completion["params"]["turn"]["id"],
-        request["params"]["expectedTurnId"]
+        completion.value["params"]["turn"]["id"],
+        request.value["params"]["expectedTurnId"]
+    );
+
+    assert!(
+        request.sequence < reply.sequence,
+        "the steer reply must follow its own request: request at {}, reply at {}",
+        request.sequence,
+        reply.sequence
+    );
+    assert!(
+        reply.sequence < completion.sequence,
+        "the steer must be acknowledged before the turn completes: reply at {}, completion at {}",
+        reply.sequence,
+        completion.sequence
     );
 }
 

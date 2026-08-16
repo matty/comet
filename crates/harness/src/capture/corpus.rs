@@ -182,6 +182,74 @@ pub fn corpus_frame(scenario: &str, sequence: u64) -> Frame {
     frame(&corpus_root(), scenario, sequence)
 }
 
+/// One frame located by what it is rather than where it landed, together
+/// with the sequence it happened to land at.
+///
+/// An unsolicited notification — Codex's `remoteControl/status/changed` is
+/// the one that forced this — can land at a different sequence on every
+/// capture, so pinning a frame, or anything recorded after one, to a
+/// [`frame`] sequence pins a race. `sequence` still rides along so a caller
+/// that located two frames by predicate can assert their relative order
+/// (a reply after its request) without pinning either one absolutely.
+#[derive(Clone, Debug)]
+pub struct FoundFrame {
+    pub sequence: u64,
+    pub channel: Channel,
+    pub value: Value,
+}
+
+/// Every frame in `scenario`'s corpus directory whose parsed JSON payload
+/// satisfies `predicate`.
+///
+/// A frame whose payload does not parse as JSON is skipped, the same
+/// contract [`frame`] leaves to its callers: payload shape is each caller's
+/// concern, not this scan's.
+fn frames_where(
+    corpus_root: &Path,
+    scenario: &str,
+    predicate: impl Fn(&Value) -> bool,
+) -> Vec<FoundFrame> {
+    let scenario_dir = corpus_root.join(scenario);
+    let events = frames(&scenario_dir)
+        .unwrap_or_else(|error| panic!("corpus {scenario} is unreadable: {error}"));
+
+    events
+        .into_iter()
+        .filter_map(|event| {
+            let sequence = event["sequence"].as_u64()?;
+            let channel: Channel = serde_json::from_value(event["channel"].clone()).ok()?;
+            let value: Value = serde_json::from_str(event["payload"].as_str()?).ok()?;
+            predicate(&value).then_some(FoundFrame {
+                sequence,
+                channel,
+                value,
+            })
+        })
+        .collect()
+}
+
+/// [`frames_where`] against this crate's own corpus, requiring exactly one
+/// match.
+///
+/// Panics naming the scenario and `description` on zero matches or on more
+/// than one — a predicate that silently matched nothing would let the
+/// assertion downstream of it pass vacuously, which is the failure mode a
+/// predicate-based lookup exists to avoid, not reintroduce.
+pub fn corpus_frame_where(
+    scenario: &str,
+    description: &str,
+    predicate: impl Fn(&Value) -> bool,
+) -> FoundFrame {
+    let mut found = frames_where(&corpus_root(), scenario, predicate);
+    match found.len() {
+        1 => found.remove(0),
+        0 => panic!("corpus {scenario} has no frame matching: {description}"),
+        n => panic!(
+            "corpus {scenario} has {n} frames matching: {description} (expected exactly one)"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod frame_tests {
     use super::*;
