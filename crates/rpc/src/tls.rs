@@ -293,7 +293,7 @@ where
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(identity.certificate_chain(), identity.private_key())
         .map_err(|error| LanConnectError::Transport(error.to_string()))?;
-    let tcp = TcpStream::connect(endpoint)
+    let tcp = crate::dial::connect_tcp(endpoint)
         .await
         .map_err(|error| LanConnectError::Transport(error.to_string()))?;
     let endpoint = tcp
@@ -470,7 +470,7 @@ where
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
-    let tcp = TcpStream::connect(endpoint)
+    let tcp = crate::dial::connect_tcp(endpoint)
         .await
         .map_err(|error| PairingError::Transport(error.to_string()))?;
     let endpoint = tcp

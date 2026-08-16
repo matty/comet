@@ -144,10 +144,14 @@ promoted capture, or a new CLI version's added or removed field, **fails the gol
 field is actually *read*, grep the decode sources instead; the sheet records that a field is
 present, never whether Comet consumes it.
 
-**`git diff docs/providers/claude-2.1.228.md docs/providers/claude-2.1.229.md` is the
+**`git diff --no-index docs/providers/claude-2.1.228.md docs/providers/claude-2.1.229.md` is the
 version-change report.** No differ is built or planned: the sheets are generated markdown, so
-diffing two of them is the whole mechanism. Regenerate after promoting a capture, read what the
-failing golden test named, and commit the result in the same change that promotes the capture:
+diffing two of them is the whole mechanism. **`--no-index` is not optional** — without it git
+reads the two paths as pathspecs and diffs each file against the index, which on a clean tree
+prints nothing and exits 0. This file carried the command without it until 2026-08-16, so a
+reader who ran it as written saw an empty report and no error. Regenerate after promoting a
+capture, read what the failing golden test named, and commit the result in the same change that
+promotes the capture:
 
 ```powershell
 $env:COMET_UPDATE_SHEETS = "1"; cargo test -p comet-harness --test capture_corpus

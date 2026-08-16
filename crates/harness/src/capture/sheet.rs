@@ -68,6 +68,21 @@ pub struct SheetScenario {
     /// still not have been launched identically, which is exactly the case
     /// `CODEX_HOME` catches for Codex's `model-discovery*` family.
     pub configured_env: BTreeMap<String, String>,
+    /// The length of a `system`/`init` frame's `tools` array, if this
+    /// scenario's archive holds one — `None` when no such frame appears (a
+    /// discovery-only scenario, or a provider that has no equivalent frame
+    /// at all).
+    ///
+    /// Closes D86: the array itself is redacted element-by-element (`.tools`
+    /// is not on `claude.txt`), so the Fields section below can only ever
+    /// print the bare path, never a name from it — but the *length*
+    /// survives redaction and is exactly what would show a roster change
+    /// (a new built-in tool, or the recording account gaining or losing an
+    /// MCP connector) that the Fields section is structurally blind to.
+    /// Sourced from the archive's array length, never from any tool name
+    /// inside it — this field must never carry anything that came out of a
+    /// redacted element.
+    pub tool_count: Option<usize>,
 }
 
 /// Renders one version's capability sheet as markdown.
@@ -185,6 +200,7 @@ fn scenario_lines(scenarios: &[SheetScenario]) -> Vec<String> {
         lines.push(String::new());
         lines.push(format!("cwd: `{}`", scenario.cwd));
         lines.push(env_line(&scenario.configured_env));
+        lines.push(tools_line(scenario.tool_count));
         lines.push(String::new());
         lines.push("```".to_owned());
         for arg in &scenario.argv {
@@ -210,6 +226,18 @@ fn env_line(configured_env: &BTreeMap<String, String>) -> String {
         .map(|(key, value)| format!("`{key}={value}`"))
         .collect();
     format!("env: {}", vars.join(", "))
+}
+
+/// `tools: 29` when this scenario's archive holds a `system`/`init` frame,
+/// or `tools: (not observed)` when it does not — one line either way, the
+/// same "an explicit line beats a missing one" shape [`env_line`] already
+/// uses. This is the one place the array's *length* crosses from evidence
+/// into rendered text; nothing here ever sees a tool name (D86).
+fn tools_line(tool_count: Option<usize>) -> String {
+    match tool_count {
+        Some(count) => format!("tools: {count}"),
+        None => "tools: (not observed)".to_owned(),
+    }
 }
 
 fn field_lines(provider: &str, version: &str, observations: &[FieldObservation]) -> Vec<String> {
@@ -336,6 +364,18 @@ mod tests {
         cwd: &str,
         env: &[(&str, &str)],
     ) -> SheetScenario {
+        scenario_with_tools(name, purpose, argv, cwd, env, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scenario_with_tools(
+        name: &str,
+        purpose: &str,
+        argv: &[&str],
+        cwd: &str,
+        env: &[(&str, &str)],
+        tool_count: Option<usize>,
+    ) -> SheetScenario {
         SheetScenario {
             name: name.to_owned(),
             purpose: purpose.to_owned(),
@@ -345,6 +385,7 @@ mod tests {
                 .iter()
                 .map(|(key, value)| (key.to_string(), value.to_string()))
                 .collect(),
+            tool_count,
         }
     }
 
@@ -633,6 +674,50 @@ mod tests {
         assert!(
             fresh_text.contains("cwd: `<CWD>`") && model_discovery.contains("cwd: `<CWD>`"),
             "cwd must render for every scenario: {scenarios_section}"
+        );
+    }
+
+    /// D86: a scenario whose archive holds a `system`/`init` frame's `tools`
+    /// array renders its observed length, and a scenario with no such frame
+    /// says so explicitly rather than omitting the line — the same
+    /// present-vs-absent contrast [`cwd_and_env_render_even_when_argv_is_identical`]
+    /// already proves for `env`.
+    #[test]
+    fn tools_line_renders_the_observed_length_or_says_not_observed() {
+        let scenarios = vec![
+            scenario_with_tools(
+                "subagent",
+                "capture a Claude subagent run",
+                &["<HOME>\\claude.exe"],
+                "<CWD>",
+                &[],
+                Some(35),
+            ),
+            scenario_with_tools(
+                "model-discovery",
+                "capture Claude model discovery",
+                &["<HOME>\\claude.exe", "--bare"],
+                "<CWD>",
+                &[],
+                None,
+            ),
+        ];
+        let rendered = render_sheet("claude", "2.1.229", &[], &BTreeMap::new(), &scenarios);
+        let scenarios_section = section(&rendered, "## Scenarios");
+
+        let model_discovery =
+            &scenarios_section[scenarios_section.find("### model-discovery").unwrap()
+                ..scenarios_section.find("### subagent").unwrap()];
+        let subagent = &scenarios_section[scenarios_section.find("### subagent").unwrap()..];
+
+        assert!(
+            subagent.contains("tools: 35"),
+            "a scenario with an observed tools array must print its length: {subagent}"
+        );
+        assert!(
+            model_discovery.contains("tools: (not observed)"),
+            "a scenario with no system/init frame must say so explicitly, not omit the line: \
+             {model_discovery}"
         );
     }
 

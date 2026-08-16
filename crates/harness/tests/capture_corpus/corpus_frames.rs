@@ -24,11 +24,26 @@ fn payload(scenario: &str, sequence: u64) -> Value {
 /// `crates/harness/src/codex/discovery.rs` must skip notifications rather than
 /// take the next frame.
 ///
-/// The literal request ids (`1`, `2`) were incidental to that claim, and
-/// `.id` is not on `codex.txt` (the allowlist-sanitizer stage), so the
-/// archive now holds placeholders there. What actually matters — that
-/// `initialize` and `model/list` are two DIFFERENT replies, not the same
-/// frame read twice — survives as an inequality instead of an equality.
+/// This is an inequality rather than the equality it should be, and the
+/// reason recorded here until 2026-08-16 was **wrong**. It blamed the
+/// allowlist: `.id` is not on `codex.txt`, so the archive holds placeholders
+/// there, and the join was said to be unrecoverable.
+///
+/// Redaction does not lose the join. Equal values share a placeholder by
+/// design, and `steer` demonstrates it — its `initialize` request and reply
+/// both read `<V1>`. This scenario reads `<V1>` on the request and `<V2>` on
+/// the reply, which means the two ids **differed before sanitizing**: the
+/// recording lost the join, not the sanitizer.
+///
+/// Six of the seven committed Codex scenarios have zero request-to-reply id
+/// joins; only `steer` (recorded in a later change) has all four. The current
+/// recorder is not affected — a live `model-discovery` taken on 2026-08-16
+/// joins `id=1` and `id=2` across stdin and stdout correctly.
+///
+/// So this assertion is weaker than the evidence should support, and the fix
+/// is a re-capture rather than an edit here. **Restore the equality when
+/// stage 6 re-records Codex**, and add the property test that would have
+/// caught it: every request id in a Codex capture appears on both channels.
 #[test]
 fn codex_discovery_interleaves_a_notification_before_the_model_list_reply() {
     let initialize = payload(CODEX_MODEL_DISCOVERY, 2);
@@ -109,13 +124,34 @@ fn task_create_puts_the_assigned_id_only_on_the_result() {
 /// `TaskUpdate`'s `tool_use_result` reports an explicit `statusChange`
 /// `{from,to}`, while `activeForm` appears only on the tool input, so neither
 /// frame alone describes the change.
+///
+/// `.message.content[].input.taskId` is one of D73's seven tool-argument
+/// union paths (`docs/debt/D73-tool-argument-union-paths.md`): it is
+/// allowlisted whole, so its literal value is published as-is rather than
+/// replaced by a placeholder. This assertion no longer depends on that —
+/// it checks the *join* (the update call names the task `TaskCreate`
+/// assigned, and that differs from the corpus's other task) rather than the
+/// literal string, so the seven lines can be dropped from `claude.txt` at
+/// the next promotion without breaking this test.
 #[test]
 fn task_update_splits_status_change_and_active_form_across_two_frames() {
+    let first_created = payload(CHECKLIST, 64);
+    let second_created = payload(CHECKLIST, 65);
     let call = payload(CHECKLIST, 88);
     let result = payload(CHECKLIST, 93);
 
+    assert_ne!(
+        first_created["tool_use_result"]["task"]["id"],
+        second_created["tool_use_result"]["task"]["id"],
+        "the corpus's two created tasks must carry distinct ids, or the equality \
+         check below would pass for the wrong reason"
+    );
+
     let input = &call["message"]["content"][0]["input"];
-    assert_eq!(input["taskId"], "1");
+    assert_eq!(
+        input["taskId"], first_created["tool_use_result"]["task"]["id"],
+        "the update call must name the task TaskCreate assigned: {input}"
+    );
     assert!(
         input["activeForm"].is_string(),
         "activeForm rides the input: {input}"
@@ -133,6 +169,13 @@ fn task_update_splits_status_change_and_active_form_across_two_frames() {
 /// A resumed Claude process restates no task list at init, and its first task
 /// frame updates an id it never created — so a per-run accumulator receives a
 /// status change for an unknown item.
+///
+/// Same D73 caveat as the test above: `.message.content[].input.taskId` and
+/// `.tool_use_result.taskId` are both union paths whose literal is published
+/// as-is, not a placeholder. This asserts the join instead — the update call
+/// and its own result must name the same task — so dropping the seven
+/// allowlist lines at the next promotion (turning the value into a
+/// placeholder) leaves this test unaffected.
 #[test]
 fn a_resumed_run_updates_a_task_it_never_created() {
     let init = payload(CHECKLIST_RESUME, 2);
@@ -146,7 +189,9 @@ fn a_resumed_run_updates_a_task_it_never_created() {
             "a resumed init restates no task list, but carried {key}: {init}"
         );
     }
-    assert_eq!(call["message"]["content"][0]["input"]["taskId"], "2");
-    assert_eq!(result["tool_use_result"]["taskId"], "2");
+    assert_eq!(
+        call["message"]["content"][0]["input"]["taskId"], result["tool_use_result"]["taskId"],
+        "the update call and its result must name the same task: call={call} result={result}"
+    );
     assert_eq!(result["tool_use_result"]["statusChange"]["from"], "pending");
 }

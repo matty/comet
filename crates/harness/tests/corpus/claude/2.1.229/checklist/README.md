@@ -31,7 +31,8 @@ sequence 55's `subject` reads `<V210>` and its `description` `<V209>`, and seque
 `activeForm` reads `<V240>` — not the prompt text.
 
 That closure is not a reason to relax the prompt. The scenario prompts in
-`crates/harness/src/capture/checklist.rs` still keep every task subject meaningless, on purpose:
+`claude_checklist_prompt`/`claude_checklist_resume_prompt`
+(`crates/harness/src/capture/record/scenarios/claude.rs`) still keep every task subject meaningless, on purpose:
 writing something descriptive here would mean trusting the sanitizer to keep catching it forever,
 and `docs/debt/D73-tool-argument-union-paths.md` already names a live way that trust can be
 misplaced — several of these same tool-argument paths

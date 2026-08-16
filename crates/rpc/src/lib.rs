@@ -19,6 +19,7 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 mod client;
+mod dial;
 mod pairing;
 mod server;
 mod tls;

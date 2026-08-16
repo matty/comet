@@ -1,5 +1,20 @@
 # D75 — the subagent read-back files carry a different, unenforced redaction standard
 
+### Closed — option 2 below was chosen: the files are deleted
+
+`read-back-doc-snapshot.json` and `read-back-run-journal.jsonl` are gone. Nothing in `crates/`
+loaded them as test data — the only references were this page, `allowlist_property.rs`'s doc
+comments (explaining why they were outside the total property's remit), and a paragraph in
+`subagent/README.md` — so removing them cost no test coverage. `allowlist_property.rs`'s
+carve-out comments now say plainly that the exemption is gone: the property's remit is the whole
+corpus's frame evidence, with nothing exempted for being sanitized to a different standard.
+
+The reasoning below — why the files existed, what they published, and why the roster field was
+not structurally safe even though this one capture happened to be clean — is kept for whoever
+next hand-sanitizes evidence outside `sanitize_dir`'s reach and reaches for the same shortcut.
+
+---
+
 **Not a defect in the allowlist or in `sanitize_dir`** — both do exactly what they are scoped to
 do. Found during Task 6 (documentation) of the allowlist-sanitizer stage, while sweeping
 `tests/corpus/` for anything the new machinery does not actually reach.
