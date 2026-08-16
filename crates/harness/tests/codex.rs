@@ -21,6 +21,14 @@ fn fixture_path() -> &'static str {
     env!("CARGO_BIN_EXE_fake-codex")
 }
 
+fn init_stall_fixture_path() -> &'static str {
+    env!("CARGO_BIN_EXE_fake-codex-init-stall")
+}
+
+fn init_crash_fixture_path() -> &'static str {
+    env!("CARGO_BIN_EXE_fake-codex-init-crash")
+}
+
 fn harness() -> CodexHarness {
     CodexHarness::new()
         .with_executable(fixture_path())
@@ -107,6 +115,142 @@ async fn run_to_end(
     )
     .await
     .expect("run finished in time")
+}
+
+/// Break caught: dropping the setup timeout leaves this collection waiting on
+/// the fixture's live stdout forever. Collecting to EOF also proves the child
+/// was reaped rather than merely sending `Done` before cleanup.
+#[tokio::test]
+async fn codex_startup_timeout_is_terminal_private_and_reaped() {
+    let (controls, _steer, _token) = controls("Yes");
+    let harness = CodexHarness::new()
+        .with_executable(init_stall_fixture_path())
+        .with_startup_timeout(Duration::from_millis(50))
+        .with_graces(Duration::from_millis(10), Duration::from_millis(10));
+    let stream = harness
+        .run(request("scenario:happy"), controls)
+        .await
+        .expect("stall fixture starts");
+    let events = tokio::time::timeout(
+        Duration::from_secs(2),
+        stream
+            .map(|event| event.expect("normalized event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("startup timeout must close the stream after reaping the child");
+
+    assert_eq!(
+        events,
+        vec![AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: Some(
+                "Codex didn't finish starting. Open Codex in a terminal to sign in, then try again."
+                    .into(),
+            ),
+            session_id: None,
+        }]
+    );
+    assert!(
+        !format!("{events:?}").contains("TASK81_INIT_STALL_PRIVATE_DIAGNOSTIC"),
+        "owner-local stderr leaked into the transcript event: {events:?}"
+    );
+}
+
+/// Break caught: forwarding the JSON-RPC error or stderr tail makes the
+/// transcript expose process detail instead of Comet's actionable copy.
+#[tokio::test]
+async fn codex_startup_failure_keeps_process_detail_out_of_the_transcript() {
+    let (controls, _steer, _token) = controls("Yes");
+    let harness = CodexHarness::new()
+        .with_executable(init_crash_fixture_path())
+        .with_startup_timeout(Duration::from_secs(1))
+        .with_graces(Duration::from_millis(10), Duration::from_millis(10));
+    let stream = harness
+        .run(request("scenario:happy"), controls)
+        .await
+        .expect("crash fixture starts");
+    let events = tokio::time::timeout(
+        Duration::from_secs(2),
+        stream
+            .map(|event| event.expect("normalized event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("startup failure must close the stream after reaping the child");
+
+    assert_eq!(
+        events,
+        vec![AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: Some(
+                "Codex couldn't start. Check that Codex is signed in, then try again.".into(),
+            ),
+            session_id: None,
+        }]
+    );
+    let visible = format!("{events:?}");
+    assert!(!visible.contains("TASK81_INIT_CRASH_PRIVATE_DIAGNOSTIC"));
+    assert!(!visible.contains("73"), "exit code leaked: {visible}");
+}
+
+/// Break caught: retaining the startup timer after `SessionStarted` turns a
+/// legitimate long-running turn into a false startup failure.
+#[tokio::test]
+async fn codex_startup_timeout_never_applies_to_an_active_turn() {
+    let (controls, _steer, token) = controls("Yes");
+    let mut stream = CodexHarness::new()
+        .with_executable(fixture_path())
+        .with_startup_timeout(Duration::from_millis(25))
+        .run(request("scenario:interrupt"), controls)
+        .await
+        .expect("run starts");
+
+    let started = tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("startup completes")
+        .expect("stream stays open")
+        .expect("normalized event");
+    assert!(matches!(started, AgentEvent::SessionStarted { .. }));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    loop {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Err(_) => break,
+            Ok(Some(Ok(event))) => assert!(
+                !matches!(event, AgentEvent::Done { .. }),
+                "startup deadline survived into the active turn: {event:?}"
+            ),
+            Ok(Some(Err(error))) => panic!("active turn failed: {error}"),
+            Ok(None) => panic!("active turn ended before explicit interruption"),
+        }
+    }
+
+    token.cancel();
+    let tail = tokio::time::timeout(
+        Duration::from_secs(2),
+        stream
+            .map(|event| event.expect("normalized event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("explicit interruption completes");
+    assert!(tail.iter().any(|event| matches!(
+        event,
+        AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            ..
+        }
+    )));
+    assert!(!tail.iter().any(|event| matches!(
+        event,
+        AgentEvent::Done {
+            status: DoneStatus::Errored,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]
