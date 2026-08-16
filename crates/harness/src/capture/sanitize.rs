@@ -117,7 +117,7 @@ pub enum SanitizationError {
 }
 
 /// Per-capture redaction state: which values have already been assigned a
-/// placeholder, and the counters that feed the manifest.
+/// placeholder.
 ///
 /// Numbering is keyed on the original value, not on a counter, so equal
 /// values collide into the same placeholder deliberately — a join that held
@@ -127,12 +127,15 @@ pub enum SanitizationError {
 /// (`<V1>`, `<V2>`, …) for every other unlisted scalar. Both are `Vec`, not
 /// `HashMap`, because encounter order is what makes a run byte-deterministic
 /// — the publication tests assert on that determinism directly.
+///
+/// No longer carries a `counts` accounting map — `placeholders` and
+/// `redaction_counts` were dropped from the written manifest at the stage-6
+/// promotion, since nobody read the per-category counts.
 #[derive(Default)]
 struct Redactor {
     paths: Vec<PathRedaction>,
     named: BTreeMap<&'static str, Vec<(Value, String)>>,
     generic: Vec<(Value, String)>,
-    counts: BTreeMap<String, u64>,
     /// Distinct raw values seen at each path the allowlist withheld,
     /// keyed by dotted path (`BTreeMap` for path-sorted, deterministic
     /// iteration). Never leaves this struct as raw values -- `novel_paths`
@@ -146,7 +149,6 @@ struct Redactor {
 struct PathRedaction {
     values: Vec<String>,
     placeholder: &'static str,
-    kind: &'static str,
 }
 
 /// Convert one raw capture into reviewable staging artifacts.
@@ -228,8 +230,6 @@ pub fn sanitize_dir(
 
     let mut cli_version = capture.cli_version.clone();
     redactor.sanitize_paths_and_validate(&mut cli_version, "cli_version")?;
-    let mut normalized_cli_version = capture.cli_version.trim().to_owned();
-    redactor.sanitize_paths_and_validate(&mut normalized_cli_version, "normalized_cli_version")?;
     let mut scenario = capture.scenario.clone();
     redactor.sanitize_paths_and_validate(&mut scenario, "scenario")?;
     let mut purpose = capture.purpose.clone();
@@ -237,31 +237,21 @@ pub fn sanitize_dir(
     let mut platform = serde_json::to_value(&capture.platform)
         .map_err(|source| SanitizationError::EncodeOutput { source })?;
     redactor.sanitize_nonsemantic_value(&mut platform, "platform")?;
-    let channels: Vec<Channel> = capture.events.iter().fold(Vec::new(), |mut seen, event| {
-        if !seen.contains(&event.channel) {
-            seen.push(event.channel);
-        }
-        seen
-    });
-    // Computed before `redactor.counts` is moved into the manifest below --
-    // `novel_paths` only borrows, but the borrow checker won't let it borrow
-    // the whole `Redactor` after one of its fields has been partially moved.
+    // The manifest is provenance only, stage-6 promotion onward: `source`,
+    // `normalized_cli_version`, `channels`, `placeholders` and
+    // `redaction_counts` were all dropped -- nothing under `crates/` read any
+    // of them.
     let novel_paths = redactor.novel_paths();
     let manifest = json!({
         "schema_version": 1,
-        "source": "capture.json",
         "provider": capture.provider,
         "cli_version": cli_version,
-        "normalized_cli_version": normalized_cli_version,
         "captured_at_unix_ms": capture.captured_at_unix_ms,
         "scenario": scenario,
         "purpose": purpose,
         "platform": platform,
         "command": command,
-        "channels": channels,
         "exit_code": capture.exit_code,
-        "placeholders": redactor.placeholder_definitions(),
-        "redaction_counts": redactor.counts,
     });
     let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|source| SanitizationError::EncodeOutput { source })?;
@@ -530,41 +520,26 @@ enum Payload {
 impl Redactor {
     fn new(capture: &RawCapture) -> Self {
         let mut redactor = Self::default();
-        redactor.add_path(capture.redaction_roots.cwd.as_deref(), "<CWD>", "cwd_path");
-        redactor.add_path(
-            capture.redaction_roots.repo.as_deref(),
-            "<REPO>",
-            "repo_path",
-        );
-        redactor.add_path(
-            capture.redaction_roots.home.as_deref(),
-            "<HOME>",
-            "home_path",
-        );
-        redactor.add_path(
-            capture.redaction_roots.temp.as_deref(),
-            "<TEMP>",
-            "temp_path",
-        );
+        redactor.add_path(capture.redaction_roots.cwd.as_deref(), "<CWD>");
+        redactor.add_path(capture.redaction_roots.repo.as_deref(), "<REPO>");
+        redactor.add_path(capture.redaction_roots.home.as_deref(), "<HOME>");
+        redactor.add_path(capture.redaction_roots.temp.as_deref(), "<TEMP>");
         redactor.add_path(
             capture.redaction_roots.codex_home.as_deref(),
             "<CODEX_HOME>",
-            "codex_home_path",
         );
         redactor.add_path(
             capture.redaction_roots.approval_target.as_deref(),
             "<APPROVAL_TARGET>",
-            "approval_target_path",
         );
         redactor.add_path(
             capture.redaction_roots.trusted_powershell.as_deref(),
             "<TRUSTED_POWERSHELL>",
-            "trusted_powershell_path",
         );
         redactor
     }
 
-    fn add_path(&mut self, value: Option<&str>, placeholder: &'static str, kind: &'static str) {
+    fn add_path(&mut self, value: Option<&str>, placeholder: &'static str) {
         let Some(value) = value.filter(|value| !value.is_empty()) else {
             return;
         };
@@ -593,7 +568,6 @@ impl Redactor {
         self.paths.push(PathRedaction {
             values,
             placeholder,
-            kind,
         });
         self.paths
             .sort_by_key(|path| std::cmp::Reverse(path.values.first().map_or(0, String::len)));
@@ -793,36 +767,30 @@ impl Redactor {
                 let group = self.named.entry(name).or_default();
                 let placeholder = format!("<{name}_{}>", group.len() + 1);
                 group.push((value.clone(), placeholder.clone()));
-                *self.counts.entry(name.to_ascii_lowercase()).or_default() += 1;
                 placeholder
             }
             None => {
                 let placeholder = format!("<V{}>", self.generic.len() + 1);
                 self.generic.push((value.clone(), placeholder.clone()));
-                *self.counts.entry("v".to_owned()).or_default() += 1;
                 placeholder
             }
         }
     }
 
     /// The placeholder `value` was already assigned, in whichever group it
-    /// landed in, counting the reuse — or `None` if this sanitizer has never
-    /// seen the value. Never allocates a new placeholder, which is what makes
-    /// it usable as a *lookup* by callers that must not invent one.
+    /// landed in — or `None` if this sanitizer has never seen the value.
+    /// Never allocates a new placeholder, which is what makes it usable as a
+    /// *lookup* by callers that must not invent one.
     fn existing_placeholder(&mut self, value: &Value) -> Option<String> {
-        for (&name, group) in &self.named {
+        for group in self.named.values() {
             if let Some((_, placeholder)) = group.iter().find(|(known, _)| known == value) {
-                let placeholder = placeholder.clone();
-                *self.counts.entry(name.to_ascii_lowercase()).or_default() += 1;
-                return Some(placeholder);
+                return Some(placeholder.clone());
             }
         }
-        if let Some((_, placeholder)) = self.generic.iter().find(|(known, _)| known == value) {
-            let placeholder = placeholder.clone();
-            *self.counts.entry("v".to_owned()).or_default() += 1;
-            return Some(placeholder);
-        }
-        None
+        self.generic
+            .iter()
+            .find(|(known, _)| known == value)
+            .map(|(_, placeholder)| placeholder.clone())
     }
 
     fn sanitize_nonsemantic_value(
@@ -979,20 +947,13 @@ impl Redactor {
         location: &str,
     ) -> Result<(), SanitizationError> {
         for path in &self.paths {
-            let mut occurrences = 0;
             for value in &path.values {
                 if path_occurrence_escapes_root(text, value) {
                     return Err(SanitizationError::UnrecognizedAbsolutePath {
                         location: location.to_owned(),
                     });
                 }
-                let found = replace_path_occurrences(text, value, path.placeholder);
-                if found != 0 {
-                    occurrences += found;
-                }
-            }
-            if occurrences != 0 {
-                *self.counts.entry(path.kind.to_owned()).or_default() += occurrences;
+                replace_path_occurrences(text, value, path.placeholder);
             }
         }
         if contains_absolute_path(text) {
@@ -1006,34 +967,6 @@ impl Redactor {
             });
         }
         Ok(())
-    }
-
-    fn placeholder_definitions(&self) -> Vec<Value> {
-        let mut definitions = Vec::new();
-        for (name, values) in &self.named {
-            let kind = name.to_ascii_lowercase();
-            for (_, placeholder) in values {
-                definitions.push(json!({
-                    "placeholder": placeholder,
-                    "kind": kind,
-                }));
-            }
-        }
-        for (_, placeholder) in &self.generic {
-            definitions.push(json!({
-                "placeholder": placeholder,
-                "kind": "v",
-            }));
-        }
-        for path in &self.paths {
-            if self.counts.contains_key(path.kind) {
-                definitions.push(json!({
-                    "placeholder": path.placeholder,
-                    "kind": path.kind,
-                }));
-            }
-        }
-        definitions
     }
 }
 
@@ -1126,6 +1059,33 @@ fn is_generated_placeholder_shape(text: &str) -> bool {
         !name.is_empty() && !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
     });
     numbered_generic || numbered_named
+}
+
+/// The seven literal path-root placeholders `Redactor::new` writes directly
+/// (`<CWD>`, `<REPO>`, `<HOME>`, `<TEMP>`, `<CODEX_HOME>`, `<APPROVAL_TARGET>`,
+/// `<TRUSTED_POWERSHELL>`) — never through the numbered `named`/`generic`
+/// machinery, so `is_generated_placeholder_shape` alone does not recognize
+/// them (see its own doc comment: none ends in `_<digits>`, by design).
+pub const PATH_ROOT_PLACEHOLDERS: [&str; 7] = [
+    "<CWD>",
+    "<REPO>",
+    "<HOME>",
+    "<TEMP>",
+    "<CODEX_HOME>",
+    "<APPROVAL_TARGET>",
+    "<TRUSTED_POWERSHELL>",
+];
+
+/// Whether `text` is shaped like *any* placeholder this sanitizer can
+/// produce: a numbered generic/named token (`is_generated_placeholder_shape`)
+/// or one of the seven literal path roots above.
+///
+/// Sound with no declared-per-capture list to check against: `sanitize_scalar`
+/// already rejects an allowlisted value that happens to have this shape
+/// (`PlaceholderShapedValue`), so nothing kept verbatim in a promoted capture
+/// can satisfy this check by coincidence.
+pub fn is_placeholder_token(text: &str) -> bool {
+    is_generated_placeholder_shape(text) || PATH_ROOT_PLACEHOLDERS.contains(&text)
 }
 
 /// A decision this task owns, not Task 1's path review: the tool-name-at-
@@ -1722,9 +1682,11 @@ mod tests {
     }
 
     /// Same walk as `sanitize_value`, but returns a `SanitizationReport` —
-    /// `events_bytes` holds the single sanitized value and `manifest_bytes`
-    /// the placeholder/count accounting, so Task 3's novel-path report can
-    /// exercise this without a full `sanitize_dir` round trip.
+    /// `events_bytes` holds the single sanitized value, so Task 3's
+    /// novel-path report can exercise this without a full `sanitize_dir`
+    /// round trip. `manifest_bytes` is a stand-in, not `sanitize_dir`'s real
+    /// provenance manifest (this helper never sees a `RawCapture` to build
+    /// one from) — every caller in this module only checks it is non-empty.
     fn sanitize_value_reporting(value: Value, provider: Provider) -> SanitizationReport {
         let mut value = value;
         let mut redactor = Redactor::default();
@@ -1733,11 +1695,8 @@ mod tests {
             .expect("test value expected to sanitize cleanly");
         let events_bytes = serde_json::to_vec(&value).expect("sanitized value encodes");
         let novel_paths = redactor.novel_paths();
-        let manifest_bytes = serde_json::to_vec(&json!({
-            "placeholders": redactor.placeholder_definitions(),
-            "redaction_counts": redactor.counts,
-        }))
-        .expect("manifest encodes");
+        let manifest_bytes =
+            serde_json::to_vec(&json!({ "schema_version": 1 })).expect("manifest encodes");
         SanitizationReport {
             events_path: PathBuf::new(),
             manifest_path: PathBuf::new(),

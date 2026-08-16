@@ -30,7 +30,8 @@ pub use corpus::{
 };
 pub use record::{Requirements, SCENARIOS, ScenarioSpec, record, scenario};
 pub use sanitize::{
-    NovelPath, SanitizationError, SanitizationReport, render_novel_paths_report, sanitize_dir,
+    NovelPath, PATH_ROOT_PLACEHOLDERS, SanitizationError, SanitizationReport, is_placeholder_token,
+    render_novel_paths_report, sanitize_dir,
 };
 pub use sheet::{SheetScenario, render_sheet};
 pub use surface::{

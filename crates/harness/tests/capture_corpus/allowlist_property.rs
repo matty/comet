@@ -45,11 +45,11 @@
 //! allowlist and turns this green; until then, the failure below is the
 //! proof the property does what it says.
 
-use std::collections::BTreeSet;
 use std::path::Path;
 
 use comet_harness::capture::{
-    MAP_PATHS, Provider, allows, allows_prefix, corpus_root, frames, promoted_scenarios,
+    MAP_PATHS, Provider, allows, allows_prefix, corpus_root, frames, is_placeholder_token,
+    promoted_scenarios,
 };
 use serde_json::Value;
 
@@ -91,15 +91,8 @@ fn every_committed_value_is_allowlisted_or_a_placeholder() {
     for scenario in scenarios {
         scenario_count += 1;
         let manifest_path = scenario.directory.join("manifest.json");
-        let (provider, placeholders) =
-            manifest_provider_and_placeholders(&manifest_path, &scenario.label);
-        check_scenario(
-            &scenario.directory,
-            &scenario.label,
-            provider,
-            &placeholders,
-            &mut escapes,
-        );
+        let provider = manifest_provider(&manifest_path, &scenario.label);
+        check_scenario(&scenario.directory, &scenario.label, provider, &mut escapes);
     }
 
     // Mirrors the same guard the shared corpus walk uses: a broken walk that
@@ -150,10 +143,8 @@ fn every_committed_map_key_is_allowlisted_or_a_placeholder() {
         .unwrap_or_else(|error| panic!("{} could not be walked: {error}", corpus_root.display()));
     for scenario in scenarios {
         scenario_count += 1;
-        let (provider, placeholders) = manifest_provider_and_placeholders(
-            &scenario.directory.join("manifest.json"),
-            &scenario.label,
-        );
+        let provider =
+            manifest_provider(&scenario.directory.join("manifest.json"), &scenario.label);
         let events = frames(&scenario.directory)
             .unwrap_or_else(|error| panic!("{}: events.jsonl unreadable: {error}", scenario.label));
         for event in events {
@@ -168,7 +159,7 @@ fn every_committed_map_key_is_allowlisted_or_a_placeholder() {
             collect_map_keys(&payload, "", &mut keys);
             for (parent_path, key) in keys {
                 let formed = format!("{parent_path}.{key}");
-                if allows_prefix(provider, &formed) || placeholders.contains(&key) {
+                if allows_prefix(provider, &formed) || is_placeholder_token(&key) {
                     continue;
                 }
                 escapes.push(Escape {
@@ -226,52 +217,19 @@ fn collect_map_keys(value: &Value, path: &str, out: &mut Vec<(String, String)>) 
     }
 }
 
-/// The reciprocity that survives Task 5's manifest-reconstruction gap
-/// (docs/debt -- see the D73/D75 neighbourhood in `docs/debt/README.md` for
-/// the sibling gaps this same review pass found): every `<..._N>`/`<...>`
-/// bracket-shaped token committed anywhere in a manifest is either declared
-/// in that manifest's own `placeholders` list, or is one of the seven
-/// literal path-root placeholders `Redactor::new` writes directly
-/// (`sanitize.rs:519-553`) without ever registering them in
-/// `placeholder_definitions()` -- `<CWD>`, `<REPO>`, `<HOME>`, `<TEMP>`,
-/// `<CODEX_HOME>`, `<APPROVAL_TARGET>`, `<TRUSTED_POWERSHELL>`.
+/// Every `<..._N>`/`<...>` bracket-shaped token committed anywhere in a
+/// manifest is actually shaped like a placeholder this sanitizer can produce
+/// (`is_placeholder_token`): a numbered generic/named token, or one of the
+/// seven literal path roots.
 ///
-/// The second branch is a known, accepted gap, not something this test is
-/// trying to close: `claude/2.1.228/approval/manifest.json` and
-/// `codex/0.147.0/model-discovery-logged-out/manifest.json` both carry a
-/// path-root placeholder in `command`/`configured_env` that the re-sanitize
-/// pass's `placeholder_definitions()` never declared, because Task 5
-/// reconstructed their raw input from already-sanitized output -- the text
-/// already read `<CWD>`/`<HOME>`/`<CODEX_HOME>` verbatim, so the fresh
-/// redaction roots on the second pass had nothing left to match and
-/// `sanitize_paths_and_validate` counted zero occurrences. The values
-/// themselves are still safe (a placeholder token, not raw content); what is
-/// missing is only the bookkeeping that would let a reader confirm that from
-/// the manifest alone. What this test actually guards is the case that gap
-/// does *not* cover: any OTHER bracket-shaped token -- one that is not on
-/// the closed seven-item path-root list -- must still be declared, so a
-/// genuinely new kind of undeclared, unreconciled token is still caught.
-const KNOWN_UNDECLARED_PATH_ROOTS: [&str; 7] = [
-    "<CWD>",
-    "<REPO>",
-    "<HOME>",
-    "<TEMP>",
-    "<CODEX_HOME>",
-    "<APPROVAL_TARGET>",
-    "<TRUSTED_POWERSHELL>",
-];
-
-/// Walks [`promoted_scenarios`] rather than every `manifest.json` under the
-/// corpus directly, so this is narrower than its own name suggests: a
-/// scenario directory holding a `manifest.json` but no `events.jsonl` would
-/// never reach the `manifest_path.is_file()` check below at all, because
-/// `promoted_scenarios` never yields it. Inert today — every scenario
-/// directory in the committed corpus carries both files together, verified
-/// directly rather than assumed — but real if that ever stops holding.
+/// Used to check reciprocity against a `placeholders` array each manifest
+/// declared; that array was dropped at the stage-6 promotion (nobody read
+/// the per-capture accounting), so this checks shape directly instead. No
+/// declared list left to fall out of sync with the text.
 #[test]
-fn every_manifest_token_is_declared_or_a_known_path_root() {
+fn every_bracket_shaped_manifest_token_is_placeholder_shaped() {
     let corpus_root = corpus_root();
-    let mut undeclared = Vec::new();
+    let mut unshaped = Vec::new();
     let mut manifest_count = 0u64;
 
     let scenarios = promoted_scenarios(&corpus_root)
@@ -291,22 +249,14 @@ fn every_manifest_token_is_declared_or_a_known_path_root() {
                 scenario.label
             )
         });
-        let declared: BTreeSet<&str> = manifest["placeholders"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{}: manifest has no placeholders array", scenario.label))
-            .iter()
-            .filter_map(|entry| entry["placeholder"].as_str())
-            .collect();
 
         let mut tokens = Vec::new();
         collect_bracket_tokens(&manifest, &mut tokens);
         for token in tokens {
-            if declared.contains(token.as_str())
-                || KNOWN_UNDECLARED_PATH_ROOTS.contains(&token.as_str())
-            {
+            if is_placeholder_token(&token) {
                 continue;
             }
-            undeclared.push(format!("{}: {token}", scenario.label));
+            unshaped.push(format!("{}: {token}", scenario.label));
         }
     }
 
@@ -316,10 +266,10 @@ fn every_manifest_token_is_declared_or_a_known_path_root() {
         corpus_root.display()
     );
     assert!(
-        undeclared.is_empty(),
-        "bracket-shaped token(s) in a committed manifest are neither declared in that \
-         manifest's own placeholders list nor one of the seven known path-root literals:\n{}",
-        undeclared.join("\n")
+        unshaped.is_empty(),
+        "bracket-shaped token(s) in a committed manifest are not shaped like any \
+         placeholder this sanitizer produces:\n{}",
+        unshaped.join("\n")
     );
 }
 
@@ -350,14 +300,13 @@ fn collect_bracket_tokens(value: &Value, out: &mut Vec<String>) {
     }
 }
 
-/// One scenario's worth of frames, checked against its own provider and its
-/// own manifest's placeholder vocabulary. Failures are pushed onto `escapes`
-/// rather than panicking here, so one bad scenario does not hide every other.
+/// One scenario's worth of frames, checked against its own provider.
+/// Failures are pushed onto `escapes` rather than panicking here, so one bad
+/// scenario does not hide every other.
 fn check_scenario(
     scenario_dir: &Path,
     scenario: &str,
     provider: Provider,
-    placeholders: &BTreeSet<String>,
     escapes: &mut Vec<Escape>,
 ) {
     let events = frames(scenario_dir)
@@ -375,7 +324,7 @@ fn check_scenario(
                 let mut scalars = Vec::new();
                 collect_scalars(&value, "", &mut scalars);
                 for (path, scalar) in scalars {
-                    if is_escape(provider, &path, &scalar, placeholders) {
+                    if is_escape(provider, &path, &scalar) {
                         escapes.push(Escape {
                             scenario: scenario.to_owned(),
                             sequence,
@@ -391,7 +340,7 @@ fn check_scenario(
             // one thing to check is that the whole string is itself a known
             // placeholder.
             Err(_) => {
-                if !placeholders.contains(payload) {
+                if !is_placeholder_token(payload) {
                     escapes.push(Escape {
                         scenario: scenario.to_owned(),
                         sequence,
@@ -441,29 +390,20 @@ fn collect_scalars(value: &Value, path: &str, out: &mut Vec<(String, Value)>) {
 ///
 /// Mirrors `Redactor::sanitize_scalar`'s own condition in `sanitize.rs`
 /// exactly -- `if path_allowed && !is_mcp_tool_identity(value)` -- not just
-/// `allows(provider, path)` alone. Getting this half wrong is not a
-/// hypothetical: an allowlisted path is a decision about the *field*, not a
-/// licence for whatever a provider puts in it, and six of Claude's allowed
-/// paths hold a tool name (`.event.content_block.name`, `.last_tool_name`,
+/// `allows(provider, path)` alone. Five of Claude's allowed paths hold a
+/// tool name (`.event.content_block.name`, `.last_tool_name`,
 /// `.message.content[].content[].tool_name`, `.message.content[].name`,
-/// `.request.tool_name`, `.tool_use_result.matches[]`). An MCP invocation
-/// puts `mcp__<server>__<tool>` in that same field, which embeds the exact
-/// server identity `.mcp_servers[].name` and `.tools[]` are excluded to
-/// protect -- so a value shaped like that must still be a placeholder even
-/// though its path is on the list, and checking `allows` alone would call it
-/// clean. See `is_mcp_tool_identity`'s own doc comment in `sanitize.rs` for
-/// the reviewed reasoning behind the exception itself.
-fn is_escape(
-    provider: Provider,
-    path: &str,
-    scalar: &Value,
-    placeholders: &BTreeSet<String>,
-) -> bool {
+/// `.request.tool_name` -- `.tool_use_result.matches[]` left this family at
+/// the stage-6 promotion, closing D73), and an MCP invocation puts
+/// `mcp__<server>__<tool>` there, embedding server identity the allowlist
+/// otherwise excludes. See `is_mcp_tool_identity`'s doc comment in
+/// `sanitize.rs` for the reviewed reasoning.
+fn is_escape(provider: Provider, path: &str, scalar: &Value) -> bool {
     let kept_verbatim = allows(provider, path) && !is_mcp_tool_identity(scalar);
     if kept_verbatim {
         return false;
     }
-    !matches!(scalar, Value::String(text) if placeholders.contains(text))
+    !matches!(scalar, Value::String(text) if is_placeholder_token(text))
 }
 
 /// Local mirror of the private `is_mcp_tool_identity` in `sanitize.rs` --
@@ -474,50 +414,21 @@ fn is_mcp_tool_identity(value: &Value) -> bool {
     value.as_str().is_some_and(|text| text.starts_with("mcp__"))
 }
 
-/// The provider and the full set of placeholder strings a scenario's own
-/// manifest recorded as actually used (`manifest["placeholders"][].placeholder`).
+/// The provider a scenario's own manifest declares.
 ///
-/// Reading this per scenario, rather than hardcoding the current placeholder
-/// vocabulary, is deliberate: before Task 5 re-sanitized the archive, the
-/// committed corpus still carried the *old* blocklist-era typed names
-/// (`<SESSION_ID_1>`, `<CLAUDE_THINKING_SIGNATURE_1>`, ...), not the six-kind
-/// vocabulary `sanitize.rs` writes today (`<SESSION_1>`, `<MACHINE_1>`, ...).
-/// Task 5 has since run: every *manifest* in the corpus now uses the
-/// six-kind vocabulary, and no `SESSION_ID`/`CLAUDE_`-prefixed placeholder
-/// remains in any of them. That claim used to stop at manifests rather than
-/// the whole corpus directory, because `claude/2.1.229/subagent/
-/// read-back-run-journal.jsonl` still held `<SESSION_ID_1>` twice,
-/// hand-sanitized under the old vocabulary, outside `sanitize_dir`'s remit,
-/// and with no manifest of its own for this function to read. `D75` in
-/// `docs/debt/README.md` deleted that file (and its sibling
-/// `read-back-doc-snapshot.json`) rather than bringing it under the
-/// allowlist, so the exception is gone: every placeholder anywhere in the
-/// corpus now comes from a manifest this function can read. Reading each
-/// manifest's own list, rather than hardcoding either vocabulary, is what
-/// let this property hold across that sanitizer-vocabulary change without
-/// editing the test, and is what lets it keep holding across whatever the
-/// vocabulary becomes next.
-fn manifest_provider_and_placeholders(
-    manifest_path: &Path,
-    scenario: &str,
-) -> (Provider, BTreeSet<String>) {
+/// Used to also read `manifest["placeholders"]` alongside it; that array was
+/// dropped at the stage-6 promotion, and placeholder recognition moved to
+/// shape (`is_placeholder_token`), so `provider` is all that is left to read.
+fn manifest_provider(manifest_path: &Path, scenario: &str) -> Provider {
     let text = std::fs::read_to_string(manifest_path)
         .unwrap_or_else(|error| panic!("{scenario}: manifest.json unreadable: {error}"));
     let manifest: Value = serde_json::from_str(&text)
         .unwrap_or_else(|error| panic!("{scenario}: manifest.json is not valid JSON: {error}"));
-    let provider = match manifest["provider"].as_str() {
+    match manifest["provider"].as_str() {
         Some("claude") => Provider::Claude,
         Some("codex") => Provider::Codex,
         other => panic!("{scenario}: manifest has an unknown provider: {other:?}"),
-    };
-    let placeholders = manifest["placeholders"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{scenario}: manifest has no placeholders array"))
-        .iter()
-        .filter_map(|entry| entry["placeholder"].as_str())
-        .map(str::to_owned)
-        .collect();
-    (provider, placeholders)
+    }
 }
 
 #[cfg(test)]
@@ -528,8 +439,6 @@ mod self_check {
     //! `sanitize.rs`." Runs a synthetic capture through the production
     //! sanitizer and cross-checks every scalar's path against its real
     //! allow/placeholder outcome.
-
-    use std::collections::BTreeSet;
 
     use comet_harness::capture::{Provider, allows, sanitize_dir};
     use serde_json::Value;
@@ -603,20 +512,11 @@ mod self_check {
         assert!(allows(Provider::Claude, ".request.tool_name"));
         let redacted_tool_name = by_path[".request.tool_name"].as_str().unwrap();
         assert_ne!(redacted_tool_name, "mcp__linear__create_issue");
-        let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
-        let placeholders: BTreeSet<String> = manifest["placeholders"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|entry| entry["placeholder"].as_str())
-            .map(str::to_owned)
-            .collect();
         assert!(
             !is_escape(
                 Provider::Claude,
                 ".request.tool_name",
                 by_path[".request.tool_name"],
-                &placeholders
             ),
             "the real sanitizer's redacted mcp__ placeholder must not read as an escape"
         );
@@ -652,39 +552,22 @@ mod self_check {
             allows(Provider::Claude, path),
             "test premise: {path} must actually be on claude.txt"
         );
-        let empty_placeholders = BTreeSet::new();
 
         let raw_mcp_identity = Value::String("mcp__linear__create_issue".to_owned());
         assert!(
-            is_escape(
-                Provider::Claude,
-                path,
-                &raw_mcp_identity,
-                &empty_placeholders
-            ),
+            is_escape(Provider::Claude, path, &raw_mcp_identity),
             "a raw mcp__ value at an allowlisted path must still count as an escape"
         );
 
         // Same path, a built-in tool name -- the exception is scoped to the
         // `mcp__` prefix, not the whole path, so this must NOT be an escape.
         let builtin = Value::String("Bash".to_owned());
-        assert!(!is_escape(
-            Provider::Claude,
-            path,
-            &builtin,
-            &empty_placeholders
-        ));
+        assert!(!is_escape(Provider::Claude, path, &builtin));
 
         // The same mcp__ identity IS clean once it has actually become a
-        // placeholder the corpus's manifest recorded as used.
-        let mut known_placeholders = BTreeSet::new();
-        known_placeholders.insert("<V1>".to_owned());
+        // placeholder -- shape-recognized directly, with no declared list to
+        // consult.
         let placeholder_value = Value::String("<V1>".to_owned());
-        assert!(!is_escape(
-            Provider::Claude,
-            path,
-            &placeholder_value,
-            &known_placeholders
-        ));
+        assert!(!is_escape(Provider::Claude, path, &placeholder_value));
     }
 }

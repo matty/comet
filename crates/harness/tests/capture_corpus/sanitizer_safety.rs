@@ -21,10 +21,11 @@
 //!   whatever a provider puts in it, so these need coverage that lands on an
 //!   allowed path, not an unlisted one -- a value on an unlisted path never
 //!   reaches these scans at all anymore.
-//! - The same scans, run unconditionally on the six manifest metadata fields
-//!   (`command`, `cli_version`, `normalized_cli_version`, `scenario`,
-//!   `purpose`, `platform`) that never pass through the path allowlist in the
-//!   first place.
+//! - The same scans, run unconditionally on the five manifest metadata fields
+//!   (`command`, `cli_version`, `scenario`, `purpose`, `platform`) that never
+//!   pass through the path allowlist. (`normalized_cli_version` was a sixth
+//!   until the stage-6 promotion dropped it, `source`, `channels`,
+//!   `placeholders` and `redaction_counts` -- the manifest is bare provenance now.)
 
 use super::support::*;
 
@@ -259,13 +260,15 @@ fn sanitizer_rejects_secret_field_names_regardless_of_path_and_still_permits_num
 ///
 /// Not subsumed by the allowlist, and not subsumed by
 /// `sanitizer_rejects_a_credential_riding_an_allowlisted_path` above: these
-/// six manifest fields (`command`'s argv and program path, `cli_version`,
-/// `normalized_cli_version`, `scenario`, `purpose`, `platform`) never pass
-/// through the path allowlist at all -- `sanitize_dir` scans each of them
-/// directly, unconditionally, and `allowlist_property.rs` only ever reads a
-/// manifest's `provider` and `placeholders` fields, never these. The manifest
-/// is committed evidence in a public repo, so each of these six needs its own
-/// proof the fail-closed scan still runs on it.
+/// five manifest fields (`command`'s argv and program path, `cli_version`,
+/// `scenario`, `purpose`, `platform`) never pass through the path allowlist
+/// at all -- `sanitize_dir` scans each of them directly, unconditionally, and
+/// `allowlist_property.rs` only ever reads a manifest's `provider` field,
+/// never these. The manifest is committed evidence in a public repo, so each
+/// of these five needs its own proof the fail-closed scan still runs on it.
+/// (Two mutations below, `command_program` and `command_args`, both land
+/// inside `command`, so the six-entry table below still exercises five
+/// distinct top-level fields.)
 type ManifestMutator = fn(&mut Value);
 
 #[test]
@@ -387,7 +390,6 @@ fn sanitizer_reuses_the_event_session_mapping_in_claude_resume_argv() {
         manifest["command"]["args"],
         serde_json::json!(["--print", "--resume=<SESSION_1>"])
     );
-    assert_eq!(manifest["redaction_counts"]["session"], 2);
     assert!(
         !String::from_utf8(report.manifest_bytes)
             .unwrap()
