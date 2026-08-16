@@ -16,6 +16,7 @@ capture one bounded Claude run script
 
 cwd: `<CWD>`
 env: (none set)
+tools: 59
 
 ```
 <HOME>\.local\bin\claude.exe
@@ -42,6 +43,7 @@ capture one bounded Claude run script
 
 cwd: `<CWD>`
 env: (none set)
+tools: 59
 
 ```
 <HOME>\.local\bin\claude.exe
@@ -69,6 +71,7 @@ capture Claude delegating a Task/Agent subagent, including the resumed task_star
 
 cwd: `<CWD>`
 env: (none set)
+tools: 35
 
 ```
 <HOME>\.local\bin\claude.exe
