@@ -883,19 +883,23 @@ impl Redactor {
         Ok(())
     }
 
-    /// Scenarios whose argv may legitimately carry `--resume=<id>`.
+    /// Whether `scenario`'s argv may legitimately carry `--resume=<id>`.
     ///
     /// The rule this gates is fail-closed on purpose: a `--resume` in a
     /// capture that had no business resuming is evidence the command was not
     /// what the scenario says, and that must stop promotion rather than be
-    /// sanitized away. What is wrong with it is only that the permitted set is
-    /// a literal here, so every new resume-bearing scenario is rejected until
-    /// someone finds this function — `checklist-resume` was, and the error
-    /// (`Claude capture command has invalid resume arguments at command.args`)
-    /// names the argv rather than the missing registration. **D60** is the
-    /// structural fix: one scenario table the help text, `supported_pair` and
-    /// this list all read from.
-    const RESUMING_SCENARIOS: &'static [&'static str] = &["resume", "checklist-resume"];
+    /// sanitized away. Reads `Requirements::needs_resume_id` off the one
+    /// scenario table (**D60**: `record::scenarios::SCENARIOS`) rather than
+    /// repeating the permitted set as a literal here — a literal here was
+    /// exactly the fourth unsynchronized copy D60 closed the other three of;
+    /// every new resume-bearing scenario was rejected until someone found
+    /// this function (`checklist-resume` was, and the error
+    /// `Claude capture command has invalid resume arguments at command.args`
+    /// names the argv rather than the missing registration).
+    fn claude_scenario_allows_resume(scenario: &str) -> bool {
+        super::record::scenario("claude", scenario)
+            .is_some_and(|spec| spec.requirements.needs_resume_id)
+    }
 
     fn sanitize_claude_resume_argv(
         &mut self,
@@ -916,7 +920,7 @@ impl Redactor {
                     .then_some(index)
             })
             .collect();
-        if !Self::RESUMING_SCENARIOS.contains(&scenario) {
+        if !Self::claude_scenario_allows_resume(scenario) {
             if resume_like.is_empty() {
                 return Ok(());
             }
@@ -974,15 +978,15 @@ impl Redactor {
         text: &mut String,
         location: &str,
     ) -> Result<(), SanitizationError> {
-        for path in self.paths.clone() {
+        for path in &self.paths {
             let mut occurrences = 0;
-            for value in path.values {
-                if path_occurrence_escapes_root(text, &value) {
+            for value in &path.values {
+                if path_occurrence_escapes_root(text, value) {
                     return Err(SanitizationError::UnrecognizedAbsolutePath {
                         location: location.to_owned(),
                     });
                 }
-                let found = replace_path_occurrences(text, &value, path.placeholder);
+                let found = replace_path_occurrences(text, value, path.placeholder);
                 if found != 0 {
                     occurrences += found;
                 }
@@ -1087,28 +1091,6 @@ fn is_secret_field(field: &str, value: &Value) -> bool {
         || normalized == "secret"
 }
 
-/// A decision this task owns, not Task 1's path review: the tool-name-at-
-/// invocation family (`.message.content[].name`, `.event.content_block.name`,
-/// `.request.tool_name`, `.last_tool_name`,
-/// `.message.content[].content[].tool_name`, `.tool_use_result.matches[]`) is
-/// allowlisted, and every sampled value today is a built-in tool name
-/// (`Read`, `Bash`, `TaskCreate`). An MCP invocation puts
-/// `mcp__<server>__<tool>` in that same field, embedding the server identity
-/// `.mcp_servers[].name` and `.tools[]` were both excluded to protect —
-/// closing those paths and leaving this one open would undo the fix. A path
-/// decision can't express "this field, except when the value looks like
-/// this", so the exception lives at the value, checked after the path is
-/// already known to be allowed.
-///
-/// `.request.display_name` was originally in this family and is deliberately
-/// no longer allowlisted at all (review finding, 2026-08-15): it exists to
-/// hold a *friendly rendering*, not the raw name, so an MCP tool's friendly
-/// rendering can plausibly read `create_issue (linear)` — naming
-/// the server while never containing the literal `mcp__` prefix this check
-/// matches on. `crates/harness/src/claude/wire.rs:694` records the field as
-/// present and deliberately undecoded, so by the standing "nothing decodes
-/// it" rule it should not have been on the list regardless of the prefix
-/// gap.
 /// Whether `text` is shaped like a placeholder this sanitizer *generates* —
 /// `<V12>`, or a named group with a trailing number (`<SESSION_1>`,
 /// `<PROSE_3>`).
@@ -1146,50 +1128,91 @@ fn is_generated_placeholder_shape(text: &str) -> bool {
     numbered_generic || numbered_named
 }
 
+/// A decision this task owns, not Task 1's path review: the tool-name-at-
+/// invocation family (`.message.content[].name`, `.event.content_block.name`,
+/// `.request.tool_name`, `.last_tool_name`,
+/// `.message.content[].content[].tool_name`, `.tool_use_result.matches[]`) is
+/// allowlisted, and every sampled value today is a built-in tool name
+/// (`Read`, `Bash`, `TaskCreate`). An MCP invocation puts
+/// `mcp__<server>__<tool>` in that same field, embedding the server identity
+/// `.mcp_servers[].name` and `.tools[]` were both excluded to protect —
+/// closing those paths and leaving this one open would undo the fix. A path
+/// decision can't express "this field, except when the value looks like
+/// this", so the exception lives at the value, checked after the path is
+/// already known to be allowed.
+///
+/// `.request.display_name` was originally in this family and is deliberately
+/// no longer allowlisted at all (review finding, 2026-08-15): it exists to
+/// hold a *friendly rendering*, not the raw name, so an MCP tool's friendly
+/// rendering can plausibly read `create_issue (linear)` — naming
+/// the server while never containing the literal `mcp__` prefix this check
+/// matches on. `crates/harness/src/claude/wire.rs:694` records the field as
+/// present and deliberately undecoded, so by the standing "nothing decodes
+/// it" rule it should not have been on the list regardless of the prefix
+/// gap.
 fn is_mcp_tool_identity(value: &Value) -> bool {
     value.as_str().is_some_and(|text| text.starts_with("mcp__"))
 }
 
 /// The type-and-length summary a `NovelPath` reports instead of a value:
 /// `"string len 8"` (or `"string len 8-42"` when lengths vary across the
-/// distinct values seen), `"number"`, `"bool"`. String length is counted in
+/// distinct values seen), `"number"`, or `"mixed"` when a path's withheld
+/// values are not all the same JSON type. String length is counted in
 /// `char`s, not bytes, so it reflects what a reader would see rather than a
-/// UTF-8 encoding detail. `"mixed"` covers the case (not reachable through
-/// `sanitize_scalar` today, since only `String`/`Number` scalars are ever
-/// redacted) where a path's withheld values are not all the same JSON type.
+/// UTF-8 encoding detail.
+///
+/// `"mixed"` **is** reachable, despite an earlier version of this comment
+/// claiming otherwise: `sanitize_value_tree`'s array arm gives every element
+/// the same collapsed path (`{path}[]`), so a novel array mixing a string
+/// and a number — `["a", 5]` — hands two different `Value` variants to the
+/// same path in a single walk.
+/// `mixed_type_values_at_one_path_report_as_mixed` proves it directly.
+///
+/// What genuinely cannot reach here: `Bool`/`Null`/`Array`/`Object`, and an
+/// empty slice. `sanitize_value_tree` (line 691) routes only `String`/
+/// `Number` into `sanitize_scalar` — everything else falls through its `_ =>
+/// Ok(())` arm untouched — and the map-key branch that also feeds
+/// `record_novel` always passes a `Value::String`. `values` is never empty
+/// either: a path's entry in `self.novel` is created and given its first
+/// value in the same call (`record_novel`), so `describe_shape` never sees
+/// an entry that exists but holds nothing.
 fn describe_shape(values: &[Value]) -> String {
+    debug_assert!(
+        !values.is_empty(),
+        "describe_shape is only ever called on an existing self.novel entry, which record_novel \
+         never leaves empty"
+    );
+    if values.is_empty() {
+        // The assertion above is compiled out of a release build, so this is
+        // the fallback if the invariant it names ever breaks there — without
+        // it, `min_len`/`max_len` stay at their unset `usize::MAX`/`0`
+        // starting values and the string branch below would print a
+        // nonsensical range like "string len 18446744073709551615-0" instead
+        // of failing loudly or degrading safely.
+        return "no withheld values".to_owned();
+    }
     let mut all_string = true;
     let mut all_number = true;
-    let mut all_bool = true;
     let mut min_len = usize::MAX;
     let mut max_len = 0usize;
     for value in values {
         match value {
             Value::String(text) => {
                 all_number = false;
-                all_bool = false;
                 let len = text.chars().count();
                 min_len = min_len.min(len);
                 max_len = max_len.max(len);
             }
             Value::Number(_) => {
                 all_string = false;
-                all_bool = false;
-            }
-            Value::Bool(_) => {
-                all_string = false;
-                all_number = false;
             }
             _ => {
                 all_string = false;
                 all_number = false;
-                all_bool = false;
             }
         }
     }
-    if values.is_empty() {
-        "empty".to_owned()
-    } else if all_string {
+    if all_string {
         if min_len == max_len {
             format!("string len {min_len}")
         } else {
@@ -1197,8 +1220,6 @@ fn describe_shape(values: &[Value]) -> String {
         }
     } else if all_number {
         "number".to_owned()
-    } else if all_bool {
-        "bool".to_owned()
     } else {
         "mixed".to_owned()
     }
@@ -1280,8 +1301,9 @@ fn is_token_counter_field(field: &str) -> bool {
 }
 
 fn contains_secret_value(value: &str) -> bool {
-    let uppercase = value.to_ascii_uppercase();
-    if uppercase.contains("-----BEGIN ") && uppercase.contains(" PRIVATE KEY-----") {
+    if contains_ascii_case_insensitive(value, "-----BEGIN ")
+        && contains_ascii_case_insensitive(value, " PRIVATE KEY-----")
+    {
         return true;
     }
     ["sk-ant-", "sk-proj-", "xoxb-", "ghp_", "github_pat_"]
@@ -1290,6 +1312,20 @@ fn contains_secret_value(value: &str) -> bool {
         || value
             .match_indices("sk-")
             .any(|(index, _)| index == 0 || !value.as_bytes()[index - 1].is_ascii_alphanumeric())
+}
+
+/// Whether `haystack` contains `needle`, comparing ASCII case-insensitively,
+/// without allocating an uppercased copy of `haystack` — this runs once per
+/// scanned string in the sanitizer's hot loop (~2,900 calls on the largest
+/// capture), and `to_ascii_uppercase` was paying for a full string clone on
+/// every call just to test for one fixed-case literal.
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    needle.len() <= haystack.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 fn replace_path_occurrences(text: &mut String, path: &str, placeholder: &str) -> u64 {
@@ -1780,6 +1816,25 @@ mod tests {
             entry.distinct_values, 2,
             "two distinct strings, three occurrences"
         );
+    }
+
+    /// Break caught: a future editor re-reads `describe_shape`'s old doc
+    /// comment (or a `/simplify` pass's notes) and concludes `"mixed"` is
+    /// dead code, the same mistaken conclusion this file's own comment used
+    /// to state. An array collapses every element to one shared path
+    /// (`sanitize_value_tree`'s own array arithmetic), so a JSON array
+    /// mixing a string and a number at a novel path hands `describe_shape`
+    /// two different `Value` variants in a single call — reachable, not
+    /// hypothetical.
+    #[test]
+    fn mixed_type_values_at_one_path_report_as_mixed() {
+        let report = sanitize_value_reporting(json!({"mystery": ["a-string", 5]}), Provider::Codex);
+        let entry = report
+            .novel_paths
+            .iter()
+            .find(|n| n.path == ".mystery[]")
+            .expect("array elements share one allowlist path, and it is novel");
+        assert_eq!(entry.shape, "mixed", "{entry:?}");
     }
 
     /// `render_novel_paths_report` is the thing that actually gets pasted

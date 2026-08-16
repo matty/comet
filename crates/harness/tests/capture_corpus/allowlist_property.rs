@@ -41,9 +41,11 @@
 //! proof the property does what it says.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use comet_harness::capture::{MAP_PATHS, Provider, allows, allows_prefix};
+use comet_harness::capture::{
+    MAP_PATHS, Provider, allows, allows_prefix, corpus_root, frames, promoted_scenarios,
+};
 use serde_json::Value;
 
 /// One committed scalar that is neither on its provider's allowlist nor
@@ -75,40 +77,29 @@ impl std::fmt::Display for Escape {
 
 #[test]
 fn every_committed_value_is_allowlisted_or_a_placeholder() {
-    let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    let corpus_root = corpus_root();
     let mut escapes = Vec::new();
     let mut scenario_count = 0u64;
 
-    for provider_dir in subdirectories(&corpus_root) {
-        for version_dir in subdirectories(&provider_dir) {
-            for scenario_dir in subdirectories(&version_dir) {
-                let events_path = scenario_dir.join("events.jsonl");
-                if !events_path.is_file() {
-                    continue;
-                }
-                scenario_count += 1;
-                let scenario = scenario_dir
-                    .strip_prefix(&corpus_root)
-                    .unwrap_or(scenario_dir.as_path())
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let manifest_path = scenario_dir.join("manifest.json");
-                let (provider, placeholders) =
-                    manifest_provider_and_placeholders(&manifest_path, &scenario);
-                check_scenario(
-                    &events_path,
-                    &scenario,
-                    provider,
-                    &placeholders,
-                    &mut escapes,
-                );
-            }
-        }
+    let scenarios = promoted_scenarios(&corpus_root)
+        .unwrap_or_else(|error| panic!("{} could not be walked: {error}", corpus_root.display()));
+    for scenario in scenarios {
+        scenario_count += 1;
+        let manifest_path = scenario.directory.join("manifest.json");
+        let (provider, placeholders) =
+            manifest_provider_and_placeholders(&manifest_path, &scenario.label);
+        check_scenario(
+            &scenario.directory,
+            &scenario.label,
+            provider,
+            &placeholders,
+            &mut escapes,
+        );
     }
 
-    // Mirrors the same guard `allowlist.rs`'s own corpus walk uses: a broken
-    // walk that silently visits nothing must fail loudly, not read as "the
-    // property holds" by finding zero frames to check.
+    // Mirrors the same guard the shared corpus walk uses: a broken walk that
+    // silently visits nothing must fail loudly, not read as "the property
+    // holds" by finding zero frames to check.
     assert!(
         scenario_count > 0,
         "found no events.jsonl under {} -- corpus walk is broken, not just empty",
@@ -146,60 +137,44 @@ fn every_committed_value_is_allowlisted_or_a_placeholder() {
 /// invisible to every test in this file.
 #[test]
 fn every_committed_map_key_is_allowlisted_or_a_placeholder() {
-    let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    let corpus_root = corpus_root();
     let mut escapes = Vec::new();
     let mut scenario_count = 0u64;
 
-    for provider_dir in subdirectories(&corpus_root) {
-        for version_dir in subdirectories(&provider_dir) {
-            for scenario_dir in subdirectories(&version_dir) {
-                let events_path = scenario_dir.join("events.jsonl");
-                if !events_path.is_file() {
+    let scenarios = promoted_scenarios(&corpus_root)
+        .unwrap_or_else(|error| panic!("{} could not be walked: {error}", corpus_root.display()));
+    for scenario in scenarios {
+        scenario_count += 1;
+        let (provider, placeholders) = manifest_provider_and_placeholders(
+            &scenario.directory.join("manifest.json"),
+            &scenario.label,
+        );
+        let events = frames(&scenario.directory)
+            .unwrap_or_else(|error| panic!("{}: events.jsonl unreadable: {error}", scenario.label));
+        for event in events {
+            let sequence = event["sequence"].as_u64().unwrap_or_default();
+            let Some(payload) = event["payload"].as_str() else {
+                continue;
+            };
+            let Ok(payload) = serde_json::from_str::<Value>(payload) else {
+                continue;
+            };
+            let mut keys = Vec::new();
+            collect_map_keys(&payload, "", &mut keys);
+            for (parent_path, key) in keys {
+                let formed = format!("{parent_path}.{key}");
+                if allows_prefix(provider, &formed) || placeholders.contains(&key) {
                     continue;
                 }
-                scenario_count += 1;
-                let scenario = scenario_dir
-                    .strip_prefix(&corpus_root)
-                    .unwrap_or(scenario_dir.as_path())
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let (provider, placeholders) = manifest_provider_and_placeholders(
-                    &scenario_dir.join("manifest.json"),
-                    &scenario,
-                );
-                let text = std::fs::read_to_string(&events_path)
-                    .unwrap_or_else(|error| panic!("{scenario}: events.jsonl unreadable: {error}"));
-                for line in text.lines() {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let event: Value = serde_json::from_str(line)
-                        .unwrap_or_else(|error| panic!("{scenario}: invalid event line: {error}"));
-                    let sequence = event["sequence"].as_u64().unwrap_or_default();
-                    let Some(payload) = event["payload"].as_str() else {
-                        continue;
-                    };
-                    let Ok(payload) = serde_json::from_str::<Value>(payload) else {
-                        continue;
-                    };
-                    let mut keys = Vec::new();
-                    collect_map_keys(&payload, "", &mut keys);
-                    for (parent_path, key) in keys {
-                        let formed = format!("{parent_path}.{key}");
-                        if allows_prefix(provider, &formed) || placeholders.contains(&key) {
-                            continue;
-                        }
-                        escapes.push(Escape {
-                            scenario: scenario.clone(),
-                            sequence,
-                            // The map position, never the key: this message
-                            // lands in terminals and PR bodies, and naming the
-                            // key would republish the identifier the failure
-                            // is complaining about.
-                            path: format!("{parent_path}.{{}}"),
-                        });
-                    }
-                }
+                escapes.push(Escape {
+                    scenario: scenario.label.clone(),
+                    sequence,
+                    // The map position, never the key: this message
+                    // lands in terminals and PR bodies, and naming the
+                    // key would republish the identifier the failure
+                    // is complaining about.
+                    path: format!("{parent_path}.{{}}"),
+                });
             }
         }
     }
@@ -281,49 +256,52 @@ const KNOWN_UNDECLARED_PATH_ROOTS: [&str; 7] = [
     "<TRUSTED_POWERSHELL>",
 ];
 
+/// Walks [`promoted_scenarios`] rather than every `manifest.json` under the
+/// corpus directly, so this is narrower than its own name suggests: a
+/// scenario directory holding a `manifest.json` but no `events.jsonl` would
+/// never reach the `manifest_path.is_file()` check below at all, because
+/// `promoted_scenarios` never yields it. Inert today — every scenario
+/// directory in the committed corpus carries both files together, verified
+/// directly rather than assumed — but real if that ever stops holding.
 #[test]
 fn every_manifest_token_is_declared_or_a_known_path_root() {
-    let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    let corpus_root = corpus_root();
     let mut undeclared = Vec::new();
     let mut manifest_count = 0u64;
 
-    for provider_dir in subdirectories(&corpus_root) {
-        for version_dir in subdirectories(&provider_dir) {
-            for scenario_dir in subdirectories(&version_dir) {
-                let manifest_path = scenario_dir.join("manifest.json");
-                if !manifest_path.is_file() {
-                    continue;
-                }
-                manifest_count += 1;
-                let scenario = scenario_dir
-                    .strip_prefix(&corpus_root)
-                    .unwrap_or(scenario_dir.as_path())
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let text = std::fs::read_to_string(&manifest_path).unwrap_or_else(|error| {
-                    panic!("{scenario}: manifest.json unreadable: {error}")
-                });
-                let manifest: Value = serde_json::from_str(&text).unwrap_or_else(|error| {
-                    panic!("{scenario}: manifest.json is not valid JSON: {error}")
-                });
-                let declared: BTreeSet<&str> = manifest["placeholders"]
-                    .as_array()
-                    .unwrap_or_else(|| panic!("{scenario}: manifest has no placeholders array"))
-                    .iter()
-                    .filter_map(|entry| entry["placeholder"].as_str())
-                    .collect();
+    let scenarios = promoted_scenarios(&corpus_root)
+        .unwrap_or_else(|error| panic!("{} could not be walked: {error}", corpus_root.display()));
+    for scenario in scenarios {
+        let manifest_path = scenario.directory.join("manifest.json");
+        if !manifest_path.is_file() {
+            continue;
+        }
+        manifest_count += 1;
+        let text = std::fs::read_to_string(&manifest_path).unwrap_or_else(|error| {
+            panic!("{}: manifest.json unreadable: {error}", scenario.label)
+        });
+        let manifest: Value = serde_json::from_str(&text).unwrap_or_else(|error| {
+            panic!(
+                "{}: manifest.json is not valid JSON: {error}",
+                scenario.label
+            )
+        });
+        let declared: BTreeSet<&str> = manifest["placeholders"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{}: manifest has no placeholders array", scenario.label))
+            .iter()
+            .filter_map(|entry| entry["placeholder"].as_str())
+            .collect();
 
-                let mut tokens = Vec::new();
-                collect_bracket_tokens(&manifest, &mut tokens);
-                for token in tokens {
-                    if declared.contains(token.as_str())
-                        || KNOWN_UNDECLARED_PATH_ROOTS.contains(&token.as_str())
-                    {
-                        continue;
-                    }
-                    undeclared.push(format!("{scenario}: {token}"));
-                }
+        let mut tokens = Vec::new();
+        collect_bracket_tokens(&manifest, &mut tokens);
+        for token in tokens {
+            if declared.contains(token.as_str())
+                || KNOWN_UNDECLARED_PATH_ROOTS.contains(&token.as_str())
+            {
+                continue;
             }
+            undeclared.push(format!("{}: {token}", scenario.label));
         }
     }
 
@@ -371,23 +349,18 @@ fn collect_bracket_tokens(value: &Value, out: &mut Vec<String>) {
 /// own manifest's placeholder vocabulary. Failures are pushed onto `escapes`
 /// rather than panicking here, so one bad scenario does not hide every other.
 fn check_scenario(
-    events_path: &Path,
+    scenario_dir: &Path,
     scenario: &str,
     provider: Provider,
     placeholders: &BTreeSet<String>,
     escapes: &mut Vec<Escape>,
 ) {
-    let text = std::fs::read_to_string(events_path)
+    let events = frames(scenario_dir)
         .unwrap_or_else(|error| panic!("{scenario}: events.jsonl unreadable: {error}"));
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: Value = serde_json::from_str(line)
-            .unwrap_or_else(|error| panic!("{scenario}: invalid event line: {error}"));
+    for event in events {
         let sequence = event["sequence"]
             .as_u64()
-            .unwrap_or_else(|| panic!("{scenario}: an event line has no sequence: {line}"));
+            .unwrap_or_else(|| panic!("{scenario}: an event line has no sequence: {event}"));
         let Some(payload) = event["payload"].as_str() else {
             panic!("{scenario} frame {sequence}: event has no payload string");
         };
@@ -536,21 +509,6 @@ fn manifest_provider_and_placeholders(
         .map(str::to_owned)
         .collect();
     (provider, placeholders)
-}
-
-/// An unreadable entry panics rather than being filtered out. Every property in
-/// this file is total over the corpus, and a walk that silently skipped a
-/// subtree would report the property as holding over evidence it never read.
-fn subdirectories(parent: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(parent)
-        .unwrap_or_else(|error| panic!("{}: {error}", parent.display()))
-        .map(|entry| {
-            entry
-                .unwrap_or_else(|error| panic!("{}: unreadable entry: {error}", parent.display()))
-                .path()
-        })
-        .filter(|path| path.is_dir())
-        .collect()
 }
 
 #[cfg(test)]

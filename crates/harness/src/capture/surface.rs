@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use super::corpus::PromotedScenario;
+
 /// Which way a field was observed travelling.
 ///
 /// Input surface is not decoration: `ToProvider` fields are how Comet *drives*
@@ -56,8 +58,13 @@ pub struct FieldObservation {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SurfaceError {
-    #[error("corpus root {root} could not be read")]
-    UnreadableRoot { root: PathBuf },
+    /// `reason` carries `promoted_scenarios`'s own error chain, which names
+    /// the actual provider/version/scenario directory that failed to read —
+    /// `root` alone would otherwise be the only path in this message even
+    /// when the failure is three levels deeper, misreporting a bad
+    /// `claude/2.1.228` entry as the corpus root itself being unreadable.
+    #[error("corpus root {root} could not be walked: {reason}")]
+    UnreadableRoot { root: PathBuf, reason: String },
     #[error("corpus root {root} holds no promoted scenario")]
     EmptyCorpus { root: PathBuf },
     #[error("{scenario} has events that are not valid capture JSON")]
@@ -174,26 +181,20 @@ pub const VOCABULARY_PATHS: &[&str] = &[
 /// for fields applies with more force to a discriminator.
 pub type Vocabulary = BTreeMap<(String, String, Direction), BTreeMap<String, BTreeSet<String>>>;
 
-pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, SurfaceError> {
-    Ok(observe_surface(corpus_root)?.0)
-}
-
-/// The value vocabulary for every version in the corpus. Walks the same
-/// evidence [`observe_corpus`] does — see [`observe_surface`] — so a value
-/// collected here is a value some promoted capture actually contains.
-pub fn observe_vocabulary(corpus_root: &Path) -> Result<Vocabulary, SurfaceError> {
-    Ok(observe_surface(corpus_root)?.1)
-}
-
 /// Both the field inventory and the value vocabulary from one pass over the
-/// archive. A sheet needs both, and calling [`observe_corpus`] and
-/// [`observe_vocabulary`] separately would walk the same ~800 committed
-/// frames twice for no reason — this is the entry point a renderer should
-/// use; the other two exist for a caller that only wants one half.
+/// archive. A sheet needs both, and walking the corpus for each separately
+/// would visit the same ~800 committed frames twice for no reason — this is
+/// the one entry point; a caller that wants only one half destructures the
+/// tuple.
 pub fn observe_surface(
     corpus_root: &Path,
 ) -> Result<(Vec<FieldObservation>, Vocabulary), SurfaceError> {
-    let scenarios = promoted_scenarios(corpus_root)?;
+    let scenarios = super::corpus::promoted_scenarios(corpus_root).map_err(|error| {
+        SurfaceError::UnreadableRoot {
+            root: corpus_root.to_owned(),
+            reason: format!("{error:#}"),
+        }
+    })?;
     if scenarios.is_empty() {
         return Err(SurfaceError::EmptyCorpus {
             root: corpus_root.to_owned(),
@@ -204,20 +205,12 @@ pub fn observe_surface(
         BTreeMap::new();
     let mut vocabulary: Vocabulary = BTreeMap::new();
     for scenario in scenarios {
-        let events =
-            std::fs::read_to_string(scenario.directory.join("events.jsonl")).map_err(|_| {
-                SurfaceError::UnreadableEvents {
-                    scenario: scenario.label.clone(),
-                }
-            })?;
-        for line in events.lines() {
-            if line.trim().is_empty() {
-                continue;
+        let events = super::corpus::frames(&scenario.directory).map_err(|_| {
+            SurfaceError::UnreadableEvents {
+                scenario: scenario.label.clone(),
             }
-            let event: Value =
-                serde_json::from_str(line).map_err(|_| SurfaceError::UnreadableEvents {
-                    scenario: scenario.label.clone(),
-                })?;
+        })?;
+        for event in events {
             let sequence = event["sequence"].as_u64().unwrap_or_default();
             let direction = match event["channel"].as_str() {
                 Some("stdin") => Direction::ToProvider,
@@ -251,60 +244,6 @@ pub fn observe_surface(
     }
 
     Ok((inventory.into_values().collect(), vocabulary))
-}
-
-struct PromotedScenario {
-    directory: PathBuf,
-    /// `provider/version/scenario`.
-    label: String,
-    provider: String,
-    version: String,
-}
-
-fn promoted_scenarios(corpus_root: &Path) -> Result<Vec<PromotedScenario>, SurfaceError> {
-    let unreadable = || SurfaceError::UnreadableRoot {
-        root: corpus_root.to_owned(),
-    };
-    let mut scenarios = Vec::new();
-    for provider in sorted_directories(corpus_root).ok_or_else(unreadable)? {
-        let provider_name = file_name(&provider);
-        // An unreadable subtree is an error, never an empty one. Treating it as
-        // empty would drop every field beneath it from a snapshot whose whole
-        // job is saying what the evidence contains.
-        for version in sorted_directories(&provider).ok_or_else(unreadable)? {
-            let version_name = file_name(&version);
-            for scenario in sorted_directories(&version).ok_or_else(unreadable)? {
-                if !scenario.join("events.jsonl").is_file() {
-                    continue;
-                }
-                let scenario_name = file_name(&scenario);
-                scenarios.push(PromotedScenario {
-                    label: format!("{provider_name}/{version_name}/{scenario_name}"),
-                    provider: provider_name.clone(),
-                    version: version_name.clone(),
-                    directory: scenario,
-                });
-            }
-        }
-    }
-    Ok(scenarios)
-}
-
-fn sorted_directories(parent: &Path) -> Option<Vec<PathBuf>> {
-    let mut directories: Vec<PathBuf> = std::fs::read_dir(parent)
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
-    directories.sort();
-    Some(directories)
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
 }
 
 struct Visit<'a> {

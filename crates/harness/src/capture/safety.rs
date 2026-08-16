@@ -87,6 +87,56 @@ pub(in crate::capture) struct DirectoryIdentity {
     inode: u64,
 }
 
+/// The Windows file-identity primitive both [`directory_identity`] and
+/// [`file_identity`] need: open `canonical` without acquiring share locks,
+/// read back its volume serial number and file index, and error using `what`
+/// to name what could not be identified. `flags` is the one thing that
+/// legitimately differs between the two callers —
+/// `FILE_FLAG_BACKUP_SEMANTICS` to open a directory handle, `0` to require a
+/// regular file — everything else (the `CreateFileW`/
+/// `GetFileInformationByHandle` sequence and its four `SAFETY` comments) was
+/// duplicated verbatim between them, which is the worst shape for an
+/// `unsafe` block: a fix to one copy is invisible in the other.
+#[cfg(windows)]
+fn windows_handle_identity(canonical: &Path, flags: u32, what: &str) -> anyhow::Result<(u32, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
+    };
+    let wide: Vec<u16> = canonical.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: `wide` is a live, NUL-terminated UTF-16 path for this call.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            flags,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        bail!("{what} identity could not be opened.");
+    }
+    // SAFETY: ownership of the newly opened handle transfers to `File`.
+    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: the live file handle and writable output pointer are valid for this call.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+        bail!("{what} identity could not be read.");
+    }
+    // SAFETY: the successful call initialized the whole structure.
+    let info = unsafe { info.assume_init() };
+    Ok((
+        info.dwVolumeSerialNumber,
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+
 fn directory_identity(path: &Path) -> anyhow::Result<DirectoryIdentity> {
     let link_metadata = std::fs::symlink_metadata(path).map_err(|_| {
         anyhow!("Codex on-request approval target must remain an accessible empty directory.")
@@ -105,42 +155,16 @@ fn directory_identity(path: &Path) -> anyhow::Result<DirectoryIdentity> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-        use std::os::windows::io::{AsRawHandle, FromRawHandle};
-        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        use windows_sys::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
-        };
-        let wide: Vec<u16> = canonical.as_os_str().encode_wide().chain(Some(0)).collect();
-        // SAFETY: `wide` is a live, NUL-terminated UTF-16 path for this call.
-        let handle = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS,
-                std::ptr::null_mut(),
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            bail!("Codex on-request approval target identity could not be opened.");
-        }
-        // SAFETY: ownership of the newly opened handle transfers to `File`.
-        let file = unsafe { std::fs::File::from_raw_handle(handle) };
-        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
-        // SAFETY: the live file handle and writable output pointer are valid for this call.
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
-            bail!("Codex on-request approval target identity could not be read.");
-        }
-        // SAFETY: the successful call initialized the whole structure.
-        let info = unsafe { info.assume_init() };
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        let (volume_serial_number, file_index) = windows_handle_identity(
+            &canonical,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            "Codex on-request approval target",
+        )?;
         Ok(DirectoryIdentity {
             canonical,
-            volume_serial_number: info.dwVolumeSerialNumber,
-            file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            volume_serial_number,
+            file_index,
         })
     }
     #[cfg(unix)]
@@ -259,50 +283,13 @@ pub(super) fn file_identity(path: &Path) -> anyhow::Result<FileIdentity> {
     }
     let canonical = std::fs::canonicalize(path)
         .map_err(|_| anyhow!("The trusted PowerShell executable could not be resolved."))?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use std::os::windows::io::{AsRawHandle, FromRawHandle};
-        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        use windows_sys::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_SHARE_DELETE, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
-        };
-        let wide: Vec<u16> = canonical.as_os_str().encode_wide().chain(Some(0)).collect();
-        // SAFETY: `wide` is a live, NUL-terminated UTF-16 path for this call.
-        let handle = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                0,
-                std::ptr::null_mut(),
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            bail!("The trusted PowerShell executable identity could not be opened.");
-        }
-        // SAFETY: ownership of the newly opened handle transfers to `File`.
-        let file = unsafe { std::fs::File::from_raw_handle(handle) };
-        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
-        // SAFETY: the live file handle and writable output pointer are valid for this call.
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
-            bail!("The trusted PowerShell executable identity could not be read.");
-        }
-        // SAFETY: the successful call initialized the whole structure.
-        let info = unsafe { info.assume_init() };
-        Ok(FileIdentity {
-            canonical,
-            volume_serial_number: info.dwVolumeSerialNumber,
-            file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-        })
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(FileIdentity { canonical })
-    }
+    let (volume_serial_number, file_index) =
+        windows_handle_identity(&canonical, 0, "The trusted PowerShell executable")?;
+    Ok(FileIdentity {
+        canonical,
+        volume_serial_number,
+        file_index,
+    })
 }
 
 #[cfg(windows)]
