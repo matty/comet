@@ -8,9 +8,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use comet_harness::capture::{
-    Direction, FieldObservation, observe_corpus, observe_surface, observe_vocabulary,
-};
+use comet_harness::capture::{Direction, FieldObservation, corpus_root, observe_surface};
 use serde_json::{Value, json};
 
 /// Writes one scenario directory: the frames, each payload a JSON string
@@ -90,7 +88,7 @@ fn inventory_records_direction_and_the_first_frame() {
         )],
     );
 
-    let observations = observe_corpus(root.path()).unwrap();
+    let observations = observe_surface(root.path()).unwrap().0;
 
     let prompt_len = find(&observations, ".prompt_len");
     assert_eq!(prompt_len.direction, Direction::ToProvider);
@@ -132,7 +130,7 @@ fn inventory_keeps_two_versions_of_one_provider_apart() {
         &[(1, "stdout", json!({"onlyNew": 1, "shared": "new-value"}))],
     );
 
-    let observations = observe_corpus(root.path()).unwrap();
+    let observations = observe_surface(root.path()).unwrap().0;
 
     let old_field = find(&observations, ".onlyOld");
     assert_eq!(old_field.version, "1.0.0");
@@ -194,7 +192,7 @@ fn inventory_folds_a_declared_map_path_into_one_entry() {
         )],
     );
 
-    let observations = observe_corpus(root.path()).unwrap();
+    let observations = observe_surface(root.path()).unwrap().0;
     let seen = paths(&observations);
 
     assert!(
@@ -229,7 +227,7 @@ fn inventory_separates_the_same_key_seen_at_two_paths() {
         )],
     );
 
-    let observations = observe_corpus(root.path()).unwrap();
+    let observations = observe_surface(root.path()).unwrap().0;
     let seen = paths(&observations);
 
     assert!(seen.contains(".message.content"), "{seen:?}");
@@ -245,8 +243,7 @@ fn inventory_separates_the_same_key_seen_at_two_paths() {
 /// provider adds a data-keyed object, this is what says so.
 #[test]
 fn the_promoted_corpus_yields_both_directions_and_no_data_shaped_field_names() {
-    let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
-    let observations = observe_corpus(&corpus_root).unwrap();
+    let observations = observe_surface(&corpus_root()).unwrap().0;
 
     assert!(observations.len() > 100, "{} observed", observations.len());
     for direction in [Direction::ToProvider, Direction::FromProvider] {
@@ -298,7 +295,7 @@ fn an_unparseable_structured_frame_is_an_error_and_stderr_text_is_not() {
     events.push('\n');
     std::fs::write(directory.join("events.jsonl"), &events).unwrap();
     assert!(
-        observe_corpus(root.path()).is_ok(),
+        observe_surface(root.path()).is_ok(),
         "stderr prose must not stop the walk"
     );
 
@@ -312,7 +309,7 @@ fn an_unparseable_structured_frame_is_an_error_and_stderr_text_is_not() {
     events.push('\n');
     std::fs::write(directory.join("events.jsonl"), events).unwrap();
     assert!(
-        observe_corpus(root.path()).is_err(),
+        observe_surface(root.path()).is_err(),
         "an unparseable stdout frame silently vanished from the inventory"
     );
 }
@@ -323,10 +320,10 @@ fn an_unparseable_structured_frame_is_an_error_and_stderr_text_is_not() {
 #[test]
 fn an_empty_or_missing_corpus_root_is_an_error_not_an_empty_inventory() {
     let missing = tempfile::tempdir().unwrap().path().join("absent");
-    assert!(observe_corpus(&missing).is_err());
+    assert!(observe_surface(&missing).is_err());
 
     let empty = tempfile::tempdir().unwrap();
-    assert!(observe_corpus(empty.path()).is_err());
+    assert!(observe_surface(empty.path()).is_err());
 }
 
 /// Break caught: the value vocabulary is what turns "a `.type` field exists"
@@ -335,7 +332,7 @@ fn an_empty_or_missing_corpus_root_is_an_error_not_an_empty_inventory() {
 /// values, and a field that varies just as much but is not on
 /// `VOCABULARY_PATHS` must not contribute anything — collecting every path
 /// would make the vocabulary indistinguishable from the field inventory
-/// `observe_corpus` already provides.
+/// `observe_surface`'s inventory half already provides.
 #[test]
 fn vocabulary_collects_declared_paths_only() {
     let root = tempfile::tempdir().unwrap();
@@ -363,7 +360,7 @@ fn vocabulary_collects_declared_paths_only() {
         ],
     );
 
-    let vocabulary = observe_vocabulary(root.path()).unwrap();
+    let vocabulary = observe_surface(root.path()).unwrap().1;
     let claude = vocabulary
         .get(&(
             "claude".to_string(),
@@ -415,7 +412,7 @@ fn vocabulary_ignores_a_non_scalar_at_a_declared_path() {
         )],
     );
 
-    let vocabulary = observe_vocabulary(root.path()).unwrap();
+    let vocabulary = observe_surface(root.path()).unwrap().1;
     let claude = vocabulary
         .get(&(
             "claude".to_string(),
@@ -460,7 +457,7 @@ fn vocabulary_collects_method_for_codex() {
         ],
     );
 
-    let vocabulary = observe_vocabulary(root.path()).unwrap();
+    let vocabulary = observe_surface(root.path()).unwrap().1;
     let to_provider = vocabulary
         .get(&(
             "codex".to_string(),
@@ -511,7 +508,7 @@ fn vocabulary_keeps_directions_of_the_same_path_apart() {
         ],
     );
 
-    let vocabulary = observe_vocabulary(root.path()).unwrap();
+    let vocabulary = observe_surface(root.path()).unwrap().1;
     let to_provider = vocabulary
         .get(&(
             "claude".to_string(),
@@ -559,8 +556,7 @@ fn vocabulary_keeps_directions_of_the_same_path_apart() {
 /// exactly the case direction-keying exists for.
 #[test]
 fn the_promoted_corpus_yields_the_control_protocol_subtypes() {
-    let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
-    let vocabulary = observe_vocabulary(&corpus_root).unwrap();
+    let vocabulary = observe_surface(&corpus_root()).unwrap().1;
 
     let values_at = |direction: Direction, path: &str| -> BTreeSet<String> {
         vocabulary
@@ -589,48 +585,5 @@ fn the_promoted_corpus_yields_the_control_protocol_subtypes() {
         values_at(Direction::FromProvider, ".response.subtype"),
         BTreeSet::from(["success".to_string()]),
         "Claude Code's reply to Comet's initialize request"
-    );
-}
-
-/// Break caught: `observe_corpus` and `observe_vocabulary` each call the
-/// same underlying walk, but a renderer needing both would walk the archive
-/// twice calling them separately. `observe_surface` is the one-call,
-/// one-walk entry point Task 3 uses; this checks it returns the same two
-/// halves the separate calls do; a divergence here would mean one of the
-/// three entry points stopped sharing the walk it's documented to share.
-#[test]
-fn surface_returns_the_same_pair_the_separate_entry_points_do() {
-    let root = tempfile::tempdir().unwrap();
-    write_scenario(
-        root.path(),
-        "claude",
-        "2.1.229",
-        "checklist",
-        &[(1, "stdout", json!({"type": "system", "subtype": "init"}))],
-    );
-
-    let (observations, vocabulary) = observe_surface(root.path()).unwrap();
-    let observations_alone = observe_corpus(root.path()).unwrap();
-    let vocabulary_alone = observe_vocabulary(root.path()).unwrap();
-
-    assert_eq!(
-        paths(&observations),
-        paths(&observations_alone),
-        "observe_surface's inventory half must match observe_corpus's"
-    );
-    assert_eq!(
-        vocabulary, vocabulary_alone,
-        "observe_surface's vocabulary half must match observe_vocabulary's"
-    );
-    assert!(
-        vocabulary
-            .get(&(
-                "claude".to_string(),
-                "2.1.229".to_string(),
-                Direction::FromProvider
-            ))
-            .is_some_and(|paths| paths.contains_key(".type")),
-        "observe_surface must actually collect vocabulary, not return an empty stand-in: \
-         {vocabulary:?}"
     );
 }

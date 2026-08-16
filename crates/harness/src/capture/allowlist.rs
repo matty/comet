@@ -327,15 +327,18 @@ mod tests {
     fn every_named_leaf_matches_something_in_the_committed_corpus() {
         let mut occurrences: std::collections::BTreeMap<&'static str, u64> =
             std::collections::BTreeMap::new();
-        for events_path in corpus_events_files() {
-            let text = std::fs::read_to_string(&events_path)
-                .unwrap_or_else(|error| panic!("{}: {error}", events_path.display()));
-            for line in text.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let event: serde_json::Value = serde_json::from_str(line)
-                    .unwrap_or_else(|error| panic!("{}: {error}", events_path.display()));
+        let root = crate::capture::corpus_root();
+        let scenarios = crate::capture::promoted_scenarios(&root)
+            .unwrap_or_else(|error| panic!("{}: {error}", root.display()));
+        assert!(
+            !scenarios.is_empty(),
+            "found no events.jsonl under {} -- corpus walk is broken, not just empty",
+            root.display()
+        );
+        for scenario in scenarios {
+            let events = crate::capture::frames(&scenario.directory)
+                .unwrap_or_else(|error| panic!("{}: {error}", scenario.directory.display()));
+            for event in events {
                 let Some(payload) = event["payload"].as_str() else {
                     continue;
                 };
@@ -383,45 +386,6 @@ mod tests {
             }
             _ => {}
         }
-    }
-
-    fn corpus_events_files() -> Vec<std::path::PathBuf> {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
-        let mut files = Vec::new();
-        for provider in subdirectories(&root) {
-            for version in subdirectories(&provider) {
-                for scenario in subdirectories(&version) {
-                    let events = scenario.join("events.jsonl");
-                    if events.is_file() {
-                        files.push(events);
-                    }
-                }
-            }
-        }
-        assert!(
-            !files.is_empty(),
-            "found no events.jsonl under {} -- corpus walk is broken, not just empty",
-            root.display()
-        );
-        files
-    }
-
-    /// An unreadable entry panics rather than being filtered out. Skipping one
-    /// silently would let this file's corpus walk visit a subset of the archive
-    /// and still report a green pass — a coverage test that quietly covered
-    /// less is worse than one that fails.
-    fn subdirectories(parent: &std::path::Path) -> Vec<std::path::PathBuf> {
-        std::fs::read_dir(parent)
-            .unwrap_or_else(|error| panic!("{}: {error}", parent.display()))
-            .map(|entry| {
-                entry
-                    .unwrap_or_else(|error| {
-                        panic!("{}: unreadable entry: {error}", parent.display())
-                    })
-                    .path()
-            })
-            .filter(|path| path.is_dir())
-            .collect()
     }
 
     /// Adjudicated 2026-08-15, in two rounds. These paths were on the

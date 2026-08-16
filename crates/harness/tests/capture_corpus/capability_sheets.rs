@@ -17,13 +17,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use comet_harness::capture::{
-    Direction, FieldObservation, SheetScenario, Vocabulary, observe_surface, render_sheet,
+    Direction, FieldObservation, SheetScenario, Vocabulary, corpus_root, observe_surface,
+    promoted_scenarios, render_sheet,
 };
 use serde_json::Value;
-
-fn corpus_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus")
-}
 
 /// `docs/providers/`, two directories above this crate (`crates/harness` →
 /// the repo root) — the sheets live outside any test tree so they're what a
@@ -45,36 +42,24 @@ fn docs_root() -> PathBuf {
         .join("providers")
 }
 
-fn sorted_dirs(parent: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(parent)
-        .unwrap_or_else(|error| panic!("{} could not be read: {error}", parent.display()))
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
-    dirs.sort();
-    dirs
-}
-
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
-/// Every `(provider, version)` pair `root` holds, discovered by walking
-/// directories rather than a hand-maintained list — a newly promoted version
-/// directory must make this test fail for want of a sheet, not silently go
-/// unchecked because nobody added its name here.
+/// Every `(provider, version)` pair `root` holds, discovered by walking the
+/// shared corpus walk rather than a hand-maintained list — a newly promoted
+/// version directory must make this test fail for want of a sheet, not
+/// silently go unchecked because nobody added its name here.
 fn corpus_versions(root: &Path) -> Vec<(String, String)> {
-    let mut versions = Vec::new();
-    for provider in sorted_dirs(root) {
-        let provider_name = file_name(&provider);
-        for version in sorted_dirs(&provider) {
-            versions.push((provider_name.clone(), file_name(&version)));
-        }
-    }
-    versions
+    let scenarios = promoted_scenarios(root)
+        .unwrap_or_else(|error| panic!("{} could not be walked: {error}", root.display()));
+    let versions: BTreeSet<(String, String)> = scenarios
+        .into_iter()
+        .map(|scenario| (scenario.provider, scenario.version))
+        .collect();
+    versions.into_iter().collect()
 }
 
 /// Every promoted scenario under `root/provider/version`, as [`render_sheet`]

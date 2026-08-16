@@ -23,8 +23,10 @@ mod surface;
 mod test_support;
 mod types;
 
-pub use allowlist::{Allowlist, allows, allows_prefix, named_kind};
-pub use corpus::{Frame, corpus_frame, frame};
+pub use allowlist::{allows, allows_prefix, named_kind};
+pub use corpus::{
+    Frame, PromotedScenario, corpus_frame, corpus_root, frame, frames, promoted_scenarios,
+};
 pub use record::{Requirements, SCENARIOS, ScenarioSpec, record, scenario};
 pub use sanitize::{
     NovelPath, SanitizationError, SanitizationReport, render_novel_paths_report, sanitize_dir,
@@ -32,7 +34,7 @@ pub use sanitize::{
 pub use sheet::{SheetScenario, render_sheet};
 pub use surface::{
     Direction, FieldObservation, FrameRef, MAP_PATHS, SurfaceError, VOCABULARY_PATHS, Vocabulary,
-    observe_corpus, observe_surface, observe_vocabulary,
+    observe_surface,
 };
 pub use types::{
     CaptureConfig, CaptureEvent, Channel, CommandSnapshot, PlatformMetadata, Provider, RawCapture,
