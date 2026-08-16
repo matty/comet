@@ -128,44 +128,6 @@ stream-json
 --bare
 ```
 
-### model-discovery-neutral-cwd
-
-capture Claude model discovery from a neutral working directory
-
-cwd: `<CWD>`
-env: (none set)
-tools: (not observed)
-
-```
-<HOME>\.local\bin\claude.exe
---print
---input-format
-stream-json
---output-format
-stream-json
---verbose
---bare
-```
-
-### model-discovery-project-cwd
-
-capture Claude model discovery from the selected project directory
-
-cwd: `<CWD>`
-env: (none set)
-tools: (not observed)
-
-```
-<HOME>\.local\bin\claude.exe
---print
---input-format
-stream-json
---output-format
-stream-json
---verbose
---bare
-```
-
 ### resume
 
 capture one bounded Claude run script
@@ -202,12 +164,12 @@ Every dotted path observed on the wire for this provider and version, split by t
 
 - `G1`: approval
 - `G2`: approval, attachment, command-discovery, fresh-text
-- `G3`: approval, attachment, command-discovery, fresh-text, model-discovery, model-discovery-neutral-cwd, model-discovery-project-cwd, resume
+- `G3`: approval, attachment, command-discovery, fresh-text, model-discovery, resume
 - `G4`: approval, attachment, command-discovery, fresh-text, resume
 - `G5`: approval, attachment, fresh-text, resume
 - `G6`: approval, attachment, resume
 - `G7`: attachment
-- `G8`: command-discovery, model-discovery, model-discovery-neutral-cwd, model-discovery-project-cwd
+- `G8`: command-discovery, model-discovery
 
 ### To provider
 

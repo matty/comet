@@ -209,20 +209,14 @@ fn sanitizer_substitutes_the_codex_and_approval_specific_redaction_roots() {
     }
 }
 
-/// Break caught: manifest accounting can silently omit a redaction category or count definitions
-/// rather than actual replacements, preventing a reviewer from auditing what changed.
+/// Break caught: the manifest carrying more than bare provenance again (`placeholders` and
+/// `redaction_counts` were dropped at the stage-6 promotion), or placeholder identity failing to
+/// collide equal values into one token and silently breaking a cross-frame join.
 ///
-/// `session_id` is Claude's real wire spelling (snake_case) and `named_kind` normalizes before
-/// comparing, so it resolves to the named `SESSION` group; the other three redacted fields
-/// (`.message.content` x2, `level`, the bare `.message`) aren't one of the six identifier kinds
-/// and fall into the generic `v` bucket. This exercises both accounting paths at once and pins
-/// the property the old blocklist-vocabulary version of this test also pinned: the *count*
-/// reflects every replacement, including reused ones, not just the distinct placeholders minted.
-/// `session_id` repeats the identical value `"same-session"` across both events, so it
-/// contributes one placeholder (`<SESSION_1>`) but must count twice — a naive implementation
-/// that counted only new-placeholder creation would report 1, not 2.
+/// `session_id` repeats the identical value `"same-session"` across both events, so both
+/// occurrences must collide into the same `<SESSION_1>` placeholder.
 #[test]
-fn sanitizer_manifest_accounts_for_placeholder_definitions_and_counts() {
+fn sanitizer_manifest_is_bare_provenance_and_placeholders_still_collide_equal_values() {
     let temp = tempfile::tempdir().unwrap();
     let raw = write_raw_capture(
         temp.path(),
@@ -237,7 +231,6 @@ fn sanitizer_manifest_accounts_for_placeholder_definitions_and_counts() {
     let report = sanitize_dir(&raw, &staging_dir(temp.path(), "accounting")).unwrap();
     let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
     assert_eq!(manifest["schema_version"], 1);
-    assert_eq!(manifest["source"], "capture.json");
     assert_eq!(manifest["provider"], "claude");
     assert_eq!(manifest["captured_at_unix_ms"], 1786464000123i64);
     assert_eq!(manifest["scenario"], "model-discovery");
@@ -245,22 +238,26 @@ fn sanitizer_manifest_accounts_for_placeholder_definitions_and_counts() {
         manifest["purpose"],
         "capture Claude's token-free model initialize reply"
     );
-    // session_id: 2 occurrences (one distinct value) into the named SESSION group; the two
-    // distinct prompt texts plus the two unlisted event-3 fields: 4 occurrences into the
-    // generic bucket. 6 total occurrences, 5 distinct placeholders -- the occurrence/placeholder
-    // gap is what this test exists to pin.
-    assert_eq!(manifest["redaction_counts"]["session"], 2);
-    assert_eq!(manifest["redaction_counts"]["v"], 4);
-    assert_eq!(
-        manifest["placeholders"],
-        serde_json::json!([
-            {"placeholder": "<SESSION_1>", "kind": "session"},
-            {"placeholder": "<V1>", "kind": "v"},
-            {"placeholder": "<V2>", "kind": "v"},
-            {"placeholder": "<V3>", "kind": "v"},
-            {"placeholder": "<V4>", "kind": "v"}
-        ])
+    assert!(
+        manifest.get("placeholders").is_none(),
+        "the manifest is provenance only -- placeholders must not reappear: {manifest}"
     );
+    assert!(
+        manifest.get("redaction_counts").is_none(),
+        "the manifest is provenance only -- redaction_counts must not reappear: {manifest}"
+    );
+
+    let payloads = sanitized_payloads(&report.events_bytes);
+    assert_eq!(payloads[0]["session_id"], "<SESSION_1>");
+    assert_eq!(
+        payloads[1]["session_id"], "<SESSION_1>",
+        "the identical session_id in both events must collide into one placeholder"
+    );
+    assert_ne!(
+        payloads[0]["message"]["content"], payloads[1]["message"]["content"],
+        "the two distinct prompt texts must not collide with each other"
+    );
+
     assert_eq!(
         std::fs::read(report.events_path).unwrap(),
         report.events_bytes

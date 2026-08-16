@@ -210,16 +210,72 @@ pub(in crate::capture::record) async fn attachment(
     session.wait_for_turn_end().await
 }
 
-/// Prompt for `checklist`: create two tasks, then drive the first through
-/// both transitions. Moved here, unchanged in substance, from the deleted
-/// `capture/checklist.rs` — decision "the scenario owns its prompt" moves
-/// prompt text out of the binary and into the scenario body that sends it.
+/// Same one-call-per-recording contract as `fresh_text_request` above. The prompt is
+/// deliberately identical to `fresh_text_request`'s — `auto`/`full-access` exist to record what
+/// mode configuration reaches the wire, not to exercise interesting agent behaviour, and holding
+/// the prompt fixed makes the mode the only variable a reader diffing this scenario against
+/// `fresh-text`/`full-access` needs to account for.
+pub(in crate::capture::record) fn auto_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
+    Ok(cheap_claude_request(
+        "Reply with the single word capture.",
+        input,
+        RuntimeMode::Auto,
+    ))
+}
+
+/// Same shape as `fresh_text` above: a plain text turn, no approval handling needed — the trivial
+/// prompt never triggers a tool call, so it does not matter that `Auto` would otherwise still let
+/// Claude self-review some calls.
+pub(in crate::capture::record) async fn auto(
+    session: &mut Session<ClaudeProvider>,
+    _input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    let request = session
+        .request
+        .clone()
+        .expect("auto is a Run scenario and always carries a request");
+    let line = claude_user_line(&request, false).await?;
+    session.send(&line).await?;
+    session.wait_for_turn_end().await
+}
+
+/// Same one-call-per-recording contract as `fresh_text_request` above, and the same "identical
+/// prompt" reasoning as `auto_request`.
+pub(in crate::capture::record) fn full_access_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
+    Ok(cheap_claude_request(
+        "Reply with the single word capture.",
+        input,
+        RuntimeMode::FullAccess,
+    ))
+}
+
+/// Same shape as `fresh_text`/`auto` above. `FullAccess` disables the sandbox and skips
+/// permissions entirely (`bypassPermissions` + `--dangerously-skip-permissions`), so there is no
+/// `can_use_tool` round trip to answer even if the trivial prompt did call a tool — this scenario
+/// exists to record that the mode reaches the wire, not to exercise what an unsandboxed tool call
+/// looks like.
+pub(in crate::capture::record) async fn full_access(
+    session: &mut Session<ClaudeProvider>,
+    _input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    let request = session
+        .request
+        .clone()
+        .expect("full-access is a Run scenario and always carries a request");
+    let line = claude_user_line(&request, false).await?;
+    session.send(&line).await?;
+    session.wait_for_turn_end().await
+}
+
+/// Prompt for `checklist`: create two tasks, then drive the first through both transitions.
 ///
-/// Opens with `ToolSearch` because the task tools are *deferred* on at least
-/// one machine — captured 2026-08-13, where the model reached them through
-/// `{"query":"select:TaskCreate,TaskUpdate","total_deferred_tools":45}`. On an
-/// installation that lists them eagerly the search is a harmless extra frame;
-/// without it, on one that does not, the run produces no checklist at all.
+/// Opens with `ToolSearch` because the task tools are *deferred* on at least one machine —
+/// without it first, on an installation that doesn't list them eagerly, the run produces no
+/// checklist at all. On one that does, the search is just a harmless extra frame.
 fn claude_checklist_prompt() -> String {
     concat!(
         r#"Use ToolSearch exactly once with input {"query":"select:TaskCreate,TaskUpdate","max_results":5}. "#,
@@ -259,25 +315,15 @@ pub(in crate::capture::record) fn checklist_request(
     ))
 }
 
-/// Send the checklist prompt and wait for the turn to end. Nothing here
-/// inspects what the model actually did with the task tools — no
-/// created/updated task-id accounting, no bail on a mutation count the
-/// prompt asked for but the model did not produce.
+/// Send the checklist prompt and wait for the turn to end. Nothing here inspects what the model
+/// did with the task tools — no created/updated task-id accounting, no bail on a mutation count
+/// the prompt asked for but the model didn't produce (that accounting lived in `recording.rs`'s
+/// `claude_run`; deleted here, closing `docs/debt/` D61).
 ///
-/// That accounting used to live in `recording.rs`'s `claude_run` (the
-/// `created`/`updated` `BTreeSet`s and their `bail!`s, requiring at least 2
-/// distinct confirmed creates and 1 confirmed update here, and for
-/// `checklist-resume` at least 1 confirmed update to an id it had not itself
-/// created) and is deleted by the neutral-recorder stage, closing `docs/debt/` D61. Per
-/// design §3.2
-/// (`2026-08-14-provider-capture-simplification-design.md`): a pre-spawn
-/// guard protects the machine; a frame check that aborts protects only a
-/// scenario's tidiness, and does it by destroying evidence already paid for
-/// in tokens. A model that ignores this prompt and creates no task does not
-/// produce a failed capture — it produces a recording of a model ignoring
-/// instructions, which is itself evidence of the CLI's real behavior under
-/// this prompt, and the deleted guard threw it away along with the tokens
-/// that paid for it.
+/// Per design §3.2: a pre-spawn guard protects the machine; a frame check that aborts protects
+/// only a scenario's tidiness, by destroying evidence already paid for in tokens. A model that
+/// ignores this prompt and creates no task doesn't produce a failed capture — it produces a
+/// recording of the CLI's real behavior under this prompt, which is evidence in itself.
 pub(in crate::capture::record) async fn checklist(
     session: &mut Session<ClaudeProvider>,
     _input: &ScenarioInput,
@@ -334,18 +380,14 @@ pub(in crate::capture::record) async fn checklist_resume(
 /// check that a Bash request is the one thing this scenario expects to run).
 const CLAUDE_APPROVAL_COMMAND: &str = "printf capture";
 
-/// Prompt for `approval`: ask for one Bash approval, then one Write
-/// approval, so the capture records a real `can_use_tool` round trip for
-/// each. Moved here, unchanged in substance, from the deleted
-/// `capture/approval/common.rs::claude_approval_prompt` — decision "the
-/// scenario owns its prompt" moves prompt text out of the binary and into
-/// the scenario body that sends it, same as `claude_checklist_prompt` above.
-/// `APPROVAL_MARKER_NAME`/`APPROVAL_MARKER_CONTENT` stay defined in
-/// `capture::safety` rather than moving here too: `validate_ordinary_approval_cwd`'s own
-/// marker-absence check reads `APPROVAL_MARKER_NAME` directly, and Codex's `codex_approval_prompt`
-/// (`record/scenarios/codex.rs`, moved there in Task 8 alongside this function) reads the same
-/// constant for its own marker path — only each provider's prompt-building function moved, not
-/// the shared name/content the fence and both prompts agree on.
+/// Prompt for `approval`: ask for one Bash approval, then one Write approval, so the capture
+/// records a real `can_use_tool` round trip for each.
+///
+/// `APPROVAL_MARKER_NAME`/`APPROVAL_MARKER_CONTENT` stay defined in `capture::safety` rather
+/// than moving here: `validate_ordinary_approval_cwd`'s marker-absence check and Codex's
+/// `codex_approval_prompt` both read the same constants for their own marker paths — only each
+/// provider's prompt-building function moved, not the shared name/content both prompts and the
+/// fence agree on.
 fn claude_approval_prompt(cwd: &Path) -> String {
     let marker = cwd.join(APPROVAL_MARKER_NAME);
     format!(
@@ -368,32 +410,20 @@ pub(in crate::capture::record) fn approval_request(
     ))
 }
 
-/// Recognizes a Claude `can_use_tool` control request and returns its
-/// request id, the tool it names, and the input it is asking to run. Every
-/// other frame — the Bash/Write `tool_use` frames leading up to it, the
-/// plain assistant text, anything else — returns `None` and is simply left
-/// unanswered.
+/// Recognizes a Claude `can_use_tool` control request and returns its request id, the tool it
+/// names, and the input it asks to run. Every other frame returns `None` and is left unanswered.
 ///
-/// A `can_use_tool` request whose `tool_name` is missing or not a string is
-/// still recognized here, with an empty tool name standing in for it: it is
-/// a real request the CLI is blocked on a reply for, so it must not fall
-/// into the same `None` bucket as a frame that was never an approval request
-/// at all. An empty tool name matches neither `claude_marker_grant`'s
-/// `"Bash"` nor `"Write"` arm, so it lands in that function's catch-all —
-/// declined, same as any other tool this scenario doesn't recognize. Before
-/// this, a missing/non-string `tool_name` returned `None` here, the request
-/// went unanswered, and the CLI blocked forever on a reply that never came —
-/// burning the run to the recorder timeout and losing the capture, the exact
-/// outcome the decline path exists to prevent.
+/// A `can_use_tool` request with a missing/non-string `tool_name` is still recognized here (with
+/// an empty tool name standing in), not folded into the `None` bucket — it's a real request the
+/// CLI is blocked on a reply for. An empty tool name matches neither `claude_marker_grant`'s
+/// `"Bash"` nor `"Write"` arm, so it lands in that function's catch-all and gets declined.
+/// Before this, a missing/non-string `tool_name` returned `None`, the request went unanswered,
+/// and the CLI blocked forever — burning the run to the recorder timeout and losing the capture.
 ///
-/// This is the surviving half of the deleted `observe_claude_approval_frame`:
-/// noticing that a frame IS an approval request is driving, not validating,
-/// so nothing here checks request order, request-id uniqueness, or the shape
-/// of the surrounding transcript the way the deleted
-/// `ClaudeApprovalState`/`strict_claude_approval_block` did. Deciding whether
-/// the named tool and input actually get granted is a separate question,
-/// answered at grant time by `claude_marker_grant` below — see `approval`'s
-/// own doc comment for why that split exists.
+/// The surviving half of the deleted `observe_claude_approval_frame`: noticing a frame IS an
+/// approval request is driving, not validating, so nothing here checks request order, id
+/// uniqueness, or transcript shape. Deciding whether the tool/input actually gets granted is a
+/// separate question, answered at grant time by `claude_marker_grant` below.
 fn pending_approval(frame: &Value) -> Option<(String, String, Value)> {
     if frame["type"] != "control_request" || frame["request"]["subtype"] != "can_use_tool" {
         return None;
@@ -406,34 +436,22 @@ fn pending_approval(frame: &Value) -> Option<(String, String, Value)> {
     Some((request_id, tool_name, frame["request"]["input"].clone()))
 }
 
-/// The one check that survives from the deleted validators, run at GRANT
-/// TIME rather than as a frame check that aborts: the request must be
-/// exactly the marker Bash command, or exactly the marker Write into the
-/// scenario's own cwd. Everything else is refused.
+/// The one check that survives from the deleted validators, run at GRANT TIME rather than as a
+/// frame check that aborts: the request must be exactly the marker Bash command, or exactly the
+/// marker Write into the scenario's own cwd. Everything else is refused.
 ///
-/// This is Task 6's Codex precedent, applied to Claude: a check that runs
-/// before a write is actually granted protects the machine, not evidence
-/// tidiness, so design §3.2's "delete every frame check that aborts" does
-/// not reach it — but per that same precedent it DECLINES an unrecognized
-/// request rather than aborting the capture (see `answer_every_approval` in
-/// `record/scenarios/codex.rs`). Claude has no pre-spawn fence to recheck an
-/// identity against (`record.rs::record_claude`'s doc comment), so unlike
-/// Codex's grant-time rechecks this does not compare against an identity
-/// captured earlier — it recomputes, fresh, the same bounded shape the
-/// deleted `validate_claude_marker_input` checked: the Write's input must
-/// equal `{file_path: <cwd>/capture-marker.txt, content: "capture\n"}`
-/// exactly.
+/// Codex's precedent, applied to Claude: this protects the machine, not evidence tidiness, so
+/// design §3.2 doesn't reach it — but per that precedent it DECLINES an unrecognized request
+/// rather than aborting the capture. Claude has no pre-spawn fence to recheck an identity against,
+/// so unlike Codex's grant-time rechecks this recomputes, fresh, the same bounded shape the
+/// deleted `validate_claude_marker_input` checked: the Write's input must equal
+/// `{file_path: <cwd>/capture-marker.txt, content: "capture\n"}` exactly.
 ///
-/// What actually stops a `../` or symlinked `file_path` from walking the
-/// write out of `cwd` is the byte-for-byte equality against `expected_path`
-/// in the `Write` arm below, which admits no traversal at all — `file_path`
-/// must match exactly before the canonicalize comparison that follows it
-/// ever runs. That canonicalize comparison is a faithful port of the
-/// deleted pre-stage check, kept for behavioural continuity, but it cannot
-/// fail in practice: `expected_path` is `cwd.join(APPROVAL_MARKER_NAME)`, so
-/// `expected_path.parent()` is `cwd` itself, and canonicalizing that against
-/// a canonicalized `cwd` compares one path to itself. It is inherited from
-/// the deleted code and inert here, not a second line of defense.
+/// What actually stops a `../` or symlinked `file_path` from escaping `cwd` is that byte-for-byte
+/// equality in the `Write` arm below — `file_path` must match exactly before the canonicalize
+/// comparison that follows it ever runs. That comparison is inherited from the deleted code for
+/// behavioural continuity but is inert: `expected_path.parent()` is always `cwd` itself, so it
+/// compares one canonicalized path to itself, not a second line of defense.
 fn claude_marker_grant(tool_name: &str, input: &Value, cwd: &Path) -> anyhow::Result<()> {
     if tool_name == "Bash" {
         if input == &json!({"command": CLAUDE_APPROVAL_COMMAND}) {
@@ -481,27 +499,20 @@ fn decision_response(request_id: &str, tool_name: &str, input: &Value, cwd: &Pat
     crate::claude::wire::control_response_line(request_id, response)
 }
 
-/// Send the approval prompt, then answer every `can_use_tool` request the
-/// model makes until the turn ends.
+/// Send the approval prompt, then answer every `can_use_tool` request the model makes until the
+/// turn ends.
 ///
-/// No count, no order, no request-id bookkeeping: the deleted
-/// `ClaudeApprovalState`/`observe_claude_approval_frame`/
-/// `strict_claude_approval_block` enforced an exact "one Bash, then one
-/// bounded Write" contract and bailed — discarding a real, paid-for capture —
-/// on a model that used a different tool, asked twice, asked out of order, or
-/// never asked at all.
+/// No count, order, or request-id bookkeeping — the deleted validators enforced an exact "one
+/// Bash, then one bounded Write" contract and bailed, discarding a real, paid-for capture, on any
+/// deviation.
 ///
-/// One check DOES survive, at `claude_marker_grant` above — and it is not
-/// the class design §3.2 removes, because it runs before a write is actually
-/// granted, not after one already happened. This matters live: Claude's
-/// `--permission-prompt-tool stdio` (`RuntimeMode::ApprovalRequired`, wired
-/// in `claude/mod.rs`) asks this driver to approve or deny EVERY tool call,
-/// and this provider has no pre-spawn fence at all
-/// (`record.rs::record_claude`'s doc comment) — replying `allow`
-/// unconditionally, as this function used to, would let a live `approval`
-/// capture run against an arbitrary operator cwd grant an arbitrary Write or
-/// Bash. A mismatch here DECLINES the grant and keeps recording — never
-/// `bail!`, which would throw away tokens already spent.
+/// `claude_marker_grant` above is the one check that DOES survive, because it runs before a
+/// write is granted, not after one already happened. This matters live: Claude's
+/// `--permission-prompt-tool stdio` asks this driver to approve or deny EVERY tool call, and this
+/// provider has no pre-spawn fence at all — replying `allow` unconditionally would let a live
+/// `approval` capture grant an arbitrary Write or Bash against an arbitrary operator cwd. A
+/// mismatch here DECLINES the grant and keeps recording — never `bail!`, which would throw away
+/// tokens already spent.
 pub(in crate::capture::record) async fn approval(
     session: &mut Session<ClaudeProvider>,
     _input: &ScenarioInput,
@@ -761,16 +772,12 @@ mod tests {
         let capture = session.finish(deadline).await.unwrap();
 
         let stdout = channel_payloads(&capture, Channel::Stdout);
-        // The fixture is selected by matching a substring of the real
-        // `claude_checklist_prompt()` text (`fake_claude.rs`'s
-        // `"TaskCreate exactly twice"` branch), not a `scenario:` tag. If
-        // that prompt is ever reworded, the match silently fails and
-        // dispatch falls through to the fixture's generic
-        // `error_during_execution` reply — which also has no `TaskCreate`
-        // call, also carries a `result` frame, and also exits 0, so every
-        // assertion below would keep passing while asserting nothing about
-        // `checklist_no_tasks()` at all. `sess-checklist-no-tasks` exists
-        // only in that scenario, so this fails loudly instead.
+        // Dispatched by substring match on the real prompt text, not a `scenario:` tag — if the
+        // prompt is ever reworded, dispatch silently falls through to the fixture's generic
+        // `error_during_execution` reply, which also has no TaskCreate call, also carries a
+        // result frame, and also exits 0, so every assertion below would keep passing while
+        // testing nothing. `sess-checklist-no-tasks` only exists in the real branch, so this
+        // fails loudly instead.
         assert!(
             stdout
                 .iter()
@@ -835,19 +842,15 @@ mod tests {
         );
     }
 
-    /// The validator deletion, proven end to end, in both directions: a fake Claude that raises
-    /// three `can_use_tool` requests in a row — none checked for order or count — must have every
-    /// one of them answered. The deleted `ClaudeApprovalState`/`observe_claude_approval_frame`/
-    /// `validate_claude_marker_input`/`strict_claude_approval_block` would have bailed the instant
-    /// a second, unaccounted-for request id showed up; `pending_approval` has no such bookkeeping,
-    /// so it just keeps answering.
+    /// The validator deletion, proven end to end: a fake Claude raising three `can_use_tool`
+    /// requests in a row (uncounted, unordered) must have every one answered — `pending_approval`
+    /// has no bookkeeping to bail on, unlike the deleted validators.
     ///
-    /// This is also the CRITICAL fix's own proof, in both directions: the first two requests are
-    /// exactly the marker Bash command and the marker Write into this scenario's own cwd, so both
-    /// must be GRANTED; the third is a Write to a file the scenario never asked for, so it must be
-    /// DECLINED — and, unlike the deleted validators (which `bail!`ed and discarded the whole
-    /// paid-for capture on exactly this kind of mismatch), the run must still reach its terminal
-    /// frame.
+    /// Also proves the grant/decline split: the first two requests are the marker Bash command
+    /// and the marker Write into this scenario's cwd, so both must be GRANTED; the third is a
+    /// Write to an unrequested file, so it must be DECLINED — and, unlike the deleted validators
+    /// (which `bail!`ed and discarded the whole capture on this kind of mismatch), the run must
+    /// still reach its terminal frame.
     #[tokio::test]
     async fn claude_approval_scenario_answers_every_request_it_sees() {
         let raw = tempfile::tempdir().unwrap();
@@ -958,15 +961,12 @@ mod tests {
         );
     }
 
-    /// End-to-end proof of the same bug, against a real spawned fake-claude: before the fix,
-    /// `fake-claude`'s `approval_missing_tool_name` blocks on `read_line` waiting for a reply to
-    /// its single, `tool_name`-less `can_use_tool` request, and `pending_approval` returning
-    /// `None` for it means that reply never comes — the capture hangs to the timeout instead of
-    /// reaching its terminal frame. This drives a real `Session` with a custom wire line (not the
-    /// production `approval_request` prompt, so it reaches fake-claude's dedicated branch rather
-    /// than `approval_three_requests`) through the same recognize-then-answer loop `approval`
-    /// itself runs, and asserts the run completes with a decline and a terminal frame instead of
-    /// blocking forever.
+    /// End-to-end proof of the same bug against a real spawned fake-claude: before the fix,
+    /// `pending_approval` returning `None` for a `tool_name`-less request means the fixture's
+    /// `read_line` never gets a reply and the capture hangs to the timeout instead of reaching
+    /// its terminal frame. Drives a custom wire line (not the production `approval_request`
+    /// prompt) to reach fake-claude's dedicated branch, through the same recognize-then-answer
+    /// loop `approval` itself runs.
     #[tokio::test]
     async fn claude_approval_declines_a_request_missing_tool_name_instead_of_hanging() {
         let raw = tempfile::tempdir().unwrap();
@@ -1043,16 +1043,13 @@ mod tests {
     }
 
     /// The table's `runtime_mode` and the body's own `RunRequest.runtime_mode` are two separate
-    /// homes for one fact — the row's `fence` field drives fence selection (`record::codex_fence`
-    /// for the two Codex approval rows; every Claude row uses `no_fence`), the request builder
-    /// drives what actually reaches the wire. Task 7's own
+    /// homes for one fact — nothing but this loop proves they still agree;
     /// `comet-provider-capture.rs::scenario_names_own_their_runtime_modes` reads only
-    /// `spec.runtime_mode` and cannot see the two drift apart.
+    /// `spec.runtime_mode` and can't see the two drift apart.
     ///
-    /// Break caught: a `*_request` builder's `RuntimeMode` literal is edited (or a copy/paste
-    /// leaves it stale) while the table's `runtime_mode` field is not — the row would still
-    /// select the right fence and print the right `--help` text while sending the wrong mode on
-    /// the wire.
+    /// Break caught: a `*_request` builder's `RuntimeMode` literal goes stale while the table's
+    /// `runtime_mode` field doesn't — the row would still select the right fence and print the
+    /// right `--help` text while sending the wrong mode on the wire.
     #[test]
     fn every_claude_run_rows_declared_mode_matches_its_request_builder() {
         let plain = ScenarioInput::default();
@@ -1079,6 +1076,11 @@ mod tests {
             (
                 "checklist-resume",
                 checklist_resume_request(&with_resume).unwrap().runtime_mode,
+            ),
+            ("auto", auto_request(&plain).unwrap().runtime_mode),
+            (
+                "full-access",
+                full_access_request(&plain).unwrap().runtime_mode,
             ),
         ];
         for (name, mode) in cases {
@@ -1110,6 +1112,60 @@ mod tests {
         assert_eq!(
             covered, expected,
             "every claude row with Some(runtime_mode) must have a case in this test's list"
+        );
+    }
+
+    /// `Auto` must reach the wire as Claude's `auto` permission mode, and must NOT carry
+    /// `--dangerously-skip-permissions` — same pin contract as
+    /// `record/scenarios/codex.rs`'s `codex_auto_scenario_pins_the_auto_review_reviewer_on_the_wire`,
+    /// applied to Claude's launch-argument wire instead of a JSON-RPC params object.
+    #[test]
+    fn claude_auto_scenario_pins_the_auto_permission_mode() {
+        let request = auto_request(&ScenarioInput::default()).unwrap();
+        let exe = absolute_program("claude");
+        let launch = crate::claude::run_launch(&exe, &request);
+        let snapshot = CommandSnapshot::from_launch(&launch);
+        assert!(
+            snapshot
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--permission-mode", "auto"]),
+            "Auto must reach the wire as the auto permission mode: {:?}",
+            snapshot.args
+        );
+        assert!(
+            !snapshot
+                .args
+                .iter()
+                .any(|arg| arg == "--dangerously-skip-permissions"),
+            "Auto must not skip permissions: {:?}",
+            snapshot.args
+        );
+    }
+
+    /// `FullAccess` must reach the wire as Claude's `bypassPermissions` permission mode plus
+    /// `--dangerously-skip-permissions` — same pin contract as the `Auto` test above.
+    #[test]
+    fn claude_full_access_scenario_pins_bypass_permissions_and_the_skip_flag() {
+        let request = full_access_request(&ScenarioInput::default()).unwrap();
+        let exe = absolute_program("claude");
+        let launch = crate::claude::run_launch(&exe, &request);
+        let snapshot = CommandSnapshot::from_launch(&launch);
+        assert!(
+            snapshot
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--permission-mode", "bypassPermissions"]),
+            "FullAccess must reach the wire as the bypassPermissions permission mode: {:?}",
+            snapshot.args
+        );
+        assert!(
+            snapshot
+                .args
+                .iter()
+                .any(|arg| arg == "--dangerously-skip-permissions"),
+            "FullAccess must skip permissions on the launch: {:?}",
+            snapshot.args
         );
     }
 }

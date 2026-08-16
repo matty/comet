@@ -6,27 +6,19 @@ use crate::capture::Provider;
 /// The provider seam, and the whole of it.
 ///
 /// Claude Code and Codex differ on exactly four things (design
-/// `2026-08-14-provider-capture-simplification-design.md` §3.1): how to
-/// spawn them, how their stdout lines frame into a value, how to hand-shake
-/// once connected, and which frame means a turn is over. Everything else —
-/// sequencing, channel tagging, timeouts, the raw write, partial-capture
-/// classification — is provider-neutral and lives once in [`Session`].
+/// `2026-08-14-provider-capture-simplification-design.md` §3.1): how to spawn them, how their
+/// stdout lines frame into a value, how to hand-shake once connected, and which frame means a
+/// turn is over. Everything else — sequencing, channel tagging, timeouts, the raw write,
+/// partial-capture classification — is provider-neutral and lives once in [`Session`].
 ///
-/// SPAWN is the fourth member and it is *not* here — see the amendment in
-/// `plan-preamble.md`'s "seam, written out once": which launch a scenario
-/// needs varies per scenario as well as per provider (Claude alone needs
-/// three: bare model discovery, non-bare command discovery, a run), so it
-/// lives on `ScenarioSpec::launch`, a per-row `fn` pointer into the same
-/// per-provider production launch builders. Do not move it back here — a
-/// first draft did, and it could not express `command-discovery` needing a
-/// different launch than `model-discovery` without a bypass that silently
-/// left the two indistinguishable at the table.
+/// SPAWN is not a fifth member: which launch a scenario needs varies per scenario as well as per
+/// provider (Claude alone needs three), so it lives on `ScenarioSpec::launch` instead. Do not
+/// move it back here — a first draft did, and it could not express `command-discovery` needing a
+/// different launch than `model-discovery` without a bypass that silently left the two
+/// indistinguishable at the table.
 ///
-/// Nothing anticipatory: no approval abstraction (approvals are a scenario,
-/// not a provider capability) and no capability enum. A fifth member is
-/// added when a third provider — pi, or an ACP agent — has a *recording* to
-/// design against, per this repository's capture-before-planning rule, not
-/// before.
+/// Nothing anticipatory: no approval abstraction, no capability enum. A member is added only
+/// once a third provider has a *recording* to design against, not before.
 pub(super) trait CaptureProvider: Sized {
     /// `"claude"` | `"codex"` — used in the raw directory name and internal
     /// tracing. Not for user-facing copy: that needs "Claude"/"Codex", which
@@ -46,25 +38,18 @@ pub(super) trait CaptureProvider: Sized {
     /// cannot read is evidence, not a failure.
     fn frame(line: &str) -> Option<Value>;
 
-    /// HANDSHAKE. Claude's `control_request`/`initialize`; Codex's
-    /// `initialize` → await reply → `initialized`, in that order.
+    /// HANDSHAKE. Claude's `control_request`/`initialize`; Codex's `initialize` → await reply →
+    /// `initialized`, in that order.
     ///
-    /// `thread/start` is NOT part of the Codex handshake: no discovery
-    /// scenario sends one. It belongs to the run scenario bodies that need a
-    /// thread (Task 5) — a handshake that branches per scenario would not be
-    /// a seam member.
+    /// `thread/start` is NOT part of the Codex handshake: no discovery scenario sends one. It
+    /// belongs to run scenario bodies that need a thread — a handshake that branches per
+    /// scenario would not be a seam member.
     ///
-    /// **The scenario body calls this, not the recorder.** `record_generic`
-    /// (`record.rs`) never calls a seam member unconditionally: every
-    /// discovery body and every Codex run body opens with
-    /// `Self::handshake(session, input).await?` itself; a Claude run body
-    /// calls nothing, because Comet's own run path sends the user turn as its
-    /// first stdin line and no `control_request`/`initialize` at all
-    /// (`crate::claude::mod.rs`'s run driver). Calling this unconditionally
-    /// from the recorder would put a line on the tape the product never
-    /// sends — the one thing a capture must never do. The provider still owns
-    /// *how* to handshake, which is what keeps this a seam member; the
-    /// scenario owns *whether*.
+    /// **The scenario body calls this, not the recorder.** `record_generic` never calls a seam
+    /// member unconditionally: every discovery body and every Codex run body opens with
+    /// `Self::handshake(session, input).await?` itself; a Claude run body calls nothing, because
+    /// Comet's own run path sends the user turn as its first stdin line, no `control_request`/
+    /// `initialize` at all. The provider owns *how* to handshake; the scenario owns *whether*.
     async fn handshake(
         session: &mut Session<Self>,
         input: &super::scenarios::ScenarioInput,

@@ -21,12 +21,16 @@ use comet_harness::capture::{Provider, SCENARIOS, corpus_root, promoted_scenario
 /// fails when an *exempted* row has gained evidence and this entry was left
 /// stale — that second direction is what stops the exemption list itself from
 /// becoming the next place a coverage gap hides unnoticed.
-const EXEMPT_UNCAPTURED: &[(&str, &str)] = &[
-    // Never captured; owed by the stage-6 live re-capture.
-    ("codex", "approval"),
-    ("codex", "approval-on-request"),
-    ("codex", "interruption"),
-];
+///
+/// Empty as of the stage-6 promotion: the seven rows this list used to carry
+/// (`codex/approval`, `codex/approval-on-request`, `codex/interruption`,
+/// `claude/auto`, `claude/full-access`, `codex/auto`, `codex/full-access`)
+/// all landed in the same live re-capture (Claude 2.1.233, Codex 0.147.0),
+/// promoted under `crates/harness/tests/corpus/`. Leave this empty rather
+/// than deleting the constant — the stale-exemption direction of the gate
+/// below is what would have caught these seven going stale, and it needs a
+/// (possibly empty) list to check against.
+const EXEMPT_UNCAPTURED: &[(&str, &str)] = &[];
 
 fn provider_str(provider: Provider) -> &'static str {
     match provider {

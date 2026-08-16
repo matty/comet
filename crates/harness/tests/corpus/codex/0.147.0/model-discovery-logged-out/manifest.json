@@ -1,5 +1,5 @@
 {
-  "captured_at_unix_ms": 1786508818137,
+  "captured_at_unix_ms": 1786907900010,
   "channels": [
     "stdin",
     "stdout"
@@ -124,12 +124,16 @@
       "placeholder": "<V25>"
     },
     {
-      "kind": "v",
-      "placeholder": "<V26>"
+      "kind": "cwd_path",
+      "placeholder": "<CWD>"
     },
     {
-      "kind": "v",
-      "placeholder": "<V27>"
+      "kind": "codex_home_path",
+      "placeholder": "<CODEX_HOME>"
+    },
+    {
+      "kind": "home_path",
+      "placeholder": "<HOME>"
     }
   ],
   "platform": {
@@ -139,6 +143,9 @@
   "provider": "codex",
   "purpose": "capture Codex model discovery with an isolated empty Codex home",
   "redaction_counts": {
+    "codex_home_path": 1,
+    "cwd_path": 1,
+    "home_path": 1,
     "v": 45
   },
   "scenario": "model-discovery-logged-out",

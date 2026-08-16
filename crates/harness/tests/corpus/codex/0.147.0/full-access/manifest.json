@@ -1,5 +1,5 @@
 {
-  "captured_at_unix_ms": 1786508807521,
+  "captured_at_unix_ms": 1786914676306,
   "channels": [
     "stdin",
     "stdout"
@@ -9,10 +9,8 @@
     "args": [
       "app-server"
     ],
-    "configured_env": {
-      "CODEX_HOME": "<CODEX_HOME>"
-    },
-    "creation_flags": 134217728,
+    "configured_env": {},
+    "creation_flags": 0,
     "cwd": "<CWD>",
     "kill_on_drop": true,
     "program": "<HOME>\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe",
@@ -114,6 +112,106 @@
     {
       "kind": "v",
       "placeholder": "<V23>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V24>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V25>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V26>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V27>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V28>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V29>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V30>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V31>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V32>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V33>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V34>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V35>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V36>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V37>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V38>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V39>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V40>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V41>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V42>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V43>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V44>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V45>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V46>"
+    },
+    {
+      "kind": "cwd_path",
+      "placeholder": "<CWD>"
+    },
+    {
+      "kind": "home_path",
+      "placeholder": "<HOME>"
     }
   ],
   "platform": {
@@ -121,11 +219,13 @@
     "os": "windows"
   },
   "provider": "codex",
-  "purpose": "capture Codex model discovery from a neutral working directory",
+  "purpose": "capture what Codex's danger-full-access sandbox puts on the wire",
   "redaction_counts": {
-    "v": 54
+    "cwd_path": 1,
+    "home_path": 1,
+    "v": 126
   },
-  "scenario": "model-discovery-neutral-cwd",
+  "scenario": "full-access",
   "schema_version": 1,
   "source": "capture.json"
 }

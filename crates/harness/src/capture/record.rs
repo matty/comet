@@ -51,16 +51,11 @@ pub async fn record(config: CaptureConfig) -> anyhow::Result<RawCapture> {
     }
 }
 
-/// Resolve the executable, derive the launch, build the fence, and dispatch into
-/// `record_generic` — the whole of what `record_claude`/`record_codex` used to duplicate before
-/// `launch`, `request` and `fence` all moved onto the row (Tasks 1 and 4). What's left differing
-/// between the two providers is exactly the resolver named in `AGENTS.md`'s "What the providers
-/// send": the default-executable lookup and `run_launch`, both plain per-provider `fn` values —
-/// passed in here rather than added to `CaptureProvider` as a fifth member. That trait's own doc
-/// comment (`provider.rs`) is explicit that a fifth member is earned by a third provider having
-/// a *recording* to design against, not added ahead of one; neither of these varies per scenario
-/// the way `launch`/`fence` do (the reason those two live on the row and not the trait), so a
-/// plain parameter is the version that doesn't anticipate anything.
+/// Resolves the executable, derives the launch, builds the fence, and dispatches into
+/// `record_generic`. The two providers differ only in the default-executable lookup and
+/// `run_launch`, passed as plain `fn` values rather than a fifth `CaptureProvider` member —
+/// that trait only grows a member once a third provider exists to design it against
+/// (`provider.rs`'s own doc comment).
 async fn record_provider<P: CaptureProvider>(
     provider: P,
     config: &CaptureConfig,
@@ -115,15 +110,10 @@ async fn record_codex(
     .await
 }
 
-/// The only call site for a row's `ScenarioLaunch::Run` builder IN PRODUCTION CODE — this test
-/// module's `every_row_s_builder_and_fence_match_its_declared_wiring` also calls a row's builder
-/// through `spec.launch`, deliberately, as half of checking the row is wired to the right one.
-/// Builds the `RunRequest` once, derives the launch from it through the
-/// provider's own `run_launch`, and returns the same `RunRequest` so the caller can hand it
-/// to `Session::request` — the recorder never calls a run builder a second
-/// time to build a scenario's wire line. A discovery row has no `RunRequest`
-/// at all, so its half of the match returns `None`. See `ScenarioLaunch`'s
-/// own doc comment (`scenarios.rs`) for the hazard this closes.
+/// Builds a `RunRequest` once and returns it alongside the derived launch, so the caller can
+/// reuse it for `Session::request` instead of calling a Run builder a second time to construct
+/// the wire line — see `ScenarioLaunch`'s own doc comment (`scenarios.rs`) for the hazard this
+/// closes. A discovery row has no `RunRequest`, so that half of the match returns `None`.
 fn derive_launch(
     launch: &ScenarioLaunch,
     input: &ScenarioInput,
@@ -140,26 +130,12 @@ fn derive_launch(
     }
 }
 
-/// Builds the pre-spawn fence for the two Codex scenarios that name it —
-/// `record/scenarios.rs`'s `approval` and `approval-on-request` rows point
-/// their own `fence` field at this function directly. D79: this used to be
-/// reached unconditionally for every Codex row, picking this branch by
-/// testing `spec.runtime_mode == Some(RuntimeMode::ApprovalRequired)` —
-/// which meant a *future* Codex row that legitimately wanted
-/// `ApprovalRequired` for an unrelated reason would have silently inherited
-/// the Windows-only trusted-PowerShell fence below (see
-/// `resolve_trusted_powershell`'s own doc comment for why that fails closed
-/// elsewhere rather than spawning unprotected). Now that every row must name
-/// its own fence — [`scenarios::no_fence`] is the default — reaching this
-/// function at all is itself the declaration; the `needs_approval_target`
-/// check below only chooses between this function's own two fences, not
-/// whether a fence runs at all.
-///
-/// This is the pre-spawn fence decision #6 in the stage plan requires stay —
-/// `crate::capture::safety`'s checks ran inside `recording.rs`'s
-/// `RecordingSession::start` before the neutral-recorder stage's Task 7
-/// deleted that file; this is their new home, run before `Session::start`
-/// is even called.
+/// The pre-spawn fence for Codex's `approval` and `approval-on-request` rows (both point their
+/// `fence` field here). D79: a row reaching this function is itself the declaration that it
+/// wants a fence — `needs_approval_target` below only picks which of this function's two
+/// fences applies, not whether one runs at all. Do not gate entry on `runtime_mode` instead:
+/// a future `ApprovalRequired` row for an unrelated reason would silently inherit the
+/// Windows-only trusted-PowerShell fence (see `resolve_trusted_powershell`'s doc comment).
 fn codex_fence(
     spec: &ScenarioSpec,
     config: &CaptureConfig,
@@ -172,15 +148,10 @@ fn codex_fence(
     };
 
     if spec.requirements.needs_approval_target {
-        // `approval-on-request`: a non-repository cwd and an empty,
-        // identity-stable, isolated approval target. Checked once here
-        // (matching `record_codex`'s own call), and RECHECKED right before
-        // spawn (`FenceOutcome::recheck`, run inside `Session::start`) — the
-        // window between this call (which can involve real filesystem I/O)
-        // and the eventual spawn (after directory creation and a
-        // `--version` probe) is exactly the race
-        // `crate::capture::safety::validate_on_request_preflight`'s
-        // doc comment and `docs/testing/provider-captures.md` describe.
+        // `approval-on-request`: a non-repository cwd and an empty, identity-stable,
+        // isolated approval target. RECHECKED right before spawn (`FenceOutcome::recheck`)
+        // because directory creation and the `--version` probe between this check and
+        // spawn leave a real race window — see `validate_on_request_preflight`'s doc.
         let cwd = launch_cwd()?;
         let target = config.approval_target.clone();
         let identity =
@@ -224,6 +195,33 @@ fn codex_fence(
     })
 }
 
+/// The pre-spawn fence for both providers' `full-access` row — Claude's `bypassPermissions` and
+/// Codex's `danger-full-access` both remove the sandbox entirely, so there is no approval
+/// channel to protect and nothing to recheck at grant time. The only guarantee left to give is
+/// that the process doesn't start inside a repository this project's operator cares about
+/// (reuses `safety::repository_root`). Shared by both providers since the blast radius is the
+/// same either way. Deliberately allows the system temp tree, unlike `resolve_trusted_powershell`'s
+/// forbidden roots — a disposable temp directory is the expected `--cwd` for this scenario; this
+/// only guards against forgetting `--cwd` and landing, unsandboxed, in whatever repo was current.
+fn full_access_fence(
+    _spec: &ScenarioSpec,
+    _config: &CaptureConfig,
+    launch: &LaunchDescriptor,
+) -> anyhow::Result<FenceOutcome> {
+    let cwd = launch.cwd.clone().ok_or_else(|| {
+        anyhow::anyhow!("Full-access capture requires a resolved working directory.")
+    })?;
+    let canonical = std::fs::canonicalize(&cwd)
+        .map_err(|_| anyhow::anyhow!("Full-access capture cwd could not be validated."))?;
+    if crate::capture::safety::repository_root(&canonical).is_some() {
+        anyhow::bail!(
+            "Full-access capture requires a non-repository, non-worktree cwd — pick a disposable \
+             directory outside anything you care about."
+        );
+    }
+    Ok(FenceOutcome::none())
+}
+
 /// A scenario body: given a freshly spawned session, drive it (handshaking
 /// first if this scenario needs one — see `record_generic`'s doc comment)
 /// and report whether the scenario completed.
@@ -232,30 +230,16 @@ type ScenarioBodyFn<P> = for<'a> fn(
     &'a ScenarioInput,
 ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
 
-/// The provider-neutral orchestration shared by every scenario: spawn,
-/// drive the scenario body, finish — all under one shared deadline. A
-/// failure or timeout during drive never reaches [`Session::finish`]; this
-/// function still owns `&mut session` at that point and classifies
-/// explicitly (`DriverError` for a driving failure, `Timeout` for the
-/// deadline firing) — the `drive_completed` distinction `recording.rs` made
-/// with a boolean, carried here by which branch of this match runs.
+/// The provider-neutral orchestration shared by every scenario: spawn, drive the scenario body,
+/// finish, all under one shared deadline. A drive failure or timeout is classified explicitly
+/// (`DriverError` vs `Timeout`) rather than reaching [`Session::finish`].
 ///
-/// Deliberately does NOT call `P::handshake` — see `CaptureProvider::handshake`'s
-/// own doc comment ("the scenario body calls this, not the recorder").
-/// Whether a scenario handshakes at all is a scenario decision: every
-/// discovery body and every Codex run body opens with
-/// `P::handshake(session, input).await?` itself; a Claude run body calls
-/// nothing, because a real Claude run sends no handshake and this function
-/// calling one unconditionally would put a line on the tape the product
-/// never sends.
+/// Deliberately does NOT call `P::handshake` unconditionally — whether a scenario handshakes is
+/// a scenario-body decision, because a real Claude run sends no handshake and calling one here
+/// would put a line on the tape the product never sends (see `CaptureProvider::handshake`'s doc).
 ///
-/// `deadline` is computed once, right after spawn, and passed into both the
-/// outer `timeout_at` wrapping the body *and* into [`Session::finish`], so
-/// the exit wait shares the same clock as driving instead of getting a
-/// fresh, unrelated budget — `recording.rs`'s original `finish` wrapped
-/// drive *and* the exit wait in one `timeout(self.timeout, …)`, and
-/// splitting that into two functions must not silently narrow what the
-/// configured timeout covers.
+/// `deadline` is computed once, right after spawn, and shared between the outer `timeout_at` and
+/// [`Session::finish`]'s exit wait, so the exit wait doesn't get a separate, unrelated budget.
 async fn record_generic<P: CaptureProvider>(
     provider: P,
     config: &CaptureConfig,
@@ -502,7 +486,7 @@ mod tests {
     async fn recorder_persists_structured_host_platform() {
         let raw = tempfile::tempdir().unwrap();
         let capture = record(config(
-            "model-discovery-neutral-cwd",
+            "model-discovery",
             fixture_path("fake-claude"),
             "claude",
             raw.path(),
@@ -526,7 +510,7 @@ mod tests {
                 .unwrap();
         assert_eq!(persisted["platform"]["os"], std::env::consts::OS);
         assert_eq!(persisted["platform"]["arch"], std::env::consts::ARCH);
-        assert_eq!(persisted["scenario"], "model-discovery-neutral-cwd");
+        assert_eq!(persisted["scenario"], "model-discovery");
         assert_eq!(persisted["purpose"], "local recorder test");
         assert!(persisted["captured_at_unix_ms"].as_i64().is_some());
         assert_eq!(
@@ -566,14 +550,11 @@ mod tests {
     }
 
     /// Break caught: the hard-timeout branch failing to persist a partial capture under
-    /// `PartialFailureClass::Timeout`, or the exit wait's own budget silently outliving the
-    /// configured timeout. Does NOT catch a dropped `terminate_and_reap()` call on this branch —
-    /// `Session`'s own `Drop` impl (`record/session.rs`) kills and reaps the child in the
-    /// background regardless of whether that call ran, and nothing here observes the live process
-    /// the way `record/session.rs`'s `wait_error_retains_child_for_cleanup_and_quarantine` does.
-    /// Drives a REAL timeout through `record()` — not a hand-copied reproduction of its own
-    /// timeout-handling code — using a fixture that receives the discovery initialize request and
-    /// genuinely never replies.
+    /// `PartialFailureClass::Timeout`, or the exit wait outliving the configured timeout. Does
+    /// NOT catch a dropped `terminate_and_reap()` call — `Session`'s `Drop` impl kills and reaps
+    /// the child regardless, so only `record/session.rs`'s
+    /// `wait_error_retains_child_for_cleanup_and_quarantine` observes that. Drives a REAL timeout
+    /// through `record()`, via a fixture that receives the request and never replies.
     #[tokio::test]
     async fn recorder_timeout_kills_and_reaps_the_child() {
         let raw = tempfile::tempdir().unwrap();
@@ -628,15 +609,11 @@ mod tests {
         assert_eq!(partial["failure_class"], "driver_error");
     }
 
-    /// Break caught: `record_generic` calls `P::handshake` unconditionally —
-    /// putting a `control_request`/`initialize` line on the tape before a
-    /// real Claude run's first line, which the product itself never sends
-    /// (`crates/harness/src/claude/mod.rs`'s run driver). The scenario-level
-    /// tests in `record/scenarios/claude.rs` construct a `Session` directly
-    /// and call the scenario body themselves, so none of them can catch a
-    /// regression in `record_generic` — only driving through the real public
-    /// entry point, with a scenario the SCENARIOS table now actually wires
-    /// up, can.
+    /// Break caught: `record_generic` calling `P::handshake` unconditionally, putting an
+    /// `initialize` line before a real Claude run's first line (which the product never sends —
+    /// `crates/harness/src/claude/mod.rs`'s run driver). The scenario-level tests in
+    /// `record/scenarios/claude.rs` construct a `Session` directly and never go through
+    /// `record_generic`, so only driving the real entry point (`record()`) can catch this.
     #[tokio::test]
     async fn record_claude_run_sends_no_handshake_before_the_user_turn() {
         let raw = tempfile::tempdir().unwrap();
@@ -667,15 +644,13 @@ mod tests {
         assert_eq!(capture.exit_code, Some(0));
     }
 
-    /// The Codex counterpart: a real Codex run DOES handshake first — driven
-    /// the same way, through `record()` itself, to prove the `fresh-text`
-    /// row's `body` genuinely calls `CodexProvider::handshake` before
-    /// anything scenario-specific.
+    /// The Codex counterpart: a real Codex run DOES handshake first, proven through `record()`
+    /// itself that the `fresh-text` row's body calls `CodexProvider::handshake` before anything
+    /// scenario-specific.
     ///
-    /// Break caught, verified by falsification: removing the `CodexProvider::handshake(...)`
-    /// call from `record/scenarios/codex.rs`'s `fresh_text` body fails loudly — `fake-codex`
-    /// expects `initialize` first and the whole capture errors: "Codex stopped before the
-    /// expected JSON-RPC reply." Restored after confirming.
+    /// Break caught, verified by falsification: removing the handshake call from
+    /// `record/scenarios/codex.rs`'s `fresh_text` body fails loudly — `fake-codex` expects
+    /// `initialize` first and errors "Codex stopped before the expected JSON-RPC reply."
     #[tokio::test]
     async fn record_codex_run_sends_the_initialize_handshake_first() {
         let raw = tempfile::tempdir().unwrap();
@@ -703,15 +678,12 @@ mod tests {
     }
 
     /// The recheck closure `codex_fence` builds for `approval-on-request`, proven directly:
-    /// building the fence once, then mutating the approval target's emptiness before calling the
-    /// returned `recheck`, must make `recheck` itself fail — independent of whether
-    /// `Session::start` remembers to call it at all (that wiring is
-    /// `record/session.rs`'s own `start_runs_the_fence_recheck_after_directory_creation_and_before_spawn`/
-    /// `start_aborts_before_spawn_when_the_fence_recheck_fails`).
+    /// mutating the target's emptiness after building the fence must make the returned `recheck`
+    /// fail, independent of whether `Session::start` remembers to call it (that wiring is
+    /// `record/session.rs`'s own `start_runs_the_fence_recheck_after_directory_creation_and_before_spawn`).
     ///
-    /// Break caught: `codex_fence`'s `recheck` closure stops re-running
-    /// `validate_on_request_preflight` against live filesystem state — e.g. it captures and
-    /// replays the first check's `Ok` result instead of calling the function again.
+    /// Break caught: `recheck` captures and replays the first check's `Ok` instead of re-running
+    /// `validate_on_request_preflight` against live filesystem state.
     #[tokio::test]
     async fn codex_fence_recheck_catches_a_target_that_stopped_being_empty() {
         let raw = tempfile::tempdir().unwrap();
@@ -754,21 +726,16 @@ mod tests {
         assert!(error.to_string().contains("empty"), "{error}");
     }
 
-    /// The grant-time rechecks in `record/scenarios/codex.rs`'s `approval`/`approval_on_request`
-    /// (`answer_every_approval`'s `recheck` closures) read `session.fence.approval_cwd_identity`/
-    /// `approval_target_identity` as `Option<&DirectoryIdentity>`, and `None` is not a failure
-    /// there — `validate_ordinary_approval_cwd`/`require_empty_approval_target` both treat `None`
-    /// as "no expected identity to compare against" and silently degrade to an emptiness/marker
-    /// check with no identity comparison at all (see `.agents/rules/optional-wire-fields.md`).
-    /// Every existing test for those scenarios hand-builds `FenceOutcome{ ..: Some(...) }` and
-    /// never calls `codex_fence` at all, so nothing before this test proved `codex_fence` itself
-    /// populates the field the grant-time recheck depends on.
+    /// `None` is not a failure for the grant-time rechecks in `record/scenarios/codex.rs` —
+    /// `validate_ordinary_approval_cwd`/`require_empty_approval_target` treat a missing identity
+    /// as "nothing to compare against" and silently degrade to an emptiness/marker check (see
+    /// `.agents/rules/optional-wire-fields.md`). Every existing scenario test hand-builds
+    /// `FenceOutcome{ ..: Some(...) }` without calling `codex_fence`, so nothing else proves
+    /// `codex_fence` itself populates the field the recheck depends on.
     ///
-    /// Break caught: `codex_fence` starts returning `None` for `approval_target_identity` on the
-    /// `approval-on-request` row (e.g. the `identity` binding stops being threaded into the
-    /// `FenceOutcome` literal) — the pre-spawn fence would still run and still succeed, `--help`
-    /// and dispatch would look untouched, and only the identity half of the grant-time protection
-    /// would be silently gone.
+    /// Break caught: `codex_fence` returning `None` for `approval_target_identity` on
+    /// `approval-on-request` — the pre-spawn fence still runs and succeeds, only the identity
+    /// half of grant-time protection silently disappears.
     #[tokio::test]
     async fn codex_fence_populates_the_approval_target_identity_for_on_request() {
         let raw = tempfile::tempdir().unwrap();
@@ -833,25 +800,76 @@ mod tests {
         );
     }
 
-    /// The hazard `ScenarioLaunch`/`derive_launch` exist to close: before this
-    /// task, a run scenario's launch and its wire line both came from calling
-    /// the same `*_request` builder, independently, from two different
-    /// places — the `*_launch` wrapper (to build the argv
-    /// `record_claude`/`record_codex` spawns) and the scenario body (to build
-    /// the wire line the body sends). Nothing enforced the two calls returned
-    /// the same value; only every real builder happening to be a pure
-    /// function of `input` did.
-    ///
-    /// `counting_request` is deliberately NOT pure (a call counter folded
-    /// into both `model` and `prompt`), so it turns that assumption into an
-    /// observable fact: `record_claude` reaches it through exactly one path
-    /// now — `derive_launch`, called once, whose `RunRequest` is used for
-    /// BOTH the launch and (via `Session::request`) `hazard_body`'s wire
-    /// line — so the recorded argv (`--model call-N`) and the recorded wire
-    /// line (`call-N`) must name the same call. Before this task, with a
-    /// `*_launch` wrapper calling the builder once and the body calling it a
-    /// second, independent time, this same assertion failed (`--model
-    /// call-0` vs `call-1`) — see the task report for the quoted failure.
+    /// `full_access_fence`'s whole reason to exist: reject a cwd inside a git repository or
+    /// linked worktree, cross-platform (unlike `codex_fence`, which is Windows-only). Both
+    /// providers' `full-access` row points at this same function.
+    #[test]
+    fn full_access_fence_rejects_a_repository_cwd() {
+        let raw = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir(cwd.path().join(".git")).unwrap();
+        let cfg = config(
+            "full-access",
+            fixture_path("fake-codex"),
+            "codex",
+            raw.path(),
+        );
+        let spec = scenario("codex", "full-access").unwrap();
+        let launch = LaunchDescriptor {
+            program: fixture_path("fake-codex"),
+            args: Vec::new(),
+            cwd: Some(cwd.path().into()),
+            configured_env: Default::default(),
+            stdin: StdioMode::Piped,
+            stdout: StdioMode::Piped,
+            stderr: StdioMode::Piped,
+            kill_on_drop: true,
+            #[cfg(windows)]
+            creation_flags: 0,
+        };
+
+        let error = match super::full_access_fence(spec, &cfg, &launch) {
+            Ok(_) => panic!("a repository cwd must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("non-repository"), "{error}");
+    }
+
+    /// The other half: an ordinary, non-repository directory passes.
+    #[test]
+    fn full_access_fence_accepts_a_plain_directory() {
+        let raw = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let cfg = config(
+            "full-access",
+            fixture_path("fake-codex"),
+            "codex",
+            raw.path(),
+        );
+        let spec = scenario("codex", "full-access").unwrap();
+        let launch = LaunchDescriptor {
+            program: fixture_path("fake-codex"),
+            args: Vec::new(),
+            cwd: Some(cwd.path().into()),
+            configured_env: Default::default(),
+            stdin: StdioMode::Piped,
+            stdout: StdioMode::Piped,
+            stderr: StdioMode::Piped,
+            kill_on_drop: true,
+            #[cfg(windows)]
+            creation_flags: 0,
+        };
+
+        assert!(super::full_access_fence(spec, &cfg, &launch).is_ok());
+    }
+
+    /// The hazard `ScenarioLaunch`/`derive_launch` close: a run scenario's launch and its wire
+    /// line must come from exactly one call to the request builder, not two independent calls
+    /// that happen to agree only because every real builder is a pure function of `input`.
+    /// `counting_request` is deliberately impure (a call counter folded into `model` and
+    /// `prompt`), so a second independent call is observable: the recorded argv (`--model
+    /// call-N`) and the recorded wire line (`call-N`) must name the same call. Before
+    /// `derive_launch` existed, this assertion failed with `--model call-0` vs `call-1`.
     #[tokio::test]
     async fn scenario_launch_and_body_must_share_one_request_builder_call() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -935,111 +953,45 @@ mod tests {
         );
     }
 
-    /// Task 2's twelve-row purity/wiring loop and D79's twenty-row fence loop, merged into one
-    /// loop over every row in `SCENARIOS` against one `(provider, name) → (builder, fence)`
-    /// table. A whole-branch review flagged the two as one 20-row roster enumerated across two
-    /// separate tables with two separate coverage guards; this is that merge — same coverage, one
-    /// table and one guard instead of two.
+    /// Merges Task 2's per-row purity/wiring checks and D79's fence-wiring check into one loop
+    /// over `SCENARIOS` against `EXPECTED_ROWS`, a `(provider, name) → (builder, fence)` table.
+    /// Per row this checks: purity (`build_request` called twice must agree, `Run` rows only);
+    /// run-builder wiring (the call also matches `EXPECTED_ROWS`' entry); fence wiring
+    /// (`spec.fence` fingerprinted and compared against the table's `FenceKind`); Run/Discovery
+    /// agreement (`EXPECTED_ROWS`' builder is `Some` iff the row is `Run`); and, after the loop,
+    /// coverage (`EXPECTED_ROWS` lists every `SCENARIOS` row exactly once, both directions).
     ///
-    /// What the merged table replaces:
-    /// - the twelve per-row `*_row_is_wired_to_*_request` tests (six in
-    ///   `record/scenarios/claude.rs`: `fresh_text_row_is_wired_to_fresh_text_request`,
-    ///   `resume_row_is_wired_to_resume_request`, `attachment_row_is_wired_to_attachment_request`,
-    ///   `checklist_row_is_wired_to_checklist_request`,
-    ///   `checklist_resume_row_is_wired_to_checklist_resume_request`,
-    ///   `approval_row_is_wired_to_approval_request`; six in `record/scenarios/codex.rs`:
-    ///   `fresh_text_row_is_wired_to_fresh_text_request`, `resume_row_is_wired_to_resume_request`,
-    ///   `steer_row_is_wired_to_steer_request`, `interruption_row_is_wired_to_interruption_request`,
-    ///   `approval_row_is_wired_to_approval_request`,
-    ///   `approval_on_request_row_is_wired_to_approval_on_request_request`), each of which
-    ///   compared `build_request(&input)` via `spec.launch` against the same-named builder called
-    ///   directly;
-    /// - D79's own recorded residual (`docs/debt/closed.md`): Task 4 moved fence selection onto
-    ///   each row (`scenarios::no_fence` for eighteen rows, `codex_fence` for the two Codex
-    ///   approval rows), but nothing checked a row's `fence` field against what it SHOULD be.
-    ///   D79's entry names the fix by its future name directly: "a future `EXPECTED_FENCES`-style
-    ///   table, mirroring the existing `EXPECTED_RUN_BUILDERS` one, would close it the same way" —
-    ///   this loop is that table, merged with the run-builder one rather than kept beside it.
+    /// `ScenarioInput` here is derived from `spec.requirements` rather than hardcoded per row, so
+    /// a row whose `needs_resume_id`/`needs_attachment`/`needs_approval_target` flag disagrees
+    /// with what its own builder demands fails here too.
     ///
-    /// What this loop checks, per row:
-    /// - **purity** (`Run` rows only): `build_request` is called twice (`first`/`second` below)
-    ///   and must agree.
-    /// - **run-builder wiring** (`Run` rows only): `first` is also compared against
-    ///   `EXPECTED_ROWS`' entry for this row — the builder that row is supposed to name, looked up
-    ///   by `(provider, name)` rather than through `spec.launch` a second time. A row repointed at
-    ///   another row's builder disagrees with the table and fails, naming the row.
-    /// - **fence wiring** (every row): `spec.fence` is fingerprinted (see below) and compared
-    ///   against `EXPECTED_ROWS`' `FenceKind` entry for this row.
-    /// - **Run/Discovery agreement** (every row): `EXPECTED_ROWS`' builder field must be `Some`
-    ///   exactly when the row is `ScenarioLaunch::Run` and `None` exactly when it is
-    ///   `ScenarioLaunch::Discovery` — a row flipped from one to the other without updating the
-    ///   table fails this directly, naming the row, instead of silently dropping out of a loop
-    ///   built only for one kind.
-    /// - **coverage** (both directions, after the loop): `EXPECTED_ROWS` must list every row in
-    ///   `SCENARIOS` exactly once. A row with no table entry panics inside the loop, naming the
-    ///   row; a stale table entry with no matching row fails the `covered == expected` set
-    ///   comparison.
+    /// Fence fingerprint: comparing `spec.fence` by function-pointer identity
+    /// (`std::ptr::fn_addr_eq`) does not work — distinct `fn` items are not guaranteed distinct
+    /// addresses across codegen units. Instead this calls the fence with a `cwd: None` launch:
+    /// `codex_fence`'s first statement in both branches fails with "requires a resolved working
+    /// directory" before touching `spec.requirements`, `config`, or the filesystem; `no_fence`
+    /// always returns `Ok`. That's deterministic and needs no real filesystem state, which is why
+    /// it stays portable to Linux CI, where `resolve_trusted_powershell` fails closed regardless.
     ///
-    /// It also keeps a property the twelve never had: `ScenarioInput` is derived from
-    /// `spec.requirements` here rather than hardcoded per row, so a row whose
-    /// `needs_resume_id`/`needs_attachment`/`needs_approval_target` flag disagrees with what its
-    /// own builder demands now fails here too (e.g. clearing `needs_resume_id` on a resume row
-    /// makes its builder return a "needs a --resume-id" error and the loop panics).
+    /// The purity assertion only catches impurity that varies call-to-call in the same process (a
+    /// counter, a fine clock) — NOT `normalize_run_request` reading `.git` state
+    /// (`cheap_codex_request`'s own doc), which returns the same value on both calls whenever the
+    /// filesystem is stable, i.e. always. That class of drift is instead caught by
+    /// `every_scenario_launch_matches_its_committed_corpus_manifest`, the corpus pin.
     ///
-    /// The fence fingerprint: comparing `spec.fence` by function-pointer identity
-    /// (`std::ptr::fn_addr_eq`) was considered and rejected — two distinct `fn` items are not
-    /// guaranteed to have distinct addresses across codegen units, so that comparison can pass
-    /// while comparing nothing. Instead this fingerprints a row's fence by an OBSERVABLE property
-    /// the two real fences differ on unconditionally: `codex_fence`'s very first statement in BOTH
-    /// of its branches (above, this file) is `let cwd = launch_cwd()?;`, which fails with
-    /// "requires a resolved working directory" whenever `launch.cwd` is `None` — before it reads
-    /// `spec.requirements`, `config`, or the filesystem at all. `no_fence` ignores every argument
-    /// and always returns `Ok`. Calling a row's fence with a `cwd: None` launch therefore
-    /// distinguishes the two kinds deterministically, without any of the real filesystem state (a
-    /// trusted PowerShell, an approval target, a cwd identity) `codex_fence`'s ordinary path needs
-    /// — which is what keeps this portable to the Linux CI this workspace runs on, where
-    /// `resolve_trusted_powershell` fails closed regardless of input (see its own doc comment).
-    ///
-    /// Break caught, on any of these hazards:
-    /// - **non-purity**: `build_request(&input)` called twice returns two different `RunRequest`s.
-    ///   This only catches impurity that varies between two adjacent calls in the same process —
-    ///   a counter, a fine clock. The impurity this codebase actually has —
-    ///   `normalize_run_request` reading `.git` state, named on `cheap_codex_request`'s own doc —
-    ///   returns the same value on both calls whenever the filesystem is stable during the test,
-    ///   which is always, so this assertion cannot catch it. What makes that impurity harmless is
-    ///   the single-call architecture itself (see this file's own
-    ///   `scenario_launch_and_body_must_share_one_request_builder_call`), not this loop; the
-    ///   corpus pin (`every_scenario_launch_matches_its_committed_corpus_manifest`) is what would
-    ///   catch machine-stable argv drift. This assertion stays cheap and still catches the
-    ///   call-to-call non-determinism class, so it is kept.
-    /// - **run-builder mis-wiring**: `spec.launch` names a different row's builder — `first`
-    ///   disagrees with `EXPECTED_ROWS`' entry for this row's `(provider, name)`.
-    /// - **fence mis-wiring**: pointing a non-approval Codex row (e.g. `steer`) at `codex_fence` —
-    ///   the exact mis-wiring D79's residual named as uncaught — makes that row's fingerprint
-    ///   `CodexApproval` while `EXPECTED_ROWS` still says `None`, and this test fails naming the
-    ///   row.
-    /// - **a row silently changing kind**: a `Run` row flipped to `Discovery` (or the reverse)
-    ///   without updating the table — caught directly by the Run/Discovery agreement check.
-    /// - **a row silently leaving the loop entirely**: renamed without a matching table entry, or
-    ///   a stale table entry with no matching row — caught by the `covered == expected` count
-    ///   check.
-    ///
-    /// One assertion this test does NOT independently prove: `derive_launch` — the actual, only
-    /// production call site — is checked against `run_launch(exe, &first)`, where `run_launch` is
-    /// chosen here by `spec.provider` (not by `spec.body`, which is what production actually
-    /// dispatches on). That the two choices agree is pinned by a different test,
-    /// `every_row_s_declared_provider_matches_its_body_variant` (`scenarios.rs`), not this
-    /// one. And because `derive_launch`'s `Run` arm is exactly `run_launch(executable,
+    /// Does NOT independently prove `derive_launch`'s provider dispatch: `run_launch` is chosen
+    /// here by `spec.provider`, but production dispatches by `spec.body`; that the two agree is
+    /// pinned by `every_row_s_declared_provider_matches_its_body_variant` (`scenarios.rs`), not
+    /// this test. And since `derive_launch`'s `Run` arm is exactly `run_launch(executable,
     /// &build_request(input)?)`, this assertion is a change-detector over that one function's
-    /// three-line body rather than an independent oracle — it still catches an edit that drops
-    /// the executable/request pairing or otherwise changes what that arm returns, just not a
-    /// provider mis-dispatch (that hazard belongs to the test named above).
+    /// body, not an independent oracle.
     #[test]
     fn every_row_s_builder_and_fence_match_its_declared_wiring() {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum FenceKind {
             None,
             CodexApproval,
+            FullAccess,
         }
 
         // The `(provider, name) → (builder, fence)` table the twelve-plus-twenty rows across the
@@ -1049,18 +1001,6 @@ mod tests {
         type RunBuilder = fn(&ScenarioInput) -> anyhow::Result<RunRequest>;
         const EXPECTED_ROWS: &[(Provider, &str, Option<RunBuilder>, FenceKind)] = &[
             (Provider::Claude, "model-discovery", None, FenceKind::None),
-            (
-                Provider::Claude,
-                "model-discovery-neutral-cwd",
-                None,
-                FenceKind::None,
-            ),
-            (
-                Provider::Claude,
-                "model-discovery-project-cwd",
-                None,
-                FenceKind::None,
-            ),
             (Provider::Claude, "command-discovery", None, FenceKind::None),
             (
                 Provider::Claude,
@@ -1098,19 +1038,19 @@ mod tests {
                 Some(scenarios::claude::checklist_resume_request),
                 FenceKind::None,
             ),
+            (
+                Provider::Claude,
+                "auto",
+                Some(scenarios::claude::auto_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Claude,
+                "full-access",
+                Some(scenarios::claude::full_access_request),
+                FenceKind::FullAccess,
+            ),
             (Provider::Codex, "model-discovery", None, FenceKind::None),
-            (
-                Provider::Codex,
-                "model-discovery-neutral-cwd",
-                None,
-                FenceKind::None,
-            ),
-            (
-                Provider::Codex,
-                "model-discovery-project-cwd",
-                None,
-                FenceKind::None,
-            ),
             (
                 Provider::Codex,
                 "model-discovery-logged-out",
@@ -1152,6 +1092,18 @@ mod tests {
                 "interruption",
                 Some(scenarios::codex::interruption_request),
                 FenceKind::None,
+            ),
+            (
+                Provider::Codex,
+                "auto",
+                Some(scenarios::codex::auto_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Codex,
+                "full-access",
+                Some(scenarios::codex::full_access_request),
+                FenceKind::FullAccess,
             ),
         ];
 
@@ -1197,16 +1149,18 @@ mod tests {
             let actual_fence = match (spec.fence)(spec, &cfg, &launch) {
                 Ok(_) => FenceKind::None,
                 Err(error) => {
-                    assert!(
-                        error
-                            .to_string()
-                            .contains("requires a resolved working directory"),
-                        "{:?}/{}: fence errored on a cwd-less launch with a message that isn't \
-                         codex_fence's own — got {error}",
-                        spec.provider,
-                        spec.name
-                    );
-                    FenceKind::CodexApproval
+                    let message = error.to_string();
+                    if message.starts_with("Codex approval capture requires") {
+                        FenceKind::CodexApproval
+                    } else if message.starts_with("Full-access capture requires") {
+                        FenceKind::FullAccess
+                    } else {
+                        panic!(
+                            "{:?}/{}: fence errored on a cwd-less launch with an unrecognized \
+                             message — got {error}",
+                            spec.provider, spec.name
+                        );
+                    }
                 }
             };
             assert_eq!(
@@ -1335,49 +1289,30 @@ mod tests {
         entries.remove(0)
     }
 
-    /// Task 3 (`2026-08-16-scenario-request-builders.md`): the purity/wiring checks in the loop
-    /// above (`every_row_s_builder_and_fence_match_its_declared_wiring`) prove a row's builder is
-    /// pure and that `derive_launch` faithfully turns its `RunRequest` into a launch — but every
-    /// oracle in that test is itself derived from the SAME source code this
-    /// task exists to check. This test compares against something none of that code can
-    /// influence: the committed capture archive, frozen before this branch existed (`git diff
-    /// 7d4e903..HEAD -- crates/harness/tests/corpus/` is empty) and explicitly protected by the
-    /// plan's own constraints ("No byte under `crates/harness/tests/corpus/` changes").
+    /// Independent oracle for the loop above (`every_row_s_builder_and_fence_match_its_declared_wiring`):
+    /// that loop's checks are all derived from the same production code this test exists to
+    /// check, but this one compares against the committed capture archive, frozen before this
+    /// branch existed and protected by policy ("No byte under `crates/harness/tests/corpus/`
+    /// changes").
     ///
-    /// Not every row has evidence. Three Codex rows — `approval`, `approval-on-request`,
-    /// `interruption` — have never been captured (their own exemption on `test/stage-6-integration`'s
-    /// `capture_corpus/scenario_coverage.rs`, not present on this branch; verified independently
-    /// here by walking the corpus). `claude/2.1.229/subagent` is a hand-sanitized exploratory
-    /// capture with no matching `SCENARIOS` row (see its own `README.md`) and is never looked up,
-    /// since lookup is driven by row name, not by directory listing.
+    /// `claude/2.1.229/subagent` is a hand-sanitized capture with no matching `SCENARIOS` row and
+    /// is never looked up (lookup is by row name, not directory listing).
     ///
     /// Comparison is STRUCTURAL, not byte-for-byte — the archive redacts `cwd`, `program`, and
-    /// any resume/session id embedded in argv (`docs/testing/provider-captures.md`):
-    /// - `args`: compared for exact equality after normalizing a `--resume=<id>` token on BOTH
-    ///   sides to `--resume=<REDACTED>` — the only value-bearing argv token any scenario here
-    ///   produces. Every other token — every flag, and every other value (model id, effort,
-    ///   permission-mode, `--bare`) — is real, unredacted, and compared literally; the archive
-    ///   does not redact those.
-    /// - `cwd`: presence only (`Some` vs `Some`, `None` vs `None`) — the archive redacts the
-    ///   value itself to `<CWD>`.
-    /// - `program`: compared by final path component with any `.exe` suffix stripped (via
-    ///   `program_stem`, below) — the archive redacts everything BEFORE the binary name
-    ///   (`<HOME>\...\claude.exe`), but keeps the name itself, so `claude` vs `codex` is a real
-    ///   assertion, not a no-op. A bare `is_empty()` check on both sides used to stand in here
-    ///   and could never fail for any production change — the derived side is always
-    ///   `current_dir().join("claude"|"codex")`, never empty.
-    /// - `configured_env`: key set only — a set value (`CODEX_HOME`) redacts to `<CODEX_HOME>`.
-    /// - `stdin`/`stdout`/`stderr`/`kill_on_drop`/`creation_flags` (Windows only): exact
-    ///   equality — none of these carry machine- or session-specific data, and `creation_flags`
-    ///   is a compile-time constant per launch function (`0x0800_0000` for every discovery
-    ///   launch, `0` for every run launch), not something spawn-time state could vary.
+    /// any resume/session id in argv (`docs/testing/provider-captures.md`):
+    /// - `args`: exact equality after normalizing `--resume=<id>` to `--resume=<REDACTED>` on
+    ///   both sides — every other token (flags, model id, effort, `--bare`) is unredacted and
+    ///   compared literally.
+    /// - `cwd`: presence only (the archive redacts the value to `<CWD>`).
+    /// - `program`: final path component, `.exe` stripped (`program_stem`) — the archive redacts
+    ///   everything before the binary name. A bare `is_empty()` check used to stand in here and
+    ///   could never fail for any production change; this replaced it with a real assertion.
+    /// - `configured_env`: key set only (a set value like `CODEX_HOME` redacts to `<CODEX_HOME>`).
+    /// - `stdin`/`stdout`/`stderr`/`kill_on_drop`/`creation_flags` (Windows only): exact equality —
+    ///   none carry machine- or session-specific data.
     #[test]
     fn every_scenario_launch_matches_its_committed_corpus_manifest() {
-        const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[
-            (Provider::Codex, "approval"),
-            (Provider::Codex, "approval-on-request"),
-            (Provider::Codex, "interruption"),
-        ];
+        const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[];
 
         let root = crate::capture::corpus_root();
         let promoted = crate::capture::promoted_scenarios(&root)
@@ -1393,17 +1328,11 @@ mod tests {
             };
             let label = format!("{provider_str}/{}", spec.name);
 
-            // EVERY corpus directory this scenario has, across every version — not just the
-            // first `.find()` turns up. Versions sort ascending (`promoted_scenarios`'s own doc
-            // comment), so a `.find()` here always binds to the OLDEST version's manifest,
-            // silently ignoring any newer one — harmless today (no scenario exists under two
-            // versions yet) but not once a live re-capture promotes a second version of an
-            // existing scenario: a freshly captured `claude/2.1.233/fresh-text` would sit right
-            // beside `2.1.228/fresh-text` unchecked, and this test would keep passing against
-            // the superseded evidence. The launch under test is version-independent — built from
-            // the same production code regardless of which CLI version produced the corpus
-            // evidence — so every version's manifest is a valid oracle, and checking all of them
-            // is strictly stronger than checking one.
+            // EVERY corpus directory for this scenario, across every version — not just the
+            // first found. A `.find()` here would always bind to the oldest version
+            // (`promoted_scenarios` sorts ascending) and silently miss a newer capture once a
+            // scenario exists under two versions. The launch under test is version-independent,
+            // so every version's manifest is a valid oracle and checking all is strictly stronger.
             let scenario_dirs: Vec<&crate::capture::PromotedScenario> = promoted
                 .iter()
                 .filter(|scenario| {
@@ -1497,12 +1426,8 @@ mod tests {
         unevidenced_sorted.sort();
         assert_eq!(
             unevidenced_sorted,
-            vec![
-                "codex/approval",
-                "codex/approval-on-request",
-                "codex/interruption",
-            ],
-            "the exempted-uncaptured rows must be exactly these three — a row gaining or losing \
+            Vec::<String>::new(),
+            "EXEMPT_UNCAPTURED is empty, so nothing should land in unevidenced — a row losing \
              corpus evidence must update this assertion deliberately, not pass through silently"
         );
 
@@ -1514,16 +1439,12 @@ mod tests {
         );
     }
 
-    /// The final path component of a `program`, with a trailing `.exe` stripped — `"claude"` from
-    /// both `C:\dev\comet\claude` (the derived side, built by `absolute_program`, no extension)
-    /// and `<HOME>\.local\bin\claude.exe` (the corpus side, redacted down to a directory prefix
-    /// but keeping the binary name — see this file's `docs/testing/provider-captures.md`).
+    /// The final path component of `program` with a trailing `.exe` stripped.
     ///
-    /// Deliberately does NOT use `std::path::Path` — the corpus string was captured on Windows
-    /// and always uses `\` regardless of which OS this test runs on, and `Path` on a non-Windows
-    /// host (this workspace's CI runs `ubuntu-24.04`) treats `\` as an ordinary character, not a
-    /// separator, so `Path::new(corpus).file_stem()` would return the whole redacted string
-    /// unsplit. Splitting on both `/` and `\` by hand keeps this correct on every host.
+    /// Deliberately does NOT use `std::path::Path` — the corpus string always uses `\` (captured
+    /// on Windows), and on a non-Windows host (this workspace's CI runs `ubuntu-24.04`) `Path`
+    /// treats `\` as an ordinary character, not a separator, so `file_stem()` would return the
+    /// whole redacted string unsplit. Splitting on both `/` and `\` by hand works on every host.
     fn program_stem(raw: &str) -> String {
         let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
         match name.rsplit_once('.') {

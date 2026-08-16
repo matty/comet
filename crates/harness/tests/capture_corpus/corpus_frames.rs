@@ -6,7 +6,9 @@
 //! green suite. Sequence numbers alone are not evidence; these tests assert what
 //! the frames actually contain.
 
-use comet_harness::capture::{Channel, corpus_frame, corpus_frame_where};
+use comet_harness::capture::{
+    Channel, corpus_frame, corpus_frame_where, corpus_root, frames, promoted_scenarios,
+};
 use serde_json::Value;
 
 const CODEX_MODEL_DISCOVERY: &str = "codex/0.147.0/model-discovery";
@@ -20,38 +22,14 @@ fn payload(scenario: &str, sequence: u64) -> Value {
         .unwrap_or_else(|error| panic!("{scenario} frame {sequence} is not JSON: {error}"))
 }
 
-/// After initialize succeeds, `remoteControl/status/changed` is interleaved
-/// before the `model/list` response — which is why ID-based reply matching in
-/// `crates/harness/src/codex/discovery.rs` must skip notifications rather than
-/// take the next frame.
+/// `remoteControl/status/changed` lands between initialize and the `model/list` reply, so
+/// id-based matching in `crates/harness/src/codex/discovery.rs` must skip notifications rather
+/// than take the next frame. The `model/list` reply's `id` must equal its own request's `id`.
 ///
-/// This is an inequality rather than the equality it should be, and the
-/// reason recorded here until 2026-08-16 was **wrong**. It blamed the
-/// allowlist: `.id` is not on `codex.txt`, so the archive holds placeholders
-/// there, and the join was said to be unrecoverable.
-///
-/// Redaction does not lose the join. Equal values share a placeholder by
-/// design, and `steer` demonstrates it — its `initialize` request and reply
-/// both read `<V1>`. This scenario reads `<V1>` on the request and `<V2>` on
-/// the reply, which means the two ids **differed before sanitizing**: the
-/// recording lost the join, not the sanitizer.
-///
-/// Six of the seven committed Codex scenarios have zero request-to-reply id
-/// joins; only `steer` (recorded in a later change) has all four. The current
-/// recorder is not affected — a live `model-discovery` taken on 2026-08-16
-/// joins `id=1` and `id=2` across stdin and stdout correctly.
-///
-/// So this assertion is weaker than the evidence should support, and the fix
-/// is a re-capture rather than an edit here. **Restore the equality when
-/// stage 6 re-records Codex**, and add the property test that would have
-/// caught it: every request id in a Codex capture appears on both channels.
-///
-/// The initialize reply itself stays pinned to sequence 2: it is the direct
-/// synchronous response to the initialize request at sequence 1, and nothing
-/// unsolicited can land before the very first reply. The notification and
-/// the model/list reply are both found by predicate instead — a live run on
-/// 2026-08-16 put the notification at a different sequence on two otherwise
-/// identical runs, and the model/list reply's own sequence shifts with it.
+/// The initialize reply stays pinned to sequence 2 (the direct synchronous response to sequence
+/// 1, and nothing unsolicited can land before the first reply). The notification and the
+/// `model/list` request/reply are found by predicate instead, since their sequence numbers shift
+/// between otherwise identical runs.
 #[test]
 fn codex_discovery_interleaves_a_notification_before_the_model_list_reply() {
     let initialize = payload(CODEX_MODEL_DISCOVERY, 2);
@@ -60,7 +38,12 @@ fn codex_discovery_interleaves_a_notification_before_the_model_list_reply() {
         "a remoteControl/status/changed notification",
         |value| value["method"] == "remoteControl/status/changed",
     );
-    let model_list = corpus_frame_where(
+    let model_list_request = corpus_frame_where(
+        CODEX_MODEL_DISCOVERY,
+        "a request whose method is model/list",
+        |value| value["method"] == "model/list",
+    );
+    let model_list_reply = corpus_frame_where(
         CODEX_MODEL_DISCOVERY,
         "a reply whose result carries a model list (result.data is an array)",
         |value| value["result"]["data"].is_array(),
@@ -79,21 +62,87 @@ fn codex_discovery_interleaves_a_notification_before_the_model_list_reply() {
     assert_eq!(notification.value["method"], "remoteControl/status/changed");
 
     assert!(
-        !model_list.value["id"].is_null(),
+        !model_list_reply.value["id"].is_null(),
         "model/list must carry a request id"
     );
     assert_ne!(
-        initialize["id"], model_list.value["id"],
+        initialize["id"], model_list_reply.value["id"],
         "initialize and model/list must be answers to two different requests"
     );
-    assert!(model_list.value["result"]["data"].is_array());
+    assert_eq!(
+        model_list_request.value["id"], model_list_reply.value["id"],
+        "the model/list reply must join back to the model/list request's own id"
+    );
+    assert!(model_list_reply.value["result"]["data"].is_array());
 
     assert!(
-        notification.sequence < model_list.sequence,
+        notification.sequence < model_list_reply.sequence,
         "the notification must be interleaved before the model/list reply: \
          notification at {}, model/list reply at {}",
         notification.sequence,
-        model_list.sequence
+        model_list_reply.sequence
+    );
+}
+
+/// Every JSON-RPC request id in a promoted Codex capture has a reply
+/// carrying the same id on the other channel — the property that would have
+/// caught the join loss the test above records.
+#[test]
+fn every_codex_request_id_has_a_reply_on_the_other_channel() {
+    let corpus_root = corpus_root();
+    let scenarios = promoted_scenarios(&corpus_root)
+        .unwrap_or_else(|error| panic!("{} could not be walked: {error}", corpus_root.display()));
+    let mut checked = 0u64;
+
+    for scenario in scenarios
+        .iter()
+        .filter(|scenario| scenario.provider == "codex")
+    {
+        checked += 1;
+        let mut requests = Vec::new();
+        let mut replies = std::collections::HashSet::new();
+        let events = frames(&scenario.directory)
+            .unwrap_or_else(|error| panic!("{}: events.jsonl unreadable: {error}", scenario.label));
+        for event in events {
+            let Some(payload) = event["payload"].as_str() else {
+                continue;
+            };
+            let Ok(payload) = serde_json::from_str::<Value>(payload) else {
+                continue;
+            };
+            let Some(id) = payload.get("id").filter(|id| !id.is_null()) else {
+                continue;
+            };
+            let channel = event["channel"].as_str().unwrap_or_default().to_owned();
+            if payload.get("method").is_some() {
+                requests.push((
+                    channel,
+                    id.clone(),
+                    event["sequence"].as_u64().unwrap_or_default(),
+                ));
+            } else if payload.get("result").is_some() || payload.get("error").is_some() {
+                replies.insert((channel, id.clone()));
+            }
+        }
+
+        for (channel, id, sequence) in requests {
+            let other = if channel == "stdin" {
+                "stdout"
+            } else {
+                "stdin"
+            };
+            assert!(
+                replies.contains(&(other.to_owned(), id.clone())),
+                "{} frame {sequence}: request id {id} on {channel} has no reply on {other}",
+                scenario.label
+            );
+        }
+    }
+
+    assert!(
+        checked > 0,
+        "found no codex scenario under {} -- corpus walk is broken, not just empty",
+        corpus_root.display()
     );
 }
 
@@ -177,14 +226,9 @@ fn task_create_puts_the_assigned_id_only_on_the_result() {
 /// `{from,to}`, while `activeForm` appears only on the tool input, so neither
 /// frame alone describes the change.
 ///
-/// `.message.content[].input.taskId` is one of D73's seven tool-argument
-/// union paths (`docs/debt/D73-tool-argument-union-paths.md`): it is
-/// allowlisted whole, so its literal value is published as-is rather than
-/// replaced by a placeholder. This assertion no longer depends on that —
-/// it checks the *join* (the update call names the task `TaskCreate`
-/// assigned, and that differs from the corpus's other task) rather than the
-/// literal string, so the seven lines can be dropped from `claude.txt` at
-/// the next promotion without breaking this test.
+/// D73 closed at the stage-6 promotion: `.message.content[].input.taskId` is
+/// redacted now, so the join is proven through `.tool_use_result.task.id`
+/// (TaskCreate's own result, still allowed) instead of the input.
 #[test]
 fn task_update_splits_status_change_and_active_form_across_two_frames() {
     let first_created = payload(CHECKLIST, 64);
@@ -201,8 +245,8 @@ fn task_update_splits_status_change_and_active_form_across_two_frames() {
 
     let input = &call["message"]["content"][0]["input"];
     assert_eq!(
-        input["taskId"], first_created["tool_use_result"]["task"]["id"],
-        "the update call must name the task TaskCreate assigned: {input}"
+        result["tool_use_result"]["taskId"], first_created["tool_use_result"]["task"]["id"],
+        "the update result must name the task TaskCreate assigned: {result}"
     );
     assert!(
         input["activeForm"].is_string(),
@@ -222,16 +266,15 @@ fn task_update_splits_status_change_and_active_form_across_two_frames() {
 /// frame updates an id it never created — so a per-run accumulator receives a
 /// status change for an unknown item.
 ///
-/// Same D73 caveat as the test above: `.message.content[].input.taskId` and
-/// `.tool_use_result.taskId` are both union paths whose literal is published
-/// as-is, not a placeholder. This asserts the join instead — the update call
-/// and its own result must name the same task — so dropping the seven
-/// allowlist lines at the next promotion (turning the value into a
-/// placeholder) leaves this test unaffected.
+/// D73 redacts `.message.content[].input.taskId`, and this scenario has no TaskCreate frame to
+/// cross-check against, so the join is proven by placeholder identity instead: two separate
+/// update calls in the same resumed run carry the same redacted `input.taskId` placeholder,
+/// meaning they name the same task.
 #[test]
 fn a_resumed_run_updates_a_task_it_never_created() {
     let init = payload(CHECKLIST_RESUME, 2);
-    let call = payload(CHECKLIST_RESUME, 50);
+    let first_call = payload(CHECKLIST_RESUME, 50);
+    let second_call = payload(CHECKLIST_RESUME, 58);
     let result = payload(CHECKLIST_RESUME, 55);
 
     assert_eq!(init["subtype"], "init");
@@ -242,8 +285,10 @@ fn a_resumed_run_updates_a_task_it_never_created() {
         );
     }
     assert_eq!(
-        call["message"]["content"][0]["input"]["taskId"], result["tool_use_result"]["taskId"],
-        "the update call and its result must name the same task: call={call} result={result}"
+        first_call["message"]["content"][0]["input"]["taskId"],
+        second_call["message"]["content"][0]["input"]["taskId"],
+        "two update calls in the same resumed run must name the same task: \
+         first={first_call} second={second_call}"
     );
     assert_eq!(result["tool_use_result"]["statusChange"]["from"], "pending");
 }
@@ -273,15 +318,11 @@ fn subagent_tool_use_joins_its_own_task_started() {
     );
 }
 
-/// `task_progress` and both terminal `task_notification` readings carry a
-/// `usage` object with `total_tokens`/`tool_uses`/`duration_ms` — the field
-/// set `fake_claude.rs`'s hand-typed literals reproduce with real numbers.
-/// The literal numbers themselves are not checked here (nor loadable at all:
-/// none of `.usage.total_tokens`/`.usage.tool_uses`/`.usage.duration_ms`
-/// under a `task_progress`/`task_notification` frame is on
-/// `capture/allowlist/claude.txt`, so the real values are `<Vn>`
-/// placeholders in this corpus) — this proves the *shape* the fixture claims
-/// against the genuine bytes, which is what is actually checkable.
+/// `task_progress` and both terminal `task_notification` readings carry a `usage` object with
+/// `total_tokens`/`tool_uses`/`duration_ms` — the field set `fake_claude.rs`'s hand-typed
+/// literals reproduce. The literal numbers aren't checked (none of those three paths are on
+/// `capture/allowlist/claude.txt`, so the real values are `<Vn>` placeholders here) — this test
+/// proves the *shape* only, which is what is actually checkable against genuine bytes.
 #[test]
 fn subagent_progress_and_notification_carry_a_usage_object() {
     let progress = payload(SUBAGENT, 121);
@@ -309,16 +350,12 @@ fn subagent_progress_and_notification_carry_a_usage_object() {
     assert_eq!(notification["status"], "completed");
 }
 
-/// A SendMessage-resumed subagent invocation reuses the FIRST invocation's
-/// `task_id` under a brand new `tool_use_id` — exactly the shape
-/// `fake_claude.rs`'s `happy()` fixture exercises with its own second
-/// `task_started` (same `"sub-1-task"`, new `"sub-2"`), which is what proves
-/// `normalize.rs`'s `subagent_progress.remove(&f.task_id)` on `task_started`
-/// through a real spawn: without it, the resumed terminal reading would be
-/// compared against the first invocation's already-terminal one and dropped
-/// as redundant even though the summary differs. This test is the corpus-side
-/// half of that claim — that the real provider actually resumes this way, not
-/// just that the fixture's hand-typed replay of it decodes correctly.
+/// A SendMessage-resumed subagent invocation reuses the FIRST invocation's `task_id` under a
+/// brand new `tool_use_id` — the shape that proves `normalize.rs`'s
+/// `subagent_progress.remove(&f.task_id)` on `task_started` is necessary: without it, the
+/// resumed terminal reading would be compared against the first invocation's already-terminal
+/// one and dropped as redundant even though the summary differs. This is the corpus-side proof
+/// that the real provider resumes this way, complementing `fake_claude.rs`'s hand-typed replay.
 #[test]
 fn a_resumed_subagent_task_started_reuses_the_task_id_under_a_new_tool_use_id() {
     let first_started = payload(SUBAGENT, 116);

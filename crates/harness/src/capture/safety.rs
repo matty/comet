@@ -2,13 +2,9 @@
 //!
 //! Fence the environment before spawn; then whatever happens inside the fence is safe to record.
 //! Every check in this file runs before a provider process exists, and nothing in it may read a
-//! frame — a check that inspects a frame and aborts destroys evidence already paid for (that class
-//! is deleted, not moved, per decision "delete every frame check that aborts"); a check here
-//! instead refuses to spawn at all when the environment it is about to hand a provider is not the
-//! one it was told to expect.
-//!
-//! Moved here, unchanged in behavior, from `capture/approval/{mod.rs,common.rs}` — decision 6 in
-//! the stage plan: "the pre-spawn fence stays, in a file named for what it is."
+//! frame — a check that inspects a frame and aborts destroys evidence already paid for (that
+//! class is deleted, not moved); a check here instead refuses to spawn at all when the
+//! environment it is about to hand a provider is not the one it was told to expect.
 
 use std::path::{Path, PathBuf};
 
@@ -20,31 +16,18 @@ use anyhow::{anyhow, bail};
 use crate::capture::filesystem::has_windows_reparse_point;
 
 // `pub(in crate::capture)`, not `pub(super)`: both provider prompt builders that read these
-// constants — Claude's `claude_approval_prompt` (Task 4) and Codex's `codex_approval_prompt`
-// (Task 8, completing for Codex the same move Task 4 made for Claude) — live in
-// `capture::record::scenarios::{claude, codex}`, which need to read them from there. Only the
-// constants' visibility widens, not their home: `validate_ordinary_approval_cwd` below also reads
-// `APPROVAL_MARKER_NAME` for its own marker-absence check, so moving either constant into one
-// provider's scenario module would make the fence and the other provider's prompt reach across a
-// scenario boundary instead.
-// (Task 6 deleted this module's other former reader, `validate_ordinary_approval_marker` — a
-// post-completion evidence check, not a pre-spawn one, so it did not qualify for the fence this
-// module keeps under decision #6.)
+// constants — Claude's `claude_approval_prompt` and Codex's `codex_approval_prompt` — live in
+// `capture::record::scenarios::{claude, codex}`, which need to read them from there.
+// `validate_ordinary_approval_cwd` below also reads `APPROVAL_MARKER_NAME` for its own
+// marker-absence check, so moving either constant into one provider's scenario module would
+// make the fence and the other provider's prompt reach across a scenario boundary instead.
 pub(in crate::capture) const APPROVAL_MARKER_NAME: &str = "capture-marker.txt";
 pub(in crate::capture) const APPROVAL_MARKER_CONTENT: &str = "capture\n";
 
 /// The literal command a marker-write approval asks the model to run, platform-specific. Stays
-/// here rather than moving into either provider's scenario module (unlike `codex_approval_prompt`/
-/// `approval_on_request_prompt`, which did) because `approval_on_request_prompt`
+/// here rather than moving into either provider's scenario module: `approval_on_request_prompt`
 /// (`record/scenarios/codex.rs`) embeds this command's own output verbatim into its prompt text,
 /// so the two are more one shared primitive than one owning the other.
-///
-/// `crates/harness/tests/fixtures/fake_codex.rs` used to import this directly
-/// (`comet_harness::capture::approval_marker_command`), to reconstruct the exact command a real
-/// model's exec call would produce for its own now-deleted `capture-onrequest-*`/
-/// `capture-approval-*` scenario branches — the sweep that deleted them (their only callers)
-/// removed that import too, so `pub(in crate::capture)` is now correct: nothing outside this
-/// crate's `capture` module needs to reach this function any more.
 pub(in crate::capture) fn approval_marker_command(target: &Path) -> String {
     #[cfg(windows)]
     {
@@ -87,16 +70,12 @@ pub(in crate::capture) struct DirectoryIdentity {
     inode: u64,
 }
 
-/// The Windows file-identity primitive both [`directory_identity`] and
-/// [`file_identity`] need: open `canonical` without acquiring share locks,
-/// read back its volume serial number and file index, and error using `what`
-/// to name what could not be identified. `flags` is the one thing that
-/// legitimately differs between the two callers —
-/// `FILE_FLAG_BACKUP_SEMANTICS` to open a directory handle, `0` to require a
-/// regular file — everything else (the `CreateFileW`/
-/// `GetFileInformationByHandle` sequence and its four `SAFETY` comments) was
-/// duplicated verbatim between them, which is the worst shape for an
-/// `unsafe` block: a fix to one copy is invisible in the other.
+/// The Windows file-identity primitive both [`directory_identity`] and [`file_identity`] need:
+/// open `canonical` without acquiring share locks, read back its volume serial number and file
+/// index, error using `what` to name what failed. `flags` is the one legitimate difference
+/// between the two callers (`FILE_FLAG_BACKUP_SEMANTICS` for a directory handle, `0` for a
+/// regular file) — everything else was duplicated verbatim between them before this, the worst
+/// shape for an `unsafe` block: a fix to one copy is invisible in the other.
 #[cfg(windows)]
 fn windows_handle_identity(canonical: &Path, flags: u32, what: &str) -> anyhow::Result<(u32, u64)> {
     use std::os::windows::ffi::OsStrExt;
@@ -195,28 +174,19 @@ pub(in crate::capture) fn require_empty_approval_target(
     Ok(identity)
 }
 
-/// The `approval-on-request` fence: a non-repository, non-worktree `cwd`,
-/// and an `approval_target` that stays empty, identity-stable, and isolated
-/// from both `cwd` and the system temp tree. Returns `Ok(None)` when
-/// `approval_target` is absent — every scenario but `approval-on-request`.
+/// The `approval-on-request` fence: a non-repository, non-worktree `cwd`, and an
+/// `approval_target` that stays empty, identity-stable, and isolated from both `cwd` and the
+/// system temp tree. Returns `Ok(None)` when `approval_target` is absent.
 ///
-/// Pre-Task-7 this read `CaptureOperation::Codex(CodexCaptureOperation::Run
-/// { request, script })` off a `CaptureConfig` to decide whether it applied,
-/// and additionally asserted `request.runtime_mode`/`request.sandbox` stayed
-/// `AutoAcceptEdits`/`WorkspaceWrite` after `crate::codex::normalize_run_request`.
-/// That assertion is dropped, not ported: it defended against a caller-built
-/// `RunRequest` disagreeing with what the CLI arguments said, which could
-/// happen when the binary built the request by hand from flags. Since
-/// `record::scenarios::codex::approval_on_request_request` is the only
-/// builder of that request now, and it hardcodes both fields, normalization
-/// can only ever escalate `sandbox` for a linked worktree on a slash-named
-/// branch (`crate::codex::normalize_run_request`) — a shape this very
-/// function already rejects via `repository_root`, so the condition the
-/// assertion guarded against is now structurally unreachable rather than
-/// merely re-checked. The other half of what the deleted assertion covered —
-/// `RunRequest::for_session`'s `RuntimeMode -> SandboxLevel` mapping itself
-/// regressing, independent of any cwd — is restored as a narrower debug
-/// assertion in `record::scenarios::codex::approval_on_request_request`.
+/// An older assertion here checked `request.runtime_mode`/`request.sandbox` stayed
+/// `AutoAcceptEdits`/`WorkspaceWrite` after `normalize_run_request`, guarding against a
+/// caller-built `RunRequest` disagreeing with the CLI arguments. It is dropped, not ported:
+/// `record::scenarios::codex::approval_on_request_request` is the only builder of that request
+/// now and hardcodes both fields, so `normalize_run_request` can only ever escalate `sandbox` for
+/// a linked worktree on a slash-named branch — a shape this function already rejects via
+/// `repository_root`. The condition is structurally unreachable now, not merely re-checked. The
+/// other half — the `RuntimeMode -> SandboxLevel` mapping itself regressing, independent of any
+/// cwd — is restored as a narrower debug assertion in `approval_on_request_request`.
 pub(in crate::capture) fn validate_on_request_preflight(
     cwd: &Path,
     approval_target: Option<&Path>,

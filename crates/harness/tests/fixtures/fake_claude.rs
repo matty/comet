@@ -92,7 +92,7 @@ fn check_permission_mode() {
     }
 }
 
-/// The genuine captured initialize reply, `claude/2.1.228/model-discovery`
+/// The genuine captured initialize reply, `tests/corpus/claude/2.1.228/model-discovery`
 /// frame 2, loaded byte-for-byte rather than hand-typed. Its seven curated
 /// models (including the double nesting and `resolvedModel`) are pinned in
 /// `claude/discovery.rs`'s own unit tests, which load this exact frame too;
@@ -245,7 +245,7 @@ fn happy() {
     emit(
         r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"sub-1","name":"Agent","input":{"description":"Read README and report first heading","subagent_type":"general-purpose","prompt":"Read the README.md file in the current directory and report what the first heading is.","run_in_background":false},"caller":{"type":"direct"}}],"usage":{"input_tokens":10,"cache_creation_input_tokens":1496,"cache_read_input_tokens":34676,"output_tokens":3}}}"#,
     );
-    // Shaped like `claude/2.1.229/subagent` frame 116 (same subtype, same
+    // Shaped like `tests/corpus/claude/2.1.229/subagent` frame 116 (same subtype, same
     // field set: description/subagent_type/task_type/prompt/task_id/
     // tool_use_id) — see the corrected-provenance note above the `Agent`
     // tool_use two frames up.
@@ -262,7 +262,7 @@ fn happy() {
     emit(
         r#"{"type":"user","parent_tool_use_id":"sub-1","message":{"content":[{"type":"tool_result","tool_use_id":"sub-tool","is_error":false}]}}"#,
     );
-    // Shaped like `claude/2.1.229/subagent` frame 121 — same field set
+    // Shaped like `tests/corpus/claude/2.1.229/subagent` frame 121 — same field set
     // (description/last_tool_name/subagent_type/task_id/tool_use_id/usage
     // with total_tokens, tool_uses, duration_ms). The real frame's usage
     // numbers are `<Vn>` placeholders (not on the allowlist), which is why
@@ -272,12 +272,12 @@ fn happy() {
     emit(
         r#"{"type":"system","subtype":"task_progress","task_id":"sub-1-task","tool_use_id":"sub-1","description":"Reading README.md","subagent_type":"general-purpose","usage":{"total_tokens":19215,"tool_uses":1,"duration_ms":2906},"last_tool_name":"Read"}"#,
     );
-    // Shaped like `claude/2.1.229/subagent` frame 124 — a PARTIAL patch,
+    // Shaped like `tests/corpus/claude/2.1.229/subagent` frame 124 — a PARTIAL patch,
     // status only, exactly like the real one.
     emit(
         r#"{"type":"system","subtype":"task_updated","task_id":"sub-1-task","patch":{"status":"completed","end_time":1786581776304}}"#,
     );
-    // Shaped like `claude/2.1.229/subagent` frame 125 — the frame carrying
+    // Shaped like `tests/corpus/claude/2.1.229/subagent` frame 125 — the frame carrying
     // the answer and the terminal usage totals.
     emit(
         r#"{"type":"system","subtype":"task_notification","task_id":"sub-1-task","tool_use_id":"sub-1","status":"completed","output_file":"C:\\tmp\\sub-1-task.output","summary":"Sandbox","usage":{"total_tokens":20044,"tool_uses":1,"duration_ms":4906}}"#,
@@ -571,7 +571,7 @@ const WRITE_TARGET_JSON: &str = if cfg!(windows) {
 };
 
 /// Requests permission for a Write, then reports what it was told. The
-/// `control_request` frame shape follows `claude/2.1.228/approval` frame 102,
+/// `control_request` frame shape follows `tests/corpus/claude/2.1.228/approval` frame 102,
 /// with only the path swapped for one this machine can be
 /// trusted not to have. The reply is echoed as a `stream_event` text delta
 /// rather than a full `assistant` message: `normalize.rs`'s `Frame::Assistant`

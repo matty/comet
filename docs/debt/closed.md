@@ -196,6 +196,65 @@ purity/wiring loop it sat beside — one `EXPECTED_ROWS` table covering both
 concerns, one coverage guard, in `every_row_s_builder_and_fence_match_its_declared_wiring`
 (`record.rs`) — rather than leaving the two as separate full-roster tables.
 Same fingerprinting mechanism, same falsification, one fewer enumeration.
+
+## D80 — the three-row Claude/Codex model-discovery family was one observation, not three
+
+**The row insisted on a real answer, not a reading of the table.** `claude
+model-discovery` and `model-discovery-neutral-cwd` set the same
+`runtime_mode` (`None`), the same `Requirements::discovery()`, the same
+`launch` and the same `body` — the only difference anywhere in the table was
+the `name` string and the `purpose` prose. D80 named this and explicitly
+refused to let anyone collapse the rows from the code alone: cwd
+*demonstrably* changes discovery output elsewhere (D32's 66-vs-63 commands),
+so "the two rows look identical in the table" was not evidence the CLI
+treats them identically. The row's mitigation was Stage 5's capability
+sheet, which printed all three rows' byte-identical argv/cwd/env side by
+side — visible as the same evidence recorded three times, but still not a
+verdict, because a redaction placeholder cannot rule out a real difference
+the archive no longer shows.
+
+**Stage 6 ran the re-capture the row demanded.** 2026-08-16, Claude Code
+2.1.233 (three versions newer than the corpus) and codex-cli 0.147.0, each
+provider's three model-discovery rows run back to back, one process at a
+time, from a disposable directory for the two `needs_cwd: false` rows and
+from inside this repository for `-project-cwd`. Byte-comparing the Claude
+`initialize` reply across all three runs found exactly one difference, at a
+single offset: `"pid":5912` vs `"pid":7408` vs `"pid":17260` — a per-process
+value the sanitizer already redacts. The Codex `model/list` reply was
+byte-identical across all three, confirmed by direct comparison, not merely
+by length.
+
+**The mechanism, no longer an inference.** Both `-neutral-cwd`'s and
+`model-discovery`'s `needs_cwd: false` makes the runner discard `--cwd` and
+spawn from a neutral temp directory — confirmed empirically: a disposable
+directory was passed to both and the recorded cwd was the same temp path for
+both. `model-discovery-project-cwd` genuinely ran from inside the
+repository (its recorded cwd proves it) and still returned identical bytes
+apart from `pid`. The reason is `--bare`: `model-discovery`'s argv includes
+it and `command-discovery`'s does not, and `--bare` is what skips the
+cwd-scoped project/user skill discovery D32 found varying (66 vs 63
+commands). D32's counter-evidence was always about `command-discovery`, a
+different scenario with a different launch — it never applied to this
+family, and the re-capture is what finally showed that instead of arguing it
+from the code.
+
+**The close.** `model-discovery-neutral-cwd` and `model-discovery-project-cwd`
+are deleted from `SCENARIOS` for both providers — four rows across the two
+provider tables — along with their committed corpus directories
+(`crates/harness/tests/corpus/{claude/2.1.228,codex/0.147.0}/model-discovery-{neutral-cwd,project-cwd}/`).
+Every reference to the deleted names (the CLI's own token-free-discovery
+tests, `record.rs`'s `EXPECTED_ROWS` wiring table, the two doc comments that
+explained the three-way split) is updated or removed, and the capability
+sheets are regenerated (`$env:COMET_UPDATE_SHEETS = "1"; cargo test -p
+comet-harness --test capture_corpus`) — `docs/providers/claude-2.1.228.md`
+and `docs/providers/codex-0.147.0.md` each lose two Scenarios entries and
+gain nothing, since the deleted rows added no field or vocabulary value the
+surviving `model-discovery` row didn't already show.
+
+**`model-discovery-logged-out` is untouched.** It varies by auth state, not
+cwd, and the re-capture never touched it — it remains a genuinely distinct
+observation.
+
 ## D86 — the sheet could not show tool-roster growth
 
 **The gap.** The `system`/`init` frame's `tools` array is redacted

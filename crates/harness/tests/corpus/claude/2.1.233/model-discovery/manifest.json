@@ -1,10 +1,10 @@
 {
-  "captured_at_unix_ms": 1786508519368,
+  "captured_at_unix_ms": 1786903861096,
   "channels": [
     "stdin",
     "stdout"
   ],
-  "cli_version": "2.1.228 (Claude Code)",
+  "cli_version": "2.1.233 (Claude Code)",
   "command": {
     "args": [
       "--print",
@@ -25,7 +25,7 @@
     "stdout": "Piped"
   },
   "exit_code": 0,
-  "normalized_cli_version": "2.1.228 (Claude Code)",
+  "normalized_cli_version": "2.1.233 (Claude Code)",
   "placeholders": [
     {
       "kind": "request",
@@ -518,6 +518,66 @@
     {
       "kind": "v",
       "placeholder": "<V122>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V123>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V124>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V125>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V126>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V127>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V128>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V129>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V130>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V131>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V132>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V133>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V134>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V135>"
+    },
+    {
+      "kind": "cwd_path",
+      "placeholder": "<CWD>"
+    },
+    {
+      "kind": "home_path",
+      "placeholder": "<HOME>"
     }
   ],
   "platform": {
@@ -525,12 +585,14 @@
     "os": "windows"
   },
   "provider": "claude",
-  "purpose": "capture Claude model discovery from a neutral working directory",
+  "purpose": "capture Claude's token-free model initialize reply",
   "redaction_counts": {
+    "cwd_path": 1,
+    "home_path": 1,
     "request": 2,
-    "v": 145
+    "v": 161
   },
-  "scenario": "model-discovery-neutral-cwd",
+  "scenario": "model-discovery",
   "schema_version": 1,
   "source": "capture.json"
 }

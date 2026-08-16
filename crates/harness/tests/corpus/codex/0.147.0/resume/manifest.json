@@ -1,5 +1,5 @@
 {
-  "captured_at_unix_ms": 1786541043817,
+  "captured_at_unix_ms": 1786904672704,
   "channels": [
     "stdin",
     "stdout"
@@ -21,10 +21,6 @@
   "exit_code": 0,
   "normalized_cli_version": "codex-cli 0.147.0",
   "placeholders": [
-    {
-      "kind": "session",
-      "placeholder": "<SESSION_1>"
-    },
     {
       "kind": "thread",
       "placeholder": "<THREAD_1>"
@@ -298,12 +294,12 @@
       "placeholder": "<V67>"
     },
     {
-      "kind": "v",
-      "placeholder": "<V68>"
+      "kind": "cwd_path",
+      "placeholder": "<CWD>"
     },
     {
-      "kind": "v",
-      "placeholder": "<V69>"
+      "kind": "home_path",
+      "placeholder": "<HOME>"
     }
   ],
   "platform": {
@@ -311,10 +307,11 @@
     "os": "windows"
   },
   "provider": "codex",
-  "purpose": "capture one bounded Codex run script",
+  "purpose": "capture a Codex run resuming an existing thread",
   "redaction_counts": {
-    "session": 1,
-    "thread": 28,
+    "cwd_path": 1,
+    "home_path": 1,
+    "thread": 29,
     "v": 131
   },
   "scenario": "resume",

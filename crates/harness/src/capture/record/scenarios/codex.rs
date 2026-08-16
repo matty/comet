@@ -82,15 +82,11 @@ fn codex_model_list_line(id: u64, cursor: Option<&str>) -> String {
 /// the prompt text itself.
 const CHEAP_MODEL: &str = "gpt-5.6-luna";
 
-/// The `RunRequest` every non-discovery Codex scenario in this file starts
-/// from: the cheap model, low reasoning, and the caller's cwd (or a neutral
-/// temp directory). Always run through `crate::codex::normalize_run_request`
-/// here — exactly where `recording.rs`'s `RecordingSession::start` used to
-/// apply it before anything else touched the request — so this one builder
-/// call is the only place the normalization runs: `derive_launch` derives
-/// both the launch and `Session::request` from the same normalized value, and
-/// the linked-worktree sandbox escalation (D13) can never disagree between
-/// the two.
+/// The base `RunRequest` every non-discovery Codex scenario starts from: cheap model, low
+/// reasoning, and the caller's cwd (or a neutral temp directory) — always run through
+/// `crate::codex::normalize_run_request` here, the one place normalization happens, so
+/// `derive_launch` derives both the launch and `Session::request` from the same normalized
+/// value and the linked-worktree sandbox escalation (D13) can never disagree between the two.
 fn cheap_codex_request(prompt: &str, input: &ScenarioInput, mode: RuntimeMode) -> RunRequest {
     let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
     let request = RunRequest {
@@ -191,16 +187,10 @@ async fn start_turn(
         .await
 }
 
-/// Pump frames until Codex's own `turn/started` notification confirms the
-/// turn is genuinely under way, returning the turn id it carries.
-///
-/// Ported from `recording.rs`'s deleted `codex_run`, whose `active_turn`
-/// tracking gated the steer/interrupt send on `active_turn.is_some()` — i.e.
-/// on having already observed this exact notification. Acting before it
-/// arrives would record a race against Codex's own turn bookkeeping, not a
-/// steer or an interruption. Driving, not validating: nothing here inspects
-/// anything else about the frame the way the deleted code's per-script
-/// terminal-frame bail did.
+/// Pump frames until `turn/started` confirms the turn is genuinely under way, returning its
+/// turn id. Acting on a steer/interrupt before this notification would record a race against
+/// Codex's own turn bookkeeping, not a real steer or interruption. Driving, not validating —
+/// nothing here inspects anything else about the frame.
 async fn wait_for_turn_started(session: &mut Session<CodexProvider>) -> anyhow::Result<String> {
     session
         .wait_for("a turn/started notification", |frame| {
@@ -285,6 +275,67 @@ pub(in crate::capture::record) async fn resume(
     session.wait_for_turn_end().await
 }
 
+/// Same one-call-per-recording contract as `fresh_text_request` above. The prompt is
+/// deliberately identical to `fresh_text_request`'s — `auto`/`full-access` exist to record what
+/// mode configuration reaches the wire, not to exercise interesting agent behaviour, and holding
+/// the prompt fixed makes the mode the only variable a reader diffing this scenario against
+/// `fresh-text`/`full-access` needs to account for.
+pub(in crate::capture::record) fn auto_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
+    Ok(cheap_codex_request(
+        "Reply with the single word capture.",
+        input,
+        RuntimeMode::Auto,
+    ))
+}
+
+/// Same shape as `fresh_text` above: a plain text turn, no approval handling needed — the
+/// trivial prompt never calls a tool, so `Auto`'s `on-request` approval policy and
+/// `auto_review` reviewer never actually get exercised by anything this scenario asks for.
+pub(in crate::capture::record) async fn auto(
+    session: &mut Session<CodexProvider>,
+    input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    CodexProvider::handshake(session, input).await?;
+    let request = session
+        .request
+        .clone()
+        .expect("auto is a Run scenario and always carries a request");
+    let thread_id = start_thread(session, &request).await?;
+    start_turn(session, &request, &thread_id).await?;
+    session.wait_for_turn_end().await
+}
+
+/// Same one-call-per-recording contract as `fresh_text_request` above, and the same "identical
+/// prompt" reasoning as `auto_request`.
+pub(in crate::capture::record) fn full_access_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
+    Ok(cheap_codex_request(
+        "Reply with the single word capture.",
+        input,
+        RuntimeMode::FullAccess,
+    ))
+}
+
+/// Same shape as `fresh_text`/`auto` above. `FullAccess` pins Codex's `approvalPolicy` to
+/// `"never"` — no approval will ever be raised, so there is nothing for this body to answer even
+/// if the trivial prompt did call a tool.
+pub(in crate::capture::record) async fn full_access(
+    session: &mut Session<CodexProvider>,
+    input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    CodexProvider::handshake(session, input).await?;
+    let request = session
+        .request
+        .clone()
+        .expect("full-access is a Run scenario and always carries a request");
+    let thread_id = start_thread(session, &request).await?;
+    start_turn(session, &request, &thread_id).await?;
+    session.wait_for_turn_end().await
+}
+
 /// Same one-call-per-recording contract as `fresh_text_request` above.
 pub(in crate::capture::record) fn steer_request(
     input: &ScenarioInput,
@@ -302,15 +353,10 @@ pub(in crate::capture::record) fn steer_request(
 /// string literals.
 const STEER_MESSAGE: &str = "Capture steering message.";
 
-/// Start a fresh thread and turn, wait for the turn to be genuinely under
-/// way (see [`wait_for_turn_started`]'s doc comment on why that gate is not
-/// optional), then send the production `turn/steer` params and wait for the
-/// turn to end. No reply wait on the steer itself and no bail on the
-/// terminal frame's type — `recording.rs`'s deleted `codex_run` did both,
-/// and both were the "frame check that aborts" class this stage's design
-/// removes (§3.2): a Codex rejection of the steer, or a turn that failed or
-/// aborted instead of completing under it, is itself the evidence a capture
-/// exists to record, not a reason to discard it.
+/// Start a fresh thread and turn, wait until it's genuinely under way (see
+/// [`wait_for_turn_started`]), send `turn/steer`, then wait for the turn to end. No reply wait
+/// on the steer and no bail on the terminal frame's type — a Codex rejection or a failed/aborted
+/// turn is itself the evidence a capture exists to record, not a reason to discard it (§3.2).
 pub(in crate::capture::record) async fn steer(
     session: &mut Session<CodexProvider>,
     input: &ScenarioInput,
@@ -345,11 +391,9 @@ pub(in crate::capture::record) fn interruption_request(
     ))
 }
 
-/// Same shape as [`steer`]: wait for the turn to be genuinely under way, then
-/// send the production `turn/interrupt` params and wait for the turn to end.
-/// No bail on the terminal frame being `turn/aborted` specifically —
-/// `recording.rs`'s deleted `codex_run` required exactly that, which is the
-/// same removed validator class `steer`'s doc comment explains.
+/// Same shape as [`steer`]: wait for the turn to be genuinely under way, then send the
+/// production `turn/interrupt` params and wait for the turn to end. No bail on the terminal
+/// frame being `turn/aborted` specifically — same reasoning as [`steer`]'s doc comment.
 pub(in crate::capture::record) async fn interruption(
     session: &mut Session<CodexProvider>,
     input: &ScenarioInput,
@@ -455,31 +499,18 @@ pub(in crate::capture::record) fn approval_on_request_request(
     ))
 }
 
-/// Recognizes any Codex server request whose method ends in
-/// `/requestApproval` — `item/fileChange/requestApproval` for `approval`,
-/// `item/commandExecution/requestApproval` for `approval_on_request`, and
-/// (unreachable by any capture so far, but not excluded on purpose)
-/// `item/permissions/requestApproval` — and returns its JSON-RPC id,
-/// unmodified, to echo back in the reply. Every other frame — item lifecycle
-/// notifications, `turn/started`, anything else — returns `None` and is
-/// simply left unanswered.
+/// Recognizes any Codex server request whose method ends in `/requestApproval` —
+/// `item/fileChange/requestApproval` for `approval`, `item/commandExecution/requestApproval` for
+/// `approval_on_request`, and `item/permissions/requestApproval` (unreachable by any capture so
+/// far, but not excluded on purpose) — returning its JSON-RPC id to echo back. Every other frame
+/// returns `None` and is left unanswered. Driving, not validating: nothing here checks item type,
+/// command text, or request order. Shared by both scenario bodies since recognizing "this is an
+/// approval request" doesn't depend on which scenario is running.
 ///
-/// This is the Codex counterpart of `record/scenarios/claude.rs`'s
-/// `pending_approval`: noticing that a frame is (or is not) an approval
-/// request is driving, not validating, so nothing here checks the item type,
-/// the command text, the request order, or the shape of the surrounding
-/// transcript the way the deleted `approval/codex.rs` validators
-/// (`validate_codex_approval_request`, `validate_codex_on_request_approval`,
-/// `codex_approval_ids`, and everything upstream of them) did. Shared by both
-/// scenario bodies below because recognizing "this is an approval request"
-/// does not depend on which of the two scenarios is running.
-///
-/// Answering *every* recognized method unconditionally — rather than only
-/// the one each scenario expects — is deliberate, not an oversight: an
-/// approval left unanswered blocks the turn until the recorder's own hard
-/// timeout kills it, destroying a paid-for capture. Per design §3.2 that is
-/// the exact outcome a driver must avoid; auto-answering (subject to the
-/// grant-time recheck in `answer_every_approval` below) is the safe failure.
+/// Answering *every* recognized method unconditionally, not just the one each scenario expects,
+/// is deliberate: an unanswered approval blocks the turn until the recorder's hard timeout kills
+/// it, destroying a paid-for capture (§3.2). Auto-answering, subject to the grant-time recheck in
+/// `answer_every_approval` below, is the safe failure.
 fn pending_approval(frame: &Value) -> Option<Value> {
     let method = frame["method"].as_str()?;
     if !method.ends_with("/requestApproval") {
@@ -489,15 +520,11 @@ fn pending_approval(frame: &Value) -> Option<Value> {
     (!id.is_null()).then(|| id.clone())
 }
 
-/// The reply for one approval request: the JSON-RPC envelope every scenario
-/// in this file hand-builds (same as `rpc_request` for a request line), but
-/// the `"decision"` literal itself — the one piece production owns and the
-/// one piece that can silently drift — routed through the real
-/// `codex::approval::decision_literal` (`crates/harness/src/codex/approval.rs:256`),
-/// the same function `codex/mod.rs:1343`'s `handle_server_request` calls for
-/// a real "allow"/"decline" reply. `codex::approval` is declared
-/// `pub(crate)` (`codex/mod.rs:29`, a bare `pub(crate) mod approval;` with
-/// no comment of its own) specifically so this reply builder can reach it.
+/// The reply for one approval request. The JSON-RPC envelope is hand-built like `rpc_request`,
+/// but the `"decision"` literal itself routes through the real `codex::approval::decision_literal`
+/// — the same function `codex/mod.rs`'s `handle_server_request` calls for a real reply — so it
+/// can never silently drift from production. `codex::approval` is `pub(crate)` specifically so
+/// this reply builder can reach it.
 fn decision_response(id: Value, decision: &ApprovalDecision) -> String {
     json!({
         "jsonrpc": "2.0",
@@ -507,30 +534,21 @@ fn decision_response(id: Value, decision: &ApprovalDecision) -> String {
     .to_string()
 }
 
-/// Pump frames, answering every approval request `pending_approval`
-/// recognizes, until the provider's own terminal turn notification ends the
-/// loop. Shared by `approval` and `approval_on_request`, which differ only in
-/// which request they start and which `recheck` they pass (see each
-/// function's own doc comment).
+/// Pump frames, answering every approval request `pending_approval` recognizes, until the
+/// provider's own terminal turn notification ends the loop. Shared by `approval` and
+/// `approval_on_request`, which differ only in which request they start and which `recheck` they
+/// pass.
 ///
-/// No count, no order, no item-type check, no command-text check: the
-/// deleted `CodexApprovalState`/`CodexOnRequestState` and the validators that
-/// threaded them (`observe_codex_approval_*`, `validate_codex_approval_*`,
-/// `validate_on_request_item`, `validate_codex_on_request_approval`)
-/// enforced an exact "reviewed" contract — a fixed count and order of command
-/// executions, a single bounded file-change, one sandbox failure followed by
-/// exactly one retry — and bailed on any deviation, discarding a real,
-/// paid-for capture. Per design §3.2, only driving survives here: notice a
-/// request, answer it, keep going, and stop only when the provider itself
-/// says the turn is over.
+/// No count, order, item-type, or command-text check — deleted validators enforced an exact
+/// "reviewed" contract and bailed on any deviation, discarding a real, paid-for capture. Only
+/// driving survives here (§3.2): notice a request, answer it, keep going, stop only when the
+/// provider says the turn is over.
 ///
-/// `recheck` is the one exception, and it is not a frame validator: it
-/// re-verifies the pre-spawn fence's environment guarantee — the cwd or
-/// approval target the fence validated before spawn — still holds at the
-/// exact moment a write is about to be granted, closing the TOCTOU window
-/// between spawn and this grant. `recheck` never reads the frame; it reads
-/// the filesystem. On failure this declines the write instead of aborting
-/// the capture: no unsafe write is granted, and the tape survives.
+/// `recheck` is the one exception: not a frame validator, it re-verifies the pre-spawn fence's
+/// environment guarantee still holds at the exact moment a write is about to be granted, closing
+/// the TOCTOU window between spawn and grant. It reads the filesystem, never the frame. On
+/// failure it declines the write rather than aborting the capture — no unsafe write is granted,
+/// and the tape survives.
 async fn answer_every_approval(
     session: &mut Session<CodexProvider>,
     mut recheck: impl FnMut() -> anyhow::Result<()>,
@@ -554,18 +572,13 @@ async fn answer_every_approval(
     }
 }
 
-/// Start a fresh thread and turn under `RuntimeMode::ApprovalRequired`, then
-/// answer every `item/fileChange/requestApproval` request the model makes
-/// until the turn ends. Ported from `recording.rs`'s deleted `codex_run`
-/// `CodexRunScript::Approval` arm, minus every validator listed on
-/// `answer_every_approval`'s doc comment.
+/// Start a fresh thread and turn under `RuntimeMode::ApprovalRequired`, then answer every
+/// `item/fileChange/requestApproval` request until the turn ends (validators dropped, see
+/// `answer_every_approval`'s doc comment).
 ///
 /// The grant-time recheck re-verifies the cwd's identity against
-/// `session.fence.approval_cwd_identity` — the value `record::codex_fence`
-/// records before spawn — with `require_marker_absent: true`, matching what
-/// the deleted `codex_run` checked immediately before accepting. Unlike that
-/// deleted code, a mismatch here declines the grant instead of aborting the
-/// whole capture.
+/// `session.fence.approval_cwd_identity` (recorded by `record::codex_fence` before spawn) with
+/// `require_marker_absent: true`. A mismatch declines the grant instead of aborting the capture.
 pub(in crate::capture::record) async fn approval(
     session: &mut Session<CodexProvider>,
     input: &ScenarioInput,
@@ -590,18 +603,12 @@ pub(in crate::capture::record) async fn approval(
     .await
 }
 
-/// Same shape as [`approval`], differing only in which request it starts
-/// (`approval_on_request_request`, built from `input.approval_target` rather
-/// than `input.cwd`), which approval method Codex ends up asking about
-/// (`item/commandExecution/requestApproval` rather than
-/// `item/fileChange/requestApproval`) — `answer_every_approval` does not need
-/// to know which one it is answering — and which grant-time recheck it
-/// passes: `require_empty_approval_target` against
-/// `session.fence.approval_target_identity`, matching what the deleted
-/// `codex_run` checked immediately before accepting an on-request approval.
-/// Ported from `recording.rs`'s deleted `codex_run` `CodexRunScript::ApprovalOnRequest`
-/// arm, minus every validator listed on `answer_every_approval`'s doc
-/// comment.
+/// Same shape as [`approval`], differing only in: which request it starts
+/// (`approval_on_request_request`, from `input.approval_target` rather than `input.cwd`); which
+/// approval method Codex asks about (`item/commandExecution/requestApproval` rather than
+/// `item/fileChange/requestApproval` — `answer_every_approval` doesn't need to know which); and
+/// which grant-time recheck it passes: `require_empty_approval_target` against
+/// `session.fence.approval_target_identity`.
 pub(in crate::capture::record) async fn approval_on_request(
     session: &mut Session<CodexProvider>,
     input: &ScenarioInput,
@@ -682,13 +689,9 @@ mod tests {
     /// Break caught: a Codex run driver skips a handshake stage, loses the concrete run scenario,
     /// or waits forever after the provider's terminal turn notification.
     ///
-    /// Ported from `recording.rs`, renamed from `..._records_the_explicit_script` — `CodexRunScript`
-    /// no longer names what runs, the scenario functions do. `fresh_text`'s real prompt ("Reply with
-    /// the single word capture.") now has its own branch in `fake_codex.rs` (`simple_completed`,
-    /// additive alongside the pre-existing `scenario:capture-fresh` test marker, same rationale as
-    /// the `steer`/`interrupt` matches below), so this drives a genuine modelled `turn/completed`
-    /// transcript rather than the fixture's generic `fail_turn` fallback — the pin below fails
-    /// loudly if that dispatch match ever stops matching and the fallback quietly took over.
+    /// `fresh_text`'s exact prompt has its own branch in `fake_codex.rs` (`simple_completed`), so
+    /// this drives a genuine modelled `turn/completed` transcript rather than the fixture's generic
+    /// `fail_turn` fallback — the pin below fails loudly if that dispatch match ever stops matching.
     #[tokio::test]
     async fn recorder_codex_run_records_the_explicit_scenario() {
         let raw = tempfile::tempdir().unwrap();
@@ -725,14 +728,11 @@ mod tests {
         assert_eq!(capture.exit_code, Some(0));
     }
 
-    /// Ported from `recording.rs` (name kept). Now end-to-end: drives `steer` and `interruption`
-    /// against `fake-codex`'s real `steer`/`interrupt` branches — reachable through the ported
-    /// scenarios' own production prompts, per the additive match `fake_codex.rs` gained alongside
-    /// the neutral-recorder stage's port of these scenarios — and asserts the exact
-    /// `turn/steer`/`turn/interrupt` line each one puts on the
-    /// wire matches `crate::codex::turn_steer_params`/`turn_interrupt_params` computed
-    /// independently. The pre-port version only checked those two production functions against
-    /// themselves, never against anything `codex_run` actually sent.
+    /// Drives `steer`/`interruption` end-to-end against `fake-codex`'s real branches, asserting the
+    /// exact `turn/steer`/`turn/interrupt` line each sends matches
+    /// `crate::codex::turn_steer_params`/`turn_interrupt_params` computed independently — the
+    /// pre-port version only checked those helpers against themselves, never against anything
+    /// actually sent on the wire.
     ///
     /// Break caught: `steer`/`interruption` stop calling those production helpers and hand-build
     /// the JSON-RPC params inline instead.
@@ -957,13 +957,8 @@ mod tests {
         );
     }
 
-    /// Ported from `comet-provider-capture.rs`'s own test module, where it covered
-    /// `approval_on_request_prompt` through the crate's public re-export
-    /// (`comet_harness::capture::approval_on_request_prompt`) back when the binary built prompts
-    /// itself. Task 7's table refactor left that re-export with no production caller, and Task 8
-    /// dropped it along with `approval_marker_command`'s two prompt-building siblings — this
-    /// scenario module is the function's home now, so the coverage moves here rather than being
-    /// lost with the re-export.
+    /// Covers `approval_on_request_prompt`'s shell-quoting directly (this scenario module is
+    /// its home now; the crate's old public re-export is gone).
     ///
     /// Break caught: a future edit to `approval_marker_command`'s Windows quoting drops the
     /// doubled single-quote escape (`replace('\'', "''")`) or the Unix branch's shell-escape
@@ -1013,26 +1008,20 @@ mod tests {
         (turn_start, decisions)
     }
 
-    /// The validator deletion, proven: a fake Codex that raises two
-    /// `item/fileChange/requestApproval` requests in a row — neither checked for count, order or
-    /// item shape — must have both answered with an `accept` reply carrying that request's own
-    /// id. The deleted `CodexApprovalState` and the validators that threaded it would have
-    /// bailed the instant anything but the single reviewed file-change request appeared;
-    /// `pending_approval` has no such bookkeeping, so it just keeps answering.
+    /// The validator deletion, proven: a fake Codex raising two `item/fileChange/requestApproval`
+    /// requests in a row (uncounted, unordered) must get both answered with an `accept` reply
+    /// carrying that request's own id — `pending_approval` has no bookkeeping to bail on, unlike
+    /// the deleted `CodexApprovalState` validators.
     ///
-    /// Also pins the two things nothing else in this file's tests catch (`approval_row_is_wired_
-    /// to_approval_request` builds its "expected" from the same `approval_request` call, so it
-    /// cannot tell a wrong runtime mode from a right one — see this test's own falsification note
-    /// in the task report):
-    /// - `RuntimeMode::ApprovalRequired` reaching the wire as `"approvalPolicy":"untrusted"` —
-    ///   checked against a literal, not by calling `approval_request` again, so a production
-    ///   regression to any other mode can't satisfy its own assertion.
+    /// Also pins two things nothing else here catches (`approval_row_is_wired_to_approval_request`
+    /// builds its "expected" from the same `approval_request` call, so it can't tell a wrong
+    /// runtime mode from a right one):
+    /// - `RuntimeMode::ApprovalRequired` reaching the wire as `"approvalPolicy":"untrusted"`,
+    ///   checked against a literal rather than by calling `approval_request` again.
     /// - the grant-time cwd recheck passing (not declining) when the cwd never changed, using a
-    ///   real `DirectoryIdentity` computed the same way `record::codex_fence`'s pre-spawn check
-    ///   would.
+    ///   real `DirectoryIdentity` computed the way `record::codex_fence`'s pre-spawn check would.
     ///
-    /// Dispatched in `fake_codex.rs` on a substring of the real `codex_approval_prompt` text —
-    /// same rationale as the `steer`/`interrupt` branches matching their scenarios' real prompts.
+    /// Dispatched in `fake_codex.rs` on a substring of the real `codex_approval_prompt` text.
     #[tokio::test]
     async fn codex_approval_scenario_answers_every_request_it_sees() {
         let raw = tempfile::tempdir().unwrap();
@@ -1294,20 +1283,13 @@ mod tests {
     }
 
     /// The Codex counterpart of `record/scenarios/claude.rs`'s
-    /// `every_claude_run_rows_declared_mode_matches_its_request_builder` — see that test's own
-    /// doc comment for why this needs its own check independent of
-    /// `comet-provider-capture.rs::scenario_names_own_their_runtime_modes`, which reads only
-    /// `spec.runtime_mode`. Since D79, fence selection is unrelated to this test: each row names
-    /// its own `fence` field directly (`codex_fence` for `approval` and `approval-on-request`,
-    /// `no_fence` for everything else), checked by
-    /// `every_row_s_builder_and_fence_match_its_declared_wiring`, not by `runtime_mode`. What this
-    /// test guards is the drift `codex_fence`'s row-level wiring left standing: `spec.runtime_mode`
-    /// and the row's own request builder are two independent homes for the same
-    /// `RuntimeMode`, and nothing but this loop proves they still agree — a drift here would leave
-    /// the table (and anything reading it, like the mode tables in this file and `--help` text)
-    /// claiming one mode while Codex is actually sent another, exactly the mismatch
-    /// `approval-on-request`'s hardcoded `AutoAcceptEdits` (`scenarios.rs`'s table entry) exists to
-    /// keep honest.
+    /// `every_claude_run_rows_declared_mode_matches_its_request_builder` — see that test's doc for
+    /// why it's independent of `comet-provider-capture.rs::scenario_names_own_their_runtime_modes`,
+    /// which reads only `spec.runtime_mode`. `spec.runtime_mode` and a row's own request builder
+    /// are two independent homes for the same `RuntimeMode`, and nothing but this loop proves they
+    /// still agree — a drift would leave `--help` text and mode tables claiming one mode while
+    /// Codex is actually sent another, exactly what `approval-on-request`'s hardcoded
+    /// `AutoAcceptEdits` (`scenarios.rs`'s table entry) exists to keep honest.
     #[test]
     fn every_codex_run_rows_declared_mode_matches_its_request_builder() {
         let plain = ScenarioInput::default();
@@ -1336,6 +1318,11 @@ mod tests {
             (
                 "interruption",
                 interruption_request(&plain).unwrap().runtime_mode,
+            ),
+            ("auto", auto_request(&plain).unwrap().runtime_mode),
+            (
+                "full-access",
+                full_access_request(&plain).unwrap().runtime_mode,
             ),
         ];
         for (name, mode) in cases {
@@ -1368,5 +1355,82 @@ mod tests {
             covered, expected,
             "every codex row with Some(runtime_mode) must have a case in this test's list"
         );
+    }
+
+    /// `Auto` must reach the wire as Codex's `auto_review` reviewer — same "pin a literal, not
+    /// the production helper against itself" contract as `recorder_codex_run_preserves_production_linked_worktree_parameters`'s
+    /// `ApprovalRequired`/`untrusted` pin above. `on-request` is the shared approval-policy
+    /// literal `AutoAcceptEdits` and `Auto` both map to (`catalog.rs::approval_policy`); the
+    /// reviewer is the one field that actually distinguishes the two.
+    #[tokio::test]
+    async fn codex_auto_scenario_pins_the_auto_review_reviewer_on_the_wire() {
+        let raw = tempfile::tempdir().unwrap();
+        let executable = fixture_path("fake-codex");
+        let input = ScenarioInput::default();
+        let request = auto_request(&input).unwrap();
+        let mut session = start_codex_run_session("auto", executable, raw.path(), request).await;
+        auto(&mut session, &input).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let capture = session.finish(deadline).await.unwrap();
+
+        let stdin: Vec<Value> = channel_payloads(&capture, Channel::Stdin)
+            .into_iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let thread_start = stdin
+            .iter()
+            .find(|line| line["method"] == "thread/start")
+            .expect("a thread/start line was sent");
+        assert_eq!(
+            thread_start["params"]["approvalsReviewer"], "auto_review",
+            "Auto must reach the wire as the auto_review reviewer: {thread_start:?}"
+        );
+        assert_eq!(thread_start["params"]["approvalPolicy"], "on-request");
+        let turn_start = stdin
+            .iter()
+            .find(|line| line["method"] == "turn/start")
+            .expect("a turn/start line was sent");
+        assert_eq!(turn_start["params"]["approvalPolicy"], "on-request");
+        assert_eq!(capture.exit_code, Some(0));
+    }
+
+    /// `FullAccess` must reach the wire as Codex's `danger-full-access` sandbox and `never`
+    /// approval policy — same pin contract as the `Auto` test above.
+    #[tokio::test]
+    async fn codex_full_access_scenario_pins_danger_full_access_on_the_wire() {
+        let raw = tempfile::tempdir().unwrap();
+        let executable = fixture_path("fake-codex");
+        let input = ScenarioInput::default();
+        let request = full_access_request(&input).unwrap();
+        let mut session =
+            start_codex_run_session("full-access", executable, raw.path(), request).await;
+        full_access(&mut session, &input).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let capture = session.finish(deadline).await.unwrap();
+
+        let stdin: Vec<Value> = channel_payloads(&capture, Channel::Stdin)
+            .into_iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let thread_start = stdin
+            .iter()
+            .find(|line| line["method"] == "thread/start")
+            .expect("a thread/start line was sent");
+        assert_eq!(
+            thread_start["params"]["sandbox"], "danger-full-access",
+            "FullAccess must reach the wire as the danger-full-access sandbox: {thread_start:?}"
+        );
+        assert_eq!(thread_start["params"]["approvalPolicy"], "never");
+        assert_eq!(thread_start["params"]["approvalsReviewer"], "user");
+        let turn_start = stdin
+            .iter()
+            .find(|line| line["method"] == "turn/start")
+            .expect("a turn/start line was sent");
+        assert_eq!(turn_start["params"]["approvalPolicy"], "never");
+        assert_eq!(
+            turn_start["params"]["sandboxPolicy"],
+            json!({"type": "dangerFullAccess"})
+        );
+        assert_eq!(capture.exit_code, Some(0));
     }
 }

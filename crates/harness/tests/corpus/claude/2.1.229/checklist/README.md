@@ -27,20 +27,21 @@ The allowlist-sanitizer stage closed the general mechanism: none of `.message.co
 input.subject`, `.description`, or `.activeForm` is on
 `crates/harness/src/capture/allowlist/claude.txt`, so a field nothing on that list names now
 defaults to redacted rather than surviving by omission. Confirm it yourself in `events.jsonl`:
-sequence 55's `subject` reads `<V210>` and its `description` `<V209>`, and sequence 88's
-`activeForm` reads `<V240>` — not the prompt text.
+sequence 55's `subject` reads `<V215>` and its `description` `<V214>`, and sequence 88's
+`activeForm` reads `<V246>` — not the prompt text.
 
 That closure is not a reason to relax the prompt. The scenario prompts in
 `claude_checklist_prompt`/`claude_checklist_resume_prompt`
 (`crates/harness/src/capture/record/scenarios/claude.rs`) still keep every task subject meaningless, on purpose:
-writing something descriptive here would mean trusting the sanitizer to keep catching it forever,
-and `docs/debt/D73-tool-argument-union-paths.md` already names a live way that trust can be
-misplaced — several of these same tool-argument paths
-(`.message.content[].input.status`/`.taskId`/`.type` and their `tool_use_result` siblings) are
-allowlisted as a *union* across today's five known tools, and a future, unreviewed tool (including
-a third-party MCP tool) landing content on one of those already-approved paths would not be caught
-by anything that reviews paths rather than values. A synthetic subject has nothing in it worth
-catching either way, whatever a future capture lands on a neighboring field.
+writing something descriptive here would mean trusting the sanitizer to keep catching it forever.
+`docs/debt/D73-tool-argument-union-paths.md` (closed at the stage-6 promotion) named the live way
+that trust could be misplaced — several tool-argument paths
+(`.message.content[].input.status`/`.taskId`/`.type` and their `tool_use_result` siblings) were
+allowlisted as a *union* across five known tools, so an unreviewed sixth tool landing content on
+one of those paths would not have been caught by anything that reviews paths rather than values.
+The seven lines are gone from `claude.txt` now, closing that specific risk, but the general
+lesson stands: a synthetic subject has nothing in it worth catching either way, whatever a future
+capture lands on a neighboring field.
 
 **Do not "improve" them into something descriptive**, and do not re-record this pair from an
 ad-hoc prompt.

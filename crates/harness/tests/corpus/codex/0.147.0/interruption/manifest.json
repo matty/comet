@@ -1,5 +1,5 @@
 {
-  "captured_at_unix_ms": 1786508808352,
+  "captured_at_unix_ms": 1786904618772,
   "channels": [
     "stdin",
     "stdout"
@@ -9,10 +9,8 @@
     "args": [
       "app-server"
     ],
-    "configured_env": {
-      "CODEX_HOME": "<CODEX_HOME>"
-    },
-    "creation_flags": 134217728,
+    "configured_env": {},
+    "creation_flags": 0,
     "cwd": "<CWD>",
     "kill_on_drop": true,
     "program": "<HOME>\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe",
@@ -114,6 +112,42 @@
     {
       "kind": "v",
       "placeholder": "<V23>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V24>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V25>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V26>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V27>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V28>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V29>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V30>"
+    },
+    {
+      "kind": "cwd_path",
+      "placeholder": "<CWD>"
+    },
+    {
+      "kind": "home_path",
+      "placeholder": "<HOME>"
     }
   ],
   "platform": {
@@ -121,11 +155,13 @@
     "os": "windows"
   },
   "provider": "codex",
-  "purpose": "capture Codex model discovery from the selected project directory",
+  "purpose": "capture a Codex run interrupted mid-turn",
   "redaction_counts": {
-    "v": 54
+    "cwd_path": 1,
+    "home_path": 1,
+    "v": 92
   },
-  "scenario": "model-discovery-project-cwd",
+  "scenario": "interruption",
   "schema_version": 1,
   "source": "capture.json"
 }

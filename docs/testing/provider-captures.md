@@ -189,6 +189,11 @@ without it the two paths are pathspecs, so git diffs each file against the index
 nothing on a clean tree — an empty report that exits 0 and looks like "no changes between these
 versions".
 
+**When that diff shows a changed or removed field, check whether a fixture asserts on it.** A
+fixture cannot fail when a provider changes — the sheet's golden test is the drift alarm, not a
+corpus-replaying fixture, which was considered and cut for exactly that duplication — so this
+manual read is what actually reconnects a moved field to the hand-typed literal that assumed it.
+
 ## Provider contradictions
 
 A live contradiction stops retries and promotion for that scenario. Preserve its ignored

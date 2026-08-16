@@ -38,23 +38,19 @@ pub struct ScenarioInput {
     pub approval_target: Option<PathBuf>,
 }
 
-/// What the binary must have collected before this scenario may run — read
-/// by `comet-provider-capture.rs`'s argument validation, which looks the row
-/// up by `(provider, name)` and checks each flag against what was supplied
-/// instead of hand-coding a per-scenario `if` chain.
+/// What the binary must have collected before this scenario may run — read by
+/// `comet-provider-capture.rs`'s argument validation, which looks the row up by
+/// `(provider, name)` instead of hand-coding a per-scenario `if` chain.
 ///
-/// `needs_cwd` is not "may I pass --cwd" (every scenario tolerates the
-/// flag); it is "does this scenario's behavior vary by cwd at all". False
-/// only for the cwd-independent discovery aliases (`model-discovery`,
-/// `model-discovery-neutral-cwd`, and Codex's `model-discovery-logged-out`)
-/// — those always run from a neutral temp directory regardless of what
-/// `--cwd` names, which is the entire reason `model-discovery-neutral-cwd`
-/// is a distinct scenario from `model-discovery-project-cwd`. True
-/// everywhere else, including every run scenario: an omitted `--cwd` still
-/// resolves to the caller's current directory for those, not a temp
-/// directory, so `model-discovery-project-cwd`'s point (capturing discovery
-/// from the selected project directory) survives being run with no explicit
-/// `--cwd` at all.
+/// `needs_cwd` means "does this scenario's behavior vary by cwd at all", not "may I pass --cwd"
+/// (every scenario tolerates the flag). False only for the cwd-independent discovery scenarios
+/// (`model-discovery` and Codex's `model-discovery-logged-out`), which always run from a neutral
+/// temp directory regardless of `--cwd`. True everywhere else, including every run scenario.
+///
+/// `model-discovery` used to have cwd-varying siblings `-neutral-cwd`/`-project-cwd`; a real
+/// capture proved `--bare` discovery is cwd-independent for both providers (`command-discovery`
+/// is where cwd actually changes the reply — D32). The siblings are deleted; see
+/// `docs/debt/closed.md` D80 for the evidence.
 #[derive(Clone, Copy, Debug)]
 pub struct Requirements {
     pub spends_tokens: bool,
@@ -102,14 +98,12 @@ pub struct ScenarioSpec {
     /// `CaptureProvider`'s doc comment for why: which launch a scenario
     /// needs varies per scenario as well as per provider.
     pub(super) launch: ScenarioLaunch,
-    /// The pre-spawn fence, per row — closes D79. Selection used to be
-    /// *derived* in `record.rs`'s `codex_fence` from
-    /// `spec.runtime_mode == Some(RuntimeMode::ApprovalRequired)`, so a
-    /// future Codex row that legitimately wanted `ApprovalRequired` for some
-    /// other reason would have silently inherited the Windows-only trusted-
-    /// PowerShell fence. Every row now names its own fence explicitly;
-    /// [`no_fence`] is the default for the eighteen rows that need none, and
-    /// the two Codex approval rows point at `super::codex_fence` directly.
+    /// The pre-spawn fence, per row — closes D79. Selection used to be derived from
+    /// `spec.runtime_mode == Some(RuntimeMode::ApprovalRequired)`, so a future Codex row wanting
+    /// `ApprovalRequired` for an unrelated reason would have silently inherited the Windows-only
+    /// trusted-PowerShell fence. Every row now names its own fence: [`no_fence`] by default, the
+    /// two Codex approval rows point at `super::codex_fence`, and both providers' `full-access`
+    /// row points at `super::full_access_fence`.
     pub(super) fence:
         fn(&ScenarioSpec, &CaptureConfig, &LaunchDescriptor) -> anyhow::Result<FenceOutcome>,
     pub(super) body: ScenarioBody,
@@ -129,21 +123,17 @@ pub(super) fn no_fence(
     Ok(FenceOutcome::none())
 }
 
-/// What a row's `launch` needs to build. A discovery scenario resolves a
-/// `LaunchDescriptor` directly — it never starts a turn, so there is no
-/// `RunRequest` to speak of. A run scenario instead names a builder that
-/// produces a `RunRequest`, and `record.rs` (`derive_launch`) is the ONLY
-/// caller that ever invokes it: it builds the `RunRequest` once, derives the
-/// launch from it via the provider's own `run_launch`, and hands that same
-/// `RunRequest` to the scenario body through `Session::request`. Before this
-/// enum existed, a row's `launch` field was always a bare
-/// `fn(&ScenarioInput, &Path) -> anyhow::Result<LaunchDescriptor>` — every run
-/// scenario's `*_launch` wrapper called its own `*_request` builder to
-/// satisfy that shape, and the scenario body separately called the same
-/// builder again to build its wire line. Two independent calls agreed only
-/// because every builder happened to be a pure function of `input`; nothing
-/// enforced it. Routing both the launch and the body through one call closes
-/// that hole structurally instead of by convention.
+/// What a row's `launch` needs to build. A discovery scenario resolves a `LaunchDescriptor`
+/// directly (no turn, no `RunRequest`). A run scenario instead names a builder that produces a
+/// `RunRequest`, and `record.rs`'s `derive_launch` is the ONLY caller that ever invokes it: it
+/// builds the `RunRequest` once, derives the launch from it, and hands that same value to the
+/// scenario body through `Session::request`.
+///
+/// Before this enum existed, a row's `launch` was a bare `fn(&ScenarioInput, &Path) ->
+/// anyhow::Result<LaunchDescriptor>`, and the scenario body separately called the same
+/// `*_request` builder again for its wire line — the two independent calls agreed only because
+/// every builder happened to be pure, which nothing enforced. Routing both through one call
+/// closes that hole structurally instead of by convention.
 #[derive(Clone, Copy)]
 pub(super) enum ScenarioLaunch {
     Run(fn(&ScenarioInput) -> anyhow::Result<RunRequest>),
@@ -169,29 +159,6 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::model_discovery(s, i))),
     },
     ScenarioSpec {
-        name: "model-discovery-neutral-cwd",
-        purpose: "capture Claude model discovery from a neutral working directory",
-        provider: Provider::Claude,
-        runtime_mode: None,
-        requirements: Requirements::discovery(),
-        launch: ScenarioLaunch::Discovery(claude::model_discovery_launch),
-        fence: no_fence,
-        body: ScenarioBody::Claude(|s, i| Box::pin(claude::model_discovery(s, i))),
-    },
-    ScenarioSpec {
-        name: "model-discovery-project-cwd",
-        purpose: "capture Claude model discovery from the selected project directory",
-        provider: Provider::Claude,
-        runtime_mode: None,
-        requirements: Requirements {
-            needs_cwd: true,
-            ..Requirements::discovery()
-        },
-        launch: ScenarioLaunch::Discovery(claude::model_discovery_launch),
-        fence: no_fence,
-        body: ScenarioBody::Claude(|s, i| Box::pin(claude::model_discovery(s, i))),
-    },
-    ScenarioSpec {
         name: "command-discovery",
         purpose: "capture Claude's cwd-scoped command initialize reply",
         provider: Provider::Claude,
@@ -212,29 +179,6 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Codex,
         runtime_mode: None,
         requirements: Requirements::discovery(),
-        launch: ScenarioLaunch::Discovery(codex::model_discovery_launch),
-        fence: no_fence,
-        body: ScenarioBody::Codex(|s, i| Box::pin(codex::model_discovery(s, i))),
-    },
-    ScenarioSpec {
-        name: "model-discovery-neutral-cwd",
-        purpose: "capture Codex model discovery from a neutral working directory",
-        provider: Provider::Codex,
-        runtime_mode: None,
-        requirements: Requirements::discovery(),
-        launch: ScenarioLaunch::Discovery(codex::model_discovery_launch),
-        fence: no_fence,
-        body: ScenarioBody::Codex(|s, i| Box::pin(codex::model_discovery(s, i))),
-    },
-    ScenarioSpec {
-        name: "model-discovery-project-cwd",
-        purpose: "capture Codex model discovery from the selected project directory",
-        provider: Provider::Codex,
-        runtime_mode: None,
-        requirements: Requirements {
-            needs_cwd: true,
-            ..Requirements::discovery()
-        },
         launch: ScenarioLaunch::Discovery(codex::model_discovery_launch),
         fence: no_fence,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::model_discovery(s, i))),
@@ -322,6 +266,26 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::checklist_resume(s, i))),
     },
     ScenarioSpec {
+        name: "auto",
+        purpose: "capture what Claude's auto permission mode puts on the wire",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::Auto),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(claude::auto_request),
+        fence: no_fence,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::auto(s, i))),
+    },
+    ScenarioSpec {
+        name: "full-access",
+        purpose: "capture what Claude's bypassPermissions mode puts on the wire",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::FullAccess),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(claude::full_access_request),
+        fence: super::full_access_fence,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::full_access(s, i))),
+    },
+    ScenarioSpec {
         name: "fresh-text",
         purpose: "capture a plain Codex text turn",
         provider: Provider::Codex,
@@ -397,6 +361,26 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         fence: no_fence,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::interruption(s, i))),
     },
+    ScenarioSpec {
+        name: "auto",
+        purpose: "capture what Codex's auto_review reviewer puts on the wire",
+        provider: Provider::Codex,
+        runtime_mode: Some(RuntimeMode::Auto),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(codex::auto_request),
+        fence: no_fence,
+        body: ScenarioBody::Codex(|s, i| Box::pin(codex::auto(s, i))),
+    },
+    ScenarioSpec {
+        name: "full-access",
+        purpose: "capture what Codex's danger-full-access sandbox puts on the wire",
+        provider: Provider::Codex,
+        runtime_mode: Some(RuntimeMode::FullAccess),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(codex::full_access_request),
+        fence: super::full_access_fence,
+        body: ScenarioBody::Codex(|s, i| Box::pin(codex::full_access(s, i))),
+    },
 ];
 
 /// Look up a scenario by the exact provider and name strings the binary's
@@ -422,8 +406,6 @@ mod tests {
     fn every_scenario_name_the_binary_advertises_is_in_the_table() {
         for (provider, name) in [
             ("claude", "model-discovery"),
-            ("claude", "model-discovery-neutral-cwd"),
-            ("claude", "model-discovery-project-cwd"),
             ("claude", "command-discovery"),
             ("claude", "fresh-text"),
             ("claude", "approval"),
@@ -431,9 +413,9 @@ mod tests {
             ("claude", "attachment"),
             ("claude", "checklist"),
             ("claude", "checklist-resume"),
+            ("claude", "auto"),
+            ("claude", "full-access"),
             ("codex", "model-discovery"),
-            ("codex", "model-discovery-neutral-cwd"),
-            ("codex", "model-discovery-project-cwd"),
             ("codex", "model-discovery-logged-out"),
             ("codex", "fresh-text"),
             ("codex", "approval"),
@@ -441,6 +423,8 @@ mod tests {
             ("codex", "resume"),
             ("codex", "steer"),
             ("codex", "interruption"),
+            ("codex", "auto"),
+            ("codex", "full-access"),
         ] {
             assert!(
                 scenario(provider, name).is_some(),
@@ -448,7 +432,7 @@ mod tests {
             );
         }
         assert!(scenario("claude", "no-such-scenario").is_none());
-        assert!(scenario("codex", "model-discovery-project-cwd").is_some());
+        assert!(scenario("codex", "model-discovery-logged-out").is_some());
         assert_eq!(
             SCENARIOS.len(),
             20,
@@ -486,17 +470,11 @@ mod tests {
     }
 
     /// Break caught: `needs_cwd` regresses for a cwd-independent discovery
-    /// alias, letting a caller's `--cwd` silently start influencing
-    /// `model-discovery`/`model-discovery-neutral-cwd`/
-    /// `model-discovery-logged-out` and erasing their distinction from
-    /// `model-discovery-project-cwd`.
+    /// scenario, letting a caller's `--cwd` silently start influencing
+    /// `model-discovery`/`model-discovery-logged-out`.
     #[test]
     fn only_the_neutral_discovery_aliases_ignore_cwd() {
-        const NEUTRAL: &[&str] = &[
-            "model-discovery",
-            "model-discovery-neutral-cwd",
-            "model-discovery-logged-out",
-        ];
+        const NEUTRAL: &[&str] = &["model-discovery", "model-discovery-logged-out"];
         for spec in SCENARIOS {
             let neutral = NEUTRAL.contains(&spec.name);
             assert_eq!(
@@ -507,18 +485,13 @@ mod tests {
         }
     }
 
-    /// `ScenarioBody` is `pub(super)`, invisible outside `capture::record`,
-    /// so this is the one place that can check it: `record()` dispatches on
-    /// `spec.body`'s own variant (`ScenarioBody::Claude` → `record_claude`,
-    /// `ScenarioBody::Codex` → `record_codex`), never on the row's declared
-    /// `provider` field. A row whose `provider` disagrees with its `body`
-    /// variant would silently run under the wrong provider's launch and
-    /// session machinery — this is the falsification target the task brief
-    /// names directly ("add a row whose body is the wrong provider
-    /// variant").
+    /// `ScenarioBody` is `pub(super)`, so this is the one place that can check it: `record()`
+    /// dispatches on `spec.body`'s own variant, never on the row's declared `provider` field. A
+    /// row whose `provider` disagrees with its `body` variant would silently run under the wrong
+    /// provider's launch and session machinery.
     ///
-    /// Break caught: swap one row's `body` for the other provider's variant
-    /// while leaving `provider` alone.
+    /// Break caught: swap one row's `body` for the other provider's variant while leaving
+    /// `provider` alone.
     #[test]
     fn every_row_s_declared_provider_matches_its_body_variant() {
         for spec in SCENARIOS {

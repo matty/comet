@@ -25,9 +25,6 @@
 .message.content[].caller.type
 .message.content[].content[].tool_name
 .message.content[].content[].type
-.message.content[].input.status
-.message.content[].input.taskId
-.message.content[].input.type
 .message.content[].name
 .message.content[].source.media_type
 .message.content[].source.type
@@ -71,15 +68,11 @@
 .terminal_reason
 .timestamp
 .tool_use_result.content[].type
-.tool_use_result.matches[]
 .tool_use_result.resolvedModel
-.tool_use_result.status
 .tool_use_result.statusChange.from
 .tool_use_result.statusChange.to
 .tool_use_result.task.id
 .tool_use_result.taskId
-.tool_use_result.type
-.tool_use_result.updatedFields[]
 .tool_use_result.usage.inference_geo
 .tool_use_result.usage.iterations[].type
 .tool_use_result.usage.service_tier
