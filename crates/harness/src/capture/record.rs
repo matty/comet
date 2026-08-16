@@ -115,9 +115,11 @@ async fn record_codex(
     .await
 }
 
-/// The ONLY call site for a row's `ScenarioLaunch::Run` builder. Builds the
-/// `RunRequest` once, derives the launch from it through the provider's own
-/// `run_launch`, and returns the same `RunRequest` so the caller can hand it
+/// The only call site for a row's `ScenarioLaunch::Run` builder IN PRODUCTION CODE — this test
+/// module's `every_run_rows_request_builder_is_pure_and_derives_its_own_launch` also calls a
+/// row's builder through `spec.launch`, deliberately, as half of checking the row is wired to
+/// the right one. Builds the `RunRequest` once, derives the launch from it through the
+/// provider's own `run_launch`, and returns the same `RunRequest` so the caller can hand it
 /// to `Session::request` — the recorder never calls a run builder a second
 /// time to build a scenario's wire line. A discovery row has no `RunRequest`
 /// at all, so its half of the match returns `None`. See `ScenarioLaunch`'s
@@ -940,29 +942,123 @@ mod tests {
     ///   `approval_row_is_wired_to_approval_request`,
     ///   `approval_on_request_row_is_wired_to_approval_on_request_request`
     ///
-    /// Those twelve were tautologies before Task 1 (each compared `build_request(&input)` against
-    /// itself) but Task 1 gave every one of them a second, independent call through the row's own
-    /// `spec.launch` — turning them into the only per-row purity check in the suite: two calls to
-    /// the SAME builder, through TWO different paths, must agree. This test keeps exactly that
-    /// property but drops the per-row duplication, and — unlike the twelve hand-written copies —
-    /// covers any `Run` row added later automatically.
+    /// Before Task 1 these twelve were named `*_launch_uses_the_production_run_launch` and
+    /// compared `X_launch(input, exe)` against `run_launch(exe, &X_request(input))`. Task 1
+    /// renamed and reshaped them into the twelve named above: each called the row's builder
+    /// through TWO independent paths — `build_request(&input)` via `spec.launch`, and the
+    /// same-named builder called directly — and asserted the two `RunRequest`s were equal. That
+    /// caught two distinct hazards at once: a non-pure builder (the two calls disagree with each
+    /// other), and a mis-wired row (a row naming the wrong builder, so the two calls disagree
+    /// because they're different functions).
     ///
-    /// Break caught, on either hazard:
+    /// This test keeps BOTH of those properties, not just the first:
+    /// - **purity**: `build_request` is called twice (`first`/`second` below) and must agree.
+    /// - **wiring**: `first` is also compared against `EXPECTED_RUN_BUILDERS`' entry for this
+    ///   row — the builder that row is supposed to name, looked up by `(provider, name)` rather
+    ///   than through `spec.launch` a second time. A row repointed at another row's builder now
+    ///   disagrees with the table and fails, naming the row. `EXPECTED_RUN_BUILDERS` must list
+    ///   every `Run` row exactly once — the `covered == expected` assertion after the loop
+    ///   enforces that in both directions, so a `Run` row with no table entry (or a row flipped
+    ///   to `Discovery` that silently drops out of the loop) fails loudly instead of being
+    ///   skipped in silence.
+    ///
+    /// It also gained a property the twelve never had: `ScenarioInput` is derived from
+    /// `spec.requirements` here rather than hardcoded per row, so a row whose
+    /// `needs_resume_id`/`needs_attachment`/`needs_approval_target` flag disagrees with what its
+    /// own builder demands now fails here too (e.g. clearing `needs_resume_id` on a resume row
+    /// makes its builder return a "needs a --resume-id" error and the loop panics).
+    ///
+    /// Break caught, on any of three hazards:
     /// - **non-purity**: `build_request(&input)` called twice returns two different `RunRequest`s.
     ///   This is the hazard the whole plan exists to close — see this file's own
     ///   `scenario_launch_and_body_must_share_one_request_builder_call` for the recorder-level half
     ///   (a non-pure builder called once still can't disagree with itself); this is the row-level
     ///   half, catching a non-pure builder BEFORE it ever reaches the recorder.
-    /// - **derivation drift**: `derive_launch` — the actual, only call site `record_claude`/
-    ///   `record_codex` use — stops producing the same `LaunchDescriptor` `run_launch(exe, &first)`
-    ///   would, e.g. a future edit routes a row through the wrong provider's `run_launch` or drops
-    ///   the executable/request pairing.
+    /// - **mis-wiring**: `spec.launch` names a different row's builder — `first` disagrees with
+    ///   `EXPECTED_RUN_BUILDERS`' entry for this row's `(provider, name)`.
+    /// - **a `Run` row silently leaving the loop**: flipped to `Discovery`, or renamed without a
+    ///   matching table entry — caught by the `covered == expected` count check, not by the loop
+    ///   body (which simply never sees that row).
+    ///
+    /// One assertion this test does NOT independently prove: `derive_launch` — the actual, only
+    /// production call site — is checked against `run_launch(exe, &first)`, where `run_launch` is
+    /// chosen here by `spec.provider` (not by `spec.body`, which is what production actually
+    /// dispatches on). That the two choices agree is pinned by a different test,
+    /// `every_row_s_declared_provider_matches_its_body_variant` (`scenarios.rs:472`), not this
+    /// one. And because `derive_launch`'s `Run` arm is exactly `run_launch(executable,
+    /// &build_request(input)?)`, this assertion is a change-detector over that one function's
+    /// three-line body rather than an independent oracle — it still catches an edit that drops
+    /// the executable/request pairing or otherwise changes what that arm returns, just not a
+    /// provider mis-dispatch (that hazard belongs to the test named above).
     #[test]
     fn every_run_rows_request_builder_is_pure_and_derives_its_own_launch() {
+        // The `(provider, name) → builder` table the twelve implicitly encoded by their own
+        // names (e.g. `fresh_text_row_is_wired_to_fresh_text_request`). Kept exhaustive by the
+        // `covered == expected` check below: a `Run` row missing here — or a stale entry with no
+        // matching row — fails that assertion instead of the gap going unnoticed.
+        type RunBuilder = fn(&ScenarioInput) -> anyhow::Result<RunRequest>;
+        const EXPECTED_RUN_BUILDERS: &[(Provider, &str, RunBuilder)] = &[
+            (
+                Provider::Claude,
+                "fresh-text",
+                scenarios::claude::fresh_text_request,
+            ),
+            (
+                Provider::Claude,
+                "approval",
+                scenarios::claude::approval_request,
+            ),
+            (
+                Provider::Claude,
+                "resume",
+                scenarios::claude::resume_request,
+            ),
+            (
+                Provider::Claude,
+                "attachment",
+                scenarios::claude::attachment_request,
+            ),
+            (
+                Provider::Claude,
+                "checklist",
+                scenarios::claude::checklist_request,
+            ),
+            (
+                Provider::Claude,
+                "checklist-resume",
+                scenarios::claude::checklist_resume_request,
+            ),
+            (
+                Provider::Codex,
+                "fresh-text",
+                scenarios::codex::fresh_text_request,
+            ),
+            (
+                Provider::Codex,
+                "approval",
+                scenarios::codex::approval_request,
+            ),
+            (
+                Provider::Codex,
+                "approval-on-request",
+                scenarios::codex::approval_on_request_request,
+            ),
+            (Provider::Codex, "resume", scenarios::codex::resume_request),
+            (Provider::Codex, "steer", scenarios::codex::steer_request),
+            (
+                Provider::Codex,
+                "interruption",
+                scenarios::codex::interruption_request,
+            ),
+        ];
+
+        let mut covered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
         for spec in SCENARIOS {
             let ScenarioLaunch::Run(build_request) = spec.launch else {
                 continue;
             };
+            covered.insert(format!("{:?}/{}", spec.provider, spec.name));
             let input = ScenarioInput {
                 resume_id: spec
                     .requirements
@@ -998,6 +1094,30 @@ mod tests {
                 spec.provider, spec.name
             );
 
+            let (_, _, expected_builder) = EXPECTED_RUN_BUILDERS
+                .iter()
+                .find(|(provider, name, _)| *provider == spec.provider && *name == spec.name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{:?}/{}: no entry in EXPECTED_RUN_BUILDERS — add one so this row's \
+                         wiring is checked",
+                        spec.provider, spec.name
+                    )
+                });
+            let expected_request = expected_builder(&input).unwrap_or_else(|err| {
+                panic!(
+                    "{:?}/{}: EXPECTED_RUN_BUILDERS' builder failed: {err}",
+                    spec.provider, spec.name
+                )
+            });
+            assert_eq!(
+                first, expected_request,
+                "{:?}/{}: spec.launch's builder does not match the builder \
+                 EXPECTED_RUN_BUILDERS says this row should name — the row is wired to the \
+                 wrong builder",
+                spec.provider, spec.name
+            );
+
             let (exe, run_launch): (PathBuf, fn(&Path, &RunRequest) -> LaunchDescriptor) =
                 match spec.provider {
                     Provider::Claude => (absolute_program("claude"), crate::claude::run_launch),
@@ -1020,6 +1140,17 @@ mod tests {
                 spec.name
             );
         }
+
+        let expected: std::collections::BTreeSet<String> = EXPECTED_RUN_BUILDERS
+            .iter()
+            .map(|(provider, name, _)| format!("{provider:?}/{name}"))
+            .collect();
+        assert_eq!(
+            covered, expected,
+            "every Run row in SCENARIOS must have exactly one entry in EXPECTED_RUN_BUILDERS, \
+             and vice versa — a Run row missing here (or flipped to Discovery) would otherwise \
+             leave the loop in silence"
+        );
     }
 
     fn only_raw_subdirectory(raw_root: &Path) -> PathBuf {
