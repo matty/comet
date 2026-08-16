@@ -281,9 +281,9 @@ async fn happy_path_normalizes_events_and_filters_subagents() {
 
 /// `normalize.rs`'s `SubagentStatus::Failed`/`Cancelled` arms were written by
 /// hand — no capture has ever recorded a subagent ending any way but
-/// `"completed"` (see `run2-claude-subagent.jsonl`) — so nothing had run the
-/// `Failed` arm through a real spawn until this fixture existed. Fixture:
-/// `scenario:subagent-failed` in `fixtures/fake_claude.rs`.
+/// `"completed"` (see `tests/corpus/claude/2.1.229/subagent`) — so nothing
+/// had run the `Failed` arm through a real spawn until this fixture existed.
+/// Fixture: `scenario:subagent-failed` in `fixtures/fake_claude.rs`.
 #[tokio::test]
 async fn subagent_terminal_failure_reaches_the_event_stream() {
     let (controls, _steer, _token) = controls("A");
@@ -847,8 +847,10 @@ async fn initialize_discovery_drains_stderr_for_models_and_commands() {
 }
 
 /// The slice's deliverable: a real spawn, a real handshake round-trip, and a
-/// merged catalog that says it is live. The fixture is a reduced form of the
-/// captured initialize reply, `claude/2.1.228/model-discovery` frame 2.
+/// merged catalog that says it is live. The fixture emits the captured
+/// initialize reply itself, `claude/2.1.228/model-discovery` frame 2, loaded
+/// byte-for-byte rather than a hand-typed stand-in — this decodes the
+/// provider's real seven-model list, not an author's guess at its shape.
 #[tokio::test]
 async fn models_come_back_live_and_merged() {
     let catalog = harness().models().await.expect("models");

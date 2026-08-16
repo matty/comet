@@ -13,6 +13,7 @@ const CODEX_MODEL_DISCOVERY: &str = "codex/0.147.0/model-discovery";
 const CODEX_STEER: &str = "codex/0.147.0/steer";
 const CHECKLIST: &str = "claude/2.1.229/checklist";
 const CHECKLIST_RESUME: &str = "claude/2.1.229/checklist-resume";
+const SUBAGENT: &str = "claude/2.1.229/subagent";
 
 fn payload(scenario: &str, sequence: u64) -> Value {
     serde_json::from_str(&corpus_frame(scenario, sequence).payload)
@@ -194,4 +195,109 @@ fn a_resumed_run_updates_a_task_it_never_created() {
         "the update call and its result must name the same task: call={call} result={result}"
     );
     assert_eq!(result["tool_use_result"]["statusChange"]["from"], "pending");
+}
+
+/// The `Agent` tool_use that spawns a subagent and its `task_started` reading
+/// join on one id: the tool_use's own `id` is the system frame's
+/// `tool_use_id`. `fake_claude.rs`'s `happy()` fixture hand-types this same
+/// join with readable stand-ins (`"sub-1"` for both); this proves the join
+/// the fixture claims to mirror actually holds on the genuine bytes, not just
+/// on an author's guess at their shape.
+#[test]
+fn subagent_tool_use_joins_its_own_task_started() {
+    let spawn = payload(SUBAGENT, 115);
+    let started = payload(SUBAGENT, 116);
+
+    let tool_use = &spawn["message"]["content"][0];
+    assert_eq!(tool_use["name"], "Agent");
+    assert!(
+        tool_use["input"]["subagent_type"].is_string(),
+        "the spawn call must carry a subagent_type: {tool_use}"
+    );
+    assert_eq!(started["subtype"], "task_started");
+    assert_eq!(
+        tool_use["id"], started["tool_use_id"],
+        "task_started must name the tool_use_id the Agent call was assigned: \
+         spawn={tool_use} started={started}"
+    );
+}
+
+/// `task_progress` and both terminal `task_notification` readings carry a
+/// `usage` object with `total_tokens`/`tool_uses`/`duration_ms` — the field
+/// set `fake_claude.rs`'s hand-typed literals reproduce with real numbers.
+/// The literal numbers themselves are not checked here (nor loadable at all:
+/// none of `.usage.total_tokens`/`.usage.tool_uses`/`.usage.duration_ms`
+/// under a `task_progress`/`task_notification` frame is on
+/// `capture/allowlist/claude.txt`, so the real values are `<Vn>`
+/// placeholders in this corpus) — this proves the *shape* the fixture claims
+/// against the genuine bytes, which is what is actually checkable.
+#[test]
+fn subagent_progress_and_notification_carry_a_usage_object() {
+    let progress = payload(SUBAGENT, 121);
+    let notification = payload(SUBAGENT, 125);
+
+    assert_eq!(progress["subtype"], "task_progress");
+    for key in ["total_tokens", "tool_uses", "duration_ms"] {
+        assert!(
+            progress["usage"].get(key).is_some(),
+            "task_progress usage missing {key}: {progress}"
+        );
+    }
+    assert!(
+        progress["last_tool_name"].is_string(),
+        "task_progress must name the tool last run: {progress}"
+    );
+
+    assert_eq!(notification["subtype"], "task_notification");
+    for key in ["total_tokens", "tool_uses", "duration_ms"] {
+        assert!(
+            notification["usage"].get(key).is_some(),
+            "task_notification usage missing {key}: {notification}"
+        );
+    }
+    assert_eq!(notification["status"], "completed");
+}
+
+/// A SendMessage-resumed subagent invocation reuses the FIRST invocation's
+/// `task_id` under a brand new `tool_use_id` — exactly the shape
+/// `fake_claude.rs`'s `happy()` fixture exercises with its own second
+/// `task_started` (same `"sub-1-task"`, new `"sub-2"`), which is what proves
+/// `normalize.rs`'s `subagent_progress.remove(&f.task_id)` on `task_started`
+/// through a real spawn: without it, the resumed terminal reading would be
+/// compared against the first invocation's already-terminal one and dropped
+/// as redundant even though the summary differs. This test is the corpus-side
+/// half of that claim — that the real provider actually resumes this way, not
+/// just that the fixture's hand-typed replay of it decodes correctly.
+#[test]
+fn a_resumed_subagent_task_started_reuses_the_task_id_under_a_new_tool_use_id() {
+    let first_started = payload(SUBAGENT, 116);
+    let resumed_started = payload(SUBAGENT, 174);
+    let resumed_updated = payload(SUBAGENT, 201);
+    let resumed_notification = payload(SUBAGENT, 202);
+
+    assert_eq!(first_started["subtype"], "task_started");
+    assert_eq!(resumed_started["subtype"], "task_started");
+    assert_eq!(
+        first_started["task_id"], resumed_started["task_id"],
+        "a resumed invocation must reuse the first invocation's task_id: \
+         first={first_started} resumed={resumed_started}"
+    );
+    assert_ne!(
+        first_started["tool_use_id"], resumed_started["tool_use_id"],
+        "a resumed invocation must NOT reuse the first tool_use_id, or this \
+         test would pass without the resumption ever happening: \
+         first={first_started} resumed={resumed_started}"
+    );
+
+    assert_eq!(resumed_updated["subtype"], "task_updated");
+    assert_eq!(resumed_updated["task_id"], first_started["task_id"]);
+
+    assert_eq!(resumed_notification["subtype"], "task_notification");
+    assert_eq!(resumed_notification["task_id"], first_started["task_id"]);
+    assert_eq!(
+        resumed_notification["tool_use_id"], resumed_started["tool_use_id"],
+        "the resumed notification must name the RESUMED tool_use_id, not the \
+         first invocation's: notification={resumed_notification} \
+         resumed_started={resumed_started}"
+    );
 }
