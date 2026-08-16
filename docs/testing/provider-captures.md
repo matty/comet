@@ -131,31 +131,43 @@ Its sibling `every_committed_map_key_is_allowlisted_or_a_placeholder` does the s
 position, and the two are not interchangeable: the scalar property walks `String`/`Number` leaves,
 so an identifier sitting in an object *key* was invisible to it. A rogue key planted under
 `.modelUsage` with no scalars beneath it fails the key property while the scalar property, the
-manifest-token property and the field snapshot all stay green.
+manifest-token property and the capability sheet's golden test all stay green.
 
 **When a report row names a key rather than a field, the object is a map and belongs in
 `surface::MAP_PATHS`.** That is the triage step for a novel map: the declaration is one edit, and
-it decides both questions at once — the field snapshot stops recording the key as a field name,
+it decides both questions at once — the capability sheet stops recording the key as a field name,
 and the sanitizer stops publishing it. Until it is declared, the keys ride through
 ([D77](../debt/README.md)).
 
 Before committing, deliberately break each new contract once, observe a meaningful named failure,
 restore it, and rerun green. Finish with the repository gate from `AGENTS.md`.
 
-## The field snapshot
+## The capability sheet
 
-`crates/harness/tests/corpus/observed-fields.json` is a generated snapshot recording what the
-corpus shows, per provider and direction, and nothing else. Promotion is what makes a field
-appear in it, so a scenario promoted here changes it on the next regeneration:
+`docs/providers/<provider>-<version>.md` is a generated **capability sheet**, one per corpus
+version directory, recording what that version's corpus shows and nothing else: a Fields section
+(every dotted path, per direction), a Vocabulary section (the observed value set for the small
+declared discriminator paths), and a Scenarios section naming the exact evidence — argv, cwd,
+configured environment — both are drawn from. Promotion is what changes what a sheet shows, so a
+scenario promoted here changes its version's sheet on the next regeneration:
 
 ```powershell
-$env:COMET_UPDATE_SURFACE = "1"; cargo test -p comet-harness --test capture_corpus observed_fields
+$env:COMET_UPDATE_SHEETS = "1"; cargo test -p comet-harness --test capture_corpus
 ```
 
-**Read the failure before you regenerate.** It names each arriving field and the frame it first
-appears in, and that list is the point of the whole mechanism — a new CLI version's added field
-arrives as a test failure rather than as a bug six weeks later. It also reports fields that went
-*away*, which is how a dropped or re-recorded scenario announces itself.
+**Read the failing golden test before you regenerate.**
+`every_corpus_version_matches_its_committed_sheet`
+(`crates/harness/tests/capture_corpus/capability_sheets.rs`) names the line at which the
+generated sheet first diverges from the one committed, and that is the point of the whole
+mechanism — a new CLI version's added, removed or reshaped field arrives as a test failure rather
+than as a bug six weeks later. It does not name the individual frame or scenario a field first
+appeared in; grep the version's own corpus directory for the field's dotted path if you need that.
+
+**Promoting a new version means committing its capability sheet in the same change.** A version
+directory with no matching `docs/providers/<provider>-<version>.md` fails the golden test
+outright — the newly-promoted-capture case this mechanism exists to catch, not merely an
+out-of-date sheet. `git diff docs/providers/claude-2.1.228.md docs/providers/claude-2.1.229.md`
+is the version-change report; no differ is built or planned on top of it.
 
 ## Provider contradictions
 

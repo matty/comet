@@ -11,10 +11,11 @@
 //! Adding a line is a decision to publish that field's values forever.
 //!
 //! **Keys split two ways, and only one of them redacts.** A key that is a
-//! *field name* survives: `tests/corpus/observed-fields.json` is a snapshot of
-//! exactly those names, so redacting them would blank the evidence the corpus
-//! exists to hold. A key that is *data* — one under a path declared in
-//! `surface::MAP_PATHS`, where the key is a model id rather than a field —
+//! *field name* survives: each version's capability sheet under
+//! `docs/providers/` is a snapshot of exactly those names, so redacting them
+//! would blank the evidence the corpus exists to hold. A key that is *data* —
+//! one under a path declared in `surface::MAP_PATHS`, where the key is a
+//! model id rather than a field —
 //! goes through `allows_prefix` and redacts by default like any value. Before
 //! that rule (finding 1, PR #66), an object keyed by anything identifying rode
 //! into the archive verbatim while its value was dutifully redacted beside it,
@@ -104,9 +105,10 @@ pub fn allows(provider: Provider, path: &str) -> bool {
 /// reviewed is a prefix of nothing and its key is replaced.
 ///
 /// Ordinary object keys never reach this function. A field *name* is published
-/// deliberately — `tests/corpus/observed-fields.json` is a snapshot of exactly
-/// those names, and redacting them would blank the evidence the corpus exists
-/// to hold. The distinction this draws is name-versus-data, not key-versus-value.
+/// deliberately — each version's capability sheet under `docs/providers/` is a
+/// snapshot of exactly those names, and redacting them would blank the evidence
+/// the corpus exists to hold. The distinction this draws is name-versus-data,
+/// not key-versus-value.
 ///
 /// Boundary matching is the point of the `is_boundary` check: `.mcp` must not
 /// pass because `.mcp_servers[].status` happens to start with those bytes.

@@ -74,6 +74,30 @@ already-relied-on tests, for a risk (an *unreviewed* tool landing on one of thes
 not happened in any committed capture. That is why this is a deferred decision, not a same-task
 fix.
 
+## What changed since this was filed: the sheet's tool-name vocabulary
+
+The stage-5 capability sheet (`docs/providers/<provider>-<version>.md`, rendered by
+`crates/harness/src/capture/sheet.rs`) gives this risk a partial, automatic signal it did not
+have when this page was filed — **not a fix, and not D73's resolution.**
+
+`VOCABULARY_PATHS` (`crates/harness/src/capture/surface.rs`) declares `.message.content[].name`
+and `.event.content_block.name` — the tool-name-at-invocation paths — among its discriminators,
+so each version's sheet prints the exact set of tool names its corpus observed invoked, sorted,
+under its Vocabulary section (`Bash`, `Skill`, `Write` in the committed `claude-2.1.228.md`). A
+sixth tool arriving in a newly promoted capture — including a third-party MCP tool spelled
+`mcp__<server>__<tool>` — adds a new value to that list. Because the golden test
+(`every_corpus_version_matches_its_committed_sheet`,
+`crates/harness/tests/capture_corpus/capability_sheets.rs`) fails on any byte difference from the
+committed sheet, that new value fails the suite at promotion time rather than arriving silently
+— exactly the event this page names as uncaught by every other gate.
+
+**What this does not do:** it names that a new tool *arrived*, not that it landed content on one
+of the seven union paths this page is about, and it says nothing about whether that content is
+safe to allowlist. The reviewer still has to open the archive, follow the new tool name to its
+`.message.content[].input.*` and `.tool_use_result.*` fields, and make the same judgment this page
+defers. The resolution below is unchanged; this is a trigger a reviewer can now see coming, not an
+answer to the question it raises.
+
 ## What has to happen before it can stay deferred any longer
 
 **This must be settled before the next capture is promoted to the corpus.** A new capture is
