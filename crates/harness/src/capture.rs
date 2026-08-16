@@ -17,6 +17,7 @@ mod filesystem;
 mod record;
 mod safety;
 mod sanitize;
+mod sheet;
 mod surface;
 #[cfg(test)]
 mod test_support;
@@ -28,6 +29,7 @@ pub use record::{Requirements, SCENARIOS, ScenarioSpec, record, scenario};
 pub use sanitize::{
     NovelPath, SanitizationError, SanitizationReport, render_novel_paths_report, sanitize_dir,
 };
+pub use sheet::{SheetScenario, render_sheet};
 pub use surface::{
     Direction, FieldObservation, FrameRef, MAP_PATHS, SurfaceError, VOCABULARY_PATHS, Vocabulary,
     observe_corpus, observe_surface, observe_vocabulary, observed_field_lines,
