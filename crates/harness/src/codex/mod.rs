@@ -290,6 +290,11 @@ pub(crate) fn build_run_command(exe: &Path, request: &RunRequest) -> Command {
     run_launch(exe, request).command()
 }
 
+const STARTUP_TIMEOUT_MESSAGE: &str =
+    "Codex didn't finish starting. Open Codex in a terminal to sign in, then try again.";
+const STARTUP_FAILURE_MESSAGE: &str =
+    "Codex couldn't start. Check that Codex is signed in, then try again.";
+
 /// The Codex harness. Construct with [`CodexHarness::new`]; tests point it at a
 /// fake app server with [`CodexHarness::with_executable`].
 pub struct CodexHarness {
@@ -643,7 +648,7 @@ async fn run_session(session: Session) {
         request,
         interrupt_grace,
         kill_grace,
-        startup_timeout: _startup_timeout,
+        startup_timeout,
         stderr_tail,
     } = session;
     let RunControls {
@@ -658,7 +663,7 @@ async fn run_session(session: Session) {
     } = controls;
     let request_approval = Arc::new(request_approval);
 
-    // ---- handshake + thread + first turn (interruptible) ------------------
+    // ---- handshake + thread (interruptible and bounded) -------------------
     let setup = async {
         client
             .request(
@@ -701,14 +706,45 @@ async fn run_session(session: Session) {
         Ok::<String, HarnessError>(thread_id)
     };
     let thread_id = tokio::select! {
-        res = setup => match res {
-            Ok(thread_id) => thread_id,
-            Err(e) => {
+        result = tokio::time::timeout(startup_timeout, setup) => match result {
+            Ok(Ok(thread_id)) => thread_id,
+            Ok(Err(error)) => {
+                let status = child.try_wait().ok().flatten();
+                if status.is_some() {
+                    // Let the stderr reader drain the pipe after process exit.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                tracing::warn!(
+                    target: "comet_harness::codex",
+                    %error,
+                    ?status,
+                    stderr = ?stderr_tail.snapshot(),
+                    "codex startup failed"
+                );
                 let _ = event_tx
                     .send(Ok(AgentEvent::Done {
                         status: DoneStatus::Errored,
                         result: None,
-                        error: Some(e.to_string()),
+                        error: Some(STARTUP_FAILURE_MESSAGE.into()),
+                        session_id: None,
+                    }))
+                    .await;
+                shutdown_child(&mut child, kill_grace).await;
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "comet_harness::codex",
+                    timeout_secs = startup_timeout.as_secs_f64(),
+                    status = ?child.try_wait().ok().flatten(),
+                    stderr = ?stderr_tail.snapshot(),
+                    "codex startup timed out"
+                );
+                let _ = event_tx
+                    .send(Ok(AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some(STARTUP_TIMEOUT_MESSAGE.into()),
                         session_id: None,
                     }))
                     .await;
