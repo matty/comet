@@ -488,12 +488,16 @@ mod tests {
             ("claude", "attachment", RuntimeMode::AutoAcceptEdits),
             ("claude", "checklist", RuntimeMode::AutoAcceptEdits),
             ("claude", "checklist-resume", RuntimeMode::AutoAcceptEdits),
+            ("claude", "auto", RuntimeMode::Auto),
+            ("claude", "full-access", RuntimeMode::FullAccess),
             ("codex", "fresh-text", RuntimeMode::AutoAcceptEdits),
             ("codex", "approval", RuntimeMode::ApprovalRequired),
             ("codex", "approval-on-request", RuntimeMode::AutoAcceptEdits),
             ("codex", "resume", RuntimeMode::AutoAcceptEdits),
             ("codex", "steer", RuntimeMode::AutoAcceptEdits),
             ("codex", "interruption", RuntimeMode::AutoAcceptEdits),
+            ("codex", "auto", RuntimeMode::Auto),
+            ("codex", "full-access", RuntimeMode::FullAccess),
         ] {
             let spec =
                 scenario(provider, name).unwrap_or_else(|| panic!("missing {provider}/{name}"));
@@ -594,7 +598,7 @@ mod tests {
         }
     }
 
-    /// Every one of the 16 `(provider, name)` pairs in `SCENARIOS` must build a valid
+    /// Every one of the 20 `(provider, name)` pairs in `SCENARIOS` must build a valid
     /// `CaptureConfig` through this binary's own argument validation, given whatever its
     /// `Requirements` demand — restores what Task 2 broke: the binary routed every ported
     /// scenario into a dead end, and this is the CLI-level proof that every name is reachable

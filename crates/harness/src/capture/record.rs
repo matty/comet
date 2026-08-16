@@ -224,6 +224,50 @@ fn codex_fence(
     })
 }
 
+/// The pre-spawn fence for both providers' `full-access` row.
+///
+/// `FullAccess` disables the sandbox entirely — Claude's `bypassPermissions`
+/// and Codex's `danger-full-access` both mean nothing stands between the
+/// model and the filesystem — so unlike `codex_fence`'s two rows there is no
+/// approval channel to protect at grant time: nothing will ever ask, so
+/// there is nothing to recheck. The one guarantee a pre-spawn check can
+/// still give is that the process does not start inside a repository this
+/// project's own operator might care about. Reuses
+/// `safety::repository_root`, the same primitive `validate_on_request_preflight`
+/// already applies to Codex's on-request approval cwd, rather than inventing
+/// a second "is this cwd safe" rule for one more row.
+///
+/// Applies to Claude's `full-access` row too, not only Codex's — the blast
+/// radius is the same on either provider, and the check itself is
+/// provider-neutral, so the row is wired to this function directly rather
+/// than a Codex-only one.
+///
+/// Deliberately does **not** forbid the system temp tree the way
+/// `resolve_trusted_powershell`'s forbidden roots do: a disposable directory
+/// is exactly what the safety note in the stage plan asks an operator to
+/// point this scenario at, and a temp directory is a reasonable choice for
+/// that. The one thing this fence protects against is the operator forgetting
+/// `--cwd` and the process landing, unsandboxed, in whatever repository they
+/// happened to be sitting in.
+fn full_access_fence(
+    _spec: &ScenarioSpec,
+    _config: &CaptureConfig,
+    launch: &LaunchDescriptor,
+) -> anyhow::Result<FenceOutcome> {
+    let cwd = launch.cwd.clone().ok_or_else(|| {
+        anyhow::anyhow!("Full-access capture requires a resolved working directory.")
+    })?;
+    let canonical = std::fs::canonicalize(&cwd)
+        .map_err(|_| anyhow::anyhow!("Full-access capture cwd could not be validated."))?;
+    if crate::capture::safety::repository_root(&canonical).is_some() {
+        anyhow::bail!(
+            "Full-access capture requires a non-repository, non-worktree cwd — pick a disposable \
+             directory outside anything you care about."
+        );
+    }
+    Ok(FenceOutcome::none())
+}
+
 /// A scenario body: given a freshly spawned session, drive it (handshaking
 /// first if this scenario needs one — see `record_generic`'s doc comment)
 /// and report whether the scenario completed.
@@ -833,6 +877,69 @@ mod tests {
         );
     }
 
+    /// `full_access_fence`'s whole reason to exist: reject a cwd inside a git repository or
+    /// linked worktree, cross-platform (unlike `codex_fence`, which is Windows-only). Both
+    /// providers' `full-access` row points at this same function.
+    #[test]
+    fn full_access_fence_rejects_a_repository_cwd() {
+        let raw = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir(cwd.path().join(".git")).unwrap();
+        let cfg = config(
+            "full-access",
+            fixture_path("fake-codex"),
+            "codex",
+            raw.path(),
+        );
+        let spec = scenario("codex", "full-access").unwrap();
+        let launch = LaunchDescriptor {
+            program: fixture_path("fake-codex"),
+            args: Vec::new(),
+            cwd: Some(cwd.path().into()),
+            configured_env: Default::default(),
+            stdin: StdioMode::Piped,
+            stdout: StdioMode::Piped,
+            stderr: StdioMode::Piped,
+            kill_on_drop: true,
+            #[cfg(windows)]
+            creation_flags: 0,
+        };
+
+        let error = match super::full_access_fence(spec, &cfg, &launch) {
+            Ok(_) => panic!("a repository cwd must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("non-repository"), "{error}");
+    }
+
+    /// The other half: an ordinary, non-repository directory passes.
+    #[test]
+    fn full_access_fence_accepts_a_plain_directory() {
+        let raw = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let cfg = config(
+            "full-access",
+            fixture_path("fake-codex"),
+            "codex",
+            raw.path(),
+        );
+        let spec = scenario("codex", "full-access").unwrap();
+        let launch = LaunchDescriptor {
+            program: fixture_path("fake-codex"),
+            args: Vec::new(),
+            cwd: Some(cwd.path().into()),
+            configured_env: Default::default(),
+            stdin: StdioMode::Piped,
+            stdout: StdioMode::Piped,
+            stderr: StdioMode::Piped,
+            kill_on_drop: true,
+            #[cfg(windows)]
+            creation_flags: 0,
+        };
+
+        assert!(super::full_access_fence(spec, &cfg, &launch).is_ok());
+    }
+
     /// The hazard `ScenarioLaunch`/`derive_launch` exist to close: before this
     /// task, a run scenario's launch and its wire line both came from calling
     /// the same `*_request` builder, independently, from two different
@@ -1040,6 +1147,7 @@ mod tests {
         enum FenceKind {
             None,
             CodexApproval,
+            FullAccess,
         }
 
         // The `(provider, name) → (builder, fence)` table the twelve-plus-twenty rows across the
@@ -1086,6 +1194,18 @@ mod tests {
                 Some(scenarios::claude::checklist_resume_request),
                 FenceKind::None,
             ),
+            (
+                Provider::Claude,
+                "auto",
+                Some(scenarios::claude::auto_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Claude,
+                "full-access",
+                Some(scenarios::claude::full_access_request),
+                FenceKind::FullAccess,
+            ),
             (Provider::Codex, "model-discovery", None, FenceKind::None),
             (
                 Provider::Codex,
@@ -1128,6 +1248,18 @@ mod tests {
                 "interruption",
                 Some(scenarios::codex::interruption_request),
                 FenceKind::None,
+            ),
+            (
+                Provider::Codex,
+                "auto",
+                Some(scenarios::codex::auto_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Codex,
+                "full-access",
+                Some(scenarios::codex::full_access_request),
+                FenceKind::FullAccess,
             ),
         ];
 
@@ -1173,16 +1305,18 @@ mod tests {
             let actual_fence = match (spec.fence)(spec, &cfg, &launch) {
                 Ok(_) => FenceKind::None,
                 Err(error) => {
-                    assert!(
-                        error
-                            .to_string()
-                            .contains("requires a resolved working directory"),
-                        "{:?}/{}: fence errored on a cwd-less launch with a message that isn't \
-                         codex_fence's own — got {error}",
-                        spec.provider,
-                        spec.name
-                    );
-                    FenceKind::CodexApproval
+                    let message = error.to_string();
+                    if message.starts_with("Codex approval capture requires") {
+                        FenceKind::CodexApproval
+                    } else if message.starts_with("Full-access capture requires") {
+                        FenceKind::FullAccess
+                    } else {
+                        panic!(
+                            "{:?}/{}: fence errored on a cwd-less launch with an unrecognized \
+                             message — got {error}",
+                            spec.provider, spec.name
+                        );
+                    }
                 }
             };
             assert_eq!(
@@ -1353,6 +1487,11 @@ mod tests {
             (Provider::Codex, "approval"),
             (Provider::Codex, "approval-on-request"),
             (Provider::Codex, "interruption"),
+            // Never captured; owed by the stage-6 auto/full-access live re-capture.
+            (Provider::Claude, "auto"),
+            (Provider::Claude, "full-access"),
+            (Provider::Codex, "auto"),
+            (Provider::Codex, "full-access"),
         ];
 
         let root = crate::capture::corpus_root();
@@ -1474,11 +1613,15 @@ mod tests {
         assert_eq!(
             unevidenced_sorted,
             vec![
+                "claude/auto",
+                "claude/full-access",
                 "codex/approval",
                 "codex/approval-on-request",
+                "codex/auto",
+                "codex/full-access",
                 "codex/interruption",
             ],
-            "the exempted-uncaptured rows must be exactly these three — a row gaining or losing \
+            "the exempted-uncaptured rows must be exactly these seven — a row gaining or losing \
              corpus evidence must update this assertion deliberately, not pass through silently"
         );
 

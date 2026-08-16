@@ -26,6 +26,11 @@ const EXEMPT_UNCAPTURED: &[(&str, &str)] = &[
     ("codex", "approval"),
     ("codex", "approval-on-request"),
     ("codex", "interruption"),
+    // Never captured; owed by the stage-6 auto/full-access live re-capture.
+    ("claude", "auto"),
+    ("claude", "full-access"),
+    ("codex", "auto"),
+    ("codex", "full-access"),
 ];
 
 fn provider_str(provider: Provider) -> &'static str {

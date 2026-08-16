@@ -115,8 +115,11 @@ pub struct ScenarioSpec {
     /// future Codex row that legitimately wanted `ApprovalRequired` for some
     /// other reason would have silently inherited the Windows-only trusted-
     /// PowerShell fence. Every row now names its own fence explicitly;
-    /// [`no_fence`] is the default for the fourteen rows that need none, and
-    /// the two Codex approval rows point at `super::codex_fence` directly.
+    /// [`no_fence`] is the default for sixteen of the twenty rows, the two
+    /// Codex approval rows point at `super::codex_fence`, and both
+    /// providers' `full-access` row points at `super::full_access_fence` —
+    /// see that function's own doc comment for why full access needs a
+    /// fence with no approval channel to protect.
     pub(super) fence:
         fn(&ScenarioSpec, &CaptureConfig, &LaunchDescriptor) -> anyhow::Result<FenceOutcome>,
     pub(super) body: ScenarioBody,
@@ -283,6 +286,26 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::checklist_resume(s, i))),
     },
     ScenarioSpec {
+        name: "auto",
+        purpose: "capture what Claude's auto permission mode puts on the wire",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::Auto),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(claude::auto_request),
+        fence: no_fence,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::auto(s, i))),
+    },
+    ScenarioSpec {
+        name: "full-access",
+        purpose: "capture what Claude's bypassPermissions mode puts on the wire",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::FullAccess),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(claude::full_access_request),
+        fence: super::full_access_fence,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::full_access(s, i))),
+    },
+    ScenarioSpec {
         name: "fresh-text",
         purpose: "capture a plain Codex text turn",
         provider: Provider::Codex,
@@ -358,6 +381,26 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         fence: no_fence,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::interruption(s, i))),
     },
+    ScenarioSpec {
+        name: "auto",
+        purpose: "capture what Codex's auto_review reviewer puts on the wire",
+        provider: Provider::Codex,
+        runtime_mode: Some(RuntimeMode::Auto),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(codex::auto_request),
+        fence: no_fence,
+        body: ScenarioBody::Codex(|s, i| Box::pin(codex::auto(s, i))),
+    },
+    ScenarioSpec {
+        name: "full-access",
+        purpose: "capture what Codex's danger-full-access sandbox puts on the wire",
+        provider: Provider::Codex,
+        runtime_mode: Some(RuntimeMode::FullAccess),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(codex::full_access_request),
+        fence: super::full_access_fence,
+        body: ScenarioBody::Codex(|s, i| Box::pin(codex::full_access(s, i))),
+    },
 ];
 
 /// Look up a scenario by the exact provider and name strings the binary's
@@ -390,6 +433,8 @@ mod tests {
             ("claude", "attachment"),
             ("claude", "checklist"),
             ("claude", "checklist-resume"),
+            ("claude", "auto"),
+            ("claude", "full-access"),
             ("codex", "model-discovery"),
             ("codex", "model-discovery-logged-out"),
             ("codex", "fresh-text"),
@@ -398,6 +443,8 @@ mod tests {
             ("codex", "resume"),
             ("codex", "steer"),
             ("codex", "interruption"),
+            ("codex", "auto"),
+            ("codex", "full-access"),
         ] {
             assert!(
                 scenario(provider, name).is_some(),
@@ -408,7 +455,7 @@ mod tests {
         assert!(scenario("codex", "model-discovery-logged-out").is_some());
         assert_eq!(
             SCENARIOS.len(),
-            16,
+            20,
             "an added or removed row must update this count too"
         );
     }

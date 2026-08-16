@@ -210,6 +210,67 @@ pub(in crate::capture::record) async fn attachment(
     session.wait_for_turn_end().await
 }
 
+/// Same one-call-per-recording contract as `fresh_text_request` above. The prompt is
+/// deliberately identical to `fresh_text_request`'s — `auto`/`full-access` exist to record what
+/// mode configuration reaches the wire, not to exercise interesting agent behaviour, and holding
+/// the prompt fixed makes the mode the only variable a reader diffing this scenario against
+/// `fresh-text`/`full-access` needs to account for.
+pub(in crate::capture::record) fn auto_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
+    Ok(cheap_claude_request(
+        "Reply with the single word capture.",
+        input,
+        RuntimeMode::Auto,
+    ))
+}
+
+/// Same shape as `fresh_text` above: a plain text turn, no approval handling needed — the trivial
+/// prompt never triggers a tool call, so it does not matter that `Auto` would otherwise still let
+/// Claude self-review some calls.
+pub(in crate::capture::record) async fn auto(
+    session: &mut Session<ClaudeProvider>,
+    _input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    let request = session
+        .request
+        .clone()
+        .expect("auto is a Run scenario and always carries a request");
+    let line = claude_user_line(&request, false).await?;
+    session.send(&line).await?;
+    session.wait_for_turn_end().await
+}
+
+/// Same one-call-per-recording contract as `fresh_text_request` above, and the same "identical
+/// prompt" reasoning as `auto_request`.
+pub(in crate::capture::record) fn full_access_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
+    Ok(cheap_claude_request(
+        "Reply with the single word capture.",
+        input,
+        RuntimeMode::FullAccess,
+    ))
+}
+
+/// Same shape as `fresh_text`/`auto` above. `FullAccess` disables the sandbox and skips
+/// permissions entirely (`bypassPermissions` + `--dangerously-skip-permissions`), so there is no
+/// `can_use_tool` round trip to answer even if the trivial prompt did call a tool — this scenario
+/// exists to record that the mode reaches the wire, not to exercise what an unsandboxed tool call
+/// looks like.
+pub(in crate::capture::record) async fn full_access(
+    session: &mut Session<ClaudeProvider>,
+    _input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    let request = session
+        .request
+        .clone()
+        .expect("full-access is a Run scenario and always carries a request");
+    let line = claude_user_line(&request, false).await?;
+    session.send(&line).await?;
+    session.wait_for_turn_end().await
+}
+
 /// Prompt for `checklist`: create two tasks, then drive the first through
 /// both transitions. Moved here, unchanged in substance, from the deleted
 /// `capture/checklist.rs` — decision "the scenario owns its prompt" moves
@@ -1080,6 +1141,11 @@ mod tests {
                 "checklist-resume",
                 checklist_resume_request(&with_resume).unwrap().runtime_mode,
             ),
+            ("auto", auto_request(&plain).unwrap().runtime_mode),
+            (
+                "full-access",
+                full_access_request(&plain).unwrap().runtime_mode,
+            ),
         ];
         for (name, mode) in cases {
             let spec = crate::capture::record::scenarios::scenario("claude", name)
@@ -1110,6 +1176,60 @@ mod tests {
         assert_eq!(
             covered, expected,
             "every claude row with Some(runtime_mode) must have a case in this test's list"
+        );
+    }
+
+    /// `Auto` must reach the wire as Claude's `auto` permission mode, and must NOT carry
+    /// `--dangerously-skip-permissions` — same pin contract as
+    /// `record/scenarios/codex.rs`'s `codex_auto_scenario_pins_the_auto_review_reviewer_on_the_wire`,
+    /// applied to Claude's launch-argument wire instead of a JSON-RPC params object.
+    #[test]
+    fn claude_auto_scenario_pins_the_auto_permission_mode() {
+        let request = auto_request(&ScenarioInput::default()).unwrap();
+        let exe = absolute_program("claude");
+        let launch = crate::claude::run_launch(&exe, &request);
+        let snapshot = CommandSnapshot::from_launch(&launch);
+        assert!(
+            snapshot
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--permission-mode", "auto"]),
+            "Auto must reach the wire as the auto permission mode: {:?}",
+            snapshot.args
+        );
+        assert!(
+            !snapshot
+                .args
+                .iter()
+                .any(|arg| arg == "--dangerously-skip-permissions"),
+            "Auto must not skip permissions: {:?}",
+            snapshot.args
+        );
+    }
+
+    /// `FullAccess` must reach the wire as Claude's `bypassPermissions` permission mode plus
+    /// `--dangerously-skip-permissions` — same pin contract as the `Auto` test above.
+    #[test]
+    fn claude_full_access_scenario_pins_bypass_permissions_and_the_skip_flag() {
+        let request = full_access_request(&ScenarioInput::default()).unwrap();
+        let exe = absolute_program("claude");
+        let launch = crate::claude::run_launch(&exe, &request);
+        let snapshot = CommandSnapshot::from_launch(&launch);
+        assert!(
+            snapshot
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--permission-mode", "bypassPermissions"]),
+            "FullAccess must reach the wire as the bypassPermissions permission mode: {:?}",
+            snapshot.args
+        );
+        assert!(
+            snapshot
+                .args
+                .iter()
+                .any(|arg| arg == "--dangerously-skip-permissions"),
+            "FullAccess must skip permissions on the launch: {:?}",
+            snapshot.args
         );
     }
 }

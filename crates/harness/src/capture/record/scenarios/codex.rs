@@ -285,6 +285,67 @@ pub(in crate::capture::record) async fn resume(
     session.wait_for_turn_end().await
 }
 
+/// Same one-call-per-recording contract as `fresh_text_request` above. The prompt is
+/// deliberately identical to `fresh_text_request`'s — `auto`/`full-access` exist to record what
+/// mode configuration reaches the wire, not to exercise interesting agent behaviour, and holding
+/// the prompt fixed makes the mode the only variable a reader diffing this scenario against
+/// `fresh-text`/`full-access` needs to account for.
+pub(in crate::capture::record) fn auto_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
+    Ok(cheap_codex_request(
+        "Reply with the single word capture.",
+        input,
+        RuntimeMode::Auto,
+    ))
+}
+
+/// Same shape as `fresh_text` above: a plain text turn, no approval handling needed — the
+/// trivial prompt never calls a tool, so `Auto`'s `on-request` approval policy and
+/// `auto_review` reviewer never actually get exercised by anything this scenario asks for.
+pub(in crate::capture::record) async fn auto(
+    session: &mut Session<CodexProvider>,
+    input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    CodexProvider::handshake(session, input).await?;
+    let request = session
+        .request
+        .clone()
+        .expect("auto is a Run scenario and always carries a request");
+    let thread_id = start_thread(session, &request).await?;
+    start_turn(session, &request, &thread_id).await?;
+    session.wait_for_turn_end().await
+}
+
+/// Same one-call-per-recording contract as `fresh_text_request` above, and the same "identical
+/// prompt" reasoning as `auto_request`.
+pub(in crate::capture::record) fn full_access_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
+    Ok(cheap_codex_request(
+        "Reply with the single word capture.",
+        input,
+        RuntimeMode::FullAccess,
+    ))
+}
+
+/// Same shape as `fresh_text`/`auto` above. `FullAccess` pins Codex's `approvalPolicy` to
+/// `"never"` — no approval will ever be raised, so there is nothing for this body to answer even
+/// if the trivial prompt did call a tool.
+pub(in crate::capture::record) async fn full_access(
+    session: &mut Session<CodexProvider>,
+    input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    CodexProvider::handshake(session, input).await?;
+    let request = session
+        .request
+        .clone()
+        .expect("full-access is a Run scenario and always carries a request");
+    let thread_id = start_thread(session, &request).await?;
+    start_turn(session, &request, &thread_id).await?;
+    session.wait_for_turn_end().await
+}
+
 /// Same one-call-per-recording contract as `fresh_text_request` above.
 pub(in crate::capture::record) fn steer_request(
     input: &ScenarioInput,
@@ -1337,6 +1398,11 @@ mod tests {
                 "interruption",
                 interruption_request(&plain).unwrap().runtime_mode,
             ),
+            ("auto", auto_request(&plain).unwrap().runtime_mode),
+            (
+                "full-access",
+                full_access_request(&plain).unwrap().runtime_mode,
+            ),
         ];
         for (name, mode) in cases {
             let spec = crate::capture::record::scenarios::scenario("codex", name)
@@ -1368,5 +1434,82 @@ mod tests {
             covered, expected,
             "every codex row with Some(runtime_mode) must have a case in this test's list"
         );
+    }
+
+    /// `Auto` must reach the wire as Codex's `auto_review` reviewer — same "pin a literal, not
+    /// the production helper against itself" contract as `recorder_codex_run_preserves_production_linked_worktree_parameters`'s
+    /// `ApprovalRequired`/`untrusted` pin above. `on-request` is the shared approval-policy
+    /// literal `AutoAcceptEdits` and `Auto` both map to (`catalog.rs::approval_policy`); the
+    /// reviewer is the one field that actually distinguishes the two.
+    #[tokio::test]
+    async fn codex_auto_scenario_pins_the_auto_review_reviewer_on_the_wire() {
+        let raw = tempfile::tempdir().unwrap();
+        let executable = fixture_path("fake-codex");
+        let input = ScenarioInput::default();
+        let request = auto_request(&input).unwrap();
+        let mut session = start_codex_run_session("auto", executable, raw.path(), request).await;
+        auto(&mut session, &input).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let capture = session.finish(deadline).await.unwrap();
+
+        let stdin: Vec<Value> = channel_payloads(&capture, Channel::Stdin)
+            .into_iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let thread_start = stdin
+            .iter()
+            .find(|line| line["method"] == "thread/start")
+            .expect("a thread/start line was sent");
+        assert_eq!(
+            thread_start["params"]["approvalsReviewer"], "auto_review",
+            "Auto must reach the wire as the auto_review reviewer: {thread_start:?}"
+        );
+        assert_eq!(thread_start["params"]["approvalPolicy"], "on-request");
+        let turn_start = stdin
+            .iter()
+            .find(|line| line["method"] == "turn/start")
+            .expect("a turn/start line was sent");
+        assert_eq!(turn_start["params"]["approvalPolicy"], "on-request");
+        assert_eq!(capture.exit_code, Some(0));
+    }
+
+    /// `FullAccess` must reach the wire as Codex's `danger-full-access` sandbox and `never`
+    /// approval policy — same pin contract as the `Auto` test above.
+    #[tokio::test]
+    async fn codex_full_access_scenario_pins_danger_full_access_on_the_wire() {
+        let raw = tempfile::tempdir().unwrap();
+        let executable = fixture_path("fake-codex");
+        let input = ScenarioInput::default();
+        let request = full_access_request(&input).unwrap();
+        let mut session =
+            start_codex_run_session("full-access", executable, raw.path(), request).await;
+        full_access(&mut session, &input).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let capture = session.finish(deadline).await.unwrap();
+
+        let stdin: Vec<Value> = channel_payloads(&capture, Channel::Stdin)
+            .into_iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let thread_start = stdin
+            .iter()
+            .find(|line| line["method"] == "thread/start")
+            .expect("a thread/start line was sent");
+        assert_eq!(
+            thread_start["params"]["sandbox"], "danger-full-access",
+            "FullAccess must reach the wire as the danger-full-access sandbox: {thread_start:?}"
+        );
+        assert_eq!(thread_start["params"]["approvalPolicy"], "never");
+        assert_eq!(thread_start["params"]["approvalsReviewer"], "user");
+        let turn_start = stdin
+            .iter()
+            .find(|line| line["method"] == "turn/start")
+            .expect("a turn/start line was sent");
+        assert_eq!(turn_start["params"]["approvalPolicy"], "never");
+        assert_eq!(
+            turn_start["params"]["sandboxPolicy"],
+            json!({"type": "dangerFullAccess"})
+        );
+        assert_eq!(capture.exit_code, Some(0));
     }
 }
