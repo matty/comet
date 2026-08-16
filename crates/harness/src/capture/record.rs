@@ -12,14 +12,15 @@ mod scenarios;
 mod session;
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+use comet_proto::RunRequest;
 use provider::CaptureProvider;
 use providers::claude::ClaudeProvider;
 use providers::codex::CodexProvider;
 pub use scenarios::{Requirements, SCENARIOS, ScenarioSpec, scenario};
-use scenarios::{ScenarioBody, ScenarioInput};
+use scenarios::{ScenarioBody, ScenarioInput, ScenarioLaunch};
 use session::{FenceOutcome, Session};
 
 use crate::capture::types::{CaptureConfig, PartialFailureClass, Provider, RawCapture};
@@ -63,7 +64,8 @@ async fn record_claude(
             .clone()
             .or_else(crate::claude::resolve_claude_executable),
     )?;
-    let launch = (spec.launch)(&input, &executable)?;
+    let (launch, request) =
+        derive_launch(&spec.launch, &input, &executable, crate::claude::run_launch)?;
     // Claude has no pre-spawn fence: nothing here validates an environment
     // before spawn the way `codex_fence` below does for Codex. Claude's
     // `approval` DOES grant a filesystem write — a Bash command or a Write
@@ -80,6 +82,7 @@ async fn record_claude(
         input,
         body,
         FenceOutcome::none(),
+        request,
     )
     .await
 }
@@ -97,9 +100,42 @@ async fn record_codex(
             .clone()
             .or_else(crate::codex::resolve_codex_executable),
     )?;
-    let launch = (spec.launch)(&input, &executable)?;
+    let (launch, request) =
+        derive_launch(&spec.launch, &input, &executable, crate::codex::run_launch)?;
     let fence = codex_fence(spec, config, &launch)?;
-    record_generic(CodexProvider::new(), config, launch, input, body, fence).await
+    record_generic(
+        CodexProvider::new(),
+        config,
+        launch,
+        input,
+        body,
+        fence,
+        request,
+    )
+    .await
+}
+
+/// The ONLY call site for a row's `ScenarioLaunch::Run` builder. Builds the
+/// `RunRequest` once, derives the launch from it through the provider's own
+/// `run_launch`, and returns the same `RunRequest` so the caller can hand it
+/// to `Session::request` — the recorder never calls a run builder a second
+/// time to build a scenario's wire line. A discovery row has no `RunRequest`
+/// at all, so its half of the match returns `None`. See `ScenarioLaunch`'s
+/// own doc comment (`scenarios.rs`) for the hazard this closes.
+fn derive_launch(
+    launch: &ScenarioLaunch,
+    input: &ScenarioInput,
+    executable: &Path,
+    run_launch: fn(&Path, &RunRequest) -> LaunchDescriptor,
+) -> anyhow::Result<(LaunchDescriptor, Option<RunRequest>)> {
+    match launch {
+        ScenarioLaunch::Discovery(build_launch) => Ok((build_launch(input, executable)?, None)),
+        ScenarioLaunch::Run(build_request) => {
+            let request = build_request(input)?;
+            let launch = run_launch(executable, &request);
+            Ok((launch, Some(request)))
+        }
+    }
 }
 
 /// Builds the pre-spawn fence for the two Codex scenarios that need one.
@@ -218,8 +254,9 @@ async fn record_generic<P: CaptureProvider>(
     input: ScenarioInput,
     body: ScenarioBodyFn<P>,
     fence: FenceOutcome,
+    request: Option<RunRequest>,
 ) -> anyhow::Result<RawCapture> {
-    let mut session = Session::start(provider, config, launch, fence).await?;
+    let mut session = Session::start(provider, config, launch, fence, request).await?;
     let deadline = tokio::time::Instant::now() + session.timeout;
     let outcome = tokio::time::timeout_at(deadline, body(&mut session, &input)).await;
     match outcome {
@@ -692,7 +729,8 @@ mod tests {
             ..ScenarioInput::default()
         };
         let executable = fixture_path("fake-codex");
-        let launch = (spec.launch)(&input, &executable).unwrap();
+        let (launch, _request) =
+            derive_launch(&spec.launch, &input, &executable, crate::codex::run_launch).unwrap();
 
         let fence = codex_fence(spec, &cfg, &launch).unwrap();
         let recheck = fence
@@ -745,7 +783,8 @@ mod tests {
             ..ScenarioInput::default()
         };
         let executable = fixture_path("fake-codex");
-        let launch = (spec.launch)(&input, &executable).unwrap();
+        let (launch, _request) =
+            derive_launch(&spec.launch, &input, &executable, crate::codex::run_launch).unwrap();
 
         let fence = codex_fence(spec, &cfg, &launch).unwrap();
 
@@ -773,7 +812,8 @@ mod tests {
             ..ScenarioInput::default()
         };
         let executable = fixture_path("fake-codex");
-        let launch = (spec.launch)(&input, &executable).unwrap();
+        let (launch, _request) =
+            derive_launch(&spec.launch, &input, &executable, crate::codex::run_launch).unwrap();
 
         let fence = codex_fence(spec, &cfg, &launch).unwrap();
 
@@ -781,6 +821,107 @@ mod tests {
             fence.approval_cwd_identity.is_some(),
             "approval's fence must record an expected cwd identity for the grant-time recheck \
              to compare against"
+        );
+    }
+
+    /// The hazard `ScenarioLaunch`/`derive_launch` exist to close: before this
+    /// task, a run scenario's launch and its wire line both came from calling
+    /// the same `*_request` builder, independently, from two different
+    /// places — the `*_launch` wrapper (to build the argv
+    /// `record_claude`/`record_codex` spawns) and the scenario body (to build
+    /// the wire line the body sends). Nothing enforced the two calls returned
+    /// the same value; only every real builder happening to be a pure
+    /// function of `input` did.
+    ///
+    /// `counting_request` is deliberately NOT pure (a call counter folded
+    /// into both `model` and `prompt`), so it turns that assumption into an
+    /// observable fact: `record_claude` reaches it through exactly one path
+    /// now — `derive_launch`, called once, whose `RunRequest` is used for
+    /// BOTH the launch and (via `Session::request`) `hazard_body`'s wire
+    /// line — so the recorded argv (`--model call-N`) and the recorded wire
+    /// line (`call-N`) must name the same call. Before this task, with a
+    /// `*_launch` wrapper calling the builder once and the body calling it a
+    /// second, independent time, this same assertion failed (`--model
+    /// call-0` vs `call-1`) — see the task report for the quoted failure.
+    #[tokio::test]
+    async fn scenario_launch_and_body_must_share_one_request_builder_call() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        fn counting_request(input: &ScenarioInput) -> anyhow::Result<comet_proto::RunRequest> {
+            let call = CALLS.fetch_add(1, Ordering::SeqCst);
+            let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
+            Ok(comet_proto::RunRequest {
+                prompt: format!("scenario:capture-fresh call-{call}"),
+                model: Some(format!("call-{call}")),
+                cwd: cwd.display().to_string(),
+                ..comet_proto::RunRequest::for_session(comet_proto::RuntimeMode::AutoAcceptEdits)
+            })
+        }
+        fn hazard_body<'a>(
+            session: &'a mut Session<ClaudeProvider>,
+            _input: &'a ScenarioInput,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>> {
+            Box::pin(async move {
+                let request = session
+                    .request
+                    .clone()
+                    .expect("a Run scenario always carries a request");
+                let line = crate::claude::wire::user_message_line_with_images(&request.prompt, &[]);
+                session.send(&line).await?;
+                session.wait_for_turn_end().await
+            })
+        }
+
+        CALLS.store(0, Ordering::SeqCst);
+        let raw = tempfile::tempdir().unwrap();
+        let executable = fixture_path("fake-claude");
+        let spec = ScenarioSpec {
+            name: "test-only-request-builder-hazard",
+            purpose: "test-only: prove the recorder cannot call a Run builder twice",
+            provider: Provider::Claude,
+            runtime_mode: Some(comet_proto::RuntimeMode::AutoAcceptEdits),
+            requirements: Requirements::run(),
+            launch: ScenarioLaunch::Run(counting_request),
+            body: ScenarioBody::Claude(hazard_body),
+        };
+        let cfg = config(
+            "test-only-request-builder-hazard",
+            executable,
+            "claude",
+            raw.path(),
+        );
+        let input = ScenarioInput::default();
+
+        let capture = record_claude(&cfg, &spec, input, hazard_body)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "the recorder must call a Run scenario's request builder exactly once per recording"
+        );
+        let model_index = capture
+            .command
+            .args
+            .iter()
+            .position(|arg| arg == "--model")
+            .and_then(|position| capture.command.args.get(position + 1))
+            .and_then(|value| value.strip_prefix("call-"))
+            .expect("--model call-N recorded in argv");
+        let stdin = channel_payloads(&capture, Channel::Stdin);
+        let wire: serde_json::Value = serde_json::from_str(stdin[0]).unwrap();
+        let wire_prompt = wire["message"]["content"].as_str().unwrap();
+        let wire_index = wire_prompt
+            .strip_prefix("scenario:capture-fresh call-")
+            .expect("wire line carries the counted prompt");
+
+        assert_eq!(
+            model_index, wire_index,
+            "the recorded argv (--model call-{model_index}) and the recorded wire line \
+             (call-{wire_index}) must describe the same request, not two independent builder \
+             calls: {stdin:?}"
         );
     }
 

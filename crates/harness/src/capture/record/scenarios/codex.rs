@@ -213,48 +213,50 @@ async fn wait_for_turn_started(session: &mut Session<CodexProvider>) -> anyhow::
         .await
 }
 
-// Called once by `fresh_text_launch`, once by `fresh_text` — see
-// `record/scenarios/claude.rs`'s `fresh_text_request` doc comment for why
-// this stays a pure function of `input`: the two calls cannot diverge only
-// because nothing here reads anything but `input`.
-fn fresh_text_request(input: &ScenarioInput) -> RunRequest {
-    cheap_codex_request(
+/// The `RunRequest` `record.rs`'s `derive_launch` calls exactly once per
+/// `fresh-text` recording: it builds `fresh-text`'s launch from this value,
+/// then hands the SAME value to `fresh_text` below (via `Session::request`),
+/// so the recorded argv and the recorded wire line can never describe two
+/// different requests — see `record/scenarios.rs`'s `ScenarioLaunch` for the
+/// hazard this closes.
+pub(in crate::capture::record) fn fresh_text_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
+    Ok(cheap_codex_request(
         "Reply with the single word capture.",
         input,
         RuntimeMode::AutoAcceptEdits,
-    )
-}
-
-/// SPAWN for `fresh-text`: an ordinary run launch, built from the same
-/// request `fresh_text` replays as its wire line.
-pub(in crate::capture::record) fn fresh_text_launch(
-    input: &ScenarioInput,
-    executable: &Path,
-) -> anyhow::Result<LaunchDescriptor> {
-    Ok(crate::codex::run_launch(
-        executable,
-        &fresh_text_request(input),
     ))
 }
 
 /// A plain text turn: start a fresh thread, start the turn, wait for
 /// whichever terminal frame Codex sends. No bail on the terminal frame's
 /// type — see `recording.rs`'s `codex_run` doc comment on why that check is
-/// deleted, not ported.
+/// deleted, not ported. Reads the request `record.rs` already built for the
+/// launch (`Session::request`) rather than rebuilding it — see
+/// `fresh_text_request`'s own doc comment.
 pub(in crate::capture::record) async fn fresh_text(
     session: &mut Session<CodexProvider>,
     input: &ScenarioInput,
 ) -> anyhow::Result<()> {
     CodexProvider::handshake(session, input).await?;
-    let request = fresh_text_request(input);
+    let request = session
+        .request
+        .clone()
+        .expect("fresh-text is a Run scenario and always carries a request");
     let thread_id = start_thread(session, &request).await?;
     start_turn(session, &request, &thread_id).await?;
     session.wait_for_turn_end().await
 }
 
-// Called once by `resume_launch`, once by `resume` — see the note on
-// `fresh_text_request` above.
-fn resume_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
+/// Unlike Claude, a Codex resume never reaches the CLI as a launch argument;
+/// the thread id lives entirely on the wire (`thread/resume`, built by
+/// `resume_thread`) — `crate::codex::run_launch` never reads
+/// `request.resume`. Same one-call-per-recording contract as
+/// `fresh_text_request` above.
+pub(in crate::capture::record) fn resume_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
     let resume_id = input
         .resume_id
         .clone()
@@ -268,49 +270,29 @@ fn resume_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
     Ok(request)
 }
 
-/// SPAWN for `resume`: the same `app-server` launch as every other Codex
-/// scenario — unlike Claude, a Codex resume never reaches the CLI as a
-/// launch argument; the thread id lives entirely on the wire (`thread/resume`,
-/// built by `resume_thread`). See `crate::codex::run_launch`, which never
-/// reads `request.resume`.
-pub(in crate::capture::record) fn resume_launch(
-    input: &ScenarioInput,
-    executable: &Path,
-) -> anyhow::Result<LaunchDescriptor> {
-    Ok(crate::codex::run_launch(
-        executable,
-        &resume_request(input)?,
-    ))
-}
-
 pub(in crate::capture::record) async fn resume(
     session: &mut Session<CodexProvider>,
     input: &ScenarioInput,
 ) -> anyhow::Result<()> {
     CodexProvider::handshake(session, input).await?;
-    let request = resume_request(input)?;
+    let request = session
+        .request
+        .clone()
+        .expect("resume is a Run scenario and always carries a request");
     let thread_id = resume_thread(session, &request).await?;
     start_turn(session, &request, &thread_id).await?;
     session.wait_for_turn_end().await
 }
 
-// Called once by `steer_launch`, once by `steer` — see the note on
-// `fresh_text_request` above.
-fn steer_request(input: &ScenarioInput) -> RunRequest {
-    cheap_codex_request(
+/// Same one-call-per-recording contract as `fresh_text_request` above.
+pub(in crate::capture::record) fn steer_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
+    Ok(cheap_codex_request(
         "Begin a short response, then accept the follow-up instruction.",
         input,
         RuntimeMode::AutoAcceptEdits,
-    )
-}
-
-/// SPAWN for `steer`: an ordinary run launch, built from the same request
-/// `steer` replays as its wire line.
-pub(in crate::capture::record) fn steer_launch(
-    input: &ScenarioInput,
-    executable: &Path,
-) -> anyhow::Result<LaunchDescriptor> {
-    Ok(crate::codex::run_launch(executable, &steer_request(input)))
+    ))
 }
 
 /// The exact text `steer` sends as its `turn/steer` message. A named
@@ -333,7 +315,10 @@ pub(in crate::capture::record) async fn steer(
     input: &ScenarioInput,
 ) -> anyhow::Result<()> {
     CodexProvider::handshake(session, input).await?;
-    let request = steer_request(input);
+    let request = session
+        .request
+        .clone()
+        .expect("steer is a Run scenario and always carries a request");
     let thread_id = start_thread(session, &request).await?;
     start_turn(session, &request, &thread_id).await?;
     let turn_id = wait_for_turn_started(session).await?;
@@ -348,25 +333,14 @@ pub(in crate::capture::record) async fn steer(
     session.wait_for_turn_end().await
 }
 
-// Called once by `interruption_launch`, once by `interruption` — see the
-// note on `fresh_text_request` above.
-fn interruption_request(input: &ScenarioInput) -> RunRequest {
-    cheap_codex_request(
+/// Same one-call-per-recording contract as `fresh_text_request` above.
+pub(in crate::capture::record) fn interruption_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
+    Ok(cheap_codex_request(
         "Count upward slowly and keep working until interrupted.",
         input,
         RuntimeMode::AutoAcceptEdits,
-    )
-}
-
-/// SPAWN for `interruption`: an ordinary run launch, built from the same
-/// request `interruption` replays as its wire line.
-pub(in crate::capture::record) fn interruption_launch(
-    input: &ScenarioInput,
-    executable: &Path,
-) -> anyhow::Result<LaunchDescriptor> {
-    Ok(crate::codex::run_launch(
-        executable,
-        &interruption_request(input),
     ))
 }
 
@@ -380,7 +354,10 @@ pub(in crate::capture::record) async fn interruption(
     input: &ScenarioInput,
 ) -> anyhow::Result<()> {
     CodexProvider::handshake(session, input).await?;
-    let request = interruption_request(input);
+    let request = session
+        .request
+        .clone()
+        .expect("interruption is a Run scenario and always carries a request");
     let thread_id = start_thread(session, &request).await?;
     start_turn(session, &request, &thread_id).await?;
     let turn_id = wait_for_turn_started(session).await?;
@@ -415,26 +392,15 @@ fn codex_approval_prompt(cwd: &Path) -> String {
     )
 }
 
-// Called once by `approval_launch`, once by `approval` — see the note on
-// `fresh_text_request` above.
-fn approval_request(input: &ScenarioInput) -> RunRequest {
+/// Same one-call-per-recording contract as `fresh_text_request` above.
+pub(in crate::capture::record) fn approval_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
     let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
-    cheap_codex_request(
+    Ok(cheap_codex_request(
         &codex_approval_prompt(&cwd),
         input,
         RuntimeMode::ApprovalRequired,
-    )
-}
-
-/// SPAWN for `approval`: an ordinary run launch, built from the same request
-/// `approval` replays as its wire line.
-pub(in crate::capture::record) fn approval_launch(
-    input: &ScenarioInput,
-    executable: &Path,
-) -> anyhow::Result<LaunchDescriptor> {
-    Ok(crate::codex::run_launch(
-        executable,
-        &approval_request(input),
     ))
 }
 
@@ -462,9 +428,10 @@ fn approval_on_request_prompt(target: &Path) -> String {
     )
 }
 
-// Called once by `approval_on_request_launch`, once by `approval_on_request`
-// — see the note on `fresh_text_request` above.
-fn approval_on_request_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
+/// Same one-call-per-recording contract as `fresh_text_request` above.
+pub(in crate::capture::record) fn approval_on_request_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
     // `validate_on_request_preflight`'s doc comment explains why the deleted `recording.rs`
     // assertion against `normalize_run_request`'s cwd-dependent sandbox escalation is not ported:
     // the fence's own `repository_root` check makes that escalation unreachable for this
@@ -484,18 +451,6 @@ fn approval_on_request_request(input: &ScenarioInput) -> anyhow::Result<RunReque
         &approval_on_request_prompt(&target),
         input,
         RuntimeMode::AutoAcceptEdits,
-    ))
-}
-
-/// SPAWN for `approval-on-request`: an ordinary run launch, built from the
-/// same request `approval_on_request` replays as its wire line.
-pub(in crate::capture::record) fn approval_on_request_launch(
-    input: &ScenarioInput,
-    executable: &Path,
-) -> anyhow::Result<LaunchDescriptor> {
-    Ok(crate::codex::run_launch(
-        executable,
-        &approval_on_request_request(input)?,
     ))
 }
 
@@ -615,7 +570,10 @@ pub(in crate::capture::record) async fn approval(
     input: &ScenarioInput,
 ) -> anyhow::Result<()> {
     CodexProvider::handshake(session, input).await?;
-    let request = approval_request(input);
+    let request = session
+        .request
+        .clone()
+        .expect("approval is a Run scenario and always carries a request");
     let thread_id = start_thread(session, &request).await?;
     start_turn(session, &request, &thread_id).await?;
     let cwd = PathBuf::from(&request.cwd);
@@ -648,7 +606,10 @@ pub(in crate::capture::record) async fn approval_on_request(
     input: &ScenarioInput,
 ) -> anyhow::Result<()> {
     CodexProvider::handshake(session, input).await?;
-    let request = approval_on_request_request(input)?;
+    let request = session
+        .request
+        .clone()
+        .expect("approval-on-request is a Run scenario and always carries a request");
     let thread_id = start_thread(session, &request).await?;
     start_turn(session, &request, &thread_id).await?;
     let target = require_approval_target(input)?;
@@ -668,12 +629,36 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::capture::record::scenarios::ScenarioLaunch;
     use crate::capture::record::session::FenceOutcome;
     use crate::capture::test_support::{
         absolute_program, channel_payloads, config, contract_request, fixture_path,
     };
     use crate::capture::types::{Channel, CommandSnapshot};
     use crate::launch::StdioMode;
+
+    /// Starts a run-scenario `Session` exactly the way `record.rs`'s
+    /// `derive_launch`/`record_generic` now do: one `RunRequest`, used to
+    /// build both the launch and `Session::request` — never rebuilt by the
+    /// scenario body. Shared by every test below that drives a real spawn.
+    async fn start_codex_run_session(
+        scenario_name: &'static str,
+        executable: PathBuf,
+        raw_root: &Path,
+        request: RunRequest,
+    ) -> Session<CodexProvider> {
+        let launch = crate::codex::run_launch(&executable, &request);
+        let cfg = config(scenario_name, executable, "codex", raw_root);
+        Session::start(
+            CodexProvider::new(),
+            &cfg,
+            launch,
+            FenceOutcome::none(),
+            Some(request),
+        )
+        .await
+        .unwrap()
+    }
 
     #[test]
     fn codex_capture_uses_the_run_command_builder() {
@@ -694,68 +679,65 @@ mod tests {
         assert_eq!(snapshot.creation_flags, 0);
     }
 
-    /// Break caught: `fresh_text_launch` stops calling the production `crate::codex::run_launch`
-    /// and hand-builds (or hand-edits) a `LaunchDescriptor` instead.
+    /// Break caught: the `codex/fresh-text` row stops naming `fresh_text_request`, so
+    /// `record.rs`'s `derive_launch` would build its launch from the wrong request builder (or find
+    /// none at all).
     #[test]
-    fn fresh_text_launch_uses_the_production_run_launch() {
-        let exe = absolute_program("codex");
+    fn fresh_text_row_is_wired_to_fresh_text_request() {
         let input = ScenarioInput::default();
-
-        let launch = fresh_text_launch(&input, &exe).unwrap();
-        let expected = crate::codex::run_launch(&exe, &fresh_text_request(&input));
-
+        let spec = crate::capture::record::scenarios::scenario("codex", "fresh-text").unwrap();
+        let ScenarioLaunch::Run(build_request) = spec.launch else {
+            panic!("codex/fresh-text must be a Run scenario");
+        };
         assert_eq!(
-            CommandSnapshot::from_launch(&launch),
-            CommandSnapshot::from_launch(&expected)
+            build_request(&input).unwrap(),
+            fresh_text_request(&input).unwrap()
         );
     }
 
-    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for `resume`.
+    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for `resume`.
     #[test]
-    fn resume_launch_uses_the_production_run_launch() {
-        let exe = absolute_program("codex");
+    fn resume_row_is_wired_to_resume_request() {
         let input = ScenarioInput {
             resume_id: Some("resume-abc".into()),
             ..ScenarioInput::default()
         };
-
-        let launch = resume_launch(&input, &exe).unwrap();
-        let expected = crate::codex::run_launch(&exe, &resume_request(&input).unwrap());
-
+        let spec = crate::capture::record::scenarios::scenario("codex", "resume").unwrap();
+        let ScenarioLaunch::Run(build_request) = spec.launch else {
+            panic!("codex/resume must be a Run scenario");
+        };
         assert_eq!(
-            CommandSnapshot::from_launch(&launch),
-            CommandSnapshot::from_launch(&expected)
+            build_request(&input).unwrap(),
+            resume_request(&input).unwrap()
         );
     }
 
-    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for `steer`.
+    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for `steer`.
     #[test]
-    fn steer_launch_uses_the_production_run_launch() {
-        let exe = absolute_program("codex");
+    fn steer_row_is_wired_to_steer_request() {
         let input = ScenarioInput::default();
-
-        let launch = steer_launch(&input, &exe).unwrap();
-        let expected = crate::codex::run_launch(&exe, &steer_request(&input));
-
+        let spec = crate::capture::record::scenarios::scenario("codex", "steer").unwrap();
+        let ScenarioLaunch::Run(build_request) = spec.launch else {
+            panic!("codex/steer must be a Run scenario");
+        };
         assert_eq!(
-            CommandSnapshot::from_launch(&launch),
-            CommandSnapshot::from_launch(&expected)
+            build_request(&input).unwrap(),
+            steer_request(&input).unwrap()
         );
     }
 
-    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for
+    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for
     /// `interruption`.
     #[test]
-    fn interruption_launch_uses_the_production_run_launch() {
-        let exe = absolute_program("codex");
+    fn interruption_row_is_wired_to_interruption_request() {
         let input = ScenarioInput::default();
-
-        let launch = interruption_launch(&input, &exe).unwrap();
-        let expected = crate::codex::run_launch(&exe, &interruption_request(&input));
-
+        let spec = crate::capture::record::scenarios::scenario("codex", "interruption").unwrap();
+        let ScenarioLaunch::Run(build_request) = spec.launch else {
+            panic!("codex/interruption must be a Run scenario");
+        };
         assert_eq!(
-            CommandSnapshot::from_launch(&launch),
-            CommandSnapshot::from_launch(&expected)
+            build_request(&input).unwrap(),
+            interruption_request(&input).unwrap()
         );
     }
 
@@ -774,11 +756,9 @@ mod tests {
         let raw = tempfile::tempdir().unwrap();
         let executable = fixture_path("fake-codex");
         let input = ScenarioInput::default();
-        let launch = fresh_text_launch(&input, &executable).unwrap();
-        let cfg = config("fresh-text", executable, "codex", raw.path());
-        let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
-            .await
-            .unwrap();
+        let request = fresh_text_request(&input).unwrap();
+        let mut session =
+            start_codex_run_session("fresh-text", executable, raw.path(), request).await;
 
         fresh_text(&mut session, &input).await.unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -824,11 +804,8 @@ mod tests {
 
         let raw = tempfile::tempdir().unwrap();
         let executable = fixture_path("fake-codex");
-        let launch = steer_launch(&input, &executable).unwrap();
-        let cfg = config("steer", executable, "codex", raw.path());
-        let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
-            .await
-            .unwrap();
+        let request = steer_request(&input).unwrap();
+        let mut session = start_codex_run_session("steer", executable, raw.path(), request).await;
         steer(&mut session, &input).await.unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let capture = session.finish(deadline).await.unwrap();
@@ -848,11 +825,9 @@ mod tests {
 
         let raw = tempfile::tempdir().unwrap();
         let executable = fixture_path("fake-codex");
-        let launch = interruption_launch(&input, &executable).unwrap();
-        let cfg = config("interruption", executable, "codex", raw.path());
-        let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
-            .await
-            .unwrap();
+        let request = interruption_request(&input).unwrap();
+        let mut session =
+            start_codex_run_session("interruption", executable, raw.path(), request).await;
         interruption(&mut session, &input).await.unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let capture = session.finish(deadline).await.unwrap();
@@ -910,9 +885,15 @@ mod tests {
         let executable = fixture_path("fake-codex");
         let launch = crate::codex::run_launch(&executable, &request);
         let cfg = config("codex-linked-worktree", executable, "codex", raw.path());
-        let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
-            .await
-            .unwrap();
+        let mut session = Session::start(
+            CodexProvider::new(),
+            &cfg,
+            launch,
+            FenceOutcome::none(),
+            None,
+        )
+        .await
+        .unwrap();
 
         CodexProvider::handshake(&mut session, &ScenarioInput::default())
             .await
@@ -989,11 +970,8 @@ mod tests {
             resume_id: Some("resume-fail".into()),
             ..ScenarioInput::default()
         };
-        let launch = resume_launch(&input, &executable).unwrap();
-        let cfg = config("resume", executable, "codex", raw.path());
-        let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
-            .await
-            .unwrap();
+        let request = resume_request(&input).unwrap();
+        let mut session = start_codex_run_session("resume", executable, raw.path(), request).await;
 
         let error = resume(&mut session, &input).await.unwrap_err();
 
@@ -1019,11 +997,9 @@ mod tests {
             resume_id: Some("resume-success".into()),
             ..ScenarioInput::default()
         };
-        let launch = resume_launch(&input, &executable).unwrap();
-        let cfg = config("codex-resume-success", executable, "codex", raw.path());
-        let mut session = Session::start(CodexProvider::new(), &cfg, launch, FenceOutcome::none())
-            .await
-            .unwrap();
+        let request = resume_request(&input).unwrap();
+        let mut session =
+            start_codex_run_session("codex-resume-success", executable, raw.path(), request).await;
 
         resume(&mut session, &input).await.unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1043,38 +1019,36 @@ mod tests {
         );
     }
 
-    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for `approval`.
+    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for `approval`.
     #[test]
-    fn approval_launch_uses_the_production_run_launch() {
-        let exe = absolute_program("codex");
+    fn approval_row_is_wired_to_approval_request() {
         let input = ScenarioInput::default();
-
-        let launch = approval_launch(&input, &exe).unwrap();
-        let expected = crate::codex::run_launch(&exe, &approval_request(&input));
-
+        let spec = crate::capture::record::scenarios::scenario("codex", "approval").unwrap();
+        let ScenarioLaunch::Run(build_request) = spec.launch else {
+            panic!("codex/approval must be a Run scenario");
+        };
         assert_eq!(
-            CommandSnapshot::from_launch(&launch),
-            CommandSnapshot::from_launch(&expected)
+            build_request(&input).unwrap(),
+            approval_request(&input).unwrap()
         );
     }
 
-    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for
-    /// `approval_on_request`.
+    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for
+    /// `approval-on-request`.
     #[test]
-    fn approval_on_request_launch_uses_the_production_run_launch() {
-        let exe = absolute_program("codex");
+    fn approval_on_request_row_is_wired_to_approval_on_request_request() {
         let input = ScenarioInput {
             approval_target: Some(std::path::PathBuf::from("target-dir")),
             ..ScenarioInput::default()
         };
-
-        let launch = approval_on_request_launch(&input, &exe).unwrap();
-        let expected =
-            crate::codex::run_launch(&exe, &approval_on_request_request(&input).unwrap());
-
+        let spec =
+            crate::capture::record::scenarios::scenario("codex", "approval-on-request").unwrap();
+        let ScenarioLaunch::Run(build_request) = spec.launch else {
+            panic!("codex/approval-on-request must be a Run scenario");
+        };
         assert_eq!(
-            CommandSnapshot::from_launch(&launch),
-            CommandSnapshot::from_launch(&expected)
+            build_request(&input).unwrap(),
+            approval_on_request_request(&input).unwrap()
         );
     }
 
@@ -1141,10 +1115,10 @@ mod tests {
     /// bailed the instant anything but the single reviewed file-change request appeared;
     /// `pending_approval` has no such bookkeeping, so it just keeps answering.
     ///
-    /// Also pins the two things nothing else in this file's tests catch (`approval_launch_uses_
-    /// the_production_run_launch` builds its "expected" from the same `approval_request` call,
-    /// so it cannot tell a wrong runtime mode from a right one — see this test's own
-    /// falsification note in the task report):
+    /// Also pins the two things nothing else in this file's tests catch (`approval_row_is_wired_
+    /// to_approval_request` builds its "expected" from the same `approval_request` call, so it
+    /// cannot tell a wrong runtime mode from a right one — see this test's own falsification note
+    /// in the task report):
     /// - `RuntimeMode::ApprovalRequired` reaching the wire as `"approvalPolicy":"untrusted"` —
     ///   checked against a literal, not by calling `approval_request` again, so a production
     ///   regression to any other mode can't satisfy its own assertion.
@@ -1166,13 +1140,14 @@ mod tests {
             ..ScenarioInput::default()
         };
         let executable = fixture_path("fake-codex");
-        let launch = approval_launch(&input, &executable).unwrap();
+        let request = approval_request(&input).unwrap();
+        let launch = crate::codex::run_launch(&executable, &request);
         let cfg = config("approval", executable, "codex", raw.path());
         let fence = FenceOutcome {
             approval_cwd_identity: Some(cwd_identity),
             ..FenceOutcome::none()
         };
-        let mut session = Session::start(CodexProvider::new(), &cfg, launch, fence)
+        let mut session = Session::start(CodexProvider::new(), &cfg, launch, fence, Some(request))
             .await
             .unwrap();
         // Bounded, like `record/scenarios/claude.rs`'s equivalent test: the fixture reads a
@@ -1191,13 +1166,10 @@ mod tests {
         let capture = session.finish(deadline).await.unwrap();
 
         let (turn_start, decisions) = turn_start_and_decisions(&capture);
+        let expected_request = approval_request(&input).unwrap();
         assert_eq!(
             turn_start["params"],
-            crate::codex::turn_start_params(
-                &approval_request(&input),
-                "th-1",
-                &approval_request(&input).prompt
-            )
+            crate::codex::turn_start_params(&expected_request, "th-1", &expected_request.prompt)
         );
         assert_eq!(
             turn_start["params"]["approvalPolicy"], "untrusted",
@@ -1240,7 +1212,8 @@ mod tests {
             ..ScenarioInput::default()
         };
         let executable = fixture_path("fake-codex");
-        let launch = approval_launch(&input, &executable).unwrap();
+        let request = approval_request(&input).unwrap();
+        let launch = crate::codex::run_launch(&executable, &request);
         let cfg = config(
             "codex-approval-cwd-mismatch",
             executable,
@@ -1251,7 +1224,7 @@ mod tests {
             approval_cwd_identity: Some(mismatched_identity),
             ..FenceOutcome::none()
         };
-        let mut session = Session::start(CodexProvider::new(), &cfg, launch, fence)
+        let mut session = Session::start(CodexProvider::new(), &cfg, launch, fence, Some(request))
             .await
             .unwrap();
 
@@ -1300,14 +1273,15 @@ mod tests {
             ..ScenarioInput::default()
         };
         let executable = fixture_path("fake-codex");
-        let launch = approval_on_request_launch(&input, &executable).unwrap();
+        let request = approval_on_request_request(&input).unwrap();
+        let launch = crate::codex::run_launch(&executable, &request);
         let cfg = config("approval-on-request", executable, "codex", raw.path());
         let fence = FenceOutcome {
             approval_target: Some(target.path().into()),
             approval_target_identity: Some(target_identity),
             ..FenceOutcome::none()
         };
-        let mut session = Session::start(CodexProvider::new(), &cfg, launch, fence)
+        let mut session = Session::start(CodexProvider::new(), &cfg, launch, fence, Some(request))
             .await
             .unwrap();
         tokio::time::timeout(
@@ -1368,7 +1342,8 @@ mod tests {
             ..ScenarioInput::default()
         };
         let executable = fixture_path("fake-codex");
-        let launch = approval_on_request_launch(&input, &executable).unwrap();
+        let request = approval_on_request_request(&input).unwrap();
+        let launch = crate::codex::run_launch(&executable, &request);
         let cfg = config(
             "codex-approval-on-request-target-mismatch",
             executable,
@@ -1380,7 +1355,7 @@ mod tests {
             approval_target_identity: Some(mismatched_identity),
             ..FenceOutcome::none()
         };
-        let mut session = Session::start(CodexProvider::new(), &cfg, launch, fence)
+        let mut session = Session::start(CodexProvider::new(), &cfg, launch, fence, Some(request))
             .await
             .unwrap();
 
@@ -1436,8 +1411,11 @@ mod tests {
             ..ScenarioInput::default()
         };
         let cases = [
-            ("fresh-text", fresh_text_request(&plain).runtime_mode),
-            ("approval", approval_request(&plain).runtime_mode),
+            (
+                "fresh-text",
+                fresh_text_request(&plain).unwrap().runtime_mode,
+            ),
+            ("approval", approval_request(&plain).unwrap().runtime_mode),
             (
                 "approval-on-request",
                 approval_on_request_request(&with_target)
@@ -1445,8 +1423,11 @@ mod tests {
                     .runtime_mode,
             ),
             ("resume", resume_request(&with_resume).unwrap().runtime_mode),
-            ("steer", steer_request(&plain).runtime_mode),
-            ("interruption", interruption_request(&plain).runtime_mode),
+            ("steer", steer_request(&plain).unwrap().runtime_mode),
+            (
+                "interruption",
+                interruption_request(&plain).unwrap().runtime_mode,
+            ),
         ];
         for (name, mode) in cases {
             let spec = crate::capture::record::scenarios::scenario("codex", name)

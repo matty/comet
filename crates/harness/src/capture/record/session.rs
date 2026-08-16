@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail};
+use comet_proto::RunRequest;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::mpsc;
@@ -99,6 +100,13 @@ pub(super) struct Session<P: CaptureProvider> {
     pub(super) purpose: String,
     pub(super) command: CommandSnapshot,
     pub(super) fence: FenceOutcome,
+    /// The `RunRequest` `record.rs`'s `derive_launch` built THIS launch from
+    /// — `None` for a discovery scenario, which has no `RunRequest` at all.
+    /// A run scenario's body reads this instead of rebuilding its own
+    /// request, so the launch and the wire line can never describe two
+    /// different requests. See `ScenarioLaunch`'s own doc comment
+    /// (`scenarios.rs`) for the hazard this closes.
+    pub(super) request: Option<RunRequest>,
     pub(super) child: Option<Child>,
     pub(super) stdin: Option<ChildStdin>,
     pub(super) stdout_lines: mpsc::UnboundedReceiver<String>,
@@ -117,6 +125,7 @@ impl<P: CaptureProvider> Session<P> {
         config: &CaptureConfig,
         launch: LaunchDescriptor,
         mut fence: FenceOutcome,
+        request: Option<RunRequest>,
     ) -> anyhow::Result<Self> {
         let command = CommandSnapshot::from_launch(&launch);
         let cli_version = probe_version(&launch.program).await;
@@ -211,6 +220,7 @@ impl<P: CaptureProvider> Session<P> {
             purpose: config.purpose.into(),
             command,
             fence,
+            request,
             child: Some(child),
             stdin: Some(stdin),
             stdout_lines,
@@ -684,7 +694,7 @@ mod tests {
             "claude",
             raw.path(),
         );
-        let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
+        let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none(), None)
             .await
             .unwrap();
         let line = crate::claude::wire::user_message_line_with_images(&request.prompt, &[]);
@@ -765,6 +775,7 @@ mod tests {
                 creation_flags: 0,
             },
             fence: FenceOutcome::none(),
+            request: None,
             child: None,
             stdin: None,
             stdout_lines,
@@ -797,7 +808,7 @@ mod tests {
             crate::capture::record::scenarios::claude::model_discovery_launch(&input, &executable)
                 .unwrap();
         let cfg = config("claude-finish-deadline", executable, "claude", raw.path());
-        let session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
+        let session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none(), None)
             .await
             .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
@@ -818,7 +829,7 @@ mod tests {
             crate::capture::record::scenarios::claude::model_discovery_launch(&input, &executable)
                 .unwrap();
         let cfg = config("claude-wait-error", executable, "claude", raw.path());
-        let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
+        let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none(), None)
             .await
             .unwrap();
         let pid = session.child_id().expect("spawned child id");
@@ -868,6 +879,7 @@ mod tests {
                 &cfg,
                 launch,
                 FenceOutcome::none(),
+                None,
             ))
             .unwrap();
         let pid = session.child_id().expect("spawned child id");
@@ -896,7 +908,7 @@ mod tests {
             crate::capture::record::scenarios::claude::model_discovery_launch(&input, &missing)
                 .unwrap();
         let cfg = config("claude-pre-spawn-failure", missing, "claude", raw.path());
-        let result = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none()).await;
+        let result = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none(), None).await;
         let error = result
             .err()
             .expect("missing executable must fail before spawn");
@@ -934,7 +946,7 @@ mod tests {
             "claude",
             raw.path(),
         );
-        let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
+        let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none(), None)
             .await
             .unwrap();
         let directory = session.directory.clone();
@@ -992,7 +1004,7 @@ mod tests {
             ..FenceOutcome::none()
         };
 
-        let session = Session::start(ClaudeProvider, &cfg, launch, fence)
+        let session = Session::start(ClaudeProvider, &cfg, launch, fence, None)
             .await
             .unwrap();
 
@@ -1027,7 +1039,7 @@ mod tests {
             ..FenceOutcome::none()
         };
 
-        let error = match Session::start(ClaudeProvider, &cfg, launch, fence).await {
+        let error = match Session::start(ClaudeProvider, &cfg, launch, fence, None).await {
             Ok(_) => panic!("a failing recheck must abort before spawn"),
             Err(error) => error,
         };

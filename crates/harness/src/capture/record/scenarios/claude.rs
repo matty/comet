@@ -109,50 +109,47 @@ async fn claude_user_line(request: &RunRequest, require_image: bool) -> anyhow::
     ))
 }
 
-// `fresh_text_launch` and `fresh_text` (and the matching pairs for `resume`
-// and `attachment` below) each call this a second time rather than sharing
-// one computed value — the launch-on-the-row design (see the amendment on
-// `ScenarioSpec::launch`) means the launch and the body are built by two
-// separate calls with no shared state between them. The two calls cannot
-// diverge only because this stays a pure function of `input`: a future field
-// that reads something else (the clock, an env var, a counter) would make
-// the launch and the wire line disagree about what request was sent.
-fn fresh_text_request(input: &ScenarioInput) -> RunRequest {
-    cheap_claude_request(
+/// The `RunRequest` `record.rs`'s `derive_launch` calls exactly once per
+/// `fresh-text` recording: it builds `fresh-text`'s launch from this value,
+/// then hands the SAME value to `fresh_text` below (via `Session::request`),
+/// so the recorded argv and the recorded wire line can never describe two
+/// different requests — see `ScenarioLaunch`'s own doc comment for the hazard
+/// this closes.
+pub(in crate::capture::record) fn fresh_text_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
+    Ok(cheap_claude_request(
         "Reply with the single word capture.",
         input,
         RuntimeMode::AutoAcceptEdits,
-    )
-}
-
-/// SPAWN for `fresh-text`: an ordinary run launch, built from the same
-/// request `fresh_text` replays as its wire line.
-pub(in crate::capture::record) fn fresh_text_launch(
-    input: &ScenarioInput,
-    executable: &Path,
-) -> anyhow::Result<LaunchDescriptor> {
-    Ok(crate::claude::run_launch(
-        executable,
-        &fresh_text_request(input),
     ))
 }
 
 /// A plain text turn: write the user line through the production helper,
 /// then wait for the terminal result. No handshake — a Claude run never
-/// sends one; see `provider.rs`'s doc comment.
+/// sends one; see `provider.rs`'s doc comment. Reads the request `record.rs`
+/// already built for the launch (`Session::request`) rather than rebuilding
+/// it — see `fresh_text_request`'s own doc comment.
 pub(in crate::capture::record) async fn fresh_text(
     session: &mut Session<ClaudeProvider>,
-    input: &ScenarioInput,
+    _input: &ScenarioInput,
 ) -> anyhow::Result<()> {
-    let line = claude_user_line(&fresh_text_request(input), false).await?;
+    let request = session
+        .request
+        .clone()
+        .expect("fresh-text is a Run scenario and always carries a request");
+    let line = claude_user_line(&request, false).await?;
     session.send(&line).await?;
     session.wait_for_turn_end().await
 }
 
-// Called once by `resume_launch`, once by `resume` — see the note on
-// `fresh_text_request` above; the same "stays pure, so the two calls can't
-// disagree" reasoning applies here.
-fn resume_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
+/// The id reaches the CLI as `--resume=<id>` on the launch
+/// (`crate::claude::run_launch` reads `request.resume`), never as part of the
+/// wire line `resume`'s body sends — same one-call-per-recording contract as
+/// `fresh_text_request` above.
+pub(in crate::capture::record) fn resume_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
     let resume_id = input
         .resume_id
         .clone()
@@ -166,31 +163,23 @@ fn resume_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
     Ok(request)
 }
 
-/// SPAWN for `resume`: the id reaches the CLI as `--resume=<id>` on the
-/// launch (`crate::claude::run_launch` reads `request.resume`), never as
-/// part of the wire line `resume`'s body sends.
-pub(in crate::capture::record) fn resume_launch(
-    input: &ScenarioInput,
-    executable: &Path,
-) -> anyhow::Result<LaunchDescriptor> {
-    Ok(crate::claude::run_launch(
-        executable,
-        &resume_request(input)?,
-    ))
-}
-
 pub(in crate::capture::record) async fn resume(
     session: &mut Session<ClaudeProvider>,
-    input: &ScenarioInput,
+    _input: &ScenarioInput,
 ) -> anyhow::Result<()> {
-    let line = claude_user_line(&resume_request(input)?, false).await?;
+    let request = session
+        .request
+        .clone()
+        .expect("resume is a Run scenario and always carries a request");
+    let line = claude_user_line(&request, false).await?;
     session.send(&line).await?;
     session.wait_for_turn_end().await
 }
 
-// Called once by `attachment_launch`, once by `attachment` — see the note on
-// `fresh_text_request` above.
-fn attachment_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
+/// Same one-call-per-recording contract as `fresh_text_request` above.
+pub(in crate::capture::record) fn attachment_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
     let attachment = input
         .attachment
         .clone()
@@ -204,25 +193,19 @@ fn attachment_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
     Ok(request)
 }
 
-pub(in crate::capture::record) fn attachment_launch(
-    input: &ScenarioInput,
-    executable: &Path,
-) -> anyhow::Result<LaunchDescriptor> {
-    Ok(crate::claude::run_launch(
-        executable,
-        &attachment_request(input)?,
-    ))
-}
-
 /// The one scenario whose wire line must carry an inlined image ahead of the
 /// text — `require_image: true` is what makes `claude_user_line` fail loudly
 /// instead of silently recording a text-only capture when the attachment
 /// could not be inlined.
 pub(in crate::capture::record) async fn attachment(
     session: &mut Session<ClaudeProvider>,
-    input: &ScenarioInput,
+    _input: &ScenarioInput,
 ) -> anyhow::Result<()> {
-    let line = claude_user_line(&attachment_request(input)?, true).await?;
+    let request = session
+        .request
+        .clone()
+        .expect("attachment is a Run scenario and always carries a request");
+    let line = claude_user_line(&request, true).await?;
     session.send(&line).await?;
     session.wait_for_turn_end().await
 }
@@ -265,26 +248,14 @@ fn claude_checklist_resume_prompt() -> String {
     .to_owned()
 }
 
-// Called once by `checklist_launch`, once by `checklist` — see the note on
-// `fresh_text_request` above; the same "stays pure, so the two calls can't
-// disagree" reasoning applies here.
-fn checklist_request(input: &ScenarioInput) -> RunRequest {
-    cheap_claude_request(
+/// Same one-call-per-recording contract as `fresh_text_request` above.
+pub(in crate::capture::record) fn checklist_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
+    Ok(cheap_claude_request(
         &claude_checklist_prompt(),
         input,
         RuntimeMode::AutoAcceptEdits,
-    )
-}
-
-/// SPAWN for `checklist`: an ordinary run launch, built from the same request
-/// `checklist` replays as its wire line.
-pub(in crate::capture::record) fn checklist_launch(
-    input: &ScenarioInput,
-    executable: &Path,
-) -> anyhow::Result<LaunchDescriptor> {
-    Ok(crate::claude::run_launch(
-        executable,
-        &checklist_request(input),
     ))
 }
 
@@ -309,16 +280,23 @@ pub(in crate::capture::record) fn checklist_launch(
 /// that paid for it.
 pub(in crate::capture::record) async fn checklist(
     session: &mut Session<ClaudeProvider>,
-    input: &ScenarioInput,
+    _input: &ScenarioInput,
 ) -> anyhow::Result<()> {
-    let line = claude_user_line(&checklist_request(input), false).await?;
+    let request = session
+        .request
+        .clone()
+        .expect("checklist is a Run scenario and always carries a request");
+    let line = claude_user_line(&request, false).await?;
     session.send(&line).await?;
     session.wait_for_turn_end().await
 }
 
-// Called once by `checklist_resume_launch`, once by `checklist_resume` — see
-// the note on `fresh_text_request` above.
-fn checklist_resume_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
+/// The id reaches the CLI as `--resume=<id>` on the launch, never as part of
+/// the wire line the body sends — same split as `resume_request` above, and
+/// the same one-call-per-recording contract as `fresh_text_request`.
+pub(in crate::capture::record) fn checklist_resume_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
     let resume_id = input
         .resume_id
         .clone()
@@ -332,19 +310,6 @@ fn checklist_resume_request(input: &ScenarioInput) -> anyhow::Result<RunRequest>
     Ok(request)
 }
 
-/// SPAWN for `checklist-resume`: the id reaches the CLI as `--resume=<id>` on
-/// the launch, never as part of the wire line the body sends — same split as
-/// `resume_launch` above.
-pub(in crate::capture::record) fn checklist_resume_launch(
-    input: &ScenarioInput,
-    executable: &Path,
-) -> anyhow::Result<LaunchDescriptor> {
-    Ok(crate::claude::run_launch(
-        executable,
-        &checklist_resume_request(input)?,
-    ))
-}
-
 /// No session-identity check against `input.resume_id` — the abort-on-mismatch
 /// class this stage's design removes (§3.2), same as `resume` above. The old
 /// `recording.rs::claude_run` checked `value["session_id"] == request.resume`
@@ -352,9 +317,13 @@ pub(in crate::capture::record) fn checklist_resume_launch(
 /// still be worth recording, not a reason to throw the capture away.
 pub(in crate::capture::record) async fn checklist_resume(
     session: &mut Session<ClaudeProvider>,
-    input: &ScenarioInput,
+    _input: &ScenarioInput,
 ) -> anyhow::Result<()> {
-    let line = claude_user_line(&checklist_resume_request(input)?, false).await?;
+    let request = session
+        .request
+        .clone()
+        .expect("checklist-resume is a Run scenario and always carries a request");
+    let line = claude_user_line(&request, false).await?;
     session.send(&line).await?;
     session.wait_for_turn_end().await
 }
@@ -387,27 +356,15 @@ fn claude_approval_prompt(cwd: &Path) -> String {
     )
 }
 
-// Called once by `approval_launch`, once by `approval` — see the note on
-// `fresh_text_request` above; the same "stays pure, so the two calls can't
-// disagree" reasoning applies here.
-fn approval_request(input: &ScenarioInput) -> RunRequest {
+/// Same one-call-per-recording contract as `fresh_text_request` above.
+pub(in crate::capture::record) fn approval_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
     let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
-    cheap_claude_request(
+    Ok(cheap_claude_request(
         &claude_approval_prompt(&cwd),
         input,
         RuntimeMode::ApprovalRequired,
-    )
-}
-
-/// SPAWN for `approval`: an ordinary run launch, built from the same request
-/// `approval` replays as its wire line.
-pub(in crate::capture::record) fn approval_launch(
-    input: &ScenarioInput,
-    executable: &Path,
-) -> anyhow::Result<LaunchDescriptor> {
-    Ok(crate::claude::run_launch(
-        executable,
-        &approval_request(input),
     ))
 }
 
@@ -547,9 +504,12 @@ fn decision_response(request_id: &str, tool_name: &str, input: &Value, cwd: &Pat
 /// `bail!`, which would throw away tokens already spent.
 pub(in crate::capture::record) async fn approval(
     session: &mut Session<ClaudeProvider>,
-    input: &ScenarioInput,
+    _input: &ScenarioInput,
 ) -> anyhow::Result<()> {
-    let request = approval_request(input);
+    let request = session
+        .request
+        .clone()
+        .expect("approval is a Run scenario and always carries a request");
     let cwd = PathBuf::from(&request.cwd);
     let line = claude_user_line(&request, false).await?;
     session.send(&line).await?;
@@ -580,6 +540,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::capture::record::scenarios::ScenarioLaunch;
     use crate::capture::record::session::FenceOutcome;
     use crate::capture::test_support::{
         absolute_program, channel_payloads, config, contract_request, fixture_path,
@@ -633,66 +594,83 @@ mod tests {
         assert_eq!(snapshot.creation_flags, 0);
     }
 
-    /// Break caught: `fresh_text_launch` stops calling the production `crate::claude::run_launch`
-    /// and hand-builds (or hand-edits) a `LaunchDescriptor` instead — the same class of hole Task
-    /// 1's `command_discovery_launch` bypass would have shipped had it gone unnoticed.
-    /// `claude_capture_uses_the_run_command_builder` above only proves `run_launch` itself is
-    /// right; it never calls `fresh_text_launch`, so it cannot catch this.
+    /// Starts a run-scenario `Session` exactly the way `record.rs`'s
+    /// `derive_launch`/`record_generic` now do: one `RunRequest`, used to
+    /// build both the launch and `Session::request` — never rebuilt by the
+    /// scenario body. Shared by every test below that drives a real spawn.
+    async fn start_claude_run_session(
+        scenario_name: &'static str,
+        executable: PathBuf,
+        raw_root: &Path,
+        request: RunRequest,
+    ) -> Session<ClaudeProvider> {
+        let launch = crate::claude::run_launch(&executable, &request);
+        let cfg = config(scenario_name, executable, "claude", raw_root);
+        Session::start(
+            ClaudeProvider,
+            &cfg,
+            launch,
+            FenceOutcome::none(),
+            Some(request),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Break caught: the row's `launch` stops naming `fresh_text_request`, or stops being a
+    /// `ScenarioLaunch::Run` at all — `record.rs`'s `derive_launch` would then build `fresh-text`'s
+    /// launch from the wrong request (or fail to find one).
     #[test]
-    fn fresh_text_launch_uses_the_production_run_launch() {
-        let exe = absolute_program("claude");
+    fn fresh_text_row_is_wired_to_fresh_text_request() {
         let input = ScenarioInput::default();
-
-        let launch = fresh_text_launch(&input, &exe).unwrap();
-        let expected = crate::claude::run_launch(&exe, &fresh_text_request(&input));
-
+        let spec = crate::capture::record::scenarios::scenario("claude", "fresh-text").unwrap();
+        let ScenarioLaunch::Run(build_request) = spec.launch else {
+            panic!("claude/fresh-text must be a Run scenario");
+        };
         assert_eq!(
-            CommandSnapshot::from_launch(&launch),
-            CommandSnapshot::from_launch(&expected)
+            build_request(&input).unwrap(),
+            fresh_text_request(&input).unwrap()
         );
     }
 
-    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for `resume`.
+    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for `resume`.
     #[test]
-    fn resume_launch_uses_the_production_run_launch() {
-        let exe = absolute_program("claude");
+    fn resume_row_is_wired_to_resume_request() {
         let input = ScenarioInput {
             resume_id: Some("session-abc".into()),
             ..ScenarioInput::default()
         };
-
-        let launch = resume_launch(&input, &exe).unwrap();
-        let expected = crate::claude::run_launch(&exe, &resume_request(&input).unwrap());
-
+        let spec = crate::capture::record::scenarios::scenario("claude", "resume").unwrap();
+        let ScenarioLaunch::Run(build_request) = spec.launch else {
+            panic!("claude/resume must be a Run scenario");
+        };
         assert_eq!(
-            CommandSnapshot::from_launch(&launch),
-            CommandSnapshot::from_launch(&expected)
+            build_request(&input).unwrap(),
+            resume_request(&input).unwrap()
         );
     }
 
-    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for `attachment`.
+    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for `attachment`.
     #[test]
-    fn attachment_launch_uses_the_production_run_launch() {
-        let exe = absolute_program("claude");
+    fn attachment_row_is_wired_to_attachment_request() {
         let input = ScenarioInput {
             attachment: Some(PathBuf::from("tiny.png")),
             ..ScenarioInput::default()
         };
-
-        let launch = attachment_launch(&input, &exe).unwrap();
-        let expected = crate::claude::run_launch(&exe, &attachment_request(&input).unwrap());
-
+        let spec = crate::capture::record::scenarios::scenario("claude", "attachment").unwrap();
+        let ScenarioLaunch::Run(build_request) = spec.launch else {
+            panic!("claude/attachment must be a Run scenario");
+        };
         assert_eq!(
-            CommandSnapshot::from_launch(&launch),
-            CommandSnapshot::from_launch(&expected)
+            build_request(&input).unwrap(),
+            attachment_request(&input).unwrap()
         );
     }
 
     /// Break caught: `resume_request` stops setting `request.resume`, so the launch silently
-    /// starts a fresh session under the `resume` scenario name instead of resuming one — a
-    /// mislabeled capture the parity test above cannot catch, because it builds "expected" from
-    /// the same `resume_request` call. This is a pre-spawn check on the built launch descriptor,
-    /// not a frame check, so it is not the class of check this stage's design removes.
+    /// starts a fresh session under the `resume` scenario name instead of resuming one. This is a
+    /// pre-spawn check on the built launch descriptor, not a frame check, so it is not the class
+    /// of check this stage's design removes.
     #[test]
     fn resume_launch_passes_the_resume_id_as_a_launch_argument() {
         let exe = absolute_program("claude");
@@ -701,7 +679,7 @@ mod tests {
             ..ScenarioInput::default()
         };
 
-        let launch = resume_launch(&input, &exe).unwrap();
+        let launch = crate::claude::run_launch(&exe, &resume_request(&input).unwrap());
         let snapshot = CommandSnapshot::from_launch(&launch);
 
         assert!(
@@ -727,11 +705,9 @@ mod tests {
         let raw = tempfile::tempdir().unwrap();
         let executable = fixture_path("fake-claude");
         let input = ScenarioInput::default();
-        let launch = fresh_text_launch(&input, &executable).unwrap();
-        let cfg = config("fresh-text", executable, "claude", raw.path());
-        let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
-            .await
-            .unwrap();
+        let request = fresh_text_request(&input).unwrap();
+        let mut session =
+            start_claude_run_session("fresh-text", executable, raw.path(), request).await;
 
         fresh_text(&mut session, &input).await.unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -778,11 +754,9 @@ mod tests {
             ..ScenarioInput::default()
         };
         let executable = fixture_path("fake-claude");
-        let launch = attachment_launch(&input, &executable).unwrap();
-        let cfg = config("attachment", executable, "claude", raw.path());
-        let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
-            .await
-            .unwrap();
+        let request = attachment_request(&input).unwrap();
+        let mut session =
+            start_claude_run_session("attachment", executable, raw.path(), request).await;
 
         attachment(&mut session, &input).await.unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -794,37 +768,36 @@ mod tests {
         assert_eq!(first["message"]["content"][1]["type"], "text");
     }
 
-    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for `checklist`.
+    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for `checklist`.
     #[test]
-    fn checklist_launch_uses_the_production_run_launch() {
-        let exe = absolute_program("claude");
+    fn checklist_row_is_wired_to_checklist_request() {
         let input = ScenarioInput::default();
-
-        let launch = checklist_launch(&input, &exe).unwrap();
-        let expected = crate::claude::run_launch(&exe, &checklist_request(&input));
-
+        let spec = crate::capture::record::scenarios::scenario("claude", "checklist").unwrap();
+        let ScenarioLaunch::Run(build_request) = spec.launch else {
+            panic!("claude/checklist must be a Run scenario");
+        };
         assert_eq!(
-            CommandSnapshot::from_launch(&launch),
-            CommandSnapshot::from_launch(&expected)
+            build_request(&input).unwrap(),
+            checklist_request(&input).unwrap()
         );
     }
 
-    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for
+    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for
     /// `checklist-resume`.
     #[test]
-    fn checklist_resume_launch_uses_the_production_run_launch() {
-        let exe = absolute_program("claude");
+    fn checklist_resume_row_is_wired_to_checklist_resume_request() {
         let input = ScenarioInput {
             resume_id: Some("session-abc".into()),
             ..ScenarioInput::default()
         };
-
-        let launch = checklist_resume_launch(&input, &exe).unwrap();
-        let expected = crate::claude::run_launch(&exe, &checklist_resume_request(&input).unwrap());
-
+        let spec =
+            crate::capture::record::scenarios::scenario("claude", "checklist-resume").unwrap();
+        let ScenarioLaunch::Run(build_request) = spec.launch else {
+            panic!("claude/checklist-resume must be a Run scenario");
+        };
         assert_eq!(
-            CommandSnapshot::from_launch(&launch),
-            CommandSnapshot::from_launch(&expected)
+            build_request(&input).unwrap(),
+            checklist_resume_request(&input).unwrap()
         );
     }
 
@@ -839,7 +812,7 @@ mod tests {
             ..ScenarioInput::default()
         };
 
-        let launch = checklist_resume_launch(&input, &exe).unwrap();
+        let launch = crate::claude::run_launch(&exe, &checklist_resume_request(&input).unwrap());
         let snapshot = CommandSnapshot::from_launch(&launch);
 
         assert!(
@@ -863,11 +836,9 @@ mod tests {
         let raw = tempfile::tempdir().unwrap();
         let executable = fixture_path("fake-claude");
         let input = ScenarioInput::default();
-        let launch = checklist_launch(&input, &executable).unwrap();
-        let cfg = config("checklist", executable, "claude", raw.path());
-        let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
-            .await
-            .unwrap();
+        let request = checklist_request(&input).unwrap();
+        let mut session =
+            start_claude_run_session("checklist", executable, raw.path(), request).await;
 
         checklist(&mut session, &input).await.unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -910,18 +881,17 @@ mod tests {
         assert_eq!(capture.exit_code, Some(0));
     }
 
-    /// Break caught: same as `fresh_text_launch_uses_the_production_run_launch`, for `approval`.
+    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for `approval`.
     #[test]
-    fn approval_launch_uses_the_production_run_launch() {
-        let exe = absolute_program("claude");
+    fn approval_row_is_wired_to_approval_request() {
         let input = ScenarioInput::default();
-
-        let launch = approval_launch(&input, &exe).unwrap();
-        let expected = crate::claude::run_launch(&exe, &approval_request(&input));
-
+        let spec = crate::capture::record::scenarios::scenario("claude", "approval").unwrap();
+        let ScenarioLaunch::Run(build_request) = spec.launch else {
+            panic!("claude/approval must be a Run scenario");
+        };
         assert_eq!(
-            CommandSnapshot::from_launch(&launch),
-            CommandSnapshot::from_launch(&expected)
+            build_request(&input).unwrap(),
+            approval_request(&input).unwrap()
         );
     }
 
@@ -981,11 +951,9 @@ mod tests {
         let raw = tempfile::tempdir().unwrap();
         let executable = fixture_path("fake-claude");
         let input = ScenarioInput::default();
-        let launch = approval_launch(&input, &executable).unwrap();
-        let cfg = config("approval", executable, "claude", raw.path());
-        let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
-            .await
-            .unwrap();
+        let request = approval_request(&input).unwrap();
+        let mut session =
+            start_claude_run_session("approval", executable, raw.path(), request).await;
 
         // Bounded, unlike the other scenario tests in this file: the fixture below
         // (`approval_three_requests`) reads a reply off stdin before emitting its next line, so a
@@ -1102,9 +1070,9 @@ mod tests {
         let raw = tempfile::tempdir().unwrap();
         let executable = fixture_path("fake-claude");
         let input = ScenarioInput::default();
-        let launch = approval_launch(&input, &executable).unwrap();
+        let launch = crate::claude::run_launch(&executable, &approval_request(&input).unwrap());
         let cfg = config("approval", executable, "claude", raw.path());
-        let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none())
+        let mut session = Session::start(ClaudeProvider, &cfg, launch, FenceOutcome::none(), None)
             .await
             .unwrap();
 
@@ -1194,14 +1162,17 @@ mod tests {
             ..ScenarioInput::default()
         };
         let cases = [
-            ("fresh-text", fresh_text_request(&plain).runtime_mode),
-            ("approval", approval_request(&plain).runtime_mode),
+            (
+                "fresh-text",
+                fresh_text_request(&plain).unwrap().runtime_mode,
+            ),
+            ("approval", approval_request(&plain).unwrap().runtime_mode),
             ("resume", resume_request(&with_resume).unwrap().runtime_mode),
             (
                 "attachment",
                 attachment_request(&with_attachment).unwrap().runtime_mode,
             ),
-            ("checklist", checklist_request(&plain).runtime_mode),
+            ("checklist", checklist_request(&plain).unwrap().runtime_mode),
             (
                 "checklist-resume",
                 checklist_resume_request(&with_resume).unwrap().runtime_mode,
