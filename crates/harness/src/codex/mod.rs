@@ -298,6 +298,8 @@ pub struct CodexHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
+    /// Bound on initialize plus thread resume/start. It never covers a turn.
+    startup_timeout: Duration,
     /// One `model/list` per boot. `models()` is also called by titling
     /// (`crates/engine/src/titles.rs:159`) on every title generation, so an
     /// uncached discovery would spawn an app-server on a path the user never
@@ -313,6 +315,7 @@ impl Default for CodexHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
+            startup_timeout: Duration::from_secs(120),
             discovery_cache: crate::discovery::DiscoveryCache::default(),
             codex_home: None,
         }
@@ -395,6 +398,12 @@ impl CodexHarness {
     pub fn with_graces(mut self, interrupt_grace: Duration, kill_grace: Duration) -> Self {
         self.interrupt_grace = interrupt_grace;
         self.kill_grace = kill_grace;
+        self
+    }
+
+    /// Tune the initialize and thread setup bound. Running turns are unbounded.
+    pub fn with_startup_timeout(mut self, timeout: Duration) -> Self {
+        self.startup_timeout = timeout;
         self
     }
 
@@ -519,6 +528,7 @@ impl Harness for CodexHarness {
             request,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
+            startup_timeout: self.startup_timeout,
             stderr_tail,
         }));
 
@@ -542,6 +552,7 @@ struct Session {
     request: RunRequest,
     interrupt_grace: Duration,
     kill_grace: Duration,
+    startup_timeout: Duration,
     /// Rolling stderr tail for the crash message on an unexpected exit.
     stderr_tail: crate::StderrTail,
 }
@@ -632,6 +643,7 @@ async fn run_session(session: Session) {
         request,
         interrupt_grace,
         kill_grace,
+        startup_timeout: _startup_timeout,
         stderr_tail,
     } = session;
     let RunControls {
