@@ -38,30 +38,19 @@ pub struct ScenarioInput {
     pub approval_target: Option<PathBuf>,
 }
 
-/// What the binary must have collected before this scenario may run — read
-/// by `comet-provider-capture.rs`'s argument validation, which looks the row
-/// up by `(provider, name)` and checks each flag against what was supplied
-/// instead of hand-coding a per-scenario `if` chain.
+/// What the binary must have collected before this scenario may run — read by
+/// `comet-provider-capture.rs`'s argument validation, which looks the row up by
+/// `(provider, name)` instead of hand-coding a per-scenario `if` chain.
 ///
-/// `needs_cwd` is not "may I pass --cwd" (every scenario tolerates the
-/// flag); it is "does this scenario's behavior vary by cwd at all". False
-/// only for the cwd-independent discovery scenarios (`model-discovery` and
-/// Codex's `model-discovery-logged-out`) — those always run from a neutral
-/// temp directory regardless of what `--cwd` names. True everywhere else,
-/// including every run scenario: an omitted `--cwd` still resolves to the
-/// caller's current directory for those, not a temp directory.
+/// `needs_cwd` means "does this scenario's behavior vary by cwd at all", not "may I pass --cwd"
+/// (every scenario tolerates the flag). False only for the cwd-independent discovery scenarios
+/// (`model-discovery` and Codex's `model-discovery-logged-out`), which always run from a neutral
+/// temp directory regardless of `--cwd`. True everywhere else, including every run scenario.
 ///
-/// `model-discovery` used to have two cwd-varying siblings,
-/// `-neutral-cwd` and `-project-cwd`, kept as separate rows because D80
-/// insisted the question be settled by a real CLI rather than by reading
-/// the table. A 2026-08-16 re-capture against Claude 2.1.233 and Codex
-/// 0.147.0 answered it: all three rows' replies differ only by `pid` (a
-/// per-process value the sanitizer redacts) for Claude, and are
-/// byte-identical for Codex — `--bare` discovery is cwd-independent for
-/// both providers, full stop. `command-discovery` is the scenario where cwd
-/// actually changes the reply (D32's 66-vs-63 commands belongs to it, not
-/// to this family). The two siblings are deleted; see `docs/debt/closed.md`
-/// D80 for the evidence.
+/// `model-discovery` used to have cwd-varying siblings `-neutral-cwd`/`-project-cwd`; a real
+/// capture proved `--bare` discovery is cwd-independent for both providers (`command-discovery`
+/// is where cwd actually changes the reply — D32). The siblings are deleted; see
+/// `docs/debt/closed.md` D80 for the evidence.
 #[derive(Clone, Copy, Debug)]
 pub struct Requirements {
     pub spends_tokens: bool,
@@ -109,17 +98,12 @@ pub struct ScenarioSpec {
     /// `CaptureProvider`'s doc comment for why: which launch a scenario
     /// needs varies per scenario as well as per provider.
     pub(super) launch: ScenarioLaunch,
-    /// The pre-spawn fence, per row — closes D79. Selection used to be
-    /// *derived* in `record.rs`'s `codex_fence` from
-    /// `spec.runtime_mode == Some(RuntimeMode::ApprovalRequired)`, so a
-    /// future Codex row that legitimately wanted `ApprovalRequired` for some
-    /// other reason would have silently inherited the Windows-only trusted-
-    /// PowerShell fence. Every row now names its own fence explicitly;
-    /// [`no_fence`] is the default for sixteen of the twenty rows, the two
-    /// Codex approval rows point at `super::codex_fence`, and both
-    /// providers' `full-access` row points at `super::full_access_fence` —
-    /// see that function's own doc comment for why full access needs a
-    /// fence with no approval channel to protect.
+    /// The pre-spawn fence, per row — closes D79. Selection used to be derived from
+    /// `spec.runtime_mode == Some(RuntimeMode::ApprovalRequired)`, so a future Codex row wanting
+    /// `ApprovalRequired` for an unrelated reason would have silently inherited the Windows-only
+    /// trusted-PowerShell fence. Every row now names its own fence: [`no_fence`] by default, the
+    /// two Codex approval rows point at `super::codex_fence`, and both providers' `full-access`
+    /// row points at `super::full_access_fence`.
     pub(super) fence:
         fn(&ScenarioSpec, &CaptureConfig, &LaunchDescriptor) -> anyhow::Result<FenceOutcome>,
     pub(super) body: ScenarioBody,
@@ -139,21 +123,17 @@ pub(super) fn no_fence(
     Ok(FenceOutcome::none())
 }
 
-/// What a row's `launch` needs to build. A discovery scenario resolves a
-/// `LaunchDescriptor` directly — it never starts a turn, so there is no
-/// `RunRequest` to speak of. A run scenario instead names a builder that
-/// produces a `RunRequest`, and `record.rs` (`derive_launch`) is the ONLY
-/// caller that ever invokes it: it builds the `RunRequest` once, derives the
-/// launch from it via the provider's own `run_launch`, and hands that same
-/// `RunRequest` to the scenario body through `Session::request`. Before this
-/// enum existed, a row's `launch` field was always a bare
-/// `fn(&ScenarioInput, &Path) -> anyhow::Result<LaunchDescriptor>` — every run
-/// scenario's `*_launch` wrapper called its own `*_request` builder to
-/// satisfy that shape, and the scenario body separately called the same
-/// builder again to build its wire line. Two independent calls agreed only
-/// because every builder happened to be a pure function of `input`; nothing
-/// enforced it. Routing both the launch and the body through one call closes
-/// that hole structurally instead of by convention.
+/// What a row's `launch` needs to build. A discovery scenario resolves a `LaunchDescriptor`
+/// directly (no turn, no `RunRequest`). A run scenario instead names a builder that produces a
+/// `RunRequest`, and `record.rs`'s `derive_launch` is the ONLY caller that ever invokes it: it
+/// builds the `RunRequest` once, derives the launch from it, and hands that same value to the
+/// scenario body through `Session::request`.
+///
+/// Before this enum existed, a row's `launch` was a bare `fn(&ScenarioInput, &Path) ->
+/// anyhow::Result<LaunchDescriptor>`, and the scenario body separately called the same
+/// `*_request` builder again for its wire line — the two independent calls agreed only because
+/// every builder happened to be pure, which nothing enforced. Routing both through one call
+/// closes that hole structurally instead of by convention.
 #[derive(Clone, Copy)]
 pub(super) enum ScenarioLaunch {
     Run(fn(&ScenarioInput) -> anyhow::Result<RunRequest>),
@@ -505,18 +485,13 @@ mod tests {
         }
     }
 
-    /// `ScenarioBody` is `pub(super)`, invisible outside `capture::record`,
-    /// so this is the one place that can check it: `record()` dispatches on
-    /// `spec.body`'s own variant (`ScenarioBody::Claude` → `record_claude`,
-    /// `ScenarioBody::Codex` → `record_codex`), never on the row's declared
-    /// `provider` field. A row whose `provider` disagrees with its `body`
-    /// variant would silently run under the wrong provider's launch and
-    /// session machinery — this is the falsification target the task brief
-    /// names directly ("add a row whose body is the wrong provider
-    /// variant").
+    /// `ScenarioBody` is `pub(super)`, so this is the one place that can check it: `record()`
+    /// dispatches on `spec.body`'s own variant, never on the row's declared `provider` field. A
+    /// row whose `provider` disagrees with its `body` variant would silently run under the wrong
+    /// provider's launch and session machinery.
     ///
-    /// Break caught: swap one row's `body` for the other provider's variant
-    /// while leaving `provider` alone.
+    /// Break caught: swap one row's `body` for the other provider's variant while leaving
+    /// `provider` alone.
     #[test]
     fn every_row_s_declared_provider_matches_its_body_variant() {
         for spec in SCENARIOS {

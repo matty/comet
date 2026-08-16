@@ -22,19 +22,14 @@ fn payload(scenario: &str, sequence: u64) -> Value {
         .unwrap_or_else(|error| panic!("{scenario} frame {sequence} is not JSON: {error}"))
 }
 
-/// `remoteControl/status/changed` lands between initialize and the
-/// `model/list` reply, so id-based matching in
-/// `crates/harness/src/codex/discovery.rs` must skip notifications rather
-/// than take the next frame. The `model/list` reply's `id` must equal its
-/// own request's `id` — the join, restored on the stage-6 re-capture; the
-/// pre-promotion corpus lost it at recording time, not at sanitizing (commit
-/// history has the finding).
+/// `remoteControl/status/changed` lands between initialize and the `model/list` reply, so
+/// id-based matching in `crates/harness/src/codex/discovery.rs` must skip notifications rather
+/// than take the next frame. The `model/list` reply's `id` must equal its own request's `id`.
 ///
-/// The initialize reply stays pinned to sequence 2: it is the direct
-/// synchronous response to the initialize request at sequence 1, and nothing
-/// unsolicited can land before the very first reply. The notification and
-/// the `model/list` request/reply are found by predicate instead, since
-/// their own sequence numbers shift between otherwise identical runs.
+/// The initialize reply stays pinned to sequence 2 (the direct synchronous response to sequence
+/// 1, and nothing unsolicited can land before the first reply). The notification and the
+/// `model/list` request/reply are found by predicate instead, since their sequence numbers shift
+/// between otherwise identical runs.
 #[test]
 fn codex_discovery_interleaves_a_notification_before_the_model_list_reply() {
     let initialize = payload(CODEX_MODEL_DISCOVERY, 2);
@@ -271,12 +266,10 @@ fn task_update_splits_status_change_and_active_form_across_two_frames() {
 /// frame updates an id it never created — so a per-run accumulator receives a
 /// status change for an unknown item.
 ///
-/// D73 closed at the stage-6 promotion, redacting `.message.content[].input.taskId`.
-/// This scenario has no TaskCreate frame to cross-check the literal
-/// `.tool_use_result.taskId` against (the task predates the resume), so the
-/// join is proven the other way this corpus still can: two separate update
-/// calls in the same resumed run carry the same redacted `input.taskId`
-/// placeholder, meaning they name the same task.
+/// D73 redacts `.message.content[].input.taskId`, and this scenario has no TaskCreate frame to
+/// cross-check against, so the join is proven by placeholder identity instead: two separate
+/// update calls in the same resumed run carry the same redacted `input.taskId` placeholder,
+/// meaning they name the same task.
 #[test]
 fn a_resumed_run_updates_a_task_it_never_created() {
     let init = payload(CHECKLIST_RESUME, 2);
@@ -325,15 +318,11 @@ fn subagent_tool_use_joins_its_own_task_started() {
     );
 }
 
-/// `task_progress` and both terminal `task_notification` readings carry a
-/// `usage` object with `total_tokens`/`tool_uses`/`duration_ms` — the field
-/// set `fake_claude.rs`'s hand-typed literals reproduce with real numbers.
-/// The literal numbers themselves are not checked here (nor loadable at all:
-/// none of `.usage.total_tokens`/`.usage.tool_uses`/`.usage.duration_ms`
-/// under a `task_progress`/`task_notification` frame is on
-/// `capture/allowlist/claude.txt`, so the real values are `<Vn>`
-/// placeholders in this corpus) — this proves the *shape* the fixture claims
-/// against the genuine bytes, which is what is actually checkable.
+/// `task_progress` and both terminal `task_notification` readings carry a `usage` object with
+/// `total_tokens`/`tool_uses`/`duration_ms` — the field set `fake_claude.rs`'s hand-typed
+/// literals reproduce. The literal numbers aren't checked (none of those three paths are on
+/// `capture/allowlist/claude.txt`, so the real values are `<Vn>` placeholders here) — this test
+/// proves the *shape* only, which is what is actually checkable against genuine bytes.
 #[test]
 fn subagent_progress_and_notification_carry_a_usage_object() {
     let progress = payload(SUBAGENT, 121);
@@ -361,16 +350,12 @@ fn subagent_progress_and_notification_carry_a_usage_object() {
     assert_eq!(notification["status"], "completed");
 }
 
-/// A SendMessage-resumed subagent invocation reuses the FIRST invocation's
-/// `task_id` under a brand new `tool_use_id` — exactly the shape
-/// `fake_claude.rs`'s `happy()` fixture exercises with its own second
-/// `task_started` (same `"sub-1-task"`, new `"sub-2"`), which is what proves
-/// `normalize.rs`'s `subagent_progress.remove(&f.task_id)` on `task_started`
-/// through a real spawn: without it, the resumed terminal reading would be
-/// compared against the first invocation's already-terminal one and dropped
-/// as redundant even though the summary differs. This test is the corpus-side
-/// half of that claim — that the real provider actually resumes this way, not
-/// just that the fixture's hand-typed replay of it decodes correctly.
+/// A SendMessage-resumed subagent invocation reuses the FIRST invocation's `task_id` under a
+/// brand new `tool_use_id` — the shape that proves `normalize.rs`'s
+/// `subagent_progress.remove(&f.task_id)` on `task_started` is necessary: without it, the
+/// resumed terminal reading would be compared against the first invocation's already-terminal
+/// one and dropped as redundant even though the summary differs. This is the corpus-side proof
+/// that the real provider resumes this way, complementing `fake_claude.rs`'s hand-typed replay.
 #[test]
 fn a_resumed_subagent_task_started_reuses_the_task_id_under_a_new_tool_use_id() {
     let first_started = payload(SUBAGENT, 116);
