@@ -1166,7 +1166,7 @@ fn is_mcp_tool_identity(value: &Value) -> bool {
 /// the same collapsed path (`{path}[]`), so a novel array mixing a string
 /// and a number — `["a", 5]` — hands two different `Value` variants to the
 /// same path in a single walk.
-/// `probe_mixed_type_values_reach_describe_shape` proves it directly.
+/// `mixed_type_values_at_one_path_report_as_mixed` proves it directly.
 ///
 /// What genuinely cannot reach here: `Bool`/`Null`/`Array`/`Object`, and an
 /// empty slice. `sanitize_value_tree` (line 691) routes only `String`/

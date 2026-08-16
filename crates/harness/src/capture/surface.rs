@@ -58,8 +58,13 @@ pub struct FieldObservation {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SurfaceError {
-    #[error("corpus root {root} could not be read")]
-    UnreadableRoot { root: PathBuf },
+    /// `reason` carries `promoted_scenarios`'s own error chain, which names
+    /// the actual provider/version/scenario directory that failed to read —
+    /// `root` alone would otherwise be the only path in this message even
+    /// when the failure is three levels deeper, misreporting a bad
+    /// `claude/2.1.228` entry as the corpus root itself being unreadable.
+    #[error("corpus root {root} could not be walked: {reason}")]
+    UnreadableRoot { root: PathBuf, reason: String },
     #[error("corpus root {root} holds no promoted scenario")]
     EmptyCorpus { root: PathBuf },
     #[error("{scenario} has events that are not valid capture JSON")]
@@ -184,9 +189,10 @@ pub type Vocabulary = BTreeMap<(String, String, Direction), BTreeMap<String, BTr
 pub fn observe_surface(
     corpus_root: &Path,
 ) -> Result<(Vec<FieldObservation>, Vocabulary), SurfaceError> {
-    let scenarios = super::corpus::promoted_scenarios(corpus_root).map_err(|_| {
+    let scenarios = super::corpus::promoted_scenarios(corpus_root).map_err(|error| {
         SurfaceError::UnreadableRoot {
             root: corpus_root.to_owned(),
+            reason: format!("{error:#}"),
         }
     })?;
     if scenarios.is_empty() {

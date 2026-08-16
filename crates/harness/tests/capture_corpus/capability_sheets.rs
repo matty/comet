@@ -486,6 +486,11 @@ fn a_sheet_with_no_corresponding_corpus_version_fails() {
         !failures[0].contains("claude-9.9.9.md"),
         "the seeded, matching sheet must not be reported: {failures:?}"
     );
+    assert!(
+        failures[0].contains("no longer has"),
+        "claude/0.0.0 does not exist on disk at all, so this must take the genuinely-gone \
+         branch, not the still-exists-but-empty one its sibling test below covers: {failures:?}"
+    );
 }
 
 /// Break caught (review finding, 2026-08-16): the orphan scan used to report
