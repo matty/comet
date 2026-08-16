@@ -162,18 +162,32 @@ a third provider having a *recording* to design against, not added ahead of
 one, and neither value varies per scenario the way `launch`/`fence` do (the
 reason those two live on the row rather than the trait).
 
-**Residual, found by this task's falsification and left open on purpose.**
-Pointing a *non-approval* Codex row (`steer`) at `codex_fence` and running the
-full `comet-harness` suite (500 tests) found nothing that fails. The reason:
-every test that reaches `spec.fence` at all does so either by calling
-`record()` end-to-end for a scenario that already names the right fence
-(`approval`, `approval-on-request`, and the no-fence rows), or by hand-building
-a `Session` directly with `FenceOutcome::none()` and never touching `spec.fence`
-in the first place (`start_codex_run_session`, `record/scenarios/codex.rs`).
-No test iterates `SCENARIOS` checking each row's `fence` against an expected
-table the way `every_run_rows_request_builder_is_pure_and_derives_its_own_launch`
-does for `launch`. So the hazard this closes — *derivation* from an unrelated
-field — is gone, but *declaring the wrong function* on a row is still caught by
-nobody. A future `EXPECTED_FENCES`-style table, mirroring the existing
-`EXPECTED_RUN_BUILDERS` one, would close it the same way.
+**Residual, found by this task's falsification — closed.** Pointing a
+*non-approval* Codex row (`steer`) at `codex_fence` and running the full
+`comet-harness` suite (500 tests) found nothing that fails at the time this
+task landed. The reason: every test that reached `spec.fence` at all did so
+either by calling `record()` end-to-end for a scenario that already names the
+right fence (`approval`, `approval-on-request`, and the no-fence rows), or by
+hand-building a `Session` directly with `FenceOutcome::none()` and never
+touching `spec.fence` in the first place (`start_codex_run_session`,
+`record/scenarios/codex.rs`). No test iterated `SCENARIOS` checking each
+row's `fence` against an expected table the way
+`every_run_rows_request_builder_is_pure_and_derives_its_own_launch` does for
+`launch`. So the hazard this closed — *derivation* from an unrelated field —
+was gone, but *declaring the wrong function* on a row was still caught by
+nobody.
+
+`scenario-request-builders`'s fix pass (2026-08-16) closed it: a fourth loop,
+`every_row_s_fence_matches_the_kind_its_name_declares` (`record.rs`), checks
+every `SCENARIOS` row's `fence` against an exhaustive `(Provider, name,
+expected kind)` table — the `EXPECTED_FENCES`-style table this entry named as
+the future fix. It does not compare `spec.fence` by function-pointer identity
+(`std::ptr::fn_addr_eq` is not reliable across codegen units); it fingerprints
+by observable behavior instead — `codex_fence`'s very first statement in both
+of its branches reads `launch.cwd`, so calling a row's fence with a `cwd:
+None` launch reliably tells `codex_fence` (errors, naming the missing cwd)
+apart from `no_fence` (always `Ok`), with no real filesystem state needed.
+Falsified by pointing `steer` at `codex_fence` — the same probe that found
+this residual — and confirming the new loop fails naming the row, then
+restoring.
 

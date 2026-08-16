@@ -1161,6 +1161,161 @@ mod tests {
         );
     }
 
+    /// Closes D79's own recorded residual (`docs/debt/closed.md`): Task 4 moved fence selection
+    /// onto each row (`scenarios::no_fence` for eighteen rows, `codex_fence` for the two Codex
+    /// approval rows), but nothing checked a row's `fence` field against what it SHOULD be —
+    /// D79's entry names the fix by its future name directly: "a future `EXPECTED_FENCES`-style
+    /// table, mirroring the existing `EXPECTED_RUN_BUILDERS` one, would close it the same way."
+    /// This is that table.
+    ///
+    /// Comparing `spec.fence` by function-pointer identity (`std::ptr::fn_addr_eq`) was
+    /// considered and rejected: two distinct `fn` items are not guaranteed to have distinct
+    /// addresses across codegen units, so that comparison can pass while comparing nothing.
+    /// Instead this fingerprints a row's fence by an OBSERVABLE property the two real fences
+    /// differ on unconditionally: `codex_fence`'s very first statement in BOTH of its branches
+    /// (above, this file) is `let cwd = launch_cwd()?;`, which fails with "requires a resolved
+    /// working directory" whenever `launch.cwd` is `None` — before it reads `spec.requirements`,
+    /// `config`, or the filesystem at all. `no_fence` ignores every argument and always returns
+    /// `Ok`. Calling a row's fence with a `cwd: None` launch therefore distinguishes the two
+    /// kinds deterministically, without any of the real filesystem state (a trusted PowerShell,
+    /// an approval target, a cwd identity) `codex_fence`'s ordinary path needs — which is what
+    /// keeps this portable to the Linux CI this workspace runs on, where
+    /// `resolve_trusted_powershell` fails closed regardless of input (see its own doc comment).
+    ///
+    /// Break caught, by falsification: pointing `steer` (a non-approval Codex row) at
+    /// `codex_fence` — the exact mis-wiring D79's residual named as uncaught — makes `steer`'s
+    /// fingerprint `CodexApproval` while `EXPECTED_FENCES` still says `None`, and this test fails
+    /// naming the row.
+    #[test]
+    fn every_row_s_fence_matches_the_kind_its_name_declares() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum FenceKind {
+            None,
+            CodexApproval,
+        }
+
+        const EXPECTED_FENCES: &[(Provider, &str, FenceKind)] = &[
+            (Provider::Claude, "model-discovery", FenceKind::None),
+            (
+                Provider::Claude,
+                "model-discovery-neutral-cwd",
+                FenceKind::None,
+            ),
+            (
+                Provider::Claude,
+                "model-discovery-project-cwd",
+                FenceKind::None,
+            ),
+            (Provider::Claude, "command-discovery", FenceKind::None),
+            (Provider::Claude, "fresh-text", FenceKind::None),
+            (Provider::Claude, "approval", FenceKind::None),
+            (Provider::Claude, "resume", FenceKind::None),
+            (Provider::Claude, "attachment", FenceKind::None),
+            (Provider::Claude, "checklist", FenceKind::None),
+            (Provider::Claude, "checklist-resume", FenceKind::None),
+            (Provider::Codex, "model-discovery", FenceKind::None),
+            (
+                Provider::Codex,
+                "model-discovery-neutral-cwd",
+                FenceKind::None,
+            ),
+            (
+                Provider::Codex,
+                "model-discovery-project-cwd",
+                FenceKind::None,
+            ),
+            (
+                Provider::Codex,
+                "model-discovery-logged-out",
+                FenceKind::None,
+            ),
+            (Provider::Codex, "fresh-text", FenceKind::None),
+            (Provider::Codex, "approval", FenceKind::CodexApproval),
+            (
+                Provider::Codex,
+                "approval-on-request",
+                FenceKind::CodexApproval,
+            ),
+            (Provider::Codex, "resume", FenceKind::None),
+            (Provider::Codex, "steer", FenceKind::None),
+            (Provider::Codex, "interruption", FenceKind::None),
+        ];
+
+        let raw = tempfile::tempdir().unwrap();
+        let mut covered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        for spec in SCENARIOS {
+            let provider_str = match spec.provider {
+                Provider::Claude => "claude",
+                Provider::Codex => "codex",
+            };
+            covered.insert(format!("{:?}/{}", spec.provider, spec.name));
+
+            let cfg = config(
+                spec.name,
+                PathBuf::from("provider"),
+                provider_str,
+                raw.path(),
+            );
+            let launch = LaunchDescriptor {
+                program: Path::new("provider").into(),
+                args: Vec::new(),
+                cwd: None,
+                configured_env: Default::default(),
+                stdin: StdioMode::Piped,
+                stdout: StdioMode::Piped,
+                stderr: StdioMode::Piped,
+                kill_on_drop: true,
+                #[cfg(windows)]
+                creation_flags: 0,
+            };
+
+            let actual = match (spec.fence)(spec, &cfg, &launch) {
+                Ok(_) => FenceKind::None,
+                Err(error) => {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("requires a resolved working directory"),
+                        "{:?}/{}: fence errored on a cwd-less launch with a message that isn't \
+                         codex_fence's own — got {error}",
+                        spec.provider,
+                        spec.name
+                    );
+                    FenceKind::CodexApproval
+                }
+            };
+
+            let (_, _, expected) = EXPECTED_FENCES
+                .iter()
+                .find(|(provider, name, _)| *provider == spec.provider && *name == spec.name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{:?}/{}: no entry in EXPECTED_FENCES — add one so this row's fence is \
+                         checked",
+                        spec.provider, spec.name
+                    )
+                });
+
+            assert_eq!(
+                actual, *expected,
+                "{:?}/{}: fence kind mismatch — the row is wired to a different fence than \
+                 EXPECTED_FENCES says it should be",
+                spec.provider, spec.name
+            );
+        }
+
+        let expected: std::collections::BTreeSet<String> = EXPECTED_FENCES
+            .iter()
+            .map(|(provider, name, _)| format!("{provider:?}/{name}"))
+            .collect();
+        assert_eq!(
+            covered, expected,
+            "every SCENARIOS row must have exactly one entry in EXPECTED_FENCES, and vice versa \
+             — a row missing here would otherwise leave the loop in silence"
+        );
+    }
+
     fn only_raw_subdirectory(raw_root: &Path) -> PathBuf {
         let mut entries: Vec<_> = std::fs::read_dir(raw_root)
             .unwrap()
@@ -1201,7 +1356,12 @@ mod tests {
     ///   does not redact those.
     /// - `cwd`: presence only (`Some` vs `Some`, `None` vs `None`) — the archive redacts the
     ///   value itself to `<CWD>`.
-    /// - `program`: presence only — redacted to `<HOME>\...`.
+    /// - `program`: compared by final path component with any `.exe` suffix stripped (via
+    ///   `program_stem`, below) — the archive redacts everything BEFORE the binary name
+    ///   (`<HOME>\...\claude.exe`), but keeps the name itself, so `claude` vs `codex` is a real
+    ///   assertion, not a no-op. A bare `is_empty()` check on both sides used to stand in here
+    ///   and could never fail for any production change — the derived side is always
+    ///   `current_dir().join("claude"|"codex")`, never empty.
     /// - `configured_env`: key set only — a set value (`CODEX_HOME`) redacts to `<CODEX_HOME>`.
     /// - `stdin`/`stdout`/`stderr`/`kill_on_drop`/`creation_flags` (Windows only): exact
     ///   equality — none of these carry machine- or session-specific data, and `creation_flags`
@@ -1229,9 +1389,20 @@ mod tests {
             };
             let label = format!("{provider_str}/{}", spec.name);
 
-            let scenario_dir = promoted
+            // EVERY corpus directory this scenario has, across every version — not just the
+            // first `.find()` turns up. Versions sort ascending (`promoted_scenarios`'s own doc
+            // comment), so a `.find()` here always binds to the OLDEST version's manifest,
+            // silently ignoring any newer one — harmless today (no scenario exists under two
+            // versions yet) but not once a live re-capture promotes a second version of an
+            // existing scenario: a freshly captured `claude/2.1.233/fresh-text` would sit right
+            // beside `2.1.228/fresh-text` unchecked, and this test would keep passing against
+            // the superseded evidence. The launch under test is version-independent — built from
+            // the same production code regardless of which CLI version produced the corpus
+            // evidence — so every version's manifest is a valid oracle, and checking all of them
+            // is strictly stronger than checking one.
+            let scenario_dirs: Vec<&crate::capture::PromotedScenario> = promoted
                 .iter()
-                .find(|scenario| {
+                .filter(|scenario| {
                     scenario.provider == provider_str
                         && scenario
                             .directory
@@ -1239,9 +1410,9 @@ mod tests {
                             .and_then(|name| name.to_str())
                             == Some(spec.name)
                 })
-                .map(|scenario| scenario.directory.clone());
+                .collect();
 
-            let Some(scenario_dir) = scenario_dir else {
+            if scenario_dirs.is_empty() {
                 if EXEMPT_UNCAPTURED.contains(&(spec.provider, spec.name)) {
                     unevidenced.push(label);
                 } else {
@@ -1252,23 +1423,7 @@ mod tests {
                     ));
                 }
                 continue;
-            };
-
-            let manifest_path = scenario_dir.join("manifest.json");
-            let manifest: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap_or_else(
-                    |error| panic!("{} could not be read: {error}", manifest_path.display()),
-                ))
-                .unwrap_or_else(|error| {
-                    panic!("{} is not valid JSON: {error}", manifest_path.display())
-                });
-            let corpus_command: CommandSnapshot =
-                serde_json::from_value(manifest["command"].clone()).unwrap_or_else(|error| {
-                    panic!(
-                        "{} has no valid command object: {error}",
-                        manifest_path.display()
-                    )
-                });
+            }
 
             // `cwd` only needs to be present (comparison is presence-only, see this test's own
             // doc comment); the two neutral-cwd discovery rows ignore it entirely in production
@@ -1306,11 +1461,32 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{label}: derive_launch failed: {error}"));
             let derived = CommandSnapshot::from_launch(&derived_launch);
 
-            failures.extend(compare_launch_against_corpus_manifest(
-                &label,
-                &derived,
-                &corpus_command,
-            ));
+            for scenario_dir in &scenario_dirs {
+                let manifest_path = scenario_dir.directory.join("manifest.json");
+                let manifest: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap_or_else(
+                        |error| panic!("{} could not be read: {error}", manifest_path.display()),
+                    ))
+                    .unwrap_or_else(|error| {
+                        panic!("{} is not valid JSON: {error}", manifest_path.display())
+                    });
+                let corpus_command: CommandSnapshot =
+                    serde_json::from_value(manifest["command"].clone()).unwrap_or_else(|error| {
+                        panic!(
+                            "{} has no valid command object: {error}",
+                            manifest_path.display()
+                        )
+                    });
+
+                // Names which version disagreed, not just the row — the whole point of checking
+                // every version instead of the first is a message that says which one broke.
+                let versioned_label = format!("{label} ({})", scenario_dir.version);
+                failures.extend(compare_launch_against_corpus_manifest(
+                    &versioned_label,
+                    &derived,
+                    &corpus_command,
+                ));
+            }
         }
 
         let mut unevidenced_sorted = unevidenced.clone();
@@ -1332,6 +1508,24 @@ mod tests {
             failures.len(),
             failures.join("\n\n")
         );
+    }
+
+    /// The final path component of a `program`, with a trailing `.exe` stripped — `"claude"` from
+    /// both `C:\dev\comet\claude` (the derived side, built by `absolute_program`, no extension)
+    /// and `<HOME>\.local\bin\claude.exe` (the corpus side, redacted down to a directory prefix
+    /// but keeping the binary name — see this file's `docs/testing/provider-captures.md`).
+    ///
+    /// Deliberately does NOT use `std::path::Path` — the corpus string was captured on Windows
+    /// and always uses `\` regardless of which OS this test runs on, and `Path` on a non-Windows
+    /// host (this workspace's CI runs `ubuntu-24.04`) treats `\` as an ordinary character, not a
+    /// separator, so `Path::new(corpus).file_stem()` would return the whole redacted string
+    /// unsplit. Splitting on both `/` and `\` by hand keeps this correct on every host.
+    fn program_stem(raw: &str) -> String {
+        let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+        match name.rsplit_once('.') {
+            Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") => stem.to_owned(),
+            _ => name.to_owned(),
+        }
     }
 
     /// The archive-vs-derived comparator `every_scenario_launch_matches_its_committed_corpus_manifest`
@@ -1371,9 +1565,12 @@ mod tests {
                 derived.cwd, corpus.cwd
             ));
         }
-        if derived.program.is_empty() || corpus.program.is_empty() {
+        let derived_stem = program_stem(&derived.program);
+        let corpus_stem = program_stem(&corpus.program);
+        if derived_stem.is_empty() || corpus_stem.is_empty() || derived_stem != corpus_stem {
             failures.push(format!(
-                "{label}: program must be non-empty on both sides — derived {:?}, corpus {:?}",
+                "{label}: program stem differs — derived {:?} (stem {derived_stem:?}), corpus \
+                 {:?} (stem {corpus_stem:?})",
                 derived.program, corpus.program
             ));
         }
