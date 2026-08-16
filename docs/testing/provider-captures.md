@@ -164,6 +164,21 @@ than as a bug six weeks later. It does not name the individual frame or scenario
 appeared in; grep the version's own corpus directory for the field's leaf name if you need that —
 the dotted path is a walker construction and never appears in `events.jsonl` verbatim.
 
+**A path in the sheet's Fields section is not always spelled the way `claude.txt`/`codex.txt`
+spell the same field.** The sanitizer suffixes every array position with `[]`, including an array
+whose elements are plain scalars, because it decides allow-or-redact once per element regardless
+of what the element is. The sheet's walker (`Visit::walk`,
+`crates/harness/src/capture/surface.rs`) does not: it records a field's path once, when it visits
+the *key* that names it, before it knows whether the value turns out to be an array — and a
+scalar-only array is never revisited with the `[]` suffix, because nothing inside it is an object
+whose own keys would trigger another recording. An array of *objects* does get the suffix (each
+element's own keys re-enter the object arm and record their own `[]`-suffixed paths), so the gap
+is specific to arrays of scalars. Concretely: `allowlist/claude.txt` writes
+`.tool_use_result.matches[]`, and the field is genuinely present in `claude-2.1.229.md`'s
+evidence, but its Fields section shows `.tool_use_result.matches` — no brackets. Grepping a sheet
+for an allowlist path verbatim can come up empty even when the field is right there; check the
+bare field name too before concluding it is absent.
+
 **Promoting a new version means committing its capability sheet in the same change.** A version
 directory with no matching `docs/providers/<provider>-<version>.md` fails the golden test
 outright — the newly-promoted-capture case this mechanism exists to catch, not merely an

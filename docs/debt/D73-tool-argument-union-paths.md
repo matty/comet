@@ -45,8 +45,16 @@ The gate is `crates/harness/tests/capture_corpus/capability_sheets.rs`'s golden 
 which fails a promotion when the corpus renders a sheet whose Fields section differs from the one
 committed — including a *path* it has never rendered before. (`surface_map.rs` is not the gate:
 it holds unit tests of the walker `observe_surface`, and gates nothing on its own.) That is
-exactly the wrong granularity for this risk: the seven paths above already exist in every
-committed sheet. A new capture that puts an MCP tool's `input.status` value there is not a new
+exactly the wrong granularity for this risk: all seven paths above are already present in the
+evidence `claude-2.1.229.md` renders (one of them, `.tool_use_result.type`, also in
+`claude-2.1.228.md`; none in `codex-0.147.0.md`, which carries no Claude-shaped evidence at all —
+version-splitting the sheet is exactly what makes "every committed sheet" the wrong thing to say
+here, where the deleted, version-merging `observed-fields.json` would have made it true). Two of
+the seven — `.tool_use_result.matches[]` and `.tool_use_result.updatedFields[]` — do not appear in
+the sheet under that exact spelling: the Fields section shows `.tool_use_result.matches` and
+`.tool_use_result.updatedFields`, without the trailing `[]` the allowlist writes for the same
+field. `docs/testing/provider-captures.md`'s capability-sheet section explains why; the field is
+present either way. A new capture that puts an MCP tool's `input.status` value there is not a new
 path — it is the *same* path with different meaning, which the gate was never built to
 distinguish. The sheet's own blind spot ("A sheet reports fields and vocabulary values that are
 present; a capability no capture ever exercised cannot appear in it at all" — `AGENTS.md`, "What
