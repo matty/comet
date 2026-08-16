@@ -24,11 +24,26 @@ fn payload(scenario: &str, sequence: u64) -> Value {
 /// `crates/harness/src/codex/discovery.rs` must skip notifications rather than
 /// take the next frame.
 ///
-/// The literal request ids (`1`, `2`) were incidental to that claim, and
-/// `.id` is not on `codex.txt` (the allowlist-sanitizer stage), so the
-/// archive now holds placeholders there. What actually matters — that
-/// `initialize` and `model/list` are two DIFFERENT replies, not the same
-/// frame read twice — survives as an inequality instead of an equality.
+/// This is an inequality rather than the equality it should be, and the
+/// reason recorded here until 2026-08-16 was **wrong**. It blamed the
+/// allowlist: `.id` is not on `codex.txt`, so the archive holds placeholders
+/// there, and the join was said to be unrecoverable.
+///
+/// Redaction does not lose the join. Equal values share a placeholder by
+/// design, and `steer` demonstrates it — its `initialize` request and reply
+/// both read `<V1>`. This scenario reads `<V1>` on the request and `<V2>` on
+/// the reply, which means the two ids **differed before sanitizing**: the
+/// recording lost the join, not the sanitizer.
+///
+/// Six of the seven committed Codex scenarios have zero request-to-reply id
+/// joins; only `steer` (recorded in a later change) has all four. The current
+/// recorder is not affected — a live `model-discovery` taken on 2026-08-16
+/// joins `id=1` and `id=2` across stdin and stdout correctly.
+///
+/// So this assertion is weaker than the evidence should support, and the fix
+/// is a re-capture rather than an edit here. **Restore the equality when
+/// stage 6 re-records Codex**, and add the property test that would have
+/// caught it: every request id in a Codex capture appears on both channels.
 #[test]
 fn codex_discovery_interleaves_a_notification_before_the_model_list_reply() {
     let initialize = payload(CODEX_MODEL_DISCOVERY, 2);
