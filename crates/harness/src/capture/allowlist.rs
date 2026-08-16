@@ -20,7 +20,7 @@
 //! that rule (finding 1, PR #66), an object keyed by anything identifying rode
 //! into the archive verbatim while its value was dutifully redacted beside it,
 //! and no test could see it: `allowlist_property.rs` walks scalars, and the
-//! surface snapshot collapses a map key to `{}` by design. What is still open
+//! capability sheet collapses a map key to `{}` by design. What is still open
 //! is a map at an *undeclared* path — `docs/debt/README.md` D77.
 //!
 //! **Standing rule (adopted 2026-08-15): a field nothing decodes defaults to

@@ -161,7 +161,8 @@ $env:COMET_UPDATE_SHEETS = "1"; cargo test -p comet-harness --test capture_corpu
 generated sheet first diverges from the one committed, and that is the point of the whole
 mechanism — a new CLI version's added, removed or reshaped field arrives as a test failure rather
 than as a bug six weeks later. It does not name the individual frame or scenario a field first
-appeared in; grep the version's own corpus directory for the field's dotted path if you need that.
+appeared in; grep the version's own corpus directory for the field's leaf name if you need that —
+the dotted path is a walker construction and never appears in `events.jsonl` verbatim.
 
 **Promoting a new version means committing its capability sheet in the same change.** A version
 directory with no matching `docs/providers/<provider>-<version>.md` fails the golden test

@@ -24,12 +24,15 @@ unrelated same-named field elsewhere in the payload), these seven paths already 
 .tool_use_result.updatedFields[]    ["status"] | ["activeForm","status"] — TaskUpdate
 ```
 
-`observed-fields.json` independently shows the same pattern one level up: `.tool_use_result` is a
-union across tools sharing one path prefix (`.filePath`, `.stdout`, `.structuredPatch`, `.query`,
-`.prompt` all appear there, one tool's field at a time). Each of the seven lines above was reviewed
-against the values these five tools produce. But the path itself does not belong to any one of
-them — it belongs to whichever tool is in flight, and nothing stops a **sixth** tool, including a
-third party's MCP tool whose argument schema Comet does not control and has never captured, from
+Each version's capability sheet independently shows the same pattern one level up:
+`.tool_use_result` is a union across tools sharing one path prefix — `docs/providers/claude-2.1.228.md`
+shows `.filePath`, `.stdout` and `.structuredPatch` there, and `docs/providers/claude-2.1.229.md`
+shows `.query` and `.prompt`, one tool's field at a time, now split across two version-keyed
+sheets rather than merged into the single file the deleted snapshot used to show them in. Each of
+the seven lines above was reviewed against the values these five tools produce. But the path
+itself does not belong to any one of them — it belongs to whichever tool is in flight, and
+nothing stops a **sixth** tool, including a third party's MCP tool whose argument schema Comet
+does not control and has never captured, from
 landing on the same already-approved path. The five tools above are the reviewed, bounded case;
 an MCP tool's arguments are the unbounded one. A future capture that exercises a genuinely new
 tool puts that tool's field **at the same path**, and the allowlist, being path-keyed, has no way
@@ -37,15 +40,18 @@ to notice the field's *meaning* — and its *reviewer* — changed underneath it
 
 ## Why the surface gate cannot catch this
 
-`crates/harness/tests/capture_corpus/surface_map.rs` (the "new-field gate",
-`docs/testing/provider-captures.md`) fails a promotion when the corpus shows a *path* it has
-never seen before. That is exactly the wrong granularity for this risk: the seven paths above
-already exist in `observed-fields.json`. A new capture that puts an MCP tool's `input.status`
-value there is not a new path — it is the *same* path with different meaning, which the gate was
-never built to distinguish. The gate's blind spot ("it reports fields that are present; a
-capability no capture ever exercised cannot appear in it at all" — `AGENTS.md`, "What the
-providers send") is exactly this: the field is present today, under a narrower meaning than the
-path actually carries.
+The gate is `crates/harness/tests/capture_corpus/capability_sheets.rs`'s golden test,
+`every_corpus_version_matches_its_committed_sheet` (see `docs/testing/provider-captures.md`),
+which fails a promotion when the corpus renders a sheet whose Fields section differs from the one
+committed — including a *path* it has never rendered before. (`surface_map.rs` is not the gate:
+it holds unit tests of the walker `observe_surface`, and gates nothing on its own.) That is
+exactly the wrong granularity for this risk: the seven paths above already exist in every
+committed sheet. A new capture that puts an MCP tool's `input.status` value there is not a new
+path — it is the *same* path with different meaning, which the gate was never built to
+distinguish. The sheet's own blind spot ("A sheet reports fields and vocabulary values that are
+present; a capability no capture ever exercised cannot appear in it at all" — `AGENTS.md`, "What
+the providers send") is exactly this: the field is present today, under a narrower meaning than
+the path actually carries.
 
 ## Why the `mcp__` value rule doesn't help either
 

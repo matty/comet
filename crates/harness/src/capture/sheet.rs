@@ -154,16 +154,16 @@ fn scenario_lines(scenarios: &[SheetScenario]) -> Vec<String> {
          otherwise support — this list is what makes that limit visible instead of silent. \
          A distinct name is not proof of distinct coverage, either, and a matching argv is \
          not proof of an identical launch: two scenarios can print the same argv and still \
-         set different environment variables, and its presence in one scenario's env line \
-         and its absence from another's is real evidence a claim of identical launches \
-         must survive. Compare the whole block — argv, cwd and env together — before \
-         concluding two scenarios were launched identically, and compare it again before \
-         concluding two with the same purpose sentence tested the same thing — trusting \
-         the name or the purpose alone is not enough either way. Even a whole-block \
-         comparison is not a sufficiency test, though: a redaction placeholder cannot \
-         separate two scenarios whose real value redacted to the same token, so two \
-         blocks that read byte-identical in every field can still have been launched \
-         with genuinely different values underneath — the archive's placeholders prove a \
+         set different environment variables, and a placeholder's presence in one \
+         scenario's env line and its absence from another's is real evidence a claim of \
+         identical launches must survive. Compare the whole block — argv, cwd and env \
+         together — before concluding two scenarios were launched identically, and compare \
+         it again before concluding two with the same purpose sentence tested the same \
+         thing — trusting the name or the purpose alone is not enough either way. Even a \
+         whole-block comparison is not a sufficiency test, though: a redaction placeholder \
+         cannot separate two scenarios whose real value redacted to the same token, so two \
+         blocks that read byte-identical in every field can still have been launched with \
+         genuinely different values underneath — the archive's placeholders prove a \
          difference when they show one, never that there wasn't one when they don't."
             .to_owned(),
         String::new(),
@@ -736,16 +736,21 @@ mod tests {
         // never populates it). What must never appear are the concrete
         // *values* that path takes under Claude.
         //
-        // `"initialize"` only works as a Claude-only literal against THIS
-        // synthetic evidence, which deliberately avoids it. Codex's own real
-        // corpus is not Claude-only here: `.method` is `"initialize"` for
-        // Comet's own request on `codex/0.147.0/model-discovery`'s first
-        // frame (`stdin`, to-provider), so the real `codex-0.147.0.md`
-        // legitimately contains this exact string in its Vocabulary section.
-        // Do not repoint this test's `observations`/`vocabulary` at the real
-        // corpus without first dropping `"initialize"` from this list — doing
-        // so would fail for a correct reason (real Codex evidence) rather
-        // than the leak this test exists to catch.
+        // Two of these five only work as Claude-only literals against THIS
+        // synthetic evidence, which deliberately avoids both. Codex's own
+        // real corpus is not Claude-only for either: `.method` is
+        // `"initialize"` for Comet's own request on
+        // `codex/0.147.0/model-discovery`'s first frame (`stdin`,
+        // to-provider), so the real `codex-0.147.0.md` legitimately contains
+        // that string in its Vocabulary section — and Codex has four of its
+        // own `model-discovery*` scenario rows (`model-discovery`,
+        // `-logged-out`, `-neutral-cwd`, `-project-cwd`), so the real sheet's
+        // Scenarios section legitimately contains `"model-discovery"` too, as
+        // a substring of all four of those names. Do not repoint this
+        // test's `observations`/`vocabulary`/`scenarios` at the real corpus
+        // without first dropping BOTH `"initialize"` and `"model-discovery"`
+        // from this list — doing so would fail for a correct reason (real
+        // Codex evidence) rather than the leak this test exists to catch.
         for literal in [
             "Claude",
             "model-discovery",
