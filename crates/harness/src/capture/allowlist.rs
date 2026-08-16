@@ -56,11 +56,6 @@ use super::types::Provider;
 const CLAUDE_TXT: &str = include_str!("allowlist/claude.txt");
 const CODEX_TXT: &str = include_str!("allowlist/codex.txt");
 
-/// Marker type for the module this file implements: the per-provider path
-/// allowlist. The lookups themselves are the free functions below, not
-/// methods — there is no per-instance state to hang them on.
-pub struct Allowlist;
-
 fn parse(source: &'static str) -> BTreeSet<&'static str> {
     source
         .lines()
