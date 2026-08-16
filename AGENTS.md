@@ -117,6 +117,20 @@ inherited the wrong number.
 
 ## What the providers send
 
+Sanitizing a capture for the corpus runs on an **allowlist**, not a blocklist.
+`crates/harness/src/capture/allowlist/{claude,codex}.txt` name every dotted key path whose value
+may survive; everything else becomes a numbered placeholder, and equal values share a number so
+joins across frames still work. **A field nothing on the list names is redacted by default** — the
+standing rule is "nothing decodes it, so it goes," not "nothing recognized it as sensitive." Adding
+a path to one of those files is a decision to publish that field's values forever, in this public
+repository, and `docs/testing/provider-captures.md` is the review procedure for making that call.
+
+**Field names are published on purpose; map keys are not.** A key that names a field survives
+sanitizing — `observed-fields.json` is a snapshot of exactly those names. A key that *is* data,
+under a path declared in `surface::MAP_PATHS`, redacts by default like a value. Declaring a new
+map is one edit serving both: the surface snapshot stops recording the key as a field, and the
+sanitizer stops publishing it. A map nobody declared still publishes its keys (D77).
+
 `crates/harness/tests/corpus/observed-fields.json` is a generated snapshot of every field the
 promoted corpus shows, per provider and direction. It exists for one reason: a newly promoted
 capture, or a new CLI version's added field, **fails the suite** instead of arriving unnoticed.
@@ -143,6 +157,17 @@ exercised cannot appear in it at all. Procedure is in `docs/testing/provider-cap
 one thing production shares with it is `crates/harness/src/launch.rs` — the process-launch
 description both use. Keep it that way: a production type that drifts into `capture/` makes
 the boundary unreadable, which is how a design doc came to record the opposite of the truth.
+
+Inside `capture/`, the recorder itself is provider-neutral. The seam is four members — spawn,
+framing, handshake, turn-complete — but only three of them live on
+`capture::record::provider::CaptureProvider` (framing, handshake, turn-complete). Spawn lives on
+each row's `launch` field in `capture::record::scenarios::SCENARIOS` instead: which launch a
+scenario needs varies per scenario as well as per provider (Claude alone needs three — bare model
+discovery, non-bare command discovery, and a run), which a provider-level `spawn` method could not
+express without a bypass. **Do not move it back onto the trait** — a first draft did exactly that
+and it could not tell `command-discovery` from `model-discovery`. Every scenario — discovery and
+run alike, for both providers — is a plain function registered as one row in that same table, the
+one `record()` dispatches from and `comet-provider-capture --help` renders.
 
 ## The gpui fork rev is load-bearing
 

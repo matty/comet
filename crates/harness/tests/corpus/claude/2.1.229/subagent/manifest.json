@@ -1,18 +1,11 @@
 {
-  "schema_version": 1,
-  "source": "captures/2026-08-13-plan-todo-subagent/drive_claude_plan.py raw capture (corpus-subagent-2.1.229.jsonl), hand-sanitized for slice 4.2 task 9",
-  "provider": "claude",
-  "cli_version": "2.1.229 (Claude Code)",
-  "normalized_cli_version": "2.1.229 (Claude Code)",
   "captured_at_unix_ms": 1786631117153,
-  "scenario": "subagent",
-  "purpose": "capture Claude delegating a Task/Agent subagent, including the resumed task_started sharing one task_id, patch-only task_updated, task_notification with usage, and background_tasks_changed populated-then-empty",
-  "platform": {
-    "os": "windows",
-    "arch": "x86_64"
-  },
+  "channels": [
+    "stdin",
+    "stdout"
+  ],
+  "cli_version": "2.1.229 (Claude Code)",
   "command": {
-    "program": "<HOME>\\.local\\bin\\claude.exe",
     "args": [
       "--print",
       "--input-format",
@@ -28,1522 +21,2392 @@
       "--permission-mode",
       "acceptEdits"
     ],
-    "cwd": "<CWD>",
     "configured_env": {},
-    "stdin": "Piped",
-    "stdout": "Piped",
-    "stderr": "Piped",
+    "creation_flags": 0,
+    "cwd": "<CWD>",
     "kill_on_drop": true,
-    "creation_flags": 0
+    "program": "<HOME>\\.local\\bin\\claude.exe",
+    "stderr": "Piped",
+    "stdin": "Piped",
+    "stdout": "Piped"
   },
-  "channels": [
-    "stdin",
-    "stdout"
-  ],
   "exit_code": 0,
+  "normalized_cli_version": "2.1.229 (Claude Code)",
   "placeholders": [
     {
-      "placeholder": "<ASSISTANT_PROSE_10>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_1>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_11>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_2>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_12>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_3>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_13>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_4>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_14>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_5>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_15>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_6>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_16>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_7>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_17>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_8>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_18>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_9>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_19>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_10>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_1>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_11>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_20>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_12>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_21>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_13>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_22>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_14>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_23>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_15>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_24>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_16>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_25>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_17>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_26>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_18>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_27>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_19>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_28>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_20>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_29>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_21>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_2>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_22>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_30>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_23>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_31>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_24>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_32>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_25>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_33>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_26>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_34>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_27>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_35>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_28>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_36>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_29>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_37>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_30>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_38>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_31>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_39>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_32>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_3>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_33>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_40>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_34>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_41>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_35>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_42>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_36>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_43>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_37>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_44>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_38>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_45>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_39>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_46>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_40>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_47>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_41>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_48>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_42>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_49>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_43>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_4>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_44>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_50>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_45>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_51>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_46>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_52>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_47>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_53>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_48>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_54>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_49>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_55>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_50>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_56>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_51>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_57>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_52>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_58>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_53>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_59>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_54>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_5>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_55>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_60>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_56>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_61>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_57>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_62>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_58>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_63>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_59>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_64>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_60>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_65>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_61>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_66>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_62>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_67>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_63>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_68>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_64>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_69>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_65>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_6>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_66>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_70>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_67>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_71>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_68>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_72>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_69>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_73>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_70>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_74>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_71>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_75>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_72>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_76>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_73>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_77>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_74>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_78>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_75>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_79>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_76>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_7>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_77>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_80>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_78>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_81>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_79>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_82>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_80>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_83>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_81>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_84>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_82>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_85>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_83>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_86>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_84>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_87>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_85>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_88>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_86>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_89>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_87>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_8>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_88>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_90>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_89>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_91>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_90>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_92>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_91>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_93>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_92>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_94>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_93>"
     },
     {
-      "placeholder": "<ASSISTANT_PROSE_9>",
-      "kind": "assistant_prose"
+      "kind": "machine",
+      "placeholder": "<MACHINE_94>"
     },
     {
-      "placeholder": "<CLAUDE_MEMORY_PATH_1>",
-      "kind": "claude_memory_path"
+      "kind": "machine",
+      "placeholder": "<MACHINE_95>"
     },
     {
-      "placeholder": "<CLAUDE_MESSAGE_ID_1>",
-      "kind": "claude_message_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_96>"
     },
     {
-      "placeholder": "<CLAUDE_MESSAGE_ID_2>",
-      "kind": "claude_message_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_97>"
     },
     {
-      "placeholder": "<CLAUDE_MESSAGE_ID_3>",
-      "kind": "claude_message_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_98>"
     },
     {
-      "placeholder": "<CLAUDE_MESSAGE_ID_4>",
-      "kind": "claude_message_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_99>"
     },
     {
-      "placeholder": "<CLAUDE_MESSAGE_ID_5>",
-      "kind": "claude_message_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_100>"
     },
     {
-      "placeholder": "<CLAUDE_MESSAGE_ID_6>",
-      "kind": "claude_message_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_101>"
     },
     {
-      "placeholder": "<CLAUDE_MESSAGE_ID_7>",
-      "kind": "claude_message_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_102>"
     },
     {
-      "placeholder": "<CLAUDE_MESSAGE_ID_8>",
-      "kind": "claude_message_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_103>"
     },
     {
-      "placeholder": "<CLAUDE_REQUEST_ID_1>",
-      "kind": "claude_request_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_104>"
     },
     {
-      "placeholder": "<CLAUDE_REQUEST_ID_2>",
-      "kind": "claude_request_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_105>"
     },
     {
-      "placeholder": "<CLAUDE_REQUEST_ID_3>",
-      "kind": "claude_request_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_106>"
     },
     {
-      "placeholder": "<CLAUDE_REQUEST_ID_4>",
-      "kind": "claude_request_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_107>"
     },
     {
-      "placeholder": "<CLAUDE_REQUEST_ID_5>",
-      "kind": "claude_request_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_108>"
     },
     {
-      "placeholder": "<CLAUDE_REQUEST_ID_6>",
-      "kind": "claude_request_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_109>"
     },
     {
-      "placeholder": "<CLAUDE_REQUEST_ID_7>",
-      "kind": "claude_request_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_110>"
     },
     {
-      "placeholder": "<CLAUDE_REQUEST_ID_8>",
-      "kind": "claude_request_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_111>"
     },
     {
-      "placeholder": "<CLAUDE_THINKING_SIGNATURE_1>",
-      "kind": "claude_thinking_signature"
+      "kind": "machine",
+      "placeholder": "<MACHINE_112>"
     },
     {
-      "placeholder": "<CLAUDE_THINKING_SIGNATURE_2>",
-      "kind": "claude_thinking_signature"
+      "kind": "machine",
+      "placeholder": "<MACHINE_113>"
     },
     {
-      "placeholder": "<CLAUDE_THINKING_SIGNATURE_3>",
-      "kind": "claude_thinking_signature"
+      "kind": "machine",
+      "placeholder": "<MACHINE_114>"
     },
     {
-      "placeholder": "<CLAUDE_THINKING_SIGNATURE_4>",
-      "kind": "claude_thinking_signature"
+      "kind": "machine",
+      "placeholder": "<MACHINE_115>"
     },
     {
-      "placeholder": "<CLAUDE_THINKING_SIGNATURE_5>",
-      "kind": "claude_thinking_signature"
+      "kind": "machine",
+      "placeholder": "<MACHINE_116>"
     },
     {
-      "placeholder": "<CLAUDE_THINKING_SIGNATURE_6>",
-      "kind": "claude_thinking_signature"
+      "kind": "machine",
+      "placeholder": "<MACHINE_117>"
     },
     {
-      "placeholder": "<CLAUDE_THINKING_SIGNATURE_7>",
-      "kind": "claude_thinking_signature"
+      "kind": "machine",
+      "placeholder": "<MACHINE_118>"
     },
     {
-      "placeholder": "<CWD>",
-      "kind": "cwd_path"
+      "kind": "machine",
+      "placeholder": "<MACHINE_119>"
     },
     {
-      "placeholder": "<HOME>",
-      "kind": "home_path"
+      "kind": "machine",
+      "placeholder": "<MACHINE_120>"
     },
     {
-      "placeholder": "<MACHINE_ID_100>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_121>"
     },
     {
-      "placeholder": "<MACHINE_ID_101>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_122>"
     },
     {
-      "placeholder": "<MACHINE_ID_102>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_123>"
     },
     {
-      "placeholder": "<MACHINE_ID_103>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_124>"
     },
     {
-      "placeholder": "<MACHINE_ID_104>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_125>"
     },
     {
-      "placeholder": "<MACHINE_ID_105>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_126>"
     },
     {
-      "placeholder": "<MACHINE_ID_106>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_127>"
     },
     {
-      "placeholder": "<MACHINE_ID_107>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_128>"
     },
     {
-      "placeholder": "<MACHINE_ID_108>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_129>"
     },
     {
-      "placeholder": "<MACHINE_ID_109>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_130>"
     },
     {
-      "placeholder": "<MACHINE_ID_10>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_131>"
     },
     {
-      "placeholder": "<MACHINE_ID_110>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_132>"
     },
     {
-      "placeholder": "<MACHINE_ID_111>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_133>"
     },
     {
-      "placeholder": "<MACHINE_ID_112>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_134>"
     },
     {
-      "placeholder": "<MACHINE_ID_113>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_135>"
     },
     {
-      "placeholder": "<MACHINE_ID_114>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_136>"
     },
     {
-      "placeholder": "<MACHINE_ID_115>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_137>"
     },
     {
-      "placeholder": "<MACHINE_ID_116>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_138>"
     },
     {
-      "placeholder": "<MACHINE_ID_117>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_139>"
     },
     {
-      "placeholder": "<MACHINE_ID_118>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_140>"
     },
     {
-      "placeholder": "<MACHINE_ID_119>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_141>"
     },
     {
-      "placeholder": "<MACHINE_ID_11>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_142>"
     },
     {
-      "placeholder": "<MACHINE_ID_120>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_143>"
     },
     {
-      "placeholder": "<MACHINE_ID_121>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_144>"
     },
     {
-      "placeholder": "<MACHINE_ID_122>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_145>"
     },
     {
-      "placeholder": "<MACHINE_ID_123>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_146>"
     },
     {
-      "placeholder": "<MACHINE_ID_124>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_147>"
     },
     {
-      "placeholder": "<MACHINE_ID_125>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_148>"
     },
     {
-      "placeholder": "<MACHINE_ID_126>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_149>"
     },
     {
-      "placeholder": "<MACHINE_ID_127>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_150>"
     },
     {
-      "placeholder": "<MACHINE_ID_128>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_151>"
     },
     {
-      "placeholder": "<MACHINE_ID_129>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_152>"
     },
     {
-      "placeholder": "<MACHINE_ID_12>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_153>"
     },
     {
-      "placeholder": "<MACHINE_ID_130>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_154>"
     },
     {
-      "placeholder": "<MACHINE_ID_131>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_155>"
     },
     {
-      "placeholder": "<MACHINE_ID_132>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_156>"
     },
     {
-      "placeholder": "<MACHINE_ID_133>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_157>"
     },
     {
-      "placeholder": "<MACHINE_ID_134>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_158>"
     },
     {
-      "placeholder": "<MACHINE_ID_135>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_159>"
     },
     {
-      "placeholder": "<MACHINE_ID_136>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_160>"
     },
     {
-      "placeholder": "<MACHINE_ID_137>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_161>"
     },
     {
-      "placeholder": "<MACHINE_ID_138>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_162>"
     },
     {
-      "placeholder": "<MACHINE_ID_139>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_163>"
     },
     {
-      "placeholder": "<MACHINE_ID_13>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_164>"
     },
     {
-      "placeholder": "<MACHINE_ID_140>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_165>"
     },
     {
-      "placeholder": "<MACHINE_ID_141>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_166>"
     },
     {
-      "placeholder": "<MACHINE_ID_142>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_167>"
     },
     {
-      "placeholder": "<MACHINE_ID_143>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_168>"
     },
     {
-      "placeholder": "<MACHINE_ID_144>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_169>"
     },
     {
-      "placeholder": "<MACHINE_ID_145>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_170>"
     },
     {
-      "placeholder": "<MACHINE_ID_146>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_171>"
     },
     {
-      "placeholder": "<MACHINE_ID_147>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_172>"
     },
     {
-      "placeholder": "<MACHINE_ID_148>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_173>"
     },
     {
-      "placeholder": "<MACHINE_ID_149>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_174>"
     },
     {
-      "placeholder": "<MACHINE_ID_14>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_175>"
     },
     {
-      "placeholder": "<MACHINE_ID_150>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_176>"
     },
     {
-      "placeholder": "<MACHINE_ID_151>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_177>"
     },
     {
-      "placeholder": "<MACHINE_ID_152>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_178>"
     },
     {
-      "placeholder": "<MACHINE_ID_153>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_179>"
     },
     {
-      "placeholder": "<MACHINE_ID_154>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_180>"
     },
     {
-      "placeholder": "<MACHINE_ID_155>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_181>"
     },
     {
-      "placeholder": "<MACHINE_ID_156>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_182>"
     },
     {
-      "placeholder": "<MACHINE_ID_157>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_183>"
     },
     {
-      "placeholder": "<MACHINE_ID_158>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_184>"
     },
     {
-      "placeholder": "<MACHINE_ID_159>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_185>"
     },
     {
-      "placeholder": "<MACHINE_ID_15>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_186>"
     },
     {
-      "placeholder": "<MACHINE_ID_160>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_187>"
     },
     {
-      "placeholder": "<MACHINE_ID_161>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_188>"
     },
     {
-      "placeholder": "<MACHINE_ID_162>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_189>"
     },
     {
-      "placeholder": "<MACHINE_ID_163>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_190>"
     },
     {
-      "placeholder": "<MACHINE_ID_164>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_191>"
     },
     {
-      "placeholder": "<MACHINE_ID_165>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_192>"
     },
     {
-      "placeholder": "<MACHINE_ID_166>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_193>"
     },
     {
-      "placeholder": "<MACHINE_ID_167>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_194>"
     },
     {
-      "placeholder": "<MACHINE_ID_168>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_195>"
     },
     {
-      "placeholder": "<MACHINE_ID_169>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_196>"
     },
     {
-      "placeholder": "<MACHINE_ID_16>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_197>"
     },
     {
-      "placeholder": "<MACHINE_ID_170>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_198>"
     },
     {
-      "placeholder": "<MACHINE_ID_171>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_199>"
     },
     {
-      "placeholder": "<MACHINE_ID_172>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_200>"
     },
     {
-      "placeholder": "<MACHINE_ID_173>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_201>"
     },
     {
-      "placeholder": "<MACHINE_ID_174>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_202>"
     },
     {
-      "placeholder": "<MACHINE_ID_175>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_203>"
     },
     {
-      "placeholder": "<MACHINE_ID_176>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_204>"
     },
     {
-      "placeholder": "<MACHINE_ID_177>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_205>"
     },
     {
-      "placeholder": "<MACHINE_ID_178>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_206>"
     },
     {
-      "placeholder": "<MACHINE_ID_179>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_207>"
     },
     {
-      "placeholder": "<MACHINE_ID_17>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_208>"
     },
     {
-      "placeholder": "<MACHINE_ID_180>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_209>"
     },
     {
-      "placeholder": "<MACHINE_ID_181>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_210>"
     },
     {
-      "placeholder": "<MACHINE_ID_182>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_211>"
     },
     {
-      "placeholder": "<MACHINE_ID_183>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_212>"
     },
     {
-      "placeholder": "<MACHINE_ID_184>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_213>"
     },
     {
-      "placeholder": "<MACHINE_ID_185>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_214>"
     },
     {
-      "placeholder": "<MACHINE_ID_186>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_215>"
     },
     {
-      "placeholder": "<MACHINE_ID_187>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_216>"
     },
     {
-      "placeholder": "<MACHINE_ID_188>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_217>"
     },
     {
-      "placeholder": "<MACHINE_ID_189>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_218>"
     },
     {
-      "placeholder": "<MACHINE_ID_18>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_219>"
     },
     {
-      "placeholder": "<MACHINE_ID_190>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_220>"
     },
     {
-      "placeholder": "<MACHINE_ID_191>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_221>"
     },
     {
-      "placeholder": "<MACHINE_ID_192>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_222>"
     },
     {
-      "placeholder": "<MACHINE_ID_193>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_223>"
     },
     {
-      "placeholder": "<MACHINE_ID_194>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_224>"
     },
     {
-      "placeholder": "<MACHINE_ID_195>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_225>"
     },
     {
-      "placeholder": "<MACHINE_ID_196>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_226>"
     },
     {
-      "placeholder": "<MACHINE_ID_197>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_227>"
     },
     {
-      "placeholder": "<MACHINE_ID_198>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_228>"
     },
     {
-      "placeholder": "<MACHINE_ID_199>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_229>"
     },
     {
-      "placeholder": "<MACHINE_ID_19>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_230>"
     },
     {
-      "placeholder": "<MACHINE_ID_1>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_231>"
     },
     {
-      "placeholder": "<MACHINE_ID_200>",
-      "kind": "machine_id"
+      "kind": "machine",
+      "placeholder": "<MACHINE_232>"
     },
     {
-      "placeholder": "<MACHINE_ID_201>",
-      "kind": "machine_id"
+      "kind": "request",
+      "placeholder": "<REQUEST_1>"
     },
     {
-      "placeholder": "<MACHINE_ID_202>",
-      "kind": "machine_id"
+      "kind": "request",
+      "placeholder": "<REQUEST_2>"
     },
     {
-      "placeholder": "<MACHINE_ID_203>",
-      "kind": "machine_id"
+      "kind": "request",
+      "placeholder": "<REQUEST_3>"
     },
     {
-      "placeholder": "<MACHINE_ID_204>",
-      "kind": "machine_id"
+      "kind": "request",
+      "placeholder": "<REQUEST_4>"
     },
     {
-      "placeholder": "<MACHINE_ID_205>",
-      "kind": "machine_id"
+      "kind": "request",
+      "placeholder": "<REQUEST_5>"
     },
     {
-      "placeholder": "<MACHINE_ID_206>",
-      "kind": "machine_id"
+      "kind": "request",
+      "placeholder": "<REQUEST_6>"
     },
     {
-      "placeholder": "<MACHINE_ID_207>",
-      "kind": "machine_id"
+      "kind": "request",
+      "placeholder": "<REQUEST_7>"
     },
     {
-      "placeholder": "<MACHINE_ID_208>",
-      "kind": "machine_id"
+      "kind": "request",
+      "placeholder": "<REQUEST_8>"
     },
     {
-      "placeholder": "<MACHINE_ID_209>",
-      "kind": "machine_id"
+      "kind": "session",
+      "placeholder": "<SESSION_1>"
     },
     {
-      "placeholder": "<MACHINE_ID_20>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V1>"
     },
     {
-      "placeholder": "<MACHINE_ID_210>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V2>"
     },
     {
-      "placeholder": "<MACHINE_ID_211>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V3>"
     },
     {
-      "placeholder": "<MACHINE_ID_212>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V4>"
     },
     {
-      "placeholder": "<MACHINE_ID_213>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V5>"
     },
     {
-      "placeholder": "<MACHINE_ID_214>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V6>"
     },
     {
-      "placeholder": "<MACHINE_ID_215>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V7>"
     },
     {
-      "placeholder": "<MACHINE_ID_216>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V8>"
     },
     {
-      "placeholder": "<MACHINE_ID_217>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V9>"
     },
     {
-      "placeholder": "<MACHINE_ID_218>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V10>"
     },
     {
-      "placeholder": "<MACHINE_ID_219>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V11>"
     },
     {
-      "placeholder": "<MACHINE_ID_21>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V12>"
     },
     {
-      "placeholder": "<MACHINE_ID_220>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V13>"
     },
     {
-      "placeholder": "<MACHINE_ID_221>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V14>"
     },
     {
-      "placeholder": "<MACHINE_ID_222>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V15>"
     },
     {
-      "placeholder": "<MACHINE_ID_223>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V16>"
     },
     {
-      "placeholder": "<MACHINE_ID_224>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V17>"
     },
     {
-      "placeholder": "<MACHINE_ID_225>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V18>"
     },
     {
-      "placeholder": "<MACHINE_ID_226>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V19>"
     },
     {
-      "placeholder": "<MACHINE_ID_227>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V20>"
     },
     {
-      "placeholder": "<MACHINE_ID_228>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V21>"
     },
     {
-      "placeholder": "<MACHINE_ID_229>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V22>"
     },
     {
-      "placeholder": "<MACHINE_ID_22>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V23>"
     },
     {
-      "placeholder": "<MACHINE_ID_230>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V24>"
     },
     {
-      "placeholder": "<MACHINE_ID_231>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V25>"
     },
     {
-      "placeholder": "<MACHINE_ID_232>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V26>"
     },
     {
-      "placeholder": "<MACHINE_ID_23>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V27>"
     },
     {
-      "placeholder": "<MACHINE_ID_24>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V28>"
     },
     {
-      "placeholder": "<MACHINE_ID_25>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V29>"
     },
     {
-      "placeholder": "<MACHINE_ID_26>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V30>"
     },
     {
-      "placeholder": "<MACHINE_ID_27>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V31>"
     },
     {
-      "placeholder": "<MACHINE_ID_28>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V32>"
     },
     {
-      "placeholder": "<MACHINE_ID_29>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V33>"
     },
     {
-      "placeholder": "<MACHINE_ID_2>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V34>"
     },
     {
-      "placeholder": "<MACHINE_ID_30>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V35>"
     },
     {
-      "placeholder": "<MACHINE_ID_31>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V36>"
     },
     {
-      "placeholder": "<MACHINE_ID_32>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V37>"
     },
     {
-      "placeholder": "<MACHINE_ID_33>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V38>"
     },
     {
-      "placeholder": "<MACHINE_ID_34>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V39>"
     },
     {
-      "placeholder": "<MACHINE_ID_35>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V40>"
     },
     {
-      "placeholder": "<MACHINE_ID_36>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V41>"
     },
     {
-      "placeholder": "<MACHINE_ID_37>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V42>"
     },
     {
-      "placeholder": "<MACHINE_ID_38>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V43>"
     },
     {
-      "placeholder": "<MACHINE_ID_39>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V44>"
     },
     {
-      "placeholder": "<MACHINE_ID_3>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V45>"
     },
     {
-      "placeholder": "<MACHINE_ID_40>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V46>"
     },
     {
-      "placeholder": "<MACHINE_ID_41>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V47>"
     },
     {
-      "placeholder": "<MACHINE_ID_42>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V48>"
     },
     {
-      "placeholder": "<MACHINE_ID_43>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V49>"
     },
     {
-      "placeholder": "<MACHINE_ID_44>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V50>"
     },
     {
-      "placeholder": "<MACHINE_ID_45>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V51>"
     },
     {
-      "placeholder": "<MACHINE_ID_46>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V52>"
     },
     {
-      "placeholder": "<MACHINE_ID_47>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V53>"
     },
     {
-      "placeholder": "<MACHINE_ID_48>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V54>"
     },
     {
-      "placeholder": "<MACHINE_ID_49>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V55>"
     },
     {
-      "placeholder": "<MACHINE_ID_4>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V56>"
     },
     {
-      "placeholder": "<MACHINE_ID_50>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V57>"
     },
     {
-      "placeholder": "<MACHINE_ID_51>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V58>"
     },
     {
-      "placeholder": "<MACHINE_ID_52>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V59>"
     },
     {
-      "placeholder": "<MACHINE_ID_53>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V60>"
     },
     {
-      "placeholder": "<MACHINE_ID_54>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V61>"
     },
     {
-      "placeholder": "<MACHINE_ID_55>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V62>"
     },
     {
-      "placeholder": "<MACHINE_ID_56>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V63>"
     },
     {
-      "placeholder": "<MACHINE_ID_57>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V64>"
     },
     {
-      "placeholder": "<MACHINE_ID_58>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V65>"
     },
     {
-      "placeholder": "<MACHINE_ID_59>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V66>"
     },
     {
-      "placeholder": "<MACHINE_ID_5>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V67>"
     },
     {
-      "placeholder": "<MACHINE_ID_60>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V68>"
     },
     {
-      "placeholder": "<MACHINE_ID_61>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V69>"
     },
     {
-      "placeholder": "<MACHINE_ID_62>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V70>"
     },
     {
-      "placeholder": "<MACHINE_ID_63>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V71>"
     },
     {
-      "placeholder": "<MACHINE_ID_64>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V72>"
     },
     {
-      "placeholder": "<MACHINE_ID_65>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V73>"
     },
     {
-      "placeholder": "<MACHINE_ID_66>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V74>"
     },
     {
-      "placeholder": "<MACHINE_ID_67>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V75>"
     },
     {
-      "placeholder": "<MACHINE_ID_68>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V76>"
     },
     {
-      "placeholder": "<MACHINE_ID_69>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V77>"
     },
     {
-      "placeholder": "<MACHINE_ID_6>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V78>"
     },
     {
-      "placeholder": "<MACHINE_ID_70>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V79>"
     },
     {
-      "placeholder": "<MACHINE_ID_71>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V80>"
     },
     {
-      "placeholder": "<MACHINE_ID_72>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V81>"
     },
     {
-      "placeholder": "<MACHINE_ID_73>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V82>"
     },
     {
-      "placeholder": "<MACHINE_ID_74>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V83>"
     },
     {
-      "placeholder": "<MACHINE_ID_75>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V84>"
     },
     {
-      "placeholder": "<MACHINE_ID_76>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V85>"
     },
     {
-      "placeholder": "<MACHINE_ID_77>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V86>"
     },
     {
-      "placeholder": "<MACHINE_ID_78>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V87>"
     },
     {
-      "placeholder": "<MACHINE_ID_79>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V88>"
     },
     {
-      "placeholder": "<MACHINE_ID_7>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V89>"
     },
     {
-      "placeholder": "<MACHINE_ID_80>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V90>"
     },
     {
-      "placeholder": "<MACHINE_ID_81>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V91>"
     },
     {
-      "placeholder": "<MACHINE_ID_82>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V92>"
     },
     {
-      "placeholder": "<MACHINE_ID_83>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V93>"
     },
     {
-      "placeholder": "<MACHINE_ID_84>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V94>"
     },
     {
-      "placeholder": "<MACHINE_ID_85>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V95>"
     },
     {
-      "placeholder": "<MACHINE_ID_86>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V96>"
     },
     {
-      "placeholder": "<MACHINE_ID_87>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V97>"
     },
     {
-      "placeholder": "<MACHINE_ID_88>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V98>"
     },
     {
-      "placeholder": "<MACHINE_ID_89>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V99>"
     },
     {
-      "placeholder": "<MACHINE_ID_8>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V100>"
     },
     {
-      "placeholder": "<MACHINE_ID_90>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V101>"
     },
     {
-      "placeholder": "<MACHINE_ID_91>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V102>"
     },
     {
-      "placeholder": "<MACHINE_ID_92>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V103>"
     },
     {
-      "placeholder": "<MACHINE_ID_93>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V104>"
     },
     {
-      "placeholder": "<MACHINE_ID_94>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V105>"
     },
     {
-      "placeholder": "<MACHINE_ID_95>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V106>"
     },
     {
-      "placeholder": "<MACHINE_ID_96>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V107>"
     },
     {
-      "placeholder": "<MACHINE_ID_97>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V108>"
     },
     {
-      "placeholder": "<MACHINE_ID_98>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V109>"
     },
     {
-      "placeholder": "<MACHINE_ID_99>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V110>"
     },
     {
-      "placeholder": "<MACHINE_ID_9>",
-      "kind": "machine_id"
+      "kind": "v",
+      "placeholder": "<V111>"
     },
     {
-      "placeholder": "<PROVIDER_PROSE_1>",
-      "kind": "provider_prose"
+      "kind": "v",
+      "placeholder": "<V112>"
     },
     {
-      "placeholder": "<SESSION_ID_1>",
-      "kind": "session_id"
+      "kind": "v",
+      "placeholder": "<V113>"
     },
     {
-      "placeholder": "<TEMP>",
-      "kind": "temp_path"
+      "kind": "v",
+      "placeholder": "<V114>"
     },
     {
-      "placeholder": "<TOOL_USE_ID_1>",
-      "kind": "tool_use_id"
+      "kind": "v",
+      "placeholder": "<V115>"
     },
     {
-      "placeholder": "<TOOL_USE_ID_2>",
-      "kind": "tool_use_id"
+      "kind": "v",
+      "placeholder": "<V116>"
     },
     {
-      "placeholder": "<TOOL_USE_ID_3>",
-      "kind": "tool_use_id"
+      "kind": "v",
+      "placeholder": "<V117>"
     },
     {
-      "placeholder": "<TOOL_USE_ID_4>",
-      "kind": "tool_use_id"
+      "kind": "v",
+      "placeholder": "<V118>"
     },
     {
-      "placeholder": "<TOOL_USE_ID_5>",
-      "kind": "tool_use_id"
+      "kind": "v",
+      "placeholder": "<V119>"
     },
     {
-      "placeholder": "<TOOL_USE_ID_6>",
-      "kind": "tool_use_id"
+      "kind": "v",
+      "placeholder": "<V120>"
     },
     {
-      "placeholder": "<TOOL_USE_ID_7>",
-      "kind": "tool_use_id"
+      "kind": "v",
+      "placeholder": "<V121>"
     },
     {
-      "placeholder": "<TOOL_USE_ID_8>",
-      "kind": "tool_use_id"
+      "kind": "v",
+      "placeholder": "<V122>"
     },
     {
-      "placeholder": "<USER_TEXT_1>",
-      "kind": "user_text"
+      "kind": "v",
+      "placeholder": "<V123>"
     },
     {
-      "placeholder": "<USER_TEXT_2>",
-      "kind": "user_text"
+      "kind": "v",
+      "placeholder": "<V124>"
     },
     {
-      "placeholder": "<USER_TEXT_3>",
-      "kind": "user_text"
+      "kind": "v",
+      "placeholder": "<V125>"
     },
     {
-      "placeholder": "<USER_TEXT_4>",
-      "kind": "user_text"
+      "kind": "v",
+      "placeholder": "<V126>"
     },
     {
-      "placeholder": "<USER_TEXT_5>",
-      "kind": "user_text"
+      "kind": "v",
+      "placeholder": "<V127>"
     },
     {
-      "placeholder": "<USER_TEXT_6>",
-      "kind": "user_text"
+      "kind": "v",
+      "placeholder": "<V128>"
     },
     {
-      "placeholder": "<USER_TEXT_7>",
-      "kind": "user_text"
+      "kind": "v",
+      "placeholder": "<V129>"
     },
     {
-      "placeholder": "<USER_TEXT_8>",
-      "kind": "user_text"
+      "kind": "v",
+      "placeholder": "<V130>"
     },
     {
-      "placeholder": "<USER_TEXT_9>",
-      "kind": "user_text"
+      "kind": "v",
+      "placeholder": "<V131>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V132>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V133>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V134>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V135>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V136>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V137>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V138>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V139>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V140>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V141>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V142>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V143>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V144>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V145>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V146>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V147>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V148>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V149>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V150>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V151>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V152>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V153>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V154>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V155>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V156>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V157>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V158>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V159>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V160>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V161>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V162>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V163>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V164>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V165>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V166>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V167>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V168>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V169>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V170>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V171>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V172>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V173>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V174>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V175>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V176>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V177>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V178>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V179>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V180>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V181>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V182>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V183>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V184>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V185>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V186>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V187>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V188>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V189>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V190>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V191>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V192>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V193>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V194>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V195>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V196>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V197>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V198>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V199>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V200>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V201>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V202>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V203>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V204>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V205>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V206>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V207>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V208>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V209>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V210>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V211>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V212>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V213>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V214>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V215>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V216>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V217>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V218>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V219>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V220>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V221>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V222>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V223>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V224>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V225>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V226>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V227>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V228>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V229>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V230>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V231>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V232>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V233>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V234>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V235>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V236>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V237>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V238>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V239>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V240>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V241>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V242>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V243>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V244>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V245>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V246>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V247>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V248>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V249>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V250>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V251>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V252>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V253>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V254>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V255>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V256>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V257>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V258>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V259>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V260>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V261>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V262>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V263>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V264>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V265>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V266>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V267>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V268>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V269>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V270>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V271>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V272>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V273>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V274>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V275>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V276>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V277>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V278>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V279>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V280>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V281>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V282>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V283>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V284>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V285>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V286>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V287>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V288>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V289>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V290>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V291>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V292>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V293>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V294>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V295>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V296>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V297>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V298>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V299>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V300>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V301>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V302>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V303>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V304>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V305>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V306>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V307>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V308>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V309>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V310>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V311>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V312>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V313>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V314>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V315>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V316>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V317>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V318>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V319>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V320>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V321>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V322>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V323>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V324>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V325>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V326>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V327>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V328>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V329>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V330>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V331>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V332>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V333>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V334>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V335>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V336>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V337>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V338>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V339>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V340>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V341>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V342>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V343>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V344>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V345>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V346>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V347>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V348>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V349>"
     }
   ],
+  "platform": {
+    "arch": "x86_64",
+    "os": "windows"
+  },
+  "provider": "claude",
+  "purpose": "capture Claude delegating a Task/Agent subagent, including the resumed task_started sharing one task_id, patch-only task_updated, task_notification with usage, and background_tasks_changed populated-then-empty",
   "redaction_counts": {
-    "assistant_prose": 109,
-    "claude_memory_path": 1,
-    "claude_message_id": 25,
-    "claude_request_id": 19,
-    "claude_thinking_signature": 13,
-    "cwd_path": 8,
-    "home_path": 4,
-    "machine_id": 232,
-    "provider_prose": 2,
-    "session_id": 235,
-    "temp_path": 3,
-    "tool_use_id": 47,
-    "user_text": 14
-  }
+    "machine": 232,
+    "request": 19,
+    "session": 232,
+    "v": 915
+  },
+  "scenario": "subagent",
+  "schema_version": 1,
+  "source": "capture.json"
 }

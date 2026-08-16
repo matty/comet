@@ -54,3 +54,7 @@ path = "tests/fixtures/fake_codex_stuck_cursor.rs"
 [[bin]]
 name = "fake-codex-endless-cursor"
 path = "tests/fixtures/fake_codex_endless_cursor.rs"
+
+[[bin]]
+name = "fake-claude-discovery-stall"
+path = "tests/fixtures/fake_claude_discovery_stall.rs"

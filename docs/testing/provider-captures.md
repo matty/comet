@@ -24,6 +24,27 @@ List the supported scenarios and options without contacting a provider:
 cargo run -p comet-harness --bin comet-provider-capture -- --help
 ```
 
+That text is generated, not hand-maintained: `crates/harness/src/capture/record/scenarios.rs`'s
+`SCENARIOS` table is the single place a scenario's name, provider, purpose and argument
+requirements are declared, and both `--help` and `record()`'s own dispatch read it. There is no
+scenario name or flag requirement to keep in sync with this document — if `--help` and this
+procedure ever disagree, `--help` is current and this file is stale.
+
+**What actually makes the corpus safe to commit is `comet-provider-sanitize`'s allowlist, not a
+review step downstream of it.** `crates/harness/src/capture/allowlist/{claude,codex}.txt` name
+every dotted key path whose value may survive sanitizing, one file per provider. Everything not
+named there becomes a numbered placeholder (`<V210>`), with equal values sharing a number so joins
+across frames still work; six identifier kinds — session, thread, turn, tool-use, machine, request
+— keep a readable typed name instead of a bare number. **A field nothing on the list names is
+redacted by default.** That is the standing rule, not a fallback for the shapes nobody got around
+to recognizing: sanitizing never asks "does this look sensitive," only "is this path on the list,"
+and the fail-closed answer to everything else is the same no matter what the field turns out to
+hold.
+
+Adding a line to `claude.txt` or `codex.txt` is a decision to publish every value that path will
+ever carry, forever, in this public repository — not a judgment about whether today's capture
+happens to show something harmless.
+
 ## Capture and sanitize
 
 Choose an immutable raw root for one observation. Token-free discovery, for example:
@@ -49,22 +70,44 @@ be staged or promoted.
 
 ## Review before promotion
 
-Compare raw and staged artifacts recursively before copying anything into Git. Confirm:
+`comet-provider-sanitize` prints a **novel-path report** after every run: each dotted path it
+withheld a value for, how many distinct values it saw at that path, and a shape summary (`string`,
+`number`, `bool`, `mixed`) — never the value itself. That report is the discovery mechanism, and
+reading it is the review: triage never requires opening withheld content, because none of it is in
+the report to open.
+
+For each row, open the raw capture locally and look at what the path actually holds, then decide:
+
+- **Nothing worth allowing** — leave it. The placeholder stands, and the same row reappears on the
+  next sanitize run of a scenario that touches that path.
+- **Worth publishing forever** — add the path as a new line to `claude.txt` or `codex.txt`,
+  re-sanitize to a fresh staging name, and confirm the row is gone from the report.
+- **Something that must never survive** — a credential, a token, attachment bytes, an unrecognized
+  absolute path. Leave it withheld. If the fail-closed structural scan should already have caught
+  the shape and didn't, add a captured-shape failing test, fix the rule, and re-sanitize to a fresh
+  staging name.
+
+An empty report ("none — every field on the wire was already allowlisted") means nothing *new*
+showed up, not that nothing was captured.
+
+Separately from the allowlist decision, compare raw and staged artifacts to confirm the promoted
+frames still prove what the scenario is for:
 
 - provider, CLI version, platform, capture timestamp, scenario, purpose, command, cwd, configured
   environment, channels, and exit outcome match the observation;
 - event sequences and channels are complete and ordered, and the selected frames prove what the
   scenario is for, without relying on sanitized provider prose;
-- every placeholder definition, use, kind, and redaction count is reciprocal and consistent;
-- no username, home/repository/temp path, email/account identity, hostname or server name, machine
-  identifier, credential/token, attachment bytes, unrecognized absolute path, or policy-redacted
-  user/provider prose survives;
 - command inputs, approval joins, terminal status, and repeated identifiers retain the exact safe
   semantics required by the scenario.
 
-If sanitization leaks, corrupts semantics, or accepts an unknown sensitive shape, stop. Add a
-captured-shape failing test, fix the fail-closed structural rule, re-sanitize to a fresh staging
-name, and repeat the complete review. Do not edit staged output by hand.
+Do not edit staged output by hand.
+
+Before promoting, also check
+[`docs/debt/D73-tool-argument-union-paths.md`](../debt/D73-tool-argument-union-paths.md): seven
+paths on `claude.txt` are allowlisted as a union across today's five known tools rather than
+reviewed per tool, and that page must be settled — not merely re-read — before the next capture is
+promoted to the corpus. A new capture is exactly the event that could exercise a sixth, unreviewed
+tool (including a third-party MCP tool) through one of those already-approved paths.
 
 ## Promote
 
@@ -77,6 +120,24 @@ Run the focused gate after every promotion:
 cargo test -p comet-harness --test capture_corpus
 cargo test -p comet-harness
 ```
+
+`capture_corpus` includes `allowlist_property::every_committed_value_is_allowlisted_or_a_placeholder`
+— a total property, not a sample, over every scalar in every committed `events.jsonl`: each one is
+either at an allowlisted path or is a placeholder, with no exception. That property is the gate.
+The manual review above decides what belongs on the allowlist; this test is what actually stops an
+escape from being promoted, and it fails loudly, over the whole corpus, if one gets through.
+
+Its sibling `every_committed_map_key_is_allowlisted_or_a_placeholder` does the same in key
+position, and the two are not interchangeable: the scalar property walks `String`/`Number` leaves,
+so an identifier sitting in an object *key* was invisible to it. A rogue key planted under
+`.modelUsage` with no scalars beneath it fails the key property while the scalar property, the
+manifest-token property and the field snapshot all stay green.
+
+**When a report row names a key rather than a field, the object is a map and belongs in
+`surface::MAP_PATHS`.** That is the triage step for a novel map: the declaration is one edit, and
+it decides both questions at once — the field snapshot stops recording the key as a field name,
+and the sanitizer stops publishing it. Until it is declared, the keys ride through
+([D77](../debt/README.md)).
 
 Before committing, deliberately break each new contract once, observe a meaningful named failure,
 restore it, and rerun green. Finish with the repository gate from `AGENTS.md`.

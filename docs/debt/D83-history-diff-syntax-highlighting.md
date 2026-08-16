@@ -1,4 +1,4 @@
-# D73 — History diffs do not have a pinned source revision
+# D83 — History diffs do not have a pinned source revision
 
 The syntax-highlighting sync intentionally deferred upstream commit
 `d903bd7332b822d4ad1c76313af96dca017e398c` (`feat(ui): highlight history

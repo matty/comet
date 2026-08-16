@@ -22,76 +22,216 @@
   "normalized_cli_version": "codex-cli 0.147.0",
   "placeholders": [
     {
-      "kind": "codex_rpc_id",
-      "placeholder": "<CODEX_RPC_ID_1>"
+      "kind": "session",
+      "placeholder": "<SESSION_1>"
     },
     {
-      "kind": "codex_rpc_id",
-      "placeholder": "<CODEX_RPC_ID_2>"
+      "kind": "v",
+      "placeholder": "<V1>"
     },
     {
-      "kind": "codex_rpc_id",
-      "placeholder": "<CODEX_RPC_ID_3>"
+      "kind": "v",
+      "placeholder": "<V2>"
     },
     {
-      "kind": "session_id",
-      "placeholder": "<SESSION_ID_1>"
+      "kind": "v",
+      "placeholder": "<V3>"
     },
     {
-      "kind": "thread_id",
-      "placeholder": "<THREAD_ID_1>"
+      "kind": "v",
+      "placeholder": "<V4>"
     },
     {
-      "kind": "turn_id",
-      "placeholder": "<TURN_ID_1>"
+      "kind": "v",
+      "placeholder": "<V5>"
     },
     {
-      "kind": "tool_use_id",
-      "placeholder": "<TOOL_USE_ID_1>"
+      "kind": "v",
+      "placeholder": "<V6>"
     },
     {
-      "kind": "tool_use_id",
-      "placeholder": "<TOOL_USE_ID_2>"
+      "kind": "v",
+      "placeholder": "<V7>"
     },
     {
-      "kind": "user_text",
-      "placeholder": "<USER_TEXT_1>"
+      "kind": "v",
+      "placeholder": "<V8>"
     },
     {
-      "kind": "assistant_prose",
-      "placeholder": "<ASSISTANT_PROSE_1>"
+      "kind": "v",
+      "placeholder": "<V9>"
     },
     {
-      "kind": "assistant_prose",
-      "placeholder": "<ASSISTANT_PROSE_2>"
+      "kind": "v",
+      "placeholder": "<V10>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_1>"
+      "kind": "v",
+      "placeholder": "<V11>"
     },
     {
-      "kind": "machine_id",
-      "placeholder": "<MACHINE_ID_2>"
+      "kind": "v",
+      "placeholder": "<V12>"
     },
     {
-      "kind": "codex_mcp_server_name",
-      "placeholder": "<CODEX_MCP_SERVER_NAME_1>"
+      "kind": "v",
+      "placeholder": "<V13>"
     },
     {
-      "kind": "codex_mcp_server_name",
-      "placeholder": "<CODEX_MCP_SERVER_NAME_2>"
+      "kind": "v",
+      "placeholder": "<V14>"
     },
     {
-      "kind": "codex_thread_path",
-      "placeholder": "<CODEX_THREAD_PATH_1>"
+      "kind": "v",
+      "placeholder": "<V15>"
     },
     {
-      "kind": "cwd_path",
-      "placeholder": "<CWD>"
+      "kind": "v",
+      "placeholder": "<V16>"
     },
     {
-      "kind": "home_path",
-      "placeholder": "<HOME>"
+      "kind": "v",
+      "placeholder": "<V17>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V18>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V19>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V20>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V21>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V22>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V23>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V24>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V25>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V26>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V27>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V28>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V29>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V30>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V31>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V32>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V33>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V34>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V35>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V36>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V37>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V38>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V39>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V40>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V41>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V42>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V43>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V44>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V45>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V46>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V47>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V48>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V49>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V50>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V51>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V52>"
     }
   ],
   "platform": {
@@ -101,18 +241,8 @@
   "provider": "codex",
   "purpose": "capture one bounded Codex run script",
   "redaction_counts": {
-    "assistant_prose": 4,
-    "codex_mcp_server_name": 12,
-    "codex_rpc_id": 3,
-    "codex_thread_path": 2,
-    "cwd_path": 7,
-    "home_path": 3,
-    "machine_id": 2,
-    "session_id": 2,
-    "thread_id": 26,
-    "tool_use_id": 6,
-    "turn_id": 9,
-    "user_text": 3
+    "session": 2,
+    "v": 139
   },
   "scenario": "fresh-text",
   "schema_version": 1,

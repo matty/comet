@@ -2277,15 +2277,25 @@ mod tests {
 
     #[test]
     fn captured_claude_write_result_carries_the_complete_new_file() {
-        let events = corpus_run("claude/2.1.228/approval", &[100, 104]);
+        let frames = corpus_run("claude/2.1.228/approval", &[100, 104]);
+        // The corpus allowlist deliberately redacts source text and paths. Read
+        // the correlated values back from the sanitized frame instead of
+        // publishing a source literal merely to keep this production-seam test.
+        let write: Value = serde_json::from_str(&frames[0]).unwrap();
+        let expected_path = write["message"]["content"][0]["input"]["file_path"]
+            .as_str()
+            .unwrap();
+        let expected_new_text = write["message"]["content"][0]["input"]["content"]
+            .as_str()
+            .unwrap();
         let mut normalizer = Normalizer::new(RuntimeMode::default());
-        let events = drive(&mut normalizer, &events);
+        let events = drive(&mut normalizer, &frames);
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::ToolResult {
-                diff: Some(comet_proto::ToolDiff { old_text: None, new_text, .. }),
+                diff: Some(comet_proto::ToolDiff { path, old_text: None, new_text }),
                 ..
-            } if new_text == "capture\n"
+            } if path == expected_path && new_text == expected_new_text
         )));
     }
 
@@ -2538,6 +2548,14 @@ mod tests {
     /// `TaskCreate`'s `tool_use_result` carries the assigned task id and its
     /// subject; the id appears nowhere on the tool input, so a decode reading
     /// only the input cannot key the item.
+    ///
+    /// `.tool_use_result.task.subject` is not on `claude.txt` (user-authored
+    /// free text, the allowlist-sanitizer stage's decision 2), so the literal
+    /// subject text (`"Alpha step"`) is gone from the archive. `text.is_some()`
+    /// is what survives: it proves the subject reached `ChecklistItemChanged`
+    /// at all, which is what the decode actually needs to prove — the id,
+    /// absence of `active_form`, and `Pending` status are untouched by
+    /// redaction and still asserted exactly.
     #[test]
     fn task_create_yields_a_pending_item_with_its_assigned_id() {
         let frames = corpus_run(CHECKLIST, &[55, 64]);
@@ -2547,17 +2565,24 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, AgentEvent::ChecklistItemChanged { .. }))
             .collect();
-        assert_eq!(
-            changed,
-            vec![&AgentEvent::ChecklistItemChanged {
-                // The id is on the RESULT only; the input never knows it.
-                item_id: "1".into(),
-                text: Some("Alpha step".into()),
-                active_form: None,
-                status: ChecklistStatus::Pending,
-            }],
-            "{events:?}"
+        assert_eq!(changed.len(), 1, "{events:?}");
+        let AgentEvent::ChecklistItemChanged {
+            item_id,
+            text,
+            active_form,
+            status,
+        } = changed[0]
+        else {
+            unreachable!("filtered above");
+        };
+        // The id is on the RESULT only; the input never knows it.
+        assert_eq!(item_id, "1");
+        assert!(
+            text.is_some(),
+            "TaskCreate's subject must reach text: {events:?}"
         );
+        assert_eq!(active_form, &None);
+        assert_eq!(*status, ChecklistStatus::Pending);
     }
 
     /// `TaskCreate`'s `tool_use_result` carries the assigned task id and its
@@ -2584,6 +2609,13 @@ mod tests {
     /// A resumed Claude process restates no task list at init and its first
     /// task frame updates an id it never created, so a per-run accumulator
     /// receives a status change for an unknown item.
+    ///
+    /// `.message.content[].input.activeForm` is not on `claude.txt`
+    /// (user-authored free text, same exclusion as the subject field above),
+    /// so the literal label (`"Working the second step"`) is gone. `text`
+    /// staying exactly `None` is unaffected by that — an absent value is
+    /// never redacted, only a present one — so it is still asserted exactly;
+    /// `active_form.is_some()` replaces the literal-string check.
     #[test]
     fn a_resumed_runs_update_for_an_unseen_task_carries_its_active_form() {
         // This test's three frames are the resumed run's init (which restates
@@ -2594,14 +2626,29 @@ mod tests {
         let frames = corpus_run(CHECKLIST_RESUME, &[2, 50, 55]);
         let mut n = Normalizer::new(RuntimeMode::default());
         let events = drive(&mut n, &frames);
+        let found = events.iter().find(|e| {
+            matches!(
+                e,
+                AgentEvent::ChecklistItemChanged {
+                    item_id,
+                    status: ChecklistStatus::InProgress,
+                    ..
+                } if item_id == "2"
+            )
+        });
+        let Some(AgentEvent::ChecklistItemChanged {
+            text, active_form, ..
+        }) = found
+        else {
+            panic!("expected an in-progress ChecklistItemChanged for item 2: {events:?}");
+        };
+        assert_eq!(
+            text, &None,
+            "a resumed process never learns the subject: {events:?}"
+        );
         assert!(
-            events.contains(&AgentEvent::ChecklistItemChanged {
-                item_id: "2".into(),
-                text: None,
-                active_form: Some("Working the second step".into()),
-                status: ChecklistStatus::InProgress,
-            }),
-            "{events:?}"
+            active_form.is_some(),
+            "activeForm is the only readable label: {events:?}"
         );
     }
 
@@ -2628,6 +2675,11 @@ mod tests {
     /// `TaskUpdate`'s `tool_use_result` reports an explicit `statusChange
     /// {from,to}`, while `activeForm` appears only on the tool input, so
     /// neither frame alone describes the change.
+    ///
+    /// Same exclusion as the resumed-run test above: `activeForm`'s literal
+    /// text (`"Working the first step"`) is gone from the archive, so
+    /// `active_form.is_some()` replaces the literal-string check; `text`
+    /// staying exactly `None` and the id/status join are untouched.
     #[test]
     fn the_results_confirmed_transition_beats_the_inputs_request() {
         // This test's two frames: an `in_progress` request whose result
@@ -2638,14 +2690,29 @@ mod tests {
         let frames = corpus_run(CHECKLIST, &[88, 93]);
         let mut n = Normalizer::new(RuntimeMode::default());
         let events = drive(&mut n, &frames);
+        let found = events.iter().find(|e| {
+            matches!(
+                e,
+                AgentEvent::ChecklistItemChanged {
+                    item_id,
+                    status: ChecklistStatus::InProgress,
+                    ..
+                } if item_id == "1"
+            )
+        });
+        let Some(AgentEvent::ChecklistItemChanged {
+            text, active_form, ..
+        }) = found
+        else {
+            panic!("expected an in-progress ChecklistItemChanged for item 1: {events:?}");
+        };
+        assert_eq!(
+            text, &None,
+            "the result never restates the subject: {events:?}"
+        );
         assert!(
-            events.contains(&AgentEvent::ChecklistItemChanged {
-                item_id: "1".into(),
-                text: None,
-                active_form: Some("Working the first step".into()),
-                status: ChecklistStatus::InProgress,
-            }),
-            "{events:?}"
+            active_form.is_some(),
+            "activeForm rides the request, confirmed by the result: {events:?}"
         );
     }
 

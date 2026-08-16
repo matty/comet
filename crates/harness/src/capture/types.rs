@@ -4,8 +4,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use comet_proto::RunRequest;
-
 use crate::launch::{LaunchDescriptor, StdioMode};
 
 /// The reproducible, reviewable portion of a provider launch command.
@@ -27,8 +25,7 @@ pub struct CommandSnapshot {
 }
 
 impl CommandSnapshot {
-    // The capture recorder is the only caller; see `recording.rs`.
-    #[allow(dead_code)]
+    // The capture recorder is the only caller; see `record/session.rs`.
     pub(crate) fn from_launch(launch: &LaunchDescriptor) -> Self {
         const CAPTURED_ENV: &[&str] = &["CODEX_HOME"];
 
@@ -88,80 +85,35 @@ pub struct CaptureEvent {
     pub payload: String,
 }
 
-#[derive(Clone, Debug)]
-pub enum ClaudeCaptureOperation {
-    ModelDiscovery,
-    ModelDiscoveryAt {
-        cwd: PathBuf,
-    },
-    CommandDiscovery {
-        cwd: PathBuf,
-    },
-    Run {
-        request: RunRequest,
-        script: ClaudeRunScript,
-    },
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum ClaudeRunScript {
-    FreshText,
-    Approval,
-    Resume,
-    Attachment,
-    /// Drives the task-list tools (`TaskCreate` / `TaskUpdate`) so a capture
-    /// carries real checklist mutations.
-    Checklist,
-    /// The same list, continued by a SECOND process resuming the first. This
-    /// is the only way to observe what a resumed run is told about a list it
-    /// did not create — which is nothing, so its updates arrive for ids the
-    /// process has never seen. Separate from [`ClaudeRunScript::Resume`]
-    /// because that one's prompt creates no tasks, and separate from
-    /// [`ClaudeRunScript::Checklist`] because it additionally requires
-    /// `--resume-id`.
-    ChecklistResume,
-}
-
-#[derive(Clone, Debug)]
-pub enum CodexCaptureOperation {
-    ModelDiscovery,
-    ModelDiscoveryAt {
-        cwd: PathBuf,
-    },
-    Run {
-        request: RunRequest,
-        script: CodexRunScript,
-    },
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum CodexRunScript {
-    FreshText,
-    Approval,
-    ApprovalOnRequest,
-    Resume,
-    Steer,
-    Interruption,
-}
-
-#[derive(Clone, Debug)]
-pub enum CaptureOperation {
-    Claude(ClaudeCaptureOperation),
-    Codex(CodexCaptureOperation),
-}
-
-#[derive(Clone, Debug)]
-pub struct CaptureScenario {
-    pub name: &'static str,
-    pub purpose: &'static str,
-    pub operation: CaptureOperation,
-}
-
+/// What a capture run needs, collected once by the caller (the binary's
+/// argument parsing, or a test) and handed to [`record::record`] by name —
+/// the scenario itself, looked up in `record::scenarios::SCENARIOS`, is what
+/// decides which of these fields it actually reads.
+///
+/// Replaces the pre-Task-7 `CaptureScenario`/`CaptureOperation` pair: those
+/// encoded "which scenario" as a Rust enum SHAPE the binary had to construct
+/// by hand (one arm per scenario, `ClaudeRunScript`/`CodexRunScript` inside),
+/// so the scenario's name, its `--help` text and its dispatch arm could drift
+/// from each other — closing D60. Now the scenario's name IS the dispatch
+/// key, and everything else here is raw, ungrouped input a scenario body
+/// reads through `ScenarioInput` if it needs it.
 #[derive(Clone, Debug)]
 pub struct CaptureConfig {
-    pub scenario: CaptureScenario,
+    /// `"claude"` | `"codex"` — matches [`Provider`]'s wire name and
+    /// `record::scenarios::scenario`'s own parameter.
+    pub provider: &'static str,
+    /// Must name a row in `record::scenarios::SCENARIOS` for the chosen
+    /// `provider`; `record()` panics on a caller that violates this,
+    /// matching the old code's `unreachable!("provider/scenario pair was
+    /// validated")` — the binary validates this by construction (it only
+    /// reaches `record()` after `scenario(provider, name)` resolved).
+    pub scenario_name: &'static str,
+    pub purpose: &'static str,
     pub executable: Option<PathBuf>,
     pub codex_home: Option<PathBuf>,
+    pub cwd: Option<PathBuf>,
+    pub resume_id: Option<String>,
+    pub attachment: Option<PathBuf>,
     pub approval_target: Option<PathBuf>,
     pub raw_root: PathBuf,
     pub timeout: Duration,
