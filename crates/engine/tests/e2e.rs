@@ -32,6 +32,7 @@ const VIEWER: &str = "viewer-device";
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
+        harness: None,
         model: None,
         reasoning: None,
         model_options: Default::default(),
@@ -2029,6 +2030,7 @@ async fn real_claude_sees_uploaded_image_inline() {
     );
     let request = RunRequest {
         prompt,
+        harness: None,
         model: Some("haiku".into()),
         reasoning: None,
         model_options: Default::default(),
@@ -2131,6 +2133,7 @@ async fn real_claude_task_tools_persist_a_checklist() {
             "Do nothing else, and reply with the single word planned."
         )
         .into(),
+        harness: None,
         model: Some("haiku".into()),
         reasoning: None,
         model_options: Default::default(),

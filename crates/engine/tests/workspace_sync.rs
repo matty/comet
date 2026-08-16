@@ -143,6 +143,7 @@ where
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
+        harness: None,
         model: None,
         reasoning: None,
         model_options: Default::default(),
@@ -156,6 +157,22 @@ fn run_request(prompt: &str) -> RunRequest {
 
 /// Queue a run command into a chat doc the way a remote viewer would (ledger rule 1).
 fn queue_run(core: &EngineCore, chat_id: &str, command_id: &str, message_id: &str) {
+    queue_run_with(
+        core,
+        chat_id,
+        command_id,
+        message_id,
+        run_request("go do it"),
+    );
+}
+
+fn queue_run_with(
+    core: &EngineCore,
+    chat_id: &str,
+    command_id: &str,
+    message_id: &str,
+    request: RunRequest,
+) {
     let handle = core.doc_host.open(chat_id).expect("open chat");
     let now = chrono::Utc::now().timestamp_millis();
     handle
@@ -163,7 +180,7 @@ fn queue_run(core: &EngineCore, chat_id: &str, command_id: &str, message_id: &st
         .queue_command(&SessionCommandEntry {
             id: command_id.into(),
             payload: SessionCommandPayload::Run {
-                request: run_request("go do it"),
+                request,
                 message_id: message_id.into(),
             },
             issued_by: VIEWER.into(),
@@ -354,6 +371,166 @@ async fn claim_on_first_command_creates_the_chat_row() {
     link.abort();
     a.shutdown().await;
     b.shutdown().await;
+}
+
+/// A first command whose cwd is a linked WORKTREE must attribute the chat to
+/// the parent checkout's space — claiming at the worktree path minted a
+/// phantom sidebar space named after the worktree folder.
+#[tokio::test]
+async fn claim_resolves_a_worktree_cwd_to_the_repo_root_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), "dev-a");
+    let client = comet_rpc::memory_client(core.rpc_service());
+
+    // A checkout with a linked worktree — fs layout only; the claim path
+    // reads `.git` without spawning git.
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().join("proj");
+    let wt = repo.path().join("clever-ember");
+    std::fs::create_dir_all(root.join(".git/worktrees/clever-ember")).unwrap();
+    std::fs::create_dir_all(&wt).unwrap();
+    std::fs::write(
+        wt.join(".git"),
+        format!(
+            "gitdir: {}\n",
+            root.join(".git/worktrees/clever-ember").display()
+        ),
+    )
+    .unwrap();
+
+    // The project's space already exists (the normal state — sessions are
+    // created FROM a space).
+    client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "createSpace", "spaceId": "space-proj", "deviceId": "dev-a",
+                "path": root.to_string_lossy(),
+            }),
+        )
+        .await
+        .expect("create space");
+
+    let request = RunRequest {
+        cwd: wt.to_string_lossy().into_owned(),
+        ..run_request("go do it")
+    };
+    queue_run_with(&core, "chat-wt", "cmd-wt-1", "m-1", request);
+    wait_for(
+        || {
+            core.workspace
+                .doc()
+                .chat("chat-wt")
+                .ok()
+                .flatten()
+                .is_some_and(|c| c.space_id.as_deref() == Some("space-proj"))
+        },
+        "worktree chat attributed to the project space",
+    )
+    .await;
+    let spaces = core.workspace.read_spaces().unwrap_or_default();
+    assert_eq!(
+        spaces.len(),
+        1,
+        "no phantom space for the worktree: {spaces:?}"
+    );
+    core.shutdown().await;
+}
+
+/// The claimed row records the harness the run actually dispatched on (the
+/// request carries the picked harness) — without it the sidebar renders no
+/// harness glyph and later dispatches silently fall back to the default.
+#[tokio::test]
+async fn command_before_create_uses_selected_harness_and_backfills_the_owner_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), "dev-a");
+    let client = comet_rpc::memory_client(core.rpc_service());
+    let handle = core.doc_host.open("chat-glyph").expect("open chat");
+
+    let request = RunRequest {
+        harness: Some(HarnessId::Cursor),
+        ..run_request("go do it")
+    };
+    let command = SessionCommandPayload::Run {
+        request,
+        message_id: "m-1".into(),
+    };
+    client
+        .call(
+            methods::QUEUE_COMMAND,
+            serde_json::json!({
+                "chatId": "chat-glyph",
+                "command": serde_json::to_value(command).unwrap(),
+            }),
+        )
+        .await
+        .expect("queue command through owner RPC");
+    wait_for(
+        || {
+            handle.doc().read_entries().unwrap_or_default().iter().any(|e| {
+                e.parts.iter().any(
+                    |p| matches!(p, comet_doc::MessagePart::Text { text, .. } if text == "From cursor"),
+                )
+            })
+        },
+        "request-selected harness output",
+    )
+    .await;
+    wait_for(
+        || {
+            core.workspace
+                .doc()
+                .chat("chat-glyph")
+                .ok()
+                .flatten()
+                .and_then(|c| c.config)
+                .is_some_and(|c| c.harness == HarnessId::Cursor)
+        },
+        "claimed row carries the dispatched harness",
+    )
+    .await;
+
+    // Complete metadata can still arrive after a command-only fallback. It
+    // updates the same authoritative Machine-A document; Machine B never
+    // imports or persists a competing workspace document.
+    let claimed = core
+        .workspace
+        .doc()
+        .chat("chat-glyph")
+        .unwrap()
+        .expect("claimed row");
+    let space_id = claimed.space_id.expect("claim space");
+    let config = ChatConfig {
+        harness: HarnessId::Cursor,
+        model: None,
+        reasoning: None,
+        model_options: Default::default(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        runtime_mode: RuntimeMode::default(),
+    };
+    client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "createChat",
+                "chatId": "chat-glyph",
+                "spaceId": space_id,
+                "branch": "feature/claim-race",
+                "config": serde_json::to_value(&config).unwrap(),
+            }),
+        )
+        .await
+        .expect("late createChat");
+    let completed = core
+        .workspace
+        .doc()
+        .chat("chat-glyph")
+        .unwrap()
+        .expect("completed row");
+    assert_eq!(completed.config, Some(config));
+    assert_eq!(completed.branch.as_deref(), Some("feature/claim-race"));
+    assert_eq!(core.workspace.doc().read_spaces().unwrap().len(), 1);
+    core.shutdown().await;
 }
 
 #[tokio::test]

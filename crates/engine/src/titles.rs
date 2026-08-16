@@ -168,7 +168,7 @@ impl TitleGenerator {
              for a coding session that begins with this request:\n\n{prompt}"
         );
         for attempt in 0..=RETRY_DELAYS_MS.len() {
-            let request = title_request(cheap.clone(), cwd, title_prompt.clone());
+            let request = title_request(harness_id, cheap.clone(), cwd, title_prompt.clone());
             match collect_text(harness.as_ref(), request).await {
                 Ok(raw) => {
                     let candidate = clean_title(&raw);
@@ -198,9 +198,15 @@ impl TitleGenerator {
 /// guarantee this request itself makes. That pairing of a never-ask mode with
 /// a read-only sandbox is not one the runtime modes express, which is why
 /// this is built by hand instead of through [`RunRequest::for_session`].
-fn title_request(model: Option<String>, cwd: &str, prompt: String) -> RunRequest {
+fn title_request(
+    harness: HarnessId,
+    model: Option<String>,
+    cwd: &str,
+    prompt: String,
+) -> RunRequest {
     RunRequest {
         prompt,
+        harness: Some(harness),
         model,
         reasoning: Some(ReasoningLevel::Minimal),
         model_options: serde_json::Map::new(),
@@ -329,6 +335,7 @@ mod tests {
         // No RuntimeMode pairs those two, which is why this site builds its own
         // request instead of going through the session constructor.
         let request = title_request(
+            HarnessId::Mock,
             Some("cheap-model".into()),
             "/tmp/repo",
             "name this chat".into(),

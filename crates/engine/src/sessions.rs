@@ -1248,7 +1248,7 @@ impl SessionsEngine {
                 host.apply_chat_row_runtime_mode(&chat_id, &mut request);
                 request.resume = None; // dispatch re-injects the remembered session
                 request.attachments = Vec::new();
-                let harness_id = host.harness_for(&chat_id);
+                let harness_id = host.harness_for_request(&chat_id, &request);
                 match sessions
                     .dispatch(&chat_id, harness_id, request, Some(user_id))
                     .await
@@ -2609,6 +2609,7 @@ mod tests {
                 HarnessId::Mock,
                 RunRequest {
                     prompt: "change it".into(),
+                    harness: None,
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
