@@ -16,6 +16,7 @@ capture one bounded Claude run script
 
 cwd: `<CWD>`
 env: (none set)
+tools: 29
 
 ```
 <HOME>\.local\bin\claude.exe
@@ -42,6 +43,7 @@ capture one bounded Claude run script
 
 cwd: `<CWD>`
 env: (none set)
+tools: 29
 
 ```
 <HOME>\.local\bin\claude.exe
@@ -68,6 +70,7 @@ capture Claude's cwd-scoped command initialize reply
 
 cwd: `<CWD>`
 env: (none set)
+tools: (not observed)
 
 ```
 <HOME>\.local\bin\claude.exe
@@ -85,6 +88,7 @@ capture one bounded Claude run script
 
 cwd: `<CWD>`
 env: (none set)
+tools: 29
 
 ```
 <HOME>\.local\bin\claude.exe
@@ -111,6 +115,7 @@ capture Claude's token-free model initialize reply
 
 cwd: `<CWD>`
 env: (none set)
+tools: (not observed)
 
 ```
 <HOME>\.local\bin\claude.exe
@@ -129,6 +134,7 @@ capture Claude model discovery from a neutral working directory
 
 cwd: `<CWD>`
 env: (none set)
+tools: (not observed)
 
 ```
 <HOME>\.local\bin\claude.exe
@@ -147,6 +153,7 @@ capture Claude model discovery from the selected project directory
 
 cwd: `<CWD>`
 env: (none set)
+tools: (not observed)
 
 ```
 <HOME>\.local\bin\claude.exe
@@ -165,6 +172,7 @@ capture one bounded Claude run script
 
 cwd: `<CWD>`
 env: (none set)
+tools: 29
 
 ```
 <HOME>\.local\bin\claude.exe

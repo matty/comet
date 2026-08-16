@@ -116,3 +116,35 @@ fixture is the case the guard used to bail on — a model that replies with plai
 text and calls neither `TaskCreate` nor `TaskUpdate` — and the neutral recorder
 now returns a successful capture holding every frame, evidence intact.
 
+## D86 — the sheet could not show tool-roster growth
+
+**The gap.** The `system`/`init` frame's `tools` array is redacted
+element-by-element (`.tools[]` names no line on `claude.txt`), so the Fields
+section can only ever print the bare path `.tools`, never a count or a name
+from it. But the array's *length* survives redaction untouched — 29 tools in
+every `2.1.228` scenario, 35 in `2.1.229`'s `subagent`, 59 in `checklist` and
+`checklist-resume` (the two scenarios captured with MCP servers connected) —
+and nothing in the sheet rendered it. A real roster change (a new built-in
+tool shipped, or the recording account gaining or losing an MCP connector)
+was invisible to `git diff` between two sheets: the Fields section shows
+`.tools` either way, with no way to tell 29 from 59 apart.
+
+**The fix.** `SheetScenario` (`crates/harness/src/capture/sheet.rs`) grew a
+`tool_count: Option<usize>` field, rendered as one line in the Scenarios
+section — `tools: 29`, or `tools: (not observed)` for a scenario whose
+archive holds no `system`/`init` frame (every discovery-only scenario, and
+every Codex scenario — Codex's corpus has no equivalent frame at all today).
+`crates/harness/tests/capture_corpus/capability_sheets.rs`'s `scenarios_for`
+sources it by reading the scenario's own `events.jsonl` directly and taking
+the first `system`/`init` frame's `tools` array length — never a name from
+inside it, and never through `observe_surface`, which records field names
+only and has no notion of a value at all. Per scenario, not per version: the
+count differs *within* `2.1.229` (35 vs 59) depending on what was connected
+at capture time, so a single merged number would have hidden exactly the
+change this exists to show.
+
+Regenerating the three committed sheets after this change makes the growth
+legible in the diff: `claude-2.1.228.md` reads `tools: 29` in every scenario
+that has one; `claude-2.1.229.md` reads `tools: 35` for `subagent` and
+`tools: 59` for `checklist`/`checklist-resume`.
+
