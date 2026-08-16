@@ -23,7 +23,7 @@ pub use scenarios::{Requirements, SCENARIOS, ScenarioSpec, scenario};
 use scenarios::{ScenarioBody, ScenarioInput, ScenarioLaunch};
 use session::{FenceOutcome, Session};
 
-use crate::capture::types::{CaptureConfig, PartialFailureClass, Provider, RawCapture};
+use crate::capture::types::{CaptureConfig, PartialFailureClass, RawCapture};
 use crate::launch::LaunchDescriptor;
 
 /// Record one explicitly selected provider scenario into ignored raw
@@ -51,38 +51,48 @@ pub async fn record(config: CaptureConfig) -> anyhow::Result<RawCapture> {
     }
 }
 
+/// Resolve the executable, derive the launch, build the fence, and dispatch into
+/// `record_generic` — the whole of what `record_claude`/`record_codex` used to duplicate before
+/// `launch`, `request` and `fence` all moved onto the row (Tasks 1 and 4). What's left differing
+/// between the two providers is exactly the resolver named in `AGENTS.md`'s "What the providers
+/// send": the default-executable lookup and `run_launch`, both plain per-provider `fn` values —
+/// passed in here rather than added to `CaptureProvider` as a fifth member. That trait's own doc
+/// comment (`provider.rs`) is explicit that a fifth member is earned by a third provider having
+/// a *recording* to design against, not added ahead of one; neither of these varies per scenario
+/// the way `launch`/`fence` do (the reason those two live on the row and not the trait), so a
+/// plain parameter is the version that doesn't anticipate anything.
+async fn record_provider<P: CaptureProvider>(
+    provider: P,
+    config: &CaptureConfig,
+    spec: &ScenarioSpec,
+    input: ScenarioInput,
+    body: ScenarioBodyFn<P>,
+    default_executable: fn() -> Option<PathBuf>,
+    run_launch: fn(&Path, &RunRequest) -> LaunchDescriptor,
+) -> anyhow::Result<RawCapture> {
+    let executable = session::resolve_executable(
+        P::provider(),
+        config.executable.clone().or_else(default_executable),
+    )?;
+    let (launch, request) = derive_launch(&spec.launch, &input, &executable, run_launch)?;
+    let fence = (spec.fence)(spec, config, &launch)?;
+    record_generic(provider, config, launch, input, body, fence, request).await
+}
+
 async fn record_claude(
     config: &CaptureConfig,
     spec: &ScenarioSpec,
     input: ScenarioInput,
     body: ScenarioBodyFn<ClaudeProvider>,
 ) -> anyhow::Result<RawCapture> {
-    let executable = session::resolve_executable(
-        Provider::Claude,
-        config
-            .executable
-            .clone()
-            .or_else(crate::claude::resolve_claude_executable),
-    )?;
-    let (launch, request) =
-        derive_launch(&spec.launch, &input, &executable, crate::claude::run_launch)?;
-    // Claude has no pre-spawn fence: nothing here validates an environment
-    // before spawn the way `codex_fence` below does for Codex. Claude's
-    // `approval` DOES grant a filesystem write — a Bash command or a Write
-    // into cwd — so it is protected the same way Task 6 protects Codex's
-    // grant-time rechecks: `record/scenarios/claude.rs`'s `approval` body
-    // recomputes a marker-shape check (`claude_marker_grant`) immediately
-    // before answering each request, and DECLINES — without aborting the
-    // capture — anything that does not match. See that function's own doc
-    // comment.
-    record_generic(
+    record_provider(
         ClaudeProvider,
         config,
-        launch,
+        spec,
         input,
         body,
-        FenceOutcome::none(),
-        request,
+        crate::claude::resolve_claude_executable,
+        crate::claude::run_launch,
     )
     .await
 }
@@ -93,24 +103,14 @@ async fn record_codex(
     input: ScenarioInput,
     body: ScenarioBodyFn<CodexProvider>,
 ) -> anyhow::Result<RawCapture> {
-    let executable = session::resolve_executable(
-        Provider::Codex,
-        config
-            .executable
-            .clone()
-            .or_else(crate::codex::resolve_codex_executable),
-    )?;
-    let (launch, request) =
-        derive_launch(&spec.launch, &input, &executable, crate::codex::run_launch)?;
-    let fence = codex_fence(spec, config, &launch)?;
-    record_generic(
+    record_provider(
         CodexProvider::new(),
         config,
-        launch,
+        spec,
         input,
         body,
-        fence,
-        request,
+        crate::codex::resolve_codex_executable,
+        crate::codex::run_launch,
     )
     .await
 }
@@ -140,9 +140,20 @@ fn derive_launch(
     }
 }
 
-/// Builds the pre-spawn fence for the two Codex scenarios that need one.
-/// Every other scenario (every Claude row, and every Codex row but
-/// `approval`/`approval-on-request`) gets [`FenceOutcome::none`].
+/// Builds the pre-spawn fence for the two Codex scenarios that name it —
+/// `record/scenarios.rs`'s `approval` and `approval-on-request` rows point
+/// their own `fence` field at this function directly. D79: this used to be
+/// reached unconditionally for every Codex row, picking this branch by
+/// testing `spec.runtime_mode == Some(RuntimeMode::ApprovalRequired)` —
+/// which meant a *future* Codex row that legitimately wanted
+/// `ApprovalRequired` for an unrelated reason would have silently inherited
+/// the Windows-only trusted-PowerShell fence below (see
+/// `resolve_trusted_powershell`'s own doc comment for why that fails closed
+/// elsewhere rather than spawning unprotected). Now that every row must name
+/// its own fence — [`scenarios::no_fence`] is the default — reaching this
+/// function at all is itself the declaration; the `needs_approval_target`
+/// check below only chooses between this function's own two fences, not
+/// whether a fence runs at all.
 ///
 /// This is the pre-spawn fence decision #6 in the stage plan requires stay —
 /// `crate::capture::safety`'s checks ran inside `recording.rs`'s
@@ -197,24 +208,20 @@ fn codex_fence(
         });
     }
 
-    if spec.runtime_mode == Some(comet_proto::RuntimeMode::ApprovalRequired) {
-        // `approval`: a trusted, protected-root PowerShell (Windows only —
-        // fails closed elsewhere, see `resolve_trusted_powershell`'s own
-        // doc comment) and a cwd whose identity `record::scenarios::codex::approval`
-        // rechecks at every grant, via `approval_cwd_identity` below.
-        let cwd = launch_cwd()?;
-        let trusted = crate::capture::safety::resolve_trusted_powershell(&cwd, &config.raw_root)?;
-        let identity = crate::capture::safety::validate_ordinary_approval_cwd(&cwd, None, true)?;
-        return Ok(FenceOutcome {
-            approval_target: None,
-            approval_target_identity: None,
-            approval_cwd_identity: Some(identity),
-            trusted_powershell: Some(trusted),
-            recheck: None,
-        });
-    }
-
-    Ok(FenceOutcome::none())
+    // `approval`: a trusted, protected-root PowerShell (Windows only — fails
+    // closed elsewhere, see `resolve_trusted_powershell`'s own doc comment)
+    // and a cwd whose identity `record::scenarios::codex::approval` rechecks
+    // at every grant, via `approval_cwd_identity` below.
+    let cwd = launch_cwd()?;
+    let trusted = crate::capture::safety::resolve_trusted_powershell(&cwd, &config.raw_root)?;
+    let identity = crate::capture::safety::validate_ordinary_approval_cwd(&cwd, None, true)?;
+    Ok(FenceOutcome {
+        approval_target: None,
+        approval_target_identity: None,
+        approval_cwd_identity: Some(identity),
+        trusted_powershell: Some(trusted),
+        recheck: None,
+    })
 }
 
 /// A scenario body: given a freshly spawned session, drive it (handshaking
@@ -292,7 +299,7 @@ mod tests {
 
     use super::*;
     use crate::capture::test_support::{absolute_program, channel_payloads, config, fixture_path};
-    use crate::capture::types::{Channel, CommandSnapshot};
+    use crate::capture::types::{Channel, CommandSnapshot, Provider};
     use crate::launch::StdioMode;
 
     #[test]
@@ -885,6 +892,7 @@ mod tests {
             runtime_mode: Some(comet_proto::RuntimeMode::AutoAcceptEdits),
             requirements: Requirements::run(),
             launch: ScenarioLaunch::Run(counting_request),
+            fence: scenarios::no_fence,
             body: ScenarioBody::Claude(hazard_body),
         };
         let cfg = config(
