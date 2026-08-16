@@ -222,12 +222,24 @@ impl RunJournal {
         Ok(())
     }
 
-    /// Remove a chat's journal file entirely (tests / future compaction).
+    /// Remove a chat's journal and crash-resume state. Both paths are attempted
+    /// so a later retry only has to retire whatever remains.
     pub fn discard(&self, chat_id: &str) -> Result<(), JournalError> {
         self.lock().remove(chat_id);
-        let path = self.path_for(chat_id);
-        if path.exists() {
-            std::fs::remove_file(path)?;
+        let mut error = None;
+        for path in [self.path_for(chat_id), self.attempts_path(chat_id)] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    if error.is_none() {
+                        error = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(error) = error {
+            return Err(JournalError::Io(error));
         }
         Ok(())
     }
@@ -358,6 +370,22 @@ mod tests {
         }
         let journal = RunJournal::open(dir.path()).unwrap();
         assert_eq!(journal.append("chat-1", &text("b")).unwrap(), 2);
+    }
+
+    #[test]
+    fn discard_removes_the_journal_and_resume_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.append("chat-1", &text("a")).unwrap();
+        journal.note_resume_attempt("chat-1");
+
+        journal.discard("chat-1").unwrap();
+
+        assert!(journal.replay("chat-1", 0).unwrap().is_empty());
+        assert_eq!(journal.resume_attempts("chat-1"), 0);
+        assert!(!dir.path().join("chat-1.jsonl").exists());
+        assert!(!dir.path().join("chat-1.resume").exists());
+        journal.discard("chat-1").unwrap();
     }
 
     #[test]

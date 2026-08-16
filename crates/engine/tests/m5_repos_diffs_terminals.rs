@@ -8,9 +8,15 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-use comet_engine::{EngineCore, HarnessRegistry, Repos, Terminals, capture_diff};
-use comet_proto::TerminalEvent;
+use comet_engine::{
+    EngineCore, HarnessRegistry, Repos, Terminals, capture_diff, read_diff_file_text,
+    working_diff_base,
+};
+use comet_proto::{
+    CheckoutFileDiffText, DiffFileSummary, GetCheckoutFileDiffTextRequest, TerminalEvent,
+};
 use comet_rpc::methods;
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -57,6 +63,22 @@ fn assemble(dir: &Path) -> EngineCore {
         None,
     )
     .expect("engine assembles")
+}
+
+fn source_hash(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+async fn checkout_source_reply(
+    client: &comet_rpc::RpcClient,
+    request: &GetCheckoutFileDiffTextRequest,
+) -> Result<CheckoutFileDiffText, comet_rpc::RpcError> {
+    client
+        .call_as(
+            methods::GET_CHECKOUT_FILE_DIFF_TEXT,
+            serde_json::to_value(request).expect("request JSON"),
+        )
+        .await
 }
 
 fn decoded(events: &[TerminalEvent]) -> String {
@@ -354,6 +376,245 @@ async fn diff_capture_tracked_untracked_and_checksum() {
     assert_ne!(snapshot.checksum, changed.checksum);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_file_diff_text_rpc_returns_working_sources_and_hashes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    std::fs::write(repo_dir.join("a.txt"), "one\nchanged\n").expect("edit a.txt");
+
+    let core = assemble(&tmp.path().join("data"));
+    let client = comet_rpc::memory_client(core.rpc_service());
+    let identity = core
+        .repos
+        .checkout_identity(&repo_dir)
+        .await
+        .expect("checkout identity");
+    let snapshot = capture_diff(&core.repos, &repo_dir)
+        .await
+        .expect("diff snapshot");
+    let reply = checkout_source_reply(
+        &client,
+        &GetCheckoutFileDiffTextRequest {
+            checkout_id: identity.id,
+            cwd: repo_dir.to_string_lossy().into_owned(),
+            path: "a.txt".into(),
+            diff_checksum: snapshot.checksum.clone(),
+        },
+    )
+    .await
+    .expect("source-pair reply");
+
+    assert_eq!(reply.diff_checksum, snapshot.checksum);
+    assert_eq!(reply.old_text.as_deref(), Some("one\ntwo\n"));
+    assert_eq!(reply.new_text.as_deref(), Some("one\nchanged\n"));
+    assert_eq!(
+        reply.old_content_hash.as_deref(),
+        Some(&*source_hash("one\ntwo\n"))
+    );
+    assert_eq!(
+        reply.new_content_hash.as_deref(),
+        Some(&*source_hash("one\nchanged\n"))
+    );
+    assert!(!reply.binary);
+    assert!(!reply.truncated);
+    assert!(!reply.stale);
+
+    drop(client);
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_file_diff_text_rpc_handles_unborn_added_deleted_renamed_binary_and_cap() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let core = assemble(&tmp.path().join("data"));
+    let client = comet_rpc::memory_client(core.rpc_service());
+
+    let unborn = tmp.path().join("unborn");
+    std::fs::create_dir_all(&unborn).expect("unborn repo");
+    git(&unborn, &["init", "-b", "main"]).await;
+    std::fs::write(unborn.join("new.txt"), "unborn\n").expect("unborn source");
+
+    let added = tmp.path().join("added");
+    init_repo(&added).await;
+    std::fs::write(added.join("new.txt"), "added\n").expect("added source");
+
+    let deleted = tmp.path().join("deleted");
+    init_repo(&deleted).await;
+    std::fs::remove_file(deleted.join("a.txt")).expect("delete source");
+
+    let renamed = tmp.path().join("renamed");
+    init_repo(&renamed).await;
+    git(&renamed, &["mv", "a.txt", "b.txt"]).await;
+
+    let binary = tmp.path().join("binary");
+    init_repo(&binary).await;
+    std::fs::write(binary.join("a.txt"), b"one\0two\n").expect("binary source");
+
+    let capped = tmp.path().join("capped");
+    init_repo(&capped).await;
+    std::fs::write(capped.join("a.txt"), vec![b'x'; 1024 * 1024 + 1]).expect("oversized source");
+
+    for (repo, path, old_text, new_text, binary_expected, truncated_expected) in [
+        (&unborn, "new.txt", None, Some("unborn\n"), false, false),
+        (&added, "new.txt", None, Some("added\n"), false, false),
+        (&deleted, "a.txt", Some("one\ntwo\n"), None, false, false),
+        (
+            &renamed,
+            "b.txt",
+            Some("one\ntwo\n"),
+            Some("one\ntwo\n"),
+            false,
+            false,
+        ),
+        (&binary, "a.txt", None, None, true, false),
+        (&capped, "a.txt", None, None, false, true),
+    ] {
+        let identity = core
+            .repos
+            .checkout_identity(repo)
+            .await
+            .expect("checkout identity");
+        let snapshot = capture_diff(&core.repos, repo).await.expect("snapshot");
+        let reply = checkout_source_reply(
+            &client,
+            &GetCheckoutFileDiffTextRequest {
+                checkout_id: identity.id,
+                cwd: repo.to_string_lossy().into_owned(),
+                path: path.into(),
+                diff_checksum: snapshot.checksum,
+            },
+        )
+        .await
+        .expect("source-pair reply");
+        assert_eq!(reply.old_text.as_deref(), old_text, "old source for {path}");
+        assert_eq!(reply.new_text.as_deref(), new_text, "new source for {path}");
+        assert_eq!(reply.binary, binary_expected, "binary flag for {path}");
+        assert_eq!(
+            reply.truncated, truncated_expected,
+            "truncated flag for {path}"
+        );
+        assert!(!reply.stale, "current source for {path}");
+    }
+
+    drop(client);
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_file_diff_text_rpc_rejects_checkout_path_and_membership_mismatches() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    std::fs::write(repo_dir.join("unchanged.txt"), "unchanged\n").expect("unchanged source");
+    git(&repo_dir, &["add", "unchanged.txt"]).await;
+    git(&repo_dir, &["commit", "-m", "add unchanged source"]).await;
+    std::fs::write(repo_dir.join("a.txt"), "one\nchanged\n").expect("edit a.txt");
+
+    let core = assemble(&tmp.path().join("data"));
+    let client = comet_rpc::memory_client(core.rpc_service());
+    let identity = core
+        .repos
+        .checkout_identity(&repo_dir)
+        .await
+        .expect("checkout identity");
+    let snapshot = capture_diff(&core.repos, &repo_dir)
+        .await
+        .expect("diff snapshot");
+    let request = |checkout_id: &str, path: &str| GetCheckoutFileDiffTextRequest {
+        checkout_id: checkout_id.into(),
+        cwd: repo_dir.to_string_lossy().into_owned(),
+        path: path.into(),
+        diff_checksum: snapshot.checksum.clone(),
+    };
+
+    let mismatch = checkout_source_reply(&client, &request("wrong-checkout", "a.txt")).await;
+    assert!(mismatch.is_err(), "checkout identity mismatch was accepted");
+    let absent = checkout_source_reply(&client, &request(&identity.id, "unchanged.txt")).await;
+    assert!(
+        absent.is_err(),
+        "path outside the captured diff was accepted"
+    );
+
+    let base = working_diff_base(&repo_dir)
+        .await
+        .expect("working diff base");
+    let unsafe_new = DiffFileSummary {
+        path: "../outside.txt".into(),
+        old_path: None,
+        status: "added".into(),
+        additions: 1,
+        deletions: 1,
+        binary: false,
+    };
+    assert_eq!(
+        read_diff_file_text(&repo_dir, &base, &unsafe_new)
+            .await
+            .expect_err("unsafe new path was read")
+            .to_string(),
+        "diff path escapes checkout"
+    );
+    let unsafe_old = DiffFileSummary {
+        path: "a.txt".into(),
+        old_path: Some("../outside.txt".into()),
+        status: "renamed".into(),
+        additions: 0,
+        deletions: 0,
+        binary: false,
+    };
+    assert_eq!(
+        read_diff_file_text(&repo_dir, &base, &unsafe_old)
+            .await
+            .expect_err("unsafe rename origin was read")
+            .to_string(),
+        "diff path escapes checkout"
+    );
+
+    drop(client);
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_file_diff_text_rpc_returns_stale_before_and_after_read() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    std::fs::write(repo_dir.join("a.txt"), "one\nfirst\n").expect("first edit");
+
+    let core = assemble(&tmp.path().join("data"));
+    let client = comet_rpc::memory_client(core.rpc_service());
+    let identity = core
+        .repos
+        .checkout_identity(&repo_dir)
+        .await
+        .expect("checkout identity");
+    let stale_snapshot = capture_diff(&core.repos, &repo_dir)
+        .await
+        .expect("stale snapshot");
+    std::fs::write(repo_dir.join("a.txt"), "one\ntwo\n").expect("restore committed source");
+
+    let reply = checkout_source_reply(
+        &client,
+        &GetCheckoutFileDiffTextRequest {
+            checkout_id: identity.id,
+            cwd: repo_dir.to_string_lossy().into_owned(),
+            path: "a.txt".into(),
+            diff_checksum: stale_snapshot.checksum.clone(),
+        },
+    )
+    .await
+    .expect("stale reply");
+    assert_eq!(reply.diff_checksum, stale_snapshot.checksum);
+    assert!(reply.stale);
+    assert_eq!(reply.old_text, None);
+    assert_eq!(reply.new_text, None);
+    assert_eq!(reply.old_content_hash, None);
+    assert_eq!(reply.new_content_hash, None);
+
+    drop(client);
+    core.shutdown().await;
+}
+
 #[tokio::test]
 async fn diff_capture_truncates_at_patch_cap() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -552,6 +813,45 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
             .expect("watcher-driven publish before timeout")
             .expect("watch alive");
     }
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_file_diff_text_rpc_fits_the_default_worker_stack() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    std::fs::write(repo_dir.join("a.txt"), "one\ntwo edited\n").expect("dirty tree");
+
+    let core = assemble(&tmp.path().join("data"));
+    let identity = core
+        .repos
+        .checkout_identity(&repo_dir)
+        .await
+        .expect("checkout identity");
+    let snapshot = capture_diff(&core.repos, &repo_dir)
+        .await
+        .expect("diff snapshot");
+    let client = comet_rpc::memory_client(core.rpc_service());
+
+    let response = client
+        .call(
+            methods::GET_CHECKOUT_FILE_DIFF_TEXT,
+            serde_json::json!({
+                "checkoutId": identity.id,
+                "cwd": repo_dir,
+                "path": "a.txt",
+                "diffChecksum": snapshot.checksum,
+            }),
+        )
+        .await
+        .expect("GetCheckoutFileDiffText");
+    let response: comet_proto::CheckoutFileDiffText =
+        serde_json::from_value(response).expect("typed response");
+    assert_eq!(response.old_text.as_deref(), Some("one\ntwo\n"));
+    assert_eq!(response.new_text.as_deref(), Some("one\ntwo edited\n"));
+    assert!(!response.stale);
+
     core.shutdown().await;
 }
 

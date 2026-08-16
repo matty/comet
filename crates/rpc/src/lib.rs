@@ -78,6 +78,7 @@ pub mod methods {
     /// Checkout-diff stream for the target device's chats (DataRpc,
     /// server-qualified — diffs are produced where the checkout lives).
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
+    pub const GET_CHECKOUT_FILE_DIFF_TEXT: &str = "GetCheckoutFileDiffText";
     // Agent accounts (server-qualified — CLI logins are per Comet instance).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
     pub const ACTIVATE_AGENT_ACCOUNT: &str = "ActivateAgentAccount";
@@ -90,6 +91,7 @@ pub mod methods {
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
+    pub const READ_TOOL_DIFF: &str = "ReadToolDiff";
     // Updates (a selected server reports/applies its own
     // binary's update). Stream: current UpdateStatus, then every change.
     pub const UPDATE_STATUS: &str = "UpdateStatus";
@@ -230,6 +232,10 @@ mod tests {
                 }
                 "Never" => Ok(RpcReply::Stream(futures::stream::pending().boxed())),
                 "Boom" => Err(RpcError::Failed("boom".into())),
+                "Unknown" => Err(RpcError::UnknownMethod(method.into())),
+                "PrefixedFailure" => Err(RpcError::Failed(
+                    "unknown method: dependency unavailable".into(),
+                )),
                 other => Err(RpcError::UnknownMethod(other.into())),
             }
         }
@@ -267,6 +273,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RpcError::Failed(m) if m == "boom"));
+    }
+
+    #[tokio::test]
+    async fn memory_transport_preserves_only_the_requested_unknown_method() {
+        let client = memory_client(Arc::new(TestService));
+
+        let unknown = client
+            .call("Unknown", serde_json::Value::Null)
+            .await
+            .expect_err("the older peer does not implement this method");
+        assert!(matches!(unknown, RpcError::UnknownMethod(name) if name == "Unknown"));
+
+        let failure = client
+            .call("PrefixedFailure", serde_json::Value::Null)
+            .await
+            .expect_err("an ordinary failure must cross the transport unchanged");
+        assert!(
+            matches!(failure, RpcError::Failed(message) if message == "unknown method: dependency unavailable")
+        );
     }
 
     #[tokio::test]

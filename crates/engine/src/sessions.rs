@@ -31,12 +31,13 @@ use comet_doc::{
 use comet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DoneStatus, HarnessId, RunRequest, RuntimeMode,
-    Session, SessionStatus, SubagentStatus, UserInputAnswer, UserInputQuestion,
+    Session, SessionStatus, SubagentStatus, ToolDiff, UserInputAnswer, UserInputQuestion,
 };
+use comet_sync::{PutToolDiffOutcome, ToolDiffLimit};
 
 use crate::doc_host::{ChatDocHandle, DocHost};
 use crate::registry::HarnessRegistry;
-use crate::run_journal::RunJournal;
+use crate::run_journal::{JournalError, RunJournal};
 use crate::{EngineError, Presence, WaitKind, due_for_expiry, new_id, now_ms, unattended_note};
 
 /// One journaled event: the durable seq plus the event, as broadcast to subscribers.
@@ -53,6 +54,18 @@ pub enum SteerOutcome {
     Accepted,
     /// No live steerable run — the caller should dispatch the prompt as a new turn.
     NotSteerable,
+}
+
+/// A deleted chat cannot retire its durable session state until its prior run
+/// has actually left the run map.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SessionCleanupError {
+    #[error("chat still has a live run")]
+    LiveRun,
+    #[error(transparent)]
+    Journal(#[from] JournalError),
+    #[error(transparent)]
+    Workspace(#[from] comet_doc::DocError),
 }
 
 /// A parked input question: the resolver, plus when it parked.
@@ -271,6 +284,34 @@ struct Inner {
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
+    #[cfg(test)]
+    run_registration_pause: Mutex<Option<RunRegistrationPause>>,
+    #[cfg(test)]
+    terminal_handoff_pause: Mutex<Option<TerminalHandoffPause>>,
+    #[cfg(test)]
+    resume_retry_pause: Mutex<Option<ResumeRetryPause>>,
+}
+
+#[cfg(test)]
+struct RunRegistrationPause {
+    chat_id: String,
+    reached: oneshot::Sender<Arc<ChatDocHandle>>,
+    release: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+struct TerminalHandoffPause {
+    chat_id: String,
+    reached: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+    settled: oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+struct ResumeRetryPause {
+    chat_id: String,
+    reached: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -302,6 +343,12 @@ impl SessionsEngine {
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
+                #[cfg(test)]
+                run_registration_pause: Mutex::new(None),
+                #[cfg(test)]
+                terminal_handoff_pause: Mutex::new(None),
+                #[cfg(test)]
+                resume_retry_pause: Mutex::new(None),
             }),
         }
     }
@@ -312,18 +359,115 @@ impl SessionsEngine {
         let _ = self.inner.doc_host.set(host);
     }
 
+    #[cfg(test)]
+    pub(crate) fn pause_next_run_registration_for_test(
+        &self,
+        chat_id: &str,
+    ) -> (oneshot::Receiver<Arc<ChatDocHandle>>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let mut slot = lock(&self.inner.run_registration_pause);
+        assert!(slot.is_none(), "only one registration pause may be armed");
+        *slot = Some(RunRegistrationPause {
+            chat_id: chat_id.to_string(),
+            reached: reached_tx,
+            release: release_rx,
+        });
+        (reached_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    async fn pause_run_registration_if_requested(
+        &self,
+        chat_id: &str,
+        handle: &Arc<ChatDocHandle>,
+    ) {
+        let pause = {
+            let mut slot = lock(&self.inner.run_registration_pause);
+            if slot.as_ref().is_some_and(|pause| pause.chat_id == chat_id) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        let Some(pause) = pause else { return };
+        let _ = pause.reached.send(handle.clone());
+        let _ = pause.release.await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_terminal_handoff_for_test(
+        &self,
+        chat_id: &str,
+    ) -> (
+        oneshot::Receiver<()>,
+        oneshot::Sender<()>,
+        oneshot::Receiver<()>,
+    ) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (settled_tx, settled_rx) = oneshot::channel();
+        let mut slot = lock(&self.inner.terminal_handoff_pause);
+        assert!(
+            slot.is_none(),
+            "only one terminal handoff pause may be armed"
+        );
+        *slot = Some(TerminalHandoffPause {
+            chat_id: chat_id.to_string(),
+            reached: reached_tx,
+            release: release_rx,
+            settled: settled_tx,
+        });
+        (reached_rx, release_tx, settled_rx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_resume_retry_for_test(
+        &self,
+        chat_id: &str,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let mut slot = lock(&self.inner.resume_retry_pause);
+        assert!(slot.is_none(), "only one resume retry pause may be armed");
+        *slot = Some(ResumeRetryPause {
+            chat_id: chat_id.to_string(),
+            reached: reached_tx,
+            release: release_rx,
+        });
+        (reached_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    async fn pause_resume_retry_if_requested(&self, chat_id: &str) {
+        let pause = {
+            let mut slot = lock(&self.inner.resume_retry_pause);
+            if slot.as_ref().is_some_and(|pause| pause.chat_id == chat_id) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        let Some(pause) = pause else { return };
+        let _ = pause.reached.send(());
+        let _ = pause.release.await;
+    }
+
     /// Wire the chat auto-titler (called once at engine assembly). After each
     /// completed exchange the run task fires it for still-untitled chats.
     pub fn set_titles(&self, titles: crate::titles::TitleGenerator) {
         let _ = self.inner.titles.set(titles);
     }
 
+    fn doc_host(&self) -> Result<&DocHost, EngineError> {
+        self.inner
+            .doc_host
+            .get()
+            .ok_or_else(|| EngineError::Other("doc host not wired into sessions engine".into()))
+    }
+
     fn doc_handle(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
-        let host =
-            self.inner.doc_host.get().ok_or_else(|| {
-                EngineError::Other("doc host not wired into sessions engine".into())
-            })?;
-        host.open(chat_id)
+        self.doc_host()?.open(chat_id)
     }
 
     /// Status watch: the full session list, re-sent on every transition.
@@ -395,7 +539,7 @@ impl SessionsEngine {
         request: RunRequest,
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
-        self.dispatch_with(chat_id, harness_id, request, message_id, true)
+        self.dispatch_with(chat_id, harness_id, request, message_id, true, None)
             .await
     }
 
@@ -411,8 +555,36 @@ impl SessionsEngine {
         request: RunRequest,
         message_id: Option<String>,
         inject_resume: bool,
+        expected_doc: Option<Arc<SessionDoc>>,
     ) -> futures::future::BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(self.dispatch_inner(chat_id, harness_id, request, message_id, inject_resume))
+        Box::pin(self.dispatch_inner(
+            chat_id,
+            harness_id,
+            request,
+            message_id,
+            inject_resume,
+            expected_doc,
+        ))
+    }
+
+    /// Re-dispatch a rejected engine-injected resume only if it still belongs
+    /// to the same document generation that rejected it.
+    fn dispatch_retry_for_generation<'a>(
+        &'a self,
+        chat_id: &'a str,
+        harness_id: HarnessId,
+        request: RunRequest,
+        message_id: String,
+        expected_doc: Arc<SessionDoc>,
+    ) -> futures::future::BoxFuture<'a, Result<String, EngineError>> {
+        self.dispatch_with(
+            chat_id,
+            harness_id,
+            request,
+            Some(message_id),
+            false,
+            Some(expected_doc),
+        )
     }
 
     async fn dispatch_inner(
@@ -422,10 +594,16 @@ impl SessionsEngine {
         mut request: RunRequest,
         message_id: Option<String>,
         inject_resume: bool,
+        expected_doc: Option<Arc<SessionDoc>>,
     ) -> Result<String, EngineError> {
-        let routed = lock(&self.inner.runs)
-            .get(chat_id)
-            .map(|h| (h.run_id.clone(), h.steerable, h.steer_tx.clone()));
+        let routed = expected_doc
+            .is_none()
+            .then(|| {
+                lock(&self.inner.runs)
+                    .get(chat_id)
+                    .map(|h| (h.run_id.clone(), h.steerable, h.steer_tx.clone()))
+            })
+            .flatten();
         if let Some((run_id, steerable, steer_tx)) = routed {
             let message = SteerMessage {
                 prompt: request.prompt.clone(),
@@ -451,7 +629,6 @@ impl SessionsEngine {
         let harness = self.inner.registry.resolve(harness_id)?;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
-        handle.write_user_message(&user_id, &request.prompt, now_ms())?;
 
         // Engine-owned resume (comet sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
@@ -462,8 +639,6 @@ impl SessionsEngine {
             request.resume = self.inner.resume_for(chat_id, &request.cwd);
             resume_injected = request.resume.is_some();
         }
-        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
-
         let run_id = new_id();
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -572,21 +747,40 @@ impl SessionsEngine {
             interrupt: interrupt_token.clone(),
         };
 
-        let displaced = lock(&self.inner.runs).insert(
-            chat_id.to_string(),
-            RunHandle {
-                run_id: run_id.clone(),
-                steerable: harness.capabilities().supports_steering,
-                steer_tx,
-                interrupt_token,
-                cancel: cancel_tx,
-                engine_tx,
-                pending_inputs,
-                pending_approvals,
-                minted_approvals,
-                session_allowed,
-            },
-        );
+        let run_handle = RunHandle {
+            run_id: run_id.clone(),
+            steerable: harness.capabilities().supports_steering,
+            steer_tx,
+            interrupt_token,
+            cancel: cancel_tx,
+            engine_tx,
+            pending_inputs,
+            pending_approvals,
+            minted_approvals,
+            session_allowed,
+        };
+
+        #[cfg(test)]
+        self.pause_run_registration_if_requested(chat_id, &handle)
+            .await;
+
+        let registration = self
+            .doc_host()?
+            .register_run_if_current(&handle, |run_doc| {
+                if let Some(expected) = expected_doc.as_ref() {
+                    if !Arc::ptr_eq(expected, &run_doc) {
+                        return Err(EngineError::ChatCleanupPendingRetry);
+                    }
+                    if lock(&self.inner.runs).contains_key(chat_id) {
+                        return Err(EngineError::ChatCleanupPendingRetry);
+                    }
+                }
+
+                handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+                let displaced = lock(&self.inner.runs).insert(chat_id.to_string(), run_handle);
+                Ok((displaced, run_doc))
+            })?;
+        let (displaced, run_doc) = registration?;
         // A handle we replaced is a run nothing can answer any more: the
         // interrupt above waits only 5s for the old run to settle and inserts
         // regardless. Dropped explicitly, and outside the lock, so its parked
@@ -594,6 +788,7 @@ impl SessionsEngine {
         // statement boundary the temporary happened to end on
         // (`RunHandle::drop`).
         drop(displaced);
+        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
         self.set_status(chat_id, SessionStatus::Working, true);
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
@@ -614,7 +809,7 @@ impl SessionsEngine {
             run_id.clone(),
             harness,
             request,
-            handle.doc_arc(),
+            run_doc,
             controls,
             engine_rx,
             cancel_rx,
@@ -702,6 +897,44 @@ impl SessionsEngine {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         Ok(true)
+    }
+
+    /// Whether a provider run still owns this chat id. Reconciliation checks
+    /// this under DocHost's lifecycle gate as a defensive fallback for a run
+    /// whose warm-handle map entry was already retired.
+    pub(crate) fn has_live_run(&self, chat_id: &str) -> bool {
+        lock(&self.inner.runs).contains_key(chat_id)
+    }
+
+    /// Retire every session-owned remnant of a deleted chat. Callers hold the
+    /// lifecycle gate, so a new generation cannot register between the live-run
+    /// check and the durable journal discard.
+    pub(crate) fn cleanup_deleted_chat(&self, chat_id: &str) -> Result<(), SessionCleanupError> {
+        if self.has_live_run(chat_id) {
+            return Err(SessionCleanupError::LiveRun);
+        }
+        self.inner.journal.discard(chat_id)?;
+        if let Some(workspace) = self.inner.workspace() {
+            workspace.delete_session(chat_id)?;
+        }
+
+        lock(&self.inner.harness_sessions).remove(chat_id);
+        lock(&self.inner.last_requests).remove(chat_id);
+        let sessions = {
+            let mut statuses = lock(&self.inner.statuses);
+            if statuses.remove(chat_id).is_none() {
+                None
+            } else {
+                let mut sessions: Vec<_> = statuses.values().cloned().collect();
+                sessions.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+                Some(sessions)
+            }
+        };
+        if let Some(sessions) = sessions {
+            self.inner.sessions_tx.send_replace(sessions);
+        }
+        lock(&self.inner.hubs).remove(chat_id);
+        Ok(())
     }
 
     /// The `runs` entry for `chat_id`, re-read for the expiry decision. `None`
@@ -1054,6 +1287,38 @@ impl SessionsEngine {
 }
 
 impl Inner {
+    #[cfg(test)]
+    async fn pause_terminal_handoff_if_requested(
+        &self,
+        chat_id: &str,
+    ) -> Option<oneshot::Sender<()>> {
+        let pause = {
+            let mut slot = lock(&self.terminal_handoff_pause);
+            if slot.as_ref().is_some_and(|pause| pause.chat_id == chat_id) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        let pause = pause?;
+        let _ = pause.reached.send(());
+        let _ = pause.release.await;
+        Some(pause.settled)
+    }
+
+    /// Keep this run's ownership pin through the terminal local/workspace
+    /// status writes. A delete finalizer treats its absence as proof that this
+    /// generation cannot write again, and may otherwise admit a same-id chat
+    /// between removal and the terminal upsert.
+    async fn finish_run(&self, chat_id: &str, run_id: &str, final_status: SessionStatus) {
+        self.set_status(chat_id, final_status, false);
+        self.remove_run(chat_id, run_id);
+        #[cfg(test)]
+        if let Some(settled) = self.pause_terminal_handoff_if_requested(chat_id).await {
+            let _ = settled.send(());
+        }
+    }
+
     /// Record a context reading against the chat's session row.
     ///
     /// A window-less reading **clears** the row rather than leaving the last
@@ -1121,6 +1386,26 @@ impl Inner {
             });
         }
         seq
+    }
+
+    /// Enforce the engine's transcript privacy boundary before this event can
+    /// be copied into the journal, broadcast stream, or document fold.
+    fn prepare_event(&self, chat_id: &str, event: &mut AgentEvent) {
+        let host = self
+            .doc_host
+            .get()
+            .expect("runs require a wired document host before they can start");
+        match prepare_event_with(event, |part_id, diff| {
+            host.put_tool_diff(chat_id, part_id, diff)
+        }) {
+            None => {}
+            Some(PrepareToolDiffFailure::Rejected(limit)) => {
+                tracing::debug!(chat = %chat_id, ?limit, "tool diff sidecar rejected")
+            }
+            Some(PrepareToolDiffFailure::Store(err)) => {
+                tracing::warn!(chat = %chat_id, error = %err, "tool diff sidecar write failed")
+            }
+        }
     }
 
     /// Bump the session's freshness on stream activity WITHOUT a status
@@ -1326,8 +1611,75 @@ impl Inner {
 
 // ── run task ────────────────────────────────────────────────────────────────
 
+/// The durable sidecar was not available for one tool result. Exact sources
+/// have already been removed from the event in every variant.
+enum PrepareToolDiffFailure {
+    Rejected(ToolDiffLimit),
+    Store(comet_sync::StoreError),
+}
+
+/// Strip exact Write/Edit call inputs and move exact tool-result sources into
+/// the sidecar before an event can reach a journal, subscriber, or document.
+fn prepare_event_with<F>(event: &mut AgentEvent, persist: F) -> Option<PrepareToolDiffFailure>
+where
+    F: FnOnce(&str, &ToolDiff) -> Result<PutToolDiffOutcome, comet_sync::StoreError>,
+{
+    if let AgentEvent::ToolCall { call, .. } = event {
+        match call {
+            comet_proto::ToolCall::WriteFile { content, .. } => *content = None,
+            comet_proto::ToolCall::EditFile {
+                old_string,
+                new_string,
+                ..
+            } => {
+                *old_string = None;
+                *new_string = None;
+            }
+            _ => {}
+        }
+        return None;
+    }
+    prepare_tool_result_with(event, persist)
+}
+
+/// Move exact tool-result sources into the sidecar once any source-bearing
+/// ToolCall has already been stripped at the authoritative event boundary.
+fn prepare_tool_result_with<F>(event: &mut AgentEvent, persist: F) -> Option<PrepareToolDiffFailure>
+where
+    F: FnOnce(&str, &ToolDiff) -> Result<PutToolDiffOutcome, comet_sync::StoreError>,
+{
+    let AgentEvent::ToolResult {
+        id,
+        diff,
+        diff_ref,
+        diff_stats,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let Some(diff) = diff.take() else {
+        // Replay of a previously prepared event. Its metadata is already the
+        // durable record, so never write it again or clear it as if it failed.
+        return None;
+    };
+
+    *diff_ref = None;
+    *diff_stats = Some(vec![diff.stat()]);
+    match persist(id, &diff) {
+        Ok(PutToolDiffOutcome::Stored {
+            diff_ref: stored, ..
+        }) => {
+            *diff_ref = Some(stored);
+            None
+        }
+        Ok(PutToolDiffOutcome::Rejected(limit)) => Some(PrepareToolDiffFailure::Rejected(limit)),
+        Err(err) => Some(PrepareToolDiffFailure::Store(err)),
+    }
+}
+
 /// Apply the render-parts privacy policy: strip heavy/sensitive tool inputs before doc
-/// entry. Full inputs live only in the local run journal.
+/// entry. Complete Write/Edit sources were already stripped at the engine boundary.
 fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
     parts
         .iter()
@@ -1337,11 +1689,15 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 call,
                 is_error,
                 resolved,
+                diff_ref,
+                diff_stats,
             } => MessagePart::Tool {
                 id: id.clone(),
                 call: sanitize_tool_call(call),
                 is_error: *is_error,
                 resolved: *resolved,
+                diff_ref: diff_ref.clone(),
+                diff_stats: diff_stats.clone(),
             },
             // Approvals carry no heavy field by construction: a file change is
             // path + operation + counts, never the patch. Passed through whole
@@ -1527,8 +1883,9 @@ async fn drive_run(
                     session_id: None,
                 },
             );
-            inner.remove_run(&chat_id, &run_id);
-            inner.set_status(&chat_id, SessionStatus::Errored, false);
+            inner
+                .finish_run(&chat_id, &run_id, SessionStatus::Errored)
+                .await;
             return;
         }
     };
@@ -1568,7 +1925,7 @@ async fn drive_run(
     let steerable = harness.capabilities().supports_steering;
 
     let final_status = loop {
-        let event: AgentEvent = tokio::select! {
+        let mut event: AgentEvent = tokio::select! {
             biased;
             changed = cancel_rx.changed(), if !interrupted => {
                 let _ = changed;
@@ -1662,6 +2019,10 @@ async fn drive_run(
         if matches!(&event, AgentEvent::ReasoningDelta { text } if text.is_empty()) {
             continue;
         }
+        // This is the authoritative privacy boundary. Every later path either
+        // publishes the event, folds it, or both, so no clone can retain exact
+        // sources beyond this point.
+        inner.prepare_event(&chat_id, &mut event);
         // A Diagnostic is bookkeeping about the protocol, not turn content.
         // It can arrive OUTSIDE a turn (a persistent session's unknown
         // notification while parked) and must not be mistaken for turn-start
@@ -1734,14 +2095,17 @@ async fn drive_run(
             };
             let chat = chat_id.clone();
             let message_id = resume_state.user_message_id.clone();
+            let retry_doc = doc.clone();
+            #[cfg(test)]
+            engine.pause_resume_retry_if_requested(&chat).await;
             tokio::spawn(async move {
-                // `inject_resume = false`: the retry must start fresh. The user
-                // entry write inside dispatch is idempotent by message id.
+                // The retry starts fresh and must still bind to the document
+                // generation that owned the rejected resume.
                 if let Err(err) = engine
-                    .dispatch_with(&chat, harness_id, retry, Some(message_id), false)
+                    .dispatch_retry_for_generation(&chat, harness_id, retry, message_id, retry_doc)
                     .await
                 {
-                    tracing::error!(chat = %chat, error = %err, "fresh-session retry dispatch failed");
+                    tracing::debug!(chat = %chat, error = %err, "fresh-session retry dispatch refused");
                 }
             });
             return;
@@ -2002,17 +2366,133 @@ async fn drive_run(
     // loop ending and this task's frame being dropped must find the channel
     // already shut rather than park into a receiver nobody polls.
     drop(engine_rx);
-    inner.remove_run(&chat_id, &run_id);
-    inner.set_status(&chat_id, final_status, false);
+    inner.finish_run(&chat_id, &run_id, final_status).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DocHostConfig;
+    use comet_sync::DocsStore;
 
     fn engine(dir: &std::path::Path) -> SessionsEngine {
         let journal = Arc::new(RunJournal::open(dir).expect("journal opens"));
         SessionsEngine::new("dev-a".into(), journal, Arc::new(HarnessRegistry::new()))
+    }
+
+    #[test]
+    fn deleted_chat_cleanup_waits_for_a_live_run_then_retires_every_session_remnant() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = engine(dir.path());
+        let mut watch = sessions.watch_sessions();
+        sessions
+            .inner
+            .journal
+            .append("chat-1", &AgentEvent::TextDelta { text: "old".into() })
+            .unwrap();
+        sessions.inner.journal.note_resume_attempt("chat-1");
+        let (_replay, _live) = sessions.subscribe("chat-1", 0).unwrap();
+        lock(&sessions.inner.harness_sessions).insert(
+            "chat-1".into(),
+            HarnessSessionRef {
+                session_id: "old-session".into(),
+                cwd: "/tmp".into(),
+            },
+        );
+        lock(&sessions.inner.last_requests).insert(
+            "chat-1".into(),
+            RunRequest {
+                cwd: "/tmp".into(),
+                ..RunRequest::for_session(RuntimeMode::default())
+            },
+        );
+        sessions.set_status("chat-1", SessionStatus::Working, true);
+        lock(&sessions.inner.runs).insert(
+            "chat-1".into(),
+            bare_handle(
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+            ),
+        );
+
+        assert!(matches!(
+            sessions.cleanup_deleted_chat("chat-1"),
+            Err(SessionCleanupError::LiveRun)
+        ));
+        assert!(sessions.has_live_run("chat-1"));
+        assert!(
+            !sessions
+                .inner
+                .journal
+                .replay("chat-1", 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(sessions.inner.journal.resume_attempts("chat-1"), 1);
+        assert!(lock(&sessions.inner.harness_sessions).contains_key("chat-1"));
+        assert!(lock(&sessions.inner.last_requests).contains_key("chat-1"));
+        assert!(lock(&sessions.inner.statuses).contains_key("chat-1"));
+        assert!(lock(&sessions.inner.hubs).contains_key("chat-1"));
+
+        lock(&sessions.inner.runs).remove("chat-1");
+        sessions.cleanup_deleted_chat("chat-1").unwrap();
+
+        assert!(
+            sessions
+                .inner
+                .journal
+                .replay("chat-1", 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(sessions.inner.journal.resume_attempts("chat-1"), 0);
+        assert!(!lock(&sessions.inner.harness_sessions).contains_key("chat-1"));
+        assert!(!lock(&sessions.inner.last_requests).contains_key("chat-1"));
+        assert!(!lock(&sessions.inner.statuses).contains_key("chat-1"));
+        assert!(!lock(&sessions.inner.hubs).contains_key("chat-1"));
+        assert!(watch.borrow_and_update().is_empty());
+        sessions.cleanup_deleted_chat("chat-1").unwrap();
+    }
+
+    /// A finite harness script lets the privacy test exercise the actual run
+    /// pipeline, including publish, journal, fold, and document rendering.
+    struct ToolDiffHarness {
+        script: Vec<AgentEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for ToolDiffHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+
+        fn display_name(&self) -> &str {
+            "Tool diff script"
+        }
+
+        fn capabilities(&self) -> comet_proto::HarnessCapabilities {
+            comet_proto::HarnessCapabilities::default()
+        }
+
+        async fn models(&self) -> Result<comet_proto::ModelCatalog, comet_harness::HarnessError> {
+            Ok(comet_proto::ModelCatalog::built_in(Vec::new()))
+        }
+
+        async fn run(
+            &self,
+            _request: RunRequest,
+            _controls: RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<AgentEvent, comet_harness::HarnessError>>,
+            comet_harness::HarnessError,
+        > {
+            Ok(Box::pin(futures::stream::iter(
+                self.script
+                    .clone()
+                    .into_iter()
+                    .map(Ok::<_, comet_harness::HarnessError>),
+            )))
+        }
     }
 
     #[test]
@@ -2031,6 +2511,396 @@ mod tests {
             decision: None,
         };
         assert_eq!(render_parts(std::slice::from_ref(&part)), vec![part]);
+    }
+
+    /// Removing preparation or moving it after publish leaks the source pair
+    /// into the live event and run journal. The sidecar is the sole allowed
+    /// durable owner of the exact source pair.
+    #[tokio::test]
+    async fn tool_result_is_stripped_before_journal_and_fold() {
+        const WRITE_POISON_NEW: &str = "TASK9_WRITE_POISON_NEW_SOURCE";
+        const EDIT_POISON_OLD: &str = "TASK9_EDIT_POISON_OLD_SOURCE";
+        const EDIT_POISON_NEW: &str = "TASK9_EDIT_POISON_NEW_SOURCE";
+
+        let write_diff = comet_proto::ToolDiff {
+            path: "src/lib.rs".into(),
+            old_text: None,
+            new_text: WRITE_POISON_NEW.into(),
+        };
+        let edit_diff = comet_proto::ToolDiff {
+            path: "src/edit.rs".into(),
+            old_text: Some(EDIT_POISON_OLD.into()),
+            new_text: EDIT_POISON_NEW.into(),
+        };
+        let write_ref = write_diff.diff_ref().unwrap();
+        let write_stats = vec![write_diff.stat()];
+        let edit_ref = edit_diff.diff_ref().unwrap();
+        let edit_stats = vec![edit_diff.stat()];
+        let poisons = [WRITE_POISON_NEW, EDIT_POISON_OLD, EDIT_POISON_NEW];
+        let script = vec![
+            AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "test".into(),
+                tools: Vec::new(),
+                cwd: "/tmp".into(),
+                session_id: "session-1".into(),
+                assistant_message_id: "assistant-1".into(),
+                runtime_mode: comet_proto::RuntimeMode::default(),
+            },
+            AgentEvent::ToolCall {
+                id: "write-tool".into(),
+                call: comet_proto::ToolCall::WriteFile {
+                    path: "src/lib.rs".into(),
+                    content: Some(WRITE_POISON_NEW.into()),
+                },
+            },
+            AgentEvent::ToolResult {
+                id: "write-tool".into(),
+                is_error: false,
+                diff: Some(write_diff.clone()),
+                // A provider/replay must never make a stale ref survive a
+                // new source pair; Stored replaces it with the sidecar ref.
+                diff_ref: Some("v1:stale".into()),
+                diff_stats: None,
+            },
+            AgentEvent::ToolCall {
+                id: "edit-tool".into(),
+                call: comet_proto::ToolCall::EditFile {
+                    path: "src/edit.rs".into(),
+                    old_string: Some(EDIT_POISON_OLD.into()),
+                    new_string: Some(EDIT_POISON_NEW.into()),
+                },
+            },
+            AgentEvent::ToolResult {
+                id: "edit-tool".into(),
+                is_error: false,
+                diff: Some(edit_diff.clone()),
+                diff_ref: Some("v1:stale".into()),
+                diff_stats: None,
+            },
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: Some("session-1".into()),
+            },
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path().join("store")).unwrap());
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                default_harness: HarnessId::Mock,
+            },
+        );
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(ToolDiffHarness { script }));
+        let journal = Arc::new(RunJournal::open(dir.path().join("journals")).unwrap());
+        let sessions = SessionsEngine::new("dev-a".into(), journal.clone(), registry);
+        sessions.set_doc_host(host.clone());
+        host.set_sessions(sessions.clone());
+
+        let (replay_before_run, mut live) = sessions.subscribe("chat-1", 0).unwrap();
+        assert!(replay_before_run.is_empty());
+        sessions
+            .dispatch(
+                "chat-1",
+                HarnessId::Mock,
+                RunRequest {
+                    prompt: "change it".into(),
+                    model: None,
+                    reasoning: None,
+                    model_options: Default::default(),
+                    cwd: "/tmp".into(),
+                    runtime_mode: comet_proto::RuntimeMode::default(),
+                    sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+                    attachments: Vec::new(),
+                    resume: None,
+                },
+                Some("user-1".into()),
+            )
+            .await
+            .unwrap();
+
+        let mut published = Vec::new();
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), live.recv())
+                .await
+                .expect("run publishes every scripted event")
+                .expect("run broadcast remains open")
+                .event;
+            let is_done = matches!(event, AgentEvent::Done { .. });
+            published.push(event);
+            if is_done {
+                break;
+            }
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while sessions
+                .session_status("chat-1")
+                .is_some_and(|session| session.status != SessionStatus::Idle)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("run finishes its document fold");
+
+        for event in &published {
+            let published_json = serde_json::to_string(event).unwrap();
+            for poison in poisons {
+                assert!(
+                    !published_json.contains(poison),
+                    "published event leaked exact source {poison}: {published_json}"
+                );
+            }
+        }
+
+        let published_result = published
+            .iter()
+            .find(|event| matches!(event, AgentEvent::ToolResult { id, .. } if id == "write-tool"))
+            .expect("write result published");
+        let AgentEvent::ToolResult {
+            diff,
+            diff_ref,
+            diff_stats,
+            ..
+        } = published_result
+        else {
+            unreachable!();
+        };
+        assert!(
+            diff.is_none(),
+            "published event must not retain exact sources"
+        );
+        assert_eq!(diff_ref.as_deref(), Some(write_ref.as_str()));
+        assert_eq!(diff_stats.as_deref(), Some(write_stats.as_slice()));
+
+        let AgentEvent::ToolResult {
+            diff,
+            diff_ref,
+            diff_stats,
+            ..
+        } = published
+            .iter()
+            .find(|event| matches!(event, AgentEvent::ToolResult { id, .. } if id == "edit-tool"))
+            .expect("whole-file Edit result published")
+        else {
+            unreachable!();
+        };
+        assert!(
+            diff.is_none(),
+            "published Edit must not retain exact sources"
+        );
+        assert_eq!(diff_ref.as_deref(), Some(edit_ref.as_str()));
+        assert_eq!(diff_stats.as_deref(), Some(edit_stats.as_slice()));
+
+        let replay = journal.replay("chat-1", 0).unwrap();
+        let replayed_result = replay
+            .iter()
+            .map(|(_, event)| event)
+            .find(|event| matches!(event, AgentEvent::ToolResult { id, .. } if id == "write-tool"))
+            .expect("write result journaled");
+        let AgentEvent::ToolResult {
+            diff,
+            diff_ref,
+            diff_stats,
+            ..
+        } = replayed_result
+        else {
+            unreachable!();
+        };
+        assert!(
+            diff.is_none(),
+            "journal replay must not retain exact sources"
+        );
+        assert_eq!(diff_ref.as_deref(), Some(write_ref.as_str()));
+        assert_eq!(diff_stats.as_deref(), Some(write_stats.as_slice()));
+        let replayed_json = serde_json::to_string(replayed_result).unwrap();
+        for poison in poisons {
+            assert!(
+                !replayed_json.contains(poison),
+                "journal replay leaked exact source {poison}: {replayed_json}"
+            );
+        }
+        let journal_text = std::fs::read_to_string(dir.path().join("journals/chat-1.jsonl"))
+            .expect("journal file exists");
+        for poison in poisons {
+            assert!(
+                !journal_text.contains(poison),
+                "journal leaked exact source {poison}: {journal_text}"
+            );
+        }
+
+        assert_eq!(
+            store
+                .read_tool_diff("chat-1", "write-tool", &write_ref)
+                .unwrap(),
+            Some(write_diff.clone()),
+            "the sidecar retains the exact source pair"
+        );
+        assert_eq!(
+            store
+                .read_tool_diff("chat-1", "edit-tool", &edit_ref)
+                .unwrap(),
+            Some(edit_diff.clone()),
+            "the sidecar retains the exact whole-file Edit pair"
+        );
+
+        let handle = host.open("chat-1").unwrap();
+        let entries = handle.doc().read_entries().unwrap();
+        let folded_tool = entries
+            .iter()
+            .flat_map(|entry| &entry.parts)
+            .find(|part| matches!(part, MessagePart::Tool { id, .. } if id == "write-tool"))
+            .expect("tool result folds into the document");
+        let MessagePart::Tool {
+            diff_ref,
+            diff_stats,
+            ..
+        } = folded_tool
+        else {
+            unreachable!();
+        };
+        assert_eq!(diff_ref.as_deref(), Some(write_ref.as_str()));
+        assert_eq!(diff_stats.as_deref(), Some(write_stats.as_slice()));
+        let folded_json = serde_json::to_string(&entries).unwrap();
+        for poison in poisons {
+            assert!(
+                !folded_json.contains(poison),
+                "folded document leaked exact source {poison}: {folded_json}"
+            );
+        }
+
+        let snapshot = handle.doc().export_snapshot().unwrap();
+        let snapshot_text = String::from_utf8_lossy(&snapshot);
+        for poison in poisons {
+            assert!(
+                !snapshot_text.contains(poison),
+                "document snapshot leaked exact source {poison}: {snapshot_text}"
+            );
+        }
+        let restored_raw = loro::LoroDoc::new();
+        restored_raw.import(&snapshot).unwrap();
+        let restored = SessionDoc::from_doc(restored_raw);
+        let restored_tool = restored
+            .read_entries()
+            .unwrap()
+            .into_iter()
+            .flat_map(|entry| entry.parts)
+            .find(|part| matches!(part, MessagePart::Tool { id, .. } if id == "write-tool"))
+            .expect("tool part survives snapshot read");
+        let MessagePart::Tool {
+            diff_ref,
+            diff_stats,
+            ..
+        } = restored_tool
+        else {
+            unreachable!();
+        };
+        assert_eq!(diff_ref.as_deref(), Some(write_ref.as_str()));
+        assert_eq!(diff_stats.as_deref(), Some(write_stats.as_slice()));
+    }
+
+    /// A failed or rejected sidecar write has useful compact statistics but
+    /// must never publish a stale or unavailable exact-source reference.
+    #[test]
+    fn sidecar_store_failure_keeps_stats_without_a_reference() {
+        let source = comet_proto::ToolDiff {
+            path: "src/lib.rs".into(),
+            old_text: Some("before\n".into()),
+            new_text: "after\n".into(),
+        };
+        let expected_stats = vec![source.stat()];
+        let event_with_source = || AgentEvent::ToolResult {
+            id: "tool-1".into(),
+            is_error: false,
+            diff: Some(source.clone()),
+            diff_ref: Some("v1:stale".into()),
+            diff_stats: None,
+        };
+        let assert_stripped = |event: &AgentEvent| {
+            let AgentEvent::ToolResult {
+                diff,
+                diff_ref,
+                diff_stats,
+                ..
+            } = event
+            else {
+                unreachable!();
+            };
+            assert!(
+                diff.is_none(),
+                "exact source must be cleared before persistence"
+            );
+            assert!(
+                diff_ref.is_none(),
+                "a failed write must clear a stale reference"
+            );
+            assert_eq!(diff_stats.as_deref(), Some(expected_stats.as_slice()));
+        };
+
+        let mut store_failure = event_with_source();
+        let failure = prepare_tool_result_with(&mut store_failure, |_part_id, _diff| {
+            Err(comet_sync::StoreError::Sqlite(
+                rusqlite::Error::InvalidQuery,
+            ))
+        });
+        assert!(matches!(
+            failure,
+            Some(PrepareToolDiffFailure::Store(
+                comet_sync::StoreError::Sqlite(_)
+            ))
+        ));
+        assert_stripped(&store_failure);
+
+        let mut quota_failure = event_with_source();
+        let failure = prepare_tool_result_with(&mut quota_failure, |_part_id, _diff| {
+            Err(comet_sync::StoreError::ToolDiffQuota)
+        });
+        assert!(matches!(
+            failure,
+            Some(PrepareToolDiffFailure::Store(
+                comet_sync::StoreError::ToolDiffQuota
+            ))
+        ));
+        assert_stripped(&quota_failure);
+
+        let mut rejected = event_with_source();
+        let failure = prepare_tool_result_with(&mut rejected, |_part_id, _diff| {
+            Ok(comet_sync::PutToolDiffOutcome::Rejected(
+                comet_sync::ToolDiffLimit::Path,
+            ))
+        });
+        assert!(matches!(
+            failure,
+            Some(PrepareToolDiffFailure::Rejected(
+                comet_sync::ToolDiffLimit::Path
+            ))
+        ));
+        assert_stripped(&rejected);
+
+        let mut replay = AgentEvent::ToolResult {
+            id: "tool-1".into(),
+            is_error: false,
+            diff: None,
+            diff_ref: Some("v1:already-stored".into()),
+            diff_stats: Some(expected_stats.clone()),
+        };
+        let result = prepare_tool_result_with(&mut replay, |_part_id, _diff| {
+            panic!("an already-stripped replay must not be persisted again")
+        });
+        assert!(result.is_none());
+        assert!(matches!(
+            replay,
+            AgentEvent::ToolResult {
+                diff: None,
+                diff_ref: Some(ref diff_ref),
+                diff_stats: Some(ref diff_stats),
+                ..
+            } if diff_ref == "v1:already-stored" && diff_stats == &expected_stats
+        ));
     }
 
     /// A run with one question and one approval parked.

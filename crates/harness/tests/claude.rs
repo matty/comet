@@ -244,11 +244,17 @@ async fn happy_path_normalizes_events_and_filters_subagents() {
     );
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "tool-1".into(),
-        is_error: false
+        is_error: false,
+        diff: None,
+        diff_ref: None,
+        diff_stats: None,
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "tool-2".into(),
-        is_error: true
+        is_error: true,
+        diff: None,
+        diff_ref: None,
+        diff_stats: None,
     }));
 
     // Informational rate-limit frames stay quiet.

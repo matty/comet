@@ -18,7 +18,10 @@ use crate::{ClientFrame, RpcError, ServerFrame};
 const STREAM_QUEUE_CAP: usize = 256;
 
 enum Pending {
-    Call(oneshot::Sender<Result<serde_json::Value, RpcError>>),
+    Call {
+        method: String,
+        reply: oneshot::Sender<Result<serde_json::Value, RpcError>>,
+    },
     Stream(mpsc::Sender<serde_json::Value>),
 }
 
@@ -166,8 +169,8 @@ impl RpcClient {
                 pending.drain().map(|(_, p)| p).collect()
             };
             for entry in drained {
-                if let Pending::Call(tx) = entry {
-                    let _ = tx.send(Err(RpcError::Closed));
+                if let Pending::Call { reply, .. } = entry {
+                    let _ = reply.send(Err(RpcError::Closed));
                 }
                 // Streams end by sender drop.
             }
@@ -189,7 +192,10 @@ impl RpcClient {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, RpcError> {
         let (tx, rx) = oneshot::channel();
-        let id = self.register(Pending::Call(tx));
+        let id = self.register(Pending::Call {
+            method: method.to_string(),
+            reply: tx,
+        });
         let mut guard = PendingGuard {
             id,
             shared: self.shared.clone(),
@@ -304,8 +310,8 @@ async fn route_frame(shared: &Arc<Shared>, frame: ServerFrame) {
     let id = frame.id;
     if let Some(err) = frame.err {
         match shared.lock().remove(&id) {
-            Some(Pending::Call(tx)) => {
-                let _ = tx.send(Err(RpcError::Failed(err)));
+            Some(Pending::Call { method, reply }) => {
+                let _ = reply.send(Err(decode_wire_error(err, &method)));
             }
             Some(Pending::Stream(_)) | None => {
                 // Stream errored: the sender drop closes the receiver.
@@ -315,8 +321,8 @@ async fn route_frame(shared: &Arc<Shared>, frame: ServerFrame) {
         return;
     }
     if let Some(value) = frame.ok {
-        if let Some(Pending::Call(tx)) = shared.lock().remove(&id) {
-            let _ = tx.send(Ok(value));
+        if let Some(Pending::Call { reply, .. }) = shared.lock().remove(&id) {
+            let _ = reply.send(Ok(value));
         }
         return;
     }
@@ -340,6 +346,16 @@ async fn route_frame(shared: &Arc<Shared>, frame: ServerFrame) {
     }
     if frame.done {
         shared.lock().remove(&id);
+    }
+}
+
+/// `ServerFrame` predates typed error envelopes. Preserve additive-method
+/// fallback only for the canonical error naming this pending call.
+fn decode_wire_error(error: String, requested_method: &str) -> RpcError {
+    if error == format!("unknown method: {requested_method}") {
+        RpcError::UnknownMethod(requested_method.to_string())
+    } else {
+        RpcError::Failed(error)
     }
 }
 

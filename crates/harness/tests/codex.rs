@@ -168,7 +168,10 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "c1".into(),
-        is_error: true
+        is_error: true,
+        diff: None,
+        diff_ref: None,
+        diff_stats: None,
     }));
 
     // fileChange (single add): WriteFile, refreshed at completion.
@@ -188,7 +191,10 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     );
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "f1".into(),
-        is_error: false
+        is_error: false,
+        diff: None,
+        diff_ref: None,
+        diff_stats: None,
     }));
 
     // mcpToolCall with failed status.
@@ -202,7 +208,10 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "mcp1".into(),
-        is_error: true
+        is_error: true,
+        diff: None,
+        diff_ref: None,
+        diff_stats: None,
     }));
 
     // webSearch lifecycle.
@@ -214,7 +223,10 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "w1".into(),
-        is_error: false
+        is_error: false,
+        diff: None,
+        diff_ref: None,
+        diff_stats: None,
     }));
 
     // No `todoList` assertion: the fixture no longer sends one, because no
@@ -295,6 +307,28 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn codex_file_change_without_complete_sources_carries_no_diff() {
+    let (controls, _steer, _token) = controls("Yes");
+    let mut request = request("scenario:happy");
+    request.cwd = "/tmp".into();
+    request.model_options.insert(
+        "serviceTier".into(),
+        serde_json::Value::String("fast".into()),
+    );
+    let events = run_to_end(&harness(), request, controls).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolResult {
+            id,
+            diff: None,
+            diff_ref: None,
+            diff_stats: None,
+            ..
+        } if id == "f1"
+    )));
 }
 
 /// `Auto` is the only mode that hands approval review to the provider, so it

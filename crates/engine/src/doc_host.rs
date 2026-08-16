@@ -27,10 +27,10 @@ use comet_doc::{
     SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
     join_continuation_entries,
 };
-use comet_proto::{ApprovalDecision, HarnessId, UserInputAnswer, UserInputQuestion};
-use comet_sync::DocsStore;
+use comet_proto::{ApprovalDecision, HarnessId, ToolDiff, UserInputAnswer, UserInputQuestion};
+use comet_sync::{DocsStore, PutToolDiffOutcome};
 
-use crate::sessions::{SessionsEngine, SteerOutcome};
+use crate::sessions::{SessionCleanupError, SessionsEngine, SteerOutcome};
 use crate::workspace_host::WorkspaceHost;
 use crate::{EngineError, new_id, now_ms};
 
@@ -64,6 +64,86 @@ struct DocHostInner {
     sessions: OnceLock<SessionsEngine>,
     workspace: OnceLock<WorkspaceHost>,
     handles: Mutex<HashMap<String, Arc<ChatDocHandle>>>,
+    /// A chat id's local lifecycle owner. This gate stays locked through
+    /// persistence, reconciliation cleanup, and final purge, so no callback
+    /// can cross into a newer generation that reuses the same id.
+    purge_gate: Mutex<PurgeGate>,
+    #[cfg(test)]
+    purges: watch::Sender<u64>,
+}
+
+/// Identity for one deletion or reconciliation lifecycle. Tokens are
+/// local-only and distinguish delayed callbacks from the current owner of the
+/// same caller-supplied chat id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PurgeToken(u64);
+
+#[derive(Debug, Clone, Copy)]
+enum StableLifecycle {
+    Live,
+    Purged { token: PurgeToken },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ChatLifecycle {
+    Reconciling {
+        token: PurgeToken,
+    },
+    Purging {
+        token: PurgeToken,
+        rollback: StableLifecycle,
+    },
+    Purged {
+        token: PurgeToken,
+    },
+}
+
+/// `chats` omits live ids. Keeping the completed token lets a canceled later
+/// tombstone restore the exact completed state it replaced, rather than
+/// reopening an unrelated generation.
+struct PurgeGate {
+    next_token: u64,
+    chats: HashMap<String, ChatLifecycle>,
+}
+
+impl PurgeGate {
+    fn next_token(&mut self) -> PurgeToken {
+        let token = PurgeToken(self.next_token);
+        self.next_token = self
+            .next_token
+            .checked_add(1)
+            .expect("chat lifecycle token counter exhausted");
+        token
+    }
+}
+
+/// The lifecycle a create owns while materializing its workspace row. A
+/// completed deletion or fresh-process reconciliation may be claimed only
+/// with its exact token; a pre-existing live row has nothing to clear.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CreateAdmission {
+    Live,
+    Reconcile(PurgeToken),
+    Revive(PurgeToken),
+}
+
+/// The synchronous cleanup result is intentionally compact: exact SQLite
+/// diagnostics stay in tracing, while a caller can avoid claiming durable
+/// deletion completed when the background final retry is still needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PurgeCleanupOutcome {
+    Cleared,
+    PendingRetry,
+}
+
+/// A finalizer either certifies the deletion generation as reusable, leaves
+/// its token in the non-reusable cleanup-pending state, or finds that a newer
+/// lifecycle already owns the id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PurgeFinishOutcome {
+    Purged,
+    PendingRetry,
+    Stale,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -73,6 +153,22 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Clone)]
 pub struct DocHost {
     inner: Arc<DocHostInner>,
+}
+
+#[cfg(test)]
+/// Install Reconciling with an existing matching token. Tests use a Purging
+/// source state to model a process that restarted after tombstoning a row.
+pub(crate) fn restore_reconciling_for_test(host: &DocHost, chat_id: &str, token: PurgeToken) {
+    let mut gate = lock(&host.inner.purge_gate);
+    let Some(current) = gate.chats.get(chat_id).map(|lifecycle| match lifecycle {
+        ChatLifecycle::Purged { token } | ChatLifecycle::Purging { token, .. } => *token,
+        ChatLifecycle::Reconciling { .. } => panic!("reconciliation is already installed"),
+    }) else {
+        panic!("a test reconciliation needs a lifecycle token");
+    };
+    assert_eq!(current, token, "the test must retain its lifecycle token");
+    gate.chats
+        .insert(chat_id.to_string(), ChatLifecycle::Reconciling { token });
 }
 
 /// One open chat doc and its change/persistence plumbing.
@@ -237,6 +333,8 @@ impl ChatDocHandle {
 
 impl DocHost {
     pub fn new(store: Arc<DocsStore>, config: DocHostConfig) -> Self {
+        #[cfg(test)]
+        let (purges, _) = watch::channel(0);
         Self {
             inner: Arc::new(DocHostInner {
                 store,
@@ -244,6 +342,12 @@ impl DocHost {
                 sessions: OnceLock::new(),
                 workspace: OnceLock::new(),
                 handles: Mutex::new(HashMap::new()),
+                purge_gate: Mutex::new(PurgeGate {
+                    next_token: 1,
+                    chats: HashMap::new(),
+                }),
+                #[cfg(test)]
+                purges,
             }),
         }
     }
@@ -273,9 +377,198 @@ impl DocHost {
         &self.inner.config.device_id
     }
 
+    /// Store one exact tool-result source pair outside the transcript document.
+    pub(crate) fn put_tool_diff(
+        &self,
+        chat_id: &str,
+        part_id: &str,
+        diff: &ToolDiff,
+    ) -> Result<PutToolDiffOutcome, comet_sync::StoreError> {
+        let gate = lock(&self.inner.purge_gate);
+        if matches!(
+            gate.chats.get(chat_id),
+            Some(
+                ChatLifecycle::Reconciling { .. }
+                    | ChatLifecycle::Purging { .. }
+                    | ChatLifecycle::Purged { .. }
+            )
+        ) {
+            return Err(comet_sync::StoreError::ToolDiffPurged);
+        }
+        // Keep the lifecycle gate held through the write. A concurrent
+        // begin-purge waits for this write and then deletes it, while a later
+        // write sees the purging/purged state and is refused.
+        let outcome = self.inner.store.put_tool_diff(chat_id, part_id, diff);
+        drop(gate);
+        outcome
+    }
+
+    /// Atomically start one deletion lifecycle. A duplicate delete while its
+    /// predecessor still settles receives no token and cannot steal cleanup.
+    pub(crate) fn begin_purge(&self, chat_id: &str) -> Option<PurgeToken> {
+        let mut gate = lock(&self.inner.purge_gate);
+        if matches!(
+            gate.chats.get(chat_id),
+            Some(ChatLifecycle::Reconciling { .. } | ChatLifecycle::Purging { .. })
+        ) {
+            return None;
+        }
+        let rollback = match gate.chats.get(chat_id) {
+            Some(ChatLifecycle::Purged { token }) => StableLifecycle::Purged { token: *token },
+            Some(ChatLifecycle::Reconciling { .. } | ChatLifecycle::Purging { .. }) => {
+                unreachable!("non-stable lifecycle returned above")
+            }
+            None => StableLifecycle::Live,
+        };
+        let token = gate.next_token();
+        gate.chats.insert(
+            chat_id.to_string(),
+            ChatLifecycle::Purging { token, rollback },
+        );
+        Some(token)
+    }
+
+    /// Roll back only the matching workspace-tombstone attempt. A stale
+    /// callback may not reopen a newer purging generation.
+    pub(crate) fn cancel_purge(&self, chat_id: &str, token: PurgeToken) -> bool {
+        let mut gate = lock(&self.inner.purge_gate);
+        let Some(ChatLifecycle::Purging {
+            token: current,
+            rollback,
+        }) = gate.chats.get(chat_id).copied()
+        else {
+            return false;
+        };
+        if current != token {
+            return false;
+        }
+        match rollback {
+            StableLifecycle::Live => {
+                gate.chats.remove(chat_id);
+            }
+            StableLifecycle::Purged { token } => {
+                gate.chats
+                    .insert(chat_id.to_string(), ChatLifecycle::Purged { token });
+            }
+        }
+        true
+    }
+
+    fn has_previous_generation_owner(&self, chat_id: &str) -> bool {
+        if lock(&self.inner.handles).contains_key(chat_id) {
+            return true;
+        }
+        self.inner
+            .sessions
+            .get()
+            .is_some_and(|sessions| sessions.has_live_run(chat_id))
+    }
+
+    /// Refuse same-id reuse while a previous generation is still settling.
+    /// Fresh-process cleanup installs a token before touching artifacts, and a
+    /// completed purge already has one; the caller must present that exact
+    /// admission after workspace create succeeds before the id becomes live.
+    pub(crate) fn admit_create(
+        &self,
+        chat_id: &str,
+        workspace_row_exists: bool,
+    ) -> Result<CreateAdmission, ()> {
+        let mut gate = lock(&self.inner.purge_gate);
+        let lifecycle = gate.chats.get(chat_id).copied();
+        let needs_owner_free = matches!(
+            lifecycle,
+            Some(ChatLifecycle::Purged { .. } | ChatLifecycle::Reconciling { .. })
+        ) || (lifecycle.is_none() && !workspace_row_exists);
+        if needs_owner_free && self.has_previous_generation_owner(chat_id) {
+            return Err(());
+        }
+
+        match lifecycle {
+            Some(ChatLifecycle::Purging { .. }) => Err(()),
+            Some(ChatLifecycle::Purged { token }) => Ok(CreateAdmission::Revive(token)),
+            Some(ChatLifecycle::Reconciling { token }) => {
+                match self.cleanup_old_generation(chat_id) {
+                    PurgeCleanupOutcome::Cleared => Ok(CreateAdmission::Reconcile(token)),
+                    PurgeCleanupOutcome::PendingRetry => Err(()),
+                }
+            }
+            None if workspace_row_exists => Ok(CreateAdmission::Live),
+            None => {
+                let token = gate.next_token();
+                gate.chats
+                    .insert(chat_id.to_string(), ChatLifecycle::Reconciling { token });
+                match self.cleanup_old_generation(chat_id) {
+                    PurgeCleanupOutcome::Cleared => Ok(CreateAdmission::Reconcile(token)),
+                    PurgeCleanupOutcome::PendingRetry => Err(()),
+                }
+            }
+        }
+    }
+
+    /// Turn a successfully materialized row live. Conditional token claims
+    /// prevent a stale create completion from reopening any newer lifecycle.
+    pub(crate) fn revive_created_chat(&self, chat_id: &str, admission: CreateAdmission) -> bool {
+        let mut gate = lock(&self.inner.purge_gate);
+        match admission {
+            CreateAdmission::Live => !matches!(
+                gate.chats.get(chat_id),
+                Some(
+                    ChatLifecycle::Reconciling { .. }
+                        | ChatLifecycle::Purging { .. }
+                        | ChatLifecycle::Purged { .. }
+                )
+            ),
+            CreateAdmission::Reconcile(token) => {
+                if matches!(
+                    gate.chats.get(chat_id),
+                    Some(ChatLifecycle::Reconciling { token: current }) if *current == token
+                ) {
+                    gate.chats.remove(chat_id);
+                    true
+                } else {
+                    false
+                }
+            }
+            CreateAdmission::Revive(token) => {
+                if matches!(
+                    gate.chats.get(chat_id),
+                    Some(ChatLifecycle::Purged { token: current }) if *current == token
+                ) {
+                    gate.chats.remove(chat_id);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn watch_purges(&self) -> watch::Receiver<u64> {
+        self.inner.purges.subscribe()
+    }
+
+    /// Read an exact tool-result source pair when its durable reference still matches.
+    #[allow(dead_code)] // Consumed by the following read-only RPC task.
+    pub(crate) fn read_tool_diff(
+        &self,
+        chat_id: &str,
+        part_id: &str,
+        diff_ref: &str,
+    ) -> Result<Option<ToolDiff>, comet_sync::StoreError> {
+        self.inner.store.read_tool_diff(chat_id, part_id, diff_ref)
+    }
+
     /// Open (or return) the chat's doc handle, load its local snapshot (or
     /// initialize it), and start the change-driven persistence task.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
+        // Lifecycle gate first, then handles/store. Reconciliation keeps this
+        // guard reserved through workspace creation, so an open cannot load an
+        // old snapshot or insert a handle into the cleaned interval.
+        let gate = lock(&self.inner.purge_gate);
+        if gate.chats.contains_key(chat_id) {
+            return Err(EngineError::ChatCleanupPendingRetry);
+        }
         if let Some(handle) = lock(&self.inner.handles).get(chat_id) {
             handle.touch();
             return Ok(handle.clone());
@@ -319,10 +612,32 @@ impl DocHost {
             }
             handles.insert(chat_id.to_string(), handle.clone());
         }
+        drop(gate);
 
         tokio::spawn(chat_task(self.clone(), Arc::downgrade(&handle), changed_rx));
         self.evict_over_budget();
         Ok(handle)
+    }
+
+    pub(crate) fn register_run_if_current<T>(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+        register: impl FnOnce(Arc<SessionDoc>) -> T,
+    ) -> Result<T, EngineError> {
+        let gate = lock(&self.inner.purge_gate);
+        if gate.chats.contains_key(&handle.chat_id) {
+            return Err(EngineError::ChatCleanupPendingRetry);
+        }
+        let current = lock(&self.inner.handles)
+            .get(&handle.chat_id)
+            .is_some_and(|current| Arc::ptr_eq(current, handle));
+        if !current {
+            return Err(EngineError::ChatCleanupPendingRetry);
+        }
+        let run_doc = handle.doc_arc();
+        let registered = register(run_doc);
+        drop(gate);
+        Ok(registered)
     }
 
     /// LRU eviction: while the warm set exceeds [`WARM_DOC_CAP`] or the
@@ -336,15 +651,15 @@ impl DocHost {
     /// Eviction flushes a final snapshot, so reopen loses nothing; missed
     /// direct peers will observe the current authoritative snapshot on reopen.
     fn evict_over_budget(&self) {
-        let mut by_age: Vec<(i64, String)> = {
+        let mut by_age: Vec<(i64, Arc<ChatDocHandle>)> = {
             let handles = lock(&self.inner.handles);
             handles
                 .values()
-                .map(|h| (h.last_access.load(Ordering::Relaxed), h.chat_id.clone()))
+                .map(|handle| (handle.last_access.load(Ordering::Relaxed), handle.clone()))
                 .collect()
         };
-        by_age.sort_unstable();
-        for (_, chat_id) in by_age {
+        by_age.sort_unstable_by_key(|(age, _)| *age);
+        for (_, candidate) in by_age {
             let (count, estimate) = {
                 let handles = lock(&self.inner.handles);
                 (
@@ -358,20 +673,39 @@ impl DocHost {
             if count <= WARM_DOC_CAP && estimate <= comet_doc::DOC_LRU_BYTE_BUDGET {
                 return;
             }
-            let evicted = {
-                let mut handles = lock(&self.inner.handles);
-                match handles.get(&chat_id) {
-                    Some(handle) if !self.pinned(handle) => handles.remove(&chat_id),
-                    _ => None,
-                }
-            };
-            if let Some(handle) = evicted {
-                // Final flush outside the map lock; ≤1s of changes could be
-                // pending in the snapshot debounce.
-                self.save_snapshot(&handle);
-                tracing::debug!(chat = %handle.chat_id, "doc evicted (LRU)");
+            if self.evict_if_current(&candidate) {
+                tracing::debug!(chat = %candidate.chat_id, "doc evicted (LRU)");
             }
         }
+    }
+
+    fn evict_if_current(&self, candidate: &Arc<ChatDocHandle>) -> bool {
+        let gate = lock(&self.inner.purge_gate);
+        if gate.chats.contains_key(&candidate.chat_id) {
+            return false;
+        }
+        let current = lock(&self.inner.handles).get(&candidate.chat_id).cloned();
+        let Some(current) = current.filter(|current| Arc::ptr_eq(current, candidate)) else {
+            return false;
+        };
+        if Arc::strong_count(&current) > 3 || self.pinned(&current) {
+            return false;
+        }
+        if !self.save_snapshot_under_gate(&gate, &current, || {}) {
+            return false;
+        }
+        let removed = {
+            let mut handles = lock(&self.inner.handles);
+            match handles.get(&current.chat_id) {
+                Some(mapped) if Arc::ptr_eq(mapped, &current) => {
+                    handles.remove(&current.chat_id);
+                    true
+                }
+                _ => false,
+            }
+        };
+        drop(gate);
+        removed
     }
 
     fn pinned(&self, handle: &Arc<ChatDocHandle>) -> bool {
@@ -396,15 +730,194 @@ impl DocHost {
         }
     }
 
-    /// Drop a chat's doc unconditionally and delete its local snapshot — the
-    /// chat is gone (DeleteChat / DeleteSpace cascade). Watchers see the
-    /// stream end; a racing writer keeps its orphaned doc until the run ends.
-    pub fn purge_chat(&self, chat_id: &str) {
+    /// Attempt both durable cleanup legs only while the matching lifecycle is
+    /// still purging. It deliberately leaves that state unchanged so callers
+    /// can make an initial synchronous pass and a final post-interrupt retry.
+    /// A stale token is a no-op.
+    pub(crate) fn cleanup_purging_chat(
+        &self,
+        chat_id: &str,
+        token: PurgeToken,
+    ) -> Option<PurgeCleanupOutcome> {
+        self.cleanup_purging_chat_with(
+            chat_id,
+            token,
+            |chat_id| self.inner.store.delete_snapshot(chat_id),
+            |chat_id| self.inner.store.delete_tool_diffs(chat_id),
+        )
+    }
+
+    fn cleanup_purging_chat_with<DeleteSnapshot, DeleteToolDiffs>(
+        &self,
+        chat_id: &str,
+        token: PurgeToken,
+        delete_snapshot: DeleteSnapshot,
+        delete_tool_diffs: DeleteToolDiffs,
+    ) -> Option<PurgeCleanupOutcome>
+    where
+        DeleteSnapshot: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
+        DeleteToolDiffs: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
+    {
+        let gate = lock(&self.inner.purge_gate);
+        self.cleanup_purging_chat_locked_with(
+            &gate,
+            chat_id,
+            token,
+            delete_snapshot,
+            delete_tool_diffs,
+        )
+    }
+
+    fn cleanup_purging_chat_locked_with<DeleteSnapshot, DeleteToolDiffs>(
+        &self,
+        gate: &PurgeGate,
+        chat_id: &str,
+        token: PurgeToken,
+        delete_snapshot: DeleteSnapshot,
+        delete_tool_diffs: DeleteToolDiffs,
+    ) -> Option<PurgeCleanupOutcome>
+    where
+        DeleteSnapshot: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
+        DeleteToolDiffs: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
+    {
+        if !matches!(
+            gate.chats.get(chat_id),
+            Some(ChatLifecycle::Purging { token: current, .. }) if *current == token
+        ) {
+            return None;
+        }
+        Some(self.cleanup_chat_artifacts_with(chat_id, delete_snapshot, delete_tool_diffs))
+    }
+
+    /// Retire all durable state owned by an old generation. This is only used
+    /// by final token-owned purge and fresh-process reconciliation; the initial
+    /// delete pass deliberately leaves the journal alone while a run settles.
+    fn cleanup_old_generation(&self, chat_id: &str) -> PurgeCleanupOutcome {
+        self.cleanup_old_generation_with(
+            chat_id,
+            |chat_id| self.inner.store.delete_snapshot(chat_id),
+            |chat_id| self.inner.store.delete_tool_diffs(chat_id),
+            |chat_id| self.cleanup_deleted_session(chat_id),
+        )
+    }
+
+    fn cleanup_old_generation_with<DeleteSnapshot, DeleteToolDiffs, RetireSession>(
+        &self,
+        chat_id: &str,
+        delete_snapshot: DeleteSnapshot,
+        delete_tool_diffs: DeleteToolDiffs,
+        retire_session: RetireSession,
+    ) -> PurgeCleanupOutcome
+    where
+        DeleteSnapshot: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
+        DeleteToolDiffs: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
+        RetireSession: FnOnce(&str) -> Result<(), SessionCleanupError>,
+    {
+        // The caller holds the purge gate. Retire the session first so the
+        // lock order stays gate -> session/run maps -> journal; artifacts do
+        // not participate in that lock hierarchy and are still attempted if
+        // session retirement needs a retry.
+        let mut retry_needed = false;
+        if let Err(err) = retire_session(chat_id) {
+            tracing::warn!(chat = %chat_id, error = %err, "session retirement failed");
+            retry_needed = true;
+        }
+        if self.cleanup_chat_artifacts_with(chat_id, delete_snapshot, delete_tool_diffs)
+            == PurgeCleanupOutcome::PendingRetry
+        {
+            retry_needed = true;
+        }
+        if retry_needed {
+            PurgeCleanupOutcome::PendingRetry
+        } else {
+            PurgeCleanupOutcome::Cleared
+        }
+    }
+
+    fn cleanup_deleted_session(&self, chat_id: &str) -> Result<(), SessionCleanupError> {
+        self.inner
+            .sessions
+            .get()
+            .map_or(Ok(()), |sessions| sessions.cleanup_deleted_chat(chat_id))
+    }
+
+    fn cleanup_chat_artifacts_with<DeleteSnapshot, DeleteToolDiffs>(
+        &self,
+        chat_id: &str,
+        delete_snapshot: DeleteSnapshot,
+        delete_tool_diffs: DeleteToolDiffs,
+    ) -> PurgeCleanupOutcome
+    where
+        DeleteSnapshot: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
+        DeleteToolDiffs: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
+    {
+        let mut retry_needed = false;
+        if let Err(err) = delete_snapshot(chat_id) {
+            tracing::warn!(chat = %chat_id, error = %err, "snapshot delete failed");
+            retry_needed = true;
+        }
+        if let Err(err) = delete_tool_diffs(chat_id) {
+            tracing::warn!(chat = %chat_id, error = %err, "tool diff sidecar delete failed");
+            retry_needed = true;
+        }
+        if retry_needed {
+            PurgeCleanupOutcome::PendingRetry
+        } else {
+            PurgeCleanupOutcome::Cleared
+        }
+    }
+
+    /// Finish only the matching deletion lifecycle and leave the id in its
+    /// completed `Purged` state. Cleanup is retried under the same lifecycle
+    /// gate, so a stale finalizer can neither erase nor re-mark a newer
+    /// generation.
+    pub(crate) fn finish_purge(&self, chat_id: &str, token: PurgeToken) -> PurgeFinishOutcome {
+        self.finish_purge_with(
+            chat_id,
+            token,
+            |chat_id| self.inner.store.delete_snapshot(chat_id),
+            |chat_id| self.inner.store.delete_tool_diffs(chat_id),
+            |chat_id| self.cleanup_deleted_session(chat_id),
+        )
+    }
+
+    fn finish_purge_with<DeleteSnapshot, DeleteToolDiffs, RetireSession>(
+        &self,
+        chat_id: &str,
+        token: PurgeToken,
+        delete_snapshot: DeleteSnapshot,
+        delete_tool_diffs: DeleteToolDiffs,
+        retire_session: RetireSession,
+    ) -> PurgeFinishOutcome
+    where
+        DeleteSnapshot: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
+        DeleteToolDiffs: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
+        RetireSession: FnOnce(&str) -> Result<(), SessionCleanupError>,
+    {
+        let mut gate = lock(&self.inner.purge_gate);
+        if !matches!(
+            gate.chats.get(chat_id),
+            Some(ChatLifecycle::Purging { token: current, .. }) if *current == token
+        ) {
+            return PurgeFinishOutcome::Stale;
+        }
         let removed = lock(&self.inner.handles).remove(chat_id);
         drop(removed);
-        if let Err(err) = self.inner.store.delete_snapshot(chat_id) {
-            tracing::warn!(chat = %chat_id, error = %err, "snapshot delete failed");
+        let cleanup = self.cleanup_old_generation_with(
+            chat_id,
+            delete_snapshot,
+            delete_tool_diffs,
+            retire_session,
+        );
+        if cleanup == PurgeCleanupOutcome::PendingRetry {
+            return PurgeFinishOutcome::PendingRetry;
         }
+        gate.chats
+            .insert(chat_id.to_string(), ChatLifecycle::Purged { token });
+        #[cfg(test)]
+        self.inner.purges.send_modify(|generation| *generation += 1);
+        drop(gate);
+        PurgeFinishOutcome::Purged
     }
 
     /// Composer path: append an immutable pending command entry (rule 1). Durable by
@@ -793,7 +1306,43 @@ impl DocHost {
         }
     }
 
-    fn save_snapshot(&self, handle: &ChatDocHandle) {
+    fn save_snapshot(&self, handle: &Arc<ChatDocHandle>) {
+        self.save_snapshot_with_probe(handle, || {});
+    }
+
+    fn save_snapshot_with_probe<Probe>(&self, handle: &Arc<ChatDocHandle>, probe: Probe)
+    where
+        Probe: FnOnce(),
+    {
+        let gate = lock(&self.inner.purge_gate);
+        let _ = self.save_snapshot_under_gate(&gate, handle, probe);
+        drop(gate);
+    }
+
+    fn save_snapshot_under_gate<Probe>(
+        &self,
+        gate: &PurgeGate,
+        handle: &Arc<ChatDocHandle>,
+        probe: Probe,
+    ) -> bool
+    where
+        Probe: FnOnce(),
+    {
+        if gate.chats.contains_key(&handle.chat_id) {
+            return false;
+        }
+        let current = lock(&self.inner.handles)
+            .get(&handle.chat_id)
+            .is_some_and(|current| Arc::ptr_eq(current, handle));
+        if !current {
+            return false;
+        }
+        probe();
+        self.persist_snapshot(handle);
+        true
+    }
+
+    fn persist_snapshot(&self, handle: &ChatDocHandle) {
         match handle.doc.export_snapshot() {
             Ok(bytes) => {
                 handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
@@ -879,8 +1428,23 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
 }
 
 #[cfg(test)]
+pub(crate) fn detach_handle_for_reconciliation_test(
+    host: &DocHost,
+    chat_id: &str,
+) -> Option<Arc<ChatDocHandle>> {
+    lock(&host.inner.handles).remove(chat_id)
+}
+
+#[cfg(test)]
+pub(crate) fn save_snapshot_for_reconciliation_test(host: &DocHost, handle: &Arc<ChatDocHandle>) {
+    host.save_snapshot(handle);
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use comet_proto::{ChatConfig, HarnessId, RuntimeMode, SandboxLevel, SubagentStatus};
 
     // These tests only exercise the workspace-row read, never a dispatch, so
@@ -957,6 +1521,120 @@ mod tests {
             .expect("chat row exists");
         assert_eq!(request.runtime_mode, RuntimeMode::AutoAcceptEdits);
         assert_eq!(request.sandbox, SandboxLevel::WorkspaceWrite);
+    }
+
+    #[tokio::test]
+    async fn snapshot_save_holds_the_lifecycle_gate_through_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = assemble_core(dir.path(), "dev-a");
+        let handle = core.doc_host.open("chat-1").unwrap();
+        handle.write_user_message("m1", "current", 1).unwrap();
+
+        core.doc_host.save_snapshot_with_probe(&handle, || {
+            assert!(
+                core.doc_host.inner.purge_gate.try_lock().is_err(),
+                "the lifecycle gate must remain held until persistence completes"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn run_registration_holds_the_lifecycle_gate_through_insertion() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = assemble_core(dir.path(), "dev-a");
+        let handle = core.doc_host.open("chat-1").unwrap();
+        core.doc_host
+            .register_run_if_current(&handle, |_doc| {
+                assert!(
+                    core.doc_host.inner.purge_gate.try_lock().is_err(),
+                    "run insertion must complete before lifecycle admission can proceed"
+                );
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn eviction_saves_the_current_handle_before_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = assemble_core(dir.path(), "dev-a");
+        let handle = core.doc_host.open("chat-1").unwrap();
+        handle
+            .write_user_message("before-evict", "persist me", 1)
+            .unwrap();
+
+        assert!(core.doc_host.evict_if_current(&handle));
+        let reopened = core.doc_host.open("chat-1").unwrap();
+        assert!(!Arc::ptr_eq(&handle, &reopened));
+        assert!(
+            reopened
+                .doc()
+                .read_entries()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.id == "before-evict")
+        );
+    }
+
+    #[tokio::test]
+    async fn eviction_defers_across_open_to_watcher_and_run_pin_transitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = assemble_core(dir.path(), "dev-a");
+        let handle = core.doc_host.open("chat-1").unwrap();
+        handle
+            .write_user_message("before-watch", "persist me", 1)
+            .unwrap();
+        let candidate = handle.clone();
+
+        assert!(!core.doc_host.evict_if_current(&candidate));
+        let receiver = handle.watch_messages();
+        drop(handle);
+        assert!(!core.doc_host.evict_if_current(&candidate));
+        drop(receiver);
+
+        let run_handle = candidate.clone();
+        assert!(!core.doc_host.evict_if_current(&candidate));
+        let run_doc = run_handle.doc_arc();
+        drop(run_handle);
+        assert!(!core.doc_host.evict_if_current(&candidate));
+        drop(run_doc);
+
+        assert!(core.doc_host.evict_if_current(&candidate));
+        let reopened = core.doc_host.open("chat-1").unwrap();
+        assert!(!Arc::ptr_eq(&candidate, &reopened));
+        assert!(
+            reopened
+                .doc()
+                .read_entries()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.id == "before-watch")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_eviction_candidate_cannot_remove_or_overwrite_its_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = assemble_core(dir.path(), "dev-a");
+        let stale = core.doc_host.open("chat-1").unwrap();
+        stale
+            .write_user_message("stale-eviction", "old", 1)
+            .unwrap();
+        assert!(detach_handle_for_reconciliation_test(&core.doc_host, "chat-1").is_some());
+
+        let replacement = core.doc_host.open("chat-1").unwrap();
+        replacement
+            .write_user_message("replacement", "new", 2)
+            .unwrap();
+        assert!(!core.doc_host.evict_if_current(&stale));
+        assert!(Arc::ptr_eq(
+            &replacement,
+            &core.doc_host.open("chat-1").unwrap()
+        ));
+
+        core.doc_host.flush_all();
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let entries = replacement.doc().read_entries().unwrap();
+        assert!(entries.iter().any(|entry| entry.id == "replacement"));
     }
 
     #[tokio::test]
@@ -1066,5 +1744,382 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A final cleanup pass may certify reuse only when both durable legs
+    /// clear. Either leg can fail independently through the initial and final
+    /// passes; the sibling must still run, and a later retry must be able to
+    /// complete the same token before a clean generation is admitted.
+    #[tokio::test]
+    async fn either_cleanup_leg_failure_stays_purging_until_retry_clears() {
+        for failing_leg in ["snapshot", "sidecar"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(DocsStore::open(dir.path().join("local-store")).unwrap());
+            let host = DocHost::new(
+                store.clone(),
+                DocHostConfig {
+                    device_id: "dev-a".into(),
+                    default_harness: HarnessId::Mock,
+                },
+            );
+            let old_diff = ToolDiff {
+                path: format!("src/{failing_leg}-old.rs"),
+                old_text: Some("TASK6_RETRY_OLD".into()),
+                new_text: "TASK6_RETRY_NEW".into(),
+            };
+            store
+                .save_snapshot("chat-1", b"TASK6_RETRY_OLD_SNAPSHOT")
+                .unwrap();
+            let PutToolDiffOutcome::Stored {
+                diff_ref: old_ref, ..
+            } = store
+                .put_tool_diff("chat-1", "old-tool", &old_diff)
+                .unwrap()
+            else {
+                panic!("the old generation seeds a sidecar");
+            };
+            let token = host.begin_purge("chat-1").unwrap();
+            let snapshot_attempts = std::cell::Cell::new(0usize);
+            let sidecar_attempts = std::cell::Cell::new(0usize);
+
+            let initial = host.cleanup_purging_chat_with(
+                "chat-1",
+                token,
+                |chat_id| {
+                    snapshot_attempts.set(snapshot_attempts.get() + 1);
+                    if failing_leg == "snapshot" {
+                        Err(comet_sync::StoreError::Sqlite(
+                            rusqlite::Error::InvalidQuery,
+                        ))
+                    } else {
+                        store.delete_snapshot(chat_id)
+                    }
+                },
+                |chat_id| {
+                    sidecar_attempts.set(sidecar_attempts.get() + 1);
+                    if failing_leg == "sidecar" {
+                        Err(comet_sync::StoreError::Sqlite(
+                            rusqlite::Error::InvalidQuery,
+                        ))
+                    } else {
+                        store.delete_tool_diffs(chat_id)
+                    }
+                },
+            );
+            assert_eq!(initial, Some(PurgeCleanupOutcome::PendingRetry));
+
+            // Refill only the successful sibling leg. The injected final pass
+            // must attempt it again rather than short-circuiting on the same
+            // failing leg.
+            if failing_leg == "snapshot" {
+                store
+                    .put_tool_diff("chat-1", "old-tool", &old_diff)
+                    .unwrap();
+            } else {
+                store
+                    .save_snapshot("chat-1", b"TASK6_RETRY_OLD_SNAPSHOT")
+                    .unwrap();
+            }
+            let final_attempt = host.finish_purge_with(
+                "chat-1",
+                token,
+                |chat_id| {
+                    snapshot_attempts.set(snapshot_attempts.get() + 1);
+                    if failing_leg == "snapshot" {
+                        Err(comet_sync::StoreError::Sqlite(
+                            rusqlite::Error::InvalidQuery,
+                        ))
+                    } else {
+                        store.delete_snapshot(chat_id)
+                    }
+                },
+                |chat_id| {
+                    sidecar_attempts.set(sidecar_attempts.get() + 1);
+                    if failing_leg == "sidecar" {
+                        Err(comet_sync::StoreError::Sqlite(
+                            rusqlite::Error::InvalidQuery,
+                        ))
+                    } else {
+                        store.delete_tool_diffs(chat_id)
+                    }
+                },
+                |_chat_id| Ok(()),
+            );
+            assert_eq!(final_attempt, PurgeFinishOutcome::PendingRetry);
+            assert_eq!(snapshot_attempts.get(), 2, "{failing_leg}");
+            assert_eq!(sidecar_attempts.get(), 2, "{failing_leg}");
+            assert!(
+                host.admit_create("chat-1", false).is_err(),
+                "{failing_leg}: failed cleanup cannot certify same-id reuse"
+            );
+            if failing_leg == "snapshot" {
+                assert_eq!(
+                    store.load_snapshot("chat-1").unwrap(),
+                    Some(b"TASK6_RETRY_OLD_SNAPSHOT".to_vec())
+                );
+                assert_eq!(
+                    store
+                        .read_tool_diff("chat-1", "old-tool", &old_ref)
+                        .unwrap(),
+                    None,
+                    "the sidecar leg still runs on both failed passes"
+                );
+            } else {
+                assert_eq!(store.load_snapshot("chat-1").unwrap(), None);
+                assert_eq!(
+                    store
+                        .read_tool_diff("chat-1", "old-tool", &old_ref)
+                        .unwrap(),
+                    Some(old_diff.clone()),
+                    "the failing sidecar remains pending"
+                );
+            }
+
+            assert_eq!(
+                host.finish_purge("chat-1", token),
+                PurgeFinishOutcome::Purged,
+                "{failing_leg}: a later clean retry completes the same token"
+            );
+            let admission = host
+                .admit_create("chat-1", false)
+                .expect("Cleared to Purged permits one clean generation");
+            assert!(host.revive_created_chat("chat-1", admission));
+            assert_eq!(store.load_snapshot("chat-1").unwrap(), None);
+            assert_eq!(
+                store
+                    .read_tool_diff("chat-1", "old-tool", &old_ref)
+                    .unwrap(),
+                None
+            );
+
+            let new_handle = host.open("chat-1").unwrap();
+            new_handle
+                .write_user_message("new-message", "new generation", 2)
+                .unwrap();
+            host.flush_all();
+            let new_diff = ToolDiff {
+                path: "src/new-generation.rs".into(),
+                old_text: Some("before".into()),
+                new_text: "after".into(),
+            };
+            assert!(matches!(
+                host.put_tool_diff("chat-1", "new-tool", &new_diff),
+                Ok(PutToolDiffOutcome::Stored { .. })
+            ));
+            assert!(store.load_snapshot("chat-1").unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn session_retirement_failure_keeps_the_lifecycle_pending_until_a_clean_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path().join("local-store")).unwrap());
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                default_harness: HarnessId::Mock,
+            },
+        );
+        let token = host.begin_purge("chat-1").unwrap();
+
+        assert_eq!(
+            host.finish_purge_with(
+                "chat-1",
+                token,
+                |_chat_id| Ok(()),
+                |_chat_id| Ok(()),
+                |_chat_id| {
+                    Err(crate::sessions::SessionCleanupError::Journal(
+                        crate::run_journal::JournalError::Io(std::io::Error::other(
+                            "injected journal cleanup failure",
+                        )),
+                    ))
+                },
+            ),
+            PurgeFinishOutcome::PendingRetry
+        );
+        assert!(
+            host.admit_create("chat-1", false).is_err(),
+            "a failed journal retirement keeps same-id recreation closed"
+        );
+
+        assert_eq!(
+            host.finish_purge("chat-1", token),
+            PurgeFinishOutcome::Purged
+        );
+        let admission = host
+            .admit_create("chat-1", false)
+            .expect("a clean retirement retry admits the next generation");
+        assert!(host.revive_created_chat("chat-1", admission));
+    }
+
+    /// A late cleanup from an older delete must not cancel or finish the
+    /// generation that replaced it. In particular, its finalizer must not
+    /// remove a sidecar written only after the newer generation was admitted.
+    #[test]
+    fn stale_purge_token_cannot_cancel_or_finalize_a_newer_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path().join("local-store")).unwrap());
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                default_harness: HarnessId::Mock,
+            },
+        );
+        let diff = ToolDiff {
+            path: "src/new-generation.rs".into(),
+            old_text: Some("before".into()),
+            new_text: "after".into(),
+        };
+        store
+            .save_snapshot("chat-1", b"newer generation snapshot")
+            .unwrap();
+        let PutToolDiffOutcome::Stored { diff_ref, .. } = store
+            .put_tool_diff("chat-1", "new-generation-tool", &diff)
+            .unwrap()
+        else {
+            panic!("the test seeds a real exact-source sidecar");
+        };
+
+        let first = host
+            .begin_purge("chat-1")
+            .expect("the first delete starts a lifecycle generation");
+        assert!(
+            host.cancel_purge("chat-1", first),
+            "the matching tombstone rollback restores the original generation"
+        );
+        let second = host
+            .begin_purge("chat-1")
+            .expect("a later delete receives a distinct generation");
+        assert_ne!(first, second);
+
+        assert!(
+            !host.cancel_purge("chat-1", first),
+            "an old rollback cannot re-open the newer purging generation"
+        );
+        assert_eq!(
+            host.finish_purge("chat-1", first),
+            PurgeFinishOutcome::Stale,
+            "an old finalizer cannot delete the newer purging generation"
+        );
+        assert!(
+            host.cleanup_purging_chat("chat-1", first).is_none(),
+            "an old initial-cleanup callback is also a no-op"
+        );
+        assert_eq!(
+            store.load_snapshot("chat-1").unwrap(),
+            Some(b"newer generation snapshot".to_vec())
+        );
+        assert_eq!(
+            store
+                .read_tool_diff("chat-1", "new-generation-tool", &diff_ref)
+                .unwrap(),
+            Some(diff.clone())
+        );
+        assert!(matches!(
+            host.put_tool_diff("chat-1", "new-generation-tool", &diff),
+            Err(comet_sync::StoreError::ToolDiffPurged)
+        ));
+
+        assert_eq!(
+            host.finish_purge("chat-1", second),
+            PurgeFinishOutcome::Purged
+        );
+        let admission = host
+            .admit_create("chat-1", false)
+            .expect("only the completed generation is reusable");
+        assert!(host.revive_created_chat("chat-1", admission));
+        assert!(matches!(
+            host.put_tool_diff("chat-1", "new-generation-tool", &diff),
+            Ok(PutToolDiffOutcome::Stored { .. })
+        ));
+    }
+
+    /// A workspace row is not the only ownership signal. Claim-on-first-command
+    /// deliberately opens a live doc before that row exists, so reconciliation
+    /// must refuse it without deleting either durable leg.
+    #[tokio::test]
+    async fn workspace_absent_live_handle_refuses_reconciliation_without_scrub() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path().join("local-store")).unwrap());
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                default_harness: HarnessId::Mock,
+            },
+        );
+        let handle = host.open("chat-1").unwrap();
+        handle
+            .write_user_message("claimable-message", "claimable generation", 1)
+            .unwrap();
+        host.flush_all();
+        let diff = ToolDiff {
+            path: "src/claimable.rs".into(),
+            old_text: Some("TASK6_CLAIMABLE_OLD".into()),
+            new_text: "TASK6_CLAIMABLE_NEW".into(),
+        };
+        let PutToolDiffOutcome::Stored { diff_ref, .. } = host
+            .put_tool_diff("chat-1", "claimable-tool", &diff)
+            .unwrap()
+        else {
+            panic!("the claimable generation stores its sidecar");
+        };
+
+        let admission = host.admit_create("chat-1", false);
+
+        assert!(
+            admission.is_err(),
+            "a workspace-absent live handle is not an orphan"
+        );
+        assert!(store.load_snapshot("chat-1").unwrap().is_some());
+        assert_eq!(
+            store
+                .read_tool_diff("chat-1", "claimable-tool", &diff_ref)
+                .unwrap(),
+            Some(diff.clone()),
+            "refused reconciliation must not scrub a legitimate writer"
+        );
+        let reopened = host.open("chat-1").unwrap();
+        assert!(Arc::ptr_eq(&handle, &reopened));
+        assert!(matches!(
+            host.put_tool_diff("chat-1", "claimable-tool", &diff),
+            Ok(PutToolDiffOutcome::Stored { .. })
+        ));
+    }
+
+    /// Reconciliation callbacks own one token. Once a generation is admitted,
+    /// a duplicate callback from it cannot clear the next reservation.
+    #[tokio::test]
+    async fn stale_reconciliation_callback_cannot_affect_admitted_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path().join("local-store")).unwrap());
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                default_harness: HarnessId::Mock,
+            },
+        );
+        let first = host
+            .admit_create("chat-1", false)
+            .expect("the first clean reconciliation is admitted");
+        assert!(host.revive_created_chat("chat-1", first));
+        let second = host
+            .admit_create("chat-1", false)
+            .expect("a later reconciliation owns a different generation");
+
+        assert!(
+            !host.revive_created_chat("chat-1", first),
+            "the stale callback cannot clear the later reservation"
+        );
+        assert!(matches!(
+            host.open("chat-1"),
+            Err(crate::EngineError::ChatCleanupPendingRetry)
+        ));
+        assert!(host.revive_created_chat("chat-1", second));
+        assert!(host.open("chat-1").is_ok());
     }
 }

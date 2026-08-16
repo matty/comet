@@ -14,9 +14,9 @@
 //!   hidden); each section collapses with a 180 ms height tween on a
 //!   clipped stand-in row (analytic heights, capped to what the clip can
 //!   reveal) and a 200 ms chevron transition;
-//! - syntax highlight reuses the markdown tokenizer per diff line, computed
-//!   time-sliced on the background executor and applied as paint-only run
-//!   colors (layout never changes).
+//! - syntax highlighting paints a tree-sitter excerpt immediately, then
+//!   promotes to checksum-bound complete old/new documents when the owning
+//!   engine returns them; syntax changes paint only, never layout.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -31,11 +31,11 @@ use gpui::{
 use comet_proto::{Chat, CheckoutDiff};
 use comet_rpc::methods;
 
-use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
 use crate::state::{AppState, ServerClient};
 use crate::theme::Theme;
+use comet_syntax::LanguageId as Lang;
 
 // ---------------------------------------------------------------------------
 // Layout numbers (analytic — they drive the fold tween)
@@ -73,6 +73,147 @@ pub struct DiffLine {
     pub old_no: Option<u32>,
     pub new_no: Option<u32>,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SourceSide {
+    Old,
+    New,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SourceLineRef {
+    pub side: SourceSide,
+    /// One-based source line number. Conversion to a document index is checked.
+    pub line_number: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiffHighlights {
+    pub old: Option<Arc<comet_syntax::HighlightedDocument>>,
+    pub new: Option<Arc<comet_syntax::HighlightedDocument>>,
+}
+
+impl DiffHighlights {
+    pub fn source_ref(&self, line: &DiffLine) -> Option<SourceLineRef> {
+        let source_ref = |side, line_number: u32| {
+            usize::try_from(line_number)
+                .ok()
+                .map(|line_number| SourceLineRef { side, line_number })
+        };
+        match line.kind {
+            LineKind::Del => line
+                .old_no
+                .and_then(|line_number| source_ref(SourceSide::Old, line_number)),
+            LineKind::Add => line
+                .new_no
+                .and_then(|line_number| source_ref(SourceSide::New, line_number)),
+            LineKind::Context => line
+                .new_no
+                .filter(|_| self.new.is_some())
+                .and_then(|line_number| source_ref(SourceSide::New, line_number))
+                .or_else(|| {
+                    line.old_no
+                        .and_then(|line_number| source_ref(SourceSide::Old, line_number))
+                }),
+            LineKind::Meta => None,
+        }
+    }
+
+    pub fn spans(&self, line: &DiffLine) -> &[comet_syntax::HighlightSpan] {
+        let Some(source_ref) = self.source_ref(line) else {
+            return &[];
+        };
+        let Some(line_index) = source_ref.line_number.checked_sub(1) else {
+            return &[];
+        };
+        match source_ref.side {
+            SourceSide::Old => self.old.as_deref(),
+            SourceSide::New => self.new.as_deref(),
+        }
+        .and_then(|document| document.lines.get(line_index))
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    }
+}
+
+/// Reject a complete pair unless every source-backed visible diff line agrees.
+/// A rejected pair leaves callers' existing excerpt or plain rendering intact.
+#[allow(dead_code)] // The local sidecar task supplies the transcript caller.
+pub(crate) fn sources_match_diff(
+    file: &FileDiff,
+    old_text: Option<&str>,
+    new_text: Option<&str>,
+) -> bool {
+    sources_match_diff_with(file, old_text, new_text, split_source_lines)
+}
+
+/// Split exactly as `similar::TextDiff::from_lines` does, but omit each line
+/// terminator because visible diff rows omit it too. `str::lines` recognizes
+/// LF and CRLF but not lone CR, which would make a valid source pair fail the
+/// complete-source preflight.
+fn split_source_lines(source: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    let mut chars = source.char_indices().peekable();
+    while let Some((at, character)) = chars.next() {
+        let mut terminator_end = at + character.len_utf8();
+        if character == '\r' {
+            if let Some(&(next, '\n')) = chars.peek() {
+                chars.next();
+                terminator_end = next + '\n'.len_utf8();
+            }
+        } else if character != '\n' {
+            continue;
+        }
+        lines.push(&source[line_start..at]);
+        line_start = terminator_end;
+    }
+    if line_start < source.len() {
+        lines.push(&source[line_start..]);
+    }
+    lines
+}
+
+fn sources_match_diff_with<'a>(
+    file: &FileDiff,
+    old_text: Option<&'a str>,
+    new_text: Option<&'a str>,
+    mut split_lines: impl FnMut(&'a str) -> Vec<&'a str>,
+) -> bool {
+    fn line_at<'a>(lines: Option<&'a [&'a str]>, line_number: u32) -> Option<&'a str> {
+        usize::try_from(line_number)
+            .ok()
+            .and_then(|line_number| line_number.checked_sub(1))
+            .and_then(|line_index| lines.and_then(|lines| lines.get(line_index).copied()))
+    }
+    let old_lines = old_text.map(&mut split_lines);
+    let new_lines = new_text.map(split_lines);
+    file.hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .all(|line| match line.kind {
+            LineKind::Del => {
+                line.old_no
+                    .and_then(|number| line_at(old_lines.as_deref(), number))
+                    == Some(line.text.as_str())
+            }
+            LineKind::Add => {
+                line.new_no
+                    .and_then(|number| line_at(new_lines.as_deref(), number))
+                    == Some(line.text.as_str())
+            }
+            LineKind::Context => {
+                let selected = new_lines.as_deref().or(old_lines.as_deref());
+                let number = if new_lines.is_some() {
+                    line.new_no
+                } else {
+                    line.old_no
+                };
+                number.and_then(|number| line_at(selected, number)) == Some(line.text.as_str())
+            }
+            LineKind::Meta => true,
+        })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -455,18 +596,156 @@ pub fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value)
     }
 }
 
-/// Language for a file path's extension (drives per-line highlighting).
-pub fn lang_for_path(path: &str) -> Option<Lang> {
-    let ext = path.rsplit('/').next()?.rsplit('.').next()?;
-    lang_for_tag(ext)
-}
-
 fn hash64(parts: &[&str]) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     for p in parts {
         p.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+const MAX_EXCERPT_SOURCE_LINES: usize = 200_000;
+
+fn excerpt_side(
+    file: &FileDiff,
+    side: SourceSide,
+    language: Lang,
+    path: &str,
+) -> Option<Arc<comet_syntax::HighlightedDocument>> {
+    let max_line = file
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .filter_map(|line| match side {
+            SourceSide::Old => line.old_no,
+            SourceSide::New => line.new_no,
+        })
+        .max()
+        .unwrap_or(0) as usize;
+    if max_line > MAX_EXCERPT_SOURCE_LINES {
+        return None;
+    }
+    let mut lines = vec![Vec::new(); max_line];
+    for hunk in &file.hunks {
+        let visible = hunk
+            .lines
+            .iter()
+            .filter_map(|line| {
+                let number = match side {
+                    SourceSide::Old => line.old_no,
+                    SourceSide::New => line.new_no,
+                }?;
+                (line.kind != LineKind::Meta).then_some((number, line.text.as_str()))
+            })
+            .collect::<Vec<_>>();
+        if visible.is_empty() {
+            continue;
+        }
+        let source = visible
+            .iter()
+            .map(|(_, text)| *text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let document = comet_syntax::highlight(comet_syntax::HighlightRequest {
+            source: &source,
+            path: Some(path),
+            fence_tag: None,
+        })
+        .ok()?;
+        for ((number, _), spans) in visible.into_iter().zip(document.lines) {
+            lines[number as usize - 1] = spans;
+        }
+    }
+    Some(Arc::new(comet_syntax::HighlightedDocument {
+        language,
+        lines,
+    }))
+}
+
+fn excerpt_highlights(file: &FileDiff, language: Lang) -> Option<DiffHighlights> {
+    if !comet_syntax::supports_language(language) {
+        return None;
+    }
+    let old = if file.status == FileStatus::Added {
+        None
+    } else {
+        Some(excerpt_side(file, SourceSide::Old, language, &file.path)?)
+    };
+    let new = if file.status == FileStatus::Deleted {
+        None
+    } else {
+        Some(excerpt_side(file, SourceSide::New, language, &file.path)?)
+    };
+    Some(DiffHighlights { old, new })
+}
+
+fn full_highlights(
+    file: &FileDiff,
+    language: Lang,
+    response: &comet_proto::CheckoutFileDiffText,
+) -> Option<DiffHighlights> {
+    if response.stale
+        || response.binary
+        || response.truncated
+        || !sources_match_diff(
+            file,
+            response.old_text.as_deref(),
+            response.new_text.as_deref(),
+        )
+    {
+        return None;
+    }
+    let parse = |source: &str, path: &str| {
+        comet_syntax::highlight(comet_syntax::HighlightRequest {
+            source,
+            path: Some(path),
+            fence_tag: None,
+        })
+        .ok()
+        .map(Arc::new)
+    };
+    let old = match response.old_text.as_deref() {
+        Some(source) => Some(parse(source, &file.path)?),
+        None => None,
+    };
+    let new = match response.new_text.as_deref() {
+        Some(source) => Some(parse(source, &file.path)?),
+        None => None,
+    };
+    if old.is_none() && new.is_none() && comet_syntax::supports_language(language) {
+        return None;
+    }
+    Some(DiffHighlights { old, new })
+}
+
+fn decode_checkout_file_diff_text_reply(
+    value: serde_json::Value,
+) -> Result<comet_proto::CheckoutFileDiffText, serde_json::Error> {
+    serde_json::from_value(value)
+}
+
+fn full_highlights_for_fetch(
+    file: &FileDiff,
+    language: Lang,
+    expected_checksum: &str,
+    result: Result<comet_proto::CheckoutFileDiffText, comet_rpc::RpcError>,
+) -> Option<Arc<DiffHighlights>> {
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::debug!(?error, "checkout diff source enrichment unavailable");
+            return None;
+        }
+    };
+    if response.diff_checksum != expected_checksum {
+        tracing::debug!(
+            expected_checksum,
+            actual_checksum = response.diff_checksum,
+            "checkout diff source reply belongs to another snapshot"
+        );
+        return None;
+    }
+    full_highlights(file, language, &response).map(Arc::new)
 }
 
 // ---------------------------------------------------------------------------
@@ -613,22 +892,32 @@ impl FileFold {
 
 struct HighlightSlot {
     fingerprint: u64,
-    lines: Option<Arc<Vec<Vec<Token>>>>,
-    _task: Option<Task<()>>,
+    state: DiffHighlightState,
+    _excerpt_task: Option<Task<()>>,
+    _fetch_task: Option<Task<()>>,
 }
 
-async fn yield_now() {
-    let mut yielded = false;
-    futures::future::poll_fn(move |cx| {
-        if yielded {
-            std::task::Poll::Ready(())
-        } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            std::task::Poll::Pending
-        }
-    })
-    .await
+enum DiffHighlightState {
+    Pending,
+    Ready(Arc<DiffHighlights>),
+    Excerpt(Arc<DiffHighlights>),
+    Plain,
+}
+
+fn promote_highlights_if_current(
+    current_fingerprint: u64,
+    requested_fingerprint: u64,
+    state: &mut DiffHighlightState,
+    highlights: Option<Arc<DiffHighlights>>,
+) -> bool {
+    let Some(highlights) = highlights else {
+        return false;
+    };
+    if current_fingerprint != requested_fingerprint {
+        return false;
+    }
+    *state = DiffHighlightState::Ready(highlights);
+    true
 }
 
 /// The Changes pane entity. Lazy: no RPC until [`Changes::ensure_watch`] runs
@@ -953,62 +1242,128 @@ impl Changes {
         pending
     }
 
-    /// Tokens for a file's diff lines (paint-only). Kicks a time-sliced
-    /// background tokenize when missing; returns the current best.
+    /// Start excerpt parsing and a lazy full-source fetch for an expanded file.
     fn request_highlight(
         &mut self,
         file: &FileDiff,
         parsed_key: &str,
         cx: &mut Context<Self>,
-    ) -> Option<Arc<Vec<Vec<Token>>>> {
-        let lang = lang_for_path(&file.path)?;
+    ) -> Option<Arc<DiffHighlights>> {
+        let lang = comet_syntax::language_for_path(&file.path)?;
         let fingerprint = hash64(&[parsed_key, &file.path]);
         if let Some(slot) = self.highlights.get(&file.path)
             && slot.fingerprint == fingerprint
         {
-            return slot.lines.clone();
+            return match &slot.state {
+                DiffHighlightState::Ready(highlights) | DiffHighlightState::Excerpt(highlights) => {
+                    Some(highlights.clone())
+                }
+                DiffHighlightState::Pending | DiffHighlightState::Plain => None,
+            };
         }
-        let texts: Vec<(LineKind, String)> = file
-            .hunks
-            .iter()
-            .flat_map(|h| h.lines.iter().map(|l| (l.kind, l.text.clone())))
-            .collect();
+        if !comet_syntax::supports_language(lang) {
+            self.highlights.insert(
+                file.path.clone(),
+                HighlightSlot {
+                    fingerprint,
+                    state: DiffHighlightState::Plain,
+                    _excerpt_task: None,
+                    _fetch_task: None,
+                },
+            );
+            return None;
+        }
         let path = file.path.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let lines = cx
+        let excerpt_file = file.clone();
+        let excerpt_path = path.clone();
+        let excerpt_task = cx.spawn(async move |this, cx| {
+            let highlights = cx
                 .background_executor()
-                .spawn(async move {
-                    let mut out = Vec::with_capacity(texts.len());
-                    for (ix, (kind, text)) in texts.iter().enumerate() {
-                        // Diff lines are fragments — no carry across lines.
-                        let tokens = match kind {
-                            LineKind::Meta => Vec::new(),
-                            _ => tokenize_line(lang, text, LineCarry::None).0,
-                        };
-                        out.push(tokens);
-                        if ix % 128 == 127 {
-                            yield_now().await;
-                        }
-                    }
-                    out
-                })
+                .spawn(async move { excerpt_highlights(&excerpt_file, lang).map(Arc::new) })
                 .await;
             this.update(cx, |changes, cx| {
-                if let Some(slot) = changes.highlights.get_mut(&path)
+                if let Some(slot) = changes.highlights.get_mut(&excerpt_path)
                     && slot.fingerprint == fingerprint
+                    && matches!(slot.state, DiffHighlightState::Pending)
                 {
-                    slot.lines = Some(Arc::new(lines));
+                    slot.state = match highlights {
+                        Some(highlights) => DiffHighlightState::Excerpt(highlights),
+                        None => DiffHighlightState::Plain,
+                    };
                     cx.notify();
                 }
             })
             .ok();
         });
+
+        let active = self
+            .resolved(cx)
+            .filter(|diff| format!("{}:{}", diff.checkout_id, diff.checksum) == parsed_key);
+        let engine = self.state.read(cx).selected_client();
+        let fetch_file = file.clone();
+        let fetch_path = path.clone();
+        let fetch_task = match (active, engine) {
+            (Some(diff), Some(engine)) => Some(cx.spawn(async move |this, cx| {
+                let expected_checksum = diff.checksum.clone();
+                let request = comet_proto::GetCheckoutFileDiffTextRequest {
+                    checkout_id: diff.checkout_id,
+                    cwd: diff.cwd,
+                    path: fetch_path.clone(),
+                    diff_checksum: expected_checksum.clone(),
+                };
+                let params = match serde_json::to_value(request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        tracing::debug!(?error, "checkout diff source request did not serialize");
+                        return;
+                    }
+                };
+                let response = match engine
+                    .client()
+                    .call(methods::GET_CHECKOUT_FILE_DIFF_TEXT, params)
+                    .await
+                {
+                    Ok(value) => match decode_checkout_file_diff_text_reply(value) {
+                        Ok(response) => Ok(response),
+                        Err(error) => {
+                            tracing::debug!(
+                                ?error,
+                                "checkout diff source reply did not match its wire contract"
+                            );
+                            return;
+                        }
+                    },
+                    Err(error) => Err(error),
+                };
+                let highlights = cx
+                    .background_executor()
+                    .spawn(async move {
+                        full_highlights_for_fetch(&fetch_file, lang, &expected_checksum, response)
+                    })
+                    .await;
+                this.update(cx, |changes, cx| {
+                    if let Some(slot) = changes.highlights.get_mut(&fetch_path)
+                        && promote_highlights_if_current(
+                            slot.fingerprint,
+                            fingerprint,
+                            &mut slot.state,
+                            highlights,
+                        )
+                    {
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })),
+            _ => None,
+        };
         self.highlights.insert(
             file.path.clone(),
             HighlightSlot {
                 fingerprint,
-                lines: None,
-                _task: Some(task),
+                state: DiffHighlightState::Pending,
+                _excerpt_task: Some(excerpt_task),
+                _fetch_task: fetch_task,
             },
         );
         None
@@ -1053,7 +1408,7 @@ impl Changes {
                 file,
                 hunk,
                 line,
-                flat,
+                flat: _,
             } => {
                 let Some(file_diff) = files.get(file as usize) else {
                     return gpui::Empty.into_any_element();
@@ -1066,12 +1421,11 @@ impl Changes {
                 else {
                     return gpui::Empty.into_any_element();
                 };
-                let tokens = highlight
-                    .as_ref()
-                    .and_then(|lines| lines.get(flat as usize))
-                    .map(|t| t.as_slice())
+                let spans = highlight
+                    .as_deref()
+                    .map(|highlights| highlights.spans(line))
                     .unwrap_or(&[]);
-                diff_line_row(line, tokens, &theme, gutter_width(file_diff))
+                diff_line_row_with_syntax(line, spans, &theme, gutter_width(file_diff))
             }
             DiffRow::BodyPad { .. } => div().w_full().h(px(BODY_BOTTOM_PAD)).into_any_element(),
             DiffRow::FoldingBody { file } => {
@@ -1272,12 +1626,6 @@ fn del_color(theme: &Theme) -> gpui::Hsla {
     theme.diff_del // red-400
 }
 
-/// Diff syntax palette — since round 9 the transcript's code blocks share the
-/// same soft hues, so this simply delegates to [`render::token_color`].
-fn diff_token_color(class: crate::markdown::highlight::TokenClass, theme: &Theme) -> gpui::Hsla {
-    render::token_color(class, theme)
-}
-
 /// One notice row ("New file", "Binary file — contents not shown", …).
 fn notice_row(notice: String, theme: &Theme) -> AnyElement {
     div()
@@ -1310,10 +1658,39 @@ fn hunk_header_row(header: &str, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// One +/−/context/meta diff line: coloured accent bar, dual line-number
-/// gutters (`gutter_px` wide — see [`gutter_width`]), marker column, and
-/// paint-only syntax runs.
-fn diff_line_row(line: &DiffLine, tokens: &[Token], theme: &Theme, gutter_px: f32) -> AnyElement {
+fn diff_line_row_with_syntax(
+    line: &DiffLine,
+    spans: &[comet_syntax::HighlightSpan],
+    theme: &Theme,
+    gutter_px: f32,
+) -> AnyElement {
+    let runs = diff_text_runs(line, spans, theme);
+    diff_line_row_with_runs(line, runs, theme, gutter_px)
+}
+
+/// Paint-only runs for a complete-source diff line. Plain and highlighted
+/// paths share this builder so syntax colors cannot alter mono text geometry.
+pub(crate) fn diff_text_runs(
+    line: &DiffLine,
+    spans: &[comet_syntax::HighlightSpan],
+    theme: &Theme,
+) -> Vec<gpui::TextRun> {
+    let mono = font(theme.font_mono.clone());
+    render::runs_for_syntax_line_with_plain(
+        &line.text,
+        spans,
+        &mono,
+        theme.text.opacity(0.92),
+        theme,
+    )
+}
+
+fn diff_line_row_with_runs(
+    line: &DiffLine,
+    runs: Vec<gpui::TextRun>,
+    theme: &Theme,
+    gutter_px: f32,
+) -> AnyElement {
     if line.kind == LineKind::Meta {
         return div()
             .h(px(DIFF_LINE_HEIGHT))
@@ -1372,14 +1749,6 @@ fn diff_line_row(line: &DiffLine, tokens: &[Token], theme: &Theme, gutter_px: f3
                 no.map(|n| n.to_string()).unwrap_or_default(),
             ))
     };
-    let mono = font(theme.font_mono.clone());
-    let runs = render::runs_with_palette(
-        &line.text,
-        tokens,
-        &mono,
-        theme.text.opacity(0.92),
-        |class| diff_token_color(class, theme),
-    );
     div()
         .h(px(DIFF_LINE_HEIGHT))
         .w_full()
@@ -1438,17 +1807,47 @@ fn diff_line_row(line: &DiffLine, tokens: &[Token], theme: &Theme, gutter_px: f3
         .into_any_element()
 }
 
+/// Render a complete-source diff without changing its row geometry. This is
+/// kept separate from the virtualized checkout view, whose excerpt highlighter
+/// is still its best available result until the source-pair RPC lands.
+pub(crate) fn render_file_body_with_syntax(
+    file: &FileDiff,
+    highlights: Option<Arc<DiffHighlights>>,
+    theme: &Theme,
+) -> AnyElement {
+    let mut children: Vec<AnyElement> = Vec::new();
+    let gutter_px = gutter_width(file);
+    for notice in file_notices(file) {
+        children.push(notice_row(notice, theme));
+    }
+    for hunk in &file.hunks {
+        children.push(hunk_header_row(&hunk.header, theme));
+        for line in &hunk.lines {
+            let spans = highlights
+                .as_deref()
+                .map(|highlights| highlights.spans(line))
+                .unwrap_or(&[]);
+            children.push(diff_line_row_with_syntax(line, spans, theme, gutter_px));
+        }
+    }
+    div()
+        .flex()
+        .flex_col()
+        .pb(px(BODY_BOTTOM_PAD))
+        .children(children)
+        .into_any_element()
+}
+
 /// Build the expanded body rows that start above `max_px`; the fold tween's
 /// stand-in never materializes lines its clip cannot reveal.
 fn render_file_body_upto(
     file: &FileDiff,
-    highlight: Option<Arc<Vec<Vec<Token>>>>,
+    highlight: Option<Arc<DiffHighlights>>,
     theme: &Theme,
     max_px: f32,
 ) -> AnyElement {
     let mut children: Vec<AnyElement> = Vec::new();
     let mut y = 0.0f32;
-    let mut line_ix = 0usize;
     let gutter_px = gutter_width(file);
 
     'build: {
@@ -1469,14 +1868,12 @@ fn render_file_body_upto(
                 if y >= max_px {
                     break 'build;
                 }
-                let tokens = highlight
-                    .as_ref()
-                    .and_then(|lines| lines.get(line_ix))
-                    .map(|t| t.as_slice())
+                let spans = highlight
+                    .as_deref()
+                    .map(|highlights| highlights.spans(line))
                     .unwrap_or(&[]);
-                children.push(diff_line_row(line, tokens, theme, gutter_px));
+                children.push(diff_line_row_with_syntax(line, spans, theme, gutter_px));
                 y += DIFF_LINE_HEIGHT;
-                line_ix += 1;
             }
         }
     }
@@ -1975,12 +2372,574 @@ rename to new_name.rs
     }
 
     #[test]
-    fn langs_resolve_from_paths() {
-        assert_eq!(lang_for_path("src/main.rs"), Some(Lang::Rust));
-        assert_eq!(lang_for_path("a/b/app.tsx"), Some(Lang::Js));
-        assert_eq!(lang_for_path("Cargo.toml"), Some(Lang::Toml));
-        assert_eq!(lang_for_path("script.sh"), Some(Lang::Bash));
-        assert_eq!(lang_for_path("README"), None);
-        assert_eq!(lang_for_path("img.png"), None);
+    fn full_diff_highlights_map_old_new_and_context_by_source_line() {
+        let old_source = "fn old() {\n    let value = 1;\n}\n";
+        let new_source = "fn new() {\n    let value = 2;\n}\n";
+        let parse = |source| {
+            Arc::new(
+                comet_syntax::highlight(comet_syntax::HighlightRequest {
+                    source,
+                    path: Some("src/lib.rs"),
+                    fence_tag: None,
+                })
+                .unwrap(),
+            )
+        };
+        let highlights = DiffHighlights {
+            old: Some(parse(old_source)),
+            new: Some(parse(new_source)),
+        };
+        let deleted = DiffLine {
+            kind: LineKind::Del,
+            old_no: Some(1),
+            new_no: None,
+            text: "fn old() {".into(),
+        };
+        let added = DiffLine {
+            kind: LineKind::Add,
+            old_no: None,
+            new_no: Some(1),
+            text: "fn new() {".into(),
+        };
+        let context = DiffLine {
+            kind: LineKind::Context,
+            old_no: Some(2),
+            new_no: Some(2),
+            text: "    let value = 2;".into(),
+        };
+
+        assert_eq!(
+            highlights.source_ref(&deleted),
+            Some(SourceLineRef {
+                side: SourceSide::Old,
+                line_number: 1
+            })
+        );
+        assert_eq!(
+            highlights.source_ref(&added),
+            Some(SourceLineRef {
+                side: SourceSide::New,
+                line_number: 1
+            })
+        );
+        assert_eq!(
+            highlights.source_ref(&context),
+            Some(SourceLineRef {
+                side: SourceSide::New,
+                line_number: 2
+            })
+        );
+        assert!(
+            highlights
+                .spans(&deleted)
+                .iter()
+                .any(|span| span.kind == comet_syntax::HighlightKind::Function)
+        );
+        assert!(
+            highlights
+                .spans(&added)
+                .iter()
+                .any(|span| span.kind == comet_syntax::HighlightKind::Function)
+        );
+
+        let old_only = DiffHighlights {
+            old: highlights.old.clone(),
+            new: None,
+        };
+        assert_eq!(
+            old_only.source_ref(&context),
+            Some(SourceLineRef {
+                side: SourceSide::Old,
+                line_number: 2
+            })
+        );
+        let invalid = DiffLine {
+            kind: LineKind::Add,
+            old_no: None,
+            new_no: Some(0),
+            text: String::new(),
+        };
+        assert!(highlights.spans(&invalid).is_empty());
+    }
+
+    #[test]
+    fn tool_diff_complete_sources_are_rejected_on_line_mismatch() {
+        let file = FileDiff {
+            path: "src/lib.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            notices: Vec::new(),
+            hunks: vec![Hunk {
+                header: "@@ -1,2 +1,2 @@".into(),
+                lines: vec![
+                    DiffLine {
+                        kind: LineKind::Del,
+                        old_no: Some(1),
+                        new_no: None,
+                        text: "fn old() {}".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Add,
+                        old_no: None,
+                        new_no: Some(1),
+                        text: "fn new() {}".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Context,
+                        old_no: Some(2),
+                        new_no: Some(2),
+                        text: "let shared = true;".into(),
+                    },
+                ],
+            }],
+            additions: 1,
+            deletions: 1,
+            max_line: 2,
+        };
+        assert!(sources_match_diff(
+            &file,
+            Some("fn old() {}\nlet shared = true;\n"),
+            Some("fn new() {}\nlet shared = true;\n")
+        ));
+        assert!(!sources_match_diff(
+            &file,
+            Some("fn stale() {}\nlet shared = true;\n"),
+            Some("fn new() {}\nlet shared = true;\n")
+        ));
+    }
+
+    #[test]
+    fn source_validation_splits_each_complete_source_once_for_many_high_lines() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let source = (1..=12_000)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = (11_001..=12_000)
+            .map(|line| DiffLine {
+                kind: LineKind::Context,
+                old_no: Some(line),
+                new_no: Some(line),
+                text: format!("line {line}"),
+            })
+            .collect();
+        let file = FileDiff {
+            path: "src/large.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            notices: Vec::new(),
+            hunks: vec![Hunk {
+                header: "@@ -11001,1000 +11001,1000 @@".into(),
+                lines,
+            }],
+            additions: 0,
+            deletions: 0,
+            max_line: 12_000,
+        };
+        let split_calls = AtomicUsize::new(0);
+
+        assert!(sources_match_diff_with(
+            &file,
+            Some(&source),
+            Some(&source),
+            |text| {
+                split_calls.fetch_add(1, Ordering::Relaxed);
+                text.lines().collect()
+            },
+        ));
+        assert_eq!(split_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn excerpt_parses_old_and_new_hunks_as_separate_documents() {
+        let file = FileDiff {
+            path: "src/lib.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            notices: vec![],
+            hunks: vec![Hunk {
+                header: "@@ -1,3 +1,3 @@".into(),
+                lines: vec![
+                    DiffLine {
+                        kind: LineKind::Context,
+                        old_no: Some(1),
+                        new_no: Some(1),
+                        text: "/* start".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Del,
+                        old_no: Some(2),
+                        new_no: None,
+                        text: "old body".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Add,
+                        old_no: None,
+                        new_no: Some(2),
+                        text: "new body".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Context,
+                        old_no: Some(3),
+                        new_no: Some(3),
+                        text: "end */".into(),
+                    },
+                ],
+            }],
+            additions: 1,
+            deletions: 1,
+            max_line: 3,
+        };
+        let highlights = excerpt_highlights(&file, Lang::Rust).expect("excerpt");
+        let deleted = &file.hunks[0].lines[1];
+        let added = &file.hunks[0].lines[2];
+        assert!(
+            highlights
+                .spans(deleted)
+                .iter()
+                .any(|span| span.kind == comet_syntax::HighlightKind::Comment)
+        );
+        assert!(
+            highlights
+                .spans(added)
+                .iter()
+                .any(|span| span.kind == comet_syntax::HighlightKind::Comment)
+        );
+    }
+
+    #[test]
+    fn checkout_file_diff_text_reply_decodes_literal_camel_case_json() {
+        let decoded = decode_checkout_file_diff_text_reply(serde_json::json!({
+            "diffChecksum": "sum-1",
+            "oldText": "let old = 1;\n",
+            "newText": "let new = 2;\n",
+            "oldContentHash": "sha256-old",
+            "newContentHash": "sha256-new",
+            "binary": false,
+            "truncated": false,
+            "stale": false
+        }))
+        .expect("literal engine reply");
+
+        assert_eq!(decoded.diff_checksum, "sum-1");
+        assert_eq!(decoded.old_text.as_deref(), Some("let old = 1;\n"));
+        assert_eq!(decoded.new_text.as_deref(), Some("let new = 2;\n"));
+        assert_eq!(decoded.old_content_hash.as_deref(), Some("sha256-old"));
+        assert_eq!(decoded.new_content_hash.as_deref(), Some("sha256-new"));
+        assert!(!decoded.binary);
+        assert!(!decoded.truncated);
+        assert!(!decoded.stale);
+    }
+
+    #[test]
+    fn excerpt_promotes_to_complete_only_for_current_snapshot() {
+        let excerpt = Arc::new(DiffHighlights::default());
+        let complete = Arc::new(DiffHighlights::default());
+        let mut state = DiffHighlightState::Excerpt(excerpt);
+
+        assert!(promote_highlights_if_current(
+            41,
+            41,
+            &mut state,
+            Some(complete.clone())
+        ));
+        assert!(matches!(
+            state,
+            DiffHighlightState::Ready(ref installed) if Arc::ptr_eq(installed, &complete)
+        ));
+    }
+
+    fn source_pair_file() -> FileDiff {
+        FileDiff {
+            path: "src/lib.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            notices: vec![],
+            hunks: vec![Hunk {
+                header: "@@ -1 +1 @@".into(),
+                lines: vec![
+                    DiffLine {
+                        kind: LineKind::Del,
+                        old_no: Some(1),
+                        new_no: None,
+                        text: "let old = 1;".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Add,
+                        old_no: None,
+                        new_no: Some(1),
+                        text: "let new = 2;".into(),
+                    },
+                ],
+            }],
+            additions: 1,
+            deletions: 1,
+            max_line: 1,
+        }
+    }
+
+    fn source_pair_reply() -> comet_proto::CheckoutFileDiffText {
+        comet_proto::CheckoutFileDiffText {
+            diff_checksum: "sum-1".into(),
+            old_text: Some("let old = 1;\n".into()),
+            new_text: Some("let new = 2;\n".into()),
+            old_content_hash: Some("sha256-old".into()),
+            new_content_hash: Some("sha256-new".into()),
+            binary: false,
+            truncated: false,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn binary_truncated_stale_and_unknown_method_keep_excerpt() {
+        let file = source_pair_file();
+        let excerpt = Arc::new(excerpt_highlights(&file, Lang::Rust).expect("excerpt"));
+        let mut stale = source_pair_reply();
+        stale.stale = true;
+        let mut binary = source_pair_reply();
+        binary.binary = true;
+        let mut truncated = source_pair_reply();
+        truncated.truncated = true;
+        let mut absent = source_pair_reply();
+        absent.old_text = None;
+        absent.new_text = None;
+
+        for fetch in [
+            Ok(stale),
+            Ok(binary),
+            Ok(truncated),
+            Ok(absent),
+            Err(comet_rpc::RpcError::UnknownMethod(
+                methods::GET_CHECKOUT_FILE_DIFF_TEXT.into(),
+            )),
+        ] {
+            let candidate = full_highlights_for_fetch(&file, Lang::Rust, "sum-1", fetch);
+            let mut state = DiffHighlightState::Excerpt(excerpt.clone());
+            assert!(!promote_highlights_if_current(
+                17, 17, &mut state, candidate
+            ));
+            assert!(matches!(
+                state,
+                DiffHighlightState::Excerpt(ref retained) if Arc::ptr_eq(retained, &excerpt)
+            ));
+        }
+    }
+
+    #[test]
+    fn late_highlight_result_does_not_replace_newer_diff_state() {
+        let file = source_pair_file();
+        let mut old_reply = source_pair_reply();
+        old_reply.diff_checksum = "sum-old".into();
+        assert!(
+            full_highlights_for_fetch(&file, Lang::Rust, "sum-new", Ok(old_reply)).is_none(),
+            "the reply checksum is checked before parsing"
+        );
+
+        let current = Arc::new(DiffHighlights::default());
+        let late = Arc::new(DiffHighlights::default());
+        let mut state = DiffHighlightState::Excerpt(current.clone());
+        let old_fingerprint = hash64(&["checkout:sum-old", "src/lib.rs"]);
+        let current_fingerprint = hash64(&["checkout:sum-new", "src/lib.rs"]);
+
+        assert!(!promote_highlights_if_current(
+            current_fingerprint,
+            old_fingerprint,
+            &mut state,
+            Some(late)
+        ));
+        assert!(matches!(
+            state,
+            DiffHighlightState::Excerpt(ref retained) if Arc::ptr_eq(retained, &current)
+        ));
+    }
+
+    #[test]
+    fn full_diff_sources_cover_added_deleted_renamed_and_context_lines() {
+        let added = FileDiff {
+            path: "src/added.rs".into(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            notices: vec![],
+            hunks: vec![Hunk {
+                header: "@@ -0,0 +1 @@".into(),
+                lines: vec![DiffLine {
+                    kind: LineKind::Add,
+                    old_no: None,
+                    new_no: Some(1),
+                    text: "fn added() {}".into(),
+                }],
+            }],
+            additions: 1,
+            deletions: 0,
+            max_line: 1,
+        };
+        let added_reply = comet_proto::CheckoutFileDiffText {
+            diff_checksum: "added".into(),
+            old_text: None,
+            new_text: Some("fn added() {}\n".into()),
+            old_content_hash: None,
+            new_content_hash: Some("new".into()),
+            binary: false,
+            truncated: false,
+            stale: false,
+        };
+        let added_highlights = full_highlights(&added, Lang::Rust, &added_reply).expect("added");
+        assert!(added_highlights.old.is_none());
+        assert!(added_highlights.new.is_some());
+        assert!(!added_highlights.spans(&added.hunks[0].lines[0]).is_empty());
+
+        let deleted = FileDiff {
+            path: "src/deleted.rs".into(),
+            old_path: None,
+            status: FileStatus::Deleted,
+            binary: false,
+            notices: vec![],
+            hunks: vec![Hunk {
+                header: "@@ -1 +0,0 @@".into(),
+                lines: vec![DiffLine {
+                    kind: LineKind::Del,
+                    old_no: Some(1),
+                    new_no: None,
+                    text: "fn deleted() {}".into(),
+                }],
+            }],
+            additions: 0,
+            deletions: 1,
+            max_line: 1,
+        };
+        let deleted_reply = comet_proto::CheckoutFileDiffText {
+            diff_checksum: "deleted".into(),
+            old_text: Some("fn deleted() {}\n".into()),
+            new_text: None,
+            old_content_hash: Some("old".into()),
+            new_content_hash: None,
+            binary: false,
+            truncated: false,
+            stale: false,
+        };
+        let deleted_highlights =
+            full_highlights(&deleted, Lang::Rust, &deleted_reply).expect("deleted");
+        assert!(deleted_highlights.old.is_some());
+        assert!(deleted_highlights.new.is_none());
+        assert!(
+            !deleted_highlights
+                .spans(&deleted.hunks[0].lines[0])
+                .is_empty()
+        );
+
+        let renamed = FileDiff {
+            path: "src/renamed.rs".into(),
+            old_path: Some("legacy.txt".into()),
+            status: FileStatus::Renamed,
+            binary: false,
+            notices: vec![],
+            hunks: vec![Hunk {
+                header: "@@ -1,2 +1,2 @@".into(),
+                lines: vec![
+                    DiffLine {
+                        kind: LineKind::Del,
+                        old_no: Some(1),
+                        new_no: None,
+                        text: "fn old() {}".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Add,
+                        old_no: None,
+                        new_no: Some(1),
+                        text: "fn new() {}".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Context,
+                        old_no: Some(2),
+                        new_no: Some(2),
+                        text: "const SHARED: bool = true;".into(),
+                    },
+                ],
+            }],
+            additions: 1,
+            deletions: 1,
+            max_line: 2,
+        };
+        let renamed_reply = comet_proto::CheckoutFileDiffText {
+            diff_checksum: "renamed".into(),
+            old_text: Some("fn old() {}\nconst SHARED: bool = true;\n".into()),
+            new_text: Some("fn new() {}\nconst SHARED: bool = true;\n".into()),
+            old_content_hash: Some("old".into()),
+            new_content_hash: Some("new".into()),
+            binary: false,
+            truncated: false,
+            stale: false,
+        };
+        let renamed_highlights =
+            full_highlights(&renamed, Lang::Rust, &renamed_reply).expect("renamed");
+        assert_eq!(
+            renamed_highlights.old.as_ref().unwrap().language,
+            Lang::Rust,
+            "the final path selects the language for both sides"
+        );
+        assert_eq!(
+            renamed_highlights.new.as_ref().unwrap().language,
+            Lang::Rust
+        );
+        for line in &renamed.hunks[0].lines {
+            assert!(
+                !renamed_highlights.spans(line).is_empty(),
+                "missing spans for {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mismatched_full_sources_are_rejected_atomically() {
+        let file = FileDiff {
+            path: "src/lib.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            notices: vec![],
+            hunks: vec![Hunk {
+                header: "@@ -1 +1 @@".into(),
+                lines: vec![
+                    DiffLine {
+                        kind: LineKind::Del,
+                        old_no: Some(1),
+                        new_no: None,
+                        text: "let old = 1;".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Add,
+                        old_no: None,
+                        new_no: Some(1),
+                        text: "let new = 2;".into(),
+                    },
+                ],
+            }],
+            additions: 1,
+            deletions: 1,
+            max_line: 1,
+        };
+        let response = comet_proto::CheckoutFileDiffText {
+            diff_checksum: "sum".into(),
+            old_text: Some("let old = 1;\n".into()),
+            new_text: Some("different snapshot\n".into()),
+            old_content_hash: None,
+            new_content_hash: None,
+            binary: false,
+            truncated: false,
+            stale: false,
+        };
+        assert!(!sources_match_diff(
+            &file,
+            response.old_text.as_deref(),
+            response.new_text.as_deref()
+        ));
+        assert!(full_highlights(&file, Lang::Rust, &response).is_none());
     }
 }

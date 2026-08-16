@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::{ToolDiff, ToolDiffStat};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HarnessId {
@@ -1388,6 +1390,12 @@ pub enum AgentEvent {
     ToolResult {
         id: String,
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<ToolDiff>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff_stats: Option<Vec<ToolDiffStat>>,
     },
     /// A live context-occupancy reading. Never persisted to docs — it is the
     /// *current* occupancy, not history, and `doc::parts` drops it deliberately.
@@ -2041,6 +2049,44 @@ mod tests {
         assert_eq!(
             RuntimeMode::FullAccess.sandbox(),
             SandboxLevel::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn old_tool_result_json_decodes_with_no_diff_metadata() {
+        let event: AgentEvent =
+            serde_json::from_str(r#"{"type":"toolResult","id":"t1","isError":false}"#).unwrap();
+        assert!(matches!(
+            event,
+            AgentEvent::ToolResult {
+                diff: None,
+                diff_ref: None,
+                diff_stats: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tool_result_diff_metadata_uses_camel_case_literals() {
+        let event = AgentEvent::ToolResult {
+            id: "t1".into(),
+            is_error: false,
+            diff: Some(ToolDiff {
+                path: "src/lib.rs".into(),
+                old_text: Some("old\n".into()),
+                new_text: "new\n".into(),
+            }),
+            diff_ref: Some("v1:abc".into()),
+            diff_stats: Some(vec![ToolDiffStat {
+                path: "src/lib.rs".into(),
+                additions: 1,
+                deletions: 1,
+            }]),
+        };
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"type":"toolResult","id":"t1","isError":false,"diff":{"path":"src/lib.rs","oldText":"old\n","newText":"new\n"},"diffRef":"v1:abc","diffStats":[{"path":"src/lib.rs","additions":1,"deletions":1}]}"#
         );
     }
 
