@@ -256,6 +256,13 @@ const KNOWN_UNDECLARED_PATH_ROOTS: [&str; 7] = [
     "<TRUSTED_POWERSHELL>",
 ];
 
+/// Walks [`promoted_scenarios`] rather than every `manifest.json` under the
+/// corpus directly, so this is narrower than its own name suggests: a
+/// scenario directory holding a `manifest.json` but no `events.jsonl` would
+/// never reach the `manifest_path.is_file()` check below at all, because
+/// `promoted_scenarios` never yields it. Inert today — every scenario
+/// directory in the committed corpus carries both files together, verified
+/// directly rather than assumed — but real if that ever stops holding.
 #[test]
 fn every_manifest_token_is_declared_or_a_known_path_root() {
     let corpus_root = corpus_root();

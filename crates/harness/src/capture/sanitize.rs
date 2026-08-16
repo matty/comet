@@ -1182,6 +1182,15 @@ fn describe_shape(values: &[Value]) -> String {
         "describe_shape is only ever called on an existing self.novel entry, which record_novel \
          never leaves empty"
     );
+    if values.is_empty() {
+        // The assertion above is compiled out of a release build, so this is
+        // the fallback if the invariant it names ever breaks there — without
+        // it, `min_len`/`max_len` stay at their unset `usize::MAX`/`0`
+        // starting values and the string branch below would print a
+        // nonsensical range like "string len 18446744073709551615-0" instead
+        // of failing loudly or degrading safely.
+        return "no withheld values".to_owned();
+    }
     let mut all_string = true;
     let mut all_number = true;
     let mut min_len = usize::MAX;

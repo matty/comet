@@ -56,21 +56,27 @@ pub struct PromotedScenario {
 /// capability-sheet golden test all repeated this same
 /// read-directories/sort/filter-by-`events.jsonl` loop, and the copies had
 /// already drifted on what an unreadable subtree does. This function owns the
-/// walk only: an unreadable provider or version subtree is always an `Err`
-/// here, and it is each caller's own job to map that into its own policy
+/// walk only: an unreadable provider or version subtree — `read_dir` failing
+/// outright, or one of its entries failing to read — is always an `Err` here,
+/// and it is each caller's own job to map that into its own policy
 /// (propagate, panic, or otherwise) — this must not be read as unifying that
 /// policy, only the traversal.
 pub fn promoted_scenarios(root: &Path) -> anyhow::Result<Vec<PromotedScenario>> {
-    let unreadable = || anyhow::anyhow!("{} could not be read", root.display());
     let mut scenarios = Vec::new();
-    for provider in sorted_directories(root).ok_or_else(unreadable)? {
+    for provider in sorted_directories(root)
+        .with_context(|| format!("{} could not be walked", root.display()))?
+    {
         let provider_name = file_name(&provider);
         // An unreadable subtree is an error, never an empty one. Treating it
         // as empty would drop every field beneath it from a caller whose
         // whole job is saying what the evidence contains.
-        for version in sorted_directories(&provider).ok_or_else(unreadable)? {
+        for version in sorted_directories(&provider)
+            .with_context(|| format!("{} could not be walked", provider.display()))?
+        {
             let version_name = file_name(&version);
-            for scenario in sorted_directories(&version).ok_or_else(unreadable)? {
+            for scenario in sorted_directories(&version)
+                .with_context(|| format!("{} could not be walked", version.display()))?
+            {
                 if !scenario.join("events.jsonl").is_file() {
                     continue;
                 }
@@ -87,15 +93,29 @@ pub fn promoted_scenarios(root: &Path) -> anyhow::Result<Vec<PromotedScenario>> 
     Ok(scenarios)
 }
 
-fn sorted_directories(parent: &Path) -> Option<Vec<PathBuf>> {
-    let mut directories: Vec<PathBuf> = std::fs::read_dir(parent)
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
+/// Every directory directly under `parent`, sorted.
+///
+/// An unreadable entry propagates as an `Err` rather than being filtered
+/// out — the same reasoning the two `subdirectories` helpers this function
+/// replaced each carried on their own doc comments: skipping an entry
+/// silently would let a walk visit a subset of the archive and still read as
+/// complete, and "a walk that silently skipped a subtree would report the
+/// property as holding over evidence it never read" is exactly the failure
+/// mode a corpus-wide property test exists to refuse. `read_dir` itself
+/// failing was already an `Err` before this fix; what changed is that a
+/// single bad `DirEntry` inside an otherwise-readable directory no longer
+/// disappears through a `filter_map(Result::ok)` — it now stops the walk
+/// too, same as it always stopped the panicking callers this replaced.
+fn sorted_directories(parent: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut directories = Vec::new();
+    for entry in std::fs::read_dir(parent)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            directories.push(path);
+        }
+    }
     directories.sort();
-    Some(directories)
+    Ok(directories)
 }
 
 fn file_name(path: &Path) -> String {

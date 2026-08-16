@@ -48,10 +48,22 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Every `(provider, version)` pair `root` holds, discovered by walking the
-/// shared corpus walk rather than a hand-maintained list — a newly promoted
-/// version directory must make this test fail for want of a sheet, not
-/// silently go unchecked because nobody added its name here.
+/// Every `(provider, version)` pair `root` holds *at least one promoted
+/// scenario for*, discovered by walking the shared corpus walk rather than a
+/// hand-maintained list — a newly promoted version directory must make this
+/// test fail for want of a sheet, not silently go unchecked because nobody
+/// added its name here.
+///
+/// Narrower than "every `provider/version` directory `root` holds": this
+/// derives from [`promoted_scenarios`], which additionally requires each
+/// scenario to have an `events.jsonl`. A version directory that exists but
+/// whose scenarios all lack one would produce no expected sheet here, and if
+/// a stale sheet for it is still committed, the orphan scan below reports it
+/// with a message naming that narrower cause rather than claiming the
+/// version directory is gone. Inert today — every promoted scenario in the
+/// committed corpus has both `manifest.json` and `events.jsonl` — but real
+/// if the corpus ever holds a version directory with no promoted scenario in
+/// it (review finding, 2026-08-16).
 fn corpus_versions(root: &Path) -> Vec<(String, String)> {
     let scenarios = promoted_scenarios(root)
         .unwrap_or_else(|error| panic!("{} could not be walked: {error}", root.display()));
@@ -270,12 +282,35 @@ fn compare_all_versions(corpus_root: &Path, docs_root: &Path) -> Vec<String> {
                 .collect();
             orphans.sort();
             for orphan in orphans {
-                failures.push(format!(
-                    "{} describes a (provider, version) the corpus at {} no longer has — \
-                     delete it, or restore the corpus directory it documents",
-                    docs_root.join(&orphan).display(),
-                    corpus_root.display()
-                ));
+                // `corpus_versions` only lists a (provider, version) that
+                // holds a promoted scenario (see its own doc comment), so an
+                // orphan can mean two different things: the directory is
+                // genuinely gone, or it still exists but currently promotes
+                // nothing. Naming which one it is stops a reader from
+                // deleting a directory that is still there for no reason.
+                let version_dir_still_exists = orphan
+                    .strip_suffix(".md")
+                    .and_then(|stem| stem.rsplit_once('-'))
+                    .is_some_and(|(provider, version)| {
+                        corpus_root.join(provider).join(version).is_dir()
+                    });
+                let failure = if version_dir_still_exists {
+                    format!(
+                        "{} describes a (provider, version) whose directory still exists under \
+                         {} but currently holds no promoted scenario (no events.jsonl) — \
+                         regenerate or delete the sheet, not the directory",
+                        docs_root.join(&orphan).display(),
+                        corpus_root.display()
+                    )
+                } else {
+                    format!(
+                        "{} describes a (provider, version) the corpus at {} no longer has — \
+                         delete it, or restore the corpus directory it documents",
+                        docs_root.join(&orphan).display(),
+                        corpus_root.display()
+                    )
+                };
+                failures.push(failure);
             }
         }
         // The orphan scan is a detection mechanism; a directory it silently
@@ -450,6 +485,51 @@ fn a_sheet_with_no_corresponding_corpus_version_fails() {
     assert!(
         !failures[0].contains("claude-9.9.9.md"),
         "the seeded, matching sheet must not be reported: {failures:?}"
+    );
+}
+
+/// Break caught (review finding, 2026-08-16): the orphan scan used to report
+/// every orphan with the same "the corpus no longer has" message, which is
+/// wrong when the `provider/version` directory is still there and simply
+/// holds no promoted scenario (no `events.jsonl`) — `corpus_versions` only
+/// lists a version with at least one promoted scenario, so a directory that
+/// still exists but currently promotes nothing looks identical to a deleted
+/// one unless the message says which case it is. Deleting a still-present
+/// directory on the strength of the wrong message would be the wrong fix.
+#[test]
+fn an_orphaned_sheet_for_a_still_present_but_empty_version_names_the_real_cause() {
+    let corpus = tempfile::tempdir().unwrap();
+    write_minimal_scenario(corpus.path(), "claude", "9.9.9", "smoke");
+    let docs = tempfile::tempdir().unwrap();
+
+    // Seed the sheet that write_minimal_scenario's version actually needs,
+    // so the only failure is the orphan below.
+    let (observations, vocabulary) = observe_surface(corpus.path()).unwrap();
+    let expected = render_version(&observations, &vocabulary, corpus.path(), "claude", "9.9.9");
+    std::fs::write(docs.path().join("claude-9.9.9.md"), expected).unwrap();
+
+    // A version directory that still exists, but whose only scenario has no
+    // events.jsonl -- promoted_scenarios never yields it, so corpus_versions
+    // never lists "claude"/"0.0.0", and a stale sheet for it looks orphaned
+    // even though the directory itself is still there.
+    std::fs::create_dir_all(corpus.path().join("claude").join("0.0.0").join("empty")).unwrap();
+    std::fs::write(docs.path().join("claude-0.0.0.md"), "# stale\n").unwrap();
+
+    let failures = compare_all_versions(corpus.path(), docs.path());
+
+    assert_eq!(
+        failures.len(),
+        1,
+        "the seeded sheet must match cleanly, leaving only the orphan: {failures:?}"
+    );
+    assert!(
+        failures[0].contains("still exists") && failures[0].contains("holds no promoted scenario"),
+        "a directory that is still present must name that, not claim the corpus no longer has \
+         it: {failures:?}"
+    );
+    assert!(
+        !failures[0].contains("no longer has"),
+        "the wrong-cause message must not fire for a directory that is still there: {failures:?}"
     );
 }
 
