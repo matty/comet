@@ -92,11 +92,16 @@ fn check_permission_mode() {
     }
 }
 
-/// Shaped exactly like Claude Code 2.1.227's answer, including the double
-/// nesting and `resolvedModel`, per `claude/2.1.228/model-discovery` frame 2.
-/// Two models are enough to prove the merge; the full five are pinned in
-/// `claude/discovery.rs`'s unit test.
-const INITIALIZE_REPLY: &str = r#"{"type":"control_response","response":{"subtype":"success","request_id":"comet-discovery-1","response":{"commands":[],"agents":[],"output_style":"default","available_output_styles":["default"],"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-5","displayName":"Sonnet","description":"Sonnet 5","supportsEffort":true,"supportedEffortLevels":["low","high"]},{"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001","displayName":"Haiku","description":"Haiku 4.5"}],"account":{"email":"user@example.test","organization":"Example","subscriptionType":"Claude Max","apiProvider":"firstParty"},"pid":1234,"current_permission_mode":"acceptEdits"}}}"#;
+/// The genuine captured initialize reply, `claude/2.1.228/model-discovery`
+/// frame 2, loaded byte-for-byte rather than hand-typed. Its seven curated
+/// models (including the double nesting and `resolvedModel`) are pinned in
+/// `claude/discovery.rs`'s own unit tests, which load this exact frame too;
+/// `models_come_back_live_and_merged` below only checks that `sonnet` merges
+/// onto `claude-sonnet-5` and that a purely-curated id survives, both of
+/// which this real payload still exercises.
+fn initialize_reply() -> String {
+    comet_harness::capture::corpus_frame("claude/2.1.228/model-discovery", 2).payload
+}
 
 /// The initialize reply for a **command** discovery: the same frame, with a
 /// `commands` array whose entries report what this child was actually handed.
@@ -136,7 +141,7 @@ fn main() {
     // adapter does: with it, the caller wants models; without it, commands.
     if first.contains("control_request") {
         if std::env::args().any(|a| a == "--bare") {
-            emit(INITIALIZE_REPLY);
+            emit(&initialize_reply());
         } else {
             emit(&command_reply());
         }
@@ -219,20 +224,31 @@ fn happy() {
     );
     // Spawns the subagent below. Realism, not one of the five system/task_*
     // frames itself (those start at the next `emit`) — a subagent block with
-    // no call that spawned it is an incoherent sequence. Shaped from
-    // run2-claude-subagent.jsonl:97: `description`/`subagent_type`/
-    // `run_in_background`/`caller` plus the four numeric `usage` fields it
-    // carries are copied verbatim. `prompt` is NOT verbatim — the capture's
-    // actual prompt runs a second sentence past what is emitted here; this
-    // fixture keeps only the first. The fake fixture's own convention is
-    // readable ids, not the capture's opaque hex/toolu_ ones, so "sub-1" /
-    // "sub-1-task" stand in for the real tool_use_id / task_id. Decodes as
+    // no call that spawned it is an incoherent sequence.
+    //
+    // Structurally shaped from the genuine corpus at
+    // `tests/corpus/claude/2.1.229/subagent`, frame 115 (an `Agent` tool_use
+    // with `description`/`subagent_type`/`run_in_background`/`caller`, same
+    // as here) — NOT loaded byte-for-byte, because `description`, `prompt`
+    // and `subagent_type` are not on `capture/allowlist/claude.txt` and
+    // survive there only as `<Vn>` placeholders; loading the real bytes would
+    // turn every readable assertion below into a placeholder-equality check
+    // with nothing left to catch a wrong string. A prior version of this
+    // comment cited `run2-claude-subagent.jsonl`, a raw pre-sanitization
+    // capture that was never committed to this repository; that citation was
+    // unverifiable and has been corrected to name the real, checked-in
+    // corpus instead. The fake fixture's own convention is readable ids, not
+    // the capture's opaque hex/toolu_ ones, so "sub-1" / "sub-1-task" stand
+    // in for the real tool_use_id / task_id. Decodes as
     // ToolCall::Unknown{name:"Agent"}: nothing in this slice teaches
     // decode_tool_use a dedicated Agent arm.
     emit(
         r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"tool_use","id":"sub-1","name":"Agent","input":{"description":"Read README and report first heading","subagent_type":"general-purpose","prompt":"Read the README.md file in the current directory and report what the first heading is.","run_in_background":false},"caller":{"type":"direct"}}],"usage":{"input_tokens":10,"cache_creation_input_tokens":1496,"cache_read_input_tokens":34676,"output_tokens":3}}}"#,
     );
-    // Shaped from run2-claude-subagent.jsonl:98.
+    // Shaped like `claude/2.1.229/subagent` frame 116 (same subtype, same
+    // field set: description/subagent_type/task_type/prompt/task_id/
+    // tool_use_id) — see the corrected-provenance note above the `Agent`
+    // tool_use two frames up.
     emit(
         r#"{"type":"system","subtype":"task_started","task_id":"sub-1-task","tool_use_id":"sub-1","description":"Read README and report first heading","subagent_type":"general-purpose","task_type":"local_agent","prompt":"Read the README.md file in the current directory and report what the first heading is."}"#,
     );
@@ -246,31 +262,42 @@ fn happy() {
     emit(
         r#"{"type":"user","parent_tool_use_id":"sub-1","message":{"content":[{"type":"tool_result","tool_use_id":"sub-tool","is_error":false}]}}"#,
     );
-    // Shaped from run2-claude-subagent.jsonl:103.
+    // Shaped like `claude/2.1.229/subagent` frame 121 — same field set
+    // (description/last_tool_name/subagent_type/task_id/tool_use_id/usage
+    // with total_tokens, tool_uses, duration_ms). The real frame's usage
+    // numbers are `<Vn>` placeholders (not on the allowlist), which is why
+    // this fixture keeps hand-picked literals rather than the corpus bytes:
+    // `happy_path_normalizes_events_and_filters_subagents` asserts the exact
+    // numbers below, and a placeholder can't be that assertion.
     emit(
         r#"{"type":"system","subtype":"task_progress","task_id":"sub-1-task","tool_use_id":"sub-1","description":"Reading README.md","subagent_type":"general-purpose","usage":{"total_tokens":19215,"tool_uses":1,"duration_ms":2906},"last_tool_name":"Read"}"#,
     );
-    // Shaped from run2-claude-subagent.jsonl:106 — a PARTIAL patch, status
-    // only, exactly like the real one.
+    // Shaped like `claude/2.1.229/subagent` frame 124 — a PARTIAL patch,
+    // status only, exactly like the real one.
     emit(
         r#"{"type":"system","subtype":"task_updated","task_id":"sub-1-task","patch":{"status":"completed","end_time":1786581776304}}"#,
     );
-    // Shaped from run2-claude-subagent.jsonl:107 — the frame carrying the
-    // answer and the terminal usage totals.
+    // Shaped like `claude/2.1.229/subagent` frame 125 — the frame carrying
+    // the answer and the terminal usage totals.
     emit(
         r#"{"type":"system","subtype":"task_notification","task_id":"sub-1-task","tool_use_id":"sub-1","status":"completed","output_file":"C:\\tmp\\sub-1-task.output","summary":"Sandbox","usage":{"total_tokens":20044,"tool_uses":1,"duration_ms":4906}}"#,
     );
     // A `SendMessage`-resumed agent: the SAME task_id under a NEW
     // tool_use_id — the fifth distinct system/task_* SHAPE this scenario
-    // emits (capture:150, 168, 169), not a fifth SUBTYPE: there are still
-    // only four claimed subtypes (task_started/task_progress/task_updated/
-    // task_notification, see normalize.rs's own doc comment on
-    // `normalize_subagent_task`); this is a second, differently-shaped
-    // `task_started` reusing one of them. This is what exercises `normalize.rs`'s
-    // `subagent_progress.remove(&f.task_id)` on `task_started` through a
-    // real spawn: without it, this second terminal reading would be
-    // compared against the first invocation's already-terminal one and
-    // dropped as redundant, even though the summary differs.
+    // emits, not a fifth SUBTYPE: there are still only four claimed subtypes
+    // (task_started/task_progress/task_updated/task_notification, see
+    // normalize.rs's own doc comment on `normalize_subagent_task`); this is a
+    // second, differently-shaped `task_started` reusing one of them. The real
+    // corpus records exactly this resumption at frames 174 (second
+    // `task_started`, same `task_id`, new `tool_use_id`), 201 (`task_updated`)
+    // and 202 (`task_notification`) — proven directly against those bytes by
+    // `a_resumed_subagent_task_started_reuses_the_task_id_under_a_new_tool_use_id`
+    // in `capture_corpus/corpus_frames.rs`. This is what exercises
+    // `normalize.rs`'s `subagent_progress.remove(&f.task_id)` on
+    // `task_started` through a real spawn: without it, this second terminal
+    // reading would be compared against the first invocation's already-
+    // terminal one and dropped as redundant, even though the summary
+    // differs.
     emit(
         r#"{"type":"system","subtype":"task_started","task_id":"sub-1-task","tool_use_id":"sub-2","description":"Read README and report first heading","subagent_type":"general-purpose","task_type":"local_agent","prompt":"What was the first heading you found?"}"#,
     );
@@ -298,9 +325,10 @@ fn happy() {
 }
 
 /// A subagent whose terminal reading is `"failed"`, not `"completed"`. No
-/// capture has ever recorded this — every run in
-/// `run2-claude-subagent.jsonl` ends `status: "completed"` — so
-/// `normalize.rs`'s `Failed`/`Cancelled` arms were written by hand against
+/// capture has ever recorded this — every subagent lifecycle in the
+/// committed corpus (`tests/corpus/claude/2.1.229/subagent`) ends
+/// `status: "completed"` — so `normalize.rs`'s `Failed`/`Cancelled` arms
+/// were written by hand against
 /// `.agents/rules/optional-wire-fields.md`'s rule and never exercised through
 /// a real spawn. This scenario is that exercise: same lifecycle shape as
 /// `happy()`'s subagent (task_started → child work → terminal reading), with
