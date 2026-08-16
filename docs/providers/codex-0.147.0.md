@@ -49,32 +49,6 @@ tools: (not observed)
 app-server
 ```
 
-### model-discovery-neutral-cwd
-
-capture Codex model discovery from a neutral working directory
-
-cwd: `<CWD>`
-env: `CODEX_HOME=<CODEX_HOME>`
-tools: (not observed)
-
-```
-<HOME>\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe
-app-server
-```
-
-### model-discovery-project-cwd
-
-capture Codex model discovery from the selected project directory
-
-cwd: `<CWD>`
-env: `CODEX_HOME=<CODEX_HOME>`
-tools: (not observed)
-
-```
-<HOME>\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe
-app-server
-```
-
 ### resume
 
 capture one bounded Codex run script
@@ -107,11 +81,11 @@ Every dotted path observed on the wire for this provider and version, split by t
 
 ### Scenario groups
 
-- `G1`: fresh-text, model-discovery, model-discovery-logged-out, model-discovery-neutral-cwd, model-discovery-project-cwd, resume, steer
+- `G1`: fresh-text, model-discovery, model-discovery-logged-out, resume, steer
 - `G2`: fresh-text, resume, steer
 - `G3`: fresh-text, steer
-- `G4`: model-discovery, model-discovery-logged-out, model-discovery-neutral-cwd, model-discovery-project-cwd
-- `G5`: model-discovery, model-discovery-neutral-cwd, model-discovery-project-cwd
+- `G4`: model-discovery
+- `G5`: model-discovery, model-discovery-logged-out
 - `G6`: model-discovery-logged-out
 - `G7`: resume
 - `G8`: steer
@@ -282,41 +256,41 @@ Every dotted path observed on the wire for this provider and version, split by t
 - `.result.approvalsReviewer` `G2`
 - `.result.codexHome` `G1`
 - `.result.cwd` `G2`
-- `.result.data` `G4`
-- `.result.data[].additionalSpeedTiers` `G4`
-- `.result.data[].availabilityNux` `G4`
+- `.result.data` `G5`
+- `.result.data[].additionalSpeedTiers` `G5`
+- `.result.data[].availabilityNux` `G5`
 - `.result.data[].availabilityNux.message` `G6`
-- `.result.data[].defaultReasoningEffort` `G4`
-- `.result.data[].defaultServiceTier` `G4`
-- `.result.data[].description` `G4`
-- `.result.data[].displayName` `G4`
-- `.result.data[].hidden` `G4`
-- `.result.data[].id` `G4`
-- `.result.data[].inputModalities` `G4`
-- `.result.data[].isDefault` `G4`
-- `.result.data[].model` `G4`
-- `.result.data[].modelSpecialty` `G4`
-- `.result.data[].serviceTiers` `G4`
-- `.result.data[].serviceTiers[].description` `G4`
-- `.result.data[].serviceTiers[].id` `G4`
-- `.result.data[].serviceTiers[].name` `G4`
-- `.result.data[].supportedReasoningEfforts` `G4`
-- `.result.data[].supportedReasoningEfforts[].description` `G4`
-- `.result.data[].supportedReasoningEfforts[].reasoningEffort` `G4`
-- `.result.data[].supportsPersonality` `G4`
-- `.result.data[].upgrade` `G4`
-- `.result.data[].upgradeInfo` `G4`
-- `.result.data[].upgradeInfo.migrationMarkdown` `G5`
-- `.result.data[].upgradeInfo.model` `G5`
-- `.result.data[].upgradeInfo.modelLink` `G5`
-- `.result.data[].upgradeInfo.upgradeCopy` `G5`
+- `.result.data[].defaultReasoningEffort` `G5`
+- `.result.data[].defaultServiceTier` `G5`
+- `.result.data[].description` `G5`
+- `.result.data[].displayName` `G5`
+- `.result.data[].hidden` `G5`
+- `.result.data[].id` `G5`
+- `.result.data[].inputModalities` `G5`
+- `.result.data[].isDefault` `G5`
+- `.result.data[].model` `G5`
+- `.result.data[].modelSpecialty` `G5`
+- `.result.data[].serviceTiers` `G5`
+- `.result.data[].serviceTiers[].description` `G5`
+- `.result.data[].serviceTiers[].id` `G5`
+- `.result.data[].serviceTiers[].name` `G5`
+- `.result.data[].supportedReasoningEfforts` `G5`
+- `.result.data[].supportedReasoningEfforts[].description` `G5`
+- `.result.data[].supportedReasoningEfforts[].reasoningEffort` `G5`
+- `.result.data[].supportsPersonality` `G5`
+- `.result.data[].upgrade` `G5`
+- `.result.data[].upgradeInfo` `G5`
+- `.result.data[].upgradeInfo.migrationMarkdown` `G4`
+- `.result.data[].upgradeInfo.model` `G4`
+- `.result.data[].upgradeInfo.modelLink` `G4`
+- `.result.data[].upgradeInfo.upgradeCopy` `G4`
 - `.result.initialTurnsPage` `G7`
 - `.result.instructionSources` `G2`
 - `.result.itemsBackwardsCursor` `G7`
 - `.result.model` `G2`
 - `.result.modelProvider` `G2`
 - `.result.multiAgentMode` `G2`
-- `.result.nextCursor` `G4`
+- `.result.nextCursor` `G5`
 - `.result.platformFamily` `G1`
 - `.result.platformOs` `G1`
 - `.result.reasoningEffort` `G2`

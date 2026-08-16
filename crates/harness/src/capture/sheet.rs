@@ -23,32 +23,24 @@ use super::surface::{Direction, FieldObservation, VOCABULARY_PATHS};
 /// One promoted scenario's identity, for the sheet's own evidence list.
 ///
 /// Printing the exact argv (plan preamble decision 7, corrected 2026-08-16
-/// after Task 3's review checked the manifests) is what makes three
-/// genuinely identical scenarios — Claude's `model-discovery`,
-/// `model-discovery-neutral-cwd` and `model-discovery-project-cwd` — read as
-/// what they are: the same program, the same args
-/// (`--print --input-format stream-json --output-format stream-json
-/// --verbose --bare`), and the same redacted `cwd` (`<CWD>`). **Nothing in
-/// the archive distinguishes them** — the working directory is the one real
-/// difference between the three runs, and it is redacted to a placeholder
-/// and unrecoverable from what's committed. Printing the argv still
-/// discharges D80, but for the opposite reason an earlier draft of this
-/// comment gave: three identical fenced blocks read as one experiment
-/// printed three times, not as three independent confirmations — which is
-/// exactly the impression a reader should take away.
+/// after Task 3's review checked the manifests) still earns its place after
+/// D80's resolution: it is what lets a reader confirm two scenarios were
+/// launched the same way, or spot the one that wasn't, without going to the
+/// manifest. D80 itself found that Claude's `model-discovery` and its former
+/// `-neutral-cwd`/`-project-cwd` siblings were one observation recorded
+/// under three names — a 2026-08-16 re-capture showed all three replies
+/// differing only by a redacted `pid`, and Codex's three equivalents
+/// byte-identical — so the two siblings are gone from the table (see
+/// `docs/debt/closed.md` D80) and this sheet now prints `model-discovery`
+/// once, not three times.
 ///
 /// `cwd` and `configured_env` joined the argv (review finding, 2026-08-16):
 /// a Claude-focused read of an earlier draft missed that argv alone is not
-/// the whole launch. All seven Codex `0.147.0` scenarios share byte-identical
-/// argv, but `configured_env` does not: `model-discovery` and its three
-/// `-logged-out`/`-neutral-cwd`/`-project-cwd` siblings set `CODEX_HOME`,
+/// the whole launch. Codex's `model-discovery` and `model-discovery-logged-out`
+/// share byte-identical argv but not `configured_env`: both set `CODEX_HOME`,
 /// while `fresh-text`, `resume` and `steer` set nothing — a real difference
 /// the argv-only block hid completely, while the sheet's own prose claimed
-/// same-argv scenarios were launched identically. Printing the redacted
-/// placeholder cannot separate `-logged-out` from its three siblings (they
-/// redact to the same token), but it does separate that family of four from
-/// the three that set nothing, which is exactly the information this struct
-/// existed to surface and previously didn't.
+/// same-argv scenarios were launched identically.
 #[derive(Clone, Debug)]
 pub struct SheetScenario {
     pub name: String,

@@ -45,16 +45,23 @@ pub struct ScenarioInput {
 ///
 /// `needs_cwd` is not "may I pass --cwd" (every scenario tolerates the
 /// flag); it is "does this scenario's behavior vary by cwd at all". False
-/// only for the cwd-independent discovery aliases (`model-discovery`,
-/// `model-discovery-neutral-cwd`, and Codex's `model-discovery-logged-out`)
-/// — those always run from a neutral temp directory regardless of what
-/// `--cwd` names, which is the entire reason `model-discovery-neutral-cwd`
-/// is a distinct scenario from `model-discovery-project-cwd`. True
-/// everywhere else, including every run scenario: an omitted `--cwd` still
-/// resolves to the caller's current directory for those, not a temp
-/// directory, so `model-discovery-project-cwd`'s point (capturing discovery
-/// from the selected project directory) survives being run with no explicit
-/// `--cwd` at all.
+/// only for the cwd-independent discovery scenarios (`model-discovery` and
+/// Codex's `model-discovery-logged-out`) — those always run from a neutral
+/// temp directory regardless of what `--cwd` names. True everywhere else,
+/// including every run scenario: an omitted `--cwd` still resolves to the
+/// caller's current directory for those, not a temp directory.
+///
+/// `model-discovery` used to have two cwd-varying siblings,
+/// `-neutral-cwd` and `-project-cwd`, kept as separate rows because D80
+/// insisted the question be settled by a real CLI rather than by reading
+/// the table. A 2026-08-16 re-capture against Claude 2.1.233 and Codex
+/// 0.147.0 answered it: all three rows' replies differ only by `pid` (a
+/// per-process value the sanitizer redacts) for Claude, and are
+/// byte-identical for Codex — `--bare` discovery is cwd-independent for
+/// both providers, full stop. `command-discovery` is the scenario where cwd
+/// actually changes the reply (D32's 66-vs-63 commands belongs to it, not
+/// to this family). The two siblings are deleted; see `docs/debt/closed.md`
+/// D80 for the evidence.
 #[derive(Clone, Copy, Debug)]
 pub struct Requirements {
     pub spends_tokens: bool,
@@ -108,7 +115,7 @@ pub struct ScenarioSpec {
     /// future Codex row that legitimately wanted `ApprovalRequired` for some
     /// other reason would have silently inherited the Windows-only trusted-
     /// PowerShell fence. Every row now names its own fence explicitly;
-    /// [`no_fence`] is the default for the eighteen rows that need none, and
+    /// [`no_fence`] is the default for the fourteen rows that need none, and
     /// the two Codex approval rows point at `super::codex_fence` directly.
     pub(super) fence:
         fn(&ScenarioSpec, &CaptureConfig, &LaunchDescriptor) -> anyhow::Result<FenceOutcome>,
@@ -169,29 +176,6 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::model_discovery(s, i))),
     },
     ScenarioSpec {
-        name: "model-discovery-neutral-cwd",
-        purpose: "capture Claude model discovery from a neutral working directory",
-        provider: Provider::Claude,
-        runtime_mode: None,
-        requirements: Requirements::discovery(),
-        launch: ScenarioLaunch::Discovery(claude::model_discovery_launch),
-        fence: no_fence,
-        body: ScenarioBody::Claude(|s, i| Box::pin(claude::model_discovery(s, i))),
-    },
-    ScenarioSpec {
-        name: "model-discovery-project-cwd",
-        purpose: "capture Claude model discovery from the selected project directory",
-        provider: Provider::Claude,
-        runtime_mode: None,
-        requirements: Requirements {
-            needs_cwd: true,
-            ..Requirements::discovery()
-        },
-        launch: ScenarioLaunch::Discovery(claude::model_discovery_launch),
-        fence: no_fence,
-        body: ScenarioBody::Claude(|s, i| Box::pin(claude::model_discovery(s, i))),
-    },
-    ScenarioSpec {
         name: "command-discovery",
         purpose: "capture Claude's cwd-scoped command initialize reply",
         provider: Provider::Claude,
@@ -212,29 +196,6 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Codex,
         runtime_mode: None,
         requirements: Requirements::discovery(),
-        launch: ScenarioLaunch::Discovery(codex::model_discovery_launch),
-        fence: no_fence,
-        body: ScenarioBody::Codex(|s, i| Box::pin(codex::model_discovery(s, i))),
-    },
-    ScenarioSpec {
-        name: "model-discovery-neutral-cwd",
-        purpose: "capture Codex model discovery from a neutral working directory",
-        provider: Provider::Codex,
-        runtime_mode: None,
-        requirements: Requirements::discovery(),
-        launch: ScenarioLaunch::Discovery(codex::model_discovery_launch),
-        fence: no_fence,
-        body: ScenarioBody::Codex(|s, i| Box::pin(codex::model_discovery(s, i))),
-    },
-    ScenarioSpec {
-        name: "model-discovery-project-cwd",
-        purpose: "capture Codex model discovery from the selected project directory",
-        provider: Provider::Codex,
-        runtime_mode: None,
-        requirements: Requirements {
-            needs_cwd: true,
-            ..Requirements::discovery()
-        },
         launch: ScenarioLaunch::Discovery(codex::model_discovery_launch),
         fence: no_fence,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::model_discovery(s, i))),
@@ -422,8 +383,6 @@ mod tests {
     fn every_scenario_name_the_binary_advertises_is_in_the_table() {
         for (provider, name) in [
             ("claude", "model-discovery"),
-            ("claude", "model-discovery-neutral-cwd"),
-            ("claude", "model-discovery-project-cwd"),
             ("claude", "command-discovery"),
             ("claude", "fresh-text"),
             ("claude", "approval"),
@@ -432,8 +391,6 @@ mod tests {
             ("claude", "checklist"),
             ("claude", "checklist-resume"),
             ("codex", "model-discovery"),
-            ("codex", "model-discovery-neutral-cwd"),
-            ("codex", "model-discovery-project-cwd"),
             ("codex", "model-discovery-logged-out"),
             ("codex", "fresh-text"),
             ("codex", "approval"),
@@ -448,10 +405,10 @@ mod tests {
             );
         }
         assert!(scenario("claude", "no-such-scenario").is_none());
-        assert!(scenario("codex", "model-discovery-project-cwd").is_some());
+        assert!(scenario("codex", "model-discovery-logged-out").is_some());
         assert_eq!(
             SCENARIOS.len(),
-            20,
+            16,
             "an added or removed row must update this count too"
         );
     }
@@ -486,17 +443,11 @@ mod tests {
     }
 
     /// Break caught: `needs_cwd` regresses for a cwd-independent discovery
-    /// alias, letting a caller's `--cwd` silently start influencing
-    /// `model-discovery`/`model-discovery-neutral-cwd`/
-    /// `model-discovery-logged-out` and erasing their distinction from
-    /// `model-discovery-project-cwd`.
+    /// scenario, letting a caller's `--cwd` silently start influencing
+    /// `model-discovery`/`model-discovery-logged-out`.
     #[test]
     fn only_the_neutral_discovery_aliases_ignore_cwd() {
-        const NEUTRAL: &[&str] = &[
-            "model-discovery",
-            "model-discovery-neutral-cwd",
-            "model-discovery-logged-out",
-        ];
+        const NEUTRAL: &[&str] = &["model-discovery", "model-discovery-logged-out"];
         for spec in SCENARIOS {
             let neutral = NEUTRAL.contains(&spec.name);
             assert_eq!(

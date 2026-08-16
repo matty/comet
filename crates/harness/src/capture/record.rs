@@ -502,7 +502,7 @@ mod tests {
     async fn recorder_persists_structured_host_platform() {
         let raw = tempfile::tempdir().unwrap();
         let capture = record(config(
-            "model-discovery-neutral-cwd",
+            "model-discovery",
             fixture_path("fake-claude"),
             "claude",
             raw.path(),
@@ -526,7 +526,7 @@ mod tests {
                 .unwrap();
         assert_eq!(persisted["platform"]["os"], std::env::consts::OS);
         assert_eq!(persisted["platform"]["arch"], std::env::consts::ARCH);
-        assert_eq!(persisted["scenario"], "model-discovery-neutral-cwd");
+        assert_eq!(persisted["scenario"], "model-discovery");
         assert_eq!(persisted["purpose"], "local recorder test");
         assert!(persisted["captured_at_unix_ms"].as_i64().is_some());
         assert_eq!(
@@ -1049,18 +1049,6 @@ mod tests {
         type RunBuilder = fn(&ScenarioInput) -> anyhow::Result<RunRequest>;
         const EXPECTED_ROWS: &[(Provider, &str, Option<RunBuilder>, FenceKind)] = &[
             (Provider::Claude, "model-discovery", None, FenceKind::None),
-            (
-                Provider::Claude,
-                "model-discovery-neutral-cwd",
-                None,
-                FenceKind::None,
-            ),
-            (
-                Provider::Claude,
-                "model-discovery-project-cwd",
-                None,
-                FenceKind::None,
-            ),
             (Provider::Claude, "command-discovery", None, FenceKind::None),
             (
                 Provider::Claude,
@@ -1099,18 +1087,6 @@ mod tests {
                 FenceKind::None,
             ),
             (Provider::Codex, "model-discovery", None, FenceKind::None),
-            (
-                Provider::Codex,
-                "model-discovery-neutral-cwd",
-                None,
-                FenceKind::None,
-            ),
-            (
-                Provider::Codex,
-                "model-discovery-project-cwd",
-                None,
-                FenceKind::None,
-            ),
             (
                 Provider::Codex,
                 "model-discovery-logged-out",

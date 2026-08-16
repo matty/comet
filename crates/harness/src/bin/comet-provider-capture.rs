@@ -384,11 +384,7 @@ mod tests {
     #[test]
     fn supports_every_token_free_discovery_observation() {
         for (provider, scenario_name) in [
-            ("claude", "model-discovery-neutral-cwd"),
-            ("claude", "model-discovery-project-cwd"),
             ("claude", "command-discovery"),
-            ("codex", "model-discovery-neutral-cwd"),
-            ("codex", "model-discovery-project-cwd"),
             ("codex", "model-discovery-logged-out"),
         ] {
             assert!(
@@ -404,19 +400,7 @@ mod tests {
     fn configures_every_token_free_discovery_without_spend_acknowledgment() {
         let empty_home = tempfile::tempdir().unwrap();
         for (provider, scenario_name, codex_home) in [
-            ("claude", "model-discovery-neutral-cwd", None),
-            ("claude", "model-discovery-project-cwd", None),
             ("claude", "command-discovery", None),
-            (
-                "codex",
-                "model-discovery-neutral-cwd",
-                Some(empty_home.path().into()),
-            ),
-            (
-                "codex",
-                "model-discovery-project-cwd",
-                Some(empty_home.path().into()),
-            ),
             (
                 "codex",
                 "model-discovery-logged-out",
@@ -480,12 +464,10 @@ mod tests {
 
     #[test]
     fn cwd_is_resolved_to_an_existing_absolute_directory() {
-        let mut args = token_free_args("claude", "model-discovery-project-cwd", None);
+        let mut args = token_free_args("claude", "command-discovery", None);
         args.cwd = Some(PathBuf::from("."));
         let config = capture_config(args).unwrap();
-        let cwd = config
-            .cwd
-            .expect("model-discovery-project-cwd must resolve a cwd");
+        let cwd = config.cwd.expect("command-discovery must resolve a cwd");
         assert!(cwd.is_absolute());
         assert!(cwd.is_dir());
         #[cfg(windows)]
@@ -612,7 +594,7 @@ mod tests {
         }
     }
 
-    /// Every one of the 20 `(provider, name)` pairs in `SCENARIOS` must build a valid
+    /// Every one of the 16 `(provider, name)` pairs in `SCENARIOS` must build a valid
     /// `CaptureConfig` through this binary's own argument validation, given whatever its
     /// `Requirements` demand — restores what Task 2 broke: the binary routed every ported
     /// scenario into a dead end, and this is the CLI-level proof that every name is reachable
