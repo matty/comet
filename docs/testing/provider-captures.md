@@ -182,8 +182,12 @@ bare field name too before concluding it is absent.
 **Promoting a new version means committing its capability sheet in the same change.** A version
 directory with no matching `docs/providers/<provider>-<version>.md` fails the golden test
 outright — the newly-promoted-capture case this mechanism exists to catch, not merely an
-out-of-date sheet. `git diff docs/providers/claude-2.1.228.md docs/providers/claude-2.1.229.md`
-is the version-change report; no differ is built or planned on top of it.
+out-of-date sheet.
+`git diff --no-index docs/providers/claude-2.1.228.md docs/providers/claude-2.1.229.md` is the
+version-change report; no differ is built or planned on top of it. **`--no-index` is load-bearing:**
+without it the two paths are pathspecs, so git diffs each file against the index and prints
+nothing on a clean tree — an empty report that exits 0 and looks like "no changes between these
+versions".
 
 ## Provider contradictions
 
