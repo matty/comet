@@ -199,24 +199,29 @@ async fn codex_startup_failure_keeps_process_detail_out_of_the_transcript() {
 
 /// Break caught: retaining the startup timer after `SessionStarted` turns a
 /// legitimate long-running turn into a false startup failure.
+///
+/// The budget must cover process spawn, not just the handshake, so it cannot be
+/// tight: Windows spawn alone is 10-30ms and a 25ms budget failed 2-in-12 here
+/// (D89). What proves the property is the observation window exceeding the
+/// startup timeout, not the timeout being small.
 #[tokio::test]
 async fn codex_startup_timeout_never_applies_to_an_active_turn() {
     let (controls, _steer, token) = controls("Yes");
     let mut stream = CodexHarness::new()
         .with_executable(fixture_path())
-        .with_startup_timeout(Duration::from_millis(25))
+        .with_startup_timeout(Duration::from_millis(500))
         .run(request("scenario:interrupt"), controls)
         .await
         .expect("run starts");
 
-    let started = tokio::time::timeout(Duration::from_secs(1), stream.next())
+    let started = tokio::time::timeout(Duration::from_secs(5), stream.next())
         .await
         .expect("startup completes")
         .expect("stream stays open")
         .expect("normalized event");
     assert!(matches!(started, AgentEvent::SessionStarted { .. }));
 
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(2000);
     loop {
         match tokio::time::timeout_at(deadline, stream.next()).await {
             Err(_) => break,
