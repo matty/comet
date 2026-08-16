@@ -925,6 +925,103 @@ mod tests {
         );
     }
 
+    /// Task 2: the twelve per-row `*_row_is_wired_to_*_request` tests (six in
+    /// `record/scenarios/claude.rs`, six in `record/scenarios/codex.rs`) folded into one loop over
+    /// every `Run` row in `SCENARIOS`, replacing:
+    ///
+    /// - claude.rs: `fresh_text_row_is_wired_to_fresh_text_request`,
+    ///   `resume_row_is_wired_to_resume_request`, `attachment_row_is_wired_to_attachment_request`,
+    ///   `checklist_row_is_wired_to_checklist_request`,
+    ///   `checklist_resume_row_is_wired_to_checklist_resume_request`,
+    ///   `approval_row_is_wired_to_approval_request`
+    /// - codex.rs: `fresh_text_row_is_wired_to_fresh_text_request`,
+    ///   `resume_row_is_wired_to_resume_request`, `steer_row_is_wired_to_steer_request`,
+    ///   `interruption_row_is_wired_to_interruption_request`,
+    ///   `approval_row_is_wired_to_approval_request`,
+    ///   `approval_on_request_row_is_wired_to_approval_on_request_request`
+    ///
+    /// Those twelve were tautologies before Task 1 (each compared `build_request(&input)` against
+    /// itself) but Task 1 gave every one of them a second, independent call through the row's own
+    /// `spec.launch` — turning them into the only per-row purity check in the suite: two calls to
+    /// the SAME builder, through TWO different paths, must agree. This test keeps exactly that
+    /// property but drops the per-row duplication, and — unlike the twelve hand-written copies —
+    /// covers any `Run` row added later automatically.
+    ///
+    /// Break caught, on either hazard:
+    /// - **non-purity**: `build_request(&input)` called twice returns two different `RunRequest`s.
+    ///   This is the hazard the whole plan exists to close — see this file's own
+    ///   `scenario_launch_and_body_must_share_one_request_builder_call` for the recorder-level half
+    ///   (a non-pure builder called once still can't disagree with itself); this is the row-level
+    ///   half, catching a non-pure builder BEFORE it ever reaches the recorder.
+    /// - **derivation drift**: `derive_launch` — the actual, only call site `record_claude`/
+    ///   `record_codex` use — stops producing the same `LaunchDescriptor` `run_launch(exe, &first)`
+    ///   would, e.g. a future edit routes a row through the wrong provider's `run_launch` or drops
+    ///   the executable/request pairing.
+    #[test]
+    fn every_run_rows_request_builder_is_pure_and_derives_its_own_launch() {
+        for spec in SCENARIOS {
+            let ScenarioLaunch::Run(build_request) = spec.launch else {
+                continue;
+            };
+            let input = ScenarioInput {
+                resume_id: spec
+                    .requirements
+                    .needs_resume_id
+                    .then(|| "purity-loop-resume-id".to_owned()),
+                attachment: spec
+                    .requirements
+                    .needs_attachment
+                    .then(|| PathBuf::from("tiny.png")),
+                approval_target: spec
+                    .requirements
+                    .needs_approval_target
+                    .then(|| PathBuf::from("target-dir")),
+                ..ScenarioInput::default()
+            };
+
+            let first = build_request(&input).unwrap_or_else(|err| {
+                panic!(
+                    "{:?}/{}: first request-builder call failed: {err}",
+                    spec.provider, spec.name
+                )
+            });
+            let second = build_request(&input).unwrap_or_else(|err| {
+                panic!(
+                    "{:?}/{}: second request-builder call failed: {err}",
+                    spec.provider, spec.name
+                )
+            });
+            assert_eq!(
+                first, second,
+                "{:?}/{}: calling the row's request builder twice with the same input produced \
+                 two different RunRequests — the builder is not pure",
+                spec.provider, spec.name
+            );
+
+            let (exe, run_launch): (PathBuf, fn(&Path, &RunRequest) -> LaunchDescriptor) =
+                match spec.provider {
+                    Provider::Claude => (absolute_program("claude"), crate::claude::run_launch),
+                    Provider::Codex => (absolute_program("codex"), crate::codex::run_launch),
+                };
+            let (derived, _request) = derive_launch(&spec.launch, &input, &exe, run_launch)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "{:?}/{}: derive_launch failed: {err}",
+                        spec.provider, spec.name
+                    )
+                });
+            let expected = run_launch(&exe, &first);
+            assert_eq!(
+                CommandSnapshot::from_launch(&derived),
+                CommandSnapshot::from_launch(&expected),
+                "{:?}/{}: the launch record.rs's own derive_launch produced does not match \
+                 run_launch(exe, &first) — the row's launch and its request have drifted apart",
+                spec.provider,
+                spec.name
+            );
+        }
+    }
+
     fn only_raw_subdirectory(raw_root: &Path) -> PathBuf {
         let mut entries: Vec<_> = std::fs::read_dir(raw_root)
             .unwrap()

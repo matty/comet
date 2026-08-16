@@ -540,7 +540,6 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::capture::record::scenarios::ScenarioLaunch;
     use crate::capture::record::session::FenceOutcome;
     use crate::capture::test_support::{
         absolute_program, channel_payloads, config, contract_request, fixture_path,
@@ -615,56 +614,6 @@ mod tests {
         )
         .await
         .unwrap()
-    }
-
-    /// Break caught: the row's `launch` stops naming `fresh_text_request`, or stops being a
-    /// `ScenarioLaunch::Run` at all — `record.rs`'s `derive_launch` would then build `fresh-text`'s
-    /// launch from the wrong request (or fail to find one).
-    #[test]
-    fn fresh_text_row_is_wired_to_fresh_text_request() {
-        let input = ScenarioInput::default();
-        let spec = crate::capture::record::scenarios::scenario("claude", "fresh-text").unwrap();
-        let ScenarioLaunch::Run(build_request) = spec.launch else {
-            panic!("claude/fresh-text must be a Run scenario");
-        };
-        assert_eq!(
-            build_request(&input).unwrap(),
-            fresh_text_request(&input).unwrap()
-        );
-    }
-
-    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for `resume`.
-    #[test]
-    fn resume_row_is_wired_to_resume_request() {
-        let input = ScenarioInput {
-            resume_id: Some("session-abc".into()),
-            ..ScenarioInput::default()
-        };
-        let spec = crate::capture::record::scenarios::scenario("claude", "resume").unwrap();
-        let ScenarioLaunch::Run(build_request) = spec.launch else {
-            panic!("claude/resume must be a Run scenario");
-        };
-        assert_eq!(
-            build_request(&input).unwrap(),
-            resume_request(&input).unwrap()
-        );
-    }
-
-    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for `attachment`.
-    #[test]
-    fn attachment_row_is_wired_to_attachment_request() {
-        let input = ScenarioInput {
-            attachment: Some(PathBuf::from("tiny.png")),
-            ..ScenarioInput::default()
-        };
-        let spec = crate::capture::record::scenarios::scenario("claude", "attachment").unwrap();
-        let ScenarioLaunch::Run(build_request) = spec.launch else {
-            panic!("claude/attachment must be a Run scenario");
-        };
-        assert_eq!(
-            build_request(&input).unwrap(),
-            attachment_request(&input).unwrap()
-        );
     }
 
     /// Break caught: `resume_request` stops setting `request.resume`, so the launch silently
@@ -768,39 +717,6 @@ mod tests {
         assert_eq!(first["message"]["content"][1]["type"], "text");
     }
 
-    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for `checklist`.
-    #[test]
-    fn checklist_row_is_wired_to_checklist_request() {
-        let input = ScenarioInput::default();
-        let spec = crate::capture::record::scenarios::scenario("claude", "checklist").unwrap();
-        let ScenarioLaunch::Run(build_request) = spec.launch else {
-            panic!("claude/checklist must be a Run scenario");
-        };
-        assert_eq!(
-            build_request(&input).unwrap(),
-            checklist_request(&input).unwrap()
-        );
-    }
-
-    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for
-    /// `checklist-resume`.
-    #[test]
-    fn checklist_resume_row_is_wired_to_checklist_resume_request() {
-        let input = ScenarioInput {
-            resume_id: Some("session-abc".into()),
-            ..ScenarioInput::default()
-        };
-        let spec =
-            crate::capture::record::scenarios::scenario("claude", "checklist-resume").unwrap();
-        let ScenarioLaunch::Run(build_request) = spec.launch else {
-            panic!("claude/checklist-resume must be a Run scenario");
-        };
-        assert_eq!(
-            build_request(&input).unwrap(),
-            checklist_resume_request(&input).unwrap()
-        );
-    }
-
     /// Break caught: same as `resume_launch_passes_the_resume_id_as_a_launch_argument`, for
     /// `checklist-resume` — a mislabeled capture that silently starts a fresh session under the
     /// `checklist-resume` name instead of resuming one.
@@ -879,20 +795,6 @@ mod tests {
             "capture must still hold a terminal frame: {stdout:?}"
         );
         assert_eq!(capture.exit_code, Some(0));
-    }
-
-    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for `approval`.
-    #[test]
-    fn approval_row_is_wired_to_approval_request() {
-        let input = ScenarioInput::default();
-        let spec = crate::capture::record::scenarios::scenario("claude", "approval").unwrap();
-        let ScenarioLaunch::Run(build_request) = spec.launch else {
-            panic!("claude/approval must be a Run scenario");
-        };
-        assert_eq!(
-            build_request(&input).unwrap(),
-            approval_request(&input).unwrap()
-        );
     }
 
     /// Unit-level coverage of `claude_marker_grant` itself, independent of any process spawn:

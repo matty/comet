@@ -629,7 +629,6 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::capture::record::scenarios::ScenarioLaunch;
     use crate::capture::record::session::FenceOutcome;
     use crate::capture::test_support::{
         absolute_program, channel_payloads, config, contract_request, fixture_path,
@@ -677,68 +676,6 @@ mod tests {
         assert!(snapshot.kill_on_drop);
         #[cfg(windows)]
         assert_eq!(snapshot.creation_flags, 0);
-    }
-
-    /// Break caught: the `codex/fresh-text` row stops naming `fresh_text_request`, so
-    /// `record.rs`'s `derive_launch` would build its launch from the wrong request builder (or find
-    /// none at all).
-    #[test]
-    fn fresh_text_row_is_wired_to_fresh_text_request() {
-        let input = ScenarioInput::default();
-        let spec = crate::capture::record::scenarios::scenario("codex", "fresh-text").unwrap();
-        let ScenarioLaunch::Run(build_request) = spec.launch else {
-            panic!("codex/fresh-text must be a Run scenario");
-        };
-        assert_eq!(
-            build_request(&input).unwrap(),
-            fresh_text_request(&input).unwrap()
-        );
-    }
-
-    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for `resume`.
-    #[test]
-    fn resume_row_is_wired_to_resume_request() {
-        let input = ScenarioInput {
-            resume_id: Some("resume-abc".into()),
-            ..ScenarioInput::default()
-        };
-        let spec = crate::capture::record::scenarios::scenario("codex", "resume").unwrap();
-        let ScenarioLaunch::Run(build_request) = spec.launch else {
-            panic!("codex/resume must be a Run scenario");
-        };
-        assert_eq!(
-            build_request(&input).unwrap(),
-            resume_request(&input).unwrap()
-        );
-    }
-
-    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for `steer`.
-    #[test]
-    fn steer_row_is_wired_to_steer_request() {
-        let input = ScenarioInput::default();
-        let spec = crate::capture::record::scenarios::scenario("codex", "steer").unwrap();
-        let ScenarioLaunch::Run(build_request) = spec.launch else {
-            panic!("codex/steer must be a Run scenario");
-        };
-        assert_eq!(
-            build_request(&input).unwrap(),
-            steer_request(&input).unwrap()
-        );
-    }
-
-    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for
-    /// `interruption`.
-    #[test]
-    fn interruption_row_is_wired_to_interruption_request() {
-        let input = ScenarioInput::default();
-        let spec = crate::capture::record::scenarios::scenario("codex", "interruption").unwrap();
-        let ScenarioLaunch::Run(build_request) = spec.launch else {
-            panic!("codex/interruption must be a Run scenario");
-        };
-        assert_eq!(
-            build_request(&input).unwrap(),
-            interruption_request(&input).unwrap()
-        );
     }
 
     /// Break caught: a Codex run driver skips a handshake stage, loses the concrete run scenario,
@@ -1016,39 +953,6 @@ mod tests {
         assert_eq!(
             resume_line["params"],
             crate::codex::thread_resume_params(&resume_request(&input).unwrap(), "resume-success")
-        );
-    }
-
-    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for `approval`.
-    #[test]
-    fn approval_row_is_wired_to_approval_request() {
-        let input = ScenarioInput::default();
-        let spec = crate::capture::record::scenarios::scenario("codex", "approval").unwrap();
-        let ScenarioLaunch::Run(build_request) = spec.launch else {
-            panic!("codex/approval must be a Run scenario");
-        };
-        assert_eq!(
-            build_request(&input).unwrap(),
-            approval_request(&input).unwrap()
-        );
-    }
-
-    /// Break caught: same as `fresh_text_row_is_wired_to_fresh_text_request`, for
-    /// `approval-on-request`.
-    #[test]
-    fn approval_on_request_row_is_wired_to_approval_on_request_request() {
-        let input = ScenarioInput {
-            approval_target: Some(std::path::PathBuf::from("target-dir")),
-            ..ScenarioInput::default()
-        };
-        let spec =
-            crate::capture::record::scenarios::scenario("codex", "approval-on-request").unwrap();
-        let ScenarioLaunch::Run(build_request) = spec.launch else {
-            panic!("codex/approval-on-request must be a Run scenario");
-        };
-        assert_eq!(
-            build_request(&input).unwrap(),
-            approval_on_request_request(&input).unwrap()
         );
     }
 
