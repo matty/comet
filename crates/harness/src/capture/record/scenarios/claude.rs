@@ -1043,9 +1043,10 @@ mod tests {
     }
 
     /// The table's `runtime_mode` and the body's own `RunRequest.runtime_mode` are two separate
-    /// homes for one fact — the row drives fence selection in `record::codex_fence`
-    /// (Codex; Claude has none), the request builder drives what actually reaches the wire. Task
-    /// 7's own `comet-provider-capture.rs::scenario_names_own_their_runtime_modes` reads only
+    /// homes for one fact — the row's `fence` field drives fence selection (`record::codex_fence`
+    /// for the two Codex approval rows; every Claude row uses `no_fence`), the request builder
+    /// drives what actually reaches the wire. Task 7's own
+    /// `comet-provider-capture.rs::scenario_names_own_their_runtime_modes` reads only
     /// `spec.runtime_mode` and cannot see the two drift apart.
     ///
     /// Break caught: a `*_request` builder's `RuntimeMode` literal is edited (or a copy/paste

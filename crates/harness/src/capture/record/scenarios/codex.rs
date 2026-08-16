@@ -86,10 +86,11 @@ const CHEAP_MODEL: &str = "gpt-5.6-luna";
 /// from: the cheap model, low reasoning, and the caller's cwd (or a neutral
 /// temp directory). Always run through `crate::codex::normalize_run_request`
 /// here — exactly where `recording.rs`'s `RecordingSession::start` used to
-/// apply it before anything else touched the request — so every caller
-/// (launch builder and scenario body alike) sees the same normalized value
-/// and the linked-worktree sandbox escalation (D13) can never disagree
-/// between the two.
+/// apply it before anything else touched the request — so this one builder
+/// call is the only place the normalization runs: `derive_launch` derives
+/// both the launch and `Session::request` from the same normalized value, and
+/// the linked-worktree sandbox escalation (D13) can never disagree between
+/// the two.
 fn cheap_codex_request(prompt: &str, input: &ScenarioInput, mode: RuntimeMode) -> RunRequest {
     let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
     let request = RunRequest {
@@ -1296,13 +1297,17 @@ mod tests {
     /// `every_claude_run_rows_declared_mode_matches_its_request_builder` — see that test's own
     /// doc comment for why this needs its own check independent of
     /// `comet-provider-capture.rs::scenario_names_own_their_runtime_modes`, which reads only
-    /// `spec.runtime_mode`. Codex `approval` is the sharpest case here: `codex_fence` selects the
-    /// trusted-PowerShell/cwd-identity fence off `spec.runtime_mode ==
-    /// Some(RuntimeMode::ApprovalRequired)`, but the wire mode Codex actually receives comes from
-    /// `approval_request`'s own `cheap_codex_request` call — a drift here would leave the fence
-    /// running for a turn that (if the mode drifted to `AutoAcceptEdits`) Codex would never ask an
-    /// approval for at all, exactly the failure `approval_on_request`'s own hardcoded
-    /// `AutoAcceptEdits` documents on the table row.
+    /// `spec.runtime_mode`. Since D79, fence selection is unrelated to this test: each row names
+    /// its own `fence` field directly (`codex_fence` for `approval` and `approval-on-request`,
+    /// `no_fence` for everything else), checked by
+    /// `every_row_s_builder_and_fence_match_its_declared_wiring`, not by `runtime_mode`. What this
+    /// test guards is the drift `codex_fence`'s row-level wiring left standing: `spec.runtime_mode`
+    /// and the row's own request builder are two independent homes for the same
+    /// `RuntimeMode`, and nothing but this loop proves they still agree — a drift here would leave
+    /// the table (and anything reading it, like the mode tables in this file and `--help` text)
+    /// claiming one mode while Codex is actually sent another, exactly the mismatch
+    /// `approval-on-request`'s hardcoded `AutoAcceptEdits` (`scenarios.rs`'s table entry) exists to
+    /// keep honest.
     #[test]
     fn every_codex_run_rows_declared_mode_matches_its_request_builder() {
         let plain = ScenarioInput::default();

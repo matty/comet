@@ -116,9 +116,9 @@ async fn record_codex(
 }
 
 /// The only call site for a row's `ScenarioLaunch::Run` builder IN PRODUCTION CODE — this test
-/// module's `every_run_rows_request_builder_is_pure_and_derives_its_own_launch` also calls a
-/// row's builder through `spec.launch`, deliberately, as half of checking the row is wired to
-/// the right one. Builds the `RunRequest` once, derives the launch from it through the
+/// module's `every_row_s_builder_and_fence_match_its_declared_wiring` also calls a row's builder
+/// through `spec.launch`, deliberately, as half of checking the row is wired to the right one.
+/// Builds the `RunRequest` once, derives the launch from it through the
 /// provider's own `run_launch`, and returns the same `RunRequest` so the caller can hand it
 /// to `Session::request` — the recorder never calls a run builder a second
 /// time to build a scenario's wire line. A discovery row has no `RunRequest`
@@ -935,322 +935,247 @@ mod tests {
         );
     }
 
-    /// Task 2: the twelve per-row `*_row_is_wired_to_*_request` tests (six in
-    /// `record/scenarios/claude.rs`, six in `record/scenarios/codex.rs`) folded into one loop over
-    /// every `Run` row in `SCENARIOS`, replacing:
+    /// Task 2's twelve-row purity/wiring loop and D79's twenty-row fence loop, merged into one
+    /// loop over every row in `SCENARIOS` against one `(provider, name) → (builder, fence)`
+    /// table. A whole-branch review flagged the two as one 20-row roster enumerated across two
+    /// separate tables with two separate coverage guards; this is that merge — same coverage, one
+    /// table and one guard instead of two.
     ///
-    /// - claude.rs: `fresh_text_row_is_wired_to_fresh_text_request`,
+    /// What the merged table replaces:
+    /// - the twelve per-row `*_row_is_wired_to_*_request` tests (six in
+    ///   `record/scenarios/claude.rs`: `fresh_text_row_is_wired_to_fresh_text_request`,
     ///   `resume_row_is_wired_to_resume_request`, `attachment_row_is_wired_to_attachment_request`,
     ///   `checklist_row_is_wired_to_checklist_request`,
     ///   `checklist_resume_row_is_wired_to_checklist_resume_request`,
-    ///   `approval_row_is_wired_to_approval_request`
-    /// - codex.rs: `fresh_text_row_is_wired_to_fresh_text_request`,
-    ///   `resume_row_is_wired_to_resume_request`, `steer_row_is_wired_to_steer_request`,
-    ///   `interruption_row_is_wired_to_interruption_request`,
+    ///   `approval_row_is_wired_to_approval_request`; six in `record/scenarios/codex.rs`:
+    ///   `fresh_text_row_is_wired_to_fresh_text_request`, `resume_row_is_wired_to_resume_request`,
+    ///   `steer_row_is_wired_to_steer_request`, `interruption_row_is_wired_to_interruption_request`,
     ///   `approval_row_is_wired_to_approval_request`,
-    ///   `approval_on_request_row_is_wired_to_approval_on_request_request`
+    ///   `approval_on_request_row_is_wired_to_approval_on_request_request`), each of which
+    ///   compared `build_request(&input)` via `spec.launch` against the same-named builder called
+    ///   directly;
+    /// - D79's own recorded residual (`docs/debt/closed.md`): Task 4 moved fence selection onto
+    ///   each row (`scenarios::no_fence` for eighteen rows, `codex_fence` for the two Codex
+    ///   approval rows), but nothing checked a row's `fence` field against what it SHOULD be.
+    ///   D79's entry names the fix by its future name directly: "a future `EXPECTED_FENCES`-style
+    ///   table, mirroring the existing `EXPECTED_RUN_BUILDERS` one, would close it the same way" —
+    ///   this loop is that table, merged with the run-builder one rather than kept beside it.
     ///
-    /// Before Task 1 these twelve were named `*_launch_uses_the_production_run_launch` and
-    /// compared `X_launch(input, exe)` against `run_launch(exe, &X_request(input))`. Task 1
-    /// renamed and reshaped them into the twelve named above: each called the row's builder
-    /// through TWO independent paths — `build_request(&input)` via `spec.launch`, and the
-    /// same-named builder called directly — and asserted the two `RunRequest`s were equal. That
-    /// caught two distinct hazards at once: a non-pure builder (the two calls disagree with each
-    /// other), and a mis-wired row (a row naming the wrong builder, so the two calls disagree
-    /// because they're different functions).
+    /// What this loop checks, per row:
+    /// - **purity** (`Run` rows only): `build_request` is called twice (`first`/`second` below)
+    ///   and must agree.
+    /// - **run-builder wiring** (`Run` rows only): `first` is also compared against
+    ///   `EXPECTED_ROWS`' entry for this row — the builder that row is supposed to name, looked up
+    ///   by `(provider, name)` rather than through `spec.launch` a second time. A row repointed at
+    ///   another row's builder disagrees with the table and fails, naming the row.
+    /// - **fence wiring** (every row): `spec.fence` is fingerprinted (see below) and compared
+    ///   against `EXPECTED_ROWS`' `FenceKind` entry for this row.
+    /// - **Run/Discovery agreement** (every row): `EXPECTED_ROWS`' builder field must be `Some`
+    ///   exactly when the row is `ScenarioLaunch::Run` and `None` exactly when it is
+    ///   `ScenarioLaunch::Discovery` — a row flipped from one to the other without updating the
+    ///   table fails this directly, naming the row, instead of silently dropping out of a loop
+    ///   built only for one kind.
+    /// - **coverage** (both directions, after the loop): `EXPECTED_ROWS` must list every row in
+    ///   `SCENARIOS` exactly once. A row with no table entry panics inside the loop, naming the
+    ///   row; a stale table entry with no matching row fails the `covered == expected` set
+    ///   comparison.
     ///
-    /// This test keeps BOTH of those properties, not just the first:
-    /// - **purity**: `build_request` is called twice (`first`/`second` below) and must agree.
-    /// - **wiring**: `first` is also compared against `EXPECTED_RUN_BUILDERS`' entry for this
-    ///   row — the builder that row is supposed to name, looked up by `(provider, name)` rather
-    ///   than through `spec.launch` a second time. A row repointed at another row's builder now
-    ///   disagrees with the table and fails, naming the row. `EXPECTED_RUN_BUILDERS` must list
-    ///   every `Run` row exactly once — the `covered == expected` assertion after the loop
-    ///   enforces that in both directions, so a `Run` row with no table entry (or a row flipped
-    ///   to `Discovery` that silently drops out of the loop) fails loudly instead of being
-    ///   skipped in silence.
-    ///
-    /// It also gained a property the twelve never had: `ScenarioInput` is derived from
+    /// It also keeps a property the twelve never had: `ScenarioInput` is derived from
     /// `spec.requirements` here rather than hardcoded per row, so a row whose
     /// `needs_resume_id`/`needs_attachment`/`needs_approval_target` flag disagrees with what its
     /// own builder demands now fails here too (e.g. clearing `needs_resume_id` on a resume row
     /// makes its builder return a "needs a --resume-id" error and the loop panics).
     ///
-    /// Break caught, on any of three hazards:
+    /// The fence fingerprint: comparing `spec.fence` by function-pointer identity
+    /// (`std::ptr::fn_addr_eq`) was considered and rejected — two distinct `fn` items are not
+    /// guaranteed to have distinct addresses across codegen units, so that comparison can pass
+    /// while comparing nothing. Instead this fingerprints a row's fence by an OBSERVABLE property
+    /// the two real fences differ on unconditionally: `codex_fence`'s very first statement in BOTH
+    /// of its branches (above, this file) is `let cwd = launch_cwd()?;`, which fails with
+    /// "requires a resolved working directory" whenever `launch.cwd` is `None` — before it reads
+    /// `spec.requirements`, `config`, or the filesystem at all. `no_fence` ignores every argument
+    /// and always returns `Ok`. Calling a row's fence with a `cwd: None` launch therefore
+    /// distinguishes the two kinds deterministically, without any of the real filesystem state (a
+    /// trusted PowerShell, an approval target, a cwd identity) `codex_fence`'s ordinary path needs
+    /// — which is what keeps this portable to the Linux CI this workspace runs on, where
+    /// `resolve_trusted_powershell` fails closed regardless of input (see its own doc comment).
+    ///
+    /// Break caught, on any of these hazards:
     /// - **non-purity**: `build_request(&input)` called twice returns two different `RunRequest`s.
-    ///   This is the hazard the whole plan exists to close — see this file's own
-    ///   `scenario_launch_and_body_must_share_one_request_builder_call` for the recorder-level half
-    ///   (a non-pure builder called once still can't disagree with itself); this is the row-level
-    ///   half, catching a non-pure builder BEFORE it ever reaches the recorder.
-    /// - **mis-wiring**: `spec.launch` names a different row's builder — `first` disagrees with
-    ///   `EXPECTED_RUN_BUILDERS`' entry for this row's `(provider, name)`.
-    /// - **a `Run` row silently leaving the loop**: flipped to `Discovery`, or renamed without a
-    ///   matching table entry — caught by the `covered == expected` count check, not by the loop
-    ///   body (which simply never sees that row).
+    ///   This only catches impurity that varies between two adjacent calls in the same process —
+    ///   a counter, a fine clock. The impurity this codebase actually has —
+    ///   `normalize_run_request` reading `.git` state, named on `cheap_codex_request`'s own doc —
+    ///   returns the same value on both calls whenever the filesystem is stable during the test,
+    ///   which is always, so this assertion cannot catch it. What makes that impurity harmless is
+    ///   the single-call architecture itself (see this file's own
+    ///   `scenario_launch_and_body_must_share_one_request_builder_call`), not this loop; the
+    ///   corpus pin (`every_scenario_launch_matches_its_committed_corpus_manifest`) is what would
+    ///   catch machine-stable argv drift. This assertion stays cheap and still catches the
+    ///   call-to-call non-determinism class, so it is kept.
+    /// - **run-builder mis-wiring**: `spec.launch` names a different row's builder — `first`
+    ///   disagrees with `EXPECTED_ROWS`' entry for this row's `(provider, name)`.
+    /// - **fence mis-wiring**: pointing a non-approval Codex row (e.g. `steer`) at `codex_fence` —
+    ///   the exact mis-wiring D79's residual named as uncaught — makes that row's fingerprint
+    ///   `CodexApproval` while `EXPECTED_ROWS` still says `None`, and this test fails naming the
+    ///   row.
+    /// - **a row silently changing kind**: a `Run` row flipped to `Discovery` (or the reverse)
+    ///   without updating the table — caught directly by the Run/Discovery agreement check.
+    /// - **a row silently leaving the loop entirely**: renamed without a matching table entry, or
+    ///   a stale table entry with no matching row — caught by the `covered == expected` count
+    ///   check.
     ///
     /// One assertion this test does NOT independently prove: `derive_launch` — the actual, only
     /// production call site — is checked against `run_launch(exe, &first)`, where `run_launch` is
     /// chosen here by `spec.provider` (not by `spec.body`, which is what production actually
     /// dispatches on). That the two choices agree is pinned by a different test,
-    /// `every_row_s_declared_provider_matches_its_body_variant` (`scenarios.rs:472`), not this
+    /// `every_row_s_declared_provider_matches_its_body_variant` (`scenarios.rs`), not this
     /// one. And because `derive_launch`'s `Run` arm is exactly `run_launch(executable,
     /// &build_request(input)?)`, this assertion is a change-detector over that one function's
     /// three-line body rather than an independent oracle — it still catches an edit that drops
     /// the executable/request pairing or otherwise changes what that arm returns, just not a
     /// provider mis-dispatch (that hazard belongs to the test named above).
     #[test]
-    fn every_run_rows_request_builder_is_pure_and_derives_its_own_launch() {
-        // The `(provider, name) → builder` table the twelve implicitly encoded by their own
-        // names (e.g. `fresh_text_row_is_wired_to_fresh_text_request`). Kept exhaustive by the
-        // `covered == expected` check below: a `Run` row missing here — or a stale entry with no
-        // matching row — fails that assertion instead of the gap going unnoticed.
-        type RunBuilder = fn(&ScenarioInput) -> anyhow::Result<RunRequest>;
-        const EXPECTED_RUN_BUILDERS: &[(Provider, &str, RunBuilder)] = &[
-            (
-                Provider::Claude,
-                "fresh-text",
-                scenarios::claude::fresh_text_request,
-            ),
-            (
-                Provider::Claude,
-                "approval",
-                scenarios::claude::approval_request,
-            ),
-            (
-                Provider::Claude,
-                "resume",
-                scenarios::claude::resume_request,
-            ),
-            (
-                Provider::Claude,
-                "attachment",
-                scenarios::claude::attachment_request,
-            ),
-            (
-                Provider::Claude,
-                "checklist",
-                scenarios::claude::checklist_request,
-            ),
-            (
-                Provider::Claude,
-                "checklist-resume",
-                scenarios::claude::checklist_resume_request,
-            ),
-            (
-                Provider::Codex,
-                "fresh-text",
-                scenarios::codex::fresh_text_request,
-            ),
-            (
-                Provider::Codex,
-                "approval",
-                scenarios::codex::approval_request,
-            ),
-            (
-                Provider::Codex,
-                "approval-on-request",
-                scenarios::codex::approval_on_request_request,
-            ),
-            (Provider::Codex, "resume", scenarios::codex::resume_request),
-            (Provider::Codex, "steer", scenarios::codex::steer_request),
-            (
-                Provider::Codex,
-                "interruption",
-                scenarios::codex::interruption_request,
-            ),
-        ];
-
-        let mut covered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-
-        for spec in SCENARIOS {
-            let ScenarioLaunch::Run(build_request) = spec.launch else {
-                continue;
-            };
-            covered.insert(format!("{:?}/{}", spec.provider, spec.name));
-            let input = ScenarioInput {
-                resume_id: spec
-                    .requirements
-                    .needs_resume_id
-                    .then(|| "purity-loop-resume-id".to_owned()),
-                attachment: spec
-                    .requirements
-                    .needs_attachment
-                    .then(|| PathBuf::from("tiny.png")),
-                approval_target: spec
-                    .requirements
-                    .needs_approval_target
-                    .then(|| PathBuf::from("target-dir")),
-                ..ScenarioInput::default()
-            };
-
-            let first = build_request(&input).unwrap_or_else(|err| {
-                panic!(
-                    "{:?}/{}: first request-builder call failed: {err}",
-                    spec.provider, spec.name
-                )
-            });
-            let second = build_request(&input).unwrap_or_else(|err| {
-                panic!(
-                    "{:?}/{}: second request-builder call failed: {err}",
-                    spec.provider, spec.name
-                )
-            });
-            assert_eq!(
-                first, second,
-                "{:?}/{}: calling the row's request builder twice with the same input produced \
-                 two different RunRequests — the builder is not pure",
-                spec.provider, spec.name
-            );
-
-            let (_, _, expected_builder) = EXPECTED_RUN_BUILDERS
-                .iter()
-                .find(|(provider, name, _)| *provider == spec.provider && *name == spec.name)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{:?}/{}: no entry in EXPECTED_RUN_BUILDERS — add one so this row's \
-                         wiring is checked",
-                        spec.provider, spec.name
-                    )
-                });
-            let expected_request = expected_builder(&input).unwrap_or_else(|err| {
-                panic!(
-                    "{:?}/{}: EXPECTED_RUN_BUILDERS' builder failed: {err}",
-                    spec.provider, spec.name
-                )
-            });
-            assert_eq!(
-                first, expected_request,
-                "{:?}/{}: spec.launch's builder does not match the builder \
-                 EXPECTED_RUN_BUILDERS says this row should name — the row is wired to the \
-                 wrong builder",
-                spec.provider, spec.name
-            );
-
-            let (exe, run_launch): (PathBuf, fn(&Path, &RunRequest) -> LaunchDescriptor) =
-                match spec.provider {
-                    Provider::Claude => (absolute_program("claude"), crate::claude::run_launch),
-                    Provider::Codex => (absolute_program("codex"), crate::codex::run_launch),
-                };
-            let (derived, _request) = derive_launch(&spec.launch, &input, &exe, run_launch)
-                .unwrap_or_else(|err| {
-                    panic!(
-                        "{:?}/{}: derive_launch failed: {err}",
-                        spec.provider, spec.name
-                    )
-                });
-            let expected = run_launch(&exe, &first);
-            assert_eq!(
-                CommandSnapshot::from_launch(&derived),
-                CommandSnapshot::from_launch(&expected),
-                "{:?}/{}: the launch record.rs's own derive_launch produced does not match \
-                 run_launch(exe, &first) — the row's launch and its request have drifted apart",
-                spec.provider,
-                spec.name
-            );
-        }
-
-        let expected: std::collections::BTreeSet<String> = EXPECTED_RUN_BUILDERS
-            .iter()
-            .map(|(provider, name, _)| format!("{provider:?}/{name}"))
-            .collect();
-        assert_eq!(
-            covered, expected,
-            "every Run row in SCENARIOS must have exactly one entry in EXPECTED_RUN_BUILDERS, \
-             and vice versa — a Run row missing here (or flipped to Discovery) would otherwise \
-             leave the loop in silence"
-        );
-    }
-
-    /// Closes D79's own recorded residual (`docs/debt/closed.md`): Task 4 moved fence selection
-    /// onto each row (`scenarios::no_fence` for eighteen rows, `codex_fence` for the two Codex
-    /// approval rows), but nothing checked a row's `fence` field against what it SHOULD be —
-    /// D79's entry names the fix by its future name directly: "a future `EXPECTED_FENCES`-style
-    /// table, mirroring the existing `EXPECTED_RUN_BUILDERS` one, would close it the same way."
-    /// This is that table.
-    ///
-    /// Comparing `spec.fence` by function-pointer identity (`std::ptr::fn_addr_eq`) was
-    /// considered and rejected: two distinct `fn` items are not guaranteed to have distinct
-    /// addresses across codegen units, so that comparison can pass while comparing nothing.
-    /// Instead this fingerprints a row's fence by an OBSERVABLE property the two real fences
-    /// differ on unconditionally: `codex_fence`'s very first statement in BOTH of its branches
-    /// (above, this file) is `let cwd = launch_cwd()?;`, which fails with "requires a resolved
-    /// working directory" whenever `launch.cwd` is `None` — before it reads `spec.requirements`,
-    /// `config`, or the filesystem at all. `no_fence` ignores every argument and always returns
-    /// `Ok`. Calling a row's fence with a `cwd: None` launch therefore distinguishes the two
-    /// kinds deterministically, without any of the real filesystem state (a trusted PowerShell,
-    /// an approval target, a cwd identity) `codex_fence`'s ordinary path needs — which is what
-    /// keeps this portable to the Linux CI this workspace runs on, where
-    /// `resolve_trusted_powershell` fails closed regardless of input (see its own doc comment).
-    ///
-    /// Break caught, by falsification: pointing `steer` (a non-approval Codex row) at
-    /// `codex_fence` — the exact mis-wiring D79's residual named as uncaught — makes `steer`'s
-    /// fingerprint `CodexApproval` while `EXPECTED_FENCES` still says `None`, and this test fails
-    /// naming the row.
-    #[test]
-    fn every_row_s_fence_matches_the_kind_its_name_declares() {
+    fn every_row_s_builder_and_fence_match_its_declared_wiring() {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum FenceKind {
             None,
             CodexApproval,
         }
 
-        const EXPECTED_FENCES: &[(Provider, &str, FenceKind)] = &[
-            (Provider::Claude, "model-discovery", FenceKind::None),
+        // The `(provider, name) → (builder, fence)` table the twelve-plus-twenty rows across the
+        // old two tables implicitly encoded. Kept exhaustive by the `covered == expected` check
+        // below: a row missing here — or a stale entry with no matching row — fails that
+        // assertion instead of the gap going unnoticed.
+        type RunBuilder = fn(&ScenarioInput) -> anyhow::Result<RunRequest>;
+        const EXPECTED_ROWS: &[(Provider, &str, Option<RunBuilder>, FenceKind)] = &[
+            (Provider::Claude, "model-discovery", None, FenceKind::None),
             (
                 Provider::Claude,
                 "model-discovery-neutral-cwd",
+                None,
                 FenceKind::None,
             ),
             (
                 Provider::Claude,
                 "model-discovery-project-cwd",
+                None,
                 FenceKind::None,
             ),
-            (Provider::Claude, "command-discovery", FenceKind::None),
-            (Provider::Claude, "fresh-text", FenceKind::None),
-            (Provider::Claude, "approval", FenceKind::None),
-            (Provider::Claude, "resume", FenceKind::None),
-            (Provider::Claude, "attachment", FenceKind::None),
-            (Provider::Claude, "checklist", FenceKind::None),
-            (Provider::Claude, "checklist-resume", FenceKind::None),
-            (Provider::Codex, "model-discovery", FenceKind::None),
+            (Provider::Claude, "command-discovery", None, FenceKind::None),
+            (
+                Provider::Claude,
+                "fresh-text",
+                Some(scenarios::claude::fresh_text_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Claude,
+                "approval",
+                Some(scenarios::claude::approval_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Claude,
+                "resume",
+                Some(scenarios::claude::resume_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Claude,
+                "attachment",
+                Some(scenarios::claude::attachment_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Claude,
+                "checklist",
+                Some(scenarios::claude::checklist_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Claude,
+                "checklist-resume",
+                Some(scenarios::claude::checklist_resume_request),
+                FenceKind::None,
+            ),
+            (Provider::Codex, "model-discovery", None, FenceKind::None),
             (
                 Provider::Codex,
                 "model-discovery-neutral-cwd",
+                None,
                 FenceKind::None,
             ),
             (
                 Provider::Codex,
                 "model-discovery-project-cwd",
+                None,
                 FenceKind::None,
             ),
             (
                 Provider::Codex,
                 "model-discovery-logged-out",
+                None,
                 FenceKind::None,
             ),
-            (Provider::Codex, "fresh-text", FenceKind::None),
-            (Provider::Codex, "approval", FenceKind::CodexApproval),
+            (
+                Provider::Codex,
+                "fresh-text",
+                Some(scenarios::codex::fresh_text_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Codex,
+                "approval",
+                Some(scenarios::codex::approval_request),
+                FenceKind::CodexApproval,
+            ),
             (
                 Provider::Codex,
                 "approval-on-request",
+                Some(scenarios::codex::approval_on_request_request),
                 FenceKind::CodexApproval,
             ),
-            (Provider::Codex, "resume", FenceKind::None),
-            (Provider::Codex, "steer", FenceKind::None),
-            (Provider::Codex, "interruption", FenceKind::None),
+            (
+                Provider::Codex,
+                "resume",
+                Some(scenarios::codex::resume_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Codex,
+                "steer",
+                Some(scenarios::codex::steer_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Codex,
+                "interruption",
+                Some(scenarios::codex::interruption_request),
+                FenceKind::None,
+            ),
         ];
 
         let raw = tempfile::tempdir().unwrap();
         let mut covered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
         for spec in SCENARIOS {
+            covered.insert(format!("{:?}/{}", spec.provider, spec.name));
+            let (_, _, expected_builder, expected_fence) = EXPECTED_ROWS
+                .iter()
+                .find(|(provider, name, _, _)| *provider == spec.provider && *name == spec.name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{:?}/{}: no entry in EXPECTED_ROWS — add one so this row's wiring is \
+                         checked",
+                        spec.provider, spec.name
+                    )
+                });
+
+            // Fence wiring — every row, discovery and run alike.
             let provider_str = match spec.provider {
                 Provider::Claude => "claude",
                 Provider::Codex => "codex",
             };
-            covered.insert(format!("{:?}/{}", spec.provider, spec.name));
-
             let cfg = config(
                 spec.name,
                 PathBuf::from("provider"),
@@ -1269,8 +1194,7 @@ mod tests {
                 #[cfg(windows)]
                 creation_flags: 0,
             };
-
-            let actual = match (spec.fence)(spec, &cfg, &launch) {
+            let actual_fence = match (spec.fence)(spec, &cfg, &launch) {
                 Ok(_) => FenceKind::None,
                 Err(error) => {
                     assert!(
@@ -1285,33 +1209,113 @@ mod tests {
                     FenceKind::CodexApproval
                 }
             };
-
-            let (_, _, expected) = EXPECTED_FENCES
-                .iter()
-                .find(|(provider, name, _)| *provider == spec.provider && *name == spec.name)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{:?}/{}: no entry in EXPECTED_FENCES — add one so this row's fence is \
-                         checked",
-                        spec.provider, spec.name
-                    )
-                });
-
             assert_eq!(
-                actual, *expected,
+                actual_fence, *expected_fence,
                 "{:?}/{}: fence kind mismatch — the row is wired to a different fence than \
-                 EXPECTED_FENCES says it should be",
+                 EXPECTED_ROWS says it should be",
                 spec.provider, spec.name
             );
+
+            // Run-builder wiring and Run/Discovery agreement.
+            match (spec.launch, expected_builder) {
+                (ScenarioLaunch::Discovery(_), None) => continue,
+                (ScenarioLaunch::Discovery(_), Some(_)) => panic!(
+                    "{:?}/{}: EXPECTED_ROWS names a builder for this row but it is a Discovery \
+                     row — the row was flipped from Run without updating the table",
+                    spec.provider, spec.name
+                ),
+                (ScenarioLaunch::Run(_), None) => panic!(
+                    "{:?}/{}: this is a Run row but EXPECTED_ROWS names no builder for it — the \
+                     row was flipped from Discovery without updating the table",
+                    spec.provider, spec.name
+                ),
+                (ScenarioLaunch::Run(build_request), Some(expected_builder)) => {
+                    let input = ScenarioInput {
+                        resume_id: spec
+                            .requirements
+                            .needs_resume_id
+                            .then(|| "purity-loop-resume-id".to_owned()),
+                        attachment: spec
+                            .requirements
+                            .needs_attachment
+                            .then(|| PathBuf::from("tiny.png")),
+                        approval_target: spec
+                            .requirements
+                            .needs_approval_target
+                            .then(|| PathBuf::from("target-dir")),
+                        ..ScenarioInput::default()
+                    };
+
+                    let first = build_request(&input).unwrap_or_else(|err| {
+                        panic!(
+                            "{:?}/{}: first request-builder call failed: {err}",
+                            spec.provider, spec.name
+                        )
+                    });
+                    let second = build_request(&input).unwrap_or_else(|err| {
+                        panic!(
+                            "{:?}/{}: second request-builder call failed: {err}",
+                            spec.provider, spec.name
+                        )
+                    });
+                    assert_eq!(
+                        first, second,
+                        "{:?}/{}: calling the row's request builder twice with the same input \
+                         produced two different RunRequests — the builder is not pure",
+                        spec.provider, spec.name
+                    );
+
+                    let expected_request = expected_builder(&input).unwrap_or_else(|err| {
+                        panic!(
+                            "{:?}/{}: EXPECTED_ROWS' builder failed: {err}",
+                            spec.provider, spec.name
+                        )
+                    });
+                    assert_eq!(
+                        first, expected_request,
+                        "{:?}/{}: spec.launch's builder does not match the builder \
+                         EXPECTED_ROWS says this row should name — the row is wired to the \
+                         wrong builder",
+                        spec.provider, spec.name
+                    );
+
+                    let (exe, run_launch): (PathBuf, fn(&Path, &RunRequest) -> LaunchDescriptor) =
+                        match spec.provider {
+                            Provider::Claude => {
+                                (absolute_program("claude"), crate::claude::run_launch)
+                            }
+                            Provider::Codex => {
+                                (absolute_program("codex"), crate::codex::run_launch)
+                            }
+                        };
+                    let (derived, _request) = derive_launch(&spec.launch, &input, &exe, run_launch)
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "{:?}/{}: derive_launch failed: {err}",
+                                spec.provider, spec.name
+                            )
+                        });
+                    let expected = run_launch(&exe, &first);
+                    assert_eq!(
+                        CommandSnapshot::from_launch(&derived),
+                        CommandSnapshot::from_launch(&expected),
+                        "{:?}/{}: the launch record.rs's own derive_launch produced does not \
+                         match run_launch(exe, &first) — the row's launch and its request have \
+                         drifted apart",
+                        spec.provider,
+                        spec.name
+                    );
+                }
+            }
         }
 
-        let expected: std::collections::BTreeSet<String> = EXPECTED_FENCES
+        let expected: std::collections::BTreeSet<String> = EXPECTED_ROWS
             .iter()
-            .map(|(provider, name, _)| format!("{provider:?}/{name}"))
+            .map(|(provider, name, _, _)| format!("{provider:?}/{name}"))
             .collect();
         assert_eq!(
             covered, expected,
-            "every SCENARIOS row must have exactly one entry in EXPECTED_FENCES, and vice versa \
+            "every row in SCENARIOS must have exactly one entry in EXPECTED_ROWS, and vice versa \
              — a row missing here would otherwise leave the loop in silence"
         );
     }
@@ -1331,10 +1335,10 @@ mod tests {
         entries.remove(0)
     }
 
-    /// Task 3 (`2026-08-16-scenario-request-builders.md`): the twelve adapted purity/wiring
-    /// tests above (`every_run_rows_request_builder_is_pure_and_derives_its_own_launch`) prove a
-    /// row's builder is pure and that `derive_launch` faithfully turns its `RunRequest` into a
-    /// launch — but every oracle in that test is itself derived from the SAME source code this
+    /// Task 3 (`2026-08-16-scenario-request-builders.md`): the purity/wiring checks in the loop
+    /// above (`every_row_s_builder_and_fence_match_its_declared_wiring`) prove a row's builder is
+    /// pure and that `derive_launch` faithfully turns its `RunRequest` into a launch — but every
+    /// oracle in that test is itself derived from the SAME source code this
     /// task exists to check. This test compares against something none of that code can
     /// influence: the committed capture archive, frozen before this branch existed (`git diff
     /// 7d4e903..HEAD -- crates/harness/tests/corpus/` is empty) and explicitly protected by the
