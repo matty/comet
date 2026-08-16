@@ -1,5 +1,36 @@
 # D73 — the allowlist has seven paths that are really a tool-argument union, not a field each
 
+### Closed — resolution 1 was chosen: the seven lines are dropped
+
+Stage 6 promotion removed all seven paths from `claude.txt`:
+`.message.content[].input.status`, `.message.content[].input.taskId`,
+`.message.content[].input.type`, `.tool_use_result.matches[]`, `.tool_use_result.status`,
+`.tool_use_result.type`, `.tool_use_result.updatedFields[]`. Every one of them now redacts by
+the same default-deny rule as any other unlisted path — re-sanitized, the seven positions in the
+`checklist`/`checklist-resume` corpus that used to carry a literal (`"1"`, `"completed"`, …) now
+read `<Vn>` placeholders, confirmed directly against `events.jsonl`.
+
+The blocker recorded below — that dropping the lines breaks `corpus_frames.rs`'s
+`task_update_splits_status_change_and_active_form_across_two_frames` and
+`a_resumed_run_updates_a_task_it_never_created` — was real, not already closed: each test's own
+doc comment claimed a placeholder-identity rewrite that the code did not actually contain, and
+both failed with a genuine literal-vs-placeholder mismatch the first time this promotion ran them
+against the re-sanitized corpus. Fixed here: the first now joins through
+`.tool_use_result.task.id` (TaskCreate's own result, never one of the seven, still literal); the
+second has no such literal to cross-check against (its task predates the resume), so it joins two
+update calls' `input.taskId` placeholders against each other instead. Both pass against the
+re-sanitized corpus; quoted failure and pass are in the promotion report.
+
+Resolution 2 (gating the seven lines on the sibling tool-name value) was not needed: nothing
+today depends on the literal survives, so the clean default-deny fix was strictly cheaper once
+its former blocker was removed.
+
+The reasoning below — why the paths were a union in the first place, and why the sheet and the
+`mcp__` value rule couldn't catch a sixth tool landing on them — is kept for whoever next
+considers allowlisting a tool-argument path instead of a specific field.
+
+---
+
 **Not a defect in the Task 2 allowlist redactor — a residual of choosing a path-based allowlist
 at all.** Filed by the Task 2 review (2026-08-15) rather than fixed, because closing it today
 breaks a stage-1 corpus assertion and the specific risk below — an *unreviewed* tool landing on
