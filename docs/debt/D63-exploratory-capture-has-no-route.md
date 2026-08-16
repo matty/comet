@@ -37,7 +37,7 @@ the manifest's own `source` field:
 > `captures/2026-08-13-plan-todo-subagent/drive_claude_plan.py raw capture
 > (corpus-subagent-2.1.229.jsonl), hand-sanitized for slice 4.2 task 9`
 
-No test asserts against that entry's frames — only the generated field snapshot enumerates
+No test asserts against that entry's frames — only the generated capability sheet enumerates
 them, which checks what fields exist and nothing about their values — which is what keeps it
 harmless: nothing depends on the hand-sanitization being correct. (It was additionally
 protected by the corpus validator's reciprocal claim checks until those were removed on

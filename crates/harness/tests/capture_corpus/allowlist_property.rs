@@ -13,8 +13,7 @@
 //!
 //! **Scope: `events.jsonl` only, not the whole corpus directory.** A handful
 //! of committed files were never in `sanitize_dir`'s remit and this walk does
-//! not visit them: `observed-fields.json` (a generated field-name snapshot,
-//! not evidence), each scenario's `README.md`, and
+//! not visit them: each scenario's `README.md`, and
 //! `claude/2.1.229/subagent/read-back-run-journal.jsonl` /
 //! `read-back-doc-snapshot.json` (a *different* session's read-back evidence,
 //! hand-sanitized by an earlier slice to its own documented standard -- see
@@ -138,8 +137,9 @@ fn every_committed_value_is_allowlisted_or_a_placeholder() {
 ///
 /// Split from the scalar property rather than folded into it because the two
 /// answer different questions. A key that is a *field name* is published on
-/// purpose — `observed-fields.json` is a snapshot of exactly those names, and
-/// this walk must not be read as licensing their redaction. A key that is
+/// purpose — each version's capability sheet under `docs/providers/` is a
+/// snapshot of exactly those names, and this walk must not be read as
+/// licensing their redaction. A key that is
 /// *data* is an identifier the archive has no more business publishing than a
 /// value, and until the key rule landed nothing checked it: `collect_scalars`
 /// visits `String`/`Number` leaves, so an MCP server name in key position was

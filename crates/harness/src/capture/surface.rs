@@ -41,6 +41,12 @@ pub struct FrameRef {
 #[derive(Clone, Debug)]
 pub struct FieldObservation {
     pub provider: String,
+    /// The CLI version the observation came from — a directory name under
+    /// `provider/` in the corpus, e.g. `2.1.229`. Carried so the inventory can
+    /// be filtered to exactly one version's surface; without it, the same
+    /// field seen in two versions collapses into a single entry and a sheet
+    /// can no longer show what changed between them (§2.1).
+    pub version: String,
     /// Dotted path from the frame root. `[]` is an array element and `{}` is a
     /// map entry, so `.modelUsage.{}.costUSD` names a field and not a model id.
     pub path: String,
@@ -74,7 +80,119 @@ pub enum SurfaceError {
 /// already agreed is data.
 pub const MAP_PATHS: &[&str] = &[".modelUsage"];
 
+/// Discriminator paths whose observed *values* form a provider's vocabulary —
+/// not every field, only the ones whose few distinct values answer "what
+/// kinds of thing does this harness say" (design §3.5, SNAPSHOT). `.type`
+/// names a frame's own kind; `.subtype` narrows it further for `system` and
+/// `result` frames; `.request.subtype` and `.response.subtype` do the same
+/// one level down, inside Claude's control-protocol envelope; `.event.type`
+/// narrows a streamed `stream_event`; `.method` is Codex's frame kind; and
+/// the remaining two name which tool ran.
+///
+/// Declared rather than inferred, for the reason [`MAP_PATHS`] is: "this
+/// field has few distinct values" is a property of a small corpus, not of
+/// the protocol, and a set built by scanning today's captures for
+/// low-cardinality fields would silently stop growing the day a genuinely
+/// new value arrived — inference already trusts whatever it has seen.
+///
+/// Found by grepping the committed corpus, not guessed:
+///
+/// - `.type` — Claude's frame kind: `assistant`, `control_request`,
+///   `control_response`, `rate_limit_event`, `result`, `stream_event`,
+///   `system`, `user`.
+/// - `.subtype` — narrows a `system` frame (`init`, `status`, `hook_started`,
+///   `hook_response`, `thinking_tokens`, `task_started`, `task_progress`,
+///   `task_updated`, `task_notification`, `background_tasks_changed` — ten
+///   values, 126 frames) or a `result` frame (`success` — one value, 7
+///   frames). `success` is a `result` subtype, not a `system` one; the two
+///   `.type`s never share a `.subtype` value in the committed corpus.
+/// - `.request.subtype`, `.response.subtype` — one level below `.subtype`,
+///   inside the `control_request`/`control_response` envelope's own
+///   `request`/`response` object, so a bare `.subtype` match never sees
+///   them. The control protocol is bidirectional, so both paths carry a
+///   genuinely different vocabulary per [`Direction`]: `.request.subtype`
+///   is `initialize` when Comet opens the request (`ToProvider`) and
+///   `can_use_tool` when Claude Code does (`FromProvider`);
+///   `.response.subtype` is `success` on both sides, but one `success` is
+///   Comet's reply to `can_use_tool` and the other is Claude Code's reply to
+///   `initialize` — the same string, unrelated occurrences, exactly what
+///   direction-keying exists to keep apart. `success` here is also not the
+///   `result`-frame `.subtype` above — same string, unrelated discriminator,
+///   which is exactly why leaf-name matching is refused elsewhere in this
+///   codebase. `.type` alone only says a frame is a `control_request`;
+///   `.request.subtype` says *which* request, and `can_use_tool` is the one
+///   Comet's entire approval surface hangs on — added 2026-08-16 after being
+///   missed the same way `.method` was: the declared set looked complete
+///   because Claude's sheet was non-empty without it, not because nothing
+///   was missing.
+/// - `.event.type` — the frame kind carried inside a streamed
+///   `stream_event`'s `event` object (`content_block_start`,
+///   `message_delta`, …); distinct from `.type` because a `stream_event`
+///   frame's own `.type` is always the literal string `stream_event`.
+/// - `.message.content[].name` — a tool's name in a buffered `assistant`
+///   message's content array. Observed values include `Bash`, `Write`,
+///   `Skill`, `TaskCreate`, `ToolSearch`, `Agent`.
+/// - `.event.content_block.name` — the same tool name, streamed: it appears
+///   on the `content_block_start` event that precedes the buffered form
+///   above, with the identical vocabulary.
+/// - `.method` — **not a Claude-shaped discriminator; added 2026-08-16.**
+///   Codex is JSON-RPC and carries no root `.type`/`.subtype`/`.event.type`
+///   at all, so without this path Codex's vocabulary was entirely empty
+///   despite the corpus exercising 22 distinct methods
+///   (`thread/start`, `turn/completed`, `item/agentMessage/delta`, …). This
+///   is not the archive's documented absence-blind-spot (design §5) — these
+///   captures exercised plenty; the declared set was simply Claude-shaped.
+///   Stage 3's allowlist ledger already names `.method` as "the vocabulary
+///   the stage-5 capability sheet reads", which is why `.method` is on
+///   `allowlist/codex.txt` even though this const didn't read it until now.
+///
+/// **No Codex tool-name path is declared.** Codex's turn items carry a kind
+/// at `.params.item.type` (`agentMessage`, `reasoning`, `userMessage`, …),
+/// but no scenario in the committed corpus exercises a Codex tool call — no
+/// `command_execution`, no MCP tool item, anywhere in `codex/0.147.0/` — so
+/// there is no real dotted form to read off the evidence. Declaring one
+/// without a capture backing it is exactly the guess this list exists to
+/// refuse.
+pub const VOCABULARY_PATHS: &[&str] = &[
+    ".type",
+    ".subtype",
+    ".request.subtype",
+    ".response.subtype",
+    ".event.type",
+    ".method",
+    ".message.content[].name",
+    ".event.content_block.name",
+];
+
+/// Distinct scalar values seen at each [`VOCABULARY_PATHS`] entry, keyed by
+/// `(provider, version, direction)` — matching the field inventory's key
+/// exactly, not folding direction away. For Codex `.method` the two
+/// directions are different vocabularies: what Comet can *drive* the CLI
+/// with (`thread/start`, `turn/steer`, …) versus what the CLI *emits*
+/// (`turn/completed`, `item/agentMessage/delta`, …). Merging them would
+/// misreport both — the same reasoning [`Direction`]'s own doc comment makes
+/// for fields applies with more force to a discriminator.
+pub type Vocabulary = BTreeMap<(String, String, Direction), BTreeMap<String, BTreeSet<String>>>;
+
 pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, SurfaceError> {
+    Ok(observe_surface(corpus_root)?.0)
+}
+
+/// The value vocabulary for every version in the corpus. Walks the same
+/// evidence [`observe_corpus`] does — see [`observe_surface`] — so a value
+/// collected here is a value some promoted capture actually contains.
+pub fn observe_vocabulary(corpus_root: &Path) -> Result<Vocabulary, SurfaceError> {
+    Ok(observe_surface(corpus_root)?.1)
+}
+
+/// Both the field inventory and the value vocabulary from one pass over the
+/// archive. A sheet needs both, and calling [`observe_corpus`] and
+/// [`observe_vocabulary`] separately would walk the same ~800 committed
+/// frames twice for no reason — this is the entry point a renderer should
+/// use; the other two exist for a caller that only wants one half.
+pub fn observe_surface(
+    corpus_root: &Path,
+) -> Result<(Vec<FieldObservation>, Vocabulary), SurfaceError> {
     let scenarios = promoted_scenarios(corpus_root)?;
     if scenarios.is_empty() {
         return Err(SurfaceError::EmptyCorpus {
@@ -82,7 +200,9 @@ pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, Surfa
         });
     }
 
-    let mut inventory: BTreeMap<(String, Direction, String), FieldObservation> = BTreeMap::new();
+    let mut inventory: BTreeMap<(String, String, Direction, String), FieldObservation> =
+        BTreeMap::new();
+    let mut vocabulary: Vocabulary = BTreeMap::new();
     for scenario in scenarios {
         let events =
             std::fs::read_to_string(scenario.directory.join("events.jsonl")).map_err(|_| {
@@ -121,6 +241,7 @@ pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, Surfa
             };
             let mut visit = Visit {
                 inventory: &mut inventory,
+                vocabulary: &mut vocabulary,
                 scenario: &scenario,
                 direction,
                 sequence,
@@ -129,7 +250,7 @@ pub fn observe_corpus(corpus_root: &Path) -> Result<Vec<FieldObservation>, Surfa
         }
     }
 
-    Ok(inventory.into_values().collect())
+    Ok((inventory.into_values().collect(), vocabulary))
 }
 
 struct PromotedScenario {
@@ -137,6 +258,7 @@ struct PromotedScenario {
     /// `provider/version/scenario`.
     label: String,
     provider: String,
+    version: String,
 }
 
 fn promoted_scenarios(corpus_root: &Path) -> Result<Vec<PromotedScenario>, SurfaceError> {
@@ -159,6 +281,7 @@ fn promoted_scenarios(corpus_root: &Path) -> Result<Vec<PromotedScenario>, Surfa
                 scenarios.push(PromotedScenario {
                     label: format!("{provider_name}/{version_name}/{scenario_name}"),
                     provider: provider_name.clone(),
+                    version: version_name.clone(),
                     directory: scenario,
                 });
             }
@@ -185,7 +308,8 @@ fn file_name(path: &Path) -> String {
 }
 
 struct Visit<'a> {
-    inventory: &'a mut BTreeMap<(String, Direction, String), FieldObservation>,
+    inventory: &'a mut BTreeMap<(String, String, Direction, String), FieldObservation>,
+    vocabulary: &'a mut Vocabulary,
     scenario: &'a PromotedScenario,
     direction: Direction,
     sequence: u64,
@@ -216,6 +340,17 @@ impl Visit<'_> {
                     self.walk(child, child_path);
                 }
             }
+            // A leaf. Only a declared discriminator path's value is worth
+            // remembering, and only as a scalar — `Object` and `Array`
+            // already matched above and can never reach here, so a shape
+            // change at a declared path (the value stops being a leaf)
+            // silently stops contributing to the vocabulary instead of
+            // being stringified into it.
+            scalar if VOCABULARY_PATHS.contains(&path.as_str()) => {
+                if let Some(value) = scalar_string(scalar) {
+                    self.record_vocabulary(&path, value);
+                }
+            }
             _ => {}
         }
     }
@@ -223,6 +358,7 @@ impl Visit<'_> {
     fn record(&mut self, path: &str) {
         let key = (
             self.scenario.provider.clone(),
+            self.scenario.version.clone(),
             self.direction,
             path.to_owned(),
         );
@@ -230,6 +366,7 @@ impl Visit<'_> {
             .entry(key)
             .or_insert_with(|| FieldObservation {
                 provider: self.scenario.provider.clone(),
+                version: self.scenario.version.clone(),
                 path: path.to_owned(),
                 direction: self.direction,
                 first_seen: FrameRef {
@@ -238,18 +375,31 @@ impl Visit<'_> {
                 },
             });
     }
+
+    fn record_vocabulary(&mut self, path: &str, value: String) {
+        self.vocabulary
+            .entry((
+                self.scenario.provider.clone(),
+                self.scenario.version.clone(),
+                self.direction,
+            ))
+            .or_default()
+            .entry(path.to_owned())
+            .or_default()
+            .insert(value);
+    }
 }
 
-/// Every observed field as `provider direction path`, the snapshot's line form.
-pub fn observed_field_lines(observations: &[FieldObservation]) -> BTreeSet<String> {
-    observations
-        .iter()
-        .map(|observation| {
-            let direction = match observation.direction {
-                Direction::ToProvider => "to-provider",
-                Direction::FromProvider => "from-provider",
-            };
-            format!("{} {direction} {}", observation.provider, observation.path)
-        })
-        .collect()
+/// A JSON scalar's value as vocabulary text, or `None` for `null` — which is
+/// "no value", not a value worth recording. `Object` and `Array` are
+/// unreachable through [`Visit::walk`]'s leaf arm but are handled here too,
+/// so this function stays correct on its own terms rather than by relying on
+/// its one caller.
+fn scalar_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        Value::Null | Value::Object(_) | Value::Array(_) => None,
+    }
 }

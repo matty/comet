@@ -126,32 +126,39 @@ a path to one of those files is a decision to publish that field's values foreve
 repository, and `docs/testing/provider-captures.md` is the review procedure for making that call.
 
 **Field names are published on purpose; map keys are not.** A key that names a field survives
-sanitizing — `observed-fields.json` is a snapshot of exactly those names. A key that *is* data,
-under a path declared in `surface::MAP_PATHS`, redacts by default like a value. Declaring a new
-map is one edit serving both: the surface snapshot stops recording the key as a field, and the
-sanitizer stops publishing it. A map nobody declared still publishes its keys (D77).
+sanitizing — each promoted version's capability sheet (below) is a snapshot of exactly those
+names. A key that *is* data, under a path declared in `surface::MAP_PATHS`, redacts by default
+like a value. Declaring a new map is one edit serving both: the sheet stops recording the key as
+a field, and the sanitizer stops publishing it. A map nobody declared still publishes its keys
+(D77).
 
-`crates/harness/tests/corpus/observed-fields.json` is a generated snapshot of every field the
-promoted corpus shows, per provider and direction. It exists for one reason: a newly promoted
-capture, or a new CLI version's added field, **fails the suite** instead of arriving unnoticed.
-Grep it before assuming a field does not exist.
+`docs/providers/<provider>-<version>.md` is a generated **capability sheet**, one per corpus
+version directory (`claude-2.1.228.md`, `claude-2.1.229.md`, `codex-0.147.0.md` today): every
+dotted field path the promoted corpus shows for that version, split by direction; the observed
+value vocabulary for a small declared set of discriminator paths (`.type`, `.method`, the
+tool-name paths, …); and the exact scenario list — argv, cwd and configured environment — the
+evidence was drawn from. It exists for the reason the deleted field snapshot did: a newly
+promoted capture, or a new CLI version's added or removed field, **fails the golden test**
+(`crates/harness/tests/capture_corpus/capability_sheets.rs`) instead of arriving unnoticed. Grep
+`docs/providers/` before assuming a field does not exist — and if you need to know whether a
+field is actually *read*, grep the decode sources instead; the sheet records that a field is
+present, never whether Comet consumes it.
 
-Regenerate after promoting a capture, read what the failure listed, and commit the result:
+**`git diff docs/providers/claude-2.1.228.md docs/providers/claude-2.1.229.md` is the
+version-change report.** No differ is built or planned: the sheets are generated markdown, so
+diffing two of them is the whole mechanism. Regenerate after promoting a capture, read what the
+failing golden test named, and commit the result in the same change that promotes the capture:
 
 ```powershell
-$env:COMET_UPDATE_SURFACE = "1"; cargo test -p comet-harness --test capture_corpus observed_fields
+$env:COMET_UPDATE_SHEETS = "1"; cargo test -p comet-harness --test capture_corpus
 ```
 
-**The snapshot records no opinion about a field** — not whether Comet reads it, not what it
-would cost to. An earlier version did, in a four-state record with a validator and two generated
-reports; of 655 entries it held 7 human decisions, and every "consumed" marking came from
-matching the field's leaf name against the decode sources, which counted
-`.message.diagnostics.cache_miss_reason.type` as read because something names `type`. Removed in
-favour of the part that can fail for a real reason. If you need to know whether a field is read,
-grep the decode sources — that is what the machine was doing anyway, less accurately.
-
-**Its blind spot is absence.** It reports fields that are present; a capability no capture ever
-exercised cannot appear in it at all. Procedure is in `docs/testing/provider-captures.md`.
+**Its blind spot is absence.** A sheet reports fields and vocabulary values that are present; a
+capability no capture ever exercised cannot appear in it at all. The sheet makes that limit more
+visible than the deleted snapshot did, not less, because it prints the scenario list it speaks
+from: before reading a field or value's absence as the CLI lacking a capability, check whether
+any scenario in that same sheet would even have produced it. Procedure is in
+`docs/testing/provider-captures.md`.
 
 `crates/harness/src/capture/` is test tooling and nothing in it is on the runtime path. The
 one thing production shares with it is `crates/harness/src/launch.rs` — the process-launch

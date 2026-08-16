@@ -24,12 +24,15 @@ unrelated same-named field elsewhere in the payload), these seven paths already 
 .tool_use_result.updatedFields[]    ["status"] | ["activeForm","status"] — TaskUpdate
 ```
 
-`observed-fields.json` independently shows the same pattern one level up: `.tool_use_result` is a
-union across tools sharing one path prefix (`.filePath`, `.stdout`, `.structuredPatch`, `.query`,
-`.prompt` all appear there, one tool's field at a time). Each of the seven lines above was reviewed
-against the values these five tools produce. But the path itself does not belong to any one of
-them — it belongs to whichever tool is in flight, and nothing stops a **sixth** tool, including a
-third party's MCP tool whose argument schema Comet does not control and has never captured, from
+Each version's capability sheet independently shows the same pattern one level up:
+`.tool_use_result` is a union across tools sharing one path prefix — `docs/providers/claude-2.1.228.md`
+shows `.filePath`, `.stdout` and `.structuredPatch` there, and `docs/providers/claude-2.1.229.md`
+shows `.query` and `.prompt`, one tool's field at a time, now split across two version-keyed
+sheets rather than merged into the single file the deleted snapshot used to show them in. Each of
+the seven lines above was reviewed against the values these five tools produce. But the path
+itself does not belong to any one of them — it belongs to whichever tool is in flight, and
+nothing stops a **sixth** tool, including a third party's MCP tool whose argument schema Comet
+does not control and has never captured, from
 landing on the same already-approved path. The five tools above are the reviewed, bounded case;
 an MCP tool's arguments are the unbounded one. A future capture that exercises a genuinely new
 tool puts that tool's field **at the same path**, and the allowlist, being path-keyed, has no way
@@ -37,15 +40,26 @@ to notice the field's *meaning* — and its *reviewer* — changed underneath it
 
 ## Why the surface gate cannot catch this
 
-`crates/harness/tests/capture_corpus/surface_map.rs` (the "new-field gate",
-`docs/testing/provider-captures.md`) fails a promotion when the corpus shows a *path* it has
-never seen before. That is exactly the wrong granularity for this risk: the seven paths above
-already exist in `observed-fields.json`. A new capture that puts an MCP tool's `input.status`
-value there is not a new path — it is the *same* path with different meaning, which the gate was
-never built to distinguish. The gate's blind spot ("it reports fields that are present; a
-capability no capture ever exercised cannot appear in it at all" — `AGENTS.md`, "What the
-providers send") is exactly this: the field is present today, under a narrower meaning than the
-path actually carries.
+The gate is `crates/harness/tests/capture_corpus/capability_sheets.rs`'s golden test,
+`every_corpus_version_matches_its_committed_sheet` (see `docs/testing/provider-captures.md`),
+which fails a promotion when the corpus renders a sheet whose Fields section differs from the one
+committed — including a *path* it has never rendered before. (`surface_map.rs` is not the gate:
+it holds unit tests of the walker `observe_surface`, and gates nothing on its own.) That is
+exactly the wrong granularity for this risk: all seven paths above are already present in the
+evidence `claude-2.1.229.md` renders (one of them, `.tool_use_result.type`, also in
+`claude-2.1.228.md`; none in `codex-0.147.0.md`, which carries no Claude-shaped evidence at all —
+version-splitting the sheet is exactly what makes "every committed sheet" the wrong thing to say
+here, where the deleted, version-merging `observed-fields.json` would have made it true). Two of
+the seven — `.tool_use_result.matches[]` and `.tool_use_result.updatedFields[]` — do not appear in
+the sheet under that exact spelling: the Fields section shows `.tool_use_result.matches` and
+`.tool_use_result.updatedFields`, without the trailing `[]` the allowlist writes for the same
+field. `docs/testing/provider-captures.md`'s capability-sheet section explains why; the field is
+present either way. A new capture that puts an MCP tool's `input.status` value there is not a new
+path — it is the *same* path with different meaning, which the gate was never built to
+distinguish. The sheet's own blind spot ("A sheet reports fields and vocabulary values that are
+present; a capability no capture ever exercised cannot appear in it at all" — `AGENTS.md`, "What
+the providers send") is exactly this: the field is present today, under a narrower meaning than
+the path actually carries.
 
 ## Why the `mcp__` value rule doesn't help either
 
@@ -73,6 +87,30 @@ into a placeholder and break both assertions — a real regression in already-pr
 already-relied-on tests, for a risk (an *unreviewed* tool landing on one of these paths) that has
 not happened in any committed capture. That is why this is a deferred decision, not a same-task
 fix.
+
+## What changed since this was filed: the sheet's tool-name vocabulary
+
+The stage-5 capability sheet (`docs/providers/<provider>-<version>.md`, rendered by
+`crates/harness/src/capture/sheet.rs`) gives this risk a partial, automatic signal it did not
+have when this page was filed — **not a fix, and not D73's resolution.**
+
+`VOCABULARY_PATHS` (`crates/harness/src/capture/surface.rs`) declares `.message.content[].name`
+and `.event.content_block.name` — the tool-name-at-invocation paths — among its discriminators,
+so each version's sheet prints the exact set of tool names its corpus observed invoked, sorted,
+under its Vocabulary section (`Bash`, `Skill`, `Write` in the committed `claude-2.1.228.md`). A
+sixth tool arriving in a newly promoted capture — including a third-party MCP tool spelled
+`mcp__<server>__<tool>` — adds a new value to that list. Because the golden test
+(`every_corpus_version_matches_its_committed_sheet`,
+`crates/harness/tests/capture_corpus/capability_sheets.rs`) fails on any byte difference from the
+committed sheet, that new value fails the suite at promotion time rather than arriving silently
+— exactly the event this page names as uncaught by every other gate.
+
+**What this does not do:** it names that a new tool *arrived*, not that it landed content on one
+of the seven union paths this page is about, and it says nothing about whether that content is
+safe to allowlist. The reviewer still has to open the archive, follow the new tool name to its
+`.message.content[].input.*` and `.tool_use_result.*` fields, and make the same judgment this page
+defers. The resolution below is unchanged; this is a trigger a reviewer can now see coming, not an
+answer to the question it raises.
 
 ## What has to happen before it can stay deferred any longer
 
