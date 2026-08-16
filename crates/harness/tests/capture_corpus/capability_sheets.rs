@@ -274,26 +274,59 @@ fn compare_all_versions(corpus_root: &Path, docs_root: &Path) -> Vec<String> {
         }
     }
 
-    if let Ok(entries) = std::fs::read_dir(docs_root) {
-        let mut orphans: Vec<String> = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
-            .map(|path| file_name(&path))
-            .filter(|name| !expected_sheets.contains(name))
-            .collect();
-        orphans.sort();
-        for orphan in orphans {
-            failures.push(format!(
-                "{} describes a (provider, version) the corpus at {} no longer has — delete it, \
-                 or restore the corpus directory it documents",
-                docs_root.join(&orphan).display(),
-                corpus_root.display()
-            ));
+    match std::fs::read_dir(docs_root) {
+        Ok(entries) => {
+            let mut orphans: Vec<String> = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .map(|path| file_name(&path))
+                .filter(|name| looks_like_a_sheet_filename(name))
+                .filter(|name| !expected_sheets.contains(name))
+                .collect();
+            orphans.sort();
+            for orphan in orphans {
+                failures.push(format!(
+                    "{} describes a (provider, version) the corpus at {} no longer has — \
+                     delete it, or restore the corpus directory it documents",
+                    docs_root.join(&orphan).display(),
+                    corpus_root.display()
+                ));
+            }
         }
+        // The orphan scan is a detection mechanism; a directory it silently
+        // skipped would read as "no orphans" rather than "did not check" —
+        // the same shape this project keeps getting bitten by (D77's
+        // neighbourhood in docs/debt/README.md is the general case).
+        Err(error) => failures.push(format!(
+            "{} could not be read ({error}); the orphaned-sheet check could not run",
+            docs_root.display()
+        )),
     }
 
     failures
+}
+
+/// Whether `name` looks like a generated sheet's own filename
+/// (`claude-2.1.229.md`, `codex-0.147.0.md`) rather than merely any `.md`
+/// file that happens to sit in `docs/providers/`. A `README.md` placed
+/// there must not be treated as an orphaned sheet — the filename-shape
+/// check is what tells the two apart, so a non-sheet file fails (if it
+/// fails at all) with a message about what it actually is, not a claim
+/// that it names a `(provider, version)` the corpus no longer has.
+///
+/// A sheet's stem always splits at its *last* hyphen into a non-empty
+/// provider name and a version that starts with a digit — true of every
+/// promoted version directory (`2.1.228`, `2.1.229`, `0.147.0`) and false
+/// of `README` (no hyphen at all) or any other prose filename a reader
+/// might drop beside the generated sheets.
+fn looks_like_a_sheet_filename(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".md") else {
+        return false;
+    };
+    let Some((provider, version)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    !provider.is_empty() && version.starts_with(|c: char| c.is_ascii_digit())
 }
 
 /// Break caught: every version's generated sheet must match its committed
@@ -446,5 +479,61 @@ fn first_difference_reports_a_line_ending_only_mismatch() {
     assert_eq!(
         first_difference("a\n", "a\r\n"),
         "content matches but bytes differ (e.g. trailing newline or line ending)"
+    );
+}
+
+/// Break caught (Task 5 review): the orphan scan used to flag every `.md`
+/// file under `docs/providers/`, not just ones shaped like a generated
+/// sheet's own filename — a `README.md` dropped in that directory would
+/// have failed the golden test with a message claiming it "describes a
+/// (provider, version) the corpus no longer has," which is the wrong
+/// problem entirely. `looks_like_a_sheet_filename` is what tells the two
+/// apart; reverting it to a bare `.md`-extension check makes this fail.
+#[test]
+fn a_non_sheet_file_in_docs_root_is_not_reported_as_an_orphan() {
+    let corpus = tempfile::tempdir().unwrap();
+    write_minimal_scenario(corpus.path(), "claude", "9.9.9", "smoke");
+    let docs = tempfile::tempdir().unwrap();
+
+    // Seed the sheet the corpus actually needs, so a real orphan or
+    // mismatch cannot be what makes the assertion below pass.
+    let (observations, vocabulary) = observe_surface(corpus.path()).unwrap();
+    let expected = render_version(&observations, &vocabulary, corpus.path(), "claude", "9.9.9");
+    std::fs::write(docs.path().join("claude-9.9.9.md"), expected).unwrap();
+
+    // Not shaped like a sheet: no `<provider>-<version>.md` split at all.
+    std::fs::write(docs.path().join("README.md"), "# providers\n").unwrap();
+
+    let failures = compare_all_versions(corpus.path(), docs.path());
+
+    assert!(
+        failures.is_empty(),
+        "a file whose name isn't shaped like a generated sheet must not be reported as an \
+         orphan: {failures:?}"
+    );
+}
+
+/// Break caught (Task 5 review): the orphan scan used to silently no-op
+/// when `docs_root` itself could not be read (`if let Ok(entries) = ...`),
+/// the swallowed-`Err` shape this project keeps getting bitten by — a
+/// check whose whole purpose is detection must report that it could not
+/// run, not read as "nothing to report." Uses a plain file rather than a
+/// missing or permission-locked directory so `read_dir` fails the same
+/// portable way on Windows and Linux.
+#[test]
+fn an_unreadable_docs_root_is_reported_not_swallowed() {
+    let corpus = tempfile::tempdir().unwrap();
+    write_minimal_scenario(corpus.path(), "claude", "9.9.9", "smoke");
+    let not_a_directory = tempfile::tempdir().unwrap();
+    let file_path = not_a_directory.path().join("not-a-directory");
+    std::fs::write(&file_path, b"").unwrap();
+
+    let failures = compare_all_versions(corpus.path(), &file_path);
+
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.contains("orphaned-sheet check could not run")),
+        "an unreadable docs_root must be reported, not silently skipped: {failures:?}"
     );
 }

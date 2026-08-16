@@ -136,8 +136,8 @@ fn header_lines(provider: &str, version: &str) -> Vec<String> {
          event fired in both. And a field or value that is new in one version is not \
          necessarily a new capability — it can be account or environment state that simply \
          did not happen to occur during the other version's runs, not a wire-format \
-         change. Argv and scenario names narrow what to check; they do not settle it on \
-         their own."
+         change. Argv, cwd, env and scenario names narrow what to check; they do not \
+         settle it on their own."
             .to_owned(),
         String::new(),
     ]
@@ -154,13 +154,17 @@ fn scenario_lines(scenarios: &[SheetScenario]) -> Vec<String> {
          otherwise support — this list is what makes that limit visible instead of silent. \
          A distinct name is not proof of distinct coverage, either, and a matching argv is \
          not proof of an identical launch: two scenarios can print the same argv and still \
-         set different environment variables — a redaction placeholder cannot separate two \
-         scenarios whose real value redacted to the same token, but its presence in one \
-         scenario's env line and its absence from another's is real evidence a claim of \
-         identical launches must survive. Compare the whole block — argv, cwd and env \
-         together — before concluding two scenarios were launched identically, and compare \
-         it again before concluding two with the same purpose sentence tested the same \
-         thing — trusting the name or the purpose alone is not enough either way."
+         set different environment variables, and its presence in one scenario's env line \
+         and its absence from another's is real evidence a claim of identical launches \
+         must survive. Compare the whole block — argv, cwd and env together — before \
+         concluding two scenarios were launched identically, and compare it again before \
+         concluding two with the same purpose sentence tested the same thing — trusting \
+         the name or the purpose alone is not enough either way. Even a whole-block \
+         comparison is not a sufficiency test, though: a redaction placeholder cannot \
+         separate two scenarios whose real value redacted to the same token, so two \
+         blocks that read byte-identical in every field can still have been launched \
+         with genuinely different values underneath — the archive's placeholders prove a \
+         difference when they show one, never that there wasn't one when they don't."
             .to_owned(),
         String::new(),
     ];
