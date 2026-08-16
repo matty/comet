@@ -257,10 +257,18 @@ enum ShellFocusFallback {
     ShellRoot,
 }
 
-fn shell_focus_fallback(route: Route) -> ShellFocusFallback {
+fn shell_focus_fallback(
+    route: Route,
+    has_focused_node: bool,
+    shell_root_is_focused: bool,
+) -> Option<ShellFocusFallback> {
     match route {
-        Route::Chat => ShellFocusFallback::Composer,
-        Route::Settings(_) => ShellFocusFallback::ShellRoot,
+        Route::Chat if !has_focused_node || shell_root_is_focused => {
+            Some(ShellFocusFallback::Composer)
+        }
+        Route::Chat => None,
+        Route::Settings(_) if !has_focused_node => Some(ShellFocusFallback::ShellRoot),
+        Route::Settings(_) => None,
     }
 }
 
@@ -4094,16 +4102,22 @@ impl Render for Shell {
         // the focused element unmounted), route it back there.
         if self.focus_sub.is_none() {
             self.focus_sub = Some(cx.on_focus_lost(window, |this: &mut Shell, window, cx| {
-                match shell_focus_fallback(this.route) {
-                    ShellFocusFallback::Composer => {
+                match shell_focus_fallback(this.route, false, false) {
+                    Some(ShellFocusFallback::Composer) => {
                         window.focus(&this.composer.focus_handle(cx), cx)
                     }
-                    ShellFocusFallback::ShellRoot => window.focus(&this.shell_focus, cx),
+                    Some(ShellFocusFallback::ShellRoot) => window.focus(&this.shell_focus, cx),
+                    None => {}
                 }
             }));
         }
-        if matches!(gate, GatePhase::Ready) && window.focused(cx).is_none() {
-            match shell_focus_fallback(self.route) {
+        let has_focused_node = window.focused(cx).is_some();
+        let shell_root_is_focused = self.shell_focus.is_focused(window);
+        if matches!(gate, GatePhase::Ready)
+            && let Some(fallback) =
+                shell_focus_fallback(self.route, has_focused_node, shell_root_is_focused)
+        {
+            match fallback {
                 ShellFocusFallback::Composer => window.focus(&self.composer.focus_handle(cx), cx),
                 ShellFocusFallback::ShellRoot => window.focus(&self.shell_focus, cx),
             }
@@ -4448,13 +4462,26 @@ mod tests {
     #[test]
     fn shell_focus_fallback_routes_chat_to_composer_and_settings_to_shell_root() {
         assert_eq!(
-            shell_focus_fallback(Route::Chat),
-            ShellFocusFallback::Composer
+            shell_focus_fallback(Route::Chat, false, false),
+            Some(ShellFocusFallback::Composer)
         );
+        assert_eq!(
+            shell_focus_fallback(Route::Chat, true, true),
+            Some(ShellFocusFallback::Composer)
+        );
+        assert_eq!(shell_focus_fallback(Route::Chat, true, false), None);
         for section in SettingsSection::ALL {
             assert_eq!(
-                shell_focus_fallback(Route::Settings(section)),
-                ShellFocusFallback::ShellRoot
+                shell_focus_fallback(Route::Settings(section), false, false),
+                Some(ShellFocusFallback::ShellRoot)
+            );
+            assert_eq!(
+                shell_focus_fallback(Route::Settings(section), true, true),
+                None
+            );
+            assert_eq!(
+                shell_focus_fallback(Route::Settings(section), true, false),
+                None
             );
         }
     }
