@@ -75,7 +75,7 @@ fn model_entry(
     levels: &[&str],
     modalities: Option<&[&str]>,
 ) -> Value {
-    // Objects, not strings, per `codex/0.147.0/model-discovery` frame 6 — the
+    // Objects, not strings, per `tests/corpus/codex/0.147.0/model-discovery` frame 6 — the
     // one the phase spec's field summary gets wrong.
     let efforts: Vec<Value> = levels
         .iter()
