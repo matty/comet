@@ -14,11 +14,13 @@ use comet_harness::{Harness, HarnessError, RunControls};
 use comet_identity::DeviceIdentity;
 use comet_proto::{
     AgentEvent, Device, HarnessCapabilities, HarnessId, ModelCatalog, PROTOCOL_VERSION,
-    RemoteConnectionState, RemoteEndpoint, RemoteEntry, RunRequest, ServerId, TrustedClient,
+    ReadToolDiffReply, RemoteConnectionState, RemoteEndpoint, RemoteEntry, RunRequest, ServerId,
+    ToolDiff, TrustedClient,
 };
 use comet_rpc::{
     RpcError, RpcReply, RpcService, TlsIdentity, connect_lan_rpc, methods, pair_client,
 };
+use comet_sync::{DocsStore, PutToolDiffOutcome};
 use data_encoding::BASE32_NOPAD;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -57,6 +59,15 @@ struct Fixture {
     service: RemoteRpcService,
 }
 
+struct OlderPeerWithoutToolDiff;
+
+#[async_trait]
+impl RpcService for OlderPeerWithoutToolDiff {
+    async fn handle(&self, method: &str, _params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        Err(RpcError::UnknownMethod(method.into()))
+    }
+}
+
 fn fixture_remote_service(device_id: &str) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let core = assemble_core(dir.path(), device_id);
@@ -66,6 +77,33 @@ fn fixture_remote_service(device_id: &str) -> Fixture {
         core,
         service,
     }
+}
+
+fn stored_tool_diff(fixture: &Fixture, chat_id: &str, part_id: &str, diff: &ToolDiff) -> String {
+    let store = DocsStore::open(fixture._dir.path().join("local-store"))
+        .expect("open the fixture sidecar store");
+    match store
+        .put_tool_diff(chat_id, part_id, diff)
+        .expect("store the fixture sidecar")
+    {
+        PutToolDiffOutcome::Stored { diff_ref, .. } => diff_ref,
+        PutToolDiffOutcome::Rejected(limit) => panic!("small fixture sidecar rejected: {limit:?}"),
+    }
+}
+
+fn sample_tool_diff() -> ToolDiff {
+    ToolDiff {
+        path: "src/lib.rs".into(),
+        old_text: Some("before\n".into()),
+        new_text: "after\n".into(),
+    }
+}
+
+fn tool_diff_reply_value(reply: RpcReply) -> serde_json::Value {
+    let RpcReply::Value(value) = reply else {
+        panic!("expected unary read-tool-diff reply");
+    };
+    value
 }
 
 fn assemble_core(data_dir: &std::path::Path, device_id: &str) -> EngineCore {
@@ -689,6 +727,13 @@ fn rpc_error(result: Result<RpcReply, RpcError>) -> RpcError {
     }
 }
 
+fn assert_failed_exact(result: Result<RpcReply, RpcError>, expected: &str) {
+    match rpc_error(result) {
+        RpcError::Failed(actual) => assert_eq!(actual, expected),
+        other => panic!("expected RpcError::Failed({expected:?}), got {other:?}"),
+    }
+}
+
 #[test]
 fn administrative_and_proxy_methods_are_denied() {
     for method in [
@@ -750,15 +795,289 @@ fn operational_surface_is_explicitly_allowed() {
         methods::RESIZE_TERMINAL,
         methods::CLOSE_TERMINAL,
         methods::WATCH_CHECKOUT_DIFFS,
+        methods::GET_CHECKOUT_FILE_DIFF_TEXT,
         methods::LIST_AGENT_ACCOUNTS,
         methods::ACTIVATE_AGENT_ACCOUNT,
         methods::UPLOAD_CHUNK,
         methods::UPLOAD_COMMIT,
         methods::READ_ATTACHMENT_CHUNK,
+        methods::READ_TOOL_DIFF,
     ] {
         assert!(remote_method_allowed(method), "{method} was not allowed");
     }
     assert!(!remote_method_allowed("FutureOperationalMethod"));
+}
+
+#[tokio::test]
+async fn rpc_read_tool_diff_returns_the_local_stored_sidecar() {
+    let fixture = fixture_remote_service("device-b");
+    fixture
+        .core
+        .workspace
+        .create_space("local-space", "device-b", "/local", None, false)
+        .unwrap();
+    fixture
+        .core
+        .workspace
+        .create_chat("local-chat", "local-space", None, None)
+        .unwrap();
+    let diff = sample_tool_diff();
+    let diff_ref = stored_tool_diff(&fixture, "local-chat", "tool-1", &diff);
+
+    let reply = fixture
+        .core
+        .rpc_service()
+        .handle(
+            methods::READ_TOOL_DIFF,
+            serde_json::json!({
+                "chatId": "local-chat",
+                "partId": "tool-1",
+                "diffRef": diff_ref,
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        tool_diff_reply_value(reply),
+        serde_json::json!({
+            "status": "available",
+            "diff": {
+                "path": "src/lib.rs",
+                "oldText": "before\n",
+                "newText": "after\n",
+            },
+        })
+    );
+}
+
+#[tokio::test]
+async fn rpc_read_tool_diff_returns_not_available_for_missing_or_stale_references() {
+    let fixture = fixture_remote_service("device-b");
+    fixture
+        .core
+        .workspace
+        .create_space("local-space", "device-b", "/local", None, false)
+        .unwrap();
+    fixture
+        .core
+        .workspace
+        .create_chat("local-chat", "local-space", None, None)
+        .unwrap();
+    let diff_ref = stored_tool_diff(&fixture, "local-chat", "tool-1", &sample_tool_diff());
+
+    for (part_id, requested_ref) in [
+        ("missing-tool", diff_ref.as_str()),
+        ("tool-1", "v1:stale-reference"),
+    ] {
+        let reply = fixture
+            .core
+            .rpc_service()
+            .handle(
+                methods::READ_TOOL_DIFF,
+                serde_json::json!({
+                    "chatId": "local-chat",
+                    "partId": part_id,
+                    "diffRef": requested_ref,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tool_diff_reply_value(reply),
+            serde_json::json!({"status":"notAvailable"})
+        );
+    }
+}
+
+#[tokio::test]
+async fn rpc_read_tool_diff_rejects_a_foreign_chat_with_a_valid_sidecar() {
+    let fixture = fixture_remote_service("device-b");
+    fixture
+        .core
+        .workspace
+        .create_space("foreign-space", "device-c", "/foreign", None, false)
+        .unwrap();
+    fixture
+        .core
+        .workspace
+        .create_chat("foreign-chat", "foreign-space", None, None)
+        .unwrap();
+    let diff_ref = stored_tool_diff(&fixture, "foreign-chat", "tool-1", &sample_tool_diff());
+
+    match fixture
+        .core
+        .rpc_service()
+        .handle(
+            methods::READ_TOOL_DIFF,
+            serde_json::json!({
+                "chatId": "foreign-chat",
+                "partId": "tool-1",
+                "diffRef": diff_ref,
+            }),
+        )
+        .await
+    {
+        Err(RpcError::Failed(actual)) => assert_eq!(actual, "chat is not hosted by this device"),
+        Err(other) => panic!("expected local host rejection, got {other:?}"),
+        Ok(reply) => panic!("foreign sidecar leaked {}", tool_diff_reply_value(reply)),
+    }
+}
+
+#[tokio::test]
+async fn rpc_read_tool_diff_rejects_an_unknown_chat_with_an_orphan_sidecar() {
+    let fixture = fixture_remote_service("device-b");
+    let diff_ref = stored_tool_diff(&fixture, "unknown-chat", "tool-1", &sample_tool_diff());
+
+    assert_failed_exact(
+        fixture
+            .core
+            .rpc_service()
+            .handle(
+                methods::READ_TOOL_DIFF,
+                serde_json::json!({
+                    "chatId": "unknown-chat",
+                    "partId": "tool-1",
+                    "diffRef": diff_ref,
+                }),
+            )
+            .await,
+        "chat is not hosted by this device",
+    );
+}
+
+#[tokio::test]
+async fn remote_read_tool_diff_serves_an_owned_chat() {
+    let fixture = fixture_remote_service("device-b");
+    fixture
+        .core
+        .workspace
+        .create_space("local-space", "device-b", "/local", None, false)
+        .unwrap();
+    fixture
+        .core
+        .workspace
+        .create_chat("local-chat", "local-space", None, None)
+        .unwrap();
+    let diff = sample_tool_diff();
+    let diff_ref = stored_tool_diff(&fixture, "local-chat", "tool-1", &diff);
+
+    let reply = fixture
+        .service
+        .handle(
+            methods::READ_TOOL_DIFF,
+            serde_json::json!({
+                "chatId": "local-chat",
+                "partId": "tool-1",
+                "diffRef": diff_ref,
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        tool_diff_reply_value(reply),
+        serde_json::json!({
+            "status": "available",
+            "diff": {
+                "path": "src/lib.rs",
+                "oldText": "before\n",
+                "newText": "after\n",
+            },
+        })
+    );
+}
+
+#[tokio::test]
+async fn remote_read_tool_diff_rejects_foreign_and_unknown_chats() {
+    let fixture = fixture_remote_service("device-b");
+    fixture
+        .core
+        .workspace
+        .create_space("foreign-space", "device-c", "/foreign", None, false)
+        .unwrap();
+    fixture
+        .core
+        .workspace
+        .create_chat("foreign-chat", "foreign-space", None, None)
+        .unwrap();
+    let foreign_ref = stored_tool_diff(&fixture, "foreign-chat", "tool-1", &sample_tool_diff());
+
+    for (chat_id, diff_ref) in [
+        ("foreign-chat", foreign_ref.as_str()),
+        ("unknown-chat", "v1:unknown-reference"),
+    ] {
+        assert_failed_exact(
+            fixture
+                .service
+                .handle(
+                    methods::READ_TOOL_DIFF,
+                    serde_json::json!({
+                        "chatId": chat_id,
+                        "partId": "tool-1",
+                        "diffRef": diff_ref,
+                    }),
+                )
+                .await,
+            &format!("chat {chat_id} is not owned by this server"),
+        );
+    }
+}
+
+#[tokio::test]
+async fn remote_read_tool_diff_returns_not_available_for_guessed_part_or_reference() {
+    let fixture = fixture_remote_service("device-b");
+    fixture
+        .core
+        .workspace
+        .create_space("local-space", "device-b", "/local", None, false)
+        .unwrap();
+    fixture
+        .core
+        .workspace
+        .create_chat("local-chat", "local-space", None, None)
+        .unwrap();
+    let diff_ref = stored_tool_diff(&fixture, "local-chat", "tool-1", &sample_tool_diff());
+
+    for (part_id, requested_ref) in [
+        ("guessed-tool", diff_ref.as_str()),
+        ("tool-1", "v1:guessed-reference"),
+    ] {
+        let reply = fixture
+            .service
+            .handle(
+                methods::READ_TOOL_DIFF,
+                serde_json::json!({
+                    "chatId": "local-chat",
+                    "partId": part_id,
+                    "diffRef": requested_ref,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tool_diff_reply_value(reply),
+            serde_json::json!({"status":"notAvailable"})
+        );
+    }
+}
+
+#[tokio::test]
+async fn read_tool_diff_unknown_method_from_an_older_peer_can_be_downgraded() {
+    let client = comet_rpc::memory_client(Arc::new(OlderPeerWithoutToolDiff));
+    let err = client
+        .call_as::<ReadToolDiffReply>(
+            methods::READ_TOOL_DIFF,
+            serde_json::json!({
+                "chatId": "local-chat",
+                "partId": "tool-1",
+                "diffRef": "v1:reference",
+            }),
+        )
+        .await
+        .expect_err("older peers do not implement the additive method");
+
+    assert!(matches!(err, RpcError::UnknownMethod(name) if name == methods::READ_TOOL_DIFF));
 }
 
 #[tokio::test]

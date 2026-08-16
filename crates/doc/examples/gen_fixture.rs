@@ -6,7 +6,7 @@ use comet_doc::{
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
     fold_event_into_parts,
 };
-use comet_proto::{AgentEvent, ToolCall};
+use comet_proto::{AgentEvent, ToolCall, ToolDiffStat};
 
 fn main() {
     let out = std::env::args()
@@ -52,6 +52,13 @@ fn main() {
         &AgentEvent::ToolResult {
             id: "tool-1".into(),
             is_error: false,
+            diff: None,
+            diff_ref: Some("v1:fixture-tool-diff".into()),
+            diff_stats: Some(vec![ToolDiffStat {
+                path: "src/lib.rs".into(),
+                additions: 1,
+                deletions: 0,
+            }]),
         },
     );
     fold_event_into_parts(

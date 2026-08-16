@@ -66,6 +66,10 @@ struct DocPartJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     is_error: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    diff_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diff_stats: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     questions: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resolved: Option<bool>,
@@ -122,6 +126,8 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             call,
             is_error,
             resolved,
+            diff_ref,
+            diff_stats,
         } => DocPartJson {
             id: id.clone(),
             kind: "tool".into(),
@@ -129,6 +135,8 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             // TS shape parity: `isError` is written only once the tool result arrived;
             // its presence IS the resolution marker.
             is_error: if *resolved { Some(*is_error) } else { None },
+            diff_ref: diff_ref.clone(),
+            diff_stats: diff_stats.as_ref().map(serde_json::to_value).transpose()?,
             ..Default::default()
         },
         MessagePart::Input {
@@ -233,6 +241,10 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                 call,
                 is_error: p.is_error.unwrap_or(false),
                 resolved: p.is_error.is_some(),
+                diff_ref: p.diff_ref,
+                diff_stats: p
+                    .diff_stats
+                    .and_then(|stats| serde_json::from_value(stats).ok()),
             },
             None => MessagePart::Text {
                 id: p.id,
@@ -849,6 +861,12 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(is_error) = doc_part.is_error {
         map.insert("isError", is_error)?;
     }
+    if let Some(diff_ref) = &doc_part.diff_ref {
+        map.insert("diffRef", diff_ref.as_str())?;
+    }
+    if let Some(diff_stats) = &doc_part.diff_stats {
+        map.insert("diffStats", loro_value_from_json(diff_stats))?;
+    }
     if let Some(questions) = &doc_part.questions {
         map.insert("questions", loro_value_from_json(questions))?;
     }
@@ -1218,6 +1236,12 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     }
     if let Some(is_error) = doc_part.is_error {
         map.insert("isError", is_error)?;
+    }
+    if let Some(diff_ref) = &doc_part.diff_ref {
+        map.insert("diffRef", diff_ref.as_str())?;
+    }
+    if let Some(diff_stats) = &doc_part.diff_stats {
+        map.insert("diffStats", loro_value_from_json(diff_stats))?;
     }
     if let Some(questions) = &doc_part.questions {
         map.insert("questions", loro_value_from_json(questions))?;
@@ -1623,6 +1647,9 @@ mod tests {
             &AgentEvent::ToolResult {
                 id: "tool-1".into(),
                 is_error: false,
+                diff: None,
+                diff_ref: None,
+                diff_stats: None,
             },
         );
         writer.sync(&folded).unwrap();
@@ -2404,6 +2431,131 @@ mod tests {
         assert_eq!(items[0].text, "Read the file");
         assert!(items[0].done);
         assert!(!items[1].done);
+    }
+
+    #[test]
+    fn old_tool_part_json_defaults_diff_metadata_to_none() {
+        let old: DocPartJson = serde_json::from_value(serde_json::json!({
+            "id": "t1",
+            "kind": "tool",
+            "call": {"kind": "exec", "command": "ls"},
+        }))
+        .unwrap();
+        let present: DocPartJson = serde_json::from_value(serde_json::json!({
+            "id": "t2",
+            "kind": "tool",
+            "call": {"kind": "exec", "command": "git status"},
+            "isError": false,
+            "diffRef": "v1:abc123",
+            "diffStats": [{"path": "src/lib.rs", "additions": 2, "deletions": 1}],
+        }))
+        .unwrap();
+        let malformed: DocPartJson = serde_json::from_value(serde_json::json!({
+            "id": "t3",
+            "kind": "tool",
+            "call": {"kind": "exec", "command": "pwd"},
+            "isError": false,
+            "diffRef": "v1:def456",
+            "diffStats": [{"path": "src/lib.rs", "additions": "two", "deletions": 1}],
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            from_doc_part(old),
+            MessagePart::Tool {
+                diff_ref: None,
+                diff_stats: None,
+                resolved: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            from_doc_part(present),
+            MessagePart::Tool {
+                diff_ref: Some(ref diff_ref),
+                diff_stats: Some(ref diff_stats),
+                resolved: true,
+                is_error: false,
+                ..
+            } if diff_ref == "v1:abc123"
+                && diff_stats == &vec![comet_proto::ToolDiffStat {
+                    path: "src/lib.rs".into(),
+                    additions: 2,
+                    deletions: 1,
+                }]
+        ));
+        assert!(matches!(
+            from_doc_part(malformed),
+            MessagePart::Tool {
+                diff_ref: Some(ref diff_ref),
+                diff_stats: None,
+                resolved: true,
+                is_error: false,
+                ..
+            } if diff_ref == "v1:def456"
+        ));
+    }
+
+    #[test]
+    fn tool_part_snapshot_roundtrip_keeps_only_reference_and_stats() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a1", "dev-a", 5).unwrap();
+        let mut folded = Vec::new();
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::ToolCall {
+                id: "tool-1".into(),
+                call: ToolCall::Exec {
+                    command: "ls".into(),
+                },
+            },
+        );
+        writer.sync(&folded).unwrap();
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::ToolResult {
+                id: "tool-1".into(),
+                is_error: false,
+                diff: Some(comet_proto::ToolDiff {
+                    path: "src/lib.rs".into(),
+                    old_text: Some("SECRET_OLD_SOURCE".into()),
+                    new_text: "SECRET_NEW_SOURCE".into(),
+                }),
+                diff_ref: Some("v1:abc123".into()),
+                diff_stats: Some(vec![comet_proto::ToolDiffStat {
+                    path: "src/lib.rs".into(),
+                    additions: 1,
+                    deletions: 1,
+                }]),
+            },
+        );
+        writer.finish(&folded, MessageStatus::Complete).unwrap();
+
+        let snapshot = doc.export_snapshot().unwrap();
+        assert!(
+            !String::from_utf8_lossy(&snapshot).contains("SECRET_OLD_SOURCE"),
+            "exact diff source leaked into SessionDoc snapshot"
+        );
+        assert!(
+            !String::from_utf8_lossy(&snapshot).contains("SECRET_NEW_SOURCE"),
+            "exact diff source leaked into SessionDoc snapshot"
+        );
+        let other = LoroDoc::new();
+        other.import(&snapshot).unwrap();
+        let restored = SessionDoc::from_doc(other);
+        assert!(matches!(
+            &restored.read_entries().unwrap()[0].parts[0],
+            MessagePart::Tool {
+                diff_ref: Some(diff_ref),
+                diff_stats: Some(diff_stats),
+                ..
+            } if diff_ref == "v1:abc123"
+                && diff_stats == &vec![comet_proto::ToolDiffStat {
+                    path: "src/lib.rs".into(),
+                    additions: 1,
+                    deletions: 1,
+                }]
+        ));
     }
 
     /// A `total_tokens` above `i64::MAX` used to be cast with `as i64`, which

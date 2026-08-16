@@ -37,7 +37,10 @@ pub mod uploads;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
-pub use diff_sync::{CheckoutDiffSync, DiffSnapshot, capture_diff};
+pub use diff_sync::{
+    CheckoutDiffSync, DiffFileTextPair, DiffSnapshot, capture_diff, read_diff_file_text,
+    working_diff_base,
+};
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig};
 pub use instance_lock::InstanceLock;
 pub use lan_server::{LanServer, LanServerHandle, LanServerStatus};
@@ -73,6 +76,10 @@ pub enum EngineError {
     Harness(#[from] comet_harness::HarnessError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// The workspace tombstone committed, but one local artifact cleanup leg
+    /// failed. Diagnostics stay in tracing and finalization will retry.
+    #[error("chat cleanup is pending retry")]
+    ChatCleanupPendingRetry,
     #[error("{0}")]
     Other(String),
 }

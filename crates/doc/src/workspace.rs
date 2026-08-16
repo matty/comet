@@ -453,6 +453,17 @@ impl WorkspaceDoc {
         Ok(())
     }
 
+    /// Tombstone one device-session row without changing its chat row. Final
+    /// generation cleanup uses this after the old run can no longer publish a
+    /// terminal status, before a same-id chat is admitted.
+    pub fn delete_session(&self, chat_id: &str) -> Result<bool, DocError> {
+        let sessions = self.doc.get_map("sessions");
+        let existed = sessions.get(chat_id).is_some();
+        sessions.delete(chat_id)?;
+        self.doc.commit();
+        Ok(existed)
+    }
+
     pub fn read_sessions(&self) -> Result<Vec<Session>, DocError> {
         let mut sessions: Vec<Session> = self
             .read_rows::<RawSession>("sessions")?
@@ -935,6 +946,19 @@ mod tests {
         assert!(ws.read_chats().unwrap().is_empty());
         assert!(ws.read_sessions().unwrap().is_empty());
         assert!(!ws.delete_chat("chat-1").unwrap());
+    }
+
+    #[test]
+    fn delete_session_tombstones_only_the_session_row() {
+        let ws = WorkspaceDoc::new();
+        ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+        ws.upsert_session(&session("chat-1", "dev-a", SessionStatus::Idle))
+            .unwrap();
+
+        assert!(ws.delete_session("chat-1").unwrap());
+        assert!(ws.chat("chat-1").unwrap().is_some());
+        assert!(ws.read_sessions().unwrap().is_empty());
+        assert!(!ws.delete_session("chat-1").unwrap());
     }
 
     #[test]

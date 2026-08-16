@@ -371,6 +371,13 @@ impl WorkspaceHost {
         }
     }
 
+    /// Tombstone a retired generation's session-status row while preserving
+    /// the chat row. Callers keep the lifecycle token that proves no stale
+    /// cleanup can erase a replacement generation.
+    pub fn delete_session(&self, chat_id: &str) -> Result<(), comet_doc::DocError> {
+        self.inner.doc.delete_session(chat_id).map(drop)
+    }
+
     // ── Mutate surface (LWW writes accepted from any device) ────────────────
 
     /// Create a chat *in a space*: the space fixes the host device and base cwd

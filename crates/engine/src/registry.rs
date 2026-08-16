@@ -374,6 +374,9 @@ pub fn default_registry() -> HarnessRegistry {
             AgentEvent::ToolResult {
                 id: "mock-tool-1".into(),
                 is_error: false,
+                diff: None,
+                diff_ref: None,
+                diff_stats: None,
             },
             AgentEvent::ToolCall {
                 id: "mock-tool-2".into(),
@@ -385,6 +388,9 @@ pub fn default_registry() -> HarnessRegistry {
             AgentEvent::ToolResult {
                 id: "mock-tool-2".into(),
                 is_error: false,
+                diff: None,
+                diff_ref: None,
+                diff_stats: None,
             },
             AgentEvent::Notice {
                 kind: comet_proto::NoticeKind::Compaction,

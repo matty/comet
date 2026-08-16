@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, ChecklistItem, NoticeKind, NoticeSeverity,
-    SubagentStatus, ToolCall, UserInputQuestion,
+    SubagentStatus, ToolCall, ToolDiffStat, UserInputQuestion,
 };
 
 use crate::constants::MSG_INLINE_MAX;
@@ -51,6 +51,10 @@ pub enum MessagePart {
         /// True once a ToolResult arrived.
         #[serde(default)]
         resolved: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff_stats: Option<Vec<ToolDiffStat>>,
     },
     #[serde(rename_all = "camelCase")]
     Input {
@@ -164,7 +168,22 @@ impl MessagePart {
     pub fn byte_len(&self) -> usize {
         match self {
             MessagePart::Text { text, .. } => text.len(),
-            MessagePart::Tool { call, .. } => serde_json::to_vec(call).map_or(0, |v| v.len()),
+            MessagePart::Tool {
+                call,
+                diff_ref,
+                diff_stats,
+                ..
+            } => {
+                serde_json::to_vec(call).map_or(0, |v| v.len())
+                    + diff_ref
+                        .as_ref()
+                        .and_then(|value| serde_json::to_vec(value).ok())
+                        .map_or(0, |value| value.len())
+                    + diff_stats
+                        .as_ref()
+                        .and_then(|value| serde_json::to_vec(value).ok())
+                        .map_or(0, |value| value.len())
+            }
             MessagePart::Input { questions, .. } => {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
             }
@@ -250,21 +269,33 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     call: call.clone(),
                     is_error: false,
                     resolved: false,
+                    diff_ref: None,
+                    diff_stats: None,
                 });
             }
         }
-        AgentEvent::ToolResult { id, is_error } => {
+        AgentEvent::ToolResult {
+            id,
+            is_error,
+            diff_ref,
+            diff_stats,
+            ..
+        } => {
             for p in out.iter_mut() {
                 if let MessagePart::Tool {
                     id: pid,
                     is_error: e,
                     resolved,
+                    diff_ref: part_diff_ref,
+                    diff_stats: part_diff_stats,
                     ..
                 } = p
                     && pid == id
                 {
                     *e = *is_error;
                     *resolved = true;
+                    *part_diff_ref = diff_ref.clone();
+                    *part_diff_stats = diff_stats.clone();
                 }
             }
         }
@@ -618,7 +649,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
 ///
 /// Keeps: command / path / pattern / url / query / server+tool names.
 /// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/Unknown input.
-/// Full inputs remain only in the host's local run journal. Idempotent.
+/// Complete file sources are retained only by the engine's bounded sidecar. Idempotent.
 pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
     match call {
         ToolCall::WriteFile { path, .. } => ToolCall::WriteFile {
@@ -871,6 +902,9 @@ mod tests {
             &AgentEvent::ToolResult {
                 id: "t".into(),
                 is_error: true,
+                diff: None,
+                diff_ref: None,
+                diff_stats: None,
             },
         );
         match &parts[0] {
@@ -882,6 +916,95 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_result_folds_reference_and_stats_without_exact_sources() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "t".into(),
+                call: ToolCall::Exec {
+                    command: "ls".into(),
+                },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolResult {
+                id: "t".into(),
+                is_error: true,
+                diff: Some(comet_proto::ToolDiff {
+                    path: "src/lib.rs".into(),
+                    old_text: Some("SECRET_OLD_SOURCE".into()),
+                    new_text: "new source".into(),
+                }),
+                diff_ref: Some("v1:abc123".into()),
+                diff_stats: Some(vec![ToolDiffStat {
+                    path: "src/lib.rs".into(),
+                    additions: 1,
+                    deletions: 1,
+                }]),
+            },
+        );
+
+        let MessagePart::Tool {
+            is_error,
+            resolved,
+            diff_ref,
+            diff_stats,
+            ..
+        } = &parts[0]
+        else {
+            panic!("unexpected {parts:?}");
+        };
+        assert!(*is_error);
+        assert!(*resolved);
+        assert_eq!(diff_ref.as_deref(), Some("v1:abc123"));
+        assert_eq!(
+            diff_stats.as_deref(),
+            Some(
+                [ToolDiffStat {
+                    path: "src/lib.rs".into(),
+                    additions: 1,
+                    deletions: 1,
+                }]
+                .as_slice()
+            )
+        );
+        assert!(
+            !serde_json::to_string(&parts)
+                .unwrap()
+                .contains("SECRET_OLD_SOURCE"),
+            "exact diff source leaked into MessagePart JSON"
+        );
+    }
+
+    #[test]
+    fn tool_byte_len_counts_json_encoded_diff_metadata() {
+        let part = MessagePart::Tool {
+            id: "tool-1".into(),
+            call: ToolCall::Exec {
+                command: "ls".into(),
+            },
+            is_error: false,
+            resolved: true,
+            diff_ref: Some("v1:ref\"\\😀".into()),
+            diff_stats: Some(vec![ToolDiffStat {
+                path: "src/\"quoted\"\\file.rs".into(),
+                additions: 12,
+                deletions: 3,
+            }]),
+        };
+
+        assert_eq!(
+            part.byte_len(),
+            "{\"kind\":\"exec\",\"command\":\"ls\"}".len()
+                + "\"v1:ref\\\"\\\\😀\"".len()
+                + "[{\"path\":\"src/\\\"quoted\\\"\\\\file.rs\",\"additions\":12,\"deletions\":3}]"
+                    .len(),
+        );
     }
 
     #[test]
@@ -916,6 +1039,8 @@ mod tests {
                 },
                 is_error: false,
                 resolved: true,
+                diff_ref: None,
+                diff_stats: None,
             },
         ];
         let chunks = split_parts(&parts);
