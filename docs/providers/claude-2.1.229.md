@@ -8,11 +8,14 @@ Two readings that argv makes tempting and both wrong: identical launch flags do 
 
 ## Scenarios
 
-Every scenario this sheet's evidence is drawn from, with the exact argv Comet launched it with (redaction placeholders are the archive's, not this sheet's). A capability no scenario here exercises cannot appear in the sections below, whatever the wire format might otherwise support — this list is what makes that limit visible instead of silent. A distinct name is not proof of distinct coverage, either: two scenarios below with the same argv were launched identically whatever their purpose sentences say, and two with the same purpose sentence can still differ in argv — compare the argv itself before concluding two scenarios tested different things, rather than trusting the name or the purpose alone.
+Every scenario this sheet's evidence is drawn from: the exact argv, working directory and configured environment Comet launched it with (redaction placeholders are the archive's, not this sheet's). A capability no scenario here exercises cannot appear in the sections below, whatever the wire format might otherwise support — this list is what makes that limit visible instead of silent. A distinct name is not proof of distinct coverage, either, and a matching argv is not proof of an identical launch: two scenarios can print the same argv and still set different environment variables — a redaction placeholder cannot separate two scenarios whose real value redacted to the same token, but its presence in one scenario's env line and its absence from another's is real evidence a claim of identical launches must survive. Compare the whole block — argv, cwd and env together — before concluding two scenarios were launched identically, and compare it again before concluding two with the same purpose sentence tested the same thing — trusting the name or the purpose alone is not enough either way.
 
 ### checklist
 
 capture one bounded Claude run script
+
+cwd: `<CWD>`
+env: (none set)
 
 ```
 <HOME>\.local\bin\claude.exe
@@ -37,6 +40,9 @@ acceptEdits
 
 capture one bounded Claude run script
 
+cwd: `<CWD>`
+env: (none set)
+
 ```
 <HOME>\.local\bin\claude.exe
 --print
@@ -60,6 +66,9 @@ acceptEdits
 ### subagent
 
 capture Claude delegating a Task/Agent subagent, including the resumed task_started sharing one task_id, patch-only task_updated, task_notification with usage, and background_tasks_changed populated-then-empty
+
+cwd: `<CWD>`
+env: (none set)
 
 ```
 <HOME>\.local\bin\claude.exe

@@ -4,8 +4,8 @@
 //! No filesystem, no `std::env`, no opinion about where the bytes end up —
 //! the golden test in `capture_corpus/capability_sheets.rs` walks the
 //! archive with [`super::surface::observe_surface`], reads each scenario's
-//! `manifest.json` for its argv, and hands the result here. This module
-//! never touches either.
+//! `manifest.json` for its argv, working directory and configured
+//! environment, and hands the result here. This module never touches either.
 //!
 //! **Line endings are `\n` only, deliberately.** `git show HEAD:AGENTS.md`
 //! (and every other committed text file checked) stores LF; the CRLF a
@@ -36,6 +36,19 @@ use super::surface::{Direction, FieldObservation, VOCABULARY_PATHS};
 /// comment gave: three identical fenced blocks read as one experiment
 /// printed three times, not as three independent confirmations — which is
 /// exactly the impression a reader should take away.
+///
+/// `cwd` and `configured_env` joined the argv (review finding, 2026-08-16):
+/// a Claude-focused read of an earlier draft missed that argv alone is not
+/// the whole launch. All seven Codex `0.147.0` scenarios share byte-identical
+/// argv, but `configured_env` does not: `model-discovery` and its three
+/// `-logged-out`/`-neutral-cwd`/`-project-cwd` siblings set `CODEX_HOME`,
+/// while `fresh-text`, `resume` and `steer` set nothing — a real difference
+/// the argv-only block hid completely, while the sheet's own prose claimed
+/// same-argv scenarios were launched identically. Printing the redacted
+/// placeholder cannot separate `-logged-out` from its three siblings (they
+/// redact to the same token), but it does separate that family of four from
+/// the three that set nothing, which is exactly the information this struct
+/// existed to surface and previously didn't.
 #[derive(Clone, Debug)]
 pub struct SheetScenario {
     pub name: String,
@@ -45,6 +58,16 @@ pub struct SheetScenario {
     /// already put there (`<CWD>`, `<HOME>`, `<REDACTED_1>`, …). Rendering
     /// starts at `argv[0]`; there is no separate program field.
     pub argv: Vec<String>,
+    /// `command.cwd`, verbatim from the manifest (redacted to `<CWD>` in
+    /// every scenario observed so far, same as every sibling — carried
+    /// anyway so it prints beside the environment rather than being the one
+    /// field a reader has to go check the manifest for).
+    pub cwd: String,
+    /// `command.configured_env`, verbatim from the manifest, sorted by key.
+    /// Distinct from `argv`: two scenarios can share byte-identical argv and
+    /// still not have been launched identically, which is exactly the case
+    /// `CODEX_HOME` catches for Codex's `model-discovery*` family.
+    pub configured_env: BTreeMap<String, String>,
 }
 
 /// Renders one version's capability sheet as markdown.
@@ -124,16 +147,20 @@ fn scenario_lines(scenarios: &[SheetScenario]) -> Vec<String> {
     let mut lines = vec![
         "## Scenarios".to_owned(),
         String::new(),
-        "Every scenario this sheet's evidence is drawn from, with the exact argv Comet \
-         launched it with (redaction placeholders are the archive's, not this sheet's). A \
-         capability no scenario here exercises cannot appear in the sections below, \
-         whatever the wire format might otherwise support — this list is what makes that \
-         limit visible instead of silent. A distinct name is not proof of distinct \
-         coverage, either: two scenarios below with the same argv were launched \
-         identically whatever their purpose sentences say, and two with the same purpose \
-         sentence can still differ in argv — compare the argv itself before concluding two \
-         scenarios tested different things, rather than trusting the name or the purpose \
-         alone."
+        "Every scenario this sheet's evidence is drawn from: the exact argv, working \
+         directory and configured environment Comet launched it with (redaction \
+         placeholders are the archive's, not this sheet's). A capability no scenario here \
+         exercises cannot appear in the sections below, whatever the wire format might \
+         otherwise support — this list is what makes that limit visible instead of silent. \
+         A distinct name is not proof of distinct coverage, either, and a matching argv is \
+         not proof of an identical launch: two scenarios can print the same argv and still \
+         set different environment variables — a redaction placeholder cannot separate two \
+         scenarios whose real value redacted to the same token, but its presence in one \
+         scenario's env line and its absence from another's is real evidence a claim of \
+         identical launches must survive. Compare the whole block — argv, cwd and env \
+         together — before concluding two scenarios were launched identically, and compare \
+         it again before concluding two with the same purpose sentence tested the same \
+         thing — trusting the name or the purpose alone is not enough either way."
             .to_owned(),
         String::new(),
     ];
@@ -152,6 +179,9 @@ fn scenario_lines(scenarios: &[SheetScenario]) -> Vec<String> {
         lines.push(String::new());
         lines.push(scenario.purpose.clone());
         lines.push(String::new());
+        lines.push(format!("cwd: `{}`", scenario.cwd));
+        lines.push(env_line(&scenario.configured_env));
+        lines.push(String::new());
         lines.push("```".to_owned());
         for arg in &scenario.argv {
             lines.push(arg.clone());
@@ -160,6 +190,22 @@ fn scenario_lines(scenarios: &[SheetScenario]) -> Vec<String> {
         lines.push(String::new());
     }
     lines
+}
+
+/// `env: (none set)` when `configured_env` is empty (every Claude scenario in
+/// the committed corpus), or `env: `KEY=value`, `KEY2=value2`` sorted by key
+/// (`BTreeMap` iterates sorted already) — one line either way, so a reader
+/// scanning the Scenarios section sees "nothing set" and "one variable set"
+/// as two visibly different lines rather than an absent one meaning nothing.
+fn env_line(configured_env: &BTreeMap<String, String>) -> String {
+    if configured_env.is_empty() {
+        return "env: (none set)".to_owned();
+    }
+    let vars: Vec<String> = configured_env
+        .iter()
+        .map(|(key, value)| format!("`{key}={value}`"))
+        .collect();
+    format!("env: {}", vars.join(", "))
 }
 
 fn field_lines(provider: &str, version: &str, observations: &[FieldObservation]) -> Vec<String> {
@@ -276,10 +322,25 @@ mod tests {
     }
 
     fn scenario(name: &str, purpose: &str, argv: &[&str]) -> SheetScenario {
+        scenario_with_env(name, purpose, argv, "<CWD>", &[])
+    }
+
+    fn scenario_with_env(
+        name: &str,
+        purpose: &str,
+        argv: &[&str],
+        cwd: &str,
+        env: &[(&str, &str)],
+    ) -> SheetScenario {
         SheetScenario {
             name: name.to_owned(),
             purpose: purpose.to_owned(),
             argv: argv.iter().map(|arg| arg.to_string()).collect(),
+            cwd: cwd.to_owned(),
+            configured_env: env
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
         }
     }
 
@@ -517,6 +578,57 @@ mod tests {
         assert!(
             rendered.contains("<REDACTED_1>"),
             "argv placeholders must render verbatim: {rendered}"
+        );
+    }
+
+    /// Break caught (Task 4 review, 2026-08-16): the Scenarios intro claimed
+    /// "two scenarios below with the same argv were launched identically",
+    /// and nothing printed could contradict it — a Claude-focused read
+    /// missed that Codex's `model-discovery` and `fresh-text` share
+    /// byte-identical argv (`app-server`) but not `configured_env`
+    /// (`CODEX_HOME` set vs. nothing set). `cwd` and `configured_env` must
+    /// render even when `argv` is identical across scenarios, and an empty
+    /// env must read as an explicit "nothing set" rather than a blank or
+    /// missing line — the same "none observed" rather than "no line at all"
+    /// principle the Fields and Vocabulary sections already hold to.
+    #[test]
+    fn cwd_and_env_render_even_when_argv_is_identical() {
+        let scenarios = vec![
+            scenario_with_env(
+                "fresh-text",
+                "capture one bounded Codex run script",
+                &["<HOME>\\codex.exe", "app-server"],
+                "<CWD>",
+                &[],
+            ),
+            scenario_with_env(
+                "model-discovery",
+                "capture Codex initialize and paged model/list replies",
+                &["<HOME>\\codex.exe", "app-server"],
+                "<CWD>",
+                &[("CODEX_HOME", "<CODEX_HOME>")],
+            ),
+        ];
+        let rendered = render_sheet("codex", "0.147.0", &[], &BTreeMap::new(), &scenarios);
+        let scenarios_section = section(&rendered, "## Scenarios");
+
+        let fresh_text = &scenarios_section[scenarios_section.find("### fresh-text").unwrap()
+            ..scenarios_section.find("### model-discovery").unwrap()];
+        let model_discovery =
+            &scenarios_section[scenarios_section.find("### model-discovery").unwrap()..];
+
+        assert!(
+            fresh_text.contains("env: (none set)"),
+            "a scenario with no configured_env must say so explicitly: {fresh_text}"
+        );
+        assert!(
+            model_discovery.contains("env: `CODEX_HOME=<CODEX_HOME>`"),
+            "a scenario's configured_env must render even though its argv is identical to a \
+             sibling's: {model_discovery}"
+        );
+        assert!(
+            fresh_text.contains("cwd: `<CWD>`") && model_discovery.contains("cwd: `<CWD>`"),
+            "cwd must render for every scenario: {scenarios_section}"
         );
     }
 
