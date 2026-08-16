@@ -1454,12 +1454,11 @@ mod tests {
     /// 7d4e903..HEAD -- crates/harness/tests/corpus/` is empty) and explicitly protected by the
     /// plan's own constraints ("No byte under `crates/harness/tests/corpus/` changes").
     ///
-    /// Not every row has evidence. Three Codex rows — `approval`, `approval-on-request`,
-    /// `interruption` — have never been captured (their own exemption on `test/stage-6-integration`'s
-    /// `capture_corpus/scenario_coverage.rs`, not present on this branch; verified independently
-    /// here by walking the corpus). `claude/2.1.229/subagent` is a hand-sanitized exploratory
-    /// capture with no matching `SCENARIOS` row (see its own `README.md`) and is never looked up,
-    /// since lookup is driven by row name, not by directory listing.
+    /// Every declared row has corpus evidence as of the stage-6 promotion — `EXEMPT_UNCAPTURED`
+    /// below is empty, matching `capture_corpus/scenario_coverage.rs`'s own now-empty list.
+    /// `claude/2.1.229/subagent` is a hand-sanitized exploratory capture with no matching
+    /// `SCENARIOS` row (see its own `README.md`) and is never looked up, since lookup is driven
+    /// by row name, not by directory listing.
     ///
     /// Comparison is STRUCTURAL, not byte-for-byte — the archive redacts `cwd`, `program`, and
     /// any resume/session id embedded in argv (`docs/testing/provider-captures.md`):
@@ -1483,16 +1482,7 @@ mod tests {
     ///   launch, `0` for every run launch), not something spawn-time state could vary.
     #[test]
     fn every_scenario_launch_matches_its_committed_corpus_manifest() {
-        const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[
-            (Provider::Codex, "approval"),
-            (Provider::Codex, "approval-on-request"),
-            (Provider::Codex, "interruption"),
-            // Never captured; owed by the stage-6 auto/full-access live re-capture.
-            (Provider::Claude, "auto"),
-            (Provider::Claude, "full-access"),
-            (Provider::Codex, "auto"),
-            (Provider::Codex, "full-access"),
-        ];
+        const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[];
 
         let root = crate::capture::corpus_root();
         let promoted = crate::capture::promoted_scenarios(&root)
@@ -1612,16 +1602,8 @@ mod tests {
         unevidenced_sorted.sort();
         assert_eq!(
             unevidenced_sorted,
-            vec![
-                "claude/auto",
-                "claude/full-access",
-                "codex/approval",
-                "codex/approval-on-request",
-                "codex/auto",
-                "codex/full-access",
-                "codex/interruption",
-            ],
-            "the exempted-uncaptured rows must be exactly these seven — a row gaining or losing \
+            Vec::<String>::new(),
+            "EXEMPT_UNCAPTURED is empty, so nothing should land in unevidenced — a row losing \
              corpus evidence must update this assertion deliberately, not pass through silently"
         );
 

@@ -1,5 +1,5 @@
 {
-  "captured_at_unix_ms": 1786568524291,
+  "captured_at_unix_ms": 1786904645678,
   "channels": [
     "stdin",
     "stdout"
@@ -21,10 +21,6 @@
   "exit_code": 0,
   "normalized_cli_version": "codex-cli 0.147.0",
   "placeholders": [
-    {
-      "kind": "session",
-      "placeholder": "<SESSION_1>"
-    },
     {
       "kind": "v",
       "placeholder": "<V1>"
@@ -400,6 +396,46 @@
     {
       "kind": "v",
       "placeholder": "<V94>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V95>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V96>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V97>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V98>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V99>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V100>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V101>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V102>"
+    },
+    {
+      "kind": "cwd_path",
+      "placeholder": "<CWD>"
+    },
+    {
+      "kind": "home_path",
+      "placeholder": "<HOME>"
     }
   ],
   "platform": {
@@ -407,10 +443,11 @@
     "os": "windows"
   },
   "provider": "codex",
-  "purpose": "capture one bounded Codex run script",
+  "purpose": "capture a Codex run receiving a mid-turn steering message",
   "redaction_counts": {
-    "session": 2,
-    "v": 270
+    "cwd_path": 1,
+    "home_path": 1,
+    "v": 291
   },
   "scenario": "steer",
   "schema_version": 1,

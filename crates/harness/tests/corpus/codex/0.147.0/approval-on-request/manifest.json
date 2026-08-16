@@ -1,0 +1,527 @@
+{
+  "captured_at_unix_ms": 1786904603767,
+  "channels": [
+    "stdin",
+    "stdout"
+  ],
+  "cli_version": "codex-cli 0.147.0",
+  "command": {
+    "args": [
+      "app-server"
+    ],
+    "configured_env": {},
+    "creation_flags": 0,
+    "cwd": "<CWD>",
+    "kill_on_drop": true,
+    "program": "<HOME>\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe",
+    "stderr": "Piped",
+    "stdin": "Piped",
+    "stdout": "Piped"
+  },
+  "exit_code": 0,
+  "normalized_cli_version": "codex-cli 0.147.0",
+  "placeholders": [
+    {
+      "kind": "v",
+      "placeholder": "<V1>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V2>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V3>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V4>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V5>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V6>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V7>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V8>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V9>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V10>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V11>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V12>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V13>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V14>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V15>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V16>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V17>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V18>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V19>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V20>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V21>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V22>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V23>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V24>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V25>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V26>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V27>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V28>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V29>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V30>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V31>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V32>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V33>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V34>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V35>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V36>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V37>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V38>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V39>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V40>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V41>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V42>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V43>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V44>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V45>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V46>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V47>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V48>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V49>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V50>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V51>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V52>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V53>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V54>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V55>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V56>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V57>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V58>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V59>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V60>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V61>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V62>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V63>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V64>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V65>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V66>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V67>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V68>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V69>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V70>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V71>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V72>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V73>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V74>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V75>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V76>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V77>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V78>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V79>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V80>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V81>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V82>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V83>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V84>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V85>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V86>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V87>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V88>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V89>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V90>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V91>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V92>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V93>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V94>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V95>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V96>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V97>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V98>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V99>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V100>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V101>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V102>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V103>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V104>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V105>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V106>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V107>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V108>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V109>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V110>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V111>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V112>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V113>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V114>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V115>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V116>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V117>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V118>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V119>"
+    },
+    {
+      "kind": "v",
+      "placeholder": "<V120>"
+    },
+    {
+      "kind": "cwd_path",
+      "placeholder": "<CWD>"
+    },
+    {
+      "kind": "home_path",
+      "placeholder": "<HOME>"
+    }
+  ],
+  "platform": {
+    "arch": "x86_64",
+    "os": "windows"
+  },
+  "provider": "codex",
+  "purpose": "capture a Codex run that answers command-execution approval requests against an external target",
+  "redaction_counts": {
+    "cwd_path": 1,
+    "home_path": 1,
+    "v": 366
+  },
+  "scenario": "approval-on-request",
+  "schema_version": 1,
+  "source": "capture.json"
+}
