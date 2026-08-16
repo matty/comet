@@ -251,6 +251,19 @@ pub enum Route {
     Settings(SettingsSection),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellFocusFallback {
+    Composer,
+    ShellRoot,
+}
+
+fn shell_focus_fallback(route: Route) -> ShellFocusFallback {
+    match route {
+        Route::Chat => ShellFocusFallback::Composer,
+        Route::Settings(_) => ShellFocusFallback::ShellRoot,
+    }
+}
+
 /// Per-chat panel open flags (comet parity: `sessionPanels` — the terminal and
 /// changes panels open *per session*, in memory only; heights and every other
 /// persisted setting stay global). New/unknown chats default to closed.
@@ -634,6 +647,9 @@ pub struct Shell {
     /// `track_focus` idiom) so ↑↓/Enter/Esc reach it instead of whatever was
     /// focused before it opened.
     space_dropdown_focus: gpui::FocusHandle,
+    /// Shell-level keyboard shortcuts need a focus-chain target when Settings
+    /// has no focused control.
+    shell_focus: gpui::FocusHandle,
     /// `true` for the one frame after the panel opens — the render pass
     /// consumes it to call `window.focus`.
     space_dropdown_focus_pending: bool,
@@ -902,6 +918,7 @@ impl Shell {
             space_dropdown_open: None,
             space_dropdown_highlight: None,
             space_dropdown_focus: cx.focus_handle(),
+            shell_focus: cx.focus_handle(),
             space_dropdown_focus_pending: false,
             space_dropdown_dismissed_at: None,
             space_panel_scroll: gpui::ScrollHandle::new(),
@@ -4073,25 +4090,23 @@ impl Render for Shell {
 
         // Keyboard shortcuts (mod-s/b/j) dispatch through the window focus
         // chain — with nothing focused they go dead. Land initial focus on the
-        // composer, and whenever focus is lost with no successor (e.g. the
-        // focused element unmounted), route it back there.
+        // route's fallback, and whenever focus is lost with no successor (e.g.
+        // the focused element unmounted), route it back there.
         if self.focus_sub.is_none() {
             self.focus_sub = Some(cx.on_focus_lost(window, |this: &mut Shell, window, cx| {
-                match this.route {
-                    Route::Chat => window.focus(&this.composer.focus_handle(cx), cx),
-                    // No composer here — clear the stale handle so `focused()`
-                    // reads None (the render hook below re-lands focus when the
-                    // route returns to Chat; a lingering unmounted handle would
-                    // otherwise dead-end keyboard dispatch for good).
-                    Route::Settings(_) => window.blur(),
+                match shell_focus_fallback(this.route) {
+                    ShellFocusFallback::Composer => {
+                        window.focus(&this.composer.focus_handle(cx), cx)
+                    }
+                    ShellFocusFallback::ShellRoot => window.focus(&this.shell_focus, cx),
                 }
             }));
         }
-        if matches!(gate, GatePhase::Ready)
-            && matches!(self.route, Route::Chat)
-            && window.focused(cx).is_none()
-        {
-            window.focus(&self.composer.focus_handle(cx), cx);
+        if matches!(gate, GatePhase::Ready) && window.focused(cx).is_none() {
+            match shell_focus_fallback(self.route) {
+                ShellFocusFallback::Composer => window.focus(&self.composer.focus_handle(cx), cx),
+                ShellFocusFallback::ShellRoot => window.focus(&self.shell_focus, cx),
+            }
         }
         // Opening a search result hands focus back to the composer, matching
         // what selecting a session anywhere else leaves you with — otherwise
@@ -4104,6 +4119,7 @@ impl Render for Shell {
 
         let root = div()
             .id("shell-root")
+            .track_focus(&self.shell_focus)
             .relative()
             .flex()
             .flex_row()
@@ -4427,6 +4443,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Keystroke::parse(&platform_combo("mod-n")).unwrap()]
         );
+    }
+
+    #[test]
+    fn shell_focus_fallback_routes_chat_to_composer_and_settings_to_shell_root() {
+        assert_eq!(
+            shell_focus_fallback(Route::Chat),
+            ShellFocusFallback::Composer
+        );
+        for section in SettingsSection::ALL {
+            assert_eq!(
+                shell_focus_fallback(Route::Settings(section)),
+                ShellFocusFallback::ShellRoot
+            );
+        }
     }
 
     #[test]
