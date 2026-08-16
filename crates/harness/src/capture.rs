@@ -32,7 +32,7 @@ pub use sanitize::{
 pub use sheet::{SheetScenario, render_sheet};
 pub use surface::{
     Direction, FieldObservation, FrameRef, MAP_PATHS, SurfaceError, VOCABULARY_PATHS, Vocabulary,
-    observe_corpus, observe_surface, observe_vocabulary, observed_field_lines,
+    observe_corpus, observe_surface, observe_vocabulary,
 };
 pub use types::{
     CaptureConfig, CaptureEvent, Channel, CommandSnapshot, PlatformMetadata, Provider, RawCapture,

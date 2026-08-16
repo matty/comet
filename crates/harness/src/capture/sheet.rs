@@ -619,6 +619,17 @@ mod tests {
         // Vocabulary subsections (reading "(none observed)", since Codex
         // never populates it). What must never appear are the concrete
         // *values* that path takes under Claude.
+        //
+        // `"initialize"` only works as a Claude-only literal against THIS
+        // synthetic evidence, which deliberately avoids it. Codex's own real
+        // corpus is not Claude-only here: `.method` is `"initialize"` for
+        // Comet's own request on `codex/0.147.0/model-discovery`'s first
+        // frame (`stdin`, to-provider), so the real `codex-0.147.0.md`
+        // legitimately contains this exact string in its Vocabulary section.
+        // Do not repoint this test's `observations`/`vocabulary` at the real
+        // corpus without first dropping `"initialize"` from this list — doing
+        // so would fail for a correct reason (real Codex evidence) rather
+        // than the leak this test exists to catch.
         for literal in [
             "Claude",
             "model-discovery",

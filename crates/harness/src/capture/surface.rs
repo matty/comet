@@ -403,17 +403,3 @@ fn scalar_string(value: &Value) -> Option<String> {
         Value::Null | Value::Object(_) | Value::Array(_) => None,
     }
 }
-
-/// Every observed field as `provider direction path`, the snapshot's line form.
-pub fn observed_field_lines(observations: &[FieldObservation]) -> BTreeSet<String> {
-    observations
-        .iter()
-        .map(|observation| {
-            let direction = match observation.direction {
-                Direction::ToProvider => "to-provider",
-                Direction::FromProvider => "from-provider",
-            };
-            format!("{} {direction} {}", observation.provider, observation.path)
-        })
-        .collect()
-}

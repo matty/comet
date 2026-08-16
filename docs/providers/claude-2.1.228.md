@@ -1,0 +1,491 @@
+# claude 2.1.228
+
+Generated from the committed capture corpus — never from a live CLI, never from what the scenario table merely declares. Regenerate with `$env:COMET_UPDATE_SHEETS = "1"; cargo test -p comet-harness --test capture_corpus`; do not hand-edit.
+
+This file reports only what the scenarios below actually produced. Diffing this sheet against another version's sheet is the version-change report (no differ is planned) — but before reading a disappearance as the CLI dropping a capability, check the Scenarios section of both sheets. A field or a vocabulary value present in one version and absent in the other may mean that version's captures simply never exercised it, not that the CLI changed; the corpus's blind spot is absence, and it did not go away just because this sheet makes it visible.
+
+Two readings that argv makes tempting and both wrong: identical launch flags do not mean identical coverage — a frame or reply that depends on something actually happening during the run only appears when a run produced that trigger, so the same flag present in both versions' scenarios is not evidence the underlying event fired in both. And a field or value that is new in one version is not necessarily a new capability — it can be account or environment state that simply did not happen to occur during the other version's runs, not a wire-format change. Argv and scenario names narrow what to check; they do not settle it on their own.
+
+## Scenarios
+
+Every scenario this sheet's evidence is drawn from, with the exact argv Comet launched it with (redaction placeholders are the archive's, not this sheet's). A capability no scenario here exercises cannot appear in the sections below, whatever the wire format might otherwise support — this list is what makes that limit visible instead of silent. A distinct name is not proof of distinct coverage, either: two scenarios below with the same argv were launched identically whatever their purpose sentences say, and two with the same purpose sentence can still differ in argv — compare the argv itself before concluding two scenarios tested different things, rather than trusting the name or the purpose alone.
+
+### approval
+
+capture one bounded Claude run script
+
+```
+<HOME>\.local\bin\claude.exe
+--print
+--input-format
+stream-json
+--output-format
+stream-json
+--verbose
+--include-partial-messages
+--permission-prompt-tool
+stdio
+--model
+claude-haiku-4-5-20251001
+--effort
+low
+--permission-mode
+default
+```
+
+### attachment
+
+capture one bounded Claude run script
+
+```
+<HOME>\.local\bin\claude.exe
+--print
+--input-format
+stream-json
+--output-format
+stream-json
+--verbose
+--include-partial-messages
+--permission-prompt-tool
+stdio
+--model
+claude-haiku-4-5-20251001
+--effort
+low
+--permission-mode
+acceptEdits
+```
+
+### command-discovery
+
+capture Claude's cwd-scoped command initialize reply
+
+```
+<HOME>\.local\bin\claude.exe
+--print
+--input-format
+stream-json
+--output-format
+stream-json
+--verbose
+```
+
+### fresh-text
+
+capture one bounded Claude run script
+
+```
+<HOME>\.local\bin\claude.exe
+--print
+--input-format
+stream-json
+--output-format
+stream-json
+--verbose
+--include-partial-messages
+--permission-prompt-tool
+stdio
+--model
+claude-haiku-4-5-20251001
+--effort
+low
+--permission-mode
+acceptEdits
+```
+
+### model-discovery
+
+capture Claude's token-free model initialize reply
+
+```
+<HOME>\.local\bin\claude.exe
+--print
+--input-format
+stream-json
+--output-format
+stream-json
+--verbose
+--bare
+```
+
+### model-discovery-neutral-cwd
+
+capture Claude model discovery from a neutral working directory
+
+```
+<HOME>\.local\bin\claude.exe
+--print
+--input-format
+stream-json
+--output-format
+stream-json
+--verbose
+--bare
+```
+
+### model-discovery-project-cwd
+
+capture Claude model discovery from the selected project directory
+
+```
+<HOME>\.local\bin\claude.exe
+--print
+--input-format
+stream-json
+--output-format
+stream-json
+--verbose
+--bare
+```
+
+### resume
+
+capture one bounded Claude run script
+
+```
+<HOME>\.local\bin\claude.exe
+--print
+--input-format
+stream-json
+--output-format
+stream-json
+--verbose
+--include-partial-messages
+--permission-prompt-tool
+stdio
+--model
+claude-haiku-4-5-20251001
+--effort
+low
+--permission-mode
+acceptEdits
+--resume=<SESSION_1>
+```
+
+## Fields
+
+Every dotted path observed on the wire for this provider and version, split by the direction it travelled — `To provider` is what Comet sends, `From provider` is what the provider sends back — one path per line, sorted. Read an absent path against the Scenarios section above before reading it as a claim about the wire format.
+
+### To provider
+
+- `.message`
+- `.message.content`
+- `.message.content[].source`
+- `.message.content[].source.data`
+- `.message.content[].source.media_type`
+- `.message.content[].source.type`
+- `.message.content[].text`
+- `.message.content[].type`
+- `.message.role`
+- `.parent_tool_use_id`
+- `.request`
+- `.request.subtype`
+- `.request_id`
+- `.response`
+- `.response.request_id`
+- `.response.response`
+- `.response.response.behavior`
+- `.response.response.updatedInput`
+- `.response.response.updatedInput.content`
+- `.response.response.updatedInput.file_path`
+- `.response.subtype`
+- `.type`
+
+### From provider
+
+- `.agents`
+- `.analytics_disabled`
+- `.apiKeySource`
+- `.api_error_status`
+- `.capabilities`
+- `.claude_code_version`
+- `.cwd`
+- `.duration_api_ms`
+- `.duration_ms`
+- `.event`
+- `.event.content_block`
+- `.event.content_block.id`
+- `.event.content_block.input`
+- `.event.content_block.name`
+- `.event.content_block.signature`
+- `.event.content_block.text`
+- `.event.content_block.thinking`
+- `.event.content_block.type`
+- `.event.delta`
+- `.event.delta.partial_json`
+- `.event.delta.signature`
+- `.event.delta.stop_reason`
+- `.event.delta.stop_sequence`
+- `.event.delta.text`
+- `.event.delta.type`
+- `.event.index`
+- `.event.message`
+- `.event.message.content`
+- `.event.message.id`
+- `.event.message.model`
+- `.event.message.role`
+- `.event.message.stop_reason`
+- `.event.message.stop_sequence`
+- `.event.message.type`
+- `.event.message.usage`
+- `.event.message.usage.input_tokens`
+- `.event.message.usage.output_tokens`
+- `.event.type`
+- `.event.usage`
+- `.event.usage.cache_creation_input_tokens`
+- `.event.usage.cache_read_input_tokens`
+- `.event.usage.input_tokens`
+- `.event.usage.output_tokens`
+- `.exit_code`
+- `.fast_mode_disabled_reason`
+- `.fast_mode_state`
+- `.hook_event`
+- `.hook_id`
+- `.hook_name`
+- `.isSynthetic`
+- `.is_error`
+- `.mcp_servers`
+- `.memory_paths`
+- `.memory_paths.auto`
+- `.message`
+- `.message.content`
+- `.message.content[].content`
+- `.message.content[].id`
+- `.message.content[].input`
+- `.message.content[].input.command`
+- `.message.content[].input.content`
+- `.message.content[].input.file_path`
+- `.message.content[].input.skill`
+- `.message.content[].is_error`
+- `.message.content[].name`
+- `.message.content[].signature`
+- `.message.content[].text`
+- `.message.content[].thinking`
+- `.message.content[].tool_use_id`
+- `.message.content[].type`
+- `.message.context_management`
+- `.message.id`
+- `.message.model`
+- `.message.role`
+- `.message.stop_reason`
+- `.message.stop_sequence`
+- `.message.type`
+- `.message.usage`
+- `.message.usage.input_tokens`
+- `.message.usage.output_tokens`
+- `.model`
+- `.modelUsage`
+- `.modelUsage.{}.cacheCreationInputTokens`
+- `.modelUsage.{}.cacheReadInputTokens`
+- `.modelUsage.{}.canonicalModel`
+- `.modelUsage.{}.contextWindow`
+- `.modelUsage.{}.costUSD`
+- `.modelUsage.{}.inputTokens`
+- `.modelUsage.{}.maxOutputTokens`
+- `.modelUsage.{}.outputTokens`
+- `.modelUsage.{}.provider`
+- `.modelUsage.{}.webSearchRequests`
+- `.num_turns`
+- `.outcome`
+- `.output`
+- `.output_style`
+- `.parent_tool_use_id`
+- `.permissionMode`
+- `.permission_denials`
+- `.plugins`
+- `.plugins[].name`
+- `.plugins[].path`
+- `.plugins[].source`
+- `.plugins[].version`
+- `.product_feedback_disabled`
+- `.request`
+- `.request.description`
+- `.request.display_name`
+- `.request.input`
+- `.request.input.content`
+- `.request.input.file_path`
+- `.request.permission_suggestions`
+- `.request.permission_suggestions[].destination`
+- `.request.permission_suggestions[].mode`
+- `.request.permission_suggestions[].type`
+- `.request.subtype`
+- `.request.tool_name`
+- `.request.tool_use_id`
+- `.request_id`
+- `.response`
+- `.response.request_id`
+- `.response.response`
+- `.response.response.account`
+- `.response.response.account.apiProvider`
+- `.response.response.account.tokenSource`
+- `.response.response.agents`
+- `.response.response.agents[].description`
+- `.response.response.agents[].model`
+- `.response.response.agents[].name`
+- `.response.response.available_output_styles`
+- `.response.response.commands`
+- `.response.response.commands[].aliases`
+- `.response.response.commands[].argumentHint`
+- `.response.response.commands[].description`
+- `.response.response.commands[].name`
+- `.response.response.current_permission_mode`
+- `.response.response.fast_mode_disabled_reason`
+- `.response.response.fast_mode_state`
+- `.response.response.ide_rc_auto_enable_gate`
+- `.response.response.models`
+- `.response.response.models[].description`
+- `.response.response.models[].displayName`
+- `.response.response.models[].resolvedModel`
+- `.response.response.models[].supportedEffortLevels`
+- `.response.response.models[].supportsAdaptiveThinking`
+- `.response.response.models[].supportsAutoMode`
+- `.response.response.models[].supportsEffort`
+- `.response.response.models[].supportsFastMode`
+- `.response.response.models[].value`
+- `.response.response.output_style`
+- `.response.response.pid`
+- `.response.response.remote_control_auto_enable`
+- `.response.response.remote_control_auto_on_by_default`
+- `.response.subtype`
+- `.result`
+- `.session_id`
+- `.skills`
+- `.slash_commands`
+- `.status`
+- `.stderr`
+- `.stdout`
+- `.stop_reason`
+- `.subtype`
+- `.terminal_reason`
+- `.time_to_request_ms`
+- `.timestamp`
+- `.tool_use_result`
+- `.tool_use_result.commandName`
+- `.tool_use_result.content`
+- `.tool_use_result.filePath`
+- `.tool_use_result.interrupted`
+- `.tool_use_result.isImage`
+- `.tool_use_result.noOutputExpected`
+- `.tool_use_result.originalFile`
+- `.tool_use_result.stderr`
+- `.tool_use_result.stdout`
+- `.tool_use_result.structuredPatch`
+- `.tool_use_result.success`
+- `.tool_use_result.type`
+- `.tool_use_result.userModified`
+- `.tools`
+- `.total_cost_usd`
+- `.ttft_ms`
+- `.ttft_stream_ms`
+- `.type`
+- `.usage`
+- `.usage.cache_creation`
+- `.usage.cache_creation.ephemeral_1h_input_tokens`
+- `.usage.cache_creation.ephemeral_5m_input_tokens`
+- `.usage.cache_creation_input_tokens`
+- `.usage.cache_read_input_tokens`
+- `.usage.inference_geo`
+- `.usage.input_tokens`
+- `.usage.iterations`
+- `.usage.output_tokens`
+- `.usage.output_tokens_details`
+- `.usage.output_tokens_details.thinking_tokens`
+- `.usage.server_tool_use`
+- `.usage.server_tool_use.web_fetch_requests`
+- `.usage.server_tool_use.web_search_requests`
+- `.usage.service_tier`
+- `.usage.speed`
+- `.uuid`
+
+## Vocabulary
+
+The observed value set for a small declared list of discriminator paths — not every field, only the ones whose values name what kind of thing a frame or a tool call is (`VOCABULARY_PATHS` in `crates/harness/src/capture/surface.rs`). Every path that const declares is listed under every direction, whether or not this version's scenarios put a scalar there. `(none observed)` means exactly that: no captured frame produced a value at that path in that direction, in this version's evidence — it is not a claim that the provider lacks the capability. Direction-keying itself is not a formality: a discriminator can carry a genuinely different vocabulary per direction, not merely an unevenly observed one — the value set one direction shows is not a subset of the other's, and a value native to one direction may never appear in the other at all. Reading a path's values without checking which direction produced them would silently merge two different discriminators into one.
+
+### To provider
+
+#### `.event.content_block.name`
+
+(none observed)
+
+#### `.event.type`
+
+(none observed)
+
+#### `.message.content[].name`
+
+(none observed)
+
+#### `.method`
+
+(none observed)
+
+#### `.request.subtype`
+
+- `initialize`
+
+#### `.response.subtype`
+
+- `success`
+
+#### `.subtype`
+
+(none observed)
+
+#### `.type`
+
+- `control_request`
+- `control_response`
+- `user`
+
+### From provider
+
+#### `.event.content_block.name`
+
+- `Bash`
+- `Skill`
+- `Write`
+
+#### `.event.type`
+
+- `content_block_delta`
+- `content_block_start`
+- `content_block_stop`
+- `message_delta`
+- `message_start`
+- `message_stop`
+
+#### `.message.content[].name`
+
+- `Bash`
+- `Skill`
+- `Write`
+
+#### `.method`
+
+(none observed)
+
+#### `.request.subtype`
+
+- `can_use_tool`
+
+#### `.response.subtype`
+
+- `success`
+
+#### `.subtype`
+
+- `hook_response`
+- `hook_started`
+- `init`
+- `status`
+- `success`
+
+#### `.type`
+
+- `assistant`
+- `control_request`
+- `control_response`
+- `result`
+- `stream_event`
+- `system`
+- `user`
