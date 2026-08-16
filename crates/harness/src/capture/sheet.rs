@@ -22,13 +22,20 @@ use super::surface::{Direction, FieldObservation, VOCABULARY_PATHS};
 
 /// One promoted scenario's identity, for the sheet's own evidence list.
 ///
-/// Printing the exact argv (plan preamble decision 7) is what makes two
-/// byte-identical scenarios — `model-discovery` and
-/// `model-discovery-neutral-cwd` — read as two identical experiments rather
-/// than as independent confirmation of the same capability. The scenario's
-/// working directory is redacted to a placeholder in the archive itself, so
-/// the argv is what actually distinguishes them; there is no separate `cwd`
-/// field here to reconcile.
+/// Printing the exact argv (plan preamble decision 7, corrected 2026-08-16
+/// after Task 3's review checked the manifests) is what makes three
+/// genuinely identical scenarios — Claude's `model-discovery`,
+/// `model-discovery-neutral-cwd` and `model-discovery-project-cwd` — read as
+/// what they are: the same program, the same args
+/// (`--print --input-format stream-json --output-format stream-json
+/// --verbose --bare`), and the same redacted `cwd` (`<CWD>`). **Nothing in
+/// the archive distinguishes them** — the working directory is the one real
+/// difference between the three runs, and it is redacted to a placeholder
+/// and unrecoverable from what's committed. Printing the argv still
+/// discharges D80, but for the opposite reason an earlier draft of this
+/// comment gave: three identical fenced blocks read as one experiment
+/// printed three times, not as three independent confirmations — which is
+/// exactly the impression a reader should take away.
 #[derive(Clone, Debug)]
 pub struct SheetScenario {
     pub name: String,
@@ -85,18 +92,28 @@ fn header_lines(provider: &str, version: &str) -> Vec<String> {
     vec![
         format!("# {provider} {version}"),
         String::new(),
-        "Generated from the committed capture corpus -- never from a live CLI, never from \
-         what the scenario table merely declares. Regenerate with `COMET_UPDATE_SHEETS=1 \
-         cargo test -p comet-harness --test capture_corpus`; do not hand-edit."
+        "Generated from the committed capture corpus — never from a live CLI, never from \
+         what the scenario table merely declares. Regenerate with `$env:COMET_UPDATE_SHEETS \
+         = \"1\"; cargo test -p comet-harness --test capture_corpus`; do not hand-edit."
             .to_owned(),
         String::new(),
         "This file reports only what the scenarios below actually produced. Diffing this \
          sheet against another version's sheet is the version-change report (no differ is \
-         planned) -- but before reading a disappearance as the CLI dropping a capability, \
+         planned) — but before reading a disappearance as the CLI dropping a capability, \
          check the Scenarios section of both sheets. A field or a vocabulary value present \
          in one version and absent in the other may mean that version's captures simply \
          never exercised it, not that the CLI changed; the corpus's blind spot is absence, \
          and it did not go away just because this sheet makes it visible."
+            .to_owned(),
+        String::new(),
+        "Two readings that argv makes tempting and both wrong: identical launch flags do \
+         not mean identical coverage — a control frame like `can_use_tool` only appears \
+         when a run actually triggered an approval, so the same flag present in both \
+         versions' scenarios is not evidence the capability fired in both. And a field or \
+         value that is new in one version is not necessarily a new capability — it can be \
+         account or environment state (`rate_limit_event`, for one) that simply did not \
+         happen to occur during the other version's runs. Argv and scenario names narrow \
+         what to check; they do not settle it on their own."
             .to_owned(),
         String::new(),
     ]
@@ -109,8 +126,12 @@ fn scenario_lines(scenarios: &[SheetScenario]) -> Vec<String> {
         "Every scenario this sheet's evidence is drawn from, with the exact argv Comet \
          launched it with (redaction placeholders are the archive's, not this sheet's). A \
          capability no scenario here exercises cannot appear in the sections below, \
-         whatever the wire format might otherwise support -- this list is what makes that \
-         limit visible instead of silent."
+         whatever the wire format might otherwise support — this list is what makes that \
+         limit visible instead of silent. A distinct name is not proof of distinct \
+         coverage: several scenarios below share the same boilerplate purpose and, for \
+         Claude's `model-discovery` trio, identical argv — read the purpose and argv \
+         themselves, not just the count of names, before concluding two runs tested \
+         different things."
             .to_owned(),
         String::new(),
     ];
@@ -144,8 +165,8 @@ fn field_lines(provider: &str, version: &str, observations: &[FieldObservation])
         "## Fields".to_owned(),
         String::new(),
         "Every dotted path observed on the wire for this provider and version, split by the \
-         direction it travelled -- `To provider` is what Comet sends, `From provider` is \
-         what the provider sends back -- one path per line, sorted. Read an absent path \
+         direction it travelled — `To provider` is what Comet sends, `From provider` is \
+         what the provider sends back — one path per line, sorted. Read an absent path \
          against the Scenarios section above before reading it as a claim about the wire \
          format."
             .to_owned(),
@@ -185,16 +206,19 @@ fn vocabulary_lines(vocabulary: &BTreeMap<(Direction, String), BTreeSet<String>>
     let mut lines = vec![
         "## Vocabulary".to_owned(),
         String::new(),
-        "The observed value set for a small declared list of discriminator paths -- not \
+        "The observed value set for a small declared list of discriminator paths — not \
          every field, only the ones whose values name what kind of thing a frame or a tool \
          call is (`VOCABULARY_PATHS` in `crates/harness/src/capture/surface.rs`). Every \
-         declared path is listed under every direction, whether or not this version's \
-         scenarios put a scalar there. `(none observed)` means exactly that: no captured \
-         frame produced a value at that path in that direction, in this version's evidence. \
-         It is not a claim that the provider lacks the capability -- a discriminator that \
-         structurally applies to only one direction (Codex declares no tool-name path at \
-         all; see `VOCABULARY_PATHS`'s own doc comment) will read this way in every sheet, \
-         for every version, on purpose."
+         path that const declares is listed under every direction, whether or not this \
+         version's scenarios put a scalar there. `(none observed)` means exactly that: no \
+         captured frame produced a value at that path in that direction, in this version's \
+         evidence — it is not a claim that the provider lacks the capability. \
+         Direction-keying itself is not a formality: a discriminator can carry a genuinely \
+         different vocabulary per direction, not merely an unevenly observed one — Claude's \
+         `.request.subtype` is `initialize` to-provider and `can_use_tool` from-provider, \
+         and neither direction ever sees the other's value. Reading a path's values without \
+         checking which direction produced them would silently merge two different \
+         discriminators into one."
             .to_owned(),
         String::new(),
     ];
@@ -257,6 +281,66 @@ mod tests {
         }
     }
 
+    /// The text of one `##`-level section, from its own heading up to (but
+    /// not including) the next `##`-level heading, or the end of the
+    /// document for the last section.
+    ///
+    /// Exists so a test can assert against exactly the section it names
+    /// rather than the whole rendered document. Two earlier versions of the
+    /// tests below asserted `rendered.contains("(none observed)")` against
+    /// the whole document while also passing empty input to the *other*
+    /// section — Fields' two empty subsections satisfied the vocabulary
+    /// test, and Vocabulary's sixteen empty subsections satisfied the
+    /// fields test, regardless of what the section under test actually did.
+    /// Review finding, 2026-08-16.
+    fn section<'a>(rendered: &'a str, heading: &str) -> &'a str {
+        let start = rendered
+            .find(heading)
+            .unwrap_or_else(|| panic!("no {heading:?} heading in: {rendered}"));
+        let after = &rendered[start..];
+        let end = after[heading.len()..]
+            .find("\n## ")
+            .map(|offset| offset + heading.len())
+            .unwrap_or(after.len());
+        &after[..end]
+    }
+
+    /// Every `#### \`path\`` heading inside `section` must be followed
+    /// (heading, blank separator, content) by exactly the text
+    /// `(none observed)` — stronger than "the phrase appears somewhere in
+    /// this section," which a real value at some *other* declared path
+    /// could also satisfy while the path under test silently renders
+    /// something else. Panics (rather than returning a count) if `section`
+    /// names no heading at all, since that would make the loop below
+    /// vacuously true.
+    fn assert_every_heading_reads_none_observed(section: &str) {
+        let mut checked = 0;
+        for heading_start in section
+            .match_indices("#### `")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+        {
+            let after = &section[heading_start..];
+            let heading_end = after
+                .find('\n')
+                .expect("heading line must end in a newline");
+            let heading = &after[..heading_end];
+            let rest = after[heading_end..]
+                .strip_prefix("\n\n")
+                .unwrap_or_else(|| {
+                    panic!("{heading:?} must be followed by a blank separator line: {section}")
+                });
+            let content_end = rest.find('\n').unwrap_or(rest.len());
+            let content = &rest[..content_end];
+            assert_eq!(
+                content, "(none observed)",
+                "{heading} must read exactly \"(none observed)\", found {content:?}: {section}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no declared-path headings found: {section}");
+    }
+
     #[test]
     fn header_names_provider_and_version() {
         let rendered = render_sheet("claude", "2.1.229", &[], &BTreeMap::new(), &[]);
@@ -317,43 +401,40 @@ mod tests {
     /// path, not as a missing or shortened section — the two traps named in
     /// the task (a false version regression, and an empty section reading
     /// as an absence of capability) both hinge on this.
+    ///
+    /// Break caught (review, 2026-08-16): the original version of this test
+    /// asserted `rendered.contains("(none observed)")` against the *whole*
+    /// document while passing `&[]` for `observations` too — so `field_lines`
+    /// emitted "(none observed)" twice before the Vocabulary section was
+    /// even reached, and the assertion passed regardless of what the
+    /// Vocabulary section actually rendered. Change `vocabulary_lines`'s
+    /// `_ => lines.push("(none observed)".to_owned())` arm to
+    /// `_ => lines.push(String::new())` and this fixed version still fails,
+    /// which the original did not.
     #[test]
     fn an_empty_vocabulary_reads_as_none_observed_not_a_missing_section() {
         let rendered = render_sheet("codex", "0.147.0", &[], &BTreeMap::new(), &[]);
+        let vocabulary_section = section(&rendered, "## Vocabulary");
 
         for path in VOCABULARY_PATHS {
             let heading = format!("#### `{path}`");
             assert!(
-                rendered.contains(&heading),
+                vocabulary_section.contains(&heading),
                 "declared path {path} must still get its own subsection with zero observed \
-                 values: {rendered}"
+                 values: {vocabulary_section}"
             );
         }
-        assert!(
-            rendered.contains("(none observed)"),
-            "an unobserved declared path must say so explicitly: {rendered}"
-        );
-        // Scoped to the Vocabulary section itself, not the whole document —
-        // the Scenarios intro legitimately uses "cannot appear" for the
-        // archive's own documented absence-blind-spot, which is a true and
-        // unrelated statement. Checking for an unqualified claim of
-        // incapacity has to account for negation: the section is expected to
-        // *mention* "lacks the capability" while explicitly denying it, so
-        // the real assertion is that the denial is present, not that the
-        // phrase is absent.
-        let vocabulary_section = &rendered[rendered.find("## Vocabulary").unwrap()..];
+        // Stronger than "the phrase appears somewhere in the section": every
+        // one of the 8 declared paths x 2 directions = 16 headings must
+        // individually read exactly "(none observed)", not merely have the
+        // phrase appear once anywhere while some heading renders something
+        // else (or nothing).
+        assert_every_heading_reads_none_observed(vocabulary_section);
         assert!(
             vocabulary_section.contains("not a claim that the provider lacks the capability"),
             "the vocabulary section must explicitly deny that an unobserved path means the \
              provider lacks it: {vocabulary_section}"
         );
-        for phrase in ["does not support", "unsupported", "cannot do"] {
-            assert!(
-                !vocabulary_section.to_ascii_lowercase().contains(phrase),
-                "the vocabulary section must not read as an unqualified claim the provider \
-                 lacks the capability (found {phrase:?}): {vocabulary_section}"
-            );
-        }
     }
 
     #[test]
@@ -431,13 +512,37 @@ mod tests {
         );
     }
 
+    /// Break caught (review, 2026-08-16): the original version of this test
+    /// asserted `rendered.contains("(none observed)")` against the *whole*
+    /// document while passing an empty `vocabulary` too — so
+    /// `vocabulary_lines` emitted "(none observed)" sixteen times (8
+    /// declared paths x 2 directions) regardless of what `field_lines`
+    /// rendered, and the assertion passed no matter what. Change
+    /// `field_lines`'s `lines.push("(none observed)".to_owned())` to
+    /// `lines.push(String::new())` and this fixed version still fails,
+    /// which the original did not.
     #[test]
     fn fields_with_nothing_observed_still_say_so() {
         let rendered = render_sheet("claude", "2.1.229", &[], &BTreeMap::new(), &[]);
-        let to_provider_idx = rendered.find("### To provider").unwrap();
-        let from_provider_idx = rendered.find("### From provider").unwrap();
-        assert!(to_provider_idx < from_provider_idx, "{rendered}");
-        assert!(rendered.contains("(none observed)"), "{rendered}");
+        let fields_section = section(&rendered, "## Fields");
+
+        let to_provider_idx = fields_section.find("### To provider").unwrap();
+        let from_provider_idx = fields_section.find("### From provider").unwrap();
+        assert!(to_provider_idx < from_provider_idx, "{fields_section}");
+
+        for heading in ["### To provider", "### From provider"] {
+            let after = &fields_section[fields_section.find(heading).unwrap() + heading.len()..];
+            let content = after.strip_prefix("\n\n").unwrap_or_else(|| {
+                panic!("{heading:?} must be followed by a blank separator line: {fields_section}")
+            });
+            let content_end = content.find('\n').unwrap_or(content.len());
+            assert_eq!(
+                &content[..content_end],
+                "(none observed)",
+                "{heading} must read exactly \"(none observed)\" when nothing was observed: \
+                 {fields_section}"
+            );
+        }
     }
 
     #[test]
