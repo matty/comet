@@ -16,6 +16,7 @@ capture one bounded Codex run script
 
 cwd: `<CWD>`
 env: (none set)
+tools: (not observed)
 
 ```
 <HOME>\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe
@@ -28,6 +29,7 @@ capture Codex initialize and paged model/list replies
 
 cwd: `<CWD>`
 env: `CODEX_HOME=<CODEX_HOME>`
+tools: (not observed)
 
 ```
 <HOME>\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe
@@ -40,6 +42,7 @@ capture Codex model discovery with an isolated empty Codex home
 
 cwd: `<CWD>`
 env: `CODEX_HOME=<CODEX_HOME>`
+tools: (not observed)
 
 ```
 <HOME>\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe
@@ -52,6 +55,7 @@ capture Codex model discovery from a neutral working directory
 
 cwd: `<CWD>`
 env: `CODEX_HOME=<CODEX_HOME>`
+tools: (not observed)
 
 ```
 <HOME>\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe
@@ -64,6 +68,7 @@ capture Codex model discovery from the selected project directory
 
 cwd: `<CWD>`
 env: `CODEX_HOME=<CODEX_HOME>`
+tools: (not observed)
 
 ```
 <HOME>\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe
@@ -76,6 +81,7 @@ capture one bounded Codex run script
 
 cwd: `<CWD>`
 env: (none set)
+tools: (not observed)
 
 ```
 <HOME>\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe
@@ -88,6 +94,7 @@ capture one bounded Codex run script
 
 cwd: `<CWD>`
 env: (none set)
+tools: (not observed)
 
 ```
 <HOME>\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe

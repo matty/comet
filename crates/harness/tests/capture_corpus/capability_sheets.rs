@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use comet_harness::capture::{
-    Direction, FieldObservation, SheetScenario, Vocabulary, corpus_root, observe_surface,
+    Direction, FieldObservation, SheetScenario, Vocabulary, corpus_root, frames, observe_surface,
     promoted_scenarios, render_sheet,
 };
 use serde_json::Value;
@@ -160,9 +160,41 @@ fn scenarios_for(root: &Path, provider: &str, version: &str) -> Vec<SheetScenari
             argv,
             cwd,
             configured_env,
+            tool_count: tool_count_for(&path),
         });
     }
     scenarios
+}
+
+/// The length of the first `system`/`init` frame's `tools` array in
+/// `scenario_dir`'s archive, or `None` if no such frame appears there (a
+/// discovery-only scenario, or a provider with no equivalent frame at all —
+/// Codex's corpus has none today).
+///
+/// Reads `events.jsonl` directly rather than through [`observe_surface`]:
+/// that walker deliberately records field *names*, never a value, and
+/// `.tools` is redacted element-by-element on `claude.txt` — its length is
+/// the one thing about that array this sheet is allowed to show (D86), and
+/// it has to come from the array itself, not from anything the surface walk
+/// already discarded.
+fn tool_count_for(scenario_dir: &Path) -> Option<usize> {
+    let events = frames(scenario_dir)
+        .unwrap_or_else(|error| panic!("{} could not be read: {error}", scenario_dir.display()));
+    for event in events {
+        let Some(payload) = event["payload"]
+            .as_str()
+            .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+        else {
+            continue;
+        };
+        if payload["type"].as_str() == Some("system")
+            && payload["subtype"].as_str() == Some("init")
+            && let Some(tools) = payload["tools"].as_array()
+        {
+            return Some(tools.len());
+        }
+    }
+    None
 }
 
 /// Renders one version's sheet from evidence the caller already walked:
