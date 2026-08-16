@@ -25,7 +25,8 @@ mod types;
 
 pub use allowlist::{allows, allows_prefix, named_kind};
 pub use corpus::{
-    Frame, PromotedScenario, corpus_frame, corpus_root, frame, frames, promoted_scenarios,
+    FoundFrame, Frame, PromotedScenario, corpus_frame, corpus_frame_where, corpus_root, frame,
+    frames, promoted_scenarios,
 };
 pub use record::{Requirements, SCENARIOS, ScenarioSpec, record, scenario};
 pub use sanitize::{
