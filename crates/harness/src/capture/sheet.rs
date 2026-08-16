@@ -107,13 +107,14 @@ fn header_lines(provider: &str, version: &str) -> Vec<String> {
             .to_owned(),
         String::new(),
         "Two readings that argv makes tempting and both wrong: identical launch flags do \
-         not mean identical coverage — a control frame like `can_use_tool` only appears \
-         when a run actually triggered an approval, so the same flag present in both \
-         versions' scenarios is not evidence the capability fired in both. And a field or \
-         value that is new in one version is not necessarily a new capability — it can be \
-         account or environment state (`rate_limit_event`, for one) that simply did not \
-         happen to occur during the other version's runs. Argv and scenario names narrow \
-         what to check; they do not settle it on their own."
+         not mean identical coverage — a frame or reply that depends on something actually \
+         happening during the run only appears when a run produced that trigger, so the \
+         same flag present in both versions' scenarios is not evidence the underlying \
+         event fired in both. And a field or value that is new in one version is not \
+         necessarily a new capability — it can be account or environment state that simply \
+         did not happen to occur during the other version's runs, not a wire-format \
+         change. Argv and scenario names narrow what to check; they do not settle it on \
+         their own."
             .to_owned(),
         String::new(),
     ]
@@ -128,10 +129,11 @@ fn scenario_lines(scenarios: &[SheetScenario]) -> Vec<String> {
          capability no scenario here exercises cannot appear in the sections below, \
          whatever the wire format might otherwise support — this list is what makes that \
          limit visible instead of silent. A distinct name is not proof of distinct \
-         coverage: several scenarios below share the same boilerplate purpose and, for \
-         Claude's `model-discovery` trio, identical argv — read the purpose and argv \
-         themselves, not just the count of names, before concluding two runs tested \
-         different things."
+         coverage, either: two scenarios below with the same argv were launched \
+         identically whatever their purpose sentences say, and two with the same purpose \
+         sentence can still differ in argv — compare the argv itself before concluding two \
+         scenarios tested different things, rather than trusting the name or the purpose \
+         alone."
             .to_owned(),
         String::new(),
     ];
@@ -214,10 +216,10 @@ fn vocabulary_lines(vocabulary: &BTreeMap<(Direction, String), BTreeSet<String>>
          captured frame produced a value at that path in that direction, in this version's \
          evidence — it is not a claim that the provider lacks the capability. \
          Direction-keying itself is not a formality: a discriminator can carry a genuinely \
-         different vocabulary per direction, not merely an unevenly observed one — Claude's \
-         `.request.subtype` is `initialize` to-provider and `can_use_tool` from-provider, \
-         and neither direction ever sees the other's value. Reading a path's values without \
-         checking which direction produced them would silently merge two different \
+         different vocabulary per direction, not merely an unevenly observed one — the \
+         value set one direction shows is not a subset of the other's, and a value native \
+         to one direction may never appear in the other at all. Reading a path's values \
+         without checking which direction produced them would silently merge two different \
          discriminators into one."
             .to_owned(),
         String::new(),
@@ -293,14 +295,20 @@ mod tests {
     /// test, and Vocabulary's sixteen empty subsections satisfied the
     /// fields test, regardless of what the section under test actually did.
     /// Review finding, 2026-08-16.
+    ///
+    /// Looks for `"\n\n## "` (blank separator, then the heading marker),
+    /// not bare `"\n## "` — every genuine `##`-heading in `render_sheet`'s
+    /// output is preceded by a blank line (the join always inserts one), so
+    /// this can't be fooled by a scenario argv line that happens to start
+    /// with `## ` inside a fenced block, which is preceded by a single `\n`.
     fn section<'a>(rendered: &'a str, heading: &str) -> &'a str {
         let start = rendered
             .find(heading)
             .unwrap_or_else(|| panic!("no {heading:?} heading in: {rendered}"));
         let after = &rendered[start..];
         let end = after[heading.len()..]
-            .find("\n## ")
-            .map(|offset| offset + heading.len())
+            .find("\n\n## ")
+            .map(|offset| offset + heading.len() + 1)
             .unwrap_or(after.len());
         &after[..end]
     }
@@ -556,5 +564,73 @@ mod tests {
             rendered.ends_with('\n') && !rendered.ends_with("\n\n"),
             "must end in exactly one trailing newline: {rendered:?}"
         );
+    }
+
+    /// Break caught (review, 2026-08-16): the Scenarios intro named Claude's
+    /// `model-discovery` trio as a worked example of same-argv scenarios,
+    /// and it rendered into *every* sheet regardless of `provider` — a
+    /// Codex reader got a Claude anecdote while Codex's own, structurally
+    /// identical case (its four `model-discovery*` scenarios share
+    /// byte-identical program/args/cwd, verified directly against the
+    /// corpus) went unmentioned. The header and the Vocabulary intro carried
+    /// the same defect (`can_use_tool`, `rate_limit_event`,
+    /// `.request.subtype`/`initialize` are Claude-only literals that used to
+    /// render into the Codex sheet too).
+    ///
+    /// An earlier version of this test rendered the same synthetic evidence
+    /// under two different `provider` values and asserted the output was
+    /// identical past the header line — which sounds like it tests "no
+    /// provider-specific literal," but doesn't: a hardcoded literal that
+    /// renders unconditionally, the same way regardless of `provider` (which
+    /// is exactly the shape the real bug had — the string wasn't gated on
+    /// `if provider == "claude"`, it was just always there), satisfies an
+    /// equality check trivially, because both sides of the diff contain it
+    /// equally. Falsifying that version by reintroducing the literal proved
+    /// this: the test stayed green. Replaced with a direct search for the
+    /// literals the review actually found, which does discriminate — a
+    /// Codex render must never contain a name that belongs only to Claude's
+    /// evidence.
+    #[test]
+    fn a_codex_sheet_names_no_claude_only_literal() {
+        // Evidence built entirely from generic, non-Claude, non-Codex
+        // strings, so if any of the literals below show up in the output,
+        // they can only have come from the renderer's own static prose.
+        let observations = vec![observation(
+            "codex",
+            "9.9.9",
+            Direction::FromProvider,
+            ".shared",
+        )];
+        let vocabulary: BTreeMap<(Direction, String), BTreeSet<String>> = BTreeMap::from([(
+            (Direction::FromProvider, ".type".to_owned()),
+            BTreeSet::from(["shared-value".to_owned()]),
+        )]);
+        let scenarios = vec![scenario(
+            "shared-scenario",
+            "shared purpose",
+            &["prog", "--flag"],
+        )];
+
+        let rendered = render_sheet("codex", "9.9.9", &observations, &vocabulary, &scenarios);
+
+        // `.request.subtype` itself is deliberately excluded from this list:
+        // it's a declared path name in `VOCABULARY_PATHS`, shared by every
+        // provider, and correctly appears as one of Codex's own eight
+        // Vocabulary subsections (reading "(none observed)", since Codex
+        // never populates it). What must never appear are the concrete
+        // *values* that path takes under Claude.
+        for literal in [
+            "Claude",
+            "model-discovery",
+            "can_use_tool",
+            "rate_limit_event",
+            "initialize",
+        ] {
+            assert!(
+                !rendered.contains(literal),
+                "a Codex sheet must never name {literal:?} — that names a concrete frame, \
+                 tool or scenario absent from Codex's own evidence: {rendered}"
+            );
+        }
     }
 }
