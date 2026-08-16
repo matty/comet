@@ -11,14 +11,19 @@
 //! `events.jsonl` byte, and it keeps holding for captures that do not exist
 //! yet.
 //!
-//! **Scope: `events.jsonl` only, not the whole corpus directory.** A handful
-//! of committed files were never in `sanitize_dir`'s remit and this walk does
-//! not visit them: each scenario's `README.md`, and
-//! `claude/2.1.229/subagent/read-back-run-journal.jsonl` /
-//! `read-back-doc-snapshot.json` (a *different* session's read-back evidence,
-//! hand-sanitized by an earlier slice to its own documented standard -- see
-//! that directory's `README.md`). A green run here certifies the frame
-//! evidence, not literally every byte under `tests/corpus/`.
+//! **Scope: `events.jsonl` only, not the whole corpus directory.** The one
+//! kind of committed file this walk still does not visit is each scenario's
+//! `README.md` -- prose, not frame evidence, so it was never a candidate.
+//! Until D75, a second carve-out sat beside it: `claude/2.1.229/subagent/
+//! read-back-run-journal.jsonl` and `read-back-doc-snapshot.json` were a
+//! *different* session's read-back evidence, hand-sanitized by an earlier
+//! slice to its own documented standard rather than through `sanitize_dir`,
+//! so this property skipped them too. D75 deleted both files rather than
+//! bringing them under the allowlist, so that carve-out is gone -- the
+//! property's remit is now the whole corpus's frame evidence, with nothing
+//! exempted for being sanitized to a different standard. A green run here
+//! certifies the frame evidence, not literally every byte under
+//! `tests/corpus/`.
 //!
 //! **What a green run does *not* certify.** This property only ever inspects
 //! the content of a scalar it is about to call an escape (an unlisted path,
@@ -479,15 +484,19 @@ fn is_mcp_tool_identity(value: &Value) -> bool {
 /// vocabulary `sanitize.rs` writes today (`<SESSION_1>`, `<MACHINE_1>`, ...).
 /// Task 5 has since run: every *manifest* in the corpus now uses the
 /// six-kind vocabulary, and no `SESSION_ID`/`CLAUDE_`-prefixed placeholder
-/// remains in any of them. That is a claim about manifests, not the whole
-/// corpus directory — `claude/2.1.229/subagent/read-back-run-journal.jsonl`
-/// still holds `<SESSION_ID_1>` twice, hand-sanitized under the old
-/// vocabulary and never in `sanitize_dir`'s remit at all (see `D75` in
-/// `docs/debt/README.md`), so it has no manifest of its own for this
-/// function to read regardless. Reading each manifest's own list, rather
-/// than hardcoding either vocabulary, is what let this property hold across
-/// that sanitizer-vocabulary change without editing the test, and is what
-/// lets it keep holding across whatever the vocabulary becomes next.
+/// remains in any of them. That claim used to stop at manifests rather than
+/// the whole corpus directory, because `claude/2.1.229/subagent/
+/// read-back-run-journal.jsonl` still held `<SESSION_ID_1>` twice,
+/// hand-sanitized under the old vocabulary, outside `sanitize_dir`'s remit,
+/// and with no manifest of its own for this function to read. `D75` in
+/// `docs/debt/README.md` deleted that file (and its sibling
+/// `read-back-doc-snapshot.json`) rather than bringing it under the
+/// allowlist, so the exception is gone: every placeholder anywhere in the
+/// corpus now comes from a manifest this function can read. Reading each
+/// manifest's own list, rather than hardcoding either vocabulary, is what
+/// let this property hold across that sanitizer-vocabulary change without
+/// editing the test, and is what lets it keep holding across whatever the
+/// vocabulary becomes next.
 fn manifest_provider_and_placeholders(
     manifest_path: &Path,
     scenario: &str,
