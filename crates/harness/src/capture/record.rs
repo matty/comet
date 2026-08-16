@@ -1167,4 +1167,251 @@ mod tests {
         );
         entries.remove(0)
     }
+
+    /// Task 3 (`2026-08-16-scenario-request-builders.md`): the twelve adapted purity/wiring
+    /// tests above (`every_run_rows_request_builder_is_pure_and_derives_its_own_launch`) prove a
+    /// row's builder is pure and that `derive_launch` faithfully turns its `RunRequest` into a
+    /// launch — but every oracle in that test is itself derived from the SAME source code this
+    /// task exists to check. This test compares against something none of that code can
+    /// influence: the committed capture archive, frozen before this branch existed (`git diff
+    /// 7d4e903..HEAD -- crates/harness/tests/corpus/` is empty) and explicitly protected by the
+    /// plan's own constraints ("No byte under `crates/harness/tests/corpus/` changes").
+    ///
+    /// Not every row has evidence. Three Codex rows — `approval`, `approval-on-request`,
+    /// `interruption` — have never been captured (their own exemption on `test/stage-6-integration`'s
+    /// `capture_corpus/scenario_coverage.rs`, not present on this branch; verified independently
+    /// here by walking the corpus). `claude/2.1.229/subagent` is a hand-sanitized exploratory
+    /// capture with no matching `SCENARIOS` row (see its own `README.md`) and is never looked up,
+    /// since lookup is driven by row name, not by directory listing.
+    ///
+    /// Comparison is STRUCTURAL, not byte-for-byte — the archive redacts `cwd`, `program`, and
+    /// any resume/session id embedded in argv (`docs/testing/provider-captures.md`):
+    /// - `args`: compared for exact equality after normalizing a `--resume=<id>` token on BOTH
+    ///   sides to `--resume=<REDACTED>` — the only value-bearing argv token any scenario here
+    ///   produces. Every other token — every flag, and every other value (model id, effort,
+    ///   permission-mode, `--bare`) — is real, unredacted, and compared literally; the archive
+    ///   does not redact those.
+    /// - `cwd`: presence only (`Some` vs `Some`, `None` vs `None`) — the archive redacts the
+    ///   value itself to `<CWD>`.
+    /// - `program`: presence only — redacted to `<HOME>\...`.
+    /// - `configured_env`: key set only — a set value (`CODEX_HOME`) redacts to `<CODEX_HOME>`.
+    /// - `stdin`/`stdout`/`stderr`/`kill_on_drop`/`creation_flags` (Windows only): exact
+    ///   equality — none of these carry machine- or session-specific data, and `creation_flags`
+    ///   is a compile-time constant per launch function (`0x0800_0000` for every discovery
+    ///   launch, `0` for every run launch), not something spawn-time state could vary.
+    #[test]
+    fn every_scenario_launch_matches_its_committed_corpus_manifest() {
+        const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[
+            (Provider::Codex, "approval"),
+            (Provider::Codex, "approval-on-request"),
+            (Provider::Codex, "interruption"),
+        ];
+
+        let root = crate::capture::corpus_root();
+        let promoted = crate::capture::promoted_scenarios(&root)
+            .unwrap_or_else(|error| panic!("{} could not be walked: {error}", root.display()));
+
+        let mut failures = Vec::new();
+        let mut unevidenced: Vec<String> = Vec::new();
+
+        for spec in SCENARIOS {
+            let provider_str = match spec.provider {
+                Provider::Claude => "claude",
+                Provider::Codex => "codex",
+            };
+            let label = format!("{provider_str}/{}", spec.name);
+
+            let scenario_dir = promoted
+                .iter()
+                .find(|scenario| {
+                    scenario.provider == provider_str
+                        && scenario
+                            .directory
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            == Some(spec.name)
+                })
+                .map(|scenario| scenario.directory.clone());
+
+            let Some(scenario_dir) = scenario_dir else {
+                if EXEMPT_UNCAPTURED.contains(&(spec.provider, spec.name)) {
+                    unevidenced.push(label);
+                } else {
+                    failures.push(format!(
+                        "{label}: no corpus evidence anywhere under {}, and no exemption in \
+                         EXEMPT_UNCAPTURED",
+                        root.display()
+                    ));
+                }
+                continue;
+            };
+
+            let manifest_path = scenario_dir.join("manifest.json");
+            let manifest: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap_or_else(
+                    |error| panic!("{} could not be read: {error}", manifest_path.display()),
+                ))
+                .unwrap_or_else(|error| {
+                    panic!("{} is not valid JSON: {error}", manifest_path.display())
+                });
+            let corpus_command: CommandSnapshot =
+                serde_json::from_value(manifest["command"].clone()).unwrap_or_else(|error| {
+                    panic!(
+                        "{} has no valid command object: {error}",
+                        manifest_path.display()
+                    )
+                });
+
+            // `cwd` only needs to be present (comparison is presence-only, see this test's own
+            // doc comment); the two neutral-cwd discovery rows ignore it entirely in production
+            // and always spawn from a temp directory regardless, so `Some(temp_dir())` here is
+            // behaviourally identical to leaving it `None` for them.
+            let input = ScenarioInput {
+                cwd: Some(std::env::temp_dir()),
+                resume_id: spec
+                    .requirements
+                    .needs_resume_id
+                    .then(|| "corpus-pin-resume-id".to_owned()),
+                attachment: spec
+                    .requirements
+                    .needs_attachment
+                    .then(|| PathBuf::from("tiny.png")),
+                approval_target: spec
+                    .requirements
+                    .needs_approval_target
+                    .then(|| PathBuf::from("target-dir")),
+                // Every Codex discovery row's launch builder needs a codex_home or falls back to
+                // auto-discovering one from the real environment this test happens to run in —
+                // supplying one explicitly keeps the test hermetic regardless of what's installed
+                // on the machine running it.
+                codex_home: (spec.provider == Provider::Codex && !spec.requirements.spends_tokens)
+                    .then(|| std::env::temp_dir().join("comet-corpus-pin-codex-home")),
+            };
+
+            let (exe, run_launch): (PathBuf, fn(&Path, &RunRequest) -> LaunchDescriptor) =
+                match spec.provider {
+                    Provider::Claude => (absolute_program("claude"), crate::claude::run_launch),
+                    Provider::Codex => (absolute_program("codex"), crate::codex::run_launch),
+                };
+
+            let (derived_launch, _request) = derive_launch(&spec.launch, &input, &exe, run_launch)
+                .unwrap_or_else(|error| panic!("{label}: derive_launch failed: {error}"));
+            let derived = CommandSnapshot::from_launch(&derived_launch);
+
+            failures.extend(compare_launch_against_corpus_manifest(
+                &label,
+                &derived,
+                &corpus_command,
+            ));
+        }
+
+        let mut unevidenced_sorted = unevidenced.clone();
+        unevidenced_sorted.sort();
+        assert_eq!(
+            unevidenced_sorted,
+            vec![
+                "codex/approval",
+                "codex/approval-on-request",
+                "codex/interruption",
+            ],
+            "the exempted-uncaptured rows must be exactly these three — a row gaining or losing \
+             corpus evidence must update this assertion deliberately, not pass through silently"
+        );
+
+        assert!(
+            failures.is_empty(),
+            "{} row(s) disagree with their committed corpus manifest:\n\n{}",
+            failures.len(),
+            failures.join("\n\n")
+        );
+    }
+
+    /// The archive-vs-derived comparator `every_scenario_launch_matches_its_committed_corpus_manifest`
+    /// uses for one row, returning one message per mismatched field rather than stopping at the
+    /// first — see that test's own doc comment for which fields are compared exactly and which
+    /// only for presence/shape.
+    fn compare_launch_against_corpus_manifest(
+        label: &str,
+        derived: &CommandSnapshot,
+        corpus: &CommandSnapshot,
+    ) -> Vec<String> {
+        fn normalize_argv(args: &[String]) -> Vec<String> {
+            args.iter()
+                .map(|arg| {
+                    if arg.starts_with("--resume=") {
+                        "--resume=<REDACTED>".to_owned()
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect()
+        }
+
+        let mut failures = Vec::new();
+
+        let derived_args = normalize_argv(&derived.args);
+        let corpus_args = normalize_argv(&corpus.args);
+        if derived_args != corpus_args {
+            failures.push(format!(
+                "{label}: args differ (normalized)\n    derived: {derived_args:?}\n    corpus:  {corpus_args:?}"
+            ));
+        }
+
+        if derived.cwd.is_some() != corpus.cwd.is_some() {
+            failures.push(format!(
+                "{label}: cwd presence differs — derived {:?}, corpus {:?}",
+                derived.cwd, corpus.cwd
+            ));
+        }
+        if derived.program.is_empty() || corpus.program.is_empty() {
+            failures.push(format!(
+                "{label}: program must be non-empty on both sides — derived {:?}, corpus {:?}",
+                derived.program, corpus.program
+            ));
+        }
+
+        let derived_keys: std::collections::BTreeSet<&String> =
+            derived.configured_env.keys().collect();
+        let corpus_keys: std::collections::BTreeSet<&String> =
+            corpus.configured_env.keys().collect();
+        if derived_keys != corpus_keys {
+            failures.push(format!(
+                "{label}: configured_env key set differs — derived {derived_keys:?}, corpus {corpus_keys:?}"
+            ));
+        }
+
+        if derived.stdin != corpus.stdin {
+            failures.push(format!(
+                "{label}: stdin differs — derived {:?}, corpus {:?}",
+                derived.stdin, corpus.stdin
+            ));
+        }
+        if derived.stdout != corpus.stdout {
+            failures.push(format!(
+                "{label}: stdout differs — derived {:?}, corpus {:?}",
+                derived.stdout, corpus.stdout
+            ));
+        }
+        if derived.stderr != corpus.stderr {
+            failures.push(format!(
+                "{label}: stderr differs — derived {:?}, corpus {:?}",
+                derived.stderr, corpus.stderr
+            ));
+        }
+        if derived.kill_on_drop != corpus.kill_on_drop {
+            failures.push(format!(
+                "{label}: kill_on_drop differs — derived {}, corpus {}",
+                derived.kill_on_drop, corpus.kill_on_drop
+            ));
+        }
+        #[cfg(windows)]
+        if derived.creation_flags != corpus.creation_flags {
+            failures.push(format!(
+                "{label}: creation_flags differ — derived {:#x}, corpus {:#x}",
+                derived.creation_flags, corpus.creation_flags
+            ));
+        }
+
+        failures
+    }
 }
