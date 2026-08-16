@@ -54,6 +54,15 @@ pub struct FieldObservation {
     pub path: String,
     pub direction: Direction,
     pub first_seen: FrameRef,
+    /// Every scenario (bare directory name, e.g. `fresh-text` — not the
+    /// `provider/version/scenario` form [`FrameRef::scenario`] uses) whose
+    /// evidence produced this field, for this `(provider, version,
+    /// direction)`. D85: `first_seen` alone answers "where do I start
+    /// looking," but not "is this field's presence here explained by one
+    /// narrow scenario or by most of the corpus" — a fact the capability
+    /// sheet's Fields section needs to tell a real capability change apart
+    /// from a field whose only scenario this version happens not to run.
+    pub scenarios: BTreeSet<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -301,7 +310,8 @@ impl Visit<'_> {
             self.direction,
             path.to_owned(),
         );
-        self.inventory
+        let observation = self
+            .inventory
             .entry(key)
             .or_insert_with(|| FieldObservation {
                 provider: self.scenario.provider.clone(),
@@ -312,7 +322,16 @@ impl Visit<'_> {
                     scenario: self.scenario.label.clone(),
                     sequence: self.sequence,
                 },
+                scenarios: BTreeSet::new(),
             });
+        // Every scenario that reaches this path adds itself here, not just
+        // the first — `or_insert_with` above only guards the entry's
+        // creation, so a field seen in five of a version's eight scenarios
+        // still ends up with all five, not the one that happened to sort
+        // first.
+        observation
+            .scenarios
+            .insert(scenario_name(&self.scenario.directory));
     }
 
     fn record_vocabulary(&mut self, path: &str, value: String) {
@@ -327,6 +346,20 @@ impl Visit<'_> {
             .or_default()
             .insert(value);
     }
+}
+
+/// The bare scenario directory name (`fresh-text`, `resume`, …) — not the
+/// `provider/version/scenario` form [`FrameRef::scenario`] carries. What
+/// [`FieldObservation::scenarios`] and the capability sheet's Scenario
+/// groups both key on, so a field's tag can be cross-checked directly
+/// against the `###`-level scenario names the Scenarios section itself
+/// renders.
+fn scenario_name(directory: &Path) -> String {
+    directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .unwrap_or_default()
 }
 
 /// A JSON scalar's value as vocabulary text, or `None` for `null` — which is

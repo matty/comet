@@ -2,7 +2,7 @@
 
 Generated from the committed capture corpus — never from a live CLI, never from what the scenario table merely declares. Regenerate with `$env:COMET_UPDATE_SHEETS = "1"; cargo test -p comet-harness --test capture_corpus`; do not hand-edit.
 
-This file reports only what the scenarios below actually produced. Diffing this sheet against another version's sheet is the version-change report (no differ is planned) — but before reading a disappearance as the CLI dropping a capability, check the Scenarios section of both sheets. A field or a vocabulary value present in one version and absent in the other may mean that version's captures simply never exercised it, not that the CLI changed; the corpus's blind spot is absence, and it did not go away just because this sheet makes it visible.
+This file reports only what the scenarios below actually produced. Diffing this sheet against another version's sheet is the version-change report (no differ is planned).
 
 Two readings that argv makes tempting and both wrong: identical launch flags do not mean identical coverage — a frame or reply that depends on something actually happening during the run only appears when a run produced that trigger, so the same flag present in both versions' scenarios is not evidence the underlying event fired in both. And a field or value that is new in one version is not necessarily a new capability — it can be account or environment state that simply did not happen to occur during the other version's runs, not a wire-format change. Argv, cwd, env and scenario names narrow what to check; they do not settle it on their own.
 
@@ -103,278 +103,289 @@ app-server
 
 ## Fields
 
-Every dotted path observed on the wire for this provider and version, split by the direction it travelled — `To provider` is what Comet sends, `From provider` is what the provider sends back — one path per line, sorted. Read an absent path against the Scenarios section above before reading it as a claim about the wire format.
+Every dotted path observed on the wire for this provider and version, split by the direction it travelled — `To provider` is what Comet sends, `From provider` is what the provider sends back — one path per line, sorted, each tagged with the scenario group (below) that produced it. A field missing from this version's list is only evidence the CLI dropped it if the scenarios that group names are also present in the other version's own Scenarios section — a group made only of scenarios this version's Scenarios section doesn't have means the field was simply never exercised here, not removed.
+
+### Scenario groups
+
+- `G1`: fresh-text, model-discovery, model-discovery-logged-out, model-discovery-neutral-cwd, model-discovery-project-cwd, resume, steer
+- `G2`: fresh-text, resume, steer
+- `G3`: fresh-text, steer
+- `G4`: model-discovery, model-discovery-logged-out, model-discovery-neutral-cwd, model-discovery-project-cwd
+- `G5`: model-discovery, model-discovery-neutral-cwd, model-discovery-project-cwd
+- `G6`: model-discovery-logged-out
+- `G7`: resume
+- `G8`: steer
 
 ### To provider
 
-- `.id`
-- `.jsonrpc`
-- `.method`
-- `.params`
-- `.params.approvalPolicy`
-- `.params.approvalsReviewer`
-- `.params.capabilities`
-- `.params.capabilities.experimentalApi`
-- `.params.clientInfo`
-- `.params.clientInfo.name`
-- `.params.clientInfo.title`
-- `.params.clientInfo.version`
-- `.params.cwd`
-- `.params.effort`
-- `.params.expectedTurnId`
-- `.params.input`
-- `.params.input[].text`
-- `.params.input[].type`
-- `.params.model`
-- `.params.sandbox`
-- `.params.sandboxPolicy`
-- `.params.sandboxPolicy.networkAccess`
-- `.params.sandboxPolicy.type`
-- `.params.summary`
-- `.params.threadId`
+- `.id` `G1`
+- `.jsonrpc` `G1`
+- `.method` `G1`
+- `.params` `G1`
+- `.params.approvalPolicy` `G2`
+- `.params.approvalsReviewer` `G2`
+- `.params.capabilities` `G1`
+- `.params.capabilities.experimentalApi` `G1`
+- `.params.clientInfo` `G1`
+- `.params.clientInfo.name` `G1`
+- `.params.clientInfo.title` `G1`
+- `.params.clientInfo.version` `G1`
+- `.params.cwd` `G2`
+- `.params.effort` `G2`
+- `.params.expectedTurnId` `G8`
+- `.params.input` `G2`
+- `.params.input[].text` `G2`
+- `.params.input[].type` `G2`
+- `.params.model` `G2`
+- `.params.sandbox` `G2`
+- `.params.sandboxPolicy` `G2`
+- `.params.sandboxPolicy.networkAccess` `G2`
+- `.params.sandboxPolicy.type` `G2`
+- `.params.summary` `G2`
+- `.params.threadId` `G2`
 
 ### From provider
 
-- `.emittedAtMs`
-- `.id`
-- `.method`
-- `.params`
-- `.params.completedAtMs`
-- `.params.delta`
-- `.params.environmentId`
-- `.params.error`
-- `.params.failureReason`
-- `.params.installationId`
-- `.params.item`
-- `.params.item.clientId`
-- `.params.item.content`
-- `.params.item.content[].text`
-- `.params.item.content[].text_elements`
-- `.params.item.content[].type`
-- `.params.item.id`
-- `.params.item.memoryCitation`
-- `.params.item.phase`
-- `.params.item.summary`
-- `.params.item.text`
-- `.params.item.type`
-- `.params.itemId`
-- `.params.name`
-- `.params.rateLimits`
-- `.params.rateLimits.credits`
-- `.params.rateLimits.credits.balance`
-- `.params.rateLimits.credits.hasCredits`
-- `.params.rateLimits.credits.unlimited`
-- `.params.rateLimits.individualLimit`
-- `.params.rateLimits.limitId`
-- `.params.rateLimits.limitName`
-- `.params.rateLimits.planType`
-- `.params.rateLimits.primary`
-- `.params.rateLimits.primary.resetsAt`
-- `.params.rateLimits.primary.usedPercent`
-- `.params.rateLimits.primary.windowDurationMins`
-- `.params.rateLimits.rateLimitReachedType`
-- `.params.rateLimits.secondary`
-- `.params.rateLimits.spendControlReached`
-- `.params.serverName`
-- `.params.startedAtMs`
-- `.params.status`
-- `.params.status.activeFlags`
-- `.params.status.type`
-- `.params.summaryIndex`
-- `.params.thread`
-- `.params.thread.agentNickname`
-- `.params.thread.agentRole`
-- `.params.thread.canAcceptDirectInput`
-- `.params.thread.cliVersion`
-- `.params.thread.createdAt`
-- `.params.thread.cwd`
-- `.params.thread.ephemeral`
-- `.params.thread.extra`
-- `.params.thread.forkedFromId`
-- `.params.thread.gitInfo`
-- `.params.thread.historyMode`
-- `.params.thread.id`
-- `.params.thread.modelProvider`
-- `.params.thread.name`
-- `.params.thread.parentThreadId`
-- `.params.thread.path`
-- `.params.thread.preview`
-- `.params.thread.recencyAt`
-- `.params.thread.section`
-- `.params.thread.sectionEnteredAt`
-- `.params.thread.sessionId`
-- `.params.thread.source`
-- `.params.thread.status`
-- `.params.thread.status.type`
-- `.params.thread.threadSource`
-- `.params.thread.turns`
-- `.params.thread.updatedAt`
-- `.params.threadId`
-- `.params.threadSettings`
-- `.params.threadSettings.activePermissionProfile`
-- `.params.threadSettings.approvalPolicy`
-- `.params.threadSettings.approvalsReviewer`
-- `.params.threadSettings.collaborationMode`
-- `.params.threadSettings.collaborationMode.mode`
-- `.params.threadSettings.collaborationMode.settings`
-- `.params.threadSettings.collaborationMode.settings.developer_instructions`
-- `.params.threadSettings.collaborationMode.settings.model`
-- `.params.threadSettings.collaborationMode.settings.reasoning_effort`
-- `.params.threadSettings.cwd`
-- `.params.threadSettings.effort`
-- `.params.threadSettings.model`
-- `.params.threadSettings.modelProvider`
-- `.params.threadSettings.multiAgentMode`
-- `.params.threadSettings.personality`
-- `.params.threadSettings.sandboxPolicy`
-- `.params.threadSettings.sandboxPolicy.excludeSlashTmp`
-- `.params.threadSettings.sandboxPolicy.excludeTmpdirEnvVar`
-- `.params.threadSettings.sandboxPolicy.networkAccess`
-- `.params.threadSettings.sandboxPolicy.type`
-- `.params.threadSettings.sandboxPolicy.writableRoots`
-- `.params.threadSettings.serviceTier`
-- `.params.threadSettings.summary`
-- `.params.tokenUsage`
-- `.params.tokenUsage.last`
-- `.params.tokenUsage.last.cacheWriteInputTokens`
-- `.params.tokenUsage.last.cachedInputTokens`
-- `.params.tokenUsage.last.inputTokens`
-- `.params.tokenUsage.last.outputTokens`
-- `.params.tokenUsage.last.reasoningOutputTokens`
-- `.params.tokenUsage.last.totalTokens`
-- `.params.tokenUsage.modelContextWindow`
-- `.params.tokenUsage.total`
-- `.params.tokenUsage.total.cacheWriteInputTokens`
-- `.params.tokenUsage.total.cachedInputTokens`
-- `.params.tokenUsage.total.inputTokens`
-- `.params.tokenUsage.total.outputTokens`
-- `.params.tokenUsage.total.reasoningOutputTokens`
-- `.params.tokenUsage.total.totalTokens`
-- `.params.turn`
-- `.params.turn.completedAt`
-- `.params.turn.durationMs`
-- `.params.turn.error`
-- `.params.turn.id`
-- `.params.turn.items`
-- `.params.turn.itemsView`
-- `.params.turn.items[].id`
-- `.params.turn.items[].memoryCitation`
-- `.params.turn.items[].phase`
-- `.params.turn.items[].text`
-- `.params.turn.items[].type`
-- `.params.turn.startedAt`
-- `.params.turn.status`
-- `.params.turnId`
-- `.result`
-- `.result.activePermissionProfile`
-- `.result.approvalPolicy`
-- `.result.approvalsReviewer`
-- `.result.codexHome`
-- `.result.cwd`
-- `.result.data`
-- `.result.data[].additionalSpeedTiers`
-- `.result.data[].availabilityNux`
-- `.result.data[].availabilityNux.message`
-- `.result.data[].defaultReasoningEffort`
-- `.result.data[].defaultServiceTier`
-- `.result.data[].description`
-- `.result.data[].displayName`
-- `.result.data[].hidden`
-- `.result.data[].id`
-- `.result.data[].inputModalities`
-- `.result.data[].isDefault`
-- `.result.data[].model`
-- `.result.data[].modelSpecialty`
-- `.result.data[].serviceTiers`
-- `.result.data[].serviceTiers[].description`
-- `.result.data[].serviceTiers[].id`
-- `.result.data[].serviceTiers[].name`
-- `.result.data[].supportedReasoningEfforts`
-- `.result.data[].supportedReasoningEfforts[].description`
-- `.result.data[].supportedReasoningEfforts[].reasoningEffort`
-- `.result.data[].supportsPersonality`
-- `.result.data[].upgrade`
-- `.result.data[].upgradeInfo`
-- `.result.data[].upgradeInfo.migrationMarkdown`
-- `.result.data[].upgradeInfo.model`
-- `.result.data[].upgradeInfo.modelLink`
-- `.result.data[].upgradeInfo.upgradeCopy`
-- `.result.initialTurnsPage`
-- `.result.instructionSources`
-- `.result.itemsBackwardsCursor`
-- `.result.model`
-- `.result.modelProvider`
-- `.result.multiAgentMode`
-- `.result.nextCursor`
-- `.result.platformFamily`
-- `.result.platformOs`
-- `.result.reasoningEffort`
-- `.result.runtimeWorkspaceRoots`
-- `.result.sandbox`
-- `.result.sandbox.excludeSlashTmp`
-- `.result.sandbox.excludeTmpdirEnvVar`
-- `.result.sandbox.networkAccess`
-- `.result.sandbox.type`
-- `.result.sandbox.writableRoots`
-- `.result.serviceTier`
-- `.result.thread`
-- `.result.thread.agentNickname`
-- `.result.thread.agentRole`
-- `.result.thread.canAcceptDirectInput`
-- `.result.thread.cliVersion`
-- `.result.thread.createdAt`
-- `.result.thread.cwd`
-- `.result.thread.ephemeral`
-- `.result.thread.extra`
-- `.result.thread.forkedFromId`
-- `.result.thread.gitInfo`
-- `.result.thread.historyMode`
-- `.result.thread.id`
-- `.result.thread.modelProvider`
-- `.result.thread.name`
-- `.result.thread.parentThreadId`
-- `.result.thread.path`
-- `.result.thread.preview`
-- `.result.thread.recencyAt`
-- `.result.thread.section`
-- `.result.thread.sectionEnteredAt`
-- `.result.thread.sessionId`
-- `.result.thread.source`
-- `.result.thread.status`
-- `.result.thread.status.type`
-- `.result.thread.threadSource`
-- `.result.thread.turns`
-- `.result.thread.turns[].completedAt`
-- `.result.thread.turns[].durationMs`
-- `.result.thread.turns[].error`
-- `.result.thread.turns[].id`
-- `.result.thread.turns[].items`
-- `.result.thread.turns[].itemsView`
-- `.result.thread.turns[].items[].clientId`
-- `.result.thread.turns[].items[].content`
-- `.result.thread.turns[].items[].content[].text`
-- `.result.thread.turns[].items[].content[].text_elements`
-- `.result.thread.turns[].items[].content[].type`
-- `.result.thread.turns[].items[].id`
-- `.result.thread.turns[].items[].memoryCitation`
-- `.result.thread.turns[].items[].phase`
-- `.result.thread.turns[].items[].text`
-- `.result.thread.turns[].items[].type`
-- `.result.thread.turns[].startedAt`
-- `.result.thread.turns[].status`
-- `.result.thread.updatedAt`
-- `.result.turn`
-- `.result.turn.completedAt`
-- `.result.turn.durationMs`
-- `.result.turn.error`
-- `.result.turn.id`
-- `.result.turn.items`
-- `.result.turn.itemsView`
-- `.result.turn.startedAt`
-- `.result.turn.status`
-- `.result.turnId`
-- `.result.turnsBackwardsCursor`
-- `.result.userAgent`
+- `.emittedAtMs` `G1`
+- `.id` `G1`
+- `.method` `G1`
+- `.params` `G1`
+- `.params.completedAtMs` `G2`
+- `.params.delta` `G2`
+- `.params.environmentId` `G1`
+- `.params.error` `G2`
+- `.params.failureReason` `G2`
+- `.params.installationId` `G1`
+- `.params.item` `G2`
+- `.params.item.clientId` `G2`
+- `.params.item.content` `G2`
+- `.params.item.content[].text` `G2`
+- `.params.item.content[].text_elements` `G2`
+- `.params.item.content[].type` `G2`
+- `.params.item.id` `G2`
+- `.params.item.memoryCitation` `G2`
+- `.params.item.phase` `G2`
+- `.params.item.summary` `G8`
+- `.params.item.text` `G2`
+- `.params.item.type` `G2`
+- `.params.itemId` `G2`
+- `.params.name` `G2`
+- `.params.rateLimits` `G2`
+- `.params.rateLimits.credits` `G2`
+- `.params.rateLimits.credits.balance` `G2`
+- `.params.rateLimits.credits.hasCredits` `G2`
+- `.params.rateLimits.credits.unlimited` `G2`
+- `.params.rateLimits.individualLimit` `G2`
+- `.params.rateLimits.limitId` `G2`
+- `.params.rateLimits.limitName` `G2`
+- `.params.rateLimits.planType` `G2`
+- `.params.rateLimits.primary` `G2`
+- `.params.rateLimits.primary.resetsAt` `G2`
+- `.params.rateLimits.primary.usedPercent` `G2`
+- `.params.rateLimits.primary.windowDurationMins` `G2`
+- `.params.rateLimits.rateLimitReachedType` `G2`
+- `.params.rateLimits.secondary` `G2`
+- `.params.rateLimits.spendControlReached` `G2`
+- `.params.serverName` `G1`
+- `.params.startedAtMs` `G2`
+- `.params.status` `G1`
+- `.params.status.activeFlags` `G2`
+- `.params.status.type` `G2`
+- `.params.summaryIndex` `G8`
+- `.params.thread` `G3`
+- `.params.thread.agentNickname` `G3`
+- `.params.thread.agentRole` `G3`
+- `.params.thread.canAcceptDirectInput` `G3`
+- `.params.thread.cliVersion` `G3`
+- `.params.thread.createdAt` `G3`
+- `.params.thread.cwd` `G3`
+- `.params.thread.ephemeral` `G3`
+- `.params.thread.extra` `G3`
+- `.params.thread.forkedFromId` `G3`
+- `.params.thread.gitInfo` `G3`
+- `.params.thread.historyMode` `G3`
+- `.params.thread.id` `G3`
+- `.params.thread.modelProvider` `G3`
+- `.params.thread.name` `G3`
+- `.params.thread.parentThreadId` `G3`
+- `.params.thread.path` `G3`
+- `.params.thread.preview` `G3`
+- `.params.thread.recencyAt` `G3`
+- `.params.thread.section` `G3`
+- `.params.thread.sectionEnteredAt` `G3`
+- `.params.thread.sessionId` `G3`
+- `.params.thread.source` `G3`
+- `.params.thread.status` `G3`
+- `.params.thread.status.type` `G3`
+- `.params.thread.threadSource` `G3`
+- `.params.thread.turns` `G3`
+- `.params.thread.updatedAt` `G3`
+- `.params.threadId` `G2`
+- `.params.threadSettings` `G2`
+- `.params.threadSettings.activePermissionProfile` `G2`
+- `.params.threadSettings.approvalPolicy` `G2`
+- `.params.threadSettings.approvalsReviewer` `G2`
+- `.params.threadSettings.collaborationMode` `G2`
+- `.params.threadSettings.collaborationMode.mode` `G2`
+- `.params.threadSettings.collaborationMode.settings` `G2`
+- `.params.threadSettings.collaborationMode.settings.developer_instructions` `G2`
+- `.params.threadSettings.collaborationMode.settings.model` `G2`
+- `.params.threadSettings.collaborationMode.settings.reasoning_effort` `G2`
+- `.params.threadSettings.cwd` `G2`
+- `.params.threadSettings.effort` `G2`
+- `.params.threadSettings.model` `G2`
+- `.params.threadSettings.modelProvider` `G2`
+- `.params.threadSettings.multiAgentMode` `G2`
+- `.params.threadSettings.personality` `G2`
+- `.params.threadSettings.sandboxPolicy` `G2`
+- `.params.threadSettings.sandboxPolicy.excludeSlashTmp` `G2`
+- `.params.threadSettings.sandboxPolicy.excludeTmpdirEnvVar` `G2`
+- `.params.threadSettings.sandboxPolicy.networkAccess` `G2`
+- `.params.threadSettings.sandboxPolicy.type` `G2`
+- `.params.threadSettings.sandboxPolicy.writableRoots` `G2`
+- `.params.threadSettings.serviceTier` `G2`
+- `.params.threadSettings.summary` `G2`
+- `.params.tokenUsage` `G2`
+- `.params.tokenUsage.last` `G2`
+- `.params.tokenUsage.last.cacheWriteInputTokens` `G2`
+- `.params.tokenUsage.last.cachedInputTokens` `G2`
+- `.params.tokenUsage.last.inputTokens` `G2`
+- `.params.tokenUsage.last.outputTokens` `G2`
+- `.params.tokenUsage.last.reasoningOutputTokens` `G2`
+- `.params.tokenUsage.last.totalTokens` `G2`
+- `.params.tokenUsage.modelContextWindow` `G2`
+- `.params.tokenUsage.total` `G2`
+- `.params.tokenUsage.total.cacheWriteInputTokens` `G2`
+- `.params.tokenUsage.total.cachedInputTokens` `G2`
+- `.params.tokenUsage.total.inputTokens` `G2`
+- `.params.tokenUsage.total.outputTokens` `G2`
+- `.params.tokenUsage.total.reasoningOutputTokens` `G2`
+- `.params.tokenUsage.total.totalTokens` `G2`
+- `.params.turn` `G2`
+- `.params.turn.completedAt` `G2`
+- `.params.turn.durationMs` `G2`
+- `.params.turn.error` `G2`
+- `.params.turn.id` `G2`
+- `.params.turn.items` `G2`
+- `.params.turn.itemsView` `G2`
+- `.params.turn.items[].id` `G2`
+- `.params.turn.items[].memoryCitation` `G2`
+- `.params.turn.items[].phase` `G2`
+- `.params.turn.items[].text` `G2`
+- `.params.turn.items[].type` `G2`
+- `.params.turn.startedAt` `G2`
+- `.params.turn.status` `G2`
+- `.params.turnId` `G2`
+- `.result` `G1`
+- `.result.activePermissionProfile` `G2`
+- `.result.approvalPolicy` `G2`
+- `.result.approvalsReviewer` `G2`
+- `.result.codexHome` `G1`
+- `.result.cwd` `G2`
+- `.result.data` `G4`
+- `.result.data[].additionalSpeedTiers` `G4`
+- `.result.data[].availabilityNux` `G4`
+- `.result.data[].availabilityNux.message` `G6`
+- `.result.data[].defaultReasoningEffort` `G4`
+- `.result.data[].defaultServiceTier` `G4`
+- `.result.data[].description` `G4`
+- `.result.data[].displayName` `G4`
+- `.result.data[].hidden` `G4`
+- `.result.data[].id` `G4`
+- `.result.data[].inputModalities` `G4`
+- `.result.data[].isDefault` `G4`
+- `.result.data[].model` `G4`
+- `.result.data[].modelSpecialty` `G4`
+- `.result.data[].serviceTiers` `G4`
+- `.result.data[].serviceTiers[].description` `G4`
+- `.result.data[].serviceTiers[].id` `G4`
+- `.result.data[].serviceTiers[].name` `G4`
+- `.result.data[].supportedReasoningEfforts` `G4`
+- `.result.data[].supportedReasoningEfforts[].description` `G4`
+- `.result.data[].supportedReasoningEfforts[].reasoningEffort` `G4`
+- `.result.data[].supportsPersonality` `G4`
+- `.result.data[].upgrade` `G4`
+- `.result.data[].upgradeInfo` `G4`
+- `.result.data[].upgradeInfo.migrationMarkdown` `G5`
+- `.result.data[].upgradeInfo.model` `G5`
+- `.result.data[].upgradeInfo.modelLink` `G5`
+- `.result.data[].upgradeInfo.upgradeCopy` `G5`
+- `.result.initialTurnsPage` `G7`
+- `.result.instructionSources` `G2`
+- `.result.itemsBackwardsCursor` `G7`
+- `.result.model` `G2`
+- `.result.modelProvider` `G2`
+- `.result.multiAgentMode` `G2`
+- `.result.nextCursor` `G4`
+- `.result.platformFamily` `G1`
+- `.result.platformOs` `G1`
+- `.result.reasoningEffort` `G2`
+- `.result.runtimeWorkspaceRoots` `G2`
+- `.result.sandbox` `G2`
+- `.result.sandbox.excludeSlashTmp` `G2`
+- `.result.sandbox.excludeTmpdirEnvVar` `G2`
+- `.result.sandbox.networkAccess` `G2`
+- `.result.sandbox.type` `G2`
+- `.result.sandbox.writableRoots` `G2`
+- `.result.serviceTier` `G2`
+- `.result.thread` `G2`
+- `.result.thread.agentNickname` `G2`
+- `.result.thread.agentRole` `G2`
+- `.result.thread.canAcceptDirectInput` `G2`
+- `.result.thread.cliVersion` `G2`
+- `.result.thread.createdAt` `G2`
+- `.result.thread.cwd` `G2`
+- `.result.thread.ephemeral` `G2`
+- `.result.thread.extra` `G2`
+- `.result.thread.forkedFromId` `G2`
+- `.result.thread.gitInfo` `G2`
+- `.result.thread.historyMode` `G2`
+- `.result.thread.id` `G2`
+- `.result.thread.modelProvider` `G2`
+- `.result.thread.name` `G2`
+- `.result.thread.parentThreadId` `G2`
+- `.result.thread.path` `G2`
+- `.result.thread.preview` `G2`
+- `.result.thread.recencyAt` `G2`
+- `.result.thread.section` `G2`
+- `.result.thread.sectionEnteredAt` `G2`
+- `.result.thread.sessionId` `G2`
+- `.result.thread.source` `G2`
+- `.result.thread.status` `G2`
+- `.result.thread.status.type` `G2`
+- `.result.thread.threadSource` `G2`
+- `.result.thread.turns` `G2`
+- `.result.thread.turns[].completedAt` `G7`
+- `.result.thread.turns[].durationMs` `G7`
+- `.result.thread.turns[].error` `G7`
+- `.result.thread.turns[].id` `G7`
+- `.result.thread.turns[].items` `G7`
+- `.result.thread.turns[].itemsView` `G7`
+- `.result.thread.turns[].items[].clientId` `G7`
+- `.result.thread.turns[].items[].content` `G7`
+- `.result.thread.turns[].items[].content[].text` `G7`
+- `.result.thread.turns[].items[].content[].text_elements` `G7`
+- `.result.thread.turns[].items[].content[].type` `G7`
+- `.result.thread.turns[].items[].id` `G7`
+- `.result.thread.turns[].items[].memoryCitation` `G7`
+- `.result.thread.turns[].items[].phase` `G7`
+- `.result.thread.turns[].items[].text` `G7`
+- `.result.thread.turns[].items[].type` `G7`
+- `.result.thread.turns[].startedAt` `G7`
+- `.result.thread.turns[].status` `G7`
+- `.result.thread.updatedAt` `G2`
+- `.result.turn` `G2`
+- `.result.turn.completedAt` `G2`
+- `.result.turn.durationMs` `G2`
+- `.result.turn.error` `G2`
+- `.result.turn.id` `G2`
+- `.result.turn.items` `G2`
+- `.result.turn.itemsView` `G2`
+- `.result.turn.startedAt` `G2`
+- `.result.turn.status` `G2`
+- `.result.turnId` `G8`
+- `.result.turnsBackwardsCursor` `G7`
+- `.result.userAgent` `G1`
 
 ## Vocabulary
 

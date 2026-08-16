@@ -228,3 +228,43 @@ legible in the diff: `claude-2.1.228.md` reads `tools: 29` in every scenario
 that has one; `claude-2.1.229.md` reads `tools: 35` for `subagent` and
 `tools: 59` for `checklist`/`checklist-resume`.
 
+## D85 — the sheet named a field but not which scenario produced it
+
+**The gap, measured.** `claude/2.1.228` and `claude/2.1.229` share zero
+scenario names — 2.1.228 holds `approval`, `attachment`, `command-discovery`,
+`fresh-text`, three `model-discovery*` and `resume`; 2.1.229 holds
+`checklist`, `checklist-resume` and `subagent`. So `git diff --no-index
+docs/providers/claude-2.1.228.md docs/providers/claude-2.1.229.md` — the
+whole version-change mechanism — showed ~200 insertions and ~200 deletions
+that described *different scenarios*, not different CLI behaviour, and
+roughly a third of each sheet was caveat prose whose entire subject was that
+a reader could not tell those two cases apart. `FieldObservation::first_seen`
+(`crates/harness/src/capture/surface.rs`) computed a scenario and sequence
+for exactly this triage and was read nowhere outside `surface_map.rs`'s own
+pinning tests.
+
+**Why `first_seen` alone wasn't the fix.** A single frame reference answers
+"where do I start looking," but not the actual question a diff reader has: a
+field seen in one narrow scenario and a field seen in every scenario this
+version ran are a different fact, and only the second is strong evidence a
+disappearance means something. Rendering just the first occurrence would have
+kept the ambiguity the caveat prose was apologizing for.
+
+**The fix.** `FieldObservation` grew `scenarios: BTreeSet<String>` — every
+scenario (bare directory name) whose evidence produced that field, populated
+in `Visit::record` on every visit, not just the first. `sheet.rs`'s Fields
+section renders it as a **scenario-group index**: every distinct scenario set
+among a version's fields gets one `G<n>` line (`- \`G1\`: approval,
+attachment, fresh-text, resume`), and each field line carries only the tag
+(`` - `.type` `G3` ``) — two fields sharing five scenarios collapse to one
+group line instead of five names printed twice. A reader now tells "the CLI
+dropped this field" from "no scenario here exercised it" by checking whether
+the tag's scenario names appear in the *other* sheet's own Scenarios section,
+without opening the corpus. The header's and Fields section's caveat
+paragraphs were cut accordingly — the apology clause in the header ("check
+the Scenarios section of both sheets... it did not go away just because this
+sheet makes it visible") is gone, 91 words down to 25, since the Fields
+section now carries the actionable version of that instruction itself; the
+Vocabulary section is unchanged and keeps its own local caveat, because it
+has no equivalent per-value attribution.
+

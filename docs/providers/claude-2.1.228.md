@@ -2,7 +2,7 @@
 
 Generated from the committed capture corpus — never from a live CLI, never from what the scenario table merely declares. Regenerate with `$env:COMET_UPDATE_SHEETS = "1"; cargo test -p comet-harness --test capture_corpus`; do not hand-edit.
 
-This file reports only what the scenarios below actually produced. Diffing this sheet against another version's sheet is the version-change report (no differ is planned) — but before reading a disappearance as the CLI dropping a capability, check the Scenarios section of both sheets. A field or a vocabulary value present in one version and absent in the other may mean that version's captures simply never exercised it, not that the CLI changed; the corpus's blind spot is absence, and it did not go away just because this sheet makes it visible.
+This file reports only what the scenarios below actually produced. Diffing this sheet against another version's sheet is the version-change report (no differ is planned).
 
 Two readings that argv makes tempting and both wrong: identical launch flags do not mean identical coverage — a frame or reply that depends on something actually happening during the run only appears when a run produced that trigger, so the same flag present in both versions' scenarios is not evidence the underlying event fired in both. And a field or value that is new in one version is not necessarily a new capability — it can be account or environment state that simply did not happen to occur during the other version's runs, not a wire-format change. Argv, cwd, env and scenario names narrow what to check; they do not settle it on their own.
 
@@ -196,238 +196,249 @@ acceptEdits
 
 ## Fields
 
-Every dotted path observed on the wire for this provider and version, split by the direction it travelled — `To provider` is what Comet sends, `From provider` is what the provider sends back — one path per line, sorted. Read an absent path against the Scenarios section above before reading it as a claim about the wire format.
+Every dotted path observed on the wire for this provider and version, split by the direction it travelled — `To provider` is what Comet sends, `From provider` is what the provider sends back — one path per line, sorted, each tagged with the scenario group (below) that produced it. A field missing from this version's list is only evidence the CLI dropped it if the scenarios that group names are also present in the other version's own Scenarios section — a group made only of scenarios this version's Scenarios section doesn't have means the field was simply never exercised here, not removed.
+
+### Scenario groups
+
+- `G1`: approval
+- `G2`: approval, attachment, command-discovery, fresh-text
+- `G3`: approval, attachment, command-discovery, fresh-text, model-discovery, model-discovery-neutral-cwd, model-discovery-project-cwd, resume
+- `G4`: approval, attachment, command-discovery, fresh-text, resume
+- `G5`: approval, attachment, fresh-text, resume
+- `G6`: approval, attachment, resume
+- `G7`: attachment
+- `G8`: command-discovery, model-discovery, model-discovery-neutral-cwd, model-discovery-project-cwd
 
 ### To provider
 
-- `.message`
-- `.message.content`
-- `.message.content[].source`
-- `.message.content[].source.data`
-- `.message.content[].source.media_type`
-- `.message.content[].source.type`
-- `.message.content[].text`
-- `.message.content[].type`
-- `.message.role`
-- `.parent_tool_use_id`
-- `.request`
-- `.request.subtype`
-- `.request_id`
-- `.response`
-- `.response.request_id`
-- `.response.response`
-- `.response.response.behavior`
-- `.response.response.updatedInput`
-- `.response.response.updatedInput.content`
-- `.response.response.updatedInput.file_path`
-- `.response.subtype`
-- `.type`
+- `.message` `G5`
+- `.message.content` `G5`
+- `.message.content[].source` `G7`
+- `.message.content[].source.data` `G7`
+- `.message.content[].source.media_type` `G7`
+- `.message.content[].source.type` `G7`
+- `.message.content[].text` `G7`
+- `.message.content[].type` `G7`
+- `.message.role` `G5`
+- `.parent_tool_use_id` `G5`
+- `.request` `G8`
+- `.request.subtype` `G8`
+- `.request_id` `G8`
+- `.response` `G1`
+- `.response.request_id` `G1`
+- `.response.response` `G1`
+- `.response.response.behavior` `G1`
+- `.response.response.updatedInput` `G1`
+- `.response.response.updatedInput.content` `G1`
+- `.response.response.updatedInput.file_path` `G1`
+- `.response.subtype` `G1`
+- `.type` `G3`
 
 ### From provider
 
-- `.agents`
-- `.analytics_disabled`
-- `.apiKeySource`
-- `.api_error_status`
-- `.capabilities`
-- `.claude_code_version`
-- `.cwd`
-- `.duration_api_ms`
-- `.duration_ms`
-- `.event`
-- `.event.content_block`
-- `.event.content_block.id`
-- `.event.content_block.input`
-- `.event.content_block.name`
-- `.event.content_block.signature`
-- `.event.content_block.text`
-- `.event.content_block.thinking`
-- `.event.content_block.type`
-- `.event.delta`
-- `.event.delta.partial_json`
-- `.event.delta.signature`
-- `.event.delta.stop_reason`
-- `.event.delta.stop_sequence`
-- `.event.delta.text`
-- `.event.delta.type`
-- `.event.index`
-- `.event.message`
-- `.event.message.content`
-- `.event.message.id`
-- `.event.message.model`
-- `.event.message.role`
-- `.event.message.stop_reason`
-- `.event.message.stop_sequence`
-- `.event.message.type`
-- `.event.message.usage`
-- `.event.message.usage.input_tokens`
-- `.event.message.usage.output_tokens`
-- `.event.type`
-- `.event.usage`
-- `.event.usage.cache_creation_input_tokens`
-- `.event.usage.cache_read_input_tokens`
-- `.event.usage.input_tokens`
-- `.event.usage.output_tokens`
-- `.exit_code`
-- `.fast_mode_disabled_reason`
-- `.fast_mode_state`
-- `.hook_event`
-- `.hook_id`
-- `.hook_name`
-- `.isSynthetic`
-- `.is_error`
-- `.mcp_servers`
-- `.memory_paths`
-- `.memory_paths.auto`
-- `.message`
-- `.message.content`
-- `.message.content[].content`
-- `.message.content[].id`
-- `.message.content[].input`
-- `.message.content[].input.command`
-- `.message.content[].input.content`
-- `.message.content[].input.file_path`
-- `.message.content[].input.skill`
-- `.message.content[].is_error`
-- `.message.content[].name`
-- `.message.content[].signature`
-- `.message.content[].text`
-- `.message.content[].thinking`
-- `.message.content[].tool_use_id`
-- `.message.content[].type`
-- `.message.context_management`
-- `.message.id`
-- `.message.model`
-- `.message.role`
-- `.message.stop_reason`
-- `.message.stop_sequence`
-- `.message.type`
-- `.message.usage`
-- `.message.usage.input_tokens`
-- `.message.usage.output_tokens`
-- `.model`
-- `.modelUsage`
-- `.modelUsage.{}.cacheCreationInputTokens`
-- `.modelUsage.{}.cacheReadInputTokens`
-- `.modelUsage.{}.canonicalModel`
-- `.modelUsage.{}.contextWindow`
-- `.modelUsage.{}.costUSD`
-- `.modelUsage.{}.inputTokens`
-- `.modelUsage.{}.maxOutputTokens`
-- `.modelUsage.{}.outputTokens`
-- `.modelUsage.{}.provider`
-- `.modelUsage.{}.webSearchRequests`
-- `.num_turns`
-- `.outcome`
-- `.output`
-- `.output_style`
-- `.parent_tool_use_id`
-- `.permissionMode`
-- `.permission_denials`
-- `.plugins`
-- `.plugins[].name`
-- `.plugins[].path`
-- `.plugins[].source`
-- `.plugins[].version`
-- `.product_feedback_disabled`
-- `.request`
-- `.request.description`
-- `.request.display_name`
-- `.request.input`
-- `.request.input.content`
-- `.request.input.file_path`
-- `.request.permission_suggestions`
-- `.request.permission_suggestions[].destination`
-- `.request.permission_suggestions[].mode`
-- `.request.permission_suggestions[].type`
-- `.request.subtype`
-- `.request.tool_name`
-- `.request.tool_use_id`
-- `.request_id`
-- `.response`
-- `.response.request_id`
-- `.response.response`
-- `.response.response.account`
-- `.response.response.account.apiProvider`
-- `.response.response.account.tokenSource`
-- `.response.response.agents`
-- `.response.response.agents[].description`
-- `.response.response.agents[].model`
-- `.response.response.agents[].name`
-- `.response.response.available_output_styles`
-- `.response.response.commands`
-- `.response.response.commands[].aliases`
-- `.response.response.commands[].argumentHint`
-- `.response.response.commands[].description`
-- `.response.response.commands[].name`
-- `.response.response.current_permission_mode`
-- `.response.response.fast_mode_disabled_reason`
-- `.response.response.fast_mode_state`
-- `.response.response.ide_rc_auto_enable_gate`
-- `.response.response.models`
-- `.response.response.models[].description`
-- `.response.response.models[].displayName`
-- `.response.response.models[].resolvedModel`
-- `.response.response.models[].supportedEffortLevels`
-- `.response.response.models[].supportsAdaptiveThinking`
-- `.response.response.models[].supportsAutoMode`
-- `.response.response.models[].supportsEffort`
-- `.response.response.models[].supportsFastMode`
-- `.response.response.models[].value`
-- `.response.response.output_style`
-- `.response.response.pid`
-- `.response.response.remote_control_auto_enable`
-- `.response.response.remote_control_auto_on_by_default`
-- `.response.subtype`
-- `.result`
-- `.session_id`
-- `.skills`
-- `.slash_commands`
-- `.status`
-- `.stderr`
-- `.stdout`
-- `.stop_reason`
-- `.subtype`
-- `.terminal_reason`
-- `.time_to_request_ms`
-- `.timestamp`
-- `.tool_use_result`
-- `.tool_use_result.commandName`
-- `.tool_use_result.content`
-- `.tool_use_result.filePath`
-- `.tool_use_result.interrupted`
-- `.tool_use_result.isImage`
-- `.tool_use_result.noOutputExpected`
-- `.tool_use_result.originalFile`
-- `.tool_use_result.stderr`
-- `.tool_use_result.stdout`
-- `.tool_use_result.structuredPatch`
-- `.tool_use_result.success`
-- `.tool_use_result.type`
-- `.tool_use_result.userModified`
-- `.tools`
-- `.total_cost_usd`
-- `.ttft_ms`
-- `.ttft_stream_ms`
-- `.type`
-- `.usage`
-- `.usage.cache_creation`
-- `.usage.cache_creation.ephemeral_1h_input_tokens`
-- `.usage.cache_creation.ephemeral_5m_input_tokens`
-- `.usage.cache_creation_input_tokens`
-- `.usage.cache_read_input_tokens`
-- `.usage.inference_geo`
-- `.usage.input_tokens`
-- `.usage.iterations`
-- `.usage.output_tokens`
-- `.usage.output_tokens_details`
-- `.usage.output_tokens_details.thinking_tokens`
-- `.usage.server_tool_use`
-- `.usage.server_tool_use.web_fetch_requests`
-- `.usage.server_tool_use.web_search_requests`
-- `.usage.service_tier`
-- `.usage.speed`
-- `.uuid`
+- `.agents` `G5`
+- `.analytics_disabled` `G5`
+- `.apiKeySource` `G5`
+- `.api_error_status` `G5`
+- `.capabilities` `G5`
+- `.claude_code_version` `G5`
+- `.cwd` `G5`
+- `.duration_api_ms` `G5`
+- `.duration_ms` `G5`
+- `.event` `G5`
+- `.event.content_block` `G5`
+- `.event.content_block.id` `G6`
+- `.event.content_block.input` `G6`
+- `.event.content_block.name` `G6`
+- `.event.content_block.signature` `G6`
+- `.event.content_block.text` `G5`
+- `.event.content_block.thinking` `G6`
+- `.event.content_block.type` `G5`
+- `.event.delta` `G5`
+- `.event.delta.partial_json` `G6`
+- `.event.delta.signature` `G6`
+- `.event.delta.stop_reason` `G5`
+- `.event.delta.stop_sequence` `G5`
+- `.event.delta.text` `G5`
+- `.event.delta.type` `G5`
+- `.event.index` `G5`
+- `.event.message` `G5`
+- `.event.message.content` `G5`
+- `.event.message.id` `G5`
+- `.event.message.model` `G5`
+- `.event.message.role` `G5`
+- `.event.message.stop_reason` `G5`
+- `.event.message.stop_sequence` `G5`
+- `.event.message.type` `G5`
+- `.event.message.usage` `G5`
+- `.event.message.usage.input_tokens` `G5`
+- `.event.message.usage.output_tokens` `G5`
+- `.event.type` `G5`
+- `.event.usage` `G5`
+- `.event.usage.cache_creation_input_tokens` `G5`
+- `.event.usage.cache_read_input_tokens` `G5`
+- `.event.usage.input_tokens` `G5`
+- `.event.usage.output_tokens` `G5`
+- `.exit_code` `G2`
+- `.fast_mode_disabled_reason` `G5`
+- `.fast_mode_state` `G5`
+- `.hook_event` `G2`
+- `.hook_id` `G2`
+- `.hook_name` `G2`
+- `.isSynthetic` `G6`
+- `.is_error` `G5`
+- `.mcp_servers` `G5`
+- `.memory_paths` `G5`
+- `.memory_paths.auto` `G5`
+- `.message` `G5`
+- `.message.content` `G5`
+- `.message.content[].content` `G6`
+- `.message.content[].id` `G6`
+- `.message.content[].input` `G6`
+- `.message.content[].input.command` `G1`
+- `.message.content[].input.content` `G1`
+- `.message.content[].input.file_path` `G1`
+- `.message.content[].input.skill` `G6`
+- `.message.content[].is_error` `G1`
+- `.message.content[].name` `G6`
+- `.message.content[].signature` `G6`
+- `.message.content[].text` `G5`
+- `.message.content[].thinking` `G6`
+- `.message.content[].tool_use_id` `G6`
+- `.message.content[].type` `G5`
+- `.message.context_management` `G5`
+- `.message.id` `G5`
+- `.message.model` `G5`
+- `.message.role` `G5`
+- `.message.stop_reason` `G5`
+- `.message.stop_sequence` `G5`
+- `.message.type` `G5`
+- `.message.usage` `G5`
+- `.message.usage.input_tokens` `G5`
+- `.message.usage.output_tokens` `G5`
+- `.model` `G5`
+- `.modelUsage` `G5`
+- `.modelUsage.{}.cacheCreationInputTokens` `G5`
+- `.modelUsage.{}.cacheReadInputTokens` `G5`
+- `.modelUsage.{}.canonicalModel` `G5`
+- `.modelUsage.{}.contextWindow` `G5`
+- `.modelUsage.{}.costUSD` `G5`
+- `.modelUsage.{}.inputTokens` `G5`
+- `.modelUsage.{}.maxOutputTokens` `G5`
+- `.modelUsage.{}.outputTokens` `G5`
+- `.modelUsage.{}.provider` `G5`
+- `.modelUsage.{}.webSearchRequests` `G5`
+- `.num_turns` `G5`
+- `.outcome` `G2`
+- `.output` `G2`
+- `.output_style` `G5`
+- `.parent_tool_use_id` `G5`
+- `.permissionMode` `G5`
+- `.permission_denials` `G5`
+- `.plugins` `G5`
+- `.plugins[].name` `G5`
+- `.plugins[].path` `G5`
+- `.plugins[].source` `G5`
+- `.plugins[].version` `G5`
+- `.product_feedback_disabled` `G5`
+- `.request` `G1`
+- `.request.description` `G1`
+- `.request.display_name` `G1`
+- `.request.input` `G1`
+- `.request.input.content` `G1`
+- `.request.input.file_path` `G1`
+- `.request.permission_suggestions` `G1`
+- `.request.permission_suggestions[].destination` `G1`
+- `.request.permission_suggestions[].mode` `G1`
+- `.request.permission_suggestions[].type` `G1`
+- `.request.subtype` `G1`
+- `.request.tool_name` `G1`
+- `.request.tool_use_id` `G1`
+- `.request_id` `G1`
+- `.response` `G8`
+- `.response.request_id` `G8`
+- `.response.response` `G8`
+- `.response.response.account` `G8`
+- `.response.response.account.apiProvider` `G8`
+- `.response.response.account.tokenSource` `G8`
+- `.response.response.agents` `G8`
+- `.response.response.agents[].description` `G8`
+- `.response.response.agents[].model` `G8`
+- `.response.response.agents[].name` `G8`
+- `.response.response.available_output_styles` `G8`
+- `.response.response.commands` `G8`
+- `.response.response.commands[].aliases` `G8`
+- `.response.response.commands[].argumentHint` `G8`
+- `.response.response.commands[].description` `G8`
+- `.response.response.commands[].name` `G8`
+- `.response.response.current_permission_mode` `G8`
+- `.response.response.fast_mode_disabled_reason` `G8`
+- `.response.response.fast_mode_state` `G8`
+- `.response.response.ide_rc_auto_enable_gate` `G8`
+- `.response.response.models` `G8`
+- `.response.response.models[].description` `G8`
+- `.response.response.models[].displayName` `G8`
+- `.response.response.models[].resolvedModel` `G8`
+- `.response.response.models[].supportedEffortLevels` `G8`
+- `.response.response.models[].supportsAdaptiveThinking` `G8`
+- `.response.response.models[].supportsAutoMode` `G8`
+- `.response.response.models[].supportsEffort` `G8`
+- `.response.response.models[].supportsFastMode` `G8`
+- `.response.response.models[].value` `G8`
+- `.response.response.output_style` `G8`
+- `.response.response.pid` `G8`
+- `.response.response.remote_control_auto_enable` `G8`
+- `.response.response.remote_control_auto_on_by_default` `G8`
+- `.response.subtype` `G8`
+- `.result` `G5`
+- `.session_id` `G4`
+- `.skills` `G5`
+- `.slash_commands` `G5`
+- `.status` `G5`
+- `.stderr` `G2`
+- `.stdout` `G2`
+- `.stop_reason` `G5`
+- `.subtype` `G4`
+- `.terminal_reason` `G5`
+- `.time_to_request_ms` `G5`
+- `.timestamp` `G5`
+- `.tool_use_result` `G6`
+- `.tool_use_result.commandName` `G6`
+- `.tool_use_result.content` `G1`
+- `.tool_use_result.filePath` `G1`
+- `.tool_use_result.interrupted` `G1`
+- `.tool_use_result.isImage` `G1`
+- `.tool_use_result.noOutputExpected` `G1`
+- `.tool_use_result.originalFile` `G1`
+- `.tool_use_result.stderr` `G1`
+- `.tool_use_result.stdout` `G1`
+- `.tool_use_result.structuredPatch` `G1`
+- `.tool_use_result.success` `G6`
+- `.tool_use_result.type` `G1`
+- `.tool_use_result.userModified` `G1`
+- `.tools` `G5`
+- `.total_cost_usd` `G5`
+- `.ttft_ms` `G5`
+- `.ttft_stream_ms` `G5`
+- `.type` `G3`
+- `.usage` `G5`
+- `.usage.cache_creation` `G5`
+- `.usage.cache_creation.ephemeral_1h_input_tokens` `G5`
+- `.usage.cache_creation.ephemeral_5m_input_tokens` `G5`
+- `.usage.cache_creation_input_tokens` `G5`
+- `.usage.cache_read_input_tokens` `G5`
+- `.usage.inference_geo` `G5`
+- `.usage.input_tokens` `G5`
+- `.usage.iterations` `G5`
+- `.usage.output_tokens` `G5`
+- `.usage.output_tokens_details` `G5`
+- `.usage.output_tokens_details.thinking_tokens` `G5`
+- `.usage.server_tool_use` `G5`
+- `.usage.server_tool_use.web_fetch_requests` `G5`
+- `.usage.server_tool_use.web_search_requests` `G5`
+- `.usage.service_tier` `G5`
+- `.usage.speed` `G5`
+- `.uuid` `G4`
 
 ## Vocabulary
 

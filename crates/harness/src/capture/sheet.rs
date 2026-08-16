@@ -137,11 +137,7 @@ fn header_lines(provider: &str, version: &str) -> Vec<String> {
         String::new(),
         "This file reports only what the scenarios below actually produced. Diffing this \
          sheet against another version's sheet is the version-change report (no differ is \
-         planned) — but before reading a disappearance as the CLI dropping a capability, \
-         check the Scenarios section of both sheets. A field or a vocabulary value present \
-         in one version and absent in the other may mean that version's captures simply \
-         never exercised it, not that the CLI changed; the corpus's blind spot is absence, \
-         and it did not go away just because this sheet makes it visible."
+         planned)."
             .to_owned(),
         String::new(),
         "Two readings that argv makes tempting and both wrong: identical launch flags do \
@@ -246,12 +242,33 @@ fn field_lines(provider: &str, version: &str, observations: &[FieldObservation])
         String::new(),
         "Every dotted path observed on the wire for this provider and version, split by the \
          direction it travelled — `To provider` is what Comet sends, `From provider` is \
-         what the provider sends back — one path per line, sorted. Read an absent path \
-         against the Scenarios section above before reading it as a claim about the wire \
-         format."
+         what the provider sends back — one path per line, sorted, each tagged with the \
+         scenario group (below) that produced it. A field missing from this version's list \
+         is only evidence the CLI dropped it if the scenarios that group names are also \
+         present in the other version's own Scenarios section — a group made only of \
+         scenarios this version's Scenarios section doesn't have means the field was simply \
+         never exercised here, not removed."
             .to_owned(),
         String::new(),
     ];
+
+    let scoped: Vec<&FieldObservation> = observations
+        .iter()
+        .filter(|observation| observation.provider == provider && observation.version == version)
+        .collect();
+
+    if scoped.is_empty() {
+        for heading in ["To provider", "From provider"] {
+            lines.push(format!("### {heading}"));
+            lines.push(String::new());
+            lines.push("(none observed)".to_owned());
+            lines.push(String::new());
+        }
+        return lines;
+    }
+
+    let group_ids = scenario_group_ids(&scoped);
+    lines.extend(scenario_group_lines(&group_ids));
 
     for (heading, direction) in [
         ("To provider", Direction::ToProvider),
@@ -260,25 +277,59 @@ fn field_lines(provider: &str, version: &str, observations: &[FieldObservation])
         lines.push(format!("### {heading}"));
         lines.push(String::new());
 
-        let paths: BTreeSet<&str> = observations
+        let entries: BTreeMap<&str, usize> = scoped
             .iter()
-            .filter(|observation| {
-                observation.provider == provider
-                    && observation.version == version
-                    && observation.direction == direction
-            })
-            .map(|observation| observation.path.as_str())
+            .filter(|observation| observation.direction == direction)
+            .map(|observation| (observation.path.as_str(), group_ids[&observation.scenarios]))
             .collect();
 
-        if paths.is_empty() {
+        if entries.is_empty() {
             lines.push("(none observed)".to_owned());
         } else {
-            for path in paths {
-                lines.push(format!("- `{path}`"));
+            for (path, id) in &entries {
+                lines.push(format!("- `{path}` `G{id}`"));
             }
         }
         lines.push(String::new());
     }
+    lines
+}
+
+/// Assigns every distinct scenario set among `scoped` a stable `G<n>` id,
+/// 1-based in the sorted order of the sets themselves (`BTreeSet<String>`'s
+/// own `Ord` — lexicographic over the sorted members), never in the order
+/// `scoped` happened to be walked — what keeps [`render_sheet`]'s
+/// determinism property (same input in any order, identical bytes) holding
+/// for this too.
+fn scenario_group_ids(scoped: &[&FieldObservation]) -> BTreeMap<BTreeSet<String>, usize> {
+    let distinct: BTreeSet<BTreeSet<String>> = scoped
+        .iter()
+        .map(|observation| observation.scenarios.clone())
+        .collect();
+    distinct
+        .into_iter()
+        .enumerate()
+        .map(|(index, scenarios)| (scenarios, index + 1))
+        .collect()
+}
+
+/// Renders the `### Scenario groups` index: one line per distinct scenario
+/// set, in id order. This is what makes the per-field `` `G<n>` `` tags below
+/// mean something without a reader holding every field's scenario list in
+/// their head — two fields observed in the same five scenarios collapse to
+/// one group line instead of five names repeated twice.
+fn scenario_group_lines(group_ids: &BTreeMap<BTreeSet<String>, usize>) -> Vec<String> {
+    let mut lines = vec!["### Scenario groups".to_owned(), String::new()];
+    let mut by_id: Vec<(usize, &BTreeSet<String>)> = group_ids
+        .iter()
+        .map(|(scenarios, id)| (*id, scenarios))
+        .collect();
+    by_id.sort_by_key(|(id, _)| *id);
+    for (id, scenarios) in by_id {
+        let names: Vec<&str> = scenarios.iter().map(String::as_str).collect();
+        lines.push(format!("- `G{id}`: {}", names.join(", ")));
+    }
+    lines.push(String::new());
     lines
 }
 
@@ -341,15 +392,32 @@ mod tests {
         direction: Direction,
         path: &str,
     ) -> FieldObservation {
+        observation_in(provider, version, direction, path, &["test"])
+    }
+
+    /// Like [`observation`], but with an explicit scenario set — what the
+    /// scenario-group tests below need to control which fields land in the
+    /// same `G<n>` group and which don't.
+    fn observation_in(
+        provider: &str,
+        version: &str,
+        direction: Direction,
+        path: &str,
+        scenarios: &[&str],
+    ) -> FieldObservation {
         FieldObservation {
             provider: provider.to_owned(),
             version: version.to_owned(),
             path: path.to_owned(),
             direction,
             first_seen: FrameRef {
-                scenario: format!("{provider}/{version}/test"),
+                scenario: format!(
+                    "{provider}/{version}/{}",
+                    scenarios.first().copied().unwrap_or("test")
+                ),
                 sequence: 1,
             },
+            scenarios: scenarios.iter().map(|name| (*name).to_owned()).collect(),
         }
     }
 
@@ -567,6 +635,138 @@ mod tests {
             alpha < mid && mid < zeta,
             "fields must render sorted by path: {rendered}"
         );
+    }
+
+    /// D85: two fields observed in the exact same scenarios must share one
+    /// `G<n>` tag, and a field observed in a different scenario set must get
+    /// a different tag — the whole point of the group index is that it
+    /// collapses repetition rather than printing a scenario list per field.
+    ///
+    /// Break this would catch: a naive per-field rendering (or a group
+    /// keyed on something other than set equality, e.g. field insertion
+    /// order) would either print `.shared_a` and `.shared_b`'s identical
+    /// five-scenario list twice, or assign them different ids despite
+    /// covering the same evidence.
+    #[test]
+    fn fields_with_the_same_scenario_set_share_one_group_tag() {
+        let observations = vec![
+            observation_in(
+                "claude",
+                "2.1.229",
+                Direction::FromProvider,
+                ".solo",
+                &["alpha"],
+            ),
+            observation_in(
+                "claude",
+                "2.1.229",
+                Direction::FromProvider,
+                ".shared_a",
+                &["alpha", "beta"],
+            ),
+            observation_in(
+                "claude",
+                "2.1.229",
+                Direction::FromProvider,
+                ".shared_b",
+                &["alpha", "beta"],
+            ),
+        ];
+        let rendered = render_sheet("claude", "2.1.229", &observations, &BTreeMap::new(), &[]);
+        let fields_section = section(&rendered, "## Fields");
+
+        assert!(
+            fields_section.contains("### Scenario groups"),
+            "{fields_section}"
+        );
+        let group_lines: Vec<&str> = fields_section
+            .lines()
+            .filter(|line| line.starts_with("- `G"))
+            .collect();
+        assert_eq!(
+            group_lines.len(),
+            2,
+            "two distinct scenario sets ({{alpha}} and {{alpha, beta}}) must fold into two \
+             group lines, not one per field: {group_lines:?}"
+        );
+        assert!(
+            group_lines.contains(&"- `G1`: alpha"),
+            "the solo scenario set must render as its own group: {group_lines:?}"
+        );
+        assert!(
+            group_lines.contains(&"- `G2`: alpha, beta"),
+            "the shared scenario set must render as its own group, sorted: {group_lines:?}"
+        );
+
+        let tag_for = |path: &str| -> &str {
+            let marker = format!("`{path}` `G");
+            let start = fields_section
+                .find(&marker)
+                .unwrap_or_else(|| panic!("{path} not tagged: {fields_section}"));
+            let after = &fields_section[start + marker.len()..];
+            let end = after.find('`').unwrap();
+            &after[..end]
+        };
+        assert_eq!(
+            tag_for(".shared_a"),
+            tag_for(".shared_b"),
+            "fields observed in the identical scenario set must carry the identical tag: \
+             {fields_section}"
+        );
+        assert_ne!(
+            tag_for(".solo"),
+            tag_for(".shared_a"),
+            "fields observed in different scenario sets must carry different tags: \
+             {fields_section}"
+        );
+    }
+
+    /// D85's actual reproduction case: two versions whose evidence comes
+    /// from entirely disjoint scenarios must be distinguishable, from the
+    /// diff alone, from two versions where the same scenario stopped
+    /// producing a field. A field present under a group naming a scenario
+    /// this version's own Scenarios section holds is a real signal; a field
+    /// present under a group naming only scenarios foreign to this
+    /// version's Scenarios section is not — this is the check a reader
+    /// applies to tell the two apart without opening the corpus.
+    #[test]
+    fn a_fields_group_names_only_scenarios_this_version_actually_ran() {
+        let observations = vec![observation_in(
+            "claude",
+            "2.1.229",
+            Direction::FromProvider,
+            ".turn_only",
+            &["checklist", "subagent"],
+        )];
+        let scenarios = vec![
+            scenario("checklist", "capture one bounded run", &["prog"]),
+            scenario("checklist-resume", "capture a resumed run", &["prog"]),
+            scenario("subagent", "capture a subagent run", &["prog"]),
+        ];
+        let rendered = render_sheet(
+            "claude",
+            "2.1.229",
+            &observations,
+            &BTreeMap::new(),
+            &scenarios,
+        );
+        let fields_section = section(&rendered, "## Fields");
+        let scenarios_section = section(&rendered, "## Scenarios");
+
+        assert!(
+            fields_section.contains("- `G1`: checklist, subagent"),
+            "{fields_section}"
+        );
+        // Every scenario the group names is one this version's own
+        // Scenarios section documents — the case where a diff reader can
+        // conclude the field is real, not merely untested here.
+        for name in ["checklist", "subagent"] {
+            assert!(
+                scenarios_section.contains(&format!("### {name}")),
+                "the group names {name}, which must be one of this version's own \
+                 scenarios: {scenarios_section}"
+            );
+        }
     }
 
     /// Break this would catch: `render_sheet` trusting every observation it
