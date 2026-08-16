@@ -788,6 +788,29 @@ pub(crate) fn new_session_target(scope: &SidebarScope, spaces: &[String]) -> New
     }
 }
 
+/// History entry for a global New Session action that leaves Settings.
+///
+/// A direct target ends on the blank canvas immediately. Picker and add-space
+/// flows still show the previously active chat behind their cancellable UI, so
+/// cancelling must leave history pointing at that visible Chat route. Chat-
+/// origin actions need no entry: their selection changes already drive the
+/// normal history observer.
+fn new_session_nav_entry(
+    origin: Route,
+    target: &NewSessionTarget,
+    active_chat: &str,
+) -> Option<NavEntry> {
+    if !matches!(origin, Route::Settings(_)) {
+        return None;
+    }
+    Some(match target {
+        NewSessionTarget::Space(_) => NavEntry::Chat(String::new()),
+        NewSessionTarget::Pick(_) | NewSessionTarget::AddSpaceFirst => {
+            NavEntry::Chat(active_chat.to_string())
+        }
+    })
+}
+
 impl Shell {
     pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
@@ -2443,15 +2466,17 @@ impl Shell {
         &mut self,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> NewSessionTarget {
         let (scope, spaces) = {
             let state = self.state.read(cx);
             let spaces: Vec<String> = state.spaces.iter().map(|s| s.id.clone()).collect();
             (state.sidebar_scope.clone(), spaces)
         };
-        match new_session_target(&scope, &spaces) {
+        let target = new_session_target(&scope, &spaces);
+        match &target {
             NewSessionTarget::Space(id) => {
                 self.set_route(Route::Chat, cx);
+                let id = id.clone();
                 self.state.update(cx, |s, cx| {
                     // Mirrors `activate_space`: `select_chat(None)` alone
                     // deliberately leaves `selected_space` untouched (a scope
@@ -2482,6 +2507,7 @@ impl Shell {
             }
             NewSessionTarget::AddSpaceFirst => self.open_add_space(cx),
         }
+        target
     }
 
     /// The picker's commit path. Deliberately does not touch `sidebar_scope`:
@@ -2615,7 +2641,7 @@ impl Shell {
                         "new-session",
                         theme,
                         cx.listener(|this, _, window, cx| {
-                            this.start_session_from_sidebar(window, cx)
+                            this.start_session_from_sidebar(window, cx);
                         }),
                     )),
                 )
@@ -2665,7 +2691,7 @@ impl Shell {
                                 .text_color(theme.accent)
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.start_session_from_sidebar(window, cx)
+                                    this.start_session_from_sidebar(window, cx);
                                 }))
                                 .child(SharedString::from("Start a session →")),
                         )
@@ -4167,8 +4193,14 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &NewSession, window, cx| {
+                let origin = this.route;
                 this.set_route(Route::Chat, cx);
-                this.start_session_from_sidebar(window, cx);
+                let target = this.start_session_from_sidebar(window, cx);
+                if let Some(entry) = new_session_nav_entry(origin, &target, &this.active_chat) {
+                    // Direct selection also reaches `on_state_changed`; push
+                    // deduplication makes that later observation a no-op.
+                    this.nav.push(entry);
+                }
             }))
             .on_action(cx.listener(|this, _: &ToggleChanges, _, cx| {
                 if matches!(this.route, Route::Chat) {
@@ -4873,6 +4905,61 @@ mod tests {
             Some(NavEntry::Settings(SettingsSection::Devices))
         );
         assert_eq!(nav.back(), Some(chat("a")));
+    }
+
+    #[test]
+    fn settings_new_session_records_the_chat_route_before_cancel_or_selection() {
+        let settings = Route::Settings(SettingsSection::Devices);
+
+        let direct = new_session_nav_entry(
+            settings,
+            &NewSessionTarget::Space("space-a".into()),
+            "existing-chat",
+        );
+        assert_eq!(direct, Some(chat("")));
+        let mut direct_nav = NavHistory::new(chat("existing-chat"));
+        direct_nav.push(NavEntry::Settings(SettingsSection::Devices));
+        direct_nav.push(direct.expect("direct target records the blank canvas"));
+        let after_action = direct_nav.len();
+        direct_nav.push(chat(""));
+        assert_eq!(
+            direct_nav.len(),
+            after_action,
+            "the later selected-session observer dedups the same blank canvas"
+        );
+        assert_eq!(
+            direct_nav.back(),
+            Some(NavEntry::Settings(SettingsSection::Devices))
+        );
+
+        for pending in [
+            NewSessionTarget::Pick(vec!["space-a".into(), "space-b".into()]),
+            NewSessionTarget::AddSpaceFirst,
+        ] {
+            let mut nav = NavHistory::new(chat("existing-chat"));
+            nav.push(NavEntry::Settings(SettingsSection::Devices));
+            nav.push(
+                new_session_nav_entry(settings, &pending, "existing-chat")
+                    .expect("leaving Settings records the visible Chat route"),
+            );
+
+            assert_eq!(*nav.current(), chat("existing-chat"));
+            assert_eq!(
+                nav.back(),
+                Some(NavEntry::Settings(SettingsSection::Devices)),
+                "cancelling the pending flow leaves Back pointing at Settings"
+            );
+        }
+
+        assert_eq!(
+            new_session_nav_entry(
+                Route::Chat,
+                &NewSessionTarget::Pick(vec!["space-a".into(), "space-b".into()]),
+                "existing-chat",
+            ),
+            None,
+            "Chat-origin actions already have coherent navigation history"
+        );
     }
 
     #[test]
