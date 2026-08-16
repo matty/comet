@@ -681,6 +681,30 @@ fn decode_diff_source(
     Ok((Some(text), Some(hash), false))
 }
 
+async fn read_bounded_source<R>(reader: R, observed_len: u64) -> Result<Capture, EngineError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    if observed_len > MAX_DIFF_SOURCE_BYTES as u64 {
+        return Ok(Capture {
+            stdout: Vec::new(),
+            truncated: true,
+        });
+    }
+
+    let mut stdout = Vec::with_capacity(observed_len as usize + 1);
+    reader
+        .take((MAX_DIFF_SOURCE_BYTES + 1) as u64)
+        .read_to_end(&mut stdout)
+        .await
+        .map_err(|error| EngineError::Other(format!("read diff file: {error}")))?;
+    let truncated = stdout.len() > MAX_DIFF_SOURCE_BYTES;
+    if truncated {
+        stdout.clear();
+    }
+    Ok(Capture { stdout, truncated })
+}
+
 async fn read_worktree_source(root: &Path, path: &Path) -> Result<Capture, EngineError> {
     let canonical_root = tokio::fs::canonicalize(root)
         .await
@@ -700,19 +724,19 @@ async fn read_worktree_source(root: &Path, path: &Path) -> Result<Capture, Engin
     if !canonical.starts_with(&canonical_root) {
         return Err(EngineError::Other("diff source escapes checkout".into()));
     }
-    if metadata.len() > MAX_DIFF_SOURCE_BYTES as u64 {
-        return Ok(Capture {
-            stdout: Vec::new(),
-            truncated: true,
-        });
-    }
-    let stdout = tokio::fs::read(&canonical)
+    let file = tokio::fs::File::open(&canonical)
         .await
-        .map_err(|error| EngineError::Other(format!("read diff file: {error}")))?;
-    Ok(Capture {
-        stdout,
-        truncated: false,
-    })
+        .map_err(|error| EngineError::Other(format!("open diff file: {error}")))?;
+    let opened_metadata = file
+        .metadata()
+        .await
+        .map_err(|error| EngineError::Other(format!("read opened diff file metadata: {error}")))?;
+    if !opened_metadata.is_file() {
+        return Err(EngineError::Other(
+            "diff source is not a regular checkout file".into(),
+        ));
+    }
+    read_bounded_source(file, opened_metadata.len()).await
 }
 
 /// Read the exact old/new documents for one file in a previously captured diff.
@@ -938,6 +962,53 @@ pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
         truncated,
         checksum,
     })
+}
+
+#[cfg(test)]
+mod source_read_tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use super::{MAX_DIFF_SOURCE_BYTES, read_bounded_source};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    struct PanicAfterSentinel {
+        remaining: usize,
+    }
+
+    impl AsyncRead for PanicAfterSentinel {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            assert!(
+                self.remaining > 0,
+                "source reader was polled past the truncation sentinel"
+            );
+            let count = self.remaining.min(buf.remaining());
+            buf.initialize_unfilled_to(count).fill(b'x');
+            buf.advance(count);
+            self.remaining -= count;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn worktree_source_read_caps_growth_after_initial_metadata() {
+        let reader = PanicAfterSentinel {
+            remaining: MAX_DIFF_SOURCE_BYTES + 1,
+        };
+        let capture = read_bounded_source(reader, 1)
+            .await
+            .expect("bounded source read");
+
+        assert!(capture.truncated, "growth past the cap was accepted");
+        assert!(
+            capture.stdout.is_empty(),
+            "truncated source bytes must not escape"
+        );
+    }
 }
 
 #[cfg(test)]
