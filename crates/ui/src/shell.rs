@@ -58,7 +58,13 @@ use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
 actions!(
     shell,
-    [ToggleSidebar, ToggleChanges, AddSpacePalette, FocusSearch]
+    [
+        ToggleSidebar,
+        ToggleChanges,
+        AddSpacePalette,
+        FocusSearch,
+        NewSession
+    ]
 );
 
 // ---------------------------------------------------------------------------
@@ -148,23 +154,18 @@ fn windows_caption_font_for_build(build: u32) -> &'static str {
 /// (Re-)apply the whole app keymap: clears every binding, restores the composer
 /// map, then binds the customizable shortcuts from `keymap` (feature-inventory
 /// §1.4). Invalid persisted combos fall back to that shortcut's default.
-pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
-    fn valid_or_default(combo: &str, fallback: &str) -> String {
-        let candidate = platform_combo(combo);
-        if Keystroke::parse(&candidate).is_ok() {
-            candidate
-        } else {
-            tracing::warn!(%combo, "unparseable shortcut combo; using default");
-            platform_combo(fallback)
-        }
+fn valid_or_default(combo: &str, fallback: &str) -> String {
+    let candidate = platform_combo(combo);
+    if Keystroke::parse(&candidate).is_ok() {
+        candidate
+    } else {
+        tracing::warn!(%combo, "unparseable shortcut combo; using default");
+        platform_combo(fallback)
     }
-    cx.clear_key_bindings();
-    crate::composer::init(cx);
-    // Fixed app-level shortcuts (⌘Q quit, ⌘W close, ⌘M minimize, ⌘H hide) —
-    // these back the native menu key equivalents and must survive keymap
-    // re-application.
-    crate::app_menus::bind_keys(cx);
-    cx.bind_keys([
+}
+
+fn shell_key_bindings(keymap: &KeymapConfig) -> Vec<KeyBinding> {
+    vec![
         KeyBinding::new(
             &valid_or_default(&keymap.toggle_sidebar, "mod-s"),
             ToggleSidebar,
@@ -185,10 +186,25 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
             FocusSearch,
             None,
         ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.new_session, "mod-n"),
+            NewSession,
+            None,
+        ),
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
         // bar); pressing it again dismisses.
         KeyBinding::new(&platform_combo("mod-k"), AddSpacePalette, None),
-    ]);
+    ]
+}
+
+pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
+    cx.clear_key_bindings();
+    crate::composer::init(cx);
+    // Fixed app-level shortcuts (⌘Q quit, ⌘W close, ⌘M minimize, ⌘H hide) —
+    // these back the native menu key equivalents and must survive keymap
+    // re-application.
+    crate::app_menus::bind_keys(cx);
+    cx.bind_keys(shell_key_bindings(keymap));
 }
 
 /// The settings sections (feature-inventory §1.5 routes).
@@ -233,6 +249,27 @@ const BOTTOM_SETTINGS_SECTION: SettingsSection = SettingsSection::Devices;
 pub enum Route {
     Chat,
     Settings(SettingsSection),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellFocusFallback {
+    Composer,
+    ShellRoot,
+}
+
+fn shell_focus_fallback(
+    route: Route,
+    has_focused_node: bool,
+    shell_root_is_focused: bool,
+) -> Option<ShellFocusFallback> {
+    match route {
+        Route::Chat if !has_focused_node || shell_root_is_focused => {
+            Some(ShellFocusFallback::Composer)
+        }
+        Route::Chat => None,
+        Route::Settings(_) if !has_focused_node => Some(ShellFocusFallback::ShellRoot),
+        Route::Settings(_) => None,
+    }
 }
 
 /// Per-chat panel open flags (comet parity: `sessionPanels` — the terminal and
@@ -618,6 +655,9 @@ pub struct Shell {
     /// `track_focus` idiom) so ↑↓/Enter/Esc reach it instead of whatever was
     /// focused before it opened.
     space_dropdown_focus: gpui::FocusHandle,
+    /// Shell-level keyboard shortcuts need a focus-chain target when Settings
+    /// has no focused control.
+    shell_focus: gpui::FocusHandle,
     /// `true` for the one frame after the panel opens — the render pass
     /// consumes it to call `window.focus`.
     space_dropdown_focus_pending: bool,
@@ -746,6 +786,29 @@ pub(crate) fn new_session_target(scope: &SidebarScope, spaces: &[String]) -> New
         [only] => NewSessionTarget::Space(only.clone()),
         many => NewSessionTarget::Pick(many.to_vec()),
     }
+}
+
+/// History entry for a global New Session action that leaves Settings.
+///
+/// A direct target ends on the blank canvas immediately. Picker and add-space
+/// flows still show the previously active chat behind their cancellable UI, so
+/// cancelling must leave history pointing at that visible Chat route. Chat-
+/// origin actions need no entry: their selection changes already drive the
+/// normal history observer.
+fn new_session_nav_entry(
+    origin: Route,
+    target: &NewSessionTarget,
+    active_chat: &str,
+) -> Option<NavEntry> {
+    if !matches!(origin, Route::Settings(_)) {
+        return None;
+    }
+    Some(match target {
+        NewSessionTarget::Space(_) => NavEntry::Chat(String::new()),
+        NewSessionTarget::Pick(_) | NewSessionTarget::AddSpaceFirst => {
+            NavEntry::Chat(active_chat.to_string())
+        }
+    })
 }
 
 impl Shell {
@@ -886,6 +949,7 @@ impl Shell {
             space_dropdown_open: None,
             space_dropdown_highlight: None,
             space_dropdown_focus: cx.focus_handle(),
+            shell_focus: cx.focus_handle(),
             space_dropdown_focus_pending: false,
             space_dropdown_dismissed_at: None,
             space_panel_scroll: gpui::ScrollHandle::new(),
@@ -2402,15 +2466,17 @@ impl Shell {
         &mut self,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> NewSessionTarget {
         let (scope, spaces) = {
             let state = self.state.read(cx);
             let spaces: Vec<String> = state.spaces.iter().map(|s| s.id.clone()).collect();
             (state.sidebar_scope.clone(), spaces)
         };
-        match new_session_target(&scope, &spaces) {
+        let target = new_session_target(&scope, &spaces);
+        match &target {
             NewSessionTarget::Space(id) => {
                 self.set_route(Route::Chat, cx);
+                let id = id.clone();
                 self.state.update(cx, |s, cx| {
                     // Mirrors `activate_space`: `select_chat(None)` alone
                     // deliberately leaves `selected_space` untouched (a scope
@@ -2441,6 +2507,7 @@ impl Shell {
             }
             NewSessionTarget::AddSpaceFirst => self.open_add_space(cx),
         }
+        target
     }
 
     /// The picker's commit path. Deliberately does not touch `sidebar_scope`:
@@ -2574,7 +2641,7 @@ impl Shell {
                         "new-session",
                         theme,
                         cx.listener(|this, _, window, cx| {
-                            this.start_session_from_sidebar(window, cx)
+                            this.start_session_from_sidebar(window, cx);
                         }),
                     )),
                 )
@@ -2624,7 +2691,7 @@ impl Shell {
                                 .text_color(theme.accent)
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.start_session_from_sidebar(window, cx)
+                                    this.start_session_from_sidebar(window, cx);
                                 }))
                                 .child(SharedString::from("Start a session →")),
                         )
@@ -4057,25 +4124,29 @@ impl Render for Shell {
 
         // Keyboard shortcuts (mod-s/b/j) dispatch through the window focus
         // chain — with nothing focused they go dead. Land initial focus on the
-        // composer, and whenever focus is lost with no successor (e.g. the
-        // focused element unmounted), route it back there.
+        // route's fallback, and whenever focus is lost with no successor (e.g.
+        // the focused element unmounted), route it back there.
         if self.focus_sub.is_none() {
             self.focus_sub = Some(cx.on_focus_lost(window, |this: &mut Shell, window, cx| {
-                match this.route {
-                    Route::Chat => window.focus(&this.composer.focus_handle(cx), cx),
-                    // No composer here — clear the stale handle so `focused()`
-                    // reads None (the render hook below re-lands focus when the
-                    // route returns to Chat; a lingering unmounted handle would
-                    // otherwise dead-end keyboard dispatch for good).
-                    Route::Settings(_) => window.blur(),
+                match shell_focus_fallback(this.route, false, false) {
+                    Some(ShellFocusFallback::Composer) => {
+                        window.focus(&this.composer.focus_handle(cx), cx)
+                    }
+                    Some(ShellFocusFallback::ShellRoot) => window.focus(&this.shell_focus, cx),
+                    None => {}
                 }
             }));
         }
+        let has_focused_node = window.focused(cx).is_some();
+        let shell_root_is_focused = self.shell_focus.is_focused(window);
         if matches!(gate, GatePhase::Ready)
-            && matches!(self.route, Route::Chat)
-            && window.focused(cx).is_none()
+            && let Some(fallback) =
+                shell_focus_fallback(self.route, has_focused_node, shell_root_is_focused)
         {
-            window.focus(&self.composer.focus_handle(cx), cx);
+            match fallback {
+                ShellFocusFallback::Composer => window.focus(&self.composer.focus_handle(cx), cx),
+                ShellFocusFallback::ShellRoot => window.focus(&self.shell_focus, cx),
+            }
         }
         // Opening a search result hands focus back to the composer, matching
         // what selecting a session anywhere else leaves you with — otherwise
@@ -4088,6 +4159,7 @@ impl Render for Shell {
 
         let root = div()
             .id("shell-root")
+            .track_focus(&self.shell_focus)
             .relative()
             .flex()
             .flex_row()
@@ -4118,6 +4190,16 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 if matches!(this.route, Route::Chat) {
                     this.focus_search(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &NewSession, window, cx| {
+                let origin = this.route;
+                this.set_route(Route::Chat, cx);
+                let target = this.start_session_from_sidebar(window, cx);
+                if let Some(entry) = new_session_nav_entry(origin, &target, &this.active_chat) {
+                    // Direct selection also reaches `on_state_changed`; push
+                    // deduplication makes that later observation a no-op.
+                    this.nav.push(entry);
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleChanges, _, cx| {
@@ -4377,6 +4459,7 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Action as _;
 
     fn space_ids(ids: &[&str]) -> Vec<String> {
         ids.iter().map(|id| (*id).to_string()).collect()
@@ -4389,6 +4472,50 @@ mod tests {
             NewSessionTarget::Space("s2".into()),
             "a scoped sidebar already answers the question the picker would ask"
         );
+    }
+
+    #[test]
+    fn shell_key_bindings_include_new_session() {
+        let bindings = shell_key_bindings(&KeymapConfig::default());
+        let binding = bindings
+            .iter()
+            .find(|binding| binding.action().name() == NewSession.name())
+            .expect("NewSession binding");
+        assert_eq!(
+            binding
+                .keystrokes()
+                .iter()
+                .map(|key| key.inner().clone())
+                .collect::<Vec<_>>(),
+            vec![Keystroke::parse(&platform_combo("mod-n")).unwrap()]
+        );
+    }
+
+    #[test]
+    fn shell_focus_fallback_routes_chat_to_composer_and_settings_to_shell_root() {
+        assert_eq!(
+            shell_focus_fallback(Route::Chat, false, false),
+            Some(ShellFocusFallback::Composer)
+        );
+        assert_eq!(
+            shell_focus_fallback(Route::Chat, true, true),
+            Some(ShellFocusFallback::Composer)
+        );
+        assert_eq!(shell_focus_fallback(Route::Chat, true, false), None);
+        for section in SettingsSection::ALL {
+            assert_eq!(
+                shell_focus_fallback(Route::Settings(section), false, false),
+                Some(ShellFocusFallback::ShellRoot)
+            );
+            assert_eq!(
+                shell_focus_fallback(Route::Settings(section), true, true),
+                None
+            );
+            assert_eq!(
+                shell_focus_fallback(Route::Settings(section), true, false),
+                None
+            );
+        }
     }
 
     #[test]
@@ -4778,6 +4905,86 @@ mod tests {
             Some(NavEntry::Settings(SettingsSection::Devices))
         );
         assert_eq!(nav.back(), Some(chat("a")));
+    }
+
+    #[test]
+    fn settings_new_session_records_the_chat_route_before_cancel_or_selection() {
+        let settings = Route::Settings(SettingsSection::Devices);
+
+        let direct = new_session_nav_entry(
+            settings,
+            &NewSessionTarget::Space("space-a".into()),
+            "existing-chat",
+        );
+        assert_eq!(direct, Some(chat("")));
+        let mut direct_nav = NavHistory::new(chat("existing-chat"));
+        direct_nav.push(NavEntry::Settings(SettingsSection::Devices));
+        direct_nav.push(direct.expect("direct target records the blank canvas"));
+        let after_action = direct_nav.len();
+        direct_nav.push(chat(""));
+        assert_eq!(
+            direct_nav.len(),
+            after_action,
+            "the later selected-session observer dedups the same blank canvas"
+        );
+        assert_eq!(
+            direct_nav.back(),
+            Some(NavEntry::Settings(SettingsSection::Devices))
+        );
+
+        for pending in [
+            NewSessionTarget::Pick(vec!["space-a".into(), "space-b".into()]),
+            NewSessionTarget::AddSpaceFirst,
+        ] {
+            let mut nav = NavHistory::new(chat("existing-chat"));
+            nav.push(NavEntry::Settings(SettingsSection::Devices));
+            nav.push(
+                new_session_nav_entry(settings, &pending, "existing-chat")
+                    .expect("leaving Settings records the visible Chat route"),
+            );
+
+            assert_eq!(*nav.current(), chat("existing-chat"));
+            assert_eq!(
+                nav.back(),
+                Some(NavEntry::Settings(SettingsSection::Devices)),
+                "cancelling the pending flow leaves Back pointing at Settings"
+            );
+        }
+
+        assert_eq!(
+            new_session_nav_entry(
+                Route::Chat,
+                &NewSessionTarget::Pick(vec!["space-a".into(), "space-b".into()]),
+                "existing-chat",
+            ),
+            None,
+            "Chat-origin actions already have coherent navigation history"
+        );
+    }
+
+    #[test]
+    fn new_session_action_wires_the_target_aware_history_entry() {
+        let source = include_str!("shell.rs");
+        let production_source = source
+            .split_once("#[cfg(test)]")
+            .expect("shell test-module boundary")
+            .0;
+        let listener = production_source
+            .split_once(".on_action(cx.listener(|this, _: &NewSession")
+            .expect("NewSession action listener")
+            .1
+            .split_once(".on_action(cx.listener(|this, _: &ToggleChanges")
+            .expect("next shell action listener")
+            .0;
+
+        assert!(
+            listener.contains("new_session_nav_entry(origin, &target, &this.active_chat)"),
+            "the production listener must compute the Settings-to-Chat history entry"
+        );
+        assert!(
+            listener.contains("this.nav.push(entry)"),
+            "the production listener must record the computed history entry"
+        );
     }
 
     #[test]
