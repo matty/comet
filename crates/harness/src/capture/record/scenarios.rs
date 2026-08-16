@@ -15,12 +15,13 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-use comet_proto::RuntimeMode;
+use comet_proto::{RunRequest, RuntimeMode};
 
 use super::providers::claude::ClaudeProvider;
 use super::providers::codex::CodexProvider;
-use super::session::Session;
+use super::session::{FenceOutcome, Session};
 use crate::capture::Provider;
+use crate::capture::types::CaptureConfig;
 use crate::launch::LaunchDescriptor;
 
 /// The parameters a scenario body reads to vary its behavior without owning
@@ -65,7 +66,7 @@ pub struct Requirements {
 }
 
 impl Requirements {
-    const fn discovery() -> Self {
+    pub(super) const fn discovery() -> Self {
         Self {
             spends_tokens: false,
             needs_cwd: false,
@@ -78,7 +79,7 @@ impl Requirements {
 
     /// Every non-discovery scenario: spends tokens, and — unlike the
     /// cwd-independent discovery aliases — does read `--cwd`.
-    const fn run() -> Self {
+    pub(super) const fn run() -> Self {
         Self {
             spends_tokens: true,
             needs_cwd: true,
@@ -100,8 +101,53 @@ pub struct ScenarioSpec {
     /// SPAWN, per row — not a provider trait member. See the amendment on
     /// `CaptureProvider`'s doc comment for why: which launch a scenario
     /// needs varies per scenario as well as per provider.
-    pub(super) launch: fn(&ScenarioInput, &Path) -> anyhow::Result<LaunchDescriptor>,
+    pub(super) launch: ScenarioLaunch,
+    /// The pre-spawn fence, per row — closes D79. Selection used to be
+    /// *derived* in `record.rs`'s `codex_fence` from
+    /// `spec.runtime_mode == Some(RuntimeMode::ApprovalRequired)`, so a
+    /// future Codex row that legitimately wanted `ApprovalRequired` for some
+    /// other reason would have silently inherited the Windows-only trusted-
+    /// PowerShell fence. Every row now names its own fence explicitly;
+    /// [`no_fence`] is the default for the eighteen rows that need none, and
+    /// the two Codex approval rows point at `super::codex_fence` directly.
+    pub(super) fence:
+        fn(&ScenarioSpec, &CaptureConfig, &LaunchDescriptor) -> anyhow::Result<FenceOutcome>,
     pub(super) body: ScenarioBody,
+}
+
+/// The pre-spawn fence default: every Claude row (Claude has no pre-spawn
+/// fence at all — its `approval` body's grant-time `claude_marker_grant`
+/// recheck is the analogous protection, run against live filesystem state at
+/// every grant rather than once before spawn; see that function's own doc
+/// comment in `record/scenarios/claude.rs`) and every Codex row except
+/// `approval`/`approval-on-request`.
+pub(super) fn no_fence(
+    _spec: &ScenarioSpec,
+    _config: &CaptureConfig,
+    _launch: &LaunchDescriptor,
+) -> anyhow::Result<FenceOutcome> {
+    Ok(FenceOutcome::none())
+}
+
+/// What a row's `launch` needs to build. A discovery scenario resolves a
+/// `LaunchDescriptor` directly — it never starts a turn, so there is no
+/// `RunRequest` to speak of. A run scenario instead names a builder that
+/// produces a `RunRequest`, and `record.rs` (`derive_launch`) is the ONLY
+/// caller that ever invokes it: it builds the `RunRequest` once, derives the
+/// launch from it via the provider's own `run_launch`, and hands that same
+/// `RunRequest` to the scenario body through `Session::request`. Before this
+/// enum existed, a row's `launch` field was always a bare
+/// `fn(&ScenarioInput, &Path) -> anyhow::Result<LaunchDescriptor>` — every run
+/// scenario's `*_launch` wrapper called its own `*_request` builder to
+/// satisfy that shape, and the scenario body separately called the same
+/// builder again to build its wire line. Two independent calls agreed only
+/// because every builder happened to be a pure function of `input`; nothing
+/// enforced it. Routing both the launch and the body through one call closes
+/// that hole structurally instead of by convention.
+#[derive(Clone, Copy)]
+pub(super) enum ScenarioLaunch {
+    Run(fn(&ScenarioInput) -> anyhow::Result<RunRequest>),
+    Discovery(fn(&ScenarioInput, &Path) -> anyhow::Result<LaunchDescriptor>),
 }
 
 type BoxedFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
@@ -118,7 +164,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Claude,
         runtime_mode: None,
         requirements: Requirements::discovery(),
-        launch: claude::model_discovery_launch,
+        launch: ScenarioLaunch::Discovery(claude::model_discovery_launch),
+        fence: no_fence,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::model_discovery(s, i))),
     },
     ScenarioSpec {
@@ -127,7 +174,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Claude,
         runtime_mode: None,
         requirements: Requirements::discovery(),
-        launch: claude::model_discovery_launch,
+        launch: ScenarioLaunch::Discovery(claude::model_discovery_launch),
+        fence: no_fence,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::model_discovery(s, i))),
     },
     ScenarioSpec {
@@ -139,7 +187,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
             needs_cwd: true,
             ..Requirements::discovery()
         },
-        launch: claude::model_discovery_launch,
+        launch: ScenarioLaunch::Discovery(claude::model_discovery_launch),
+        fence: no_fence,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::model_discovery(s, i))),
     },
     ScenarioSpec {
@@ -153,7 +202,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         },
         // Visibly different from the `model-discovery` rows above: this is
         // the whole point of `launch` living on the row, not the provider.
-        launch: claude::command_discovery_launch,
+        launch: ScenarioLaunch::Discovery(claude::command_discovery_launch),
+        fence: no_fence,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::command_discovery(s, i))),
     },
     ScenarioSpec {
@@ -162,7 +212,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Codex,
         runtime_mode: None,
         requirements: Requirements::discovery(),
-        launch: codex::model_discovery_launch,
+        launch: ScenarioLaunch::Discovery(codex::model_discovery_launch),
+        fence: no_fence,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::model_discovery(s, i))),
     },
     ScenarioSpec {
@@ -171,7 +222,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Codex,
         runtime_mode: None,
         requirements: Requirements::discovery(),
-        launch: codex::model_discovery_launch,
+        launch: ScenarioLaunch::Discovery(codex::model_discovery_launch),
+        fence: no_fence,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::model_discovery(s, i))),
     },
     ScenarioSpec {
@@ -183,7 +235,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
             needs_cwd: true,
             ..Requirements::discovery()
         },
-        launch: codex::model_discovery_launch,
+        launch: ScenarioLaunch::Discovery(codex::model_discovery_launch),
+        fence: no_fence,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::model_discovery(s, i))),
     },
     ScenarioSpec {
@@ -195,7 +248,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
             needs_empty_codex_home: true,
             ..Requirements::discovery()
         },
-        launch: codex::model_discovery_launch,
+        launch: ScenarioLaunch::Discovery(codex::model_discovery_launch),
+        fence: no_fence,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::model_discovery(s, i))),
     },
     ScenarioSpec {
@@ -204,7 +258,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Claude,
         runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
         requirements: Requirements::run(),
-        launch: claude::fresh_text_launch,
+        launch: ScenarioLaunch::Run(claude::fresh_text_request),
+        fence: no_fence,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::fresh_text(s, i))),
     },
     ScenarioSpec {
@@ -213,7 +268,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Claude,
         runtime_mode: Some(RuntimeMode::ApprovalRequired),
         requirements: Requirements::run(),
-        launch: claude::approval_launch,
+        launch: ScenarioLaunch::Run(claude::approval_request),
+        fence: no_fence,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::approval(s, i))),
     },
     ScenarioSpec {
@@ -225,7 +281,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
             needs_resume_id: true,
             ..Requirements::run()
         },
-        launch: claude::resume_launch,
+        launch: ScenarioLaunch::Run(claude::resume_request),
+        fence: no_fence,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::resume(s, i))),
     },
     ScenarioSpec {
@@ -237,7 +294,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
             needs_attachment: true,
             ..Requirements::run()
         },
-        launch: claude::attachment_launch,
+        launch: ScenarioLaunch::Run(claude::attachment_request),
+        fence: no_fence,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::attachment(s, i))),
     },
     ScenarioSpec {
@@ -246,7 +304,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Claude,
         runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
         requirements: Requirements::run(),
-        launch: claude::checklist_launch,
+        launch: ScenarioLaunch::Run(claude::checklist_request),
+        fence: no_fence,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::checklist(s, i))),
     },
     ScenarioSpec {
@@ -258,7 +317,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
             needs_resume_id: true,
             ..Requirements::run()
         },
-        launch: claude::checklist_resume_launch,
+        launch: ScenarioLaunch::Run(claude::checklist_resume_request),
+        fence: no_fence,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::checklist_resume(s, i))),
     },
     ScenarioSpec {
@@ -267,7 +327,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Codex,
         runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
         requirements: Requirements::run(),
-        launch: codex::fresh_text_launch,
+        launch: ScenarioLaunch::Run(codex::fresh_text_request),
+        fence: no_fence,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::fresh_text(s, i))),
     },
     ScenarioSpec {
@@ -276,7 +337,11 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Codex,
         runtime_mode: Some(RuntimeMode::ApprovalRequired),
         requirements: Requirements::run(),
-        launch: codex::approval_launch,
+        launch: ScenarioLaunch::Run(codex::approval_request),
+        // Points at `codex_fence` explicitly — D79. This row's `runtime_mode` happens to be
+        // `ApprovalRequired`, but that is no longer why it gets the trusted-PowerShell fence:
+        // the fence is this row's own declared choice, not something re-derived from the mode.
+        fence: super::codex_fence,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::approval(s, i))),
     },
     ScenarioSpec {
@@ -292,7 +357,11 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
             needs_approval_target: true,
             ..Requirements::run()
         },
-        launch: codex::approval_on_request_launch,
+        launch: ScenarioLaunch::Run(codex::approval_on_request_request),
+        // Points at `codex_fence` explicitly — D79. `codex_fence` distinguishes this row from
+        // `approval` by `requirements.needs_approval_target`, which this row already sets below;
+        // it no longer reads `runtime_mode` at all.
+        fence: super::codex_fence,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::approval_on_request(s, i))),
     },
     ScenarioSpec {
@@ -304,7 +373,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
             needs_resume_id: true,
             ..Requirements::run()
         },
-        launch: codex::resume_launch,
+        launch: ScenarioLaunch::Run(codex::resume_request),
+        fence: no_fence,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::resume(s, i))),
     },
     ScenarioSpec {
@@ -313,7 +383,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Codex,
         runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
         requirements: Requirements::run(),
-        launch: codex::steer_launch,
+        launch: ScenarioLaunch::Run(codex::steer_request),
+        fence: no_fence,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::steer(s, i))),
     },
     ScenarioSpec {
@@ -322,7 +393,8 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         provider: Provider::Codex,
         runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
         requirements: Requirements::run(),
-        launch: codex::interruption_launch,
+        launch: ScenarioLaunch::Run(codex::interruption_request),
+        fence: no_fence,
         body: ScenarioBody::Codex(|s, i| Box::pin(codex::interruption(s, i))),
     },
 ];

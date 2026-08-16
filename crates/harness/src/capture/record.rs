@@ -12,17 +12,18 @@ mod scenarios;
 mod session;
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+use comet_proto::RunRequest;
 use provider::CaptureProvider;
 use providers::claude::ClaudeProvider;
 use providers::codex::CodexProvider;
 pub use scenarios::{Requirements, SCENARIOS, ScenarioSpec, scenario};
-use scenarios::{ScenarioBody, ScenarioInput};
+use scenarios::{ScenarioBody, ScenarioInput, ScenarioLaunch};
 use session::{FenceOutcome, Session};
 
-use crate::capture::types::{CaptureConfig, PartialFailureClass, Provider, RawCapture};
+use crate::capture::types::{CaptureConfig, PartialFailureClass, RawCapture};
 use crate::launch::LaunchDescriptor;
 
 /// Record one explicitly selected provider scenario into ignored raw
@@ -50,36 +51,48 @@ pub async fn record(config: CaptureConfig) -> anyhow::Result<RawCapture> {
     }
 }
 
+/// Resolve the executable, derive the launch, build the fence, and dispatch into
+/// `record_generic` — the whole of what `record_claude`/`record_codex` used to duplicate before
+/// `launch`, `request` and `fence` all moved onto the row (Tasks 1 and 4). What's left differing
+/// between the two providers is exactly the resolver named in `AGENTS.md`'s "What the providers
+/// send": the default-executable lookup and `run_launch`, both plain per-provider `fn` values —
+/// passed in here rather than added to `CaptureProvider` as a fifth member. That trait's own doc
+/// comment (`provider.rs`) is explicit that a fifth member is earned by a third provider having
+/// a *recording* to design against, not added ahead of one; neither of these varies per scenario
+/// the way `launch`/`fence` do (the reason those two live on the row and not the trait), so a
+/// plain parameter is the version that doesn't anticipate anything.
+async fn record_provider<P: CaptureProvider>(
+    provider: P,
+    config: &CaptureConfig,
+    spec: &ScenarioSpec,
+    input: ScenarioInput,
+    body: ScenarioBodyFn<P>,
+    default_executable: fn() -> Option<PathBuf>,
+    run_launch: fn(&Path, &RunRequest) -> LaunchDescriptor,
+) -> anyhow::Result<RawCapture> {
+    let executable = session::resolve_executable(
+        P::provider(),
+        config.executable.clone().or_else(default_executable),
+    )?;
+    let (launch, request) = derive_launch(&spec.launch, &input, &executable, run_launch)?;
+    let fence = (spec.fence)(spec, config, &launch)?;
+    record_generic(provider, config, launch, input, body, fence, request).await
+}
+
 async fn record_claude(
     config: &CaptureConfig,
     spec: &ScenarioSpec,
     input: ScenarioInput,
     body: ScenarioBodyFn<ClaudeProvider>,
 ) -> anyhow::Result<RawCapture> {
-    let executable = session::resolve_executable(
-        Provider::Claude,
-        config
-            .executable
-            .clone()
-            .or_else(crate::claude::resolve_claude_executable),
-    )?;
-    let launch = (spec.launch)(&input, &executable)?;
-    // Claude has no pre-spawn fence: nothing here validates an environment
-    // before spawn the way `codex_fence` below does for Codex. Claude's
-    // `approval` DOES grant a filesystem write — a Bash command or a Write
-    // into cwd — so it is protected the same way Task 6 protects Codex's
-    // grant-time rechecks: `record/scenarios/claude.rs`'s `approval` body
-    // recomputes a marker-shape check (`claude_marker_grant`) immediately
-    // before answering each request, and DECLINES — without aborting the
-    // capture — anything that does not match. See that function's own doc
-    // comment.
-    record_generic(
+    record_provider(
         ClaudeProvider,
         config,
-        launch,
+        spec,
         input,
         body,
-        FenceOutcome::none(),
+        crate::claude::resolve_claude_executable,
+        crate::claude::run_launch,
     )
     .await
 }
@@ -90,21 +103,57 @@ async fn record_codex(
     input: ScenarioInput,
     body: ScenarioBodyFn<CodexProvider>,
 ) -> anyhow::Result<RawCapture> {
-    let executable = session::resolve_executable(
-        Provider::Codex,
-        config
-            .executable
-            .clone()
-            .or_else(crate::codex::resolve_codex_executable),
-    )?;
-    let launch = (spec.launch)(&input, &executable)?;
-    let fence = codex_fence(spec, config, &launch)?;
-    record_generic(CodexProvider::new(), config, launch, input, body, fence).await
+    record_provider(
+        CodexProvider::new(),
+        config,
+        spec,
+        input,
+        body,
+        crate::codex::resolve_codex_executable,
+        crate::codex::run_launch,
+    )
+    .await
 }
 
-/// Builds the pre-spawn fence for the two Codex scenarios that need one.
-/// Every other scenario (every Claude row, and every Codex row but
-/// `approval`/`approval-on-request`) gets [`FenceOutcome::none`].
+/// The only call site for a row's `ScenarioLaunch::Run` builder IN PRODUCTION CODE — this test
+/// module's `every_row_s_builder_and_fence_match_its_declared_wiring` also calls a row's builder
+/// through `spec.launch`, deliberately, as half of checking the row is wired to the right one.
+/// Builds the `RunRequest` once, derives the launch from it through the
+/// provider's own `run_launch`, and returns the same `RunRequest` so the caller can hand it
+/// to `Session::request` — the recorder never calls a run builder a second
+/// time to build a scenario's wire line. A discovery row has no `RunRequest`
+/// at all, so its half of the match returns `None`. See `ScenarioLaunch`'s
+/// own doc comment (`scenarios.rs`) for the hazard this closes.
+fn derive_launch(
+    launch: &ScenarioLaunch,
+    input: &ScenarioInput,
+    executable: &Path,
+    run_launch: fn(&Path, &RunRequest) -> LaunchDescriptor,
+) -> anyhow::Result<(LaunchDescriptor, Option<RunRequest>)> {
+    match launch {
+        ScenarioLaunch::Discovery(build_launch) => Ok((build_launch(input, executable)?, None)),
+        ScenarioLaunch::Run(build_request) => {
+            let request = build_request(input)?;
+            let launch = run_launch(executable, &request);
+            Ok((launch, Some(request)))
+        }
+    }
+}
+
+/// Builds the pre-spawn fence for the two Codex scenarios that name it —
+/// `record/scenarios.rs`'s `approval` and `approval-on-request` rows point
+/// their own `fence` field at this function directly. D79: this used to be
+/// reached unconditionally for every Codex row, picking this branch by
+/// testing `spec.runtime_mode == Some(RuntimeMode::ApprovalRequired)` —
+/// which meant a *future* Codex row that legitimately wanted
+/// `ApprovalRequired` for an unrelated reason would have silently inherited
+/// the Windows-only trusted-PowerShell fence below (see
+/// `resolve_trusted_powershell`'s own doc comment for why that fails closed
+/// elsewhere rather than spawning unprotected). Now that every row must name
+/// its own fence — [`scenarios::no_fence`] is the default — reaching this
+/// function at all is itself the declaration; the `needs_approval_target`
+/// check below only chooses between this function's own two fences, not
+/// whether a fence runs at all.
 ///
 /// This is the pre-spawn fence decision #6 in the stage plan requires stay —
 /// `crate::capture::safety`'s checks ran inside `recording.rs`'s
@@ -159,24 +208,20 @@ fn codex_fence(
         });
     }
 
-    if spec.runtime_mode == Some(comet_proto::RuntimeMode::ApprovalRequired) {
-        // `approval`: a trusted, protected-root PowerShell (Windows only —
-        // fails closed elsewhere, see `resolve_trusted_powershell`'s own
-        // doc comment) and a cwd whose identity `record::scenarios::codex::approval`
-        // rechecks at every grant, via `approval_cwd_identity` below.
-        let cwd = launch_cwd()?;
-        let trusted = crate::capture::safety::resolve_trusted_powershell(&cwd, &config.raw_root)?;
-        let identity = crate::capture::safety::validate_ordinary_approval_cwd(&cwd, None, true)?;
-        return Ok(FenceOutcome {
-            approval_target: None,
-            approval_target_identity: None,
-            approval_cwd_identity: Some(identity),
-            trusted_powershell: Some(trusted),
-            recheck: None,
-        });
-    }
-
-    Ok(FenceOutcome::none())
+    // `approval`: a trusted, protected-root PowerShell (Windows only — fails
+    // closed elsewhere, see `resolve_trusted_powershell`'s own doc comment)
+    // and a cwd whose identity `record::scenarios::codex::approval` rechecks
+    // at every grant, via `approval_cwd_identity` below.
+    let cwd = launch_cwd()?;
+    let trusted = crate::capture::safety::resolve_trusted_powershell(&cwd, &config.raw_root)?;
+    let identity = crate::capture::safety::validate_ordinary_approval_cwd(&cwd, None, true)?;
+    Ok(FenceOutcome {
+        approval_target: None,
+        approval_target_identity: None,
+        approval_cwd_identity: Some(identity),
+        trusted_powershell: Some(trusted),
+        recheck: None,
+    })
 }
 
 /// A scenario body: given a freshly spawned session, drive it (handshaking
@@ -218,8 +263,9 @@ async fn record_generic<P: CaptureProvider>(
     input: ScenarioInput,
     body: ScenarioBodyFn<P>,
     fence: FenceOutcome,
+    request: Option<RunRequest>,
 ) -> anyhow::Result<RawCapture> {
-    let mut session = Session::start(provider, config, launch, fence).await?;
+    let mut session = Session::start(provider, config, launch, fence, request).await?;
     let deadline = tokio::time::Instant::now() + session.timeout;
     let outcome = tokio::time::timeout_at(deadline, body(&mut session, &input)).await;
     match outcome {
@@ -253,7 +299,7 @@ mod tests {
 
     use super::*;
     use crate::capture::test_support::{absolute_program, channel_payloads, config, fixture_path};
-    use crate::capture::types::{Channel, CommandSnapshot};
+    use crate::capture::types::{Channel, CommandSnapshot, Provider};
     use crate::launch::StdioMode;
 
     #[test]
@@ -692,7 +738,8 @@ mod tests {
             ..ScenarioInput::default()
         };
         let executable = fixture_path("fake-codex");
-        let launch = (spec.launch)(&input, &executable).unwrap();
+        let (launch, _request) =
+            derive_launch(&spec.launch, &input, &executable, crate::codex::run_launch).unwrap();
 
         let fence = codex_fence(spec, &cfg, &launch).unwrap();
         let recheck = fence
@@ -745,7 +792,8 @@ mod tests {
             ..ScenarioInput::default()
         };
         let executable = fixture_path("fake-codex");
-        let launch = (spec.launch)(&input, &executable).unwrap();
+        let (launch, _request) =
+            derive_launch(&spec.launch, &input, &executable, crate::codex::run_launch).unwrap();
 
         let fence = codex_fence(spec, &cfg, &launch).unwrap();
 
@@ -773,7 +821,8 @@ mod tests {
             ..ScenarioInput::default()
         };
         let executable = fixture_path("fake-codex");
-        let launch = (spec.launch)(&input, &executable).unwrap();
+        let (launch, _request) =
+            derive_launch(&spec.launch, &input, &executable, crate::codex::run_launch).unwrap();
 
         let fence = codex_fence(spec, &cfg, &launch).unwrap();
 
@@ -781,6 +830,493 @@ mod tests {
             fence.approval_cwd_identity.is_some(),
             "approval's fence must record an expected cwd identity for the grant-time recheck \
              to compare against"
+        );
+    }
+
+    /// The hazard `ScenarioLaunch`/`derive_launch` exist to close: before this
+    /// task, a run scenario's launch and its wire line both came from calling
+    /// the same `*_request` builder, independently, from two different
+    /// places — the `*_launch` wrapper (to build the argv
+    /// `record_claude`/`record_codex` spawns) and the scenario body (to build
+    /// the wire line the body sends). Nothing enforced the two calls returned
+    /// the same value; only every real builder happening to be a pure
+    /// function of `input` did.
+    ///
+    /// `counting_request` is deliberately NOT pure (a call counter folded
+    /// into both `model` and `prompt`), so it turns that assumption into an
+    /// observable fact: `record_claude` reaches it through exactly one path
+    /// now — `derive_launch`, called once, whose `RunRequest` is used for
+    /// BOTH the launch and (via `Session::request`) `hazard_body`'s wire
+    /// line — so the recorded argv (`--model call-N`) and the recorded wire
+    /// line (`call-N`) must name the same call. Before this task, with a
+    /// `*_launch` wrapper calling the builder once and the body calling it a
+    /// second, independent time, this same assertion failed (`--model
+    /// call-0` vs `call-1`) — see the task report for the quoted failure.
+    #[tokio::test]
+    async fn scenario_launch_and_body_must_share_one_request_builder_call() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        fn counting_request(input: &ScenarioInput) -> anyhow::Result<comet_proto::RunRequest> {
+            let call = CALLS.fetch_add(1, Ordering::SeqCst);
+            let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
+            Ok(comet_proto::RunRequest {
+                prompt: format!("scenario:capture-fresh call-{call}"),
+                model: Some(format!("call-{call}")),
+                cwd: cwd.display().to_string(),
+                ..comet_proto::RunRequest::for_session(comet_proto::RuntimeMode::AutoAcceptEdits)
+            })
+        }
+        fn hazard_body<'a>(
+            session: &'a mut Session<ClaudeProvider>,
+            _input: &'a ScenarioInput,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>> {
+            Box::pin(async move {
+                let request = session
+                    .request
+                    .clone()
+                    .expect("a Run scenario always carries a request");
+                let line = crate::claude::wire::user_message_line_with_images(&request.prompt, &[]);
+                session.send(&line).await?;
+                session.wait_for_turn_end().await
+            })
+        }
+
+        CALLS.store(0, Ordering::SeqCst);
+        let raw = tempfile::tempdir().unwrap();
+        let executable = fixture_path("fake-claude");
+        let spec = ScenarioSpec {
+            name: "test-only-request-builder-hazard",
+            purpose: "test-only: prove the recorder cannot call a Run builder twice",
+            provider: Provider::Claude,
+            runtime_mode: Some(comet_proto::RuntimeMode::AutoAcceptEdits),
+            requirements: Requirements::run(),
+            launch: ScenarioLaunch::Run(counting_request),
+            fence: scenarios::no_fence,
+            body: ScenarioBody::Claude(hazard_body),
+        };
+        let cfg = config(
+            "test-only-request-builder-hazard",
+            executable,
+            "claude",
+            raw.path(),
+        );
+        let input = ScenarioInput::default();
+
+        let capture = record_claude(&cfg, &spec, input, hazard_body)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "the recorder must call a Run scenario's request builder exactly once per recording"
+        );
+        let model_index = capture
+            .command
+            .args
+            .iter()
+            .position(|arg| arg == "--model")
+            .and_then(|position| capture.command.args.get(position + 1))
+            .and_then(|value| value.strip_prefix("call-"))
+            .expect("--model call-N recorded in argv");
+        let stdin = channel_payloads(&capture, Channel::Stdin);
+        let wire: serde_json::Value = serde_json::from_str(stdin[0]).unwrap();
+        let wire_prompt = wire["message"]["content"].as_str().unwrap();
+        let wire_index = wire_prompt
+            .strip_prefix("scenario:capture-fresh call-")
+            .expect("wire line carries the counted prompt");
+
+        assert_eq!(
+            model_index, wire_index,
+            "the recorded argv (--model call-{model_index}) and the recorded wire line \
+             (call-{wire_index}) must describe the same request, not two independent builder \
+             calls: {stdin:?}"
+        );
+    }
+
+    /// Task 2's twelve-row purity/wiring loop and D79's twenty-row fence loop, merged into one
+    /// loop over every row in `SCENARIOS` against one `(provider, name) → (builder, fence)`
+    /// table. A whole-branch review flagged the two as one 20-row roster enumerated across two
+    /// separate tables with two separate coverage guards; this is that merge — same coverage, one
+    /// table and one guard instead of two.
+    ///
+    /// What the merged table replaces:
+    /// - the twelve per-row `*_row_is_wired_to_*_request` tests (six in
+    ///   `record/scenarios/claude.rs`: `fresh_text_row_is_wired_to_fresh_text_request`,
+    ///   `resume_row_is_wired_to_resume_request`, `attachment_row_is_wired_to_attachment_request`,
+    ///   `checklist_row_is_wired_to_checklist_request`,
+    ///   `checklist_resume_row_is_wired_to_checklist_resume_request`,
+    ///   `approval_row_is_wired_to_approval_request`; six in `record/scenarios/codex.rs`:
+    ///   `fresh_text_row_is_wired_to_fresh_text_request`, `resume_row_is_wired_to_resume_request`,
+    ///   `steer_row_is_wired_to_steer_request`, `interruption_row_is_wired_to_interruption_request`,
+    ///   `approval_row_is_wired_to_approval_request`,
+    ///   `approval_on_request_row_is_wired_to_approval_on_request_request`), each of which
+    ///   compared `build_request(&input)` via `spec.launch` against the same-named builder called
+    ///   directly;
+    /// - D79's own recorded residual (`docs/debt/closed.md`): Task 4 moved fence selection onto
+    ///   each row (`scenarios::no_fence` for eighteen rows, `codex_fence` for the two Codex
+    ///   approval rows), but nothing checked a row's `fence` field against what it SHOULD be.
+    ///   D79's entry names the fix by its future name directly: "a future `EXPECTED_FENCES`-style
+    ///   table, mirroring the existing `EXPECTED_RUN_BUILDERS` one, would close it the same way" —
+    ///   this loop is that table, merged with the run-builder one rather than kept beside it.
+    ///
+    /// What this loop checks, per row:
+    /// - **purity** (`Run` rows only): `build_request` is called twice (`first`/`second` below)
+    ///   and must agree.
+    /// - **run-builder wiring** (`Run` rows only): `first` is also compared against
+    ///   `EXPECTED_ROWS`' entry for this row — the builder that row is supposed to name, looked up
+    ///   by `(provider, name)` rather than through `spec.launch` a second time. A row repointed at
+    ///   another row's builder disagrees with the table and fails, naming the row.
+    /// - **fence wiring** (every row): `spec.fence` is fingerprinted (see below) and compared
+    ///   against `EXPECTED_ROWS`' `FenceKind` entry for this row.
+    /// - **Run/Discovery agreement** (every row): `EXPECTED_ROWS`' builder field must be `Some`
+    ///   exactly when the row is `ScenarioLaunch::Run` and `None` exactly when it is
+    ///   `ScenarioLaunch::Discovery` — a row flipped from one to the other without updating the
+    ///   table fails this directly, naming the row, instead of silently dropping out of a loop
+    ///   built only for one kind.
+    /// - **coverage** (both directions, after the loop): `EXPECTED_ROWS` must list every row in
+    ///   `SCENARIOS` exactly once. A row with no table entry panics inside the loop, naming the
+    ///   row; a stale table entry with no matching row fails the `covered == expected` set
+    ///   comparison.
+    ///
+    /// It also keeps a property the twelve never had: `ScenarioInput` is derived from
+    /// `spec.requirements` here rather than hardcoded per row, so a row whose
+    /// `needs_resume_id`/`needs_attachment`/`needs_approval_target` flag disagrees with what its
+    /// own builder demands now fails here too (e.g. clearing `needs_resume_id` on a resume row
+    /// makes its builder return a "needs a --resume-id" error and the loop panics).
+    ///
+    /// The fence fingerprint: comparing `spec.fence` by function-pointer identity
+    /// (`std::ptr::fn_addr_eq`) was considered and rejected — two distinct `fn` items are not
+    /// guaranteed to have distinct addresses across codegen units, so that comparison can pass
+    /// while comparing nothing. Instead this fingerprints a row's fence by an OBSERVABLE property
+    /// the two real fences differ on unconditionally: `codex_fence`'s very first statement in BOTH
+    /// of its branches (above, this file) is `let cwd = launch_cwd()?;`, which fails with
+    /// "requires a resolved working directory" whenever `launch.cwd` is `None` — before it reads
+    /// `spec.requirements`, `config`, or the filesystem at all. `no_fence` ignores every argument
+    /// and always returns `Ok`. Calling a row's fence with a `cwd: None` launch therefore
+    /// distinguishes the two kinds deterministically, without any of the real filesystem state (a
+    /// trusted PowerShell, an approval target, a cwd identity) `codex_fence`'s ordinary path needs
+    /// — which is what keeps this portable to the Linux CI this workspace runs on, where
+    /// `resolve_trusted_powershell` fails closed regardless of input (see its own doc comment).
+    ///
+    /// Break caught, on any of these hazards:
+    /// - **non-purity**: `build_request(&input)` called twice returns two different `RunRequest`s.
+    ///   This only catches impurity that varies between two adjacent calls in the same process —
+    ///   a counter, a fine clock. The impurity this codebase actually has —
+    ///   `normalize_run_request` reading `.git` state, named on `cheap_codex_request`'s own doc —
+    ///   returns the same value on both calls whenever the filesystem is stable during the test,
+    ///   which is always, so this assertion cannot catch it. What makes that impurity harmless is
+    ///   the single-call architecture itself (see this file's own
+    ///   `scenario_launch_and_body_must_share_one_request_builder_call`), not this loop; the
+    ///   corpus pin (`every_scenario_launch_matches_its_committed_corpus_manifest`) is what would
+    ///   catch machine-stable argv drift. This assertion stays cheap and still catches the
+    ///   call-to-call non-determinism class, so it is kept.
+    /// - **run-builder mis-wiring**: `spec.launch` names a different row's builder — `first`
+    ///   disagrees with `EXPECTED_ROWS`' entry for this row's `(provider, name)`.
+    /// - **fence mis-wiring**: pointing a non-approval Codex row (e.g. `steer`) at `codex_fence` —
+    ///   the exact mis-wiring D79's residual named as uncaught — makes that row's fingerprint
+    ///   `CodexApproval` while `EXPECTED_ROWS` still says `None`, and this test fails naming the
+    ///   row.
+    /// - **a row silently changing kind**: a `Run` row flipped to `Discovery` (or the reverse)
+    ///   without updating the table — caught directly by the Run/Discovery agreement check.
+    /// - **a row silently leaving the loop entirely**: renamed without a matching table entry, or
+    ///   a stale table entry with no matching row — caught by the `covered == expected` count
+    ///   check.
+    ///
+    /// One assertion this test does NOT independently prove: `derive_launch` — the actual, only
+    /// production call site — is checked against `run_launch(exe, &first)`, where `run_launch` is
+    /// chosen here by `spec.provider` (not by `spec.body`, which is what production actually
+    /// dispatches on). That the two choices agree is pinned by a different test,
+    /// `every_row_s_declared_provider_matches_its_body_variant` (`scenarios.rs`), not this
+    /// one. And because `derive_launch`'s `Run` arm is exactly `run_launch(executable,
+    /// &build_request(input)?)`, this assertion is a change-detector over that one function's
+    /// three-line body rather than an independent oracle — it still catches an edit that drops
+    /// the executable/request pairing or otherwise changes what that arm returns, just not a
+    /// provider mis-dispatch (that hazard belongs to the test named above).
+    #[test]
+    fn every_row_s_builder_and_fence_match_its_declared_wiring() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum FenceKind {
+            None,
+            CodexApproval,
+        }
+
+        // The `(provider, name) → (builder, fence)` table the twelve-plus-twenty rows across the
+        // old two tables implicitly encoded. Kept exhaustive by the `covered == expected` check
+        // below: a row missing here — or a stale entry with no matching row — fails that
+        // assertion instead of the gap going unnoticed.
+        type RunBuilder = fn(&ScenarioInput) -> anyhow::Result<RunRequest>;
+        const EXPECTED_ROWS: &[(Provider, &str, Option<RunBuilder>, FenceKind)] = &[
+            (Provider::Claude, "model-discovery", None, FenceKind::None),
+            (
+                Provider::Claude,
+                "model-discovery-neutral-cwd",
+                None,
+                FenceKind::None,
+            ),
+            (
+                Provider::Claude,
+                "model-discovery-project-cwd",
+                None,
+                FenceKind::None,
+            ),
+            (Provider::Claude, "command-discovery", None, FenceKind::None),
+            (
+                Provider::Claude,
+                "fresh-text",
+                Some(scenarios::claude::fresh_text_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Claude,
+                "approval",
+                Some(scenarios::claude::approval_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Claude,
+                "resume",
+                Some(scenarios::claude::resume_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Claude,
+                "attachment",
+                Some(scenarios::claude::attachment_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Claude,
+                "checklist",
+                Some(scenarios::claude::checklist_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Claude,
+                "checklist-resume",
+                Some(scenarios::claude::checklist_resume_request),
+                FenceKind::None,
+            ),
+            (Provider::Codex, "model-discovery", None, FenceKind::None),
+            (
+                Provider::Codex,
+                "model-discovery-neutral-cwd",
+                None,
+                FenceKind::None,
+            ),
+            (
+                Provider::Codex,
+                "model-discovery-project-cwd",
+                None,
+                FenceKind::None,
+            ),
+            (
+                Provider::Codex,
+                "model-discovery-logged-out",
+                None,
+                FenceKind::None,
+            ),
+            (
+                Provider::Codex,
+                "fresh-text",
+                Some(scenarios::codex::fresh_text_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Codex,
+                "approval",
+                Some(scenarios::codex::approval_request),
+                FenceKind::CodexApproval,
+            ),
+            (
+                Provider::Codex,
+                "approval-on-request",
+                Some(scenarios::codex::approval_on_request_request),
+                FenceKind::CodexApproval,
+            ),
+            (
+                Provider::Codex,
+                "resume",
+                Some(scenarios::codex::resume_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Codex,
+                "steer",
+                Some(scenarios::codex::steer_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Codex,
+                "interruption",
+                Some(scenarios::codex::interruption_request),
+                FenceKind::None,
+            ),
+        ];
+
+        let raw = tempfile::tempdir().unwrap();
+        let mut covered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        for spec in SCENARIOS {
+            covered.insert(format!("{:?}/{}", spec.provider, spec.name));
+            let (_, _, expected_builder, expected_fence) = EXPECTED_ROWS
+                .iter()
+                .find(|(provider, name, _, _)| *provider == spec.provider && *name == spec.name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{:?}/{}: no entry in EXPECTED_ROWS — add one so this row's wiring is \
+                         checked",
+                        spec.provider, spec.name
+                    )
+                });
+
+            // Fence wiring — every row, discovery and run alike.
+            let provider_str = match spec.provider {
+                Provider::Claude => "claude",
+                Provider::Codex => "codex",
+            };
+            let cfg = config(
+                spec.name,
+                PathBuf::from("provider"),
+                provider_str,
+                raw.path(),
+            );
+            let launch = LaunchDescriptor {
+                program: Path::new("provider").into(),
+                args: Vec::new(),
+                cwd: None,
+                configured_env: Default::default(),
+                stdin: StdioMode::Piped,
+                stdout: StdioMode::Piped,
+                stderr: StdioMode::Piped,
+                kill_on_drop: true,
+                #[cfg(windows)]
+                creation_flags: 0,
+            };
+            let actual_fence = match (spec.fence)(spec, &cfg, &launch) {
+                Ok(_) => FenceKind::None,
+                Err(error) => {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("requires a resolved working directory"),
+                        "{:?}/{}: fence errored on a cwd-less launch with a message that isn't \
+                         codex_fence's own — got {error}",
+                        spec.provider,
+                        spec.name
+                    );
+                    FenceKind::CodexApproval
+                }
+            };
+            assert_eq!(
+                actual_fence, *expected_fence,
+                "{:?}/{}: fence kind mismatch — the row is wired to a different fence than \
+                 EXPECTED_ROWS says it should be",
+                spec.provider, spec.name
+            );
+
+            // Run-builder wiring and Run/Discovery agreement.
+            match (spec.launch, expected_builder) {
+                (ScenarioLaunch::Discovery(_), None) => continue,
+                (ScenarioLaunch::Discovery(_), Some(_)) => panic!(
+                    "{:?}/{}: EXPECTED_ROWS names a builder for this row but it is a Discovery \
+                     row — the row was flipped from Run without updating the table",
+                    spec.provider, spec.name
+                ),
+                (ScenarioLaunch::Run(_), None) => panic!(
+                    "{:?}/{}: this is a Run row but EXPECTED_ROWS names no builder for it — the \
+                     row was flipped from Discovery without updating the table",
+                    spec.provider, spec.name
+                ),
+                (ScenarioLaunch::Run(build_request), Some(expected_builder)) => {
+                    let input = ScenarioInput {
+                        resume_id: spec
+                            .requirements
+                            .needs_resume_id
+                            .then(|| "purity-loop-resume-id".to_owned()),
+                        attachment: spec
+                            .requirements
+                            .needs_attachment
+                            .then(|| PathBuf::from("tiny.png")),
+                        approval_target: spec
+                            .requirements
+                            .needs_approval_target
+                            .then(|| PathBuf::from("target-dir")),
+                        ..ScenarioInput::default()
+                    };
+
+                    let first = build_request(&input).unwrap_or_else(|err| {
+                        panic!(
+                            "{:?}/{}: first request-builder call failed: {err}",
+                            spec.provider, spec.name
+                        )
+                    });
+                    let second = build_request(&input).unwrap_or_else(|err| {
+                        panic!(
+                            "{:?}/{}: second request-builder call failed: {err}",
+                            spec.provider, spec.name
+                        )
+                    });
+                    assert_eq!(
+                        first, second,
+                        "{:?}/{}: calling the row's request builder twice with the same input \
+                         produced two different RunRequests — the builder is not pure",
+                        spec.provider, spec.name
+                    );
+
+                    let expected_request = expected_builder(&input).unwrap_or_else(|err| {
+                        panic!(
+                            "{:?}/{}: EXPECTED_ROWS' builder failed: {err}",
+                            spec.provider, spec.name
+                        )
+                    });
+                    assert_eq!(
+                        first, expected_request,
+                        "{:?}/{}: spec.launch's builder does not match the builder \
+                         EXPECTED_ROWS says this row should name — the row is wired to the \
+                         wrong builder",
+                        spec.provider, spec.name
+                    );
+
+                    let (exe, run_launch): (PathBuf, fn(&Path, &RunRequest) -> LaunchDescriptor) =
+                        match spec.provider {
+                            Provider::Claude => {
+                                (absolute_program("claude"), crate::claude::run_launch)
+                            }
+                            Provider::Codex => {
+                                (absolute_program("codex"), crate::codex::run_launch)
+                            }
+                        };
+                    let (derived, _request) = derive_launch(&spec.launch, &input, &exe, run_launch)
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "{:?}/{}: derive_launch failed: {err}",
+                                spec.provider, spec.name
+                            )
+                        });
+                    let expected = run_launch(&exe, &first);
+                    assert_eq!(
+                        CommandSnapshot::from_launch(&derived),
+                        CommandSnapshot::from_launch(&expected),
+                        "{:?}/{}: the launch record.rs's own derive_launch produced does not \
+                         match run_launch(exe, &first) — the row's launch and its request have \
+                         drifted apart",
+                        spec.provider,
+                        spec.name
+                    );
+                }
+            }
+        }
+
+        let expected: std::collections::BTreeSet<String> = EXPECTED_ROWS
+            .iter()
+            .map(|(provider, name, _, _)| format!("{provider:?}/{name}"))
+            .collect();
+        assert_eq!(
+            covered, expected,
+            "every row in SCENARIOS must have exactly one entry in EXPECTED_ROWS, and vice versa \
+             — a row missing here would otherwise leave the loop in silence"
         );
     }
 
@@ -797,5 +1333,294 @@ mod tests {
             "expected exactly one raw capture directory"
         );
         entries.remove(0)
+    }
+
+    /// Task 3 (`2026-08-16-scenario-request-builders.md`): the purity/wiring checks in the loop
+    /// above (`every_row_s_builder_and_fence_match_its_declared_wiring`) prove a row's builder is
+    /// pure and that `derive_launch` faithfully turns its `RunRequest` into a launch — but every
+    /// oracle in that test is itself derived from the SAME source code this
+    /// task exists to check. This test compares against something none of that code can
+    /// influence: the committed capture archive, frozen before this branch existed (`git diff
+    /// 7d4e903..HEAD -- crates/harness/tests/corpus/` is empty) and explicitly protected by the
+    /// plan's own constraints ("No byte under `crates/harness/tests/corpus/` changes").
+    ///
+    /// Not every row has evidence. Three Codex rows — `approval`, `approval-on-request`,
+    /// `interruption` — have never been captured (their own exemption on `test/stage-6-integration`'s
+    /// `capture_corpus/scenario_coverage.rs`, not present on this branch; verified independently
+    /// here by walking the corpus). `claude/2.1.229/subagent` is a hand-sanitized exploratory
+    /// capture with no matching `SCENARIOS` row (see its own `README.md`) and is never looked up,
+    /// since lookup is driven by row name, not by directory listing.
+    ///
+    /// Comparison is STRUCTURAL, not byte-for-byte — the archive redacts `cwd`, `program`, and
+    /// any resume/session id embedded in argv (`docs/testing/provider-captures.md`):
+    /// - `args`: compared for exact equality after normalizing a `--resume=<id>` token on BOTH
+    ///   sides to `--resume=<REDACTED>` — the only value-bearing argv token any scenario here
+    ///   produces. Every other token — every flag, and every other value (model id, effort,
+    ///   permission-mode, `--bare`) — is real, unredacted, and compared literally; the archive
+    ///   does not redact those.
+    /// - `cwd`: presence only (`Some` vs `Some`, `None` vs `None`) — the archive redacts the
+    ///   value itself to `<CWD>`.
+    /// - `program`: compared by final path component with any `.exe` suffix stripped (via
+    ///   `program_stem`, below) — the archive redacts everything BEFORE the binary name
+    ///   (`<HOME>\...\claude.exe`), but keeps the name itself, so `claude` vs `codex` is a real
+    ///   assertion, not a no-op. A bare `is_empty()` check on both sides used to stand in here
+    ///   and could never fail for any production change — the derived side is always
+    ///   `current_dir().join("claude"|"codex")`, never empty.
+    /// - `configured_env`: key set only — a set value (`CODEX_HOME`) redacts to `<CODEX_HOME>`.
+    /// - `stdin`/`stdout`/`stderr`/`kill_on_drop`/`creation_flags` (Windows only): exact
+    ///   equality — none of these carry machine- or session-specific data, and `creation_flags`
+    ///   is a compile-time constant per launch function (`0x0800_0000` for every discovery
+    ///   launch, `0` for every run launch), not something spawn-time state could vary.
+    #[test]
+    fn every_scenario_launch_matches_its_committed_corpus_manifest() {
+        const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[
+            (Provider::Codex, "approval"),
+            (Provider::Codex, "approval-on-request"),
+            (Provider::Codex, "interruption"),
+        ];
+
+        let root = crate::capture::corpus_root();
+        let promoted = crate::capture::promoted_scenarios(&root)
+            .unwrap_or_else(|error| panic!("{} could not be walked: {error}", root.display()));
+
+        let mut failures = Vec::new();
+        let mut unevidenced: Vec<String> = Vec::new();
+
+        for spec in SCENARIOS {
+            let provider_str = match spec.provider {
+                Provider::Claude => "claude",
+                Provider::Codex => "codex",
+            };
+            let label = format!("{provider_str}/{}", spec.name);
+
+            // EVERY corpus directory this scenario has, across every version — not just the
+            // first `.find()` turns up. Versions sort ascending (`promoted_scenarios`'s own doc
+            // comment), so a `.find()` here always binds to the OLDEST version's manifest,
+            // silently ignoring any newer one — harmless today (no scenario exists under two
+            // versions yet) but not once a live re-capture promotes a second version of an
+            // existing scenario: a freshly captured `claude/2.1.233/fresh-text` would sit right
+            // beside `2.1.228/fresh-text` unchecked, and this test would keep passing against
+            // the superseded evidence. The launch under test is version-independent — built from
+            // the same production code regardless of which CLI version produced the corpus
+            // evidence — so every version's manifest is a valid oracle, and checking all of them
+            // is strictly stronger than checking one.
+            let scenario_dirs: Vec<&crate::capture::PromotedScenario> = promoted
+                .iter()
+                .filter(|scenario| {
+                    scenario.provider == provider_str
+                        && scenario
+                            .directory
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            == Some(spec.name)
+                })
+                .collect();
+
+            if scenario_dirs.is_empty() {
+                if EXEMPT_UNCAPTURED.contains(&(spec.provider, spec.name)) {
+                    unevidenced.push(label);
+                } else {
+                    failures.push(format!(
+                        "{label}: no corpus evidence anywhere under {}, and no exemption in \
+                         EXEMPT_UNCAPTURED",
+                        root.display()
+                    ));
+                }
+                continue;
+            }
+
+            // `cwd` only needs to be present (comparison is presence-only, see this test's own
+            // doc comment); the two neutral-cwd discovery rows ignore it entirely in production
+            // and always spawn from a temp directory regardless, so `Some(temp_dir())` here is
+            // behaviourally identical to leaving it `None` for them.
+            let input = ScenarioInput {
+                cwd: Some(std::env::temp_dir()),
+                resume_id: spec
+                    .requirements
+                    .needs_resume_id
+                    .then(|| "corpus-pin-resume-id".to_owned()),
+                attachment: spec
+                    .requirements
+                    .needs_attachment
+                    .then(|| PathBuf::from("tiny.png")),
+                approval_target: spec
+                    .requirements
+                    .needs_approval_target
+                    .then(|| PathBuf::from("target-dir")),
+                // Every Codex discovery row's launch builder needs a codex_home or falls back to
+                // auto-discovering one from the real environment this test happens to run in —
+                // supplying one explicitly keeps the test hermetic regardless of what's installed
+                // on the machine running it.
+                codex_home: (spec.provider == Provider::Codex && !spec.requirements.spends_tokens)
+                    .then(|| std::env::temp_dir().join("comet-corpus-pin-codex-home")),
+            };
+
+            let (exe, run_launch): (PathBuf, fn(&Path, &RunRequest) -> LaunchDescriptor) =
+                match spec.provider {
+                    Provider::Claude => (absolute_program("claude"), crate::claude::run_launch),
+                    Provider::Codex => (absolute_program("codex"), crate::codex::run_launch),
+                };
+
+            let (derived_launch, _request) = derive_launch(&spec.launch, &input, &exe, run_launch)
+                .unwrap_or_else(|error| panic!("{label}: derive_launch failed: {error}"));
+            let derived = CommandSnapshot::from_launch(&derived_launch);
+
+            for scenario_dir in &scenario_dirs {
+                let manifest_path = scenario_dir.directory.join("manifest.json");
+                let manifest: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap_or_else(
+                        |error| panic!("{} could not be read: {error}", manifest_path.display()),
+                    ))
+                    .unwrap_or_else(|error| {
+                        panic!("{} is not valid JSON: {error}", manifest_path.display())
+                    });
+                let corpus_command: CommandSnapshot =
+                    serde_json::from_value(manifest["command"].clone()).unwrap_or_else(|error| {
+                        panic!(
+                            "{} has no valid command object: {error}",
+                            manifest_path.display()
+                        )
+                    });
+
+                // Names which version disagreed, not just the row — the whole point of checking
+                // every version instead of the first is a message that says which one broke.
+                let versioned_label = format!("{label} ({})", scenario_dir.version);
+                failures.extend(compare_launch_against_corpus_manifest(
+                    &versioned_label,
+                    &derived,
+                    &corpus_command,
+                ));
+            }
+        }
+
+        let mut unevidenced_sorted = unevidenced.clone();
+        unevidenced_sorted.sort();
+        assert_eq!(
+            unevidenced_sorted,
+            vec![
+                "codex/approval",
+                "codex/approval-on-request",
+                "codex/interruption",
+            ],
+            "the exempted-uncaptured rows must be exactly these three — a row gaining or losing \
+             corpus evidence must update this assertion deliberately, not pass through silently"
+        );
+
+        assert!(
+            failures.is_empty(),
+            "{} row(s) disagree with their committed corpus manifest:\n\n{}",
+            failures.len(),
+            failures.join("\n\n")
+        );
+    }
+
+    /// The final path component of a `program`, with a trailing `.exe` stripped — `"claude"` from
+    /// both `C:\dev\comet\claude` (the derived side, built by `absolute_program`, no extension)
+    /// and `<HOME>\.local\bin\claude.exe` (the corpus side, redacted down to a directory prefix
+    /// but keeping the binary name — see this file's `docs/testing/provider-captures.md`).
+    ///
+    /// Deliberately does NOT use `std::path::Path` — the corpus string was captured on Windows
+    /// and always uses `\` regardless of which OS this test runs on, and `Path` on a non-Windows
+    /// host (this workspace's CI runs `ubuntu-24.04`) treats `\` as an ordinary character, not a
+    /// separator, so `Path::new(corpus).file_stem()` would return the whole redacted string
+    /// unsplit. Splitting on both `/` and `\` by hand keeps this correct on every host.
+    fn program_stem(raw: &str) -> String {
+        let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+        match name.rsplit_once('.') {
+            Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") => stem.to_owned(),
+            _ => name.to_owned(),
+        }
+    }
+
+    /// The archive-vs-derived comparator `every_scenario_launch_matches_its_committed_corpus_manifest`
+    /// uses for one row, returning one message per mismatched field rather than stopping at the
+    /// first — see that test's own doc comment for which fields are compared exactly and which
+    /// only for presence/shape.
+    fn compare_launch_against_corpus_manifest(
+        label: &str,
+        derived: &CommandSnapshot,
+        corpus: &CommandSnapshot,
+    ) -> Vec<String> {
+        fn normalize_argv(args: &[String]) -> Vec<String> {
+            args.iter()
+                .map(|arg| {
+                    if arg.starts_with("--resume=") {
+                        "--resume=<REDACTED>".to_owned()
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect()
+        }
+
+        let mut failures = Vec::new();
+
+        let derived_args = normalize_argv(&derived.args);
+        let corpus_args = normalize_argv(&corpus.args);
+        if derived_args != corpus_args {
+            failures.push(format!(
+                "{label}: args differ (normalized)\n    derived: {derived_args:?}\n    corpus:  {corpus_args:?}"
+            ));
+        }
+
+        if derived.cwd.is_some() != corpus.cwd.is_some() {
+            failures.push(format!(
+                "{label}: cwd presence differs — derived {:?}, corpus {:?}",
+                derived.cwd, corpus.cwd
+            ));
+        }
+        let derived_stem = program_stem(&derived.program);
+        let corpus_stem = program_stem(&corpus.program);
+        if derived_stem.is_empty() || corpus_stem.is_empty() || derived_stem != corpus_stem {
+            failures.push(format!(
+                "{label}: program stem differs — derived {:?} (stem {derived_stem:?}), corpus \
+                 {:?} (stem {corpus_stem:?})",
+                derived.program, corpus.program
+            ));
+        }
+
+        let derived_keys: std::collections::BTreeSet<&String> =
+            derived.configured_env.keys().collect();
+        let corpus_keys: std::collections::BTreeSet<&String> =
+            corpus.configured_env.keys().collect();
+        if derived_keys != corpus_keys {
+            failures.push(format!(
+                "{label}: configured_env key set differs — derived {derived_keys:?}, corpus {corpus_keys:?}"
+            ));
+        }
+
+        if derived.stdin != corpus.stdin {
+            failures.push(format!(
+                "{label}: stdin differs — derived {:?}, corpus {:?}",
+                derived.stdin, corpus.stdin
+            ));
+        }
+        if derived.stdout != corpus.stdout {
+            failures.push(format!(
+                "{label}: stdout differs — derived {:?}, corpus {:?}",
+                derived.stdout, corpus.stdout
+            ));
+        }
+        if derived.stderr != corpus.stderr {
+            failures.push(format!(
+                "{label}: stderr differs — derived {:?}, corpus {:?}",
+                derived.stderr, corpus.stderr
+            ));
+        }
+        if derived.kill_on_drop != corpus.kill_on_drop {
+            failures.push(format!(
+                "{label}: kill_on_drop differs — derived {}, corpus {}",
+                derived.kill_on_drop, corpus.kill_on_drop
+            ));
+        }
+        #[cfg(windows)]
+        if derived.creation_flags != corpus.creation_flags {
+            failures.push(format!(
+                "{label}: creation_flags differ — derived {:#x}, corpus {:#x}",
+                derived.creation_flags, corpus.creation_flags
+            ));
+        }
+
+        failures
     }
 }

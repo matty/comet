@@ -116,6 +116,86 @@ fixture is the case the guard used to bail on — a model that replies with plai
 text and calls neither `TaskCreate` nor `TaskUpdate` — and the neutral recorder
 now returns a successful capture holding every frame, evidence intact.
 
+## D79 — the Codex pre-spawn fence was derived from `runtime_mode`, not declared
+
+**The bug.** `record.rs`'s `codex_fence` ran unconditionally for every Codex
+row and picked its trusted-PowerShell/cwd-identity branch by testing
+`spec.runtime_mode == Some(RuntimeMode::ApprovalRequired)`. That is a coincidence
+standing in for a decision: the `approval` row happens to be the only row that
+both wants that fence and sets that mode, so the check worked, but nothing
+tied the two together on purpose. A future Codex row that legitimately wanted
+`ApprovalRequired` for some unrelated reason would have silently inherited the
+fence anyway. The row that filed this named the right mitigating fact —
+`resolve_trusted_powershell` fails closed on every platform but Windows, so the
+wrong inheritance would read as a scenario refusing to run, never as an
+unprotected spawn — and deferred the fix to "the next Codex row added to
+`SCENARIOS`," on the reasoning that the derivation was otherwise harmless to
+leave alone.
+
+**Closed as an exception to that deferral, not by hitting the trigger.** The
+`scenario-request-builders` plan's Task 4 closed it directly, in the same
+change that moved `launch` and `request` onto the row for the identical
+reason — deriving a spawn-time decision from a field that means something else
+is the same defect class the whole plan exists to remove, in the same file,
+so the plan's own "Decisions already made" section overrode the row's
+"convert it when the trigger fires" note on purpose. No new row was added to
+`SCENARIOS` when this landed.
+
+**The fix.** `ScenarioSpec` gained a `fence: fn(&ScenarioSpec, &CaptureConfig,
+&LaunchDescriptor) -> anyhow::Result<FenceOutcome>` field
+(`capture/record/scenarios.rs`). `no_fence` — a plain `Ok(FenceOutcome::none())`
+— is the default for every Claude row and every Codex row except two;
+`approval` and `approval-on-request` name `codex_fence` directly. `record.rs`
+no longer branches on `runtime_mode` at all: `codex_fence` still picks between
+its two fences by `spec.requirements.needs_approval_target`, but reaching the
+function in the first place is now the row's own explicit choice, not
+something inferred from a field that means "this scenario starts a turn under
+approval-required," full stop.
+
+`record_claude`/`record_codex` collapsed into one generic `record_provider`
+(same change) — with `launch`, `request` and `fence` all on the row, the two
+functions differed only in which executable-resolver and `run_launch` fn to
+pass, both plain per-provider function pointers. They were passed in as
+parameters rather than added to `CaptureProvider` as a fifth trait member:
+that trait's own doc comment (`provider.rs`) says a fifth member is earned by
+a third provider having a *recording* to design against, not added ahead of
+one, and neither value varies per scenario the way `launch`/`fence` do (the
+reason those two live on the row rather than the trait).
+
+**Residual, found by this task's falsification — closed.** Pointing a
+*non-approval* Codex row (`steer`) at `codex_fence` and running the full
+`comet-harness` suite (500 tests) found nothing that fails at the time this
+task landed. The reason: every test that reached `spec.fence` at all did so
+either by calling `record()` end-to-end for a scenario that already names the
+right fence (`approval`, `approval-on-request`, and the no-fence rows), or by
+hand-building a `Session` directly with `FenceOutcome::none()` and never
+touching `spec.fence` in the first place (`start_codex_run_session`,
+`record/scenarios/codex.rs`). No test iterated `SCENARIOS` checking each
+row's `fence` against an expected table the way the run-builder purity/wiring
+loop (then `every_run_rows_request_builder_is_pure_and_derives_its_own_launch`)
+did for `launch`. So the hazard this closed — *derivation* from an unrelated
+field — was gone, but *declaring the wrong function* on a row was still
+caught by nobody.
+
+`scenario-request-builders`'s fix pass (2026-08-16) closed it: a fourth loop,
+`every_row_s_fence_matches_the_kind_its_name_declares` (`record.rs`), checked
+every `SCENARIOS` row's `fence` against an exhaustive `(Provider, name,
+expected kind)` table — the `EXPECTED_FENCES`-style table this entry named as
+the future fix. It did not compare `spec.fence` by function-pointer identity
+(`std::ptr::fn_addr_eq` is not reliable across codegen units); it fingerprinted
+by observable behavior instead — `codex_fence`'s very first statement in both
+of its branches reads `launch.cwd`, so calling a row's fence with a `cwd:
+None` launch reliably tells `codex_fence` (errors, naming the missing cwd)
+apart from `no_fence` (always `Ok`), with no real filesystem state needed.
+Falsified by pointing `steer` at `codex_fence` — the same probe that found
+this residual — and confirming the loop failed naming the row, then
+restoring.
+
+A same-day review-fixes pass merged that fourth loop with the run-builder
+purity/wiring loop it sat beside — one `EXPECTED_ROWS` table covering both
+concerns, one coverage guard, in `every_row_s_builder_and_fence_match_its_declared_wiring`
+(`record.rs`) — rather than leaving the two as separate full-roster tables.
+Same fingerprinting mechanism, same falsification, one fewer enumeration.
 ## D86 — the sheet could not show tool-roster growth
 
 **The gap.** The `system`/`init` frame's `tools` array is redacted
