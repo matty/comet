@@ -4963,6 +4963,31 @@ mod tests {
     }
 
     #[test]
+    fn new_session_action_wires_the_target_aware_history_entry() {
+        let source = include_str!("shell.rs");
+        let production_source = source
+            .split_once("#[cfg(test)]")
+            .expect("shell test-module boundary")
+            .0;
+        let listener = production_source
+            .split_once(".on_action(cx.listener(|this, _: &NewSession")
+            .expect("NewSession action listener")
+            .1
+            .split_once(".on_action(cx.listener(|this, _: &ToggleChanges")
+            .expect("next shell action listener")
+            .0;
+
+        assert!(
+            listener.contains("new_session_nav_entry(origin, &target, &this.active_chat)"),
+            "the production listener must compute the Settings-to-Chat history entry"
+        );
+        assert!(
+            listener.contains("this.nav.push(entry)"),
+            "the production listener must record the computed history entry"
+        );
+    }
+
+    #[test]
     fn remote_connections_is_a_first_class_settings_section() {
         assert!(SettingsSection::ALL.contains(&SettingsSection::RemoteConnections));
         assert_eq!(SettingsSection::RemoteConnections.label(), "Remote");
