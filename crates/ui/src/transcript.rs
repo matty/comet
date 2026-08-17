@@ -557,6 +557,8 @@ pub enum RowKind {
         /// Image refs parsed out of the message text (message-attachments.ts):
         /// thumbnails load from the owning device via ReadAttachmentChunk.
         attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
+        /// Context the prompt folded in as text, lifted back out by `badges`.
+        badges: Arc<Vec<crate::badges::MessageBadge>>,
         /// Optimistic echo not yet confirmed by a doc frame.
         pending: bool,
     },
@@ -709,9 +711,12 @@ pub fn rows_for_entry(
         // File mentions render as chips here too, not just in the composer.
         // The projection is pure over the text, so the raw-length row version
         // below stays a valid cache/diff key.
-        let (text, mentions) = match crate::composer::sent_mention_display(&parsed.text) {
+        // Lifted before the mention projection, so a comment body's own
+        // Markdown never lands in the bubble.
+        let (body, badges) = crate::badges::split(&parsed.text);
+        let (text, mentions) = match crate::composer::sent_mention_display(&body) {
             Some((display, spans)) => (display, spans),
-            None => (parsed.text, Vec::new()),
+            None => (body, Vec::new()),
         };
         return vec![Row {
             id: entry.id.clone().into(),
@@ -721,6 +726,7 @@ pub fn rows_for_entry(
                 text: text.into(),
                 mentions: Arc::new(mentions),
                 attachments: Arc::new(parsed.attachments),
+                badges: Arc::new(badges),
                 pending,
             },
             entry_id,
@@ -2310,9 +2316,11 @@ impl Transcript {
                 text,
                 mentions,
                 attachments,
+                badges,
                 pending,
             } => {
                 let attachments = attachments.clone();
+                let badges = badges.clone();
                 let text = text.clone();
                 let mentions = mentions.clone();
                 let pending = *pending;
@@ -2322,6 +2330,26 @@ impl Transcript {
                 let mut column = div().w_full().flex().flex_col();
                 if !attachments.is_empty() {
                     column = column.child(self.render_user_attachments(&row.id, &attachments, cx));
+                }
+                if !badges.is_empty() {
+                    column = column.child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .justify_end()
+                            .items_center()
+                            .gap(px(6.0))
+                            .pb(px(6.0))
+                            .children(badges.iter().enumerate().map(|(bix, badge)| {
+                                crate::badges::render(
+                                    SharedString::from(format!("{}#badge{bix}", row.id)),
+                                    badge,
+                                    &theme,
+                                )
+                            })),
+                    );
                 }
                 if !text.is_empty() {
                     // `min_w_0` is load-bearing: gpui text answers min/max-content
@@ -4437,6 +4465,47 @@ mod tests {
         };
         assert_eq!(text.as_ref(), "");
         assert_eq!(attachments.len(), 1);
+    }
+
+    #[test]
+    fn user_row_extracts_attachment_then_comment_badge_without_mutating_entry() {
+        let comments = vec![crate::comments::DiffComment::new(
+            "src/lib.rs",
+            crate::comments::CommentSide::New,
+            9,
+            "tighten this",
+        )];
+        let with_comments = crate::comments::with_comments("review", &comments);
+        let raw =
+            crate::attachments::with_attachments(&with_comments, &[r"C:\tmp\shot.png".to_string()]);
+        let mut entry = assistant("u-comments", MessageStatus::Complete, vec![]);
+        entry.role = MessageRole::User;
+        entry.status = None;
+        entry.parts = vec![text_part("t0", &raw)];
+
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::User {
+            text,
+            attachments,
+            badges,
+            ..
+        } = &rows[0].kind
+        else {
+            panic!("expected a user row");
+        };
+        assert_eq!(text.as_ref(), "review");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(badges.len(), 1);
+        assert_eq!(badges[0].label.as_ref(), "1 comment");
+        assert_eq!(badges[0].details[0].location.as_ref(), "src/lib.rs:9");
+        assert_eq!(badges[0].details[0].tag.as_deref(), Some("R"));
+        assert_eq!(badges[0].details[0].body.as_ref(), "tighten this");
+        let MessagePart::Text { text: stored, .. } = &entry.parts[0] else {
+            panic!("expected stored text");
+        };
+        assert_eq!(stored, &raw);
+        assert!(stored.contains(crate::comments::COMMENT_BLOCK_HEADER));
+        assert!(stored.contains("Attached images"));
     }
 
     /// A sent prompt's file mentions render as chips in the transcript: the

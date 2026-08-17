@@ -36,6 +36,7 @@ use comet_proto::{
 };
 use comet_rpc::{RpcClient, RpcError, RpcService, connect_ws, memory_client, methods};
 
+use crate::comments::DiffComment;
 use crate::remotes::{
     AddRemoteRequest, InstallationRemotePairer, RemoteAddCoordinator, RemoteAddState,
     run_remote_add_operation,
@@ -409,6 +410,10 @@ pub struct AppState {
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<ServerRef, Vec<SessionMessageEntry>>,
+    /// Diff comments staged per composer key. The changes pane writes them,
+    /// the composer reads them for its chip and folds them into the next
+    /// prompt — AppState is the only thing both views already share.
+    diff_comments: HashMap<ServerRef, Vec<DiffComment>>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
@@ -446,6 +451,7 @@ impl AppState {
             selected_chat: None,
             transcript: Vec::new(),
             echoes: HashMap::new(),
+            diff_comments: HashMap::new(),
             local_device_id: None,
             update: None,
             data_dir: None,
@@ -456,6 +462,62 @@ impl AppState {
             remote_add_task: None,
             auto_selected: false,
         }
+    }
+
+    // ---- diff comments (pure) ----
+
+    /// The selected, fully-qualified owner of any draft or staged comment.
+    /// New-chat canvases deliberately have no owner and cannot stage comments.
+    pub fn composer_key(&self) -> Option<ServerRef> {
+        self.selected_chat.clone()
+    }
+
+    pub fn diff_comments(&self, key: &ServerRef) -> &[DiffComment] {
+        self.diff_comments
+            .get(key)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn add_diff_comment(&mut self, key: &ServerRef, comment: DiffComment) {
+        self.diff_comments
+            .entry(key.clone())
+            .or_default()
+            .push(comment);
+    }
+
+    pub fn remove_diff_comment(&mut self, key: &ServerRef, id: &str) {
+        if let Some(list) = self.diff_comments.get_mut(key) {
+            list.retain(|c| c.id != id);
+            if list.is_empty() {
+                self.diff_comments.remove(key);
+            }
+        }
+    }
+
+    /// Snapshot-and-clear on send (`attachments` does the same): the chip
+    /// empties the instant the prompt carrying the comments goes out.
+    pub fn take_diff_comments(&mut self, key: &ServerRef) -> Vec<DiffComment> {
+        self.diff_comments.remove(key).unwrap_or_default()
+    }
+
+    /// Restore a failed send ahead of comments staged while it was in flight.
+    /// IDs keep the merge idempotent if a completion path is observed twice.
+    pub fn restore_diff_comments(&mut self, key: &ServerRef, mut taken: Vec<DiffComment>) {
+        let current = self.diff_comments.remove(key).unwrap_or_default();
+        for comment in current {
+            if !taken.iter().any(|saved| saved.id == comment.id) {
+                taken.push(comment);
+            }
+        }
+        if !taken.is_empty() {
+            self.diff_comments.insert(key.clone(), taken);
+        }
+    }
+
+    /// Drop a deleted chat's stage — its comments could never be sent again.
+    pub fn purge_diff_comments(&mut self, key: &ServerRef) {
+        self.diff_comments.remove(key);
     }
 
     // ---- reducers (pure) ----
@@ -1270,6 +1332,57 @@ mod tests {
 
     fn server(id: &str) -> comet_proto::ServerId {
         comet_proto::ServerId::new(format!("sha256:{id}"))
+    }
+
+    fn staged_comment(id: &str) -> crate::comments::DiffComment {
+        let mut comment = crate::comments::DiffComment::new(
+            "src/lib.rs",
+            crate::comments::CommentSide::New,
+            3,
+            id,
+        );
+        comment.id = id.to_string();
+        comment
+    }
+
+    #[test]
+    fn equal_raw_chat_ids_on_different_servers_do_not_share_diff_comments() {
+        let a = ServerRef::new(server("a"), "same-chat");
+        let b = ServerRef::new(server("b"), "same-chat");
+        let mut state = AppState::new();
+
+        state.add_diff_comment(&a, staged_comment("a-1"));
+
+        assert_eq!(
+            state
+                .diff_comments(&a)
+                .iter()
+                .map(|comment| comment.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-1"]
+        );
+        assert!(state.diff_comments(&b).is_empty());
+    }
+
+    #[test]
+    fn failed_send_restores_taken_comments_without_losing_newer_staged_comments() {
+        let owner = ServerRef::new(server("a"), "chat-1");
+        let mut state = AppState::new();
+        state.add_diff_comment(&owner, staged_comment("old-1"));
+        state.add_diff_comment(&owner, staged_comment("old-2"));
+
+        let taken = state.take_diff_comments(&owner);
+        state.add_diff_comment(&owner, staged_comment("new-3"));
+        state.restore_diff_comments(&owner, taken);
+
+        assert_eq!(
+            state
+                .diff_comments(&owner)
+                .iter()
+                .map(|comment| comment.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old-1", "old-2", "new-3"]
+        );
     }
 
     struct ClosedService;

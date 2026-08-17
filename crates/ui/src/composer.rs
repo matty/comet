@@ -212,6 +212,13 @@ pub fn attachment_strip_height(count: usize, inner_width: f32) -> f32 {
     STRIP_PAD_TOP + rows as f32 * STRIP_THUMB + (rows - 1) as f32 * STRIP_GAP
 }
 
+pub fn comment_strip_height(count: usize) -> f32 {
+    if count == 0 {
+        return 0.0;
+    }
+    STRIP_PAD_TOP + crate::badges::BADGE_HEIGHT
+}
+
 /// Compact↔expanded flip morph (round 9): the flip used to snap between the
 /// two pill layouts. The original has no height transition (its shell carries
 /// only `transition-colors`), so this is a native nicety: ONE committed flip
@@ -372,12 +379,64 @@ pub enum SendButtonMode {
     Stop,
 }
 
+/// What the composer holds that a send could carry. A staged image or diff
+/// comment counts: both synthesize their own prompt body, so either alone is
+/// a legal send — and during a live run has to read as Steer, not Stop.
+pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> bool {
+    !text.trim().is_empty() || attachments > 0 || comments > 0
+}
+
 pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
     match (run_live, has_text) {
         (false, _) => SendButtonMode::Send,
         (true, true) => SendButtonMode::Steer,
         (true, false) => SendButtonMode::Stop,
     }
+}
+
+pub fn assemble_user_message(
+    text: &str,
+    comments: &[crate::comments::DiffComment],
+    attachment_paths: &[String],
+) -> String {
+    attachments::with_attachments(
+        &crate::comments::with_comments(text, comments),
+        attachment_paths,
+    )
+}
+
+#[derive(Debug, Clone)]
+pub struct CommentSendSnapshot {
+    pub owner: ServerRef,
+    pub typed: String,
+    pub comments: Vec<crate::comments::DiffComment>,
+}
+
+pub fn take_comment_snapshot(
+    state: &mut AppState,
+    owner: &ServerRef,
+    typed: &str,
+) -> CommentSendSnapshot {
+    CommentSendSnapshot {
+        owner: owner.clone(),
+        typed: typed.to_string(),
+        comments: state.take_diff_comments(owner),
+    }
+}
+
+pub fn restore_comment_snapshot(state: &mut AppState, snapshot: &CommentSendSnapshot) {
+    state.restore_diff_comments(&snapshot.owner, snapshot.comments.clone());
+}
+
+/// Remove one owner's staged comments and wake every `AppState` observer.
+///
+/// The composer also repaints itself after its clear button runs, but the
+/// changes pane observes `AppState` directly. Mutating the entity without
+/// notifying its context leaves those comment cards visible until some
+/// unrelated state update happens.
+fn purge_comment_stage(state: &mut AppState, owner: &ServerRef, notify: impl FnOnce()) {
+    state.purge_diff_comments(owner);
+    notify();
 }
 
 /// Find the unresolved input request the panel should serve, if any: an
@@ -3673,8 +3732,69 @@ impl Composer {
 
     /// Drop a deleted chat's per-chat composer state — staged attachments hold
     /// raw image bytes, and a deleted chat's stage could never be sent again.
-    pub fn purge_chat(&mut self, chat_id: &ServerRef) {
+    pub fn purge_chat(&mut self, chat_id: &ServerRef, cx: &mut Context<Self>) {
         self.attachments.remove(&Some(chat_id.clone()));
+        self.state.update(cx, |state, state_cx| {
+            purge_comment_stage(state, chat_id, || state_cx.notify());
+        });
+    }
+
+    /// Staged in `AppState` because the changes pane writes them.
+    fn staged_comments(&self, cx: &App) -> Vec<crate::comments::DiffComment> {
+        let Some(key) = self.current_key.as_ref() else {
+            return Vec::new();
+        };
+        self.state.read(cx).diff_comments(key).to_vec()
+    }
+
+    fn render_comments_chip(&self, theme: &Theme, cx: &Context<Self>) -> Option<gpui::Div> {
+        let owner = self.current_key.clone()?;
+        let count = self.staged_comments(cx).len();
+        if count == 0 {
+            return None;
+        }
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .px(px(STRIP_PAD_X))
+                .pt(px(STRIP_PAD_TOP))
+                .child(
+                    crate::badges::render(
+                        "composer-comments",
+                        &crate::badges::MessageBadge {
+                            icon: crate::icons::CHAT_ROUND_LINE,
+                            label: crate::comments::chip_label(count).into(),
+                            // The staged set is already on screen in the changes
+                            // pane, so a hover card would only repeat it.
+                            details: Vec::new(),
+                        },
+                        theme,
+                    )
+                    .child(
+                        div()
+                            .id("composer-comments-remove")
+                            .ml(px(2.0))
+                            .size(px(14.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.state.update(cx, |state, state_cx| {
+                                    purge_comment_stage(state, &owner, || state_cx.notify());
+                                });
+                                cx.notify();
+                            }))
+                            .child(
+                                crate::icons::icon(crate::icons::CLOSE_CIRCLE)
+                                    .size(px(11.0))
+                                    .text_color(theme.text_faint),
+                            ),
+                    ),
+                ),
+        )
     }
 
     /// The staged-thumbnail strip (attachment-ui.tsx AttachmentStrip):
@@ -4505,10 +4625,12 @@ impl Composer {
     }
 
     fn button_mode(&self, cx: &App) -> SendButtonMode {
-        // A staged image counts as content: image-only sends are legal
-        // (the prompt body becomes "See the attached image(s).").
-        let has_text = !self.input.read(cx).text().trim().is_empty() || !self.staged().is_empty();
-        send_button_mode(self.run_live(cx), has_text)
+        let has_content = composer_has_content(
+            self.input.read(cx).text(),
+            self.staged().len(),
+            self.staged_comments(cx).len(),
+        );
+        send_button_mode(self.run_live(cx), has_content)
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
@@ -4527,9 +4649,11 @@ impl Composer {
             return;
         }
         let text = self.input.read(cx).text().trim().to_string();
+        let has_content =
+            composer_has_content(&text, self.staged().len(), self.staged_comments(cx).len());
         match self.button_mode(cx) {
             SendButtonMode::Stop => self.interrupt(cx),
-            _ if text.is_empty() && self.staged().is_empty() => {}
+            _ if !has_content => {}
             SendButtonMode::Send => self.send(text, false, cx),
             SendButtonMode::Steer => self.send(text, true, cx),
         }
@@ -4630,6 +4754,28 @@ impl Composer {
             .attachments
             .remove(&self.current_key)
             .unwrap_or_default();
+        // `typed` keeps the user's own words for the failure hand-back below:
+        // restoring the folded prompt would paste the comment block into the
+        // input as literal text.
+        let key = self.current_key.clone();
+        let typed = text.clone();
+        let comment_snapshot = self.state.update(cx, |state, cx| {
+            let snapshot = key
+                .as_ref()
+                .map(|owner| take_comment_snapshot(state, owner, &typed));
+            if snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.comments.is_empty())
+            {
+                cx.notify();
+            }
+            snapshot
+        });
+        let comments = comment_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.comments.clone())
+            .unwrap_or_default();
+        let text = assemble_user_message(&typed, &comments, &[]);
         self.preview = None;
         let message_id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().timestamp_millis();
@@ -4675,7 +4821,7 @@ impl Composer {
         cx.notify();
 
         let steer_cmd = steer && !is_new;
-        let restore_text = text.clone();
+        let restore_text = typed.clone();
         let err_chat_key = Some(chat_owner.clone());
         let async_chat_owner = chat_owner;
         let err_message_id = message_id.clone();
@@ -4799,7 +4945,7 @@ impl Composer {
                             attachments::seed_attachment(&async_chat_owner.server_id, &device_id, path, &att.name, att.image.clone());
                         }
                     }
-                    content = attachments::with_attachments(&text, &attachment_paths);
+                    content = assemble_user_message(&typed, &comments, &attachment_paths);
                     // Refresh the echo in place with the attachment refs
                     // (same id, same clock — the bubble grows its thumbnails
                     // without flickering).
@@ -4864,6 +5010,9 @@ impl Composer {
                     // draft, staged files back in the chat's stash.
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo_for(&async_chat_owner, &err_message_id);
+                        if let Some(snapshot) = comment_snapshot.as_ref() {
+                            restore_comment_snapshot(s, snapshot);
+                        }
                         cx.notify();
                     });
                     if composer.current_key == err_chat_key {
@@ -5823,12 +5972,13 @@ impl Render for Composer {
         let staged_count = self.staged().len();
         let strip_width_hint = if last_width > 0.0 { last_width } else { 720.0 };
         let strip_h = attachment_strip_height(staged_count, strip_width_hint);
+        let comment_strip_h = comment_strip_height(self.staged_comments(cx).len());
         let base_height = if expanded {
             composer_total_height(content_height)
         } else {
             COMPACT_TOTAL_HEIGHT
         };
-        let target_height = base_height + strip_h;
+        let target_height = base_height + strip_h + comment_strip_h;
         let (pill_height, morph_t, morphing) = match self.flip_morph {
             Some(m) if !m.done(now_ms) => {
                 (m.height(target_height, now_ms), m.progress(now_ms), true)
@@ -5921,6 +6071,7 @@ impl Render for Composer {
         // Staged-thumbnail strip (attachment-ui.tsx AttachmentStrip), above
         // the input inside the pill in both modes.
         let strip = self.render_attachment_strip(&theme, cx);
+        let comments_chip = self.render_comments_chip(&theme, cx);
 
         // The pill chrome (comet composer.tsx): `rounded-[26px] border
         // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
@@ -5955,6 +6106,7 @@ impl Render for Composer {
                 .relative()
                 .flex()
                 .flex_col()
+                .children(comments_chip)
                 .children(strip)
                 .child(
                     div()
@@ -6009,6 +6161,7 @@ impl Render for Composer {
                 .flex()
                 .flex_col()
                 .justify_end()
+                .children(comments_chip)
                 .children(strip)
                 .child(
                     div()
@@ -6083,6 +6236,131 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn comment(id: &str) -> crate::comments::DiffComment {
+        let mut comment = crate::comments::DiffComment::new(
+            "src/lib.rs",
+            crate::comments::CommentSide::New,
+            3,
+            id,
+        );
+        comment.id = id.into();
+        comment
+    }
+
+    fn owner(server: &str) -> ServerRef {
+        ServerRef::new(
+            comet_proto::ServerId::new(format!("sha256:{server}")),
+            "same-chat",
+        )
+    }
+
+    #[test]
+    fn comments_count_as_composer_content() {
+        assert!(!composer_has_content("   ", 0, 0));
+        assert!(composer_has_content("text", 0, 0));
+        assert!(composer_has_content("", 1, 0));
+        assert!(composer_has_content("", 0, 1));
+    }
+
+    #[test]
+    fn comment_only_live_submit_steers_instead_of_stopping() {
+        assert_eq!(
+            send_button_mode(true, composer_has_content("", 0, 2)),
+            SendButtonMode::Steer
+        );
+        assert_eq!(
+            send_button_mode(true, composer_has_content("", 0, 0)),
+            SendButtonMode::Stop
+        );
+    }
+
+    #[test]
+    fn comments_fold_before_attachments_and_both_extract() {
+        let comments = vec![comment("review this")];
+        let paths = vec![r"C:\tmp\shot.png".to_string()];
+        let assembled = assemble_user_message("review", &comments, &paths);
+        let parsed = attachments::parse_user_message_images(&assembled);
+
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(
+            parsed.text,
+            crate::comments::with_comments("review", &comments)
+        );
+        assert!(
+            assembled.find("Comments on the diff").unwrap()
+                < assembled.find("Attached images").unwrap()
+        );
+    }
+
+    #[test]
+    fn failed_send_restores_comments_to_original_server_ref() {
+        let original = owner("a");
+        let other = owner("b");
+        let mut state = AppState::new();
+        state.add_diff_comment(&original, comment("old-1"));
+        state.add_diff_comment(&original, comment("old-2"));
+
+        let snapshot = take_comment_snapshot(&mut state, &original, "typed only");
+        state.add_diff_comment(&original, comment("new-3"));
+        state.selected_chat = Some(other.clone());
+        restore_comment_snapshot(&mut state, &snapshot);
+
+        assert_eq!(snapshot.typed, "typed only");
+        assert_eq!(
+            state
+                .diff_comments(&original)
+                .iter()
+                .map(|comment| comment.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old-1", "old-2", "new-3"]
+        );
+        assert!(state.diff_comments(&other).is_empty());
+    }
+
+    #[test]
+    fn successful_send_consumes_only_the_taken_comments() {
+        let original = owner("a");
+        let mut state = AppState::new();
+        state.add_diff_comment(&original, comment("sent"));
+
+        let snapshot = take_comment_snapshot(&mut state, &original, "typed");
+        state.add_diff_comment(&original, comment("later"));
+
+        assert_eq!(snapshot.comments.len(), 1);
+        assert_eq!(state.diff_comments(&original)[0].id, "later");
+    }
+
+    #[test]
+    fn purging_a_chat_removes_only_its_diff_comments() {
+        let deleted = owner("a");
+        let same_raw_id_elsewhere = owner("b");
+        let mut state = AppState::new();
+        state.add_diff_comment(&deleted, comment("deleted"));
+        state.add_diff_comment(&same_raw_id_elsewhere, comment("kept"));
+
+        state.purge_diff_comments(&deleted);
+
+        assert!(state.diff_comments(&deleted).is_empty());
+        assert_eq!(state.diff_comments(&same_raw_id_elsewhere)[0].id, "kept");
+    }
+
+    #[test]
+    fn clearing_the_comment_chip_notifies_state_observers() {
+        use std::cell::Cell;
+
+        let owner = owner("a");
+        let mut state = AppState::new();
+        state.add_diff_comment(&owner, comment("staged"));
+        let notifications = Cell::new(0);
+
+        purge_comment_stage(&mut state, &owner, || {
+            notifications.set(notifications.get() + 1);
+        });
+
+        assert!(state.diff_comments(&owner).is_empty());
+        assert_eq!(notifications.get(), 1);
+    }
 
     fn tooltip_target(range: Range<usize>, path: &str) -> MentionTooltipTarget {
         MentionTooltipTarget {
@@ -6899,6 +7177,30 @@ mod tests {
         assert_eq!(m.progress(180.0), 1.0);
         let mid = m.progress(90.0);
         assert!(mid > 0.0 && mid < 1.0);
+    }
+
+    #[test]
+    fn staged_comments_alone_are_content() {
+        assert!(!composer_has_content("   ", 0, 0));
+        assert!(composer_has_content("hi", 0, 0));
+        assert!(composer_has_content("", 1, 0));
+        assert!(composer_has_content("", 0, 1));
+    }
+
+    #[test]
+    fn a_comment_only_stage_steers_a_live_run_instead_of_stopping_it() {
+        let live = true;
+        let comment_only = composer_has_content("", 0, 2);
+        assert_eq!(
+            send_button_mode(live, comment_only),
+            SendButtonMode::Steer,
+            "comment-only submit must steer, not interrupt the run"
+        );
+        // Nothing staged at all is still the stop square.
+        assert_eq!(
+            send_button_mode(live, composer_has_content("", 0, 0)),
+            SendButtonMode::Stop
+        );
     }
 
     #[test]
