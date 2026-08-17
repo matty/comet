@@ -428,6 +428,17 @@ pub fn restore_comment_snapshot(state: &mut AppState, snapshot: &CommentSendSnap
     state.restore_diff_comments(&snapshot.owner, snapshot.comments.clone());
 }
 
+/// Remove one owner's staged comments and wake every `AppState` observer.
+///
+/// The composer also repaints itself after its clear button runs, but the
+/// changes pane observes `AppState` directly. Mutating the entity without
+/// notifying its context leaves those comment cards visible until some
+/// unrelated state update happens.
+fn purge_comment_stage(state: &mut AppState, owner: &ServerRef, notify: impl FnOnce()) {
+    state.purge_diff_comments(owner);
+    notify();
+}
+
 /// Find the unresolved input request the panel should serve, if any: an
 /// unresolved input part on the LAST assistant entry — regardless of the
 /// entry's run status. The question stays answerable until the user actually
@@ -3723,8 +3734,8 @@ impl Composer {
     /// raw image bytes, and a deleted chat's stage could never be sent again.
     pub fn purge_chat(&mut self, chat_id: &ServerRef, cx: &mut Context<Self>) {
         self.attachments.remove(&Some(chat_id.clone()));
-        self.state.update(cx, |state, _| {
-            state.purge_diff_comments(chat_id);
+        self.state.update(cx, |state, state_cx| {
+            purge_comment_stage(state, chat_id, || state_cx.notify());
         });
     }
 
@@ -3771,8 +3782,8 @@ impl Composer {
                             .rounded(px(4.0))
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.state.update(cx, |state, _| {
-                                    state.purge_diff_comments(&owner);
+                                this.state.update(cx, |state, state_cx| {
+                                    purge_comment_stage(state, &owner, || state_cx.notify());
                                 });
                                 cx.notify();
                             }))
@@ -6332,6 +6343,23 @@ mod tests {
 
         assert!(state.diff_comments(&deleted).is_empty());
         assert_eq!(state.diff_comments(&same_raw_id_elsewhere)[0].id, "kept");
+    }
+
+    #[test]
+    fn clearing_the_comment_chip_notifies_state_observers() {
+        use std::cell::Cell;
+
+        let owner = owner("a");
+        let mut state = AppState::new();
+        state.add_diff_comment(&owner, comment("staged"));
+        let notifications = Cell::new(0);
+
+        purge_comment_stage(&mut state, &owner, || {
+            notifications.set(notifications.get() + 1);
+        });
+
+        assert!(state.diff_comments(&owner).is_empty());
+        assert_eq!(notifications.get(), 1);
     }
 
     fn tooltip_target(range: Range<usize>, path: &str) -> MentionTooltipTarget {
