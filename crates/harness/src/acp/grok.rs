@@ -814,13 +814,15 @@ impl Harness for GrokHarness {
             Some(announcement_notices),
         )
         .await?;
-        Ok(super::session::run(
+        let observer = super::subagent::SubagentTracker::new(session.session_id().to_owned());
+        Ok(super::session::run_observed(
             session,
             HarnessId::Grok,
             request,
             controls,
             usage,
             Some(SETTLE_SIGNAL),
+            Some(Box::new(observer)),
         ))
     }
 }

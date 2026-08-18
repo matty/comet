@@ -12,7 +12,9 @@ use comet_harness::acp::grok::GrokHarness;
 use comet_harness::acp::hermes::HermesHarness;
 use comet_harness::acp::session::Timeouts;
 use comet_harness::{CancellationToken, Harness, RunControls};
-use comet_proto::{AgentEvent, CatalogSource, HarnessId, ReasoningLevel, RunRequest, RuntimeMode};
+use comet_proto::{
+    AgentEvent, CatalogSource, HarnessId, ReasoningLevel, RunRequest, RuntimeMode, SubagentStatus,
+};
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
@@ -384,5 +386,106 @@ async fn a_turn_that_streams_text_gets_a_completion_boundary_before_done() {
             .iter()
             .any(|e| matches!(e, AgentEvent::Diagnostic { .. })),
         "a healthy fixture turn must not report a diagnostic: {events:#?}"
+    );
+}
+
+/// Break caught: Grok's vendor lifecycle being dropped as generic ACP chatter,
+/// which leaves a delegation as a plain tool chip while native providers draw
+/// a subagent card.
+#[tokio::test]
+async fn a_grok_subagent_lifecycle_reaches_the_native_card_events() {
+    let cwd = std::env::temp_dir().join("comet-grok-fixture-subagent");
+    std::fs::create_dir_all(&cwd).expect("disposable cwd");
+
+    let harness = against_fixture();
+    let (steer_tx, steer_rx) = mpsc::channel(1);
+    let controls = RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        request_approval: Box::new(|_| oneshot::channel().1),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+    };
+    let request = RunRequest {
+        prompt: "grok-subagent-late".into(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        ..RunRequest::for_session(RuntimeMode::default())
+    };
+
+    let mut stream = harness
+        .run(request, controls)
+        .await
+        .expect("the fixture starts");
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(event) = stream.next().await {
+            let event = event.expect("no transport error");
+            let child_finished = matches!(
+                event,
+                AgentEvent::SubagentUpdated {
+                    status: SubagentStatus::Completed,
+                    ..
+                }
+            );
+            events.push(event);
+            if child_finished {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the child settles after its parent turn rather than hanging");
+    drop(steer_tx);
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SubagentStarted {
+                task_id,
+                tool_use_id,
+                agent_type,
+                description,
+                prompt: Some(prompt),
+            } if task_id == "sub-1"
+                && tool_use_id == "sp1"
+                && agent_type == "explore"
+                && description == "Count files"
+                && prompt == "Count the files."
+        )),
+        "the correlated spawn must open the existing card: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SubagentUpdated {
+                task_id,
+                status: SubagentStatus::Running,
+                activity: Some(activity),
+                ..
+            } if task_id == "sub-1" && activity == "Counting files"
+        )),
+        "the live activity must reach the card: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SubagentUpdated {
+                task_id,
+                status: SubagentStatus::Completed,
+                summary: Some(summary),
+                tool_uses: Some(1),
+                ..
+            } if task_id == "sub-1" && summary == "two files"
+        )),
+        "the final wire output must settle the card: {events:#?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCall {
+                call: comet_proto::ToolCall::Unknown { name, .. },
+                ..
+            } if name == "spawn_subagent"
+        )),
+        "a correlated delegation must not also draw as a plain tool chip: {events:#?}"
     );
 }

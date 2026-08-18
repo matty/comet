@@ -74,6 +74,27 @@ type RequestApprovalFn =
 /// `HarnessId`.
 pub(crate) type UsageReader = fn(&Value, Option<u64>) -> Option<AgentEvent>;
 
+/// One provider's optional reading of notification frames the shared ACP
+/// protocol does not own.
+///
+/// The observer is injected by that provider's `run` method. The shared loop
+/// never dispatches on [`HarnessId`], and an ACP provider without an observer
+/// remains completely inert for vendor methods.
+pub(crate) trait NotificationObserver: Send {
+    fn observe(&mut self, method: &str, params: &Value) -> NotificationObservation;
+}
+
+/// Events a provider decoded, plus whether generic ACP handling must stop.
+///
+/// `claimed` is separate from `events`: a recognized bookkeeping frame can
+/// legitimately be silent, while falling through would draw it as an ordinary
+/// tool call or report it as protocol drift.
+#[derive(Default)]
+pub(crate) struct NotificationObservation {
+    pub events: Vec<AgentEvent>,
+    pub claimed: bool,
+}
+
 /// How a harness applies the caller's model choice to a freshly opened
 /// session: a list of extra JSON-RPC requests (method, params) to issue, in
 /// order, right after `session/new`/`session/load` and before the first
@@ -867,20 +888,50 @@ pub fn run(
     usage_reader: UsageReader,
     settle: Option<SettleSignal>,
 ) -> BoxStream<'static, Result<AgentEvent, HarnessError>> {
-    let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
-    tokio::spawn(run_session(
+    run_observed(
         session,
         harness,
         request,
         controls,
         usage_reader,
         settle,
+        None,
+    )
+}
+
+/// [`run`] with one provider-owned vendor notification observer.
+pub(crate) fn run_observed(
+    session: AcpSession,
+    harness: HarnessId,
+    request: RunRequest,
+    controls: RunControls,
+    usage_reader: UsageReader,
+    settle: Option<SettleSignal>,
+    observer: Option<Box<dyn NotificationObserver>>,
+) -> BoxStream<'static, Result<AgentEvent, HarnessError>> {
+    let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
+    tokio::spawn(run_session(
+        session,
+        harness,
+        request,
+        controls,
+        RunHooks {
+            usage_reader,
+            settle,
+            observer,
+        },
         event_tx,
     ));
     futures::stream::unfold(event_rx, |mut rx| async move {
         rx.recv().await.map(|ev| (ev, rx))
     })
     .boxed()
+}
+
+struct RunHooks {
+    usage_reader: UsageReader,
+    settle: Option<SettleSignal>,
+    observer: Option<Box<dyn NotificationObserver>>,
 }
 
 /// How a single turn stopped.
@@ -904,10 +955,14 @@ async fn run_session(
     harness: HarnessId,
     request: RunRequest,
     controls: RunControls,
-    usage_reader: UsageReader,
-    settle: Option<SettleSignal>,
+    hooks: RunHooks,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
 ) {
+    let RunHooks {
+        usage_reader,
+        settle,
+        mut observer,
+    } = hooks;
     let AcpSession {
         mut child,
         tree,
@@ -1023,6 +1078,7 @@ async fn run_session(
                 notification_handler,
                 prompt_completions: &mut prompt_completions,
                 request_approval: &request_approval,
+                observer: &mut observer,
             },
             &prompt,
             turn_images,
@@ -1110,7 +1166,20 @@ async fn run_session(
         }
 
         // Between turns: deliver a queued steer as the next prompt, or end.
-        match steering.recv().await {
+        // A provider observer keeps consuming its own out-of-band lifecycle
+        // while the parent is idle — Grok background subagents can finish
+        // after the parent's `Done`, and leaving that frame buffered until a
+        // future steer would leave the card running forever in a chat the user
+        // never sends to again.
+        match wait_for_steer(
+            &mut steering,
+            &mut incoming,
+            &client,
+            &event_tx,
+            &mut observer,
+        )
+        .await
+        {
             Some(steer) => {
                 // A turn that streamed nothing never reached the boundary
                 // rotation above, so rotate here instead: `Steered`'s contract
@@ -1145,6 +1214,72 @@ async fn run_session(
 
     shutdown_child(&mut child, timeouts.kill_grace).await;
     tree.terminate();
+}
+
+/// Wait between parent turns while still forwarding provider-owned lifecycle.
+///
+/// Only a run with an injected observer reads here. Ordinary ACP providers keep
+/// the old `steering.recv()` behavior exactly. Unclaimed notifications are
+/// intentionally dropped: a parent text/tool frame arriving after its own
+/// `Done` cannot be folded into that finished turn, and replaying it at the
+/// next prompt would attribute it to the wrong user message.
+async fn wait_for_steer(
+    steering: &mut mpsc::Receiver<crate::SteerMessage>,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    client: &RpcClient,
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    observer: &mut Option<Box<dyn NotificationObserver>>,
+) -> Option<crate::SteerMessage> {
+    if observer.is_none() {
+        return steering.recv().await;
+    }
+    loop {
+        tokio::select! {
+            steer = steering.recv() => return steer,
+            message = incoming.recv() => match message {
+                Some(Incoming::Notification { method, params }) => {
+                    let observed = observer
+                        .as_deref_mut()
+                        .expect("the observer gate above guarantees Some")
+                        .observe(&method, &params);
+                    for event in observed.events {
+                        if !send(event_tx, event).await {
+                            return None;
+                        }
+                    }
+                    if !observed.claimed {
+                        tracing::trace!(
+                            target: "comet_harness::acp",
+                            method,
+                            "dropping an unclaimed notification between parent turns"
+                        );
+                    }
+                }
+                Some(Incoming::Request { id, method, .. }) => {
+                    // No active turn owns an approval or other request here.
+                    // Answer rather than leave the agent parked forever.
+                    tracing::debug!(
+                        target: "comet_harness::acp",
+                        method,
+                        "declining a request received between parent turns"
+                    );
+                    client.respond_error(&id, -32600, "no active turn");
+                }
+                Some(Incoming::Malformed(kind)) => {
+                    if !send(
+                        event_tx,
+                        crate::diagnostic(kind.discriminator(), DiagnosticSeverity::Malformed),
+                    )
+                    .await
+                    {
+                        return None;
+                    }
+                }
+                Some(Incoming::Eof) | None => return None,
+            },
+            _ = event_tx.closed() => return None,
+        }
+    }
 }
 
 fn done_event(status: DoneStatus, error: Option<String>, session_id: &str) -> AgentEvent {
@@ -1229,6 +1364,8 @@ struct Turn<'a> {
     /// reference, because [`handle_incoming`]'s approval arm spawns a task
     /// that outlives the borrow of this `Turn` — see [`RequestApprovalFn`].
     request_approval: &'a Arc<RequestApprovalFn>,
+    /// This provider's own vendor notification reader, if it has one.
+    observer: &'a mut Option<Box<dyn NotificationObserver>>,
 }
 
 /// Borrowed state shared by both paths that consume an incoming frame.
@@ -1240,6 +1377,7 @@ struct IncomingContext<'a> {
     streamed: &'a mut bool,
     request_approval: &'a Arc<RequestApprovalFn>,
     notification_handler: Option<NotificationHandler>,
+    observer: &'a mut Option<Box<dyn NotificationObserver>>,
 }
 
 /// Bound on [`PromptCompletions`] (`docs/debt/README.md`'s D124) — the same
@@ -1356,6 +1494,7 @@ async fn drive_turn(
         notification_handler,
         prompt_completions,
         request_approval,
+        observer,
     } = turn;
     let cancel_grace = *cancel_grace;
     let prompt_stall = *prompt_stall;
@@ -1372,6 +1511,7 @@ async fn drive_turn(
         streamed,
         request_approval,
         notification_handler,
+        observer,
     };
 
     // **Drain any backlog BEFORE sending, not after.** The reader task can
@@ -1776,9 +1916,22 @@ async fn handle_incoming(message: Incoming, context: &mut IncomingContext<'_>) -
         streamed,
         request_approval,
         notification_handler,
+        observer,
     } = context;
     match message {
         Incoming::Notification { method, params } => {
+            let observed = observer
+                .as_deref_mut()
+                .map(|observer| observer.observe(&method, &params))
+                .unwrap_or_default();
+            for event in observed.events {
+                if !send(event_tx, event).await {
+                    return Handled::ConsumerGone;
+                }
+            }
+            if observed.claimed {
+                return Handled::Continue;
+            }
             if method == "session/update" {
                 // Tool frames carry state across updates, so they go through
                 // the tracker; everything else is a pure per-frame decode,
