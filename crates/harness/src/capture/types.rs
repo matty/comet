@@ -27,7 +27,11 @@ pub struct CommandSnapshot {
 impl CommandSnapshot {
     // The capture recorder is the only caller; see `record/session.rs`.
     pub(crate) fn from_launch(launch: &LaunchDescriptor) -> Self {
-        const CAPTURED_ENV: &[&str] = &["CODEX_HOME"];
+        // Both decide what the CLI answers with, so both belong in the reviewable record:
+        // `CODEX_HOME` selects Codex's account and config, `CLAUDE_CONFIG_DIR` selects Claude's
+        // (D91). A manifest missing the latter cannot distinguish an isolated capture from one
+        // carrying whatever plugins and models the capturer's machine happened to have.
+        const CAPTURED_ENV: &[&str] = &["CODEX_HOME", "CLAUDE_CONFIG_DIR"];
 
         let configured_env = launch
             .configured_env
@@ -111,6 +115,10 @@ pub struct CaptureConfig {
     pub purpose: &'static str,
     pub executable: Option<PathBuf>,
     pub codex_home: Option<PathBuf>,
+    /// `CLAUDE_CONFIG_DIR` for the Claude launch (D91). Claude Code reads its configuration
+    /// home regardless of `--cwd`, so without this every capture carries the operator's skills,
+    /// plugins, MCP servers, hooks and locally configured models.
+    pub claude_config_dir: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
     pub resume_id: Option<String>,
     pub attachment: Option<PathBuf>,
@@ -133,6 +141,8 @@ pub struct RedactionRoots {
     pub temp: Option<String>,
     #[serde(default)]
     pub codex_home: Option<String>,
+    #[serde(default)]
+    pub claude_config_dir: Option<String>,
     #[serde(default)]
     pub approval_target: Option<String>,
     #[serde(default)]

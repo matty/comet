@@ -35,6 +35,10 @@ pub struct ScenarioInput {
     pub resume_id: Option<String>,
     pub attachment: Option<PathBuf>,
     pub codex_home: Option<PathBuf>,
+    /// The configuration home every Claude launch is spawned against (D91). Set for a Claude
+    /// row or `None`; the binary rejects it for a Codex row, so nothing downstream has to ask
+    /// which provider it belongs to.
+    pub claude_config_dir: Option<PathBuf>,
     pub approval_target: Option<PathBuf>,
 }
 
@@ -59,6 +63,19 @@ pub struct Requirements {
     pub needs_attachment: bool,
     pub needs_approval_target: bool,
     pub needs_empty_codex_home: bool,
+    /// D91. True only where an empty configuration home is provably the CLI's own surface
+    /// rather than a different observation. `model-discovery` qualifies because `--bare` never
+    /// reads OAuth or the keychain (see `claude::discovery::DISCOVERY_ARGS`), so an empty home
+    /// and the operator's authenticated one answer identically but for the operator's own
+    /// models and commands — measured 2026-08-23 on 2.1.241.
+    ///
+    /// It is deliberately NOT set on `command-discovery` or the run rows, which do read
+    /// credentials: an empty home logs them out, turning a capture of Claude's command surface
+    /// into a capture of its logged-out one (42 commands and `account.tokenSource: "none"`,
+    /// against 46 and a real account under a credentials-only home). Isolating those without
+    /// logging them out needs a home seeded with `.credentials.json`, which
+    /// `docs/testing/provider-captures.md` describes and this flag cannot validate as empty.
+    pub needs_empty_claude_config: bool,
 }
 
 impl Requirements {
@@ -70,6 +87,7 @@ impl Requirements {
             needs_attachment: false,
             needs_approval_target: false,
             needs_empty_codex_home: false,
+            needs_empty_claude_config: false,
         }
     }
 
@@ -83,6 +101,7 @@ impl Requirements {
             needs_attachment: false,
             needs_approval_target: false,
             needs_empty_codex_home: false,
+            needs_empty_claude_config: false,
         }
     }
 }
@@ -153,7 +172,10 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         purpose: "capture Claude's token-free model initialize reply",
         provider: Provider::Claude,
         runtime_mode: None,
-        requirements: Requirements::discovery(),
+        requirements: Requirements {
+            needs_empty_claude_config: true,
+            ..Requirements::discovery()
+        },
         launch: ScenarioLaunch::Discovery(claude::model_discovery_launch),
         fence: no_fence,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::model_discovery(s, i))),

@@ -529,6 +529,10 @@ impl Redactor {
             "<CODEX_HOME>",
         );
         redactor.add_path(
+            capture.redaction_roots.claude_config_dir.as_deref(),
+            "<CLAUDE_CONFIG_DIR>",
+        );
+        redactor.add_path(
             capture.redaction_roots.approval_target.as_deref(),
             "<APPROVAL_TARGET>",
         );
@@ -1037,7 +1041,7 @@ fn is_secret_field(field: &str, value: &Value) -> bool {
 /// frame *after* the number was handed out — so the capture is rejected and
 /// the collision never enters the archive.
 ///
-/// The seven path-root placeholders `Redactor::new` writes (`<HOME>`,
+/// The eight path-root placeholders `Redactor::new` writes (`<HOME>`,
 /// `<CODEX_HOME>`, `<TRUSTED_POWERSHELL>`, …) are deliberately **not** this
 /// shape: none ends in `_<digits>`. That matters because
 /// `sanitize_paths_and_validate` legitimately puts them *inside* allowlisted
@@ -1061,24 +1065,26 @@ fn is_generated_placeholder_shape(text: &str) -> bool {
     numbered_generic || numbered_named
 }
 
-/// The seven literal path-root placeholders `Redactor::new` writes directly
-/// (`<CWD>`, `<REPO>`, `<HOME>`, `<TEMP>`, `<CODEX_HOME>`, `<APPROVAL_TARGET>`,
-/// `<TRUSTED_POWERSHELL>`) — never through the numbered `named`/`generic`
-/// machinery, so `is_generated_placeholder_shape` alone does not recognize
-/// them (see its own doc comment: none ends in `_<digits>`, by design).
-pub const PATH_ROOT_PLACEHOLDERS: [&str; 7] = [
+/// The eight literal path-root placeholders `Redactor::new` writes directly
+/// (`<CWD>`, `<REPO>`, `<HOME>`, `<TEMP>`, `<CODEX_HOME>`,
+/// `<CLAUDE_CONFIG_DIR>`, `<APPROVAL_TARGET>`, `<TRUSTED_POWERSHELL>`) —
+/// never through the numbered `named`/`generic` machinery, so
+/// `is_generated_placeholder_shape` alone does not recognize them (see its
+/// own doc comment: none ends in `_<digits>`, by design).
+pub const PATH_ROOT_PLACEHOLDERS: [&str; 8] = [
     "<CWD>",
     "<REPO>",
     "<HOME>",
     "<TEMP>",
     "<CODEX_HOME>",
+    "<CLAUDE_CONFIG_DIR>",
     "<APPROVAL_TARGET>",
     "<TRUSTED_POWERSHELL>",
 ];
 
 /// Whether `text` is shaped like *any* placeholder this sanitizer can
 /// produce: a numbered generic/named token (`is_generated_placeholder_shape`)
-/// or one of the seven literal path roots above.
+/// or one of the eight literal path roots above.
 ///
 /// Sound with no declared-per-capture list to check against: `sanitize_scalar`
 /// already rejects an allowlisted value that happens to have this shape
@@ -1404,7 +1410,10 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::{PublicationLock, publish_staging_pair_with, publish_staging_pair_with_commit};
+    use super::{
+        PATH_ROOT_PLACEHOLDERS, PublicationLock, publish_staging_pair_with,
+        publish_staging_pair_with_commit,
+    };
 
     /// Break caught: writing events directly into the destination before manifest creation can
     /// leave a mixed or half-written pair and destroy a previously reviewable staging artifact.
@@ -2033,22 +2042,21 @@ mod tests {
         );
     }
 
-    /// The seven path-root placeholders are deliberately not that shape, and
+    /// The eight path-root placeholders are deliberately not that shape, and
     /// must keep riding through allowlisted strings: `sanitize_paths_and_
     /// validate` writes them there itself, and the archive re-pass documented
     /// in `provider-captures.md` feeds text already carrying them back in.
     /// Rejecting those would break a workflow that works.
     #[test]
     fn a_path_root_placeholder_is_not_a_generated_shape() {
-        for root in [
-            "<CWD>",
-            "<REPO>",
-            "<HOME>",
-            "<TEMP>",
-            "<CODEX_HOME>",
-            "<APPROVAL_TARGET>",
-            "<TRUSTED_POWERSHELL>",
-        ] {
+        assert!(
+            PATH_ROOT_PLACEHOLDERS.contains(&"<CLAUDE_CONFIG_DIR>"),
+            "D91's isolated Claude config directory needs a root placeholder of its own, or its \
+             path rides through allowlisted strings verbatim"
+        );
+        // Iterated rather than re-listed: a root added to the constant without being checked
+        // here is exactly the drift this test exists to catch.
+        for root in PATH_ROOT_PLACEHOLDERS {
             assert!(
                 !is_generated_placeholder_shape(root),
                 "{root} must not read as a generated placeholder"
