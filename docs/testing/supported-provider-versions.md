@@ -6,7 +6,7 @@ instead of being carried forever on "someone might have an older one".
 
 | Provider | Floor | Corpus evidence |
 | --- | --- | --- |
-| Claude Code | **2.1.228** | `crates/harness/tests/corpus/claude/2.1.228/`, `…/2.1.229/` |
+| Claude Code | **2.1.228** | `crates/harness/tests/corpus/claude/2.1.228/`, `…/2.1.229/`, `…/2.1.233/`, `…/2.1.241/` |
 | codex-cli | **0.147.0** | `crates/harness/tests/corpus/codex/0.147.0/` |
 
 ## What the floor means

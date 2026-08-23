@@ -1,6 +1,12 @@
 # D91 — a Claude capture inherits the capturer's own configuration, and nothing records that it did
 
-**Status:** open. The recorder already solves this for Codex and was never given the Claude half.
+**Status:** partly closed. The mechanism landed — `--claude-config-dir` sets `CLAUDE_CONFIG_DIR`
+for every Claude launch, the manifest records it, and `model-discovery` refuses to run without an
+empty one — and `claude/2.1.241/{model-discovery,command-discovery}` are the first isolated
+captures in the corpus. What stays open is the archive that predates it: `2.1.228`, `2.1.229` and
+`2.1.233` are ambient and cannot be re-recorded, because the installed CLI has moved to 2.1.241.
+See "What landed" below for the part that is not merely deferred but *unresolvable* by this flag —
+the run scenarios.
 
 ## What happens
 
@@ -52,6 +58,62 @@ So the shape is `--claude-config-dir` on `comet-provider-capture` plus a
 `needs_empty_codex_home` exactly. That pairing already exists for one provider; this is the
 missing half, not a new mechanism.
 
+## What landed, and the measurement that shaped it
+
+The original sketch above — the flag plus `needs_empty_claude_config` on *the Claude rows* — is
+half right. Re-measuring on **2.1.241** from a disposable cwd, token-free, three configuration
+states rather than two:
+
+| scenario | config home | events | commands | models | `account` |
+| --- | --- | --- | --- | --- | --- |
+| `model-discovery` (`--bare`) | ambient | 2 | 43 | **5** | `tokenSource: none` |
+| `model-discovery` | empty | 2 | 42 | 4 | `tokenSource: none` |
+| `model-discovery` | credentials only | 2 | 42 | 4 | `tokenSource: none` |
+| `command-discovery` | ambient | **4** | **68** | **5** | real account |
+| `command-discovery` | empty | 2 | 42 | 4 | `tokenSource: none` |
+| `command-discovery` | credentials only | 2 | **46** | 4 | real account |
+
+Three things follow, and only the first was anticipated.
+
+**`--bare` does not isolate.** The production doc comment on `DISCOVERY_ARGS` is right that
+`--bare` skips hooks, plugin sync and CLAUDE.md, and that was read as making model discovery
+immune. It is not: ambient bare discovery answers **five** models where an isolated one answers
+four. The extra is `claude-fable-5[1m]`, configured on the capturer's machine — and
+`crates/harness/tests/corpus/claude/2.1.233/model-discovery/events.jsonl` publishes it, with
+`default` resolving to `claude-opus-5[1m]`. The corpus has been asserting a model list that no
+clean install produces, on the exact reply the model picker decodes.
+
+**An empty home is not a neutral choice for every row.** It also logs the CLI out. For
+`model-discovery` that costs nothing, because `--bare` never reads credentials — the empty and
+credentials-only rows above are identical. For `command-discovery` it is the difference between
+Claude's command surface (46) and its logged-out one (42, `tokenSource: "none"`), which is a
+different observation wearing the same scenario name. So the requirement is set on
+`model-discovery` alone, and the others take a home seeded with `.credentials.json` —
+a home the recorder cannot validate, and therefore cannot enforce. Codex's precedent is the same
+shape: `needs_empty_codex_home` belongs to the deliberately logged-out row, not to every row.
+
+**A count moves without either the CLI or the config moving.** Two `command-discovery` captures
+minutes apart, same version and same seeded home, answered 46 and 48; the extra `extra-usage` and
+`usage-credits` are account state held on the server. This is the sharper form of the caveat
+[D86](closed.md) already carries: even holding version, machine and config fixed, a `commands` or
+`tools` count is a floor, never a number to diff.
+
+## What is still open
+
+- **The run scenarios have a mechanism but no evidence.** `--claude-config-dir` reaches every
+  Claude launch, run rows included, but no run capture has been recorded through it — so
+  `tools: 62` in the 2.1.233 sheet stands uncorrected, and the credentials-seeded procedure is
+  proven for discovery only. This needs a token-spending capture session.
+- **The pre-flag corpus cannot be repaired.** `2.1.228`, `2.1.229` and `2.1.233` were all recorded
+  ambient, and their CLI versions are no longer installed. Their sheets print
+  `env: (none set)`, which is true of what the recorder set and misleading about what the CLI
+  read; the 2.1.241 sheet's `env: CLAUDE_CONFIG_DIR=<CLAUDE_CONFIG_DIR>` is what distinguishes
+  them. Compare an isolated sheet against an ambient one and the contamination is a third axis on
+  top of the two [D85](closed.md) and D86 already name.
+- **Nothing forces isolation on the rows that cannot require it.** A capturer who omits
+  `--claude-config-dir` for `command-discovery` or a run scenario gets an ambient capture, and only
+  the manifest's missing variable records that they did.
+
 ## Why not `--safe-mode`
 
 Claude Code 2.1.233 has a `--safe-mode` flag that disables the same set (CLAUDE.md, skills,
@@ -98,11 +160,12 @@ The A/B above is token-free and takes about a minute:
 
 ```powershell
 cargo run -p comet-harness --bin comet-provider-capture -- claude command-discovery --cwd <DISPOSABLE> --raw-root .comet-provider-captures\raw\ambient --timeout-seconds 60
-$env:CLAUDE_CONFIG_DIR = "<EMPTY_DIR>"
-cargo run -p comet-harness --bin comet-provider-capture -- claude command-discovery --cwd <DISPOSABLE> --raw-root .comet-provider-captures\raw\isolated --timeout-seconds 60
-$env:CLAUDE_CONFIG_DIR = $null
+cargo run -p comet-harness --bin comet-provider-capture -- claude command-discovery --claude-config-dir <EMPTY_DIR> --cwd <DISPOSABLE> --raw-root .comet-provider-captures\raw\isolated --timeout-seconds 60
 ```
 
-Compare the `commands` array length in each raw `capture.json`. The original run's artifacts are
-under `.worktrees/claude-2-1-233-corpus/.comet-provider-captures/` — gitignored, and not worth
-preserving given the above.
+Compare the `commands` array length in each raw `capture.json`. Add a third run against a home
+holding only a copy of `.credentials.json` to separate "isolated" from "logged out" — without it
+the two collapse, which is the mistake the first draft of this page made.
+
+The runs behind the table above are gitignored under `.comet-provider-captures/` and not worth
+preserving; the promoted `claude/2.1.241` pair is the durable evidence.
