@@ -50,7 +50,7 @@ happens to show something harmless.
 Choose an immutable raw root for one observation. Token-free discovery, for example:
 
 ```powershell
-cargo run -p comet-harness --bin comet-provider-capture -- claude model-discovery --cwd <DISPOSABLE_DIR> --raw-root .comet-provider-captures\raw\<RUN> --timeout-seconds 30
+cargo run -p comet-harness --bin comet-provider-capture -- claude model-discovery --claude-config-dir <EMPTY_DIR> --cwd <DISPOSABLE_DIR> --raw-root .comet-provider-captures\raw\<RUN> --timeout-seconds 30
 cargo run -p comet-harness --bin comet-provider-capture -- codex model-discovery --cwd <DISPOSABLE_DIR> --codex-home <CODEX_HOME> --raw-root .comet-provider-captures\raw\<RUN> --timeout-seconds 30
 ```
 
@@ -58,6 +58,32 @@ Turn scenarios add the acknowledgment only after separate authorization. Resume 
 the exact prior `--resume-id`; Claude attachment needs `--attachment`; Codex
 `approval-on-request` needs an empty external `--approval-target`. Never improvise a substitute
 scenario when preflight or the protocol rejects the requested one.
+
+### Which configuration home a Claude capture reads
+
+Claude Code reads its configuration home regardless of `--cwd`, so an unisolated capture records
+the operator's skills, plugins, MCP servers, hooks and locally configured models as if they were
+the CLI's own surface ([D91](../debt/D91-captures-inherit-the-capturer-s-claude-config.md)).
+`--claude-config-dir` sets `CLAUDE_CONFIG_DIR` for the spawn; the manifest records the variable,
+so the archive shows which captures were isolated and which predate the flag.
+
+Two homes, and the difference is authentication:
+
+- **Empty** — required by `model-discovery`, which the binary refuses to run without it. `--bare`
+  never reads OAuth or the keychain, so an empty home costs that scenario nothing.
+- **Seeded with `.credentials.json` copied from the live home** — for `command-discovery` and the
+  run scenarios, which do read credentials. An empty home logs those out, which records Claude's
+  logged-out surface under a name that claims otherwise. The recorder cannot validate this home
+  (it is deliberately not empty), so it is the capturer's responsibility to seed it with nothing
+  else.
+
+Credentials never reach the wire, so no seeded value enters the archive; `account.email` and its
+siblings are withheld by the allowlist like any unlisted field.
+
+**A command count is not a version signal even under isolation.** Two `command-discovery` captures
+minutes apart on the same machine, same CLI and same seeded home answered 46 and 48 commands: the
+two extra were `extra-usage` and `usage-credits`, which track account state on the server. Read a
+`commands` or `tools` count as a floor on what the CLI offers, never as a number to diff.
 
 Sanitize each successful raw directory immediately into a new immutable staging name:
 

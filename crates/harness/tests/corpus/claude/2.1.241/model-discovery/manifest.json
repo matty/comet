@@ -1,0 +1,34 @@
+{
+  "captured_at_unix_ms": 1787493658318,
+  "cli_version": "2.1.241 (Claude Code)",
+  "command": {
+    "args": [
+      "--print",
+      "--input-format",
+      "stream-json",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--bare"
+    ],
+    "configured_env": {
+      "CLAUDE_CONFIG_DIR": "<CLAUDE_CONFIG_DIR>"
+    },
+    "creation_flags": 134217728,
+    "cwd": "<CWD>",
+    "kill_on_drop": true,
+    "program": "<HOME>\\.local\\bin\\claude.exe",
+    "stderr": "Piped",
+    "stdin": "Piped",
+    "stdout": "Piped"
+  },
+  "exit_code": 0,
+  "platform": {
+    "arch": "x86_64",
+    "os": "windows"
+  },
+  "provider": "claude",
+  "purpose": "capture Claude's token-free model initialize reply",
+  "scenario": "model-discovery",
+  "schema_version": 1
+}

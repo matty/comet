@@ -72,6 +72,7 @@ Scenarios:
 Options:
   --executable <PATH>              Override the provider executable
   --codex-home <PATH>              Override CODEX_HOME for Codex discovery
+  --claude-config-dir <PATH>       Override CLAUDE_CONFIG_DIR for a Claude scenario
   --cwd <DIR>                      Existing working directory for the scenario
   --approval-target <DIR>          Empty external target for Codex on-request approval
   --raw-root <PATH>                Raw output root [default: .comet-provider-captures/raw]
@@ -91,6 +92,7 @@ struct Args {
     scenario: Option<String>,
     executable: Option<PathBuf>,
     codex_home: Option<PathBuf>,
+    claude_config_dir: Option<PathBuf>,
     cwd: Option<PathBuf>,
     approval_target: Option<PathBuf>,
     raw_root: Option<PathBuf>,
@@ -135,6 +137,9 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--acknowledge-token-spend" => parsed.acknowledge_token_spend = true,
             "--executable" => parsed.executable = Some(value(&mut arguments, &argument)?.into()),
             "--codex-home" => parsed.codex_home = Some(value(&mut arguments, &argument)?.into()),
+            "--claude-config-dir" => {
+                parsed.claude_config_dir = Some(value(&mut arguments, &argument)?.into())
+            }
             "--cwd" => parsed.cwd = Some(value(&mut arguments, &argument)?.into()),
             "--approval-target" => {
                 parsed.approval_target = Some(value(&mut arguments, &argument)?.into())
@@ -269,6 +274,36 @@ fn capture_config_with_env(
         }
     }
 
+    if args.claude_config_dir.is_some() && spec.provider != Provider::Claude {
+        return Err(
+            "--claude-config-dir applies to Claude scenarios; Codex isolation is --codex-home."
+                .into(),
+        );
+    }
+
+    if requirements.needs_empty_claude_config {
+        // Empty, not merely explicit: a directory carrying settings, plugins or skills puts the
+        // operator's surface back into the reply, which is the whole of D91. Bare discovery
+        // never reads credentials, so emptiness costs this scenario nothing.
+        let Some(config_dir) = args.claude_config_dir.as_deref() else {
+            return Err(
+                "Claude model discovery needs an explicit empty --claude-config-dir directory."
+                    .into(),
+            );
+        };
+        let mut entries = std::fs::read_dir(config_dir).map_err(|_| {
+            "Claude model discovery needs an existing explicit empty --claude-config-dir \
+             directory."
+                .to_owned()
+        })?;
+        if entries.next().is_some() {
+            return Err(
+                "Claude model discovery needs an explicit empty --claude-config-dir directory."
+                    .into(),
+            );
+        }
+    }
+
     let resume_id = if requirements.needs_resume_id {
         Some(args.resume_id.clone().ok_or_else(|| {
             format!(
@@ -294,6 +329,7 @@ fn capture_config_with_env(
         purpose: spec.purpose,
         executable: args.executable,
         codex_home: args.codex_home,
+        claude_config_dir: args.claude_config_dir,
         cwd,
         resume_id,
         attachment,
@@ -431,6 +467,57 @@ mod tests {
             populated
                 .unwrap_err()
                 .contains("explicit empty --codex-home")
+        );
+    }
+
+    /// Break caught (D91): Claude's bare model discovery runs against the operator's own
+    /// `~/.claude`, so the recorded model list and command count carry that machine's plugins,
+    /// skills and settings. Measured 2026-08-23 on 2.1.241 from a disposable cwd: ambient
+    /// discovery answers 5 models and 43 commands, the same spawn under an empty config
+    /// directory answers 4 and 42 — the extra model is `claude-fable-5[1m]`, configured locally
+    /// and listed by no clean install.
+    #[test]
+    fn model_discovery_requires_an_explicit_empty_claude_config_dir() {
+        let missing = capture_config(token_free_args("claude", "model-discovery", None));
+        assert!(
+            missing
+                .unwrap_err()
+                .contains("explicit empty --claude-config-dir")
+        );
+
+        let nonempty = tempfile::tempdir().unwrap();
+        std::fs::write(nonempty.path().join("settings.json"), "{}").unwrap();
+        let mut populated_args = token_free_args("claude", "model-discovery", None);
+        populated_args.claude_config_dir = Some(nonempty.path().into());
+        assert!(
+            capture_config(populated_args)
+                .unwrap_err()
+                .contains("explicit empty --claude-config-dir")
+        );
+
+        let empty = tempfile::tempdir().unwrap();
+        let mut isolated_args = token_free_args("claude", "model-discovery", None);
+        isolated_args.claude_config_dir = Some(empty.path().into());
+        let config = capture_config(isolated_args).expect("an empty config directory is accepted");
+        assert_eq!(
+            config.claude_config_dir.as_deref(),
+            Some(empty.path()),
+            "the validated directory must reach the recorder, or the capture still spawns ambient"
+        );
+    }
+
+    /// Break caught: `--claude-config-dir` is accepted for a Codex row and silently sets
+    /// `CLAUDE_CONFIG_DIR` on a Codex launch, putting a variable in the manifest that had no
+    /// bearing on what was recorded.
+    #[test]
+    fn claude_config_dir_is_rejected_for_a_codex_scenario() {
+        let empty = tempfile::tempdir().unwrap();
+        let mut args = token_free_args("codex", "model-discovery", None);
+        args.claude_config_dir = Some(empty.path().into());
+        assert!(
+            capture_config(args)
+                .unwrap_err()
+                .contains("--claude-config-dir applies to Claude scenarios")
         );
     }
 
@@ -619,6 +706,7 @@ mod tests {
             .tempdir_in(std::env::current_dir().unwrap())
             .unwrap();
         let empty_codex_home = tempfile::tempdir().unwrap();
+        let empty_claude_config = tempfile::tempdir().unwrap();
         let attachment = tempfile::tempdir().unwrap().path().join("image.png");
         for spec in SCENARIOS {
             let provider = provider_key(spec.provider);
@@ -636,6 +724,9 @@ mod tests {
             }
             if spec.requirements.needs_empty_codex_home {
                 args.codex_home = Some(empty_codex_home.path().into());
+            }
+            if spec.requirements.needs_empty_claude_config {
+                args.claude_config_dir = Some(empty_claude_config.path().into());
             }
             let config = capture_config(args)
                 .unwrap_or_else(|error| panic!("{provider}/{}: {error}", spec.name));

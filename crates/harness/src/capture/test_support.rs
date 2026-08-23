@@ -113,6 +113,7 @@ pub(super) fn config(
         purpose: "local recorder test",
         executable: Some(executable),
         codex_home: None,
+        claude_config_dir: None,
         cwd: None,
         resume_id: None,
         attachment: None,

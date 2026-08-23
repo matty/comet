@@ -133,7 +133,8 @@ a field, and the sanitizer stops publishing it. A map nobody declared still publ
 (D77).
 
 `docs/providers/<provider>-<version>.md` is a generated **capability sheet**, one per corpus
-version directory (`claude-2.1.228.md`, `claude-2.1.229.md`, `codex-0.147.0.md` today): every
+version directory (`claude-2.1.228.md`, `claude-2.1.229.md`, `claude-2.1.233.md`,
+`claude-2.1.241.md`, `codex-0.147.0.md` today): every
 dotted field path the promoted corpus shows for that version, split by direction; the observed
 value vocabulary for a small declared set of discriminator paths (`.type`, `.method`, the
 tool-name paths, …); and the exact scenario list — argv, cwd and configured environment — the

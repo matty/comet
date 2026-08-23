@@ -534,6 +534,7 @@ fn capture_redaction_roots(
         home: crate::home_dir().map(|path| path.to_string_lossy().into_owned()),
         temp: Some(std::env::temp_dir().to_string_lossy().into_owned()),
         codex_home: command.configured_env.get("CODEX_HOME").cloned(),
+        claude_config_dir: command.configured_env.get("CLAUDE_CONFIG_DIR").cloned(),
         approval_target: approval_target.map(|path| path.to_string_lossy().into_owned()),
         trusted_powershell: trusted_powershell
             .map(|identity| identity.canonical.to_string_lossy().into_owned()),

@@ -43,6 +43,7 @@ pub async fn record(config: CaptureConfig) -> anyhow::Result<RawCapture> {
         resume_id: config.resume_id.clone(),
         attachment: config.attachment.clone(),
         codex_home: config.codex_home.clone(),
+        claude_config_dir: config.claude_config_dir.clone(),
         approval_target: config.approval_target.clone(),
     };
     match &spec.body {
@@ -120,14 +121,26 @@ fn derive_launch(
     executable: &Path,
     run_launch: fn(&Path, &RunRequest) -> LaunchDescriptor,
 ) -> anyhow::Result<(LaunchDescriptor, Option<RunRequest>)> {
-    match launch {
-        ScenarioLaunch::Discovery(build_launch) => Ok((build_launch(input, executable)?, None)),
+    let (mut launch, request) = match launch {
+        ScenarioLaunch::Discovery(build_launch) => (build_launch(input, executable)?, None),
         ScenarioLaunch::Run(build_request) => {
             let request = build_request(input)?;
             let launch = run_launch(executable, &request);
-            Ok((launch, Some(request)))
+            (launch, Some(request))
         }
+    };
+    // D91, applied here rather than inside the production launch builders: Comet itself never
+    // sets `CLAUDE_CONFIG_DIR`, so teaching `claude::run_launch` about it would put a
+    // capture-only concern on the runtime path — the boundary AGENTS.md asks to keep readable.
+    // Isolating through the environment also leaves argv byte-identical to production's, which
+    // is what makes a capture evidence of what Comet spawns (and is why `--safe-mode`, which
+    // changes argv, is the wrong tool; see the debt page).
+    if let Some(config_dir) = &input.claude_config_dir {
+        launch
+            .configured_env
+            .insert("CLAUDE_CONFIG_DIR".into(), config_dir.clone().into());
     }
+    Ok((launch, request))
 }
 
 /// The pre-spawn fence for Codex's `approval` and `approval-on-request` rows (both point their
@@ -395,6 +408,7 @@ mod tests {
                 ("PATH".into(), "secret ambient path".into()),
                 ("UNRELATED_SECRET".into(), "must not be captured".into()),
                 ("CODEX_HOME".into(), "safe configured home".into()),
+                ("CLAUDE_CONFIG_DIR".into(), "safe configured claude".into()),
             ]
             .into(),
             stdin: StdioMode::Inherit,
@@ -407,14 +421,72 @@ mod tests {
 
         let snapshot = CommandSnapshot::from_launch(&launch);
 
+        // D91: `CLAUDE_CONFIG_DIR` is captured for the same reason `CODEX_HOME` is — it decides
+        // what the CLI answers with, so a manifest that omits it cannot tell an isolated capture
+        // from one carrying the capturer's own plugins, skills and models.
         assert_eq!(
             snapshot.configured_env,
-            [("CODEX_HOME".into(), "safe configured home".into())].into()
+            [
+                ("CODEX_HOME".into(), "safe configured home".into()),
+                ("CLAUDE_CONFIG_DIR".into(), "safe configured claude".into()),
+            ]
+            .into()
         );
         assert_eq!(snapshot.stdin, StdioMode::Inherit);
         assert_eq!(snapshot.stdout, StdioMode::Null);
         assert_eq!(snapshot.stderr, StdioMode::Piped);
         assert!(!snapshot.kill_on_drop);
+    }
+
+    /// D91: an isolated config directory only isolates if it reaches the spawn. Every Claude
+    /// row — discovery and run alike — must carry it, because the contamination is not confined
+    /// to discovery: the `tools` array a run's `system`/`init` frame reports is the operator's
+    /// MCP and plugin roster too.
+    ///
+    /// Codex rows are absent by construction rather than by assertion here: the binary rejects
+    /// `--claude-config-dir` for them (`claude_config_dir_is_rejected_for_a_codex_scenario`), so
+    /// `input.claude_config_dir` is only ever `Some` on a Claude row.
+    ///
+    /// Break caught, verified by falsification: threading the directory into the discovery
+    /// launches only — every run row then fails here with "claude/fresh-text: CLAUDE_CONFIG_DIR
+    /// missing from the launch environment". Restored after confirming.
+    #[test]
+    fn every_claude_launch_carries_the_configured_claude_config_dir() {
+        let config_dir = std::env::temp_dir().join("comet-claude-config-pin");
+        let exe = absolute_program("claude");
+
+        for spec in SCENARIOS
+            .iter()
+            .filter(|spec| spec.provider == Provider::Claude)
+        {
+            let input = ScenarioInput {
+                cwd: Some(std::env::temp_dir()),
+                resume_id: spec
+                    .requirements
+                    .needs_resume_id
+                    .then(|| "corpus-pin-resume-id".to_owned()),
+                attachment: spec
+                    .requirements
+                    .needs_attachment
+                    .then(|| PathBuf::from("tiny.png")),
+                approval_target: None,
+                codex_home: None,
+                claude_config_dir: Some(config_dir.clone()),
+            };
+
+            let (launch, _request) =
+                derive_launch(&spec.launch, &input, &exe, crate::claude::run_launch)
+                    .unwrap_or_else(|error| panic!("claude/{}: {error}", spec.name));
+
+            assert_eq!(
+                launch
+                    .configured_env
+                    .get(std::ffi::OsStr::new("CLAUDE_CONFIG_DIR")),
+                Some(&std::ffi::OsString::from(&config_dir)),
+                "claude/{}: CLAUDE_CONFIG_DIR missing from the launch environment",
+                spec.name
+            );
+        }
     }
 
     /// Break caught: selecting command discovery's non-bare launch for model discovery,
@@ -516,6 +588,43 @@ mod tests {
         assert_eq!(
             persisted["redaction_roots"]["cwd"],
             json!(capture.command.cwd)
+        );
+    }
+
+    /// D91: the archive must be able to answer "was this capture isolated?" without knowing who
+    /// ran it. That takes both halves — the manifest records the variable, and the redaction
+    /// roots carry the directory so its path leaves as `<CLAUDE_CONFIG_DIR>` rather than as one
+    /// machine's layout.
+    ///
+    /// Break caught, verified by falsification: recording the variable in `configured_env` but
+    /// leaving it out of `capture_redaction_roots` — the manifest assertion passes and this one
+    /// fails with the raw temp path, which is exactly the shape that would publish it.
+    #[tokio::test]
+    async fn recorder_records_an_isolated_claude_config_dir_and_redacts_its_path() {
+        let raw = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(
+            "model-discovery",
+            fixture_path("fake-claude"),
+            "claude",
+            raw.path(),
+        );
+        cfg.claude_config_dir = Some(config_dir.path().into());
+        let capture = record(cfg).await.unwrap();
+
+        assert_eq!(
+            capture
+                .command
+                .configured_env
+                .get("CLAUDE_CONFIG_DIR")
+                .map(String::as_str),
+            Some(config_dir.path().to_string_lossy().as_ref()),
+            "the manifest must record which configuration home the CLI read"
+        );
+        assert_eq!(
+            capture.redaction_roots.claude_config_dir.as_deref(),
+            Some(config_dir.path().to_string_lossy().as_ref()),
+            "without the redaction root the operator's path publishes verbatim"
         );
     }
 
@@ -1358,41 +1467,11 @@ mod tests {
                 continue;
             }
 
-            // `cwd` only needs to be present (comparison is presence-only, see this test's own
-            // doc comment); the two neutral-cwd discovery rows ignore it entirely in production
-            // and always spawn from a temp directory regardless, so `Some(temp_dir())` here is
-            // behaviourally identical to leaving it `None` for them.
-            let input = ScenarioInput {
-                cwd: Some(std::env::temp_dir()),
-                resume_id: spec
-                    .requirements
-                    .needs_resume_id
-                    .then(|| "corpus-pin-resume-id".to_owned()),
-                attachment: spec
-                    .requirements
-                    .needs_attachment
-                    .then(|| PathBuf::from("tiny.png")),
-                approval_target: spec
-                    .requirements
-                    .needs_approval_target
-                    .then(|| PathBuf::from("target-dir")),
-                // Every Codex discovery row's launch builder needs a codex_home or falls back to
-                // auto-discovering one from the real environment this test happens to run in —
-                // supplying one explicitly keeps the test hermetic regardless of what's installed
-                // on the machine running it.
-                codex_home: (spec.provider == Provider::Codex && !spec.requirements.spends_tokens)
-                    .then(|| std::env::temp_dir().join("comet-corpus-pin-codex-home")),
-            };
-
             let (exe, run_launch): (PathBuf, fn(&Path, &RunRequest) -> LaunchDescriptor) =
                 match spec.provider {
                     Provider::Claude => (absolute_program("claude"), crate::claude::run_launch),
                     Provider::Codex => (absolute_program("codex"), crate::codex::run_launch),
                 };
-
-            let (derived_launch, _request) = derive_launch(&spec.launch, &input, &exe, run_launch)
-                .unwrap_or_else(|error| panic!("{label}: derive_launch failed: {error}"));
-            let derived = CommandSnapshot::from_launch(&derived_launch);
 
             for scenario_dir in &scenario_dirs {
                 let manifest_path = scenario_dir.directory.join("manifest.json");
@@ -1410,6 +1489,50 @@ mod tests {
                             manifest_path.display()
                         )
                     });
+
+                // Derived per manifest, not once per row, because isolation is a capture-time
+                // parameter like `cwd`: a row can hold both a pre-D91 ambient capture and a
+                // later isolated one, and a single derived launch cannot match both key sets.
+                // Reading `CLAUDE_CONFIG_DIR`'s presence from the manifest under test asks the
+                // right question of each — "does production build the launch this capture
+                // recorded" — and leaves "was it isolated at all" to the binary's own
+                // requirement gate, which is where it can actually be enforced.
+                //
+                // `cwd` only needs to be present (comparison is presence-only, see this test's
+                // own doc comment); the neutral-cwd discovery rows ignore it entirely in
+                // production and always spawn from a temp directory regardless, so
+                // `Some(temp_dir())` here is behaviourally identical to leaving it `None`.
+                let input = ScenarioInput {
+                    cwd: Some(std::env::temp_dir()),
+                    resume_id: spec
+                        .requirements
+                        .needs_resume_id
+                        .then(|| "corpus-pin-resume-id".to_owned()),
+                    attachment: spec
+                        .requirements
+                        .needs_attachment
+                        .then(|| PathBuf::from("tiny.png")),
+                    approval_target: spec
+                        .requirements
+                        .needs_approval_target
+                        .then(|| PathBuf::from("target-dir")),
+                    // Every Codex discovery row's launch builder needs a codex_home or falls
+                    // back to auto-discovering one from the real environment this test happens
+                    // to run in — supplying one explicitly keeps the test hermetic regardless
+                    // of what's installed on the machine running it.
+                    codex_home: (spec.provider == Provider::Codex
+                        && !spec.requirements.spends_tokens)
+                        .then(|| std::env::temp_dir().join("comet-corpus-pin-codex-home")),
+                    claude_config_dir: corpus_command
+                        .configured_env
+                        .contains_key("CLAUDE_CONFIG_DIR")
+                        .then(|| std::env::temp_dir().join("comet-corpus-pin-claude-config")),
+                };
+
+                let (derived_launch, _request) =
+                    derive_launch(&spec.launch, &input, &exe, run_launch)
+                        .unwrap_or_else(|error| panic!("{label}: derive_launch failed: {error}"));
+                let derived = CommandSnapshot::from_launch(&derived_launch);
 
                 // Names which version disagreed, not just the row — the whole point of checking
                 // every version instead of the first is a message that says which one broke.
