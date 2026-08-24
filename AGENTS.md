@@ -200,6 +200,41 @@ current when the rev changes.
 (`--resume` after resolving a conflict). Full procedure:
 `.agents/workflows/sync-upstream.md`.
 
+### Upstream commits are ports, not picks
+
+Assume every upstream commit needs a manual port. On 2026-08-24, all eight upstream PRs in
+the batch conflicted **at their first commit** — the fork has diverged most in `crates/ui`,
+which is where nearly all upstream activity happens. A clean `git cherry-pick` is the
+exception now, so budget for reading the upstream intent and rewriting it against our code.
+
+**Upstream renamed the product to Zeron; this fork keeps Comet** (`b0be3dea`, recorded
+not-applicable in the ledger). Directory layout is mostly unaffected — `crates/*/src/` paths
+are identical on both sides — so the rename shows up as mechanical token substitution inside
+otherwise-shared files:
+
+| Upstream | Here |
+| --- | --- |
+| `zeron_proto::`, `zeron_ui::`, … | `comet_proto::`, `comet_ui::`, … |
+| `ZERON_*` env vars | `COMET_*` |
+| `icons::ZERON_LOGO` | `icons::COMET_LOGO` |
+| user-visible "Zeron" strings | "Comet" |
+| `apps/zeron/`, `dist/zeron.*` | `apps/comet/`, `dist/comet.*` |
+
+Comments referencing zeron's own web sources (`// zeron settings.shortcuts.tsx row: …`) are
+upstream's design provenance; keep them accurate or drop them rather than renaming the file
+they point at.
+
+**Do not rename this fork to match.** It was measured: of 45 new commits, 26 touched only
+identically-named paths and 1 touched a renamed directory, yet every PR still conflicted.
+Renaming would not have made them apply — it would only trade a seconds-long substitution
+for a data-directory migration and a churn of every `COMET_*` env var this file documents.
+
+**A clean cherry-pick is not a working one.** Upstream tests arrive carrying assumptions
+about fields we may not have. `2119bf0c` applied with no conflict and failed to compile:
+it asserts a `Chat::source_context` field introduced by a *different* commit in its own PR.
+Build and run anything you pick before believing it — a conflict-free apply proves only that
+the text merged.
+
 ## Windows ships, and no PR ever tests it
 
 `release.yml` builds `comet.exe` on `windows-latest` and gates the release on that job, so
