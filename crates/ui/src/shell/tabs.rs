@@ -107,6 +107,31 @@ pub(super) fn next_after_close(order: &[String], closed: &str) -> Option<String>
     })
 }
 
+/// The tab one step from `selected` in the strip's visual `order`, wrapping
+/// at both ends. Pure.
+///
+/// With nothing selected — the new-session canvas — cycling enters the strip
+/// at the end it would have wrapped to: the first tab going forward, the last
+/// going back. A selection that has since left the strip (archived from
+/// another device mid-cycle) is treated the same way rather than dead-ending.
+pub(super) fn cycle_target(
+    order: &[String],
+    selected: Option<&str>,
+    forward: bool,
+) -> Option<String> {
+    if order.is_empty() {
+        return None;
+    }
+    let at = selected.and_then(|id| order.iter().position(|c| c == id));
+    let next = match (at, forward) {
+        (Some(at), true) => (at + 1) % order.len(),
+        (Some(at), false) => (at + order.len() - 1) % order.len(),
+        (None, true) => 0,
+        (None, false) => order.len() - 1,
+    };
+    Some(order[next].clone())
+}
+
 impl Shell {
     /// The space's tabs in VISUAL order (manual drag order over creation order).
     fn tab_ids(&self, space_id: &str, cx: &App) -> Vec<String> {
@@ -150,6 +175,41 @@ impl Shell {
             self.state.update(cx, |s, cx| s.select_chat(next, cx));
         }
         self.archive_chat(owner, cx);
+    }
+
+    /// Ctrl+Tab / Ctrl+Shift+Tab: step through the session tab strip in the
+    /// order it is drawn, manual drag order included. Selection is immediate
+    /// (no MRU overlay held open on the modifier) — one press, one session.
+    ///
+    /// Cycling reads the same [`Shell::tab_ids`] the strip renders from, so
+    /// the order can never drift from the tabs the user is looking at.
+    ///
+    /// Chat-scoped, like the panel toggles: gpui dispatches a matched binding
+    /// before any `on_key_down`, so an unscoped cycle would fire underneath
+    /// Settings (yanking the user off the page mid-record, since these are the
+    /// very keys the shortcuts table invites them to press) or underneath the
+    /// add-space palette, stranding the overlay over a session never picked.
+    pub(super) fn cycle_session(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if !matches!(self.route, Route::Chat) || self.add_space.is_some() {
+            return;
+        }
+        let (order, selected) = {
+            let state = self.state.read(cx);
+            let space = state.selected_space.clone().map(|space| space.local_id);
+            let order = space
+                .as_deref()
+                .map(|space| self.tab_ids(space, cx))
+                .unwrap_or_default();
+            let selected = state
+                .selected_chat
+                .as_ref()
+                .map(|chat| chat.local_id.clone());
+            (order, selected)
+        };
+        if let Some(target) = cycle_target(&order, selected.as_deref(), forward) {
+            self.state
+                .update(cx, |state, cx| state.select_chat(Some(target), cx));
+        }
     }
 
     /// Track the drop slot while a tab is dragged over the strip (150ms sibling
@@ -634,10 +694,41 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_after_close, resolve_tab_order};
+    use super::{cycle_target, next_after_close, resolve_tab_order};
 
     fn ids(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Cycling order is the strip the user is looking at, so the only thing
+    /// left to get wrong is the arithmetic at the ends — and a wrap that
+    /// silently dead-ends is invisible until someone holds the shortcut down.
+    #[test]
+    fn cycling_wraps_at_both_ends_and_enters_from_the_canvas() {
+        let order = ids(&["a", "b", "c"]);
+        assert_eq!(cycle_target(&order, Some("a"), true).as_deref(), Some("b"));
+        assert_eq!(cycle_target(&order, Some("b"), true).as_deref(), Some("c"));
+        // Forward off the end wraps to the first tab.
+        assert_eq!(cycle_target(&order, Some("c"), true).as_deref(), Some("a"));
+        assert_eq!(cycle_target(&order, Some("c"), false).as_deref(), Some("b"));
+        // Back off the front wraps to the last tab.
+        assert_eq!(cycle_target(&order, Some("a"), false).as_deref(), Some("c"));
+        // From the new-session canvas, enter at the end we would have
+        // wrapped to rather than dead-ending.
+        assert_eq!(cycle_target(&order, None, true).as_deref(), Some("a"));
+        assert_eq!(cycle_target(&order, None, false).as_deref(), Some("c"));
+        // A selection that has left the strip behaves like no selection.
+        assert_eq!(
+            cycle_target(&order, Some("gone"), true).as_deref(),
+            Some("a")
+        );
+        // Nothing to cycle through.
+        assert_eq!(cycle_target(&[], Some("a"), true), None);
+        // A single tab always lands on itself.
+        assert_eq!(
+            cycle_target(&ids(&["solo"]), Some("solo"), true).as_deref(),
+            Some("solo")
+        );
     }
 
     #[test]

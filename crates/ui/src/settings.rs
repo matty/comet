@@ -115,15 +115,19 @@ pub enum ShortcutId {
     ToggleTerminal,
     FocusSearch,
     NewSession,
+    NextSession,
+    PrevSession,
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 5] = [
+    pub const ALL: [ShortcutId; 7] = [
         ShortcutId::ToggleSidebar,
         ShortcutId::ToggleChanges,
         ShortcutId::ToggleTerminal,
         ShortcutId::FocusSearch,
         ShortcutId::NewSession,
+        ShortcutId::NextSession,
+        ShortcutId::PrevSession,
     ];
 
     /// Row label (comet lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
@@ -134,6 +138,8 @@ impl ShortcutId {
             ShortcutId::ToggleTerminal => "Toggle terminal",
             ShortcutId::FocusSearch => "Focus sidebar search",
             ShortcutId::NewSession => "New session",
+            ShortcutId::NextSession => "Next session",
+            ShortcutId::PrevSession => "Previous session",
         }
     }
 
@@ -144,6 +150,10 @@ impl ShortcutId {
             ShortcutId::ToggleTerminal => "mod-j",
             ShortcutId::FocusSearch => "mod-p",
             ShortcutId::NewSession => "mod-n",
+            // Deliberately ctrl-, not mod-: on macOS "mod" becomes cmd and
+            // cmd-tab is the OS application switcher, which never reaches us.
+            ShortcutId::NextSession => "ctrl-tab",
+            ShortcutId::PrevSession => "ctrl-shift-tab",
         }
     }
 }
@@ -158,6 +168,8 @@ pub struct KeymapConfig {
     pub toggle_terminal: String,
     pub focus_search: String,
     pub new_session: String,
+    pub next_session: String,
+    pub prev_session: String,
 }
 
 impl Default for KeymapConfig {
@@ -168,6 +180,8 @@ impl Default for KeymapConfig {
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
             focus_search: ShortcutId::FocusSearch.default_combo().into(),
             new_session: ShortcutId::NewSession.default_combo().into(),
+            next_session: ShortcutId::NextSession.default_combo().into(),
+            prev_session: ShortcutId::PrevSession.default_combo().into(),
         }
     }
 }
@@ -180,6 +194,8 @@ impl KeymapConfig {
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
             ShortcutId::FocusSearch => &self.focus_search,
             ShortcutId::NewSession => &self.new_session,
+            ShortcutId::NextSession => &self.next_session,
+            ShortcutId::PrevSession => &self.prev_session,
         }
     }
 
@@ -190,6 +206,8 @@ impl KeymapConfig {
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
             ShortcutId::FocusSearch => self.focus_search = combo,
             ShortcutId::NewSession => self.new_session = combo,
+            ShortcutId::NextSession => self.next_session = combo,
+            ShortcutId::PrevSession => self.prev_session = combo,
         }
     }
 
@@ -474,6 +492,35 @@ mod tests {
         assert_eq!(d.right_pane_width, 520.0);
         assert_eq!(d.terminal_height, 280.0);
         assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
+    }
+
+    /// `Keystroke::parse` only rejects an unknown *modifier* — it accepts
+    /// "", "ctrl-" and even "ctrl-nosuchkey", so `is_ok()` alone would pass
+    /// against a typo in the key and bind a keystroke that can never fire.
+    /// Assert the parsed shape instead: the modifier we asked for, and the
+    /// exact key name.
+    #[test]
+    fn session_cycling_combos_parse_to_the_keystroke_they_name() {
+        let next = gpui::Keystroke::parse(&platform_combo(ShortcutId::NextSession.default_combo()))
+            .expect("next-session combo parses");
+        assert_eq!(next.key, "tab");
+        assert!(next.modifiers.control);
+        assert!(!next.modifiers.shift);
+
+        let prev = gpui::Keystroke::parse(&platform_combo(ShortcutId::PrevSession.default_combo()))
+            .expect("prev-session combo parses");
+        assert_eq!(prev.key, "tab");
+        assert!(prev.modifiers.control);
+        assert!(prev.modifiers.shift);
+    }
+    /// Cycling must not be reachable through the OS application switcher's
+    /// keys: on macOS `mod-` becomes `cmd-`, and cmd-tab never reaches us.
+    #[test]
+    fn session_cycling_defaults_to_control_not_the_platform_modifier() {
+        assert_eq!(ShortcutId::NextSession.default_combo(), "ctrl-tab");
+        assert_eq!(ShortcutId::PrevSession.default_combo(), "ctrl-shift-tab");
+        assert!(!ShortcutId::NextSession.default_combo().contains("mod-"));
+        assert!(!ShortcutId::PrevSession.default_combo().contains("mod-"));
     }
 
     #[test]
