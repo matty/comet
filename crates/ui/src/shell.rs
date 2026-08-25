@@ -1834,14 +1834,23 @@ impl Shell {
             .update(cx, |state, cx| state.select_chat(Some(chat_id), cx));
     }
 
-    /// Whether an overlay that owns the keyboard is up — the add-space
-    /// palette or a composer picker popover (harness/model, reasoning, repo,
-    /// branch…). Session-nav shortcuts (cycle/jump/archive) go quiet
-    /// underneath one: gpui runs a matched binding before any `on_key_down`,
-    /// so an unguarded jump would switch sessions UNDER the open popover,
-    /// stranding it over a session the user never picked.
+    /// Whether an overlay that owns the keyboard is up — any shell-owned
+    /// dialog, context menu or palette ([`Self::overlay_open`]), or a composer
+    /// picker popover (harness/model, reasoning, repo, branch…). Session-nav
+    /// shortcuts (cycle/jump/archive) go quiet underneath one: gpui runs a
+    /// matched binding before any `on_key_down`, so an unguarded jump would
+    /// switch sessions UNDER the open surface, stranding it over a session the
+    /// user never picked.
+    ///
+    /// It delegates to `overlay_open` rather than naming the shell surfaces
+    /// again. Hand-listing them here is what this fixes: the first version
+    /// named only the add-space palette, so with "Delete session?" up, ⌘1
+    /// switched session and ⌘⇧A archived one — while the dialog kept the
+    /// `ServerRef` it captured and deleted THAT chat on confirm. Nothing
+    /// tears a stale dialog down on a jump; `on_state_changed` clears them
+    /// only when the selected *server* changes, not the chat.
     pub(super) fn overlay_owns_keyboard(&self, cx: &App) -> bool {
-        self.add_space.is_some() || self.composer.read(cx).pickers().read(cx).is_open()
+        self.overlay_open() || self.composer.read(cx).pickers().read(cx).is_open()
     }
 
     /// Track the held modifiers so the sidebar can show its jump hints. Only a
@@ -5177,6 +5186,67 @@ mod tests {
             None,
             "Chat-origin actions already have coherent navigation history"
         );
+    }
+
+    /// Session-nav shortcuts must go quiet under EVERY shell-owned overlay,
+    /// not just the add-space palette. `overlay_owns_keyboard` shipped naming
+    /// one of the eight surfaces `overlay_open` already lists, so with
+    /// "Delete session?" up, ⌘1 switched session and ⌘⇧A archived one out
+    /// from under the dialog — which then deleted the chat it had captured.
+    ///
+    /// Pinned by source scan for the reason `new_session_action_…` below is:
+    /// `overlay_owns_keyboard` takes `&App`, and `crates/ui` has no gpui test
+    /// context, so the guard cannot be called here. What matters is not the
+    /// boolean but that the two lists CANNOT drift, so that is what is pinned.
+    #[test]
+    fn the_keyboard_guard_defers_to_the_one_overlay_list() {
+        let source = include_str!("shell.rs");
+        let production_source = source
+            .split_once("#[cfg(test)]")
+            .expect("shell test-module boundary")
+            .0;
+
+        let guard = production_source
+            .split_once("pub(super) fn overlay_owns_keyboard")
+            .expect("overlay_owns_keyboard")
+            .1
+            .split_once("\n    }")
+            .expect("end of overlay_owns_keyboard")
+            .0;
+        assert!(
+            guard.contains("self.overlay_open()"),
+            "overlay_owns_keyboard must defer to overlay_open, never re-list \
+             the shell surfaces: a second hand-written list is what let a jump \
+             fire under the delete-confirm dialog"
+        );
+
+        // And the list it defers to must still cover the surfaces that make
+        // that dangerous — a confirm dialog holds a ServerRef captured when it
+        // opened, so a jump underneath it retargets what the user is looking
+        // at without retargeting what Enter will do.
+        let list = production_source
+            .split_once("fn overlay_open")
+            .expect("overlay_open")
+            .1
+            .split_once("\n    }")
+            .expect("end of overlay_open")
+            .0;
+        for field in [
+            "chat_menu",
+            "rename_dialog",
+            "delete_confirm",
+            "space_menu",
+            "rename_space_dialog",
+            "delete_space_confirm",
+            "add_space",
+            "space_dropdown_open",
+        ] {
+            assert!(
+                list.contains(field),
+                "overlay_open must still name `{field}`; session-nav shortcuts \
+                 are gated on this list"
+            );
+        }
     }
 
     #[test]
