@@ -76,6 +76,14 @@ pub enum EngineError {
     Harness(#[from] comet_harness::HarnessError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// Another engine already owns this data directory.
+    ///
+    /// Its own variant rather than an `Other` string so a surface can offer
+    /// the one action that resolves it. As prose it reached the startup gate
+    /// verbatim — a filesystem path, a pid and an env var name, none of which
+    /// tell a user what to do.
+    #[error("another engine is already running on {data_dir} (pid {pid})")]
+    AlreadyRunning { data_dir: String, pid: String },
     /// The workspace tombstone committed, but one local artifact cleanup leg
     /// failed. Diagnostics stay in tracing and finalization will retry.
     #[error("chat cleanup is pending retry")]

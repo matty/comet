@@ -41,11 +41,14 @@ impl InstanceLock {
             if matches!(error.raw_os_error(), Some(32 | 33)) {
                 let holder = std::fs::read_to_string(&path).unwrap_or_default();
                 let holder = holder.trim();
-                return EngineError::Other(format!(
-                    "another comet engine is already running on {} (pid {}); stop it or use a different data dir (COMET_DATA_DIR)",
-                    data_dir.display(),
-                    if holder.is_empty() { "unknown" } else { holder },
-                ));
+                return EngineError::AlreadyRunning {
+                    data_dir: data_dir.display().to_string(),
+                    pid: if holder.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        holder.to_string()
+                    },
+                };
             }
             EngineError::Io(error)
         })?;
@@ -75,12 +78,14 @@ impl InstanceLock {
                     Some(libc::EWOULDBLOCK) => {
                         let holder = std::fs::read_to_string(&path).unwrap_or_default();
                         let holder = holder.trim();
-                        return Err(EngineError::Other(format!(
-                            "another comet engine is already running on {} (pid {}); \
-                             stop it or use a different data dir (COMET_DATA_DIR)",
-                            data_dir.display(),
-                            if holder.is_empty() { "unknown" } else { holder },
-                        )));
+                        return Err(EngineError::AlreadyRunning {
+                            data_dir: data_dir.display().to_string(),
+                            pid: if holder.is_empty() {
+                                "unknown".to_string()
+                            } else {
+                                holder.to_string()
+                            },
+                        });
                     }
                     // Anything else (ENOLCK, filesystem without flock, …) is an
                     // environment problem, not a second engine — surface it as-is.
