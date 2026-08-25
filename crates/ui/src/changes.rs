@@ -50,6 +50,10 @@ const STICKY_FILE_HEADER_BLUR: f32 = 16.0;
 /// to rows ghosting through the blur than light text is on a dark tint.
 const STICKY_FILE_HEADER_TINT_ALPHA_DARK: f32 = 0.40;
 const STICKY_FILE_HEADER_TINT_ALPHA_LIGHT: f32 = 0.85;
+// The relationship is the design, not the two numbers: retuning them is fine,
+// inverting them is the bug. A const assert catches that at build time — the
+// runtime form clippy rejects as constant-folded, and rightly.
+const _: () = assert!(STICKY_FILE_HEADER_TINT_ALPHA_LIGHT > STICKY_FILE_HEADER_TINT_ALPHA_DARK);
 pub const HUNK_HEADER_HEIGHT: f32 = 28.0;
 pub const DIFF_LINE_HEIGHT: f32 = 21.0;
 pub const NOTICE_HEIGHT: f32 = 24.0;
@@ -3332,10 +3336,6 @@ rename to new_name.rs
             assert_eq!(glass.hover_bg, theme.glass_hover());
             assert_eq!(glass.border, theme.border);
         }
-
-        // Light needs the heavier tint: dark glyphs ghost through a blur that
-        // light glyphs on a dark tint survive.
-        assert!(STICKY_FILE_HEADER_TINT_ALPHA_LIGHT > STICKY_FILE_HEADER_TINT_ALPHA_DARK);
     }
 
     #[test]
