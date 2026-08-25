@@ -1923,6 +1923,30 @@ async fn drive_run(
     const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
     let mut idle_since: Option<tokio::time::Instant> = None;
     let steerable = harness.capabilities().supports_steering;
+    // TURN-QUIESCE WATCHDOG. A harness that loses a turn's Done — the adapter
+    // never settles the prompt even though the agent finished — strands the
+    // session Working forever: the heartbeat above keeps the row fresh by
+    // design, and the idle reaper below only arms once `idle_since` is set,
+    // which a missing Done never does.
+    //
+    // This is NOT the stall timeout the comment above rejects, and the
+    // difference is the whole point. That one would END a run on silence,
+    // which is wrong because agents are legitimately quiet for minutes. This
+    // one never ends the run and never errors anything: it parks the turn
+    // exactly as a Done would — segment finalized Complete, status Idle,
+    // child and mailbox warm — and only when the fold proves nothing is in
+    // flight. A false trip therefore costs a status dip, not content.
+    //
+    // `COMET_TURN_QUIESCE_MS` overrides the window; 0 disables it.
+    let quiesce_after: Option<std::time::Duration> = match std::env::var("COMET_TURN_QUIESCE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(ms) => Some(std::time::Duration::from_millis(ms)),
+        None => Some(std::time::Duration::from_secs(120)),
+    };
+    let mut last_stream_activity = tokio::time::Instant::now();
 
     let final_status = loop {
         let mut event: AgentEvent = tokio::select! {
@@ -1945,6 +1969,62 @@ async fn drive_run(
             },
             _ = live_heartbeat.tick() => {
                 inner.touch_session(&chat_id);
+                continue;
+            }
+            // Turn-quiesce watchdog (see the knob above). Armed only when the
+            // fold proves nothing is in flight: an unresolved tool part is a
+            // command still running — legitimately silent for minutes, the
+            // case the rejected stall timeout got wrong — and an unresolved
+            // input part is a question awaiting the user. An EMPTY fold still
+            // arms (a boundary that no output ever follows is one of the wedge
+            // shapes); it just parks without writing a segment, since an empty
+            // finalize would leave a stub entry.
+            //
+            // Upstream exempts its live-plan chip here, a singleton that never
+            // resolves. We have no equivalent: our plan surface is
+            // `MessagePart::Checklist`, its own variant with a fixed id, so it
+            // never matches the `Tool` arm and needs no exemption.
+            _ = tokio::time::sleep_until(
+                last_stream_activity + quiesce_after.unwrap_or_default()
+            ), if quiesce_after.is_some()
+                && idle_since.is_none()
+                && !interrupted
+                && steerable
+                && !folded.iter().any(|p| matches!(
+                    p,
+                    MessagePart::Tool { resolved: false, .. }
+                        | MessagePart::Input { resolved: false, .. }
+                )) =>
+            {
+                tracing::warn!(
+                    chat = %chat_id,
+                    quiet_ms = quiesce_after.unwrap_or_default().as_millis() as u64,
+                    "turn quiesced: stream silent after completed output with no                      turn-end; parking (suspected missing harness Done)"
+                );
+                if !folded.is_empty() || writer.is_some() {
+                    if let Err(err) = finish_segment(
+                        doc_ref,
+                        writer.take(),
+                        &entry_id,
+                        &device_id,
+                        segment_started,
+                        &folded,
+                        MessageStatus::Complete,
+                    ) {
+                        tracing::warn!(
+                            chat = %chat_id,
+                            error = %err,
+                            "quiesce segment finish failed"
+                        );
+                    }
+                    inner.note_message(&chat_id, &folded_text(&folded));
+                }
+                folded.clear();
+                dirty = false;
+                entry_id = new_id();
+                segment_started = now_ms();
+                idle_since = Some(tokio::time::Instant::now());
+                inner.set_status(&chat_id, SessionStatus::Idle, false);
                 continue;
             }
             // Idle reaper (comet SESSION_IDLE_MS): a parked persistent session
@@ -2003,8 +2083,10 @@ async fn drive_run(
         };
 
         // Any stream activity proves the run is alive — keep the session's
-        // freshness inside the UI's 45s staleness window (throttled).
+        // freshness inside the UI's 45s staleness window (throttled), and push
+        // the quiesce watchdog's window out.
         inner.touch_session(&chat_id);
+        last_stream_activity = tokio::time::Instant::now();
         // Empty reasoning deltas are PURE heartbeats: redacted thinking and
         // tool-input-generation windows stream them with no text, and a
         // persistent session emits them between turns too. They fold to
