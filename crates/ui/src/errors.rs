@@ -13,6 +13,7 @@
 //!
 //! See `.agents/rules/user-facing-errors.md`.
 
+use comet_engine::EngineError;
 use comet_rpc::RpcError;
 
 /// What the user was waiting for. Names the thing in the user's vocabulary,
@@ -73,6 +74,34 @@ pub fn load_failure(what: Loading, err: &RpcError) -> String {
         // `EngineError`'s Display and is not written for a user, so it stays
         // in the log.
         RpcError::Failed(_) => format!("Couldn't load {noun}."),
+    }
+}
+
+/// Why the engine did not start, for the startup gate.
+///
+/// Distinct from [`load_failure`] because nothing is loading yet: this is the
+/// app with no engine behind it, and the gate is the whole screen. The gate
+/// carries a Retry control, so the copy is a summary and the affordance is the
+/// hint — except for the one case where retrying is the wrong advice.
+///
+/// The raw failure is an `anyhow` chain from `EngineHandle::bootstrap`. It was
+/// rendered verbatim until this existed: `format!("{err:#}")` put a filesystem
+/// path, a pid and `COMET_DATA_DIR` on screen when a second copy of Comet was
+/// already running. Downcasting recovers the variant so the one actionable
+/// case can say what to do instead.
+pub fn engine_start_failure(err: &anyhow::Error) -> String {
+    tracing::error!(error = ?err, "engine bootstrap failed");
+    match err.downcast_ref::<EngineError>() {
+        // Retrying fails identically until the other copy exits, so the copy
+        // names the action rather than inviting another attempt.
+        Some(EngineError::AlreadyRunning { .. }) => {
+            "Comet is already running. Switch to the open window, or quit it and try again."
+                .to_string()
+        }
+        // Everything else is a genuine assembly failure — a corrupt store, a
+        // directory Comet cannot write to. The user cannot act on which one,
+        // and the diagnosis is already in the log.
+        _ => "Comet's engine couldn't start.".to_string(),
     }
 }
 
@@ -154,6 +183,41 @@ pub fn decode_failure(what: Loading, err: &serde_json::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The startup gate is the whole screen when it shows, and it used to show
+    /// a filesystem path, a pid and `COMET_DATA_DIR` — everything the rule
+    /// forbids, in the one place a first-run user is most likely to see it.
+    #[test]
+    fn a_second_running_copy_is_named_not_dumped() {
+        let err = anyhow::Error::new(EngineError::AlreadyRunning {
+            data_dir: "/home/someone/.local/share/comet".into(),
+            pid: "48213".into(),
+        });
+        let copy = engine_start_failure(&err);
+
+        assert!(copy.contains("already running"), "names the cause: {copy}");
+        assert!(copy.contains("quit it"), "names the action: {copy}");
+        for leak in ["/home/someone", "48213", "COMET_DATA_DIR", "pid"] {
+            assert!(!copy.contains(leak), "leaked {leak:?} into: {copy}");
+        }
+    }
+
+    /// Every other assembly failure carries a developer-facing Display —
+    /// `EngineError` prefixes its arms `store:`, `doc:`, `io:` — so the copy is
+    /// generic on purpose and the diagnosis stays in the log.
+    #[test]
+    fn other_startup_failures_never_reach_the_gate_verbatim() {
+        let poison = "store: sqlite disk image is malformed";
+        for err in [
+            anyhow::Error::new(EngineError::Other(poison.into())),
+            anyhow::Error::msg(poison),
+        ] {
+            let copy = engine_start_failure(&err);
+            assert_eq!(copy, "Comet's engine couldn't start.");
+            assert!(!copy.contains("sqlite"), "leaked into: {copy}");
+            assert!(!copy.contains("store:"), "leaked a log prefix: {copy}");
+        }
+    }
 
     /// The whole point: nothing from the error's message may reach the string
     /// the user reads. This is the regression that put serde's decode text in

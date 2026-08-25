@@ -37,6 +37,7 @@ use comet_proto::{
 use comet_rpc::{RpcClient, RpcError, RpcService, connect_ws, memory_client, methods};
 
 use crate::comments::DiffComment;
+use crate::errors;
 use crate::remotes::{
     AddRemoteRequest, InstallationRemotePairer, RemoteAddCoordinator, RemoteAddState,
     run_remote_add_operation,
@@ -1087,8 +1088,13 @@ impl AppState {
         cx.spawn(async move |cx| {
             let outcome = match boot.await {
                 Ok(Ok(handle)) => Ok(handle),
-                Ok(Err(err)) => Err(format!("{err:#}")),
-                Err(join_err) => Err(join_err.to_string()),
+                // Translate, never render: the gate showed this chain verbatim
+                // — path, pid and env var — until `engine_start_failure`.
+                Ok(Err(err)) => Err(errors::engine_start_failure(&err)),
+                Err(join_err) => {
+                    tracing::error!(error = %join_err, "engine bootstrap task failed");
+                    Err("Comet's engine couldn't start.".to_string())
+                }
             };
             // NB: at the pinned rev `Entity::update(&mut AsyncApp)` returns the
             // closure's value directly (no Result) — AsyncApp implements
@@ -1096,7 +1102,8 @@ impl AppState {
             state.update(cx, |s, cx| match outcome {
                 Ok(handle) => s.attach_engine(handle, cx),
                 Err(message) => {
-                    tracing::error!(%message, "engine bootstrap failed");
+                    // Already logged with its diagnostic detail at the
+                    // translation site; `message` here is user-facing copy.
                     s.connection = ConnectionStatus::Failed(message);
                     cx.notify();
                 }
