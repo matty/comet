@@ -192,13 +192,29 @@ pub fn splash_overlay(theme: &Theme, fading: bool, view: EntityId, cx: &mut App)
     let content = div()
         .absolute()
         .inset_0()
-        .bg(theme.bg)
+        // Chrome tone, not the page tone: the boot overlay reads as part of
+        // the window rather than as a page. On macOS `glass()` is the frost
+        // tint over the blurred background; everywhere else `GLASS_ALPHA` is
+        // 1.0 and it collapses to `surface`, so this is a tone change rather
+        // than a blur off macOS — correct on both without a platform branch.
+        .bg(theme.glass())
         .flex()
         .flex_col()
         .items_center()
         .justify_center()
-        .gap(px(28.0))
-        .child(comet_mark_loader("boot-splash", theme, 64.0, view, cx))
+        // 12, not the 28 the 64px mark needed: the spinner is a fraction of
+        // its height, and the old gap left the word visibly adrift.
+        .gap(px(12.0))
+        // Cell 2.5 matches the status spinners (the blocked indicator, the
+        // changes strip) rather than the larger in-content ones — the splash
+        // is chrome now, not a hero.
+        .child(gradient_spinner(
+            "boot-splash-spinner",
+            theme,
+            2.5,
+            view,
+            cx,
+        ))
         .child(loading_word(theme));
     if fading {
         motion::splash_out("boot-splash-out", content).into_any_element()
