@@ -63,7 +63,9 @@ actions!(
         ToggleChanges,
         AddSpacePalette,
         FocusSearch,
-        NewSession
+        NewSession,
+        NextSession,
+        PrevSession
     ]
 );
 
@@ -189,6 +191,16 @@ fn shell_key_bindings(keymap: &KeymapConfig) -> Vec<KeyBinding> {
         KeyBinding::new(
             &valid_or_default(&keymap.new_session, "mod-n"),
             NewSession,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.next_session, "ctrl-tab"),
+            NextSession,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.prev_session, "ctrl-shift-tab"),
+            PrevSession,
             None,
         ),
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
@@ -4188,6 +4200,12 @@ impl Render for Shell {
                 if matches!(this.route, Route::Chat) {
                     this.focus_search(window, cx);
                 }
+            }))
+            .on_action(cx.listener(|this, _: &NextSession, _, cx| {
+                this.cycle_session(true, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PrevSession, _, cx| {
+                this.cycle_session(false, cx);
             }))
             .on_action(cx.listener(|this, _: &NewSession, window, cx| {
                 let origin = this.route;

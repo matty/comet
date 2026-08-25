@@ -129,6 +129,8 @@ fn description(id: ShortcutId) -> &'static str {
         ShortcutId::ToggleTerminal => "Show or hide the terminal for the current session.",
         ShortcutId::FocusSearch => "Jump to the sidebar search field.",
         ShortcutId::NewSession => "Open a blank session canvas to start a new session.",
+        ShortcutId::NextSession => "Step to the next session tab.",
+        ShortcutId::PrevSession => "Step to the previous session tab.",
     }
 }
 
