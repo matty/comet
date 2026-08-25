@@ -592,8 +592,10 @@ impl AgentAccounts {
         };
 
         // codex prints the authorize URL (to stderr as of 0.142 — scan both
-        // streams) and usually opens the browser itself; grab it so the app can
-        // open it too.
+        // streams); grab it so the app can open the single authorization tab.
+        // On unix the CLI's own browser-open is suppressed by the `BROWSER`
+        // no-op above, so this is the only open; elsewhere the CLI still opens
+        // its own.
         let output = Arc::new(Mutex::new(String::new()));
         for pipe in [
             child
