@@ -988,6 +988,16 @@ impl AppState {
         self.chats.iter().find(|c| c.id == id)
     }
 
+    /// The chat the Archive session shortcut acts on: the selected one, unless
+    /// it is already archived. The shortcut archives and never unarchives, so
+    /// an archived chat is left alone. Pure.
+    pub fn archivable_selected_chat(&self) -> Option<ServerRef> {
+        if self.selected_chat_row()?.archived {
+            return None;
+        }
+        self.selected_chat.clone()
+    }
+
     pub fn gate(&self) -> GatePhase {
         gate_phase(&self.connection)
     }
@@ -2142,6 +2152,25 @@ mod tests {
             state.overview_chats(Utc::now()).len(),
             "the count in the chrome and the rows in the list are one set"
         );
+    }
+
+    #[test]
+    fn archive_shortcut_only_targets_an_open_active_chat() {
+        let mut state = AppState::new();
+        let mut archived = chat("a", 0, None);
+        archived.archived = true;
+        state.apply_chats(vec![archived, chat("b", 1, None)]);
+        // No chat open: nothing to archive.
+        assert_eq!(state.archivable_selected_chat(), None);
+        // The open active chat is the target.
+        state.selected_chat = Some(ServerRef::new(state.current_server_id(), "b"));
+        assert_eq!(
+            state.archivable_selected_chat(),
+            Some(ServerRef::new(state.current_server_id(), "b"))
+        );
+        // An already archived chat stays put — the shortcut never unarchives.
+        state.selected_chat = Some(ServerRef::new(state.current_server_id(), "a"));
+        assert_eq!(state.archivable_selected_chat(), None);
     }
 
     #[test]
