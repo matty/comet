@@ -10,6 +10,7 @@ use super::*;
 use crate::errors;
 use crate::motion::TAB_SLIDE;
 use crate::pickers::{breadcrumbs, browser_rows, parent_path};
+use crate::settings::{JUMP_SLOTS, ShortcutId, display_combo};
 use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
 use comet_proto::{ChatIndicator, Device, FolderListing, Space};
 use gpui::FocusHandle;
@@ -2416,14 +2417,27 @@ impl Shell {
             .selected_chat
             .clone()
             .map(|id| id.local_id);
+        // Re-checked at render so the chips drop the FRAME a popover opens,
+        // not on the next modifier event — the jumps are suppressed under it.
+        let jump_hints = self.jump_hints && !self.overlay_owns_keyboard(cx);
+        let keymap = self.settings.keymap.clone();
         rows.into_iter()
-            .map(|(status, chat, scope, branch)| {
+            .enumerate()
+            .map(|(slot, (status, chat, scope, branch))| {
                 let time_ago: SharedString =
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
                 let is_selected = selected.as_deref() == Some(chat.id.as_str());
                 let height = super::chat_row_height(&scope);
                 let harness = chat.config.as_ref().map(|c| c.harness);
                 let click_id = chat.id.clone();
+                // Only rows a jump slot can reach wear a chip; row 10 onward
+                // keeps its time-ago.
+                let jump_label: Option<SharedString> = if jump_hints {
+                    let combo = keymap.get(ShortcutId::JumpSession(slot));
+                    (slot < JUMP_SLOTS && !combo.is_empty()).then(|| display_combo(combo).into())
+                } else {
+                    None
+                };
                 let element = self.render_chat_row(
                     chat.id.clone(),
                     transcript::single_line(
@@ -2440,6 +2454,7 @@ impl Shell {
                     // that's exclusively a sidebar-search concept.
                     None,
                     false,
+                    jump_label,
                     move |this: &mut Shell, cx: &mut Context<Shell>| {
                         let id = click_id.clone();
                         this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));

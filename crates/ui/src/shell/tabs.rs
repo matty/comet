@@ -190,7 +190,7 @@ impl Shell {
     /// very keys the shortcuts table invites them to press) or underneath the
     /// add-space palette, stranding the overlay over a session never picked.
     pub(super) fn cycle_session(&mut self, forward: bool, cx: &mut Context<Self>) {
-        if !matches!(self.route, Route::Chat) || self.add_space.is_some() {
+        if !matches!(self.route, Route::Chat) || self.overlay_owns_keyboard(cx) {
             return;
         }
         let (order, selected) = {

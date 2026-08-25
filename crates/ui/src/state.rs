@@ -974,6 +974,20 @@ impl AppState {
         rows
     }
 
+    /// The chat a jump shortcut opens: the row at `slot` (zero-based) of the
+    /// sidebar's active list. A slot past the end of a short list opens
+    /// nothing. Pure.
+    ///
+    /// Counting happens in [`Self::overview_chats`] itself rather than in a
+    /// jump-only copy of the list, so the numbering can never drift from the
+    /// rows on screen — that function already applies `sidebar_scope`, and it
+    /// is the same call the sidebar builds its rows from.
+    pub fn jump_target(&self, now: DateTime<Utc>, slot: usize) -> Option<String> {
+        self.overview_chats(now)
+            .get(slot)
+            .map(|(_, chat)| chat.id.clone())
+    }
+
     pub fn session_for(&self, chat_id: &str) -> Option<&Session> {
         self.sessions.iter().find(|s| s.chat_id == chat_id)
     }
@@ -2152,6 +2166,41 @@ mod tests {
             state.overview_chats(Utc::now()).len(),
             "the count in the chrome and the rows in the list are one set"
         );
+    }
+
+    #[test]
+    fn jump_slots_count_the_rows_the_sidebar_draws() {
+        let now = Utc::now();
+        let mut state = AppState::new();
+        let mut in_space = chat("a", 0, Some(3));
+        in_space.space_id = Some("s1".into());
+        let mut other_space = chat("b", 1, Some(2));
+        other_space.space_id = Some("s2".into());
+        let mut archived = chat("gone", 2, Some(1));
+        archived.space_id = Some("s1".into());
+        archived.archived = true;
+        state.apply_spaces(vec![
+            space("s1", "dev", "/tmp/s1", 0),
+            space("s2", "dev", "/tmp/s2", 1),
+        ]);
+        state.apply_chats(vec![in_space, other_space, archived]);
+
+        let order: Vec<&str> = state
+            .overview_chats(now)
+            .iter()
+            .map(|(_, c)| c.id.as_str())
+            .collect();
+        assert_eq!(state.jump_target(now, 0).as_deref(), Some(order[0]));
+        assert_eq!(state.jump_target(now, 1).as_deref(), Some(order[1]));
+        // The archived row is not in the active list, so no slot reaches it.
+        assert_eq!(order.len(), 2);
+        assert_eq!(state.jump_target(now, 2), None);
+        assert_eq!(state.jump_target(now, 8), None);
+
+        // A scoped sidebar renumbers: the slots count the visible rows only.
+        state.sidebar_scope = SidebarScope::Space("s2".into());
+        assert_eq!(state.jump_target(now, 0).as_deref(), Some("b"));
+        assert_eq!(state.jump_target(now, 1), None);
     }
 
     #[test]

@@ -668,6 +668,9 @@ impl Shell {
             selected,
             Some(query),
             highlighted,
+            // Search results are their own list — the jump slots number the
+            // sidebar's active rows, not these.
+            None,
             move |this: &mut Shell, cx: &mut Context<Shell>| {
                 this.open_search_result(SearchHit::Chat(click_id.clone()), cx);
             },

@@ -120,6 +120,26 @@ pub fn conflict_owner(keymap: &KeymapConfig, id: ShortcutId, combo: &str) -> Opt
         .find(|&other| other != id && keymap.get(other) == combo)
 }
 
+/// The cards the shortcuts table renders, in order. Seventeen flat rows read
+/// as one undifferentiated wall once the nine jump slots exist.
+const GROUP_ORDER: [&str; 3] = ["Panels", "Sessions", "Jump to session"];
+
+/// The section a shortcut's row renders under. A TOTAL match: a shortcut added
+/// later must pick a group, and lands on the page by construction.
+fn group(id: ShortcutId) -> &'static str {
+    match id {
+        ShortcutId::ToggleSidebar
+        | ShortcutId::ToggleChanges
+        | ShortcutId::ToggleTerminal
+        | ShortcutId::FocusSearch => "Panels",
+        ShortcutId::NewSession
+        | ShortcutId::NextSession
+        | ShortcutId::PrevSession
+        | ShortcutId::ArchiveSession => "Sessions",
+        ShortcutId::JumpSession(_) => "Jump to session",
+    }
+}
+
 /// One-line purpose copy per shortcut (comet lib/shortcuts.ts
 /// `SHORTCUT_DEFINITIONS` descriptions, verbatim).
 fn description(id: ShortcutId) -> &'static str {
@@ -132,6 +152,9 @@ fn description(id: ShortcutId) -> &'static str {
         ShortcutId::NextSession => "Step to the next session tab.",
         ShortcutId::PrevSession => "Step to the previous session tab.",
         ShortcutId::ArchiveSession => "Move the current session to the archived shelf.",
+        // One line per slot would repeat itself nine times; the ordinal is
+        // already in the row's label.
+        ShortcutId::JumpSession(_) => "Open the session at this place in the sidebar list.",
     }
 }
 
@@ -142,7 +165,10 @@ impl Render for ShortcutsPage {
         let recording = self.recording;
         let customized = self.keymap != KeymapConfig::default();
 
-        let rows = ShortcutId::ALL.into_iter().enumerate().map(|(ix, id)| {
+        // `ix` is the id's position in `ShortcutId::ALL` (element ids stay
+        // unique across the cards); `gx` is the row's place in its own card,
+        // which owns the separator rule.
+        let row = |ix: usize, gx: usize, id: ShortcutId, cx: &mut Context<Self>| {
             let combo = self.keymap.get(id).to_string();
             let is_recording = recording == Some(id);
             let non_default = combo != id.default_combo();
@@ -161,7 +187,7 @@ impl Render for ShortcutsPage {
                 .flex_row()
                 .items_center()
                 .gap(px(20.0))
-                .when(ix > 0, |el| el.border_t_1().border_color(theme.border))
+                .when(gx > 0, |el| el.border_t_1().border_color(theme.border))
                 .child(
                     div()
                         .flex_1()
@@ -237,7 +263,25 @@ impl Render for ShortcutsPage {
                         }))
                         .child(chip_text),
                 )
-        });
+        };
+        let cards: Vec<_> = GROUP_ORDER
+            .into_iter()
+            .map(|title| {
+                let rows: Vec<_> = ShortcutId::ALL
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, id)| group(*id) == title)
+                    .enumerate()
+                    .map(|(gx, (ix, id))| row(ix, gx, id, cx))
+                    .collect();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .child(widgets::field_label(&theme, title))
+                    .child(widgets::section_card(&theme).children(rows))
+            })
+            .collect();
 
         // Helper line stays in the muted tone even for a rejected conflict —
         // the message names the specific clash (comet settings.shortcuts.tsx).
@@ -311,7 +355,14 @@ impl Render for ShortcutsPage {
                                     .child(SharedString::from("Restore defaults"))
                             }),
                     )
-                    .child(widgets::section_card(&theme).mt(px(32.0)).children(rows))
+                    .child(
+                        div()
+                            .mt(px(32.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(24.0))
+                            .children(cards),
+                    )
                     .child(
                         div()
                             .mt(px(12.0))
@@ -328,6 +379,27 @@ impl Render for ShortcutsPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The page renders exactly GROUP_ORDER's cards, and `group` is a total
+    /// match, so these two halves must agree or a shortcut would exist with
+    /// nowhere on the page to appear. Holds the pair together.
+    #[test]
+    fn every_shortcut_lands_in_a_rendered_group() {
+        for id in ShortcutId::ALL {
+            assert!(
+                GROUP_ORDER.contains(&group(id)),
+                "{id:?} groups as {:?}, which no card renders",
+                group(id)
+            );
+        }
+        // And no card is empty — an unused heading would draw a bare label.
+        for title in GROUP_ORDER {
+            assert!(
+                ShortcutId::ALL.into_iter().any(|id| group(id) == title),
+                "no shortcut lands in the {title:?} card"
+            );
+        }
+    }
 
     #[test]
     fn recording_outcomes() {
