@@ -23,8 +23,16 @@ existing `upstream` points elsewhere — it never overwrites it), fetches `main`
 commits not already resolved by Git patch-equivalence or the ledger.
 
 Select one commit (`2`), a list (`1,4`), or a range (`2-5`). A blank selection is a
-bookkeeping-only run. Unselected commits are classified `deferred` (reappear next run) or
-`not-applicable` with a reason (hidden permanently, as are implemented ones).
+bookkeeping-only run. Unselected commits are classified `deferred` (reappear next run),
+`not-applicable` with a reason, or `adapted` with a reference (both hidden permanently, as
+are implemented ones).
+
+**`adapted` is for a change we hand-ported.** The fork has diverged far enough that a clean
+cherry-pick is the exception, not the rule — see AGENTS.md, "Upstream commits are ports,
+not picks". Such a commit never earns an `implemented` row, because the helper only writes
+that for a pick it made itself; without `adapted` the only way to stop it reappearing every
+run was to call it `not-applicable`, which records the opposite of what happened. Give it
+the PR or commit that carried the change.
 
 After `y`/`yes` confirms the summary, the helper creates a `sync/upstream-YYYY-MM-DD`
 branch, cherry-picks chronologically, records and commits the ledger, pushes to `origin`,

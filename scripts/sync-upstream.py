@@ -27,7 +27,18 @@ class HeadState:
     subject: str
 
 
-OUTCOMES = frozenset({"implemented", "not-applicable", "deferred"})
+OUTCOMES = frozenset({"implemented", "adapted", "not-applicable", "deferred"})
+# Outcomes that record the change as PRESENT in this fork, and so may carry
+# the local commit that landed it. "implemented" is a clean cherry-pick by
+# this helper; "adapted" is a hand-port, which is the normal case now that
+# the fork has diverged (see AGENTS.md, "Upstream commits are ports, not
+# picks"). Both are resolved and never re-listed.
+LANDED = frozenset({"implemented", "adapted"})
+# The ledger gained "adapted" at schema 2. A reader that predates it would
+# treat those rows as an unsupported outcome, so a v2 file is deliberately
+# unreadable to an older helper rather than silently mis-parsed.
+CURRENT_SCHEMA = 2
+READABLE_SCHEMAS = frozenset({1, 2})
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -238,9 +249,10 @@ def _parse_decision(value: object, context: str) -> RunDecision:
     local_commit = None
     if local_value is not None:
         local_commit = _require_sha(local_value, f"{context}.local_commit")
-    if outcome != "implemented" and local_commit is not None:
+    if outcome not in LANDED and local_commit is not None:
         raise SyncError(
-            f"{context}.local_commit is only valid for implemented commits."
+            f"{context}.local_commit is only valid for commits that landed "
+            f"here (implemented or adapted)."
         )
     return RunDecision(upstream_sha, subject, outcome, note, local_commit)
 
@@ -328,7 +340,7 @@ def load_ledger(path: Path) -> Ledger:
         raise SyncError(f"Upstream sync ledger is invalid JSON: {error.msg}.") from error
     data = _require_object(document, "ledger")
     _require_keys(data, {"schema_version", "commits", "runs"}, "ledger")
-    if data["schema_version"] != 1:
+    if data["schema_version"] not in READABLE_SCHEMAS:
         raise SyncError(
             f"Unsupported upstream sync ledger schema version: "
             f"{data['schema_version']}."
@@ -357,7 +369,10 @@ def _decision_document(decision: RunDecision) -> dict[str, object]:
 
 def serialize_ledger(ledger: Ledger) -> str:
     document = {
-        "schema_version": ledger.schema_version,
+        # Always written at the current schema: a run that records an
+        # "adapted" row must not claim to be a v1 file an older helper
+        # would misread.
+        "schema_version": CURRENT_SCHEMA,
         "commits": {
             sha: {
                 "upstream_sha": entry.upstream_sha,
@@ -457,11 +472,13 @@ def _validate_pending(pending: PendingRun) -> None:
             "Pending considered commits must match selections and classifications."
         )
     if any(
-        decision.outcome not in {"deferred", "not-applicable"}
+        decision.outcome not in {"deferred", "not-applicable", "adapted"}
         or decision.local_commit is not None
         for decision in pending.classifications
     ):
-        raise SyncError("Pending classifications must be deferred or not-applicable.")
+        raise SyncError(
+            "Pending classifications must be deferred, not-applicable or adapted."
+        )
     for upstream_sha, local_commit in pending.local_commits.items():
         _require_sha(upstream_sha, "pending.local_commits upstream SHA")
         _require_sha(local_commit, "pending.local_commits local SHA")
@@ -799,7 +816,7 @@ def classify_unselected(
         while True:
             answer = input_fn(
                 f"Commit {commit.short_oid} was not selected: "
-                "[d]efer/[n]ot-applicable [d] "
+                "[d]efer/[n]ot-applicable/[a]dapted [d] "
             ).strip().lower()
             if answer in {"", "d", "defer", "deferred"}:
                 decisions.append(
@@ -810,6 +827,23 @@ def classify_unselected(
                         "Deferred during interactive review.",
                     )
                 )
+                break
+            if answer in {"a", "adapted"}:
+                while True:
+                    reason = input_fn(
+                        "How this landed here (name the PR or commit): "
+                    ).strip()
+                    if reason:
+                        decisions.append(
+                            RunDecision(
+                                commit.oid,
+                                commit.subject,
+                                "adapted",
+                                reason,
+                            )
+                        )
+                        break
+                    print("A reference is required.", file=output)
                 break
             if answer in {"n", "not-applicable"}:
                 while True:
@@ -828,7 +862,7 @@ def classify_unselected(
                         break
                     print("Reason is required.", file=output)
                 break
-            print("Choose d or n.", file=output)
+            print("Choose d, n or a.", file=output)
     return decisions
 
 
@@ -938,11 +972,12 @@ def format_pr(run: SyncRun) -> tuple[str, str]:
     title = f"Sync upstream commits ({run.date})"
     headings = {
         "implemented": "Implemented",
+        "adapted": "Adapted (hand-ported)",
         "not-applicable": "Not applicable",
         "deferred": "Deferred",
     }
     sections = []
-    for outcome in ("implemented", "not-applicable", "deferred"):
+    for outcome in ("implemented", "adapted", "not-applicable", "deferred"):
         decisions = [
             decision for decision in run.decisions if decision.outcome == outcome
         ]
@@ -1063,6 +1098,7 @@ def _print_run_summary(
     else:
         print("(none)", file=output)
     for outcome, heading in (
+        ("adapted", "Adapted (already hand-ported here):"),
         ("not-applicable", "Not applicable:"),
         ("deferred", "Deferred:"),
     ):

@@ -22,7 +22,7 @@ LOCAL = "b" * 40
 
 def valid_document():
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "commits": {
             UPSTREAM: {
                 "upstream_sha": UPSTREAM,
@@ -110,8 +110,18 @@ class LedgerValidationTests(unittest.TestCase):
 
     def test_rejects_unknown_schema_version(self):
         document = valid_document()
-        document["schema_version"] = 2
+        document["schema_version"] = 3
         self.assert_invalid(document, "schema version")
+
+    def test_reads_the_previous_schema_and_writes_the_current_one(self):
+        """A v1 ledger predates "adapted" but is still valid to read; saving
+        it stamps the current schema so an older helper stops reading a file
+        that may now carry adapted rows."""
+        document = valid_document()
+        document["schema_version"] = 1
+        ledger = self.load_document(document)
+        written = json.loads(sync.serialize_ledger(ledger))
+        self.assertEqual(written["schema_version"], sync.CURRENT_SCHEMA)
 
     def test_rejects_short_upstream_sha(self):
         document = valid_document()
@@ -230,6 +240,39 @@ class LedgerPolicyTests(unittest.TestCase):
         )
         self.assertIn("Reason is required", output.getvalue())
 
+    def test_adapted_records_where_the_change_actually_landed(self):
+        """A hand-port is the normal case for a diverged fork, and it has no
+        cherry-pick to record. "adapted" is how it stops being re-listed
+        forever without lying that it was inapplicable."""
+        commit = self.commit("a", "Stuck-Working watchdog")
+        answers = iter(["a", "", "Hand-ported in PR #92."])
+        output = io.StringIO()
+        decisions = sync.classify_unselected(
+            [commit], set(), lambda prompt: next(answers), output
+        )
+        self.assertEqual(decisions[0].outcome, "adapted")
+        self.assertEqual(decisions[0].note, "Hand-ported in PR #92.")
+        self.assertIn("A reference is required", output.getvalue())
+
+    def test_an_adapted_commit_is_never_listed_again(self):
+        """The whole point: unlike "deferred", an adapted commit is resolved."""
+        commit = self.commit("a", "Already ported")
+        ledger = sync.Ledger(
+            schema_version=sync.CURRENT_SCHEMA,
+            commits={
+                commit.oid: sync.LedgerEntry(
+                    commit.oid,
+                    commit.subject,
+                    "adapted",
+                    "Hand-ported in PR #92.",
+                    "2026-08-25",
+                    None,
+                )
+            },
+            runs=(),
+        )
+        self.assertEqual(sync.filter_resolved([commit], ledger), [])
+
     def test_selected_commits_are_not_classified(self):
         commit = self.commit("a", "Selected")
 
@@ -251,7 +294,7 @@ class LedgerPolicyTests(unittest.TestCase):
             [commit], set(), lambda prompt: next(answers), output
         )
         self.assertEqual(decisions[0].outcome, "deferred")
-        self.assertIn("Choose d or n", output.getvalue())
+        self.assertIn("Choose d, n or a", output.getvalue())
 
     def test_build_sync_run_preserves_exact_upstream_order(self):
         newest = self.commit("c", "Newest")
