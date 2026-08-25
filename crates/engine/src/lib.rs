@@ -524,67 +524,223 @@ fn local_device_name() -> String {
     )
 }
 
+/// How many times to re-read after losing a publish race, or after failing to
+/// displace an empty file because another process holds it open.
+///
+/// Higher than the two or three a pure publish race needs, because Windows
+/// makes displacement itself contended: `rename` and `remove_file` fail with
+/// `ERROR_ACCESS_DENIED` while any other handle is open on the file, so several
+/// repairers can bounce off each other before one gets through. Not theory —
+/// 8 concurrent openers reproduced it, and the first version of this function
+/// failed startup outright when it happened.
+const DEVICE_ID_ATTEMPTS: usize = 24;
+
+/// Backoff between attempts. Paid only while repairing a corrupt identity and
+/// only under contention; the common path never sleeps.
+const DEVICE_ID_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(3);
+
 /// Stable per-installation device id, persisted at `{data_dir}/device-id`.
+///
+/// Reads it, minting one on first run and
+/// RECOVERING a zero-byte file rather than refusing to start.
+///
+/// The empty case is not hypothetical. Builds before the temp-file publish
+/// (`13cd956f`) wrote the id with `std::fs::write`, which creates, truncates,
+/// then writes: a crash or a full disk between the truncate and the write
+/// leaves nothing behind. Treating that as a hard error stranded the whole
+/// installation permanently — the engine refused to start and no amount of
+/// restarting helped, because nothing ever rewrote the file.
+///
+/// A fresh id is safe to mint here: this is the CRDT authorship string, not
+/// the pairing identity. That is `device-identity.pem` in `comet-identity`,
+/// a different file, so recovering does not invalidate a paired LAN peer.
+/// The cost is that entries written before the crash keep the old author id.
 fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
     std::fs::create_dir_all(data_dir)?;
     let path = data_dir.join("device-id");
-    match std::fs::read_to_string(&path) {
-        Ok(id) if !id.trim().is_empty() => return Ok(id.trim().to_string()),
-        Ok(_) => {
-            return Err(EngineError::Other(format!(
-                "invalid device identity {}: file is empty",
-                path.display()
-            )));
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
-    }
-
-    let id = new_id();
-    let temp_path = data_dir.join(format!(
-        ".device-id.tmp-{}-{}",
-        std::process::id(),
-        new_id()
-    ));
-    let write_result = (|| -> Result<(), EngineError> {
-        let mut temp = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)?;
-        temp.write_all(id.as_bytes())?;
-        temp.sync_all()?;
-        Ok(())
-    })();
-    if let Err(err) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(err);
-    }
-
-    // Publish only fully-written bytes and never replace another process's
-    // winner. A hard link is the portable create-if-absent primitive already
-    // used for local-profile identity; losers can immediately read the winner.
-    let publish_result = std::fs::hard_link(&temp_path, &path);
-    let _ = std::fs::remove_file(&temp_path);
-    match publish_result {
-        Ok(()) => Ok(id),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let winner = std::fs::read_to_string(&path)?;
-            if winner.trim().is_empty() {
-                Err(EngineError::Other(format!(
-                    "invalid device identity {}: file is empty",
-                    path.display()
-                )))
-            } else {
-                Ok(winner.trim().to_string())
+    for _ in 0..DEVICE_ID_ATTEMPTS {
+        match std::fs::read_to_string(&path) {
+            Ok(id) if !id.trim().is_empty() => return Ok(id.trim().to_string()),
+            // Empty: displace it so the create-if-absent publish below has a
+            // clear path. Renaming rather than deleting keeps the failure
+            // recoverable if we die here — the next start finds no file and
+            // mints one, which is the same outcome by a different route.
+            Ok(_) => {
+                if !displace_empty_device_id(data_dir, &path)? {
+                    // Another repairer holds the file open. Back off and
+                    // re-read: they are most likely about to publish, and
+                    // taking their result is the whole point.
+                    std::thread::sleep(DEVICE_ID_RETRY_PAUSE);
+                    continue;
+                }
             }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
         }
+
+        let id = new_id();
+        let temp_path = data_dir.join(format!(
+            ".device-id.tmp-{}-{}",
+            std::process::id(),
+            new_id()
+        ));
+        let write_result = (|| -> Result<(), EngineError> {
+            let mut temp = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)?;
+            temp.write_all(id.as_bytes())?;
+            temp.sync_all()?;
+            Ok(())
+        })();
+        if let Err(err) = write_result {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(err);
+        }
+
+        // Publish only fully-written bytes and never replace another process's
+        // winner. A hard link is the portable create-if-absent primitive already
+        // used for local-profile identity; losers re-read on the next pass.
+        let publish_result = std::fs::hard_link(&temp_path, &path);
+        let _ = std::fs::remove_file(&temp_path);
+        match publish_result {
+            Ok(()) => return Ok(id),
+            // Someone published first, or the empty file is still there with a
+            // repairer mid-flight. Re-read on the next pass.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                std::thread::sleep(DEVICE_ID_RETRY_PAUSE);
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(EngineError::Other(format!(
+        "could not establish a device identity at {}",
+        path.display()
+    )))
+}
+
+/// Move a zero-byte `device-id` aside so the create-if-absent publish can run.
+///
+/// Deliberately a rename and not the file lock upstream reaches for here
+/// (`8f2e5b0`-era `flock` plus a Windows share-mode open): that is
+/// platform-specific code on the one platform this repository ships and never
+/// tests in CI. Rename converges without it — two processes racing to repair
+/// both end at the create-if-absent publish, where one wins and the other
+/// re-reads. See `docs/debt/` for the residual window this leaves.
+fn displace_empty_device_id(data_dir: &Path, path: &Path) -> Result<bool, EngineError> {
+    let aside = data_dir.join(format!(".device-id.empty-{}", new_id()));
+    match std::fs::rename(path, &aside) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&aside);
+            Ok(true)
+        }
+        // Another process displaced it first; the path is clear either way.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        // Windows refuses to rename a file another handle has open
+        // (ERROR_ACCESS_DENIED). That is contention, not corruption, so the
+        // caller backs off and re-reads instead of failing the startup.
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => Ok(false),
         Err(err) => Err(err.into()),
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zero-byte `device-id` is what a pre-`13cd956f` crash leaves behind.
+    /// Erroring on it stranded the installation with no way out, so the whole
+    /// point of the recovery is that this returns an id at all.
+    #[test]
+    fn an_empty_device_id_is_recovered_rather_than_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device-id");
+        std::fs::write(&path, "").unwrap();
+
+        let id = load_or_create_device_id(dir.path()).expect("empty file recovers");
+
+        assert!(!id.trim().is_empty(), "a real id is minted");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            id,
+            "the recovered id is persisted, so the next start is stable"
+        );
+    }
+
+    /// Whitespace-only counts as empty for the same reason a zero-byte file
+    /// does — a partial write is not an identity.
+    #[test]
+    fn a_whitespace_only_device_id_is_recovered_too() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("device-id"),
+            "   
+",
+        )
+        .unwrap();
+        let id = load_or_create_device_id(dir.path()).expect("whitespace recovers");
+        assert!(!id.trim().is_empty());
+    }
+
+    /// The recovery must never fire on a healthy file: displacing a good id
+    /// would silently re-author every entry written afterwards.
+    #[test]
+    fn an_existing_device_id_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device-id");
+        std::fs::write(&path, "device-abc").unwrap();
+
+        assert_eq!(load_or_create_device_id(dir.path()).unwrap(), "device-abc");
+        assert_eq!(load_or_create_device_id(dir.path()).unwrap(), "device-abc");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "device-abc");
+    }
+
+    /// Recovery leaves no `.device-id.empty-*` litter in the data directory.
+    #[test]
+    fn recovery_cleans_up_after_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("device-id"), "").unwrap();
+        load_or_create_device_id(dir.path()).unwrap();
+
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".device-id."))
+            .collect();
+        assert!(strays.is_empty(), "left behind: {strays:?}");
+    }
+
+    /// The reason recovery publishes through create-if-absent rather than just
+    /// writing the file: two engines can cold-start together, and if they
+    /// disagreed about the id they would author the same doc under two
+    /// identities. Every caller must see the one that actually landed on disk.
+    #[test]
+    fn concurrent_recovery_agrees_on_one_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("device-id"), "").unwrap();
+        let root = dir.path().to_path_buf();
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let root = root.clone();
+                std::thread::spawn(move || load_or_create_device_id(&root).unwrap())
+            })
+            .collect();
+        let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let on_disk = std::fs::read_to_string(root.join("device-id")).unwrap();
+        let on_disk = on_disk.trim();
+        assert!(!on_disk.is_empty(), "an id landed");
+        for id in &ids {
+            assert_eq!(id, on_disk, "every caller got the id that landed: {ids:?}");
+        }
+    }
 
     #[test]
     fn local_name_prefers_override_then_windows_hostname() {
