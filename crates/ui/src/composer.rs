@@ -4876,6 +4876,77 @@ impl Composer {
         let err_message_id = message_id.clone();
         self.send_task = Some(cx.spawn(async move |this, cx| {
             let result: Result<(), String> = async {
+                // STAGE FIRST, before a worktree or a chat row exists anywhere.
+                //
+                // Staging is chat-independent — `upload_attachment` keys on a
+                // fresh `uploadId` and never sees `chat_id` — so it can run
+                // before anything is created. That ordering is the fix: a
+                // failed upload used to abort AFTER `CreateWorktree` and
+                // `createChat` had already run, leaving a worktree on disk and
+                // an empty session in the sidebar that nothing would ever use.
+                // Now a staging failure aborts with nothing created.
+                // Stage every attachment on the host device (sequential — the
+                // chunks share one channel), then thread the refs into the
+                // prompt text (`with_attachments`, the persisted transport)
+                // and the paths onto the Run request (inline image blocks).
+                let mut content = text.clone();
+                let mut attachment_paths: Vec<String> = Vec::new();
+                if !staged.is_empty() {
+                    for att in &staged {
+                        match attachments::upload_attachment(
+                            &engine,
+                            cx.background_executor(),
+                            att,
+                        )
+                        .await
+                        {
+                            Ok(path) => attachment_paths.push(path),
+                            Err(err) => {
+                                tracing::warn!(name = %att.name, error = %err, "attachment upload failed");
+                                return Err(
+                                    "Couldn't upload the attachment — the device may be offline."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    // Seed the transcript cache from local bytes so the sent
+                    // bubble's thumbnails never round-trip (seedTranscript-
+                    // Attachment in the original send path).
+                    let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
+                    for (path, att) in attachment_paths.iter().zip(&staged) {
+                        attachments::seed_attachment(&async_chat_owner.server_id, &seed_device, path, &att.name, att.image.clone());
+                        if seed_device != device_id {
+                            attachments::seed_attachment(&async_chat_owner.server_id, &device_id, path, &att.name, att.image.clone());
+                        }
+                    }
+                    content = assemble_user_message(&typed, &comments, &attachment_paths);
+                    // Refresh the echo in place with the attachment refs
+                    // (same id, same clock — the bubble grows its thumbnails
+                    // without flickering).
+                    let refreshed = SessionMessageEntry {
+                        id: message_id.clone(),
+                        role: comet_doc::MessageRole::User,
+                        parts: vec![MessagePart::Text {
+                            id: "t0".into(),
+                            text: content.clone(),
+                        }],
+                        created_at,
+                        device_id: "local".into(),
+                        status: None,
+                        continuation_of: None,
+                    };
+                    let echo_chat_owner = async_chat_owner.clone();
+                    this.update(cx, |composer, cx| {
+                        composer.state.update(cx, |s, cx| {
+                            s.remove_echo_for(&echo_chat_owner, &message_id);
+                            s.push_echo_for(echo_chat_owner, refreshed);
+                            cx.notify();
+                        });
+                    })
+                    .ok();
+                }
+
                 // Resolve the working directory: existing chats keep theirs;
                 // new chats run per the checkout plan (t3code env-mode): the
                 // space's folder as-is, an EXISTING worktree of the picked ref
@@ -4959,67 +5030,6 @@ impl Composer {
                     }
                 }
 
-                // Stage every attachment on the host device (sequential — the
-                // chunks share one channel), then thread the refs into the
-                // prompt text (`with_attachments`, the persisted transport)
-                // and the paths onto the Run request (inline image blocks).
-                let mut content = text.clone();
-                let mut attachment_paths: Vec<String> = Vec::new();
-                if !staged.is_empty() {
-                    for att in &staged {
-                        match attachments::upload_attachment(
-                            &engine,
-                            cx.background_executor(),
-                            att,
-                        )
-                        .await
-                        {
-                            Ok(path) => attachment_paths.push(path),
-                            Err(err) => {
-                                tracing::warn!(name = %att.name, error = %err, "attachment upload failed");
-                                return Err(
-                                    "Couldn't upload the attachment — the device may be offline."
-                                        .to_string(),
-                                );
-                            }
-                        }
-                    }
-                    // Seed the transcript cache from local bytes so the sent
-                    // bubble's thumbnails never round-trip (seedTranscript-
-                    // Attachment in the original send path).
-                    let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
-                    for (path, att) in attachment_paths.iter().zip(&staged) {
-                        attachments::seed_attachment(&async_chat_owner.server_id, &seed_device, path, &att.name, att.image.clone());
-                        if seed_device != device_id {
-                            attachments::seed_attachment(&async_chat_owner.server_id, &device_id, path, &att.name, att.image.clone());
-                        }
-                    }
-                    content = assemble_user_message(&typed, &comments, &attachment_paths);
-                    // Refresh the echo in place with the attachment refs
-                    // (same id, same clock — the bubble grows its thumbnails
-                    // without flickering).
-                    let refreshed = SessionMessageEntry {
-                        id: message_id.clone(),
-                        role: comet_doc::MessageRole::User,
-                        parts: vec![MessagePart::Text {
-                            id: "t0".into(),
-                            text: content.clone(),
-                        }],
-                        created_at,
-                        device_id: "local".into(),
-                        status: None,
-                        continuation_of: None,
-                    };
-                    let echo_chat_owner = async_chat_owner.clone();
-                    this.update(cx, |composer, cx| {
-                        composer.state.update(cx, |s, cx| {
-                            s.remove_echo_for(&echo_chat_owner, &message_id);
-                            s.push_echo_for(echo_chat_owner, refreshed);
-                            cx.notify();
-                        });
-                    })
-                    .ok();
-                }
 
                 let command = if steer_cmd {
                     SessionCommandPayload::Steer {
@@ -6285,6 +6295,45 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ORDER is the fix, and nothing else can hold it: `crates/ui` has no
+    /// gpui harness, so the send path cannot be driven in a test. Pin it in the
+    /// source, the way `shell.rs` pins its history-entry wiring.
+    ///
+    /// A failed attachment upload used to abort after `CreateWorktree` and
+    /// `createChat` had already run, leaving a worktree on disk and an empty
+    /// session in the sidebar that nothing would ever use.
+    #[test]
+    fn attachments_stage_before_a_worktree_or_chat_row_exists() {
+        let source = include_str!("composer.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("composer test-module boundary")
+            .0;
+        let send = production
+            .split_once("let result: Result<(), String> = async {")
+            .expect("send pipeline")
+            .1;
+
+        let stage = send
+            .find("attachments::upload_attachment(")
+            .expect("send stages attachments");
+        let worktree = send
+            .find("methods::CREATE_WORKTREE")
+            .expect("send can create a worktree");
+        let create_chat = send
+            .find(r#""op": "createChat""#)
+            .expect("send mints the chat row");
+
+        assert!(
+            stage < worktree,
+            "staging must precede CreateWorktree, or a failed upload strands a worktree"
+        );
+        assert!(
+            stage < create_chat,
+            "staging must precede createChat, or a failed upload strands an empty session"
+        );
+    }
 
     /// The press intent is judged by eye everywhere except here: that a
     /// multi-click leaves the drag disarmed is invisible until a selection
