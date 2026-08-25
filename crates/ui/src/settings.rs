@@ -117,10 +117,11 @@ pub enum ShortcutId {
     NewSession,
     NextSession,
     PrevSession,
+    ArchiveSession,
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 7] = [
+    pub const ALL: [ShortcutId; 8] = [
         ShortcutId::ToggleSidebar,
         ShortcutId::ToggleChanges,
         ShortcutId::ToggleTerminal,
@@ -128,6 +129,7 @@ impl ShortcutId {
         ShortcutId::NewSession,
         ShortcutId::NextSession,
         ShortcutId::PrevSession,
+        ShortcutId::ArchiveSession,
     ];
 
     /// Row label (comet lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
@@ -140,6 +142,7 @@ impl ShortcutId {
             ShortcutId::NewSession => "New session",
             ShortcutId::NextSession => "Next session",
             ShortcutId::PrevSession => "Previous session",
+            ShortcutId::ArchiveSession => "Archive session",
         }
     }
 
@@ -154,6 +157,9 @@ impl ShortcutId {
             // cmd-tab is the OS application switcher, which never reaches us.
             ShortcutId::NextSession => "ctrl-tab",
             ShortcutId::PrevSession => "ctrl-shift-tab",
+            // Mod+A is the composer's Select all, so archiving takes the
+            // shifted combo.
+            ShortcutId::ArchiveSession => "mod-shift-a",
         }
     }
 }
@@ -170,6 +176,7 @@ pub struct KeymapConfig {
     pub new_session: String,
     pub next_session: String,
     pub prev_session: String,
+    pub archive_session: String,
 }
 
 impl Default for KeymapConfig {
@@ -182,6 +189,7 @@ impl Default for KeymapConfig {
             new_session: ShortcutId::NewSession.default_combo().into(),
             next_session: ShortcutId::NextSession.default_combo().into(),
             prev_session: ShortcutId::PrevSession.default_combo().into(),
+            archive_session: ShortcutId::ArchiveSession.default_combo().into(),
         }
     }
 }
@@ -196,6 +204,7 @@ impl KeymapConfig {
             ShortcutId::NewSession => &self.new_session,
             ShortcutId::NextSession => &self.next_session,
             ShortcutId::PrevSession => &self.prev_session,
+            ShortcutId::ArchiveSession => &self.archive_session,
         }
     }
 
@@ -208,6 +217,7 @@ impl KeymapConfig {
             ShortcutId::NewSession => self.new_session = combo,
             ShortcutId::NextSession => self.next_session = combo,
             ShortcutId::PrevSession => self.prev_session = combo,
+            ShortcutId::ArchiveSession => self.archive_session = combo,
         }
     }
 
@@ -529,10 +539,38 @@ mod tests {
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-s");
         assert_eq!(keymap.get(ShortcutId::ToggleChanges), "mod-b");
         assert_eq!(keymap.get(ShortcutId::ToggleTerminal), "mod-j");
+        assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-shift-a");
         keymap.set(ShortcutId::ToggleSidebar, "mod-shift-x".into());
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
         keymap.reset(ShortcutId::ToggleSidebar);
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-s");
+        keymap.set(ShortcutId::ArchiveSession, "mod-shift-y".into());
+        assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-shift-y");
+        keymap.reset(ShortcutId::ArchiveSession);
+        assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-shift-a");
+    }
+
+    #[test]
+    fn every_shortcut_default_is_unique_and_bindable() {
+        // A new shortcut must not ship in conflict with an existing one, and
+        // its default must parse on this platform.
+        assert!(conflicted_shortcuts(&KeymapConfig::default()).is_empty());
+        for id in ShortcutId::ALL {
+            assert!(
+                gpui::Keystroke::parse(&platform_combo(id.default_combo())).is_ok(),
+                "{id:?} default combo does not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn a_keymap_missing_newer_shortcuts_keeps_its_customizations() {
+        // Upgrade path: a file written before archiving existed carries the
+        // user's rebinds and defaults only the new row.
+        let keymap: KeymapConfig = serde_json::from_str(r#"{"toggleSidebar": "mod-shift-x"}"#)
+            .expect("older keymap loads");
+        assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
+        assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-shift-a");
     }
 
     #[test]

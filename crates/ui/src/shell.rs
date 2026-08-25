@@ -65,7 +65,8 @@ actions!(
         FocusSearch,
         NewSession,
         NextSession,
-        PrevSession
+        PrevSession,
+        ArchiveSession
     ]
 );
 
@@ -201,6 +202,11 @@ fn shell_key_bindings(keymap: &KeymapConfig) -> Vec<KeyBinding> {
         KeyBinding::new(
             &valid_or_default(&keymap.prev_session, "ctrl-shift-tab"),
             PrevSession,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.archive_session, "mod-shift-a"),
+            ArchiveSession,
             None,
         ),
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
@@ -1775,6 +1781,16 @@ impl Shell {
             );
         }
         cx.notify();
+    }
+
+    /// The Archive session shortcut. With no chat open, or with an already
+    /// archived one, it does nothing — the shortcut archives, it never
+    /// unarchives.
+    fn archive_selected_chat(&mut self, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.state.read(cx).archivable_selected_chat() else {
+            return;
+        };
+        self.archive_chat(chat_id, cx);
     }
 
     fn archive_chat(&mut self, chat_id: comet_proto::ServerRef, cx: &mut Context<Self>) {
@@ -4206,6 +4222,13 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &PrevSession, _, cx| {
                 this.cycle_session(false, cx);
+            }))
+            // Chat-scoped like the panel toggles: Settings has no current
+            // session to archive.
+            .on_action(cx.listener(|this, _: &ArchiveSession, _, cx| {
+                if matches!(this.route, Route::Chat) {
+                    this.archive_selected_chat(cx)
+                }
             }))
             .on_action(cx.listener(|this, _: &NewSession, window, cx| {
                 let origin = this.route;

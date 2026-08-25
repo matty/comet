@@ -131,6 +131,7 @@ fn description(id: ShortcutId) -> &'static str {
         ShortcutId::NewSession => "Open a blank session canvas to start a new session.",
         ShortcutId::NextSession => "Step to the next session tab.",
         ShortcutId::PrevSession => "Step to the previous session tab.",
+        ShortcutId::ArchiveSession => "Move the current session to the archived shelf.",
     }
 }
 
