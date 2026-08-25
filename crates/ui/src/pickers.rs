@@ -902,6 +902,13 @@ impl Pickers {
         }
     }
 
+    /// Whether any picker popover is open (shell-side: session-nav shortcuts
+    /// go quiet underneath an open popover instead of yanking the session out
+    /// from under it).
+    pub fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
     // ---- open/close ----
 
     fn close(&mut self, cx: &mut Context<Self>) {

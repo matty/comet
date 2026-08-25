@@ -16,9 +16,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use gpui::{
-    AnyElement, App, Context, Empty, Entity, Focusable as _, IntoElement, KeyBinding, Keystroke,
-    MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Subscription,
-    Task, Window, WindowControlArea, actions, div, prelude::*, px,
+    Action, AnyElement, App, Context, Empty, Entity, Focusable as _, IntoElement, KeyBinding,
+    Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point,
+    Render, SharedString, Subscription, Task, Window, WindowControlArea, actions, div, prelude::*,
+    px,
 };
 
 use comet_proto::ServerId;
@@ -39,8 +40,9 @@ use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS, SIDEBAR_DEFAULT,
-    SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
+    JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
+    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, ShortcutId, TERMINAL_DEFAULT_HEIGHT, UiSettings,
+    jump_hints_visible, platform_combo,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, SidebarScope,
@@ -69,6 +71,12 @@ actions!(
         ArchiveSession
     ]
 );
+
+/// Open the session at `slot` (zero-based) of the sidebar's active list. One
+/// action carrying the slot, rather than nine near-identical action types.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = shell, no_json)]
+pub struct JumpSession(pub usize);
 
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
@@ -168,7 +176,7 @@ fn valid_or_default(combo: &str, fallback: &str) -> String {
 }
 
 fn shell_key_bindings(keymap: &KeymapConfig) -> Vec<KeyBinding> {
-    vec![
+    let mut bindings = vec![
         KeyBinding::new(
             &valid_or_default(&keymap.toggle_sidebar, "mod-s"),
             ToggleSidebar,
@@ -212,7 +220,23 @@ fn shell_key_bindings(keymap: &KeymapConfig) -> Vec<KeyBinding> {
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
         // bar); pressing it again dismisses.
         KeyBinding::new(&platform_combo("mod-k"), AddSpacePalette, None),
-    ]
+    ];
+    // ⌘1..⌘9 open the sidebar's first nine rows. A slot left unbound (an empty
+    // combo in a hand-edited file) binds nothing rather than falling back —
+    // the user cleared it on purpose.
+    bindings.extend((0..JUMP_SLOTS).filter_map(|slot| {
+        let id = ShortcutId::JumpSession(slot);
+        let combo = keymap.get(id);
+        if combo.is_empty() {
+            return None;
+        }
+        Some(KeyBinding::new(
+            &valid_or_default(combo, id.default_combo()),
+            JumpSession(slot),
+            None,
+        ))
+    }));
+    bindings
 }
 
 pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
@@ -762,6 +786,15 @@ pub struct Shell {
     /// with nothing focused they go dead. Initial focus lands on the composer
     /// and focus lost with no successor routes back there.
     focus_sub: Option<Subscription>,
+    /// Clears the jump hints when the window deactivates: a Cmd+Tab away
+    /// swallows the key-up, so without this the chips stay on screen for good.
+    activation_sub: Option<Subscription>,
+    /// The jump-hint overlay: true while the held modifiers exactly match a
+    /// jump shortcut, which swaps the first nine sidebar rows' time-ago for
+    /// their key-cap chip (t3code's `showJumpHints`). Frame-transient — window
+    /// deactivation clears it, so a chip cannot stick after an app switch
+    /// swallows the key-up.
+    pub(super) jump_hints: bool,
     /// 1s heartbeat re-rendering the working indicator (elapsed + flavour word).
     _ticker: Task<()>,
     _state_observation: Subscription,
@@ -1006,6 +1039,8 @@ impl Shell {
             splash_task: None,
             save_task: None,
             focus_sub: None,
+            activation_sub: None,
+            jump_hints: false,
             _ticker: ticker,
             _state_observation: observation,
             _composer_events: composer_events,
@@ -1783,10 +1818,63 @@ impl Shell {
         cx.notify();
     }
 
+    /// A jump shortcut: open the sidebar row at `slot`. A slot past the end of
+    /// a short list does nothing.
+    fn jump_to_session(&mut self, slot: usize, cx: &mut Context<Self>) {
+        if self.overlay_owns_keyboard(cx) {
+            return;
+        }
+        let Some(chat_id) = self.state.read(cx).jump_target(Utc::now(), slot) else {
+            return;
+        };
+        // A jump routes back to chat, so Settings is not a dead spot — then
+        // the same call a click on that sidebar row makes.
+        self.set_route(Route::Chat, cx);
+        self.state
+            .update(cx, |state, cx| state.select_chat(Some(chat_id), cx));
+    }
+
+    /// Whether an overlay that owns the keyboard is up — the add-space
+    /// palette or a composer picker popover (harness/model, reasoning, repo,
+    /// branch…). Session-nav shortcuts (cycle/jump/archive) go quiet
+    /// underneath one: gpui runs a matched binding before any `on_key_down`,
+    /// so an unguarded jump would switch sessions UNDER the open popover,
+    /// stranding it over a session the user never picked.
+    pub(super) fn overlay_owns_keyboard(&self, cx: &App) -> bool {
+        self.add_space.is_some() || self.composer.read(cx).pickers().read(cx).is_open()
+    }
+
+    /// Track the held modifiers so the sidebar can show its jump hints. Only a
+    /// change in visibility repaints — modifier traffic is otherwise constant.
+    fn on_modifiers_changed(&mut self, event: &ModifiersChangedEvent, cx: &mut Context<Self>) {
+        let mods = &event.modifiers;
+        let primary = if cfg!(target_os = "macos") {
+            mods.platform
+        } else {
+            mods.control
+        };
+        // No hints while an overlay owns the keyboard — the jumps they
+        // advertise are suppressed there.
+        let visible = matches!(self.route, Route::Chat)
+            && !self.overlay_owns_keyboard(cx)
+            && jump_hints_visible(&self.settings.keymap, primary, mods.alt, mods.shift);
+        self.set_jump_hints(visible, cx);
+    }
+
+    pub(super) fn set_jump_hints(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.jump_hints != visible {
+            self.jump_hints = visible;
+            cx.notify();
+        }
+    }
+
     /// The Archive session shortcut. With no chat open, or with an already
     /// archived one, it does nothing — the shortcut archives, it never
     /// unarchives.
     fn archive_selected_chat(&mut self, cx: &mut Context<Self>) {
+        if self.overlay_owns_keyboard(cx) {
+            return;
+        }
         let Some(chat_id) = self.state.read(cx).archivable_selected_chat() else {
             return;
         };
@@ -2204,6 +2292,11 @@ impl Shell {
         selected: bool,
         highlight_query: Option<&str>,
         keyboard_highlighted: bool,
+        // This row's jump combo while the hint overlay is up. It replaces the
+        // time-ago, which every row carries here — the working throbber sits
+        // ALONGSIDE the time rather than instead of it, so unlike upstream
+        // there is no busy row whose corner would be left empty.
+        jump_label: Option<SharedString>,
         on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -2238,14 +2331,22 @@ impl Shell {
             .flex_row()
             .items_center()
             .gap(px(4.0))
-            .child(
-                div()
+            .child(match jump_label {
+                // The jump hint takes the time-ago's place while the modifier
+                // is held, wearing the app's keyboard-hint chip — the same
+                // borderless pill the picker menus' accelerators use — so the
+                // overlay introduces no new style and reflows nothing.
+                Some(label) => crate::popover::kbd_hint(theme, &label)
+                    .line_height(px(trailing_line_height))
+                    .into_any_element(),
+                None => div()
                     .flex_none()
                     .text_size(px(11.0))
                     .line_height(px(trailing_line_height))
                     .text_color(time_tint)
-                    .child(time_ago),
-            )
+                    .child(time_ago)
+                    .into_any_element(),
+            })
             .when(working, |el| {
                 el.child(
                     div()
@@ -4151,6 +4252,17 @@ impl Render for Shell {
         // chain — with nothing focused they go dead. Land initial focus on the
         // route's fallback, and whenever focus is lost with no successor (e.g.
         // the focused element unmounted), route it back there.
+        if self.activation_sub.is_none() {
+            self.activation_sub = Some(cx.observe_window_activation(
+                window,
+                |this: &mut Shell, window, cx| {
+                    if !window.is_window_active() {
+                        this.set_jump_hints(false, cx);
+                    }
+                },
+            ));
+        }
+
         if self.focus_sub.is_none() {
             self.focus_sub = Some(cx.on_focus_lost(window, |this: &mut Shell, window, cx| {
                 match shell_focus_fallback(this.route, false, false) {
@@ -4230,6 +4342,14 @@ impl Render for Shell {
                     this.archive_selected_chat(cx)
                 }
             }))
+            // A jump routes back to chat itself, so Settings is not a dead
+            // spot — the same call a click on that sidebar row makes.
+            .on_action(
+                cx.listener(|this, jump: &JumpSession, _, cx| this.jump_to_session(jump.0, cx)),
+            )
+            .on_modifiers_changed(
+                cx.listener(|this, event, _, cx| this.on_modifiers_changed(event, cx)),
+            )
             .on_action(cx.listener(|this, _: &NewSession, window, cx| {
                 let origin = this.route;
                 this.set_route(Route::Chat, cx);
@@ -4528,7 +4648,6 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::Action as _;
 
     fn space_ids(ids: &[&str]) -> Vec<String> {
         ids.iter().map(|id| (*id).to_string()).collect()
@@ -4541,6 +4660,35 @@ mod tests {
             NewSessionTarget::Space("s2".into()),
             "a scoped sidebar already answers the question the picker would ask"
         );
+    }
+
+    #[test]
+    fn jump_slots_bind_mod_digits_and_an_empty_combo_binds_nothing() {
+        let bindings = shell_key_bindings(&KeymapConfig::default());
+        let jumps: Vec<_> = bindings
+            .iter()
+            .filter(|binding| binding.action().name() == JumpSession(0).name())
+            .collect();
+        assert_eq!(jumps.len(), JUMP_SLOTS, "one binding per slot");
+        assert_eq!(
+            jumps[0]
+                .keystrokes()
+                .iter()
+                .map(|key| key.inner().clone())
+                .collect::<Vec<_>>(),
+            vec![Keystroke::parse(&platform_combo("mod-1")).unwrap()]
+        );
+
+        // A slot cleared in a hand-edited file binds nothing rather than
+        // falling back to its default — the user cleared it on purpose.
+        let mut cleared = KeymapConfig::default();
+        cleared.set(ShortcutId::JumpSession(3), String::new());
+        let bindings = shell_key_bindings(&cleared);
+        let jumps = bindings
+            .iter()
+            .filter(|binding| binding.action().name() == JumpSession(0).name())
+            .count();
+        assert_eq!(jumps, JUMP_SLOTS - 1);
     }
 
     #[test]

@@ -3752,6 +3752,11 @@ impl Composer {
     /// Stage image files (picker / drop / pasted paths). Non-images are
     /// skipped silently (matching the original's `image/*` filter); read
     /// failures and oversize files surface in the failure notice.
+    /// The picker popovers, for the shell's keyboard-ownership check.
+    pub(crate) fn pickers(&self) -> &Entity<Pickers> {
+        &self.pickers
+    }
+
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let mut staged = Vec::new();
         for path in &paths {
@@ -5398,8 +5403,12 @@ impl Composer {
         let input_focused = self.input.read(cx).focus_handle.is_focused(window);
         let input_empty = self.input.read(cx).is_empty();
         let key = event.keystroke.key.as_str();
+        // A BARE digit picks an option. With a modifier held the keystroke
+        // belongs to an app shortcut — Mod+1..Mod+9 jump to a sidebar row —
+        // and the panel must not also consume it as a selection.
         if let Ok(digit) = key.parse::<usize>()
             && (1..=9).contains(&digit)
+            && !event.keystroke.modifiers.modified()
         {
             if !input_focused || input_empty {
                 self.wizard_select(digit - 1, cx);
