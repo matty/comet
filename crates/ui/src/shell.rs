@@ -2332,24 +2332,12 @@ impl Shell {
             .items_center()
             .gap(px(4.0))
             .child(match jump_label {
-                // t3code's jump chip: a small key-cap where the time-ago sits,
-                // so the overlay reflows nothing.
-                Some(label) => div()
-                    .flex_none()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .h(px(18.0))
-                    .px(px(5.0))
-                    .rounded(px(9.0))
-                    .border_1()
-                    .border_color(theme.border_strong)
-                    .bg(theme.surface_raised)
-                    .text_size(px(10.0))
+                // The jump hint takes the time-ago's place while the modifier
+                // is held, wearing the app's keyboard-hint chip — the same
+                // borderless pill the picker menus' accelerators use — so the
+                // overlay introduces no new style and reflows nothing.
+                Some(label) => crate::popover::kbd_hint(theme, &label)
                     .line_height(px(trailing_line_height))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text)
-                    .child(label)
                     .into_any_element(),
                 None => div()
                     .flex_none()

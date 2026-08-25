@@ -391,11 +391,17 @@ pub fn platform_combo(combo: &str) -> String {
 
 /// Human-readable combo for the shortcuts table ("mod-s" → "Cmd+S"/"Ctrl+S").
 pub fn display_combo(combo: &str) -> String {
+    display_combo_on(cfg!(target_os = "macos"), combo)
+}
+
+/// [`display_combo`] for an explicit platform, so both spellings are testable
+/// wherever the suite runs rather than only the host's.
+pub fn display_combo_on(mac: bool, combo: &str) -> String {
     combo
         .split('-')
         .map(|part| match part {
             "mod" => {
-                if cfg!(target_os = "macos") {
+                if mac {
                     "Cmd".to_string()
                 } else {
                     "Ctrl".to_string()
@@ -413,6 +419,37 @@ pub fn display_combo(combo: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("+")
+}
+
+/// Compact combo for badge surfaces (the sidebar jump hints): macOS spells
+/// the modifiers as their key glyphs in canonical ⌃⌥⇧⌘ order and drops the
+/// separators ("⌘1", "⇧⌘A") — the form the model picker's ⌘N chips already
+/// use — while other platforms keep the textual [`display_combo`] ("Ctrl+1").
+pub fn badge_combo(combo: &str) -> String {
+    badge_combo_on(cfg!(target_os = "macos"), combo)
+}
+
+/// [`badge_combo`] for an explicit platform.
+pub fn badge_combo_on(mac: bool, combo: &str) -> String {
+    if !mac {
+        return display_combo_on(false, combo);
+    }
+    let mut parts: Vec<&str> = combo.split('-').collect();
+    let key = parts.pop().unwrap_or("");
+    let mut out = String::new();
+    for glyph in ["ctrl", "alt", "shift", "mod"]
+        .iter()
+        .zip(['⌃', '⌥', '⇧', '⌘'])
+        .filter_map(|(name, glyph)| parts.contains(name).then_some(glyph))
+    {
+        out.push(glyph);
+    }
+    let mut chars = key.chars();
+    if let Some(first) = chars.next() {
+        out.extend(first.to_uppercase());
+        out.push_str(chars.as_str());
+    }
+    out
 }
 
 impl UiSettings {
@@ -745,6 +782,21 @@ mod tests {
         let mut bare = KeymapConfig::default();
         bare.set(ShortcutId::JumpSession(0), "f5".into());
         assert!(!jump_hints_visible(&bare, false, false, false));
+    }
+
+    #[test]
+    fn badge_combos_use_mac_glyphs_and_textual_form_elsewhere() {
+        // macOS: glyphs in canonical ⌃⌥⇧⌘ order, no separators — the model
+        // picker's ⌘N chip form.
+        assert_eq!(badge_combo_on(true, "mod-2"), "⌘2");
+        assert_eq!(badge_combo_on(true, "mod-shift-a"), "⇧⌘A");
+        assert_eq!(badge_combo_on(true, "mod-alt-3"), "⌥⌘3");
+        // A literal ctrl segment (the macOS recorder's spelling) is ⌃, so a
+        // ctrl-rebound slot's badge is truthful too.
+        assert_eq!(badge_combo_on(true, "ctrl-tab"), "⌃Tab");
+        // Elsewhere the textual form stands.
+        assert_eq!(badge_combo_on(false, "mod-2"), "Ctrl+2");
+        assert_eq!(badge_combo_on(false, "mod-shift-a"), "Ctrl+Shift+A");
     }
 
     #[test]

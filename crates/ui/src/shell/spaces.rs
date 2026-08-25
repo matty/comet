@@ -10,7 +10,7 @@ use super::*;
 use crate::errors;
 use crate::motion::TAB_SLIDE;
 use crate::pickers::{breadcrumbs, browser_rows, parent_path};
-use crate::settings::{JUMP_SLOTS, ShortcutId, display_combo};
+use crate::settings::{JUMP_SLOTS, ShortcutId, badge_combo};
 use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
 use comet_proto::{ChatIndicator, Device, FolderListing, Space};
 use gpui::FocusHandle;
@@ -2434,7 +2434,7 @@ impl Shell {
                 // keeps its time-ago.
                 let jump_label: Option<SharedString> = if jump_hints {
                     let combo = keymap.get(ShortcutId::JumpSession(slot));
-                    (slot < JUMP_SLOTS && !combo.is_empty()).then(|| display_combo(combo).into())
+                    (slot < JUMP_SLOTS && !combo.is_empty()).then(|| badge_combo(combo).into())
                 } else {
                     None
                 };
