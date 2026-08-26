@@ -144,16 +144,69 @@ fn preview(mode: AppearanceMode) -> AnyElement {
     }
 }
 
+/// The platform whose appearance setting Comet follows, for the System copy.
+///
+/// A parameter rather than a `cfg!` inside [`helper`] so both spellings are
+/// testable wherever the suite runs — the same shape as
+/// [`crate::settings::display_combo_on`]. This page named macOS unconditionally
+/// until a Windows user was told Comet "switches with macOS".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostOs {
+    Mac,
+    Windows,
+    Other,
+}
+
+impl HostOs {
+    const ALL: [Self; 3] = [Self::Mac, Self::Windows, Self::Other];
+
+    fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Mac
+        } else if cfg!(target_os = "windows") {
+            Self::Windows
+        } else {
+            Self::Other
+        }
+    }
+
+    /// What to call the thing Comet is following.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Mac => "macOS",
+            Self::Windows => "Windows",
+            Self::Other => "the system",
+        }
+    }
+
+    /// Only macOS offers a *scheduled* switch (sunset/sunrise). Promising one
+    /// elsewhere describes a setting the user cannot find.
+    fn schedules_appearance(self) -> bool {
+        matches!(self, Self::Mac)
+    }
+}
+
 /// Helper copy under the picker.
 fn helper(mode: AppearanceMode, system: Appearance) -> SharedString {
+    helper_on(HostOs::current(), mode, system)
+}
+
+/// [`helper`] for an explicit platform.
+fn helper_on(host: HostOs, mode: AppearanceMode, system: Appearance) -> SharedString {
     match mode {
         // Naming the resolved appearance makes "System" concrete — otherwise the
         // card says nothing about what you actually get right now.
         AppearanceMode::System => {
             let resolved = if system.is_dark() { "dark" } else { "light" };
+            let follows = host.label();
+            let schedule = if host.schedules_appearance() {
+                ", including scheduled changes"
+            } else {
+                ""
+            };
             format!(
                 "Following the system appearance — currently {resolved}. Comet switches with \
-                 macOS, including scheduled changes."
+                 {follows}{schedule}."
             )
             .into()
         }
@@ -235,6 +288,25 @@ mod tests {
         let light = helper(AppearanceMode::System, Appearance::Light);
         assert!(dark.contains("currently dark"), "got {dark}");
         assert!(light.contains("currently light"), "got {light}");
+    }
+
+    /// The card names the platform the user is actually on. It said "macOS" on
+    /// every platform until a Windows user read it.
+    #[test]
+    fn system_helper_names_the_host_platform() {
+        for host in HostOs::ALL {
+            let copy = helper_on(host, AppearanceMode::System, Appearance::Dark);
+            assert!(
+                copy.contains(host.label()),
+                "{host:?} should name {}: {copy}",
+                host.label()
+            );
+            if host != HostOs::Mac {
+                assert!(!copy.contains("macOS"), "{host:?} names macOS: {copy}");
+                // Only macOS has a sunset/sunrise schedule to promise.
+                assert!(!copy.contains("scheduled"), "{host:?}: {copy}");
+            }
+        }
     }
 
     /// The pinned modes must not claim to follow anything — that copy is the only

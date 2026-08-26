@@ -3450,6 +3450,21 @@ enum NoticeTone {
     Failure,
 }
 
+/// The one notice that names a precondition the user can go and satisfy
+/// elsewhere, so it is the one that has to retire on its own — see
+/// `Composer::on_state_changed`. Shared by the send guard and that check so the
+/// two cannot drift into a banner nothing clears.
+const NEEDS_SPACE_NOTICE: &str = "Add a space first";
+
+/// Has a standing notice been overtaken by the state it was asking for?
+///
+/// Only [`NEEDS_SPACE_NOTICE`] can be: every other notice reports something
+/// that already happened (a send failed, a model refused an image) and stays
+/// until the user sends, navigates, or clicks it away.
+fn notice_is_stale(notice: &str, has_space: bool) -> bool {
+    notice == NEEDS_SPACE_NOTICE && has_space
+}
+
 /// Why an image was refused, naming the model that refused it.
 ///
 /// One sentence with the reason and the fix, never a raw provider error: the
@@ -4581,6 +4596,21 @@ impl Composer {
             self.input.update(cx, |input, cx| input.set_text(draft, cx));
         }
 
+        // Every other notice describes what just happened; this one names a
+        // precondition the user goes and satisfies on a different surface, and
+        // adding the space does not touch the composer. It cleared on the next
+        // send or on navigation, so the banner sat there contradicting the
+        // sidebar in between. Retire it the moment its own guard would pass.
+        let has_space = self.state.read(cx).selected_space_row().is_some();
+        if self
+            .failure
+            .as_ref()
+            .is_some_and(|(text, _)| notice_is_stale(text, has_space))
+        {
+            self.failure = None;
+            cx.notify();
+        }
+
         // No latch, deliberately (see the field's doc comment). `pending_approval`
         // already returns None for any decided approval, so a decision landing
         // anywhere — this device, a paired one, or the host's `Expired` stamp —
@@ -4766,7 +4796,7 @@ impl Composer {
             // Left on `Failure` deliberately: it is red today, and recolouring
             // an unrelated surface is not this slice's change to make. It reads
             // like a `Pending` state and is the obvious next one to move.
-            self.failure = Some(("Add a space first".into(), NoticeTone::Failure));
+            self.failure = Some((NEEDS_SPACE_NOTICE.into(), NoticeTone::Failure));
             cx.notify();
             return;
         }
@@ -6486,6 +6516,28 @@ mod tests {
 
         assert!(state.diff_comments(&owner).is_empty());
         assert_eq!(notifications.get(), 1);
+    }
+
+    /// The banner asking for a space must not outlive the space being added:
+    /// it used to clear only on the next send, so it sat there contradicting a
+    /// sidebar that already had the folder in it.
+    #[test]
+    fn the_add_a_space_notice_retires_once_there_is_a_space() {
+        assert!(notice_is_stale(NEEDS_SPACE_NOTICE, true));
+        assert!(!notice_is_stale(NEEDS_SPACE_NOTICE, false));
+    }
+
+    /// Nothing else may be swept up by that rule — a failed send is a report,
+    /// not a request, and a space appearing says nothing about it.
+    #[test]
+    fn other_notices_are_never_stale() {
+        for notice in [
+            "Engine not connected",
+            attachment_blocked_message(Some("Haiku".into())).as_ref(),
+        ] {
+            assert!(!notice_is_stale(notice, true), "{notice}");
+            assert!(!notice_is_stale(notice, false), "{notice}");
+        }
     }
 
     fn tooltip_target(range: Range<usize>, path: &str) -> MentionTooltipTarget {
