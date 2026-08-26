@@ -1793,9 +1793,17 @@ fn expire_open_approvals(inner: &Inner, chat_id: &str, run_id: &str, folded: &mu
     }
 }
 
-/// Cancel every `Subagent` part still `Running` in `folded`. Called ONLY
-/// where a run has genuinely ended (the `Done` arm below) — deliberately NOT
-/// from the `Steered` boundary, unlike [`expire_open_approvals`].
+/// Cancel every `Subagent` part still `Running` in `folded`. Called ONLY from
+/// the `Done` arm below, and there only when the turn was **cut short**
+/// (`Interrupted` or `Errored`) — never on a clean completion, and never from
+/// the `Steered` boundary, unlike [`expire_open_approvals`].
+///
+/// **A cleanly completed turn can leave a live child.** Claude's `Agent` tool
+/// is not synchronous with the parent's turn: a real 2.1.246 run ended
+/// `Completed` with `result: "Agent is running. Waiting for completion
+/// notification."` and the child reported `completed`, with its answer and
+/// usage, four events later. Sweeping there manufactured `Cancelled` for an
+/// agent that succeeded. The Done arm carries the full journal trace.
 ///
 /// That split is not "two mechanisms for one job": it is one mechanism kept
 /// out of a place it would lie. The approval sweep CAUSES the state it
@@ -2373,19 +2381,44 @@ async fn drive_run(
             // and `respond_approval` would keep answering `true` for one of
             // them the whole time.
             expire_open_approvals(&inner, &chat_id, &run_id, &mut folded);
-            // Unlike the `Steered` boundary above, `Done` really does end the
-            // turn a subagent ran under — Claude's `Task` tool call is
-            // synchronous from the parent's own turn, so a part still
-            // `Running` here reflects a turn that was cut short (errored or
-            // interrupted), not one still quietly finishing elsewhere. This
-            // segment (`folded`/`entry_id`) also never gets another fold
-            // regardless: even a steerable harness that PARKS below keeps the
-            // same `run_id` alive, but its next turn folds into a NEW,
-            // cleared accumulator (`folded.clear()` further down), never back
-            // into this one — so a `Running` part written into this FINISHED
-            // segment is not merely stale-until-the-next-event, it is
-            // unreachable.
-            cancel_running_subagents(&mut folded);
+            // A subagent still `Running` at `Done` is stamped `Cancelled`
+            // ONLY when the turn was cut short. A cleanly completed turn must
+            // not claim to know a background child's fate.
+            //
+            // This arm used to sweep on every `Done`, on the premise —
+            // written here — that "Claude's `Task` tool call is synchronous
+            // from the parent's own turn". **That is false, and a real run
+            // disproves it.** Captured 2026-08-26 against Claude Code
+            // 2.1.246, one `Agent` delegation, journal seq in parentheses:
+            //
+            //   subagentStarted (46) → running (48) → **done, COMPLETED (57)**
+            //   with `result: "Agent is running. Waiting for completion
+            //   notification."` → running + usage (58) → completed (61) →
+            //   completed with the answer and full usage (62)
+            //
+            // The turn ends cleanly with the child still live, and the child
+            // reports its real outcome four events later. Sweeping at (57)
+            // manufactured `Cancelled` for an agent that completed — the
+            // exact act this function's own doc says must never happen,
+            // performed at the one boundary that was believed safe.
+            //
+            // `Interrupted` and `Errored` keep the sweep: there the turn
+            // genuinely was cut short, and the sweep is what stops a card
+            // spinning forever.
+            //
+            // The rest of the old comment still holds and is why this is only
+            // half a fix. This segment (`folded`/`entry_id`) never gets
+            // another fold: a steerable harness that PARKS keeps the same
+            // `run_id`, but its next turn folds into a NEW, cleared
+            // accumulator, so (61) and (62) above are dropped as updates for
+            // a `task_id` this accumulator never saw. The card is left
+            // honestly `Running` rather than falsely `Cancelled`, but the
+            // summary and usage it earned are still lost. Routing a late
+            // reading back to a finished segment is its own change — see
+            // `docs/debt/README.md`.
+            if *status != DoneStatus::Completed {
+                cancel_running_subagents(&mut folded);
+            }
             // A Done landing on a PARKED session with nothing streamed (the
             // idle reaper's or an interrupt's own teardown) has no entry to
             // finalize — writing one would leave an empty aborted stub.
