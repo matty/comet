@@ -6,8 +6,8 @@ use futures::stream::BoxStream;
 
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DoneStatus, FileOperation, HarnessCapabilities,
-    HarnessId, Model, ModelCatalog, ReasoningLevel, RunRequest, SteeringMode, ToolCall,
-    UserInputQuestion,
+    HarnessId, Model, ModelCatalog, ReasoningLevel, RunRequest, SteeringMode, SubagentStatus,
+    ToolCall, UserInputQuestion,
 };
 
 use crate::discovery::{Discovery, DiscoveryCache, DiscoveryFailure};
@@ -521,6 +521,134 @@ impl Harness for MockHarness {
             })
             .into_iter()
             .flatten();
+        // Dev/testing knob: `COMET_MOCK_SUBAGENT=1` fans out scripted
+        // subagents, which is the only way to put slice 4.4's card on screen
+        // without a real Claude run that happens to delegate.
+        //
+        // Shaped from the recorded run at
+        // `crates/harness/tests/corpus/claude/2.1.229/subagent`, not composed.
+        // Each agent here exists to produce a state a happy path never does:
+        //
+        // - `a` COMPLETES with a multi-paragraph summary and all three
+        //   counters. Its two `task_progress` readings are the same LENGTH on
+        //   purpose ("Reading normalize.rs" / "Reading discovery.rs"): the row
+        //   cache keys on a fingerprint that used to fold text lengths, so an
+        //   equal-length activity change is exactly the case a frozen live
+        //   line comes from.
+        // - `b` FAILS, and reports no counters at all — `None` is "not
+        //   reported", never zero, so the card must omit the line rather than
+        //   print zeros.
+        // - `c` is CANCELLED.
+        // - `d` is left RUNNING and never settled, so it exercises a card that
+        //   is still in flight when everything around it has finished.
+        //
+        // **The card's `last seen running` state is NOT reachable from here,
+        // and no value of this knob reaches it.** That state needs a genuine
+        // steer boundary (D57), and a steer only becomes one when the harness
+        // emits `AgentEvent::Steered` — which only the Claude and Codex
+        // adapters do. This mock advertises `supports_steering: true` above
+        // and then never drains `controls.steering`, so a steer sent to it is
+        // silently dropped and the run simply ends; the engine's `Done` sweep
+        // then stamps `d` `Cancelled` like any other unfinished agent. Pinning
+        // that state is `transcript.rs`'s
+        // `a_running_subagent_in_a_finished_entry_reads_last_seen_running`,
+        // not this rig. Seeing it on screen needs a real Claude run that
+        // delegates, steered mid-flight.
+        let mock_subagent = std::env::var("COMET_MOCK_SUBAGENT")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        let subagent_events = mock_subagent
+            .then(|| {
+                let started = |task: &str, kind: &str, what: &str| AgentEvent::SubagentStarted {
+                    task_id: task.into(),
+                    tool_use_id: format!("toolu_{task}"),
+                    agent_type: kind.into(),
+                    description: what.into(),
+                    prompt: None,
+                };
+                let progress = |task: &str, activity: &str| AgentEvent::SubagentUpdated {
+                    task_id: task.into(),
+                    status: SubagentStatus::Running,
+                    activity: Some(activity.into()),
+                    summary: None,
+                    total_tokens: None,
+                    duration_ms: None,
+                    tool_uses: None,
+                };
+                vec![
+                    // The parent's own tool call for `a`. Present so the
+                    // card's suppression of the contentless `Agent` chip is
+                    // exercised by the demo rig, not just by tests.
+                    AgentEvent::ToolCall {
+                        id: "toolu_a".into(),
+                        call: comet_proto::ToolCall::Unknown {
+                            name: "Agent".into(),
+                            input: None,
+                        },
+                    },
+                    started("a", "Explore", "Find every retry call site in the harness"),
+                    started("b", "general-purpose", "Summarise the release notes"),
+                    started("c", "Explore", "Check the codex adapter for the same bug"),
+                    started("d", "Explore", "Read the capability sheets"),
+                    progress("a", "Reading normalize.rs"),
+                    progress("d", "Reading claude-2.1.229.md"),
+                    // Equal length to the reading above — the fingerprint case.
+                    progress("a", "Reading discovery.rs"),
+                ]
+            })
+            .into_iter()
+            .flatten();
+        // The terminal readings ride at the END of the script, so the four
+        // agents above spend the whole run visibly in flight. That window is
+        // what makes `d`'s `last seen running` state reachable at all: it
+        // needs a STEER landing while an agent is still running, and a rig
+        // that settles everything two events after it starts leaves nobody
+        // time to type.
+        let subagent_settle_events = mock_subagent
+            .then(|| {
+                [
+                    AgentEvent::SubagentUpdated {
+                        task_id: "a".into(),
+                        status: SubagentStatus::Completed,
+                        // A terminal reading that reports NO activity, exactly
+                        // as the wire sends it. The fold leaves the last live
+                        // line standing in the part, so this is the fixture
+                        // that proves a finished card does not draw it (D53).
+                        activity: None,
+                        summary: Some(
+                            "Three call sites, all in the Claude adapter: the discovery \
+                             probe, the stream reconnect, and the model-catalog refresh.\n\n\
+                             Only the first backs off. The other two retry immediately in a \
+                             tight loop, which is why a failed catalog hammers the CLI \
+                             instead of settling."
+                                .into(),
+                        ),
+                        total_tokens: Some(20_115),
+                        duration_ms: Some(4_907),
+                        tool_uses: Some(4),
+                    },
+                    AgentEvent::SubagentUpdated {
+                        task_id: "b".into(),
+                        status: SubagentStatus::Failed,
+                        activity: None,
+                        summary: None,
+                        total_tokens: None,
+                        duration_ms: None,
+                        tool_uses: None,
+                    },
+                    AgentEvent::SubagentUpdated {
+                        task_id: "c".into(),
+                        status: SubagentStatus::Cancelled,
+                        activity: None,
+                        summary: None,
+                        total_tokens: None,
+                        duration_ms: None,
+                        tool_uses: None,
+                    },
+                ]
+            })
+            .into_iter()
+            .flatten();
         // With the code knob, also exercise a MULTILINE Exec command — the
         // round-9 chip breaker shape ("set -e\nfixture_in_original=0"): the
         // Run chip must stay one 30px line.
@@ -544,11 +672,19 @@ impl Harness for MockHarness {
             })
             .into_iter()
             .flatten();
-        let events: Vec<Result<AgentEvent, HarnessError>> = body
-            .iter()
-            .cycle()
-            .take(body.len() * repeat)
-            .cloned()
+        // The subagent starts lead the script rather than trailing the prose:
+        // the cards then stand `running` for the whole run, which is the only
+        // window in which a STEER can land on one — and that steer is the only
+        // route to the `last seen running` state (D57). Behind the knob, so
+        // the default script is untouched.
+        let events: Vec<Result<AgentEvent, HarnessError>> = subagent_events
+            .chain(
+                body.iter()
+                    .cycle()
+                    .take(body.len() * repeat)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
             .chain(code_tool_events)
             .chain(checklist_events)
             .chain(code_event)
@@ -556,6 +692,7 @@ impl Harness for MockHarness {
             .chain(mend_event)
             .chain(error_event)
             .chain(context_event)
+            .chain(subagent_settle_events)
             .chain(tail.iter().cloned())
             .map(Ok)
             .collect();
@@ -603,6 +740,66 @@ impl Harness for MockHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `COMET_MOCK_*` family is the project's standing answer to "see a UI
+    /// state without producing it for real" (D52), and an answer nobody can
+    /// find is not one. This pins the register in
+    /// `docs/testing/mock-states.md` against the knobs this file actually
+    /// reads, in BOTH directions: a knob added here and left undocumented
+    /// fails, and a documented knob deleted here fails too.
+    ///
+    /// A source-text pin, on the precedent of `composer.rs`'s ordering test
+    /// and for the same reason: the alternative is setting process-global env
+    /// vars from a test, which races every other test in the binary. What it
+    /// cannot check is that a knob still *emits* anything — that is what each
+    /// surface's own row-level tests are for.
+    #[test]
+    fn every_mock_knob_is_documented() {
+        /// Read at compile time so a missing file is a build error rather than
+        /// a test that quietly passes on an empty string.
+        const REGISTER: &str = include_str!("../../../docs/testing/mock-states.md");
+        let source = include_str!("mock.rs");
+
+        let names = |text: &str| -> std::collections::BTreeSet<String> {
+            let mut found = std::collections::BTreeSet::new();
+            let mut rest = text;
+            while let Some(at) = rest.find("COMET_MOCK_") {
+                let tail = &rest[at..];
+                let end = tail
+                    .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+                    .unwrap_or(tail.len());
+                let name = &tail[..end];
+                // Prose says "the `COMET_MOCK_*` family"; that bare prefix is
+                // not a knob.
+                if name.len() > "COMET_MOCK_".len() && !name.ends_with('_') {
+                    found.insert(name.to_string());
+                }
+                rest = &tail[end..];
+            }
+            found
+        };
+
+        // The test's own literal would otherwise count as a use.
+        let declared: std::collections::BTreeSet<String> = names(
+            source
+                .split_once("mod tests {")
+                .map_or(source, |(before, _)| before),
+        );
+        let documented = names(REGISTER);
+
+        assert!(!declared.is_empty(), "found no knobs to check");
+        let undocumented: Vec<_> = declared.difference(&documented).collect();
+        assert!(
+            undocumented.is_empty(),
+            "these knobs are read by mock.rs but missing from \
+             docs/testing/mock-states.md: {undocumented:?}"
+        );
+        let stale: Vec<_> = documented.difference(&declared).collect();
+        assert!(
+            stale.is_empty(),
+            "docs/testing/mock-states.md lists knobs mock.rs no longer reads: {stale:?}"
+        );
+    }
 
     /// Every card shape must be reachable from the knob, or the rendered
     /// check can only ever see the one kind 1.4 happened to script.

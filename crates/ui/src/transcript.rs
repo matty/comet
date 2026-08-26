@@ -543,6 +543,23 @@ impl ApprovalPaint {
     }
 }
 
+/// The subagent card's paint discriminator, on `ApprovalPaint`'s precedent and
+/// for its reason: the only thing that may vary by state is colour and glyph,
+/// never a layout number (`.agents/rules/gpui-ui.md`).
+///
+/// `LastSeenRunning` is NOT a `SubagentStatus` — no such status exists, and
+/// inventing one would reach `PROTOCOL_VERSION`. It is the reading a card gets
+/// when its own status still says `Running` while the entry around it has
+/// finished; see [`subagent_row_state`] for why that happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentPaint {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    LastSeenRunning,
+}
+
 #[derive(Clone)]
 pub enum RowKind {
     User {
@@ -613,6 +630,77 @@ pub enum RowKind {
         severity: NoticeSeverity,
         occurrences: u32,
     },
+    /// One delegated agent. Like `ApprovalCard` this is PASSIVE — a subagent
+    /// asks the user for nothing, so nothing here reaches the composer.
+    ///
+    /// Every field is resolved in [`rows_for_entry`], never at paint time:
+    /// the render arm picks colours and lays out, and makes no decisions about
+    /// what the card is allowed to say.
+    SubagentCard {
+        /// Straight off the wire ("Explore", "general-purpose"); never looked
+        /// up in the discovery handshake's `agents` catalogue (D31).
+        agent_type: SharedString,
+        description: SharedString,
+        /// The state word in the top-right ("running", "last seen running").
+        status_caption: SharedString,
+        paint: SubagentPaint,
+        /// The live line, and `Some` ONLY while the card is genuinely live.
+        /// Two independent rules blank it — see [`subagent_row_state`].
+        activity: Option<SharedString>,
+        /// The child's answer, on completion. Folds to two lines.
+        summary: Option<SharedString>,
+        /// The quiet explanatory line a terminal state carries instead of a
+        /// live one. Comet copy, never provider text.
+        caption: Option<SharedString>,
+        /// Pre-joined "20,115 tokens · 4.9s · 4 tools", omitting every counter
+        /// the provider did not report. `None` when it reported none of them.
+        counters: Option<SharedString>,
+    },
+    /// The plan the agent published for this run (slice 4.4).
+    ///
+    /// One card per RUN, sitting where the plan was first published and moving
+    /// as its steps move. It is not pinned and does not follow the viewport:
+    /// every message starts a fresh run and therefore a fresh card, so the only
+    /// window in which the plan is out of sight is inside one long turn.
+    ChecklistCard {
+        /// Codex's one-line rationale for the latest change. Claude sends none
+        /// and none is synthesized for it, so `None` here is ordinary.
+        explanation: Option<SharedString>,
+        done: usize,
+        steps: Arc<Vec<ChecklistRow>>,
+    },
+}
+
+/// One drawn step of a plan.
+#[derive(Clone, PartialEq)]
+pub struct ChecklistRow {
+    pub label: SharedString,
+    /// True when the provider named this step neither way and the label is
+    /// Comet's placeholder — the row is drawn quieter, and it is NOT an error
+    /// state. See [`checklist_label`].
+    pub unnamed: bool,
+    pub status: ChecklistStatus,
+}
+
+/// A step's visible label.
+///
+/// `text` is the step as the agent phrased it; `active_form` is its
+/// present-participle twin ("Counting lines" vs "Count the lines"), and on a
+/// resumed run it is often the ONLY human-readable text an item has — a
+/// resumed Claude process restates nothing, so a step can be first sighted by
+/// a bare status change carrying neither. That last case is real, not
+/// defensive: `COMET_MOCK_CHECKLIST` emits it deliberately, and a card that
+/// assumed every row has a subject would draw a blank line.
+fn checklist_label(item: &comet_proto::ChecklistItem) -> (SharedString, bool) {
+    match item
+        .text
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| item.active_form.as_deref().filter(|t| !t.trim().is_empty()))
+    {
+        Some(label) => (SharedString::from(single_line(label)), false),
+        None => (SharedString::from("Unnamed step"), true),
+    }
 }
 
 /// A transcript row: stable id + content version (diff key) + block payload.
@@ -686,6 +774,128 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
 /// `parse` maps `(part_key, text)` to a block tree — the entity supplies
 /// incremental parsers for live parts and a cache for complete ones; tests pass
 /// a plain `parse_full`.
+/// Thousands separators without pulling in a formatting crate — the only
+/// grouped number on either new card.
+fn grouped(n: u64) -> String {
+    let raw = n.to_string();
+    let mut out = String::with_capacity(raw.len() + raw.len() / 3);
+    for (i, c) in raw.chars().enumerate() {
+        if i > 0 && (raw.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A subagent's elapsed time, at the precision a person reads at a glance.
+fn subagent_duration(ms: u64) -> String {
+    if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1000)
+    }
+}
+
+/// The counters line, omitting every counter the provider did not report.
+///
+/// `None` is "not reported yet", never zero (`AgentEvent::SubagentUpdated`'s
+/// own doc) — so an absent counter is DROPPED rather than printed as `0`. A
+/// card reading `0 tokens` for an agent that simply never reported would be a
+/// lie the `Option` was chosen to prevent. Returns `None` when nothing at all
+/// was reported, so the row carries no empty line.
+fn subagent_counters(
+    total_tokens: Option<u64>,
+    duration_ms: Option<u64>,
+    tool_uses: Option<u32>,
+) -> Option<SharedString> {
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    if let Some(tokens) = total_tokens {
+        parts.push(format!("{} tokens", grouped(tokens)));
+    }
+    if let Some(ms) = duration_ms {
+        parts.push(subagent_duration(ms));
+    }
+    if let Some(uses) = tool_uses {
+        parts.push(format!(
+            "{uses} {}",
+            if uses == 1 { "tool" } else { "tools" }
+        ));
+    }
+    (!parts.is_empty()).then(|| SharedString::from(parts.join(" · ")))
+}
+
+/// What a subagent card is allowed to say, given its own status and whether
+/// the entry around it has finished.
+///
+/// Returns `(paint, status caption, live activity, quiet caption)`.
+///
+/// **Two independent rules blank the activity line, and neither subsumes the
+/// other.**
+///
+/// 1. A TERMINAL status blanks it (D53). The `SubagentUpdated` fold overwrites
+///    `activity` only when the new reading carries one, so a `task_updated` or
+///    `task_notification` reporting no activity leaves the last live line
+///    standing in the part. Rendering `activity` whenever it is `Some` would
+///    print "Reading normalize.rs" under a finished agent forever.
+/// 2. A FINISHED ENTRY blanks it even while the status still says `Running`
+///    (D57). Send a new message while an agent is working and Comet passes it
+///    to the CLI without stopping that agent; the accumulator is cleared on
+///    `Steered`, so every later update for that `task_id` is dropped and the
+///    part is frozen at its last reading. The card reports where it froze —
+///    `last seen running` — and never an outcome: `cancelled` would assert
+///    something nobody observed, `completed` would be a guess.
+fn subagent_row_state(
+    status: SubagentStatus,
+    activity: Option<&str>,
+    entry_finished: bool,
+) -> (
+    SubagentPaint,
+    &'static str,
+    Option<SharedString>,
+    Option<SharedString>,
+) {
+    match status {
+        SubagentStatus::Running if entry_finished => (
+            SubagentPaint::LastSeenRunning,
+            "last seen running",
+            None,
+            Some("You sent a new message before this finished.".into()),
+        ),
+        SubagentStatus::Running => (
+            SubagentPaint::Running,
+            "running",
+            activity.map(|a| SharedString::from(single_line(a))),
+            None,
+        ),
+        SubagentStatus::Completed => (SubagentPaint::Completed, "completed", None, None),
+        SubagentStatus::Failed => (
+            SubagentPaint::Failed,
+            "failed",
+            None,
+            Some("The agent stopped before it reported anything back.".into()),
+        ),
+        SubagentStatus::Cancelled => (SubagentPaint::Cancelled, "cancelled", None, None),
+    }
+}
+
+/// True for the contentless chip Claude's `Agent` call renders as today.
+///
+/// The call has no decode arm and falls through to `ToolCall::Unknown`
+/// (`comet_harness::claude::normalize`), and `sanitize_tool_call` strips
+/// `Unknown`'s input before the part enters the document — so the name is
+/// genuinely all that survives, and all there is to match on. See the
+/// suppression comment in [`rows_for_entry`].
+fn is_agent_spawn_chip(part: &MessagePart) -> bool {
+    matches!(
+        part,
+        MessagePart::Tool {
+            call: ToolCall::Unknown { name, .. },
+            ..
+        } if name == "Agent"
+    )
+}
+
 pub fn rows_for_entry(
     entry: &SessionMessageEntry,
     pending: bool,
@@ -763,7 +973,32 @@ pub fn rows_for_entry(
             *group_ix += 1;
         };
 
+    // A delegation would otherwise draw TWICE: once as the contentless `Agent`
+    // tool chip, and once as the subagent card below. The two cannot be joined
+    // — `tool_use_id` is dropped when the part is built (`doc::parts`'s
+    // `SubagentStarted` arm) and `sanitize_tool_call` strips the chip's input
+    // before it reaches the document, so the persisted chip is the bare string
+    // "Agent".
+    //
+    // So pair them POSITIONALLY and entry-locally: suppress as many `Agent`
+    // chips as this entry has cards, in fold order. Claude emits the `Agent`
+    // tool_use before its `task_started`, so in practice this pairs exactly.
+    // It fails OPEN by construction — the budget is bounded by the card count,
+    // so a delegation that never produced a card keeps its chip rather than
+    // vanishing. `split_parts` can also strand a chip and its card in separate
+    // continuation entries, which under-suppresses; that is the harmless
+    // direction and is left alone.
+    let mut agent_chip_budget = entry
+        .parts
+        .iter()
+        .filter(|p| matches!(p, MessagePart::Subagent { .. }))
+        .count();
+
     for (part_ix, part) in entry.parts.iter().enumerate() {
+        if agent_chip_budget > 0 && is_agent_spawn_chip(part) {
+            agent_chip_budget -= 1;
+            continue;
+        }
         if let Some(tool) = tool_item_from_part(part) {
             pending_group.push(tool);
             group_last_part_ix = part_ix;
@@ -928,18 +1163,115 @@ pub fn rows_for_entry(
                     timestamp: None,
                 });
             }
-            // Persisted, not drawn: subagent attribution (slice 4.2)
-            // lands the part; rendering it as a card is slice 4.4's
-            // build. An explicit no-op arm, never `_ => {}` — a
-            // wildcard here would silently swallow the NEXT part kind
-            // someone adds, and 4.4 would get no compile error naming
-            // what to build.
-            MessagePart::Subagent { .. } => {}
-            // Same deal for the checklist (slice 4.3). 4.4 draws both
-            // surfaces together, deliberately: they are the two new
-            // non-chip things in a transcript, and designing them
-            // apart is how one ends up with two unrelated card idioms.
-            MessagePart::Checklist { .. } => {}
+            MessagePart::Subagent {
+                id: part_id,
+                agent_type,
+                description,
+                status,
+                activity,
+                summary,
+                total_tokens,
+                duration_ms,
+                tool_uses,
+                ..
+            } => {
+                // A finished entry is the second of the two rules that blank
+                // the live line — see `subagent_row_state`. `None` status is
+                // NOT finished: an entry that never recorded one is not
+                // evidence the turn ended.
+                let entry_finished = matches!(
+                    entry.status,
+                    Some(MessageStatus::Complete) | Some(MessageStatus::Aborted)
+                );
+                let (paint, status_caption, activity, caption) =
+                    subagent_row_state(*status, activity.as_deref(), entry_finished);
+                let counters = subagent_counters(*total_tokens, *duration_ms, *tool_uses);
+                // The child's answer is prose and may be long; the card folds
+                // it. Kept multi-line here — the fold shows two lines and the
+                // expansion wants the paragraphs it actually sent.
+                let summary: Option<SharedString> =
+                    summary.as_ref().map(|s| SharedString::from(s.clone()));
+
+                let mut fp = agent_type.as_bytes().to_vec();
+                fp.extend_from_slice(description.as_bytes());
+                fp.extend_from_slice(status_caption.as_bytes());
+                if let Some(a) = &activity {
+                    fp.extend_from_slice(a.as_bytes());
+                }
+                if let Some(s) = &summary {
+                    fp.extend_from_slice(s.as_bytes());
+                }
+                if let Some(c) = &counters {
+                    fp.extend_from_slice(c.as_bytes());
+                }
+                rows.push(Row {
+                    id: format!("{}#{}", entry.id, part_id).into(),
+                    version: fnv1a(&fp),
+                    turn_start: false,
+                    kind: RowKind::SubagentCard {
+                        agent_type: SharedString::from(single_line(agent_type)),
+                        description: SharedString::from(single_line(description)),
+                        status_caption: status_caption.into(),
+                        paint,
+                        activity,
+                        summary,
+                        caption,
+                        counters,
+                    },
+                    entry_id: entry_id.clone(),
+                    timestamp: None,
+                });
+            }
+            MessagePart::Checklist {
+                id: part_id,
+                explanation,
+                items,
+            } => {
+                let steps: Vec<ChecklistRow> = items
+                    .iter()
+                    .map(|item| {
+                        let (label, unnamed) = checklist_label(item);
+                        ChecklistRow {
+                            label,
+                            unnamed,
+                            status: item.status,
+                        }
+                    })
+                    .collect();
+                let done = steps
+                    .iter()
+                    .filter(|s| s.status == ChecklistStatus::Completed)
+                    .count();
+
+                let mut fp: Vec<u8> = Vec::with_capacity(steps.len() * 16);
+                if let Some(explanation) = explanation {
+                    fp.extend_from_slice(explanation.as_bytes());
+                }
+                for step in &steps {
+                    fp.extend_from_slice(step.label.as_bytes());
+                    fp.push(step.unnamed as u8);
+                    fp.push(match step.status {
+                        ChecklistStatus::Pending => 0,
+                        ChecklistStatus::InProgress => 1,
+                        ChecklistStatus::Completed => 2,
+                        ChecklistStatus::Unknown => 3,
+                    });
+                }
+                rows.push(Row {
+                    id: format!("{}#{}", entry.id, part_id).into(),
+                    version: fnv1a(&fp),
+                    turn_start: false,
+                    kind: RowKind::ChecklistCard {
+                        explanation: explanation
+                            .as_ref()
+                            .map(|e| SharedString::from(single_line(e))),
+                        done,
+                        steps: Arc::new(steps),
+                    },
+                    entry_id: entry_id.clone(),
+                    timestamp: None,
+                });
+            }
         }
     }
     flush_group(
@@ -1948,6 +2280,301 @@ impl Transcript {
         rows
     }
 
+    /// One delegated agent (slice 4.4). Passive — a subagent asks the user for
+    /// nothing, so unlike an approval this puts no controls in the composer.
+    ///
+    /// Every decision about what the card may SAY was made in `rows_for_entry`
+    /// (see `subagent_row_state`); this picks colours and lays out. The only
+    /// state it owns is whether the summary is folded, which rides the same
+    /// `folds` map tool groups use and is therefore garbage-collected with the
+    /// row like any other.
+    #[allow(clippy::too_many_arguments)]
+    fn render_subagent_card(
+        &mut self,
+        row_id: &SharedString,
+        agent_type: &SharedString,
+        description: &SharedString,
+        status_caption: &SharedString,
+        paint: SubagentPaint,
+        activity: Option<&SharedString>,
+        summary: Option<&SharedString>,
+        caption: Option<&SharedString>,
+        counters: Option<&SharedString>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (tint, icon_path) = match paint {
+            SubagentPaint::Running => (theme.text_muted, crate::icons::MAGNIFER),
+            SubagentPaint::Completed => (theme.success_muted, crate::icons::CHECK),
+            SubagentPaint::Failed => (theme.danger, crate::icons::CLOSE_CIRCLE),
+            // A plain cross, not the filled STOP square: cancellation is a
+            // quiet outcome and the solid glyph read as the heaviest thing on
+            // a muted card.
+            SubagentPaint::Cancelled => (theme.text_muted, crate::icons::CLOSE),
+            SubagentPaint::LastSeenRunning => (theme.warning_muted, crate::icons::DANGER_TRIANGLE),
+        };
+        let tile = tint.opacity(0.12);
+        let border = match paint {
+            SubagentPaint::Running | SubagentPaint::Cancelled => crate::theme::hairline(0.08),
+            _ => tint.opacity(0.16),
+        };
+        let wash = match paint {
+            SubagentPaint::Running | SubagentPaint::Cancelled => crate::theme::ink(0.045),
+            _ => tint.opacity(0.05),
+        };
+
+        let summary_open = summary.is_some()
+            && self
+                .folds
+                .get(row_id)
+                .is_some_and(|fold| fold.open.unwrap_or(false));
+        let toggle_id = row_id.clone();
+
+        // The live dot breathes on the same 2.4s spec as every other pulse in
+        // the app. It is drawn ONLY when `activity` survived both blanking
+        // rules, so a finished card can never animate.
+        let live_opacity = activity.is_some().then(|| {
+            0.35 + 0.5
+                * motion::pulse_wave(motion::pulse_delta(
+                    &motion::COMET_PULSE,
+                    cx.entity_id(),
+                    cx,
+                ))
+        });
+
+        div()
+            .py(px(4.0))
+            .w_full()
+            .child(
+                card_frame(border, wash, None)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(Theme::SPACE_SM))
+                            .child(card_tile(icon_path, tile, tint))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(tint)
+                                    .child(agent_type.clone()),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme.text_muted)
+                                    .child(status_caption.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .w_full()
+                            .truncate()
+                            .text_color(theme.text.opacity(0.85))
+                            .child(description.clone()),
+                    )
+                    .children(activity.map(|activity| {
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .size(px(5.0))
+                                    .rounded(px(2.5))
+                                    .bg(theme.accent)
+                                    .opacity(live_opacity.unwrap_or(1.0)),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme.text_muted)
+                                    .child(activity.clone()),
+                            )
+                    }))
+                    .children(caption.map(|caption| {
+                        div()
+                            .min_w_0()
+                            .w_full()
+                            .text_color(theme.text_muted)
+                            .child(caption.clone())
+                    }))
+                    .children(summary.map(|summary| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(Theme::SPACE_XS))
+                            .child(div().h(px(1.0)).w_full().bg(crate::theme::hairline(0.08)))
+                            .child({
+                                let body = div()
+                                    .min_w_0()
+                                    .w_full()
+                                    .text_color(theme.text.opacity(0.85))
+                                    .child(summary.clone());
+                                // Folded height is two lines at this size, in
+                                // layout numbers only — never a palette value.
+                                if summary_open {
+                                    body
+                                } else {
+                                    body.max_h(px(36.0)).overflow_hidden()
+                                }
+                            })
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("{row_id}#sum")))
+                                    .cursor_pointer()
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from(if summary_open {
+                                        "Show less"
+                                    } else {
+                                        "Show more"
+                                    }))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let fold = this.folds.entry(toggle_id.clone()).or_default();
+                                        fold.open = Some(!fold.open.unwrap_or(false));
+                                        fold.epoch += 1;
+                                        cx.notify();
+                                    })),
+                            )
+                    }))
+                    .children(counters.map(|counters| {
+                        div()
+                            .min_w_0()
+                            .w_full()
+                            .truncate()
+                            .text_color(theme.text_faint)
+                            .child(counters.clone())
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// The plan card (slice 4.4). Passive and non-interactive: a plan is a
+    /// report, and every step's state is already on the row.
+    ///
+    /// Shares the card frame with the approval and subagent cards. Step glyphs
+    /// are DRAWN rather than iconography — the embedded Solar set has no
+    /// half-filled circle, and a ring plus a centred dot is a layout, so it
+    /// needs no new asset and stays palette-independent.
+    fn render_checklist_card(
+        &mut self,
+        explanation: Option<&SharedString>,
+        done: usize,
+        steps: &Arc<Vec<ChecklistRow>>,
+        theme: &Theme,
+    ) -> AnyElement {
+        let total = steps.len();
+        div()
+            .py(px(4.0))
+            .w_full()
+            .child(
+                card_frame(crate::theme::hairline(0.08), crate::theme::ink(0.045), None)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(Theme::SPACE_SM))
+                            .child(card_tile(
+                                crate::icons::CHECKLIST,
+                                crate::theme::ink(0.09),
+                                theme.text_muted,
+                            ))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from("Plan")),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from(format!("{done} of {total} done"))),
+                            ),
+                    )
+                    .children(explanation.map(|explanation| {
+                        div()
+                            .min_w_0()
+                            .w_full()
+                            .text_color(theme.text_muted)
+                            .child(explanation.clone())
+                    }))
+                    .child(div().h(px(1.0)).w_full().bg(crate::theme::hairline(0.08)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .children(steps.iter().map(|step| {
+                                let (ring, fill, label_color) = match step.status {
+                                    ChecklistStatus::Completed => {
+                                        (theme.success_muted, None, theme.text_muted)
+                                    }
+                                    ChecklistStatus::InProgress => {
+                                        (theme.accent, Some(theme.accent), theme.text.opacity(0.85))
+                                    }
+                                    ChecklistStatus::Pending | ChecklistStatus::Unknown => {
+                                        (theme.text_faint, None, theme.text.opacity(0.85))
+                                    }
+                                };
+                                let glyph = div()
+                                    .flex_none()
+                                    .size(px(12.0))
+                                    .mt(px(3.0))
+                                    .rounded(px(6.0))
+                                    .border_1()
+                                    .border_color(ring)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center();
+                                let glyph =
+                                    match step.status {
+                                        // A tick, drawn inside the ring the other
+                                        // states use, so the column never shifts.
+                                        ChecklistStatus::Completed => glyph.child(
+                                            crate::icons::icon(crate::icons::CHECK)
+                                                .size(px(8.0))
+                                                .text_color(theme.success_muted),
+                                        ),
+                                        _ => glyph.children(fill.map(|fill| {
+                                            div().size(px(5.0)).rounded(px(2.5)).bg(fill)
+                                        })),
+                                    };
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_start()
+                                    .gap(px(Theme::SPACE_SM))
+                                    .child(glyph)
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .text_color(if step.unnamed {
+                                                theme.text_faint
+                                            } else {
+                                                label_color
+                                            })
+                                            .child(step.label.clone()),
+                                    )
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn toggle_fold(&mut self, row_id: SharedString, current_height: f32, auto_open: bool) {
         let entry = self.folds.entry(row_id).or_default();
         let currently_open = entry.open.unwrap_or(auto_open);
@@ -2474,6 +3101,33 @@ impl Transcript {
                 paint,
             } => approval_card(label, detail.clone(), state.clone(), *paint, &theme),
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::SubagentCard {
+                agent_type,
+                description,
+                status_caption,
+                paint,
+                activity,
+                summary,
+                caption,
+                counters,
+            } => self.render_subagent_card(
+                &row.id,
+                agent_type,
+                description,
+                status_caption,
+                *paint,
+                activity.as_ref(),
+                summary.as_ref(),
+                caption.as_ref(),
+                counters.as_ref(),
+                &theme,
+                cx,
+            ),
+            RowKind::ChecklistCard {
+                explanation,
+                done,
+                steps,
+            } => self.render_checklist_card(explanation.as_ref(), *done, steps, &theme),
             RowKind::NoticeChip {
                 summary,
                 detail,
@@ -3232,6 +3886,52 @@ fn notice_chip(
 /// Passive by construction, like [`input_chip`]: the decision controls live in
 /// the composer, so there is no control here to disable when the approval is
 /// no longer answerable.
+/// The transcript's card frame — the shell every card here shares.
+///
+/// Extracted rather than repeated because the `MessagePart::Subagent` no-op
+/// arm warned about exactly this before either later card existed: designing
+/// them apart is how a transcript ends up with two unrelated card idioms.
+/// Three callers of one helper cannot drift; three hand-built cards will.
+///
+/// `fixed_height` is `Some` only for the approval card, whose one-line body
+/// has always been 56px. The others grow with their content — the transcript
+/// is a measured `list`, not a uniform one, so variable height costs nothing.
+fn card_frame(border: gpui::Hsla, wash: gpui::Hsla, fixed_height: Option<f32>) -> gpui::Div {
+    let base = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(Theme::SPACE_XS))
+        .overflow_hidden()
+        .rounded(px(Theme::PANEL_RADIUS))
+        .border_1()
+        .border_color(border)
+        .bg(wash)
+        .px(px(Theme::SPACE_SM))
+        .text_size(px(12.0));
+    match fixed_height {
+        Some(h) => base.h(px(h)).justify_center(),
+        None => base.py(px(Theme::SPACE_SM)),
+    }
+}
+
+/// The 20px icon tile every card's header row opens with.
+fn card_tile(icon_path: &'static str, bg: gpui::Hsla, tint: gpui::Hsla) -> gpui::Div {
+    div()
+        .flex_none()
+        .size(px(20.0))
+        .rounded(px(Theme::CONTROL_RADIUS))
+        .bg(bg)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            crate::icons::icon(icon_path)
+                .size(px(12.0))
+                .text_color(tint),
+        )
+}
+
 fn approval_card(
     label: &'static str,
     detail: SharedString,
@@ -3280,41 +3980,14 @@ fn approval_card(
         .py(px(4.0))
         .w_full()
         .child(
-            div()
-                .h(px(56.0))
-                .w_full()
-                .flex()
-                .flex_col()
-                .justify_center()
-                .gap(px(4.0))
-                .overflow_hidden()
-                .rounded(px(10.0))
-                .border_1()
-                .border_color(border)
-                .bg(wash)
-                .px(px(8.0))
-                .text_size(px(12.0))
+            card_frame(border, wash, Some(56.0))
                 .child(
                     div()
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(8.0))
-                        .child(
-                            div()
-                                .flex_none()
-                                .size(px(20.0))
-                                .rounded(px(6.0))
-                                .bg(tile)
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    crate::icons::icon(icon_path)
-                                        .size(px(12.0))
-                                        .text_color(tint),
-                                ),
-                        )
+                        .gap(px(Theme::SPACE_SM))
+                        .child(card_tile(icon_path, tile, tint))
                         .child(
                             div()
                                 .flex_none()
@@ -3516,6 +4189,8 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
             total_tokens,
             duration_ms,
             tool_uses,
+            activity,
+            summary,
             ..
         } = part
         {
@@ -3531,6 +4206,13 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
             acc.extend_from_slice(&duration_ms.unwrap_or(0).to_le_bytes());
             acc.push(tool_uses.is_some() as u8);
             acc.extend_from_slice(&tool_uses.unwrap_or(0).to_le_bytes());
+            // `byte_len` sums text LENGTHS, so two activity lines of equal
+            // length ("Reading a.md" -> "Reading b.md") fingerprint
+            // identically and the live line freezes on screen while the agent
+            // works. Fold the CONTENT, not the length. Unreachable before
+            // this slice, because nothing drew either field.
+            acc.extend_from_slice(activity.as_deref().unwrap_or_default().as_bytes());
+            acc.extend_from_slice(summary.as_deref().unwrap_or_default().as_bytes());
         }
         // Same blindness, sharper here: a checklist's ONLY interesting change
         // is usually a status moving with no text change at all
@@ -3553,6 +4235,12 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
                 // text-less row becoming a named one.
                 acc.push(item.text.is_some() as u8);
                 acc.push(item.active_form.is_some() as u8);
+                // And the CONTENT, for the same reason the `Subagent` arm
+                // folds its activity line: `byte_len` sums lengths, so one
+                // subject being rewritten to another of equal length is
+                // invisible to it and the card would keep the old wording.
+                acc.extend_from_slice(item.text.as_deref().unwrap_or_default().as_bytes());
+                acc.extend_from_slice(item.active_form.as_deref().unwrap_or_default().as_bytes());
             }
         }
     }
@@ -3737,6 +4425,59 @@ mod tests {
             entry_fingerprint(&completed, false),
             "a Running -> Completed transition with identical part text must \
              still change the fingerprint"
+        );
+    }
+
+    /// The same blindness one layer down, and the one the live line actually
+    /// hits: `byte_len` sums text LENGTHS, so an activity line moving between
+    /// two readings of equal length fingerprints identically and the row cache
+    /// never rebuilds — the live line freezes on screen while the agent works.
+    /// Unreachable before slice 4.4, because nothing drew the field.
+    #[test]
+    fn an_equal_length_activity_change_still_changes_the_fingerprint() {
+        let base = comet_doc::SessionMessageEntry {
+            id: "e1".into(),
+            role: comet_doc::MessageRole::Assistant,
+            parts: vec![MessagePart::Subagent {
+                id: "sub-1".into(),
+                task_id: "t1".into(),
+                agent_type: "Explore".into(),
+                description: "Find the retry sites".into(),
+                status: SubagentStatus::Running,
+                activity: Some("Reading normalize.rs".into()),
+                summary: None,
+                total_tokens: None,
+                duration_ms: None,
+                tool_uses: None,
+            }],
+            created_at: 0,
+            device_id: "d1".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        };
+        let mut moved_on = base.clone();
+        moved_on.parts = vec![MessagePart::Subagent {
+            id: "sub-1".into(),
+            task_id: "t1".into(),
+            agent_type: "Explore".into(),
+            description: "Find the retry sites".into(),
+            status: SubagentStatus::Running,
+            // Same byte length as "Reading normalize.rs".
+            activity: Some("Reading discovery.rs".into()),
+            summary: None,
+            total_tokens: None,
+            duration_ms: None,
+            tool_uses: None,
+        }];
+        assert_eq!(
+            "Reading normalize.rs".len(),
+            "Reading discovery.rs".len(),
+            "the fixture only tests anything while these are the same length"
+        );
+        assert_ne!(
+            entry_fingerprint(&base, false),
+            entry_fingerprint(&moved_on, false),
+            "an equal-length activity change must still invalidate the row cache"
         );
     }
 
@@ -4037,6 +4778,502 @@ mod tests {
         let r2 = rows_for_entry(&two, false, &mut parse);
         assert_eq!(r1[0].id, r2[0].id);
         assert_ne!(r1[0].version, r2[0].version);
+    }
+
+    // ---- slice 4.4: the subagent card ----
+
+    #[allow(clippy::too_many_arguments)]
+    fn subagent_part(
+        id: &str,
+        agent_type: &str,
+        description: &str,
+        status: SubagentStatus,
+        activity: Option<&str>,
+        summary: Option<&str>,
+        total_tokens: Option<u64>,
+        duration_ms: Option<u64>,
+        tool_uses: Option<u32>,
+    ) -> MessagePart {
+        MessagePart::Subagent {
+            id: id.into(),
+            task_id: id.into(),
+            agent_type: agent_type.into(),
+            description: description.into(),
+            status,
+            activity: activity.map(str::to_owned),
+            summary: summary.map(str::to_owned),
+            total_tokens,
+            duration_ms,
+            tool_uses,
+        }
+    }
+
+    fn agent_chip(id: &str) -> MessagePart {
+        MessagePart::Tool {
+            id: id.into(),
+            // Exactly what reaches the document: `sanitize_tool_call` has
+            // already stripped the input, so the name is all there is.
+            call: ToolCall::Unknown {
+                name: "Agent".into(),
+                input: None,
+            },
+            is_error: false,
+            resolved: true,
+            diff_ref: None,
+            diff_stats: None,
+        }
+    }
+
+    fn subagent_row(rows: &[Row]) -> (&SharedString, SubagentPaint, Option<&SharedString>) {
+        let row = rows
+            .iter()
+            .find(|r| matches!(r.kind, RowKind::SubagentCard { .. }))
+            .expect("expected a SubagentCard row");
+        let RowKind::SubagentCard {
+            status_caption,
+            paint,
+            activity,
+            ..
+        } = &row.kind
+        else {
+            unreachable!()
+        };
+        (status_caption, *paint, activity.as_ref())
+    }
+
+    /// A live agent's card carries its activity line and says so.
+    #[test]
+    fn a_running_subagent_in_a_live_entry_draws_its_activity_line() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![subagent_part(
+                "s1",
+                "Explore",
+                "Find the retry sites",
+                SubagentStatus::Running,
+                Some("Reading normalize.rs"),
+                None,
+                None,
+                None,
+                None,
+            )],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let (caption, paint, activity) = subagent_row(&rows);
+        assert_eq!(caption.as_ref(), "running");
+        assert_eq!(paint, SubagentPaint::Running);
+        assert_eq!(
+            activity.map(|a| a.as_ref()),
+            Some("Reading normalize.rs"),
+            "a live card must show what the agent is doing"
+        );
+    }
+
+    /// D57: send a new message while an agent is working and Comet never
+    /// learns the outcome. The card reports where it froze, and stops looking
+    /// alive — the entry around it is finished even though its own status is
+    /// still `Running`.
+    #[test]
+    fn a_running_subagent_in_a_finished_entry_reads_last_seen_running() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![subagent_part(
+                "s1",
+                "Explore",
+                "Find the retry sites",
+                SubagentStatus::Running,
+                Some("Reading normalize.rs"),
+                None,
+                None,
+                None,
+                None,
+            )],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let (caption, paint, activity) = subagent_row(&rows);
+        assert_eq!(caption.as_ref(), "last seen running");
+        assert_eq!(paint, SubagentPaint::LastSeenRunning);
+        assert!(
+            activity.is_none(),
+            "a frozen card must not keep a live activity line"
+        );
+    }
+
+    /// D53: the `SubagentUpdated` fold overwrites `activity` only when the new
+    /// reading carries one, so a terminal part can still be holding the last
+    /// live line. The fixture sets it DELIBERATELY — one that cleared it could
+    /// not fail.
+    #[test]
+    fn a_completed_subagent_still_carrying_activity_draws_no_activity_line() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![subagent_part(
+                "s1",
+                "Explore",
+                "Find the retry sites",
+                SubagentStatus::Completed,
+                Some("Reading normalize.rs"),
+                Some("Three call sites."),
+                Some(20_115),
+                Some(4_907),
+                Some(4),
+            )],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let (caption, _, activity) = subagent_row(&rows);
+        assert_eq!(caption.as_ref(), "completed");
+        assert!(
+            activity.is_none(),
+            "a finished card must never draw the stale live line the fold left behind"
+        );
+    }
+
+    /// `None` is "not reported yet", never zero — so an unreported counter is
+    /// dropped rather than printed as `0`.
+    #[test]
+    fn subagent_counters_omit_every_unreported_field() {
+        assert_eq!(
+            subagent_counters(Some(20_115), Some(4_907), Some(4))
+                .as_ref()
+                .map(|c| c.as_ref()),
+            Some("20,115 tokens · 4.9s · 4 tools")
+        );
+        assert_eq!(
+            subagent_counters(None, Some(4_907), None)
+                .as_ref()
+                .map(|c| c.as_ref()),
+            Some("4.9s"),
+            "an unreported counter must be absent, not zero"
+        );
+        assert_eq!(
+            subagent_counters(Some(1), None, Some(1))
+                .as_ref()
+                .map(|c| c.as_ref()),
+            Some("1 tokens · 1 tool")
+        );
+        assert!(
+            subagent_counters(None, None, None).is_none(),
+            "a card whose agent reported nothing carries no counters line at all"
+        );
+    }
+
+    /// The delegation must not read twice. One card spends one chip.
+    #[test]
+    fn a_subagent_card_suppresses_one_agent_chip() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![
+                agent_chip("t1"),
+                subagent_part(
+                    "s1",
+                    "Explore",
+                    "Find the retry sites",
+                    SubagentStatus::Completed,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r.kind, RowKind::ToolGroup { .. })),
+            "the contentless Agent chip must not survive beside its card"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r.kind, RowKind::SubagentCard { .. }))
+                .count(),
+            1
+        );
+    }
+
+    /// Suppression is budgeted by the card count, so it fails OPEN: a
+    /// delegation that never produced a card keeps its chip rather than
+    /// vanishing from the transcript entirely.
+    #[test]
+    fn an_agent_chip_with_no_card_survives() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![
+                agent_chip("t1"),
+                agent_chip("t2"),
+                subagent_part(
+                    "s1",
+                    "Explore",
+                    "Find the retry sites",
+                    SubagentStatus::Completed,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let chips: usize = rows
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RowKind::ToolGroup { tools, .. } => Some(tools.len()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(
+            chips, 1,
+            "two chips and one card must leave exactly one chip standing"
+        );
+    }
+
+    /// The match is on the `Agent` name specifically. Another unknown tool in
+    /// the same entry is not collateral.
+    #[test]
+    fn a_non_agent_unknown_tool_is_never_suppressed() {
+        let other = MessagePart::Tool {
+            id: "t1".into(),
+            call: ToolCall::Unknown {
+                name: "SomeOtherTool".into(),
+                input: None,
+            },
+            is_error: false,
+            resolved: true,
+            diff_ref: None,
+            diff_stats: None,
+        };
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![
+                other,
+                subagent_part(
+                    "s1",
+                    "Explore",
+                    "Find the retry sites",
+                    SubagentStatus::Completed,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let chips: usize = rows
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RowKind::ToolGroup { tools, .. } => Some(tools.len()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(chips, 1, "only the Agent chip may be suppressed");
+    }
+
+    // ---- slice 4.4: the plan card ----
+
+    fn step(
+        text: Option<&str>,
+        active: Option<&str>,
+        status: ChecklistStatus,
+    ) -> comet_proto::ChecklistItem {
+        comet_proto::ChecklistItem {
+            id: "1".into(),
+            text: text.map(str::to_owned),
+            active_form: active.map(str::to_owned),
+            status,
+        }
+    }
+
+    fn checklist_part(
+        explanation: Option<&str>,
+        items: Vec<comet_proto::ChecklistItem>,
+    ) -> MessagePart {
+        MessagePart::Checklist {
+            id: "checklist".into(),
+            explanation: explanation.map(str::to_owned),
+            items,
+        }
+    }
+
+    fn checklist_row(rows: &[Row]) -> (Option<&SharedString>, usize, &Arc<Vec<ChecklistRow>>) {
+        let row = rows
+            .iter()
+            .find(|r| matches!(r.kind, RowKind::ChecklistCard { .. }))
+            .expect("expected a ChecklistCard row");
+        let RowKind::ChecklistCard {
+            explanation,
+            done,
+            steps,
+        } = &row.kind
+        else {
+            unreachable!()
+        };
+        (explanation.as_ref(), *done, steps)
+    }
+
+    #[test]
+    fn a_checklist_part_becomes_a_card_counting_only_completed_steps() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![checklist_part(
+                Some("Narrowing to the fold first."),
+                vec![
+                    step(
+                        Some("Read the failing test"),
+                        None,
+                        ChecklistStatus::Completed,
+                    ),
+                    step(
+                        Some("Trace the assertion"),
+                        None,
+                        ChecklistStatus::Completed,
+                    ),
+                    step(
+                        Some("Fix the fold"),
+                        Some("Fixing the fold"),
+                        ChecklistStatus::InProgress,
+                    ),
+                    step(Some("Re-run the suite"), None, ChecklistStatus::Pending),
+                ],
+            )],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let (explanation, done, steps) = checklist_row(&rows);
+        assert_eq!(
+            explanation.map(|e| e.as_ref()),
+            Some("Narrowing to the fold first.")
+        );
+        assert_eq!(steps.len(), 4);
+        assert_eq!(done, 2, "only Completed steps count toward the tally");
+        assert_eq!(steps[2].label.as_ref(), "Fix the fold");
+        assert!(steps.iter().all(|s| !s.unnamed));
+    }
+
+    /// Claude sends no explanation and none may be synthesized for it, so the
+    /// row is simply absent rather than filled with Comet's own prose.
+    #[test]
+    fn a_claude_plan_carries_no_explanation_row() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![checklist_part(
+                None,
+                vec![step(Some("Read the test"), None, ChecklistStatus::Pending)],
+            )],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let (explanation, _, _) = checklist_row(&rows);
+        assert!(explanation.is_none());
+    }
+
+    /// A resumed run restates nothing, so a step can arrive with only its
+    /// present-participle form — or with neither. Neither may render blank.
+    #[test]
+    fn a_step_label_falls_back_through_active_form_to_a_placeholder() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![checklist_part(
+                None,
+                vec![
+                    step(
+                        Some("Count the lines"),
+                        Some("Counting the lines"),
+                        ChecklistStatus::Pending,
+                    ),
+                    step(
+                        None,
+                        Some("Counting the lines"),
+                        ChecklistStatus::InProgress,
+                    ),
+                    step(None, None, ChecklistStatus::Unknown),
+                    // An empty string is not a subject either.
+                    step(Some("   "), None, ChecklistStatus::Pending),
+                ],
+            )],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let (_, _, steps) = checklist_row(&rows);
+        assert_eq!(steps[0].label.as_ref(), "Count the lines");
+        assert!(!steps[0].unnamed);
+        assert_eq!(
+            steps[1].label.as_ref(),
+            "Counting the lines",
+            "a step this run never saw the subject of falls back to the active form"
+        );
+        assert!(!steps[1].unnamed);
+        assert_eq!(steps[2].label.as_ref(), "Unnamed step");
+        assert!(steps[2].unnamed, "the placeholder row is drawn quieter");
+        assert_eq!(
+            steps[3].label.as_ref(),
+            "Unnamed step",
+            "a blank subject is not a subject"
+        );
+    }
+
+    /// An unrecognized status degrades to `Unknown` at the wire boundary and
+    /// must still draw — it is a step like any other, not an error.
+    #[test]
+    fn an_unknown_step_status_still_draws_a_row() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![checklist_part(
+                None,
+                vec![step(Some("Something new"), None, ChecklistStatus::Unknown)],
+            )],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let (_, done, steps) = checklist_row(&rows);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].status, ChecklistStatus::Unknown);
+        assert_eq!(done, 0, "an unknown status is not a completion");
+    }
+
+    /// The row cache keys on the entry fingerprint, which folds text LENGTHS.
+    /// A step rewritten to another subject of the same length must still
+    /// repaint, or the card keeps the old wording.
+    #[test]
+    fn an_equal_length_step_rewrite_still_changes_the_fingerprint() {
+        let before = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![checklist_part(
+                None,
+                vec![step(
+                    Some("Read the aaa file"),
+                    None,
+                    ChecklistStatus::Pending,
+                )],
+            )],
+        );
+        let after = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![checklist_part(
+                None,
+                vec![step(
+                    Some("Read the bbb file"),
+                    None,
+                    ChecklistStatus::Pending,
+                )],
+            )],
+        );
+        assert_eq!("Read the aaa file".len(), "Read the bbb file".len());
+        assert_ne!(
+            entry_fingerprint(&before, false),
+            entry_fingerprint(&after, false)
+        );
     }
 
     fn approval_part(id: &str, decision: Option<comet_proto::ApprovalDecision>) -> MessagePart {
