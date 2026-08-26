@@ -407,7 +407,15 @@ pub fn display_combo_on(mac: bool, combo: &str) -> String {
                     "Ctrl".to_string()
                 }
             }
-            "alt" => "Alt".to_string(),
+            // macOS spells this key Option, and every native shortcuts list
+            // shows "Opt"; only the badge surface uses the ⌥ glyph.
+            "alt" => {
+                if mac {
+                    "Opt".to_string()
+                } else {
+                    "Alt".to_string()
+                }
+            }
             "shift" => "Shift".to_string(),
             other => {
                 let mut chars = other.chars();
@@ -913,6 +921,11 @@ mod tests {
             format!("{display_primary}+Shift+S")
         );
         assert_eq!(display_combo("f5"), "F5");
+        // Both spellings assert here rather than only the host's: the alt key
+        // is Option on macOS and Alt everywhere else, and the suite runs on
+        // Linux in CI.
+        assert_eq!(display_combo_on(true, "mod-alt-up"), "Cmd+Opt+Up");
+        assert_eq!(display_combo_on(false, "mod-alt-up"), "Ctrl+Alt+Up");
     }
 
     #[test]
