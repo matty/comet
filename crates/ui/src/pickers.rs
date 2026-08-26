@@ -3265,6 +3265,21 @@ fn trait_chip(theme: &Theme, active: bool) -> gpui::Div {
 /// Brand mark + optional tint for a harness (the Claude mark keeps its brand
 /// orange even on the monochrome surface; the mock harness scripts
 /// Claude-flavoured runs, so it wears the Claude mark).
+/// What the model chip says when it has no name to show.
+///
+/// Two different failures reach the same empty label, and they are not the same
+/// sentence: no harness at all (discovery failed on a fresh install) versus a
+/// known harness whose model catalog did not land. Both open the same popover,
+/// which is where the reason and the Retry row live — the chip only has to stop
+/// being blank, and stop guessing.
+fn unresolved_chip_label(has_harness: bool) -> &'static str {
+    if has_harness {
+        "Model unavailable"
+    } else {
+        "Agent unavailable"
+    }
+}
+
 pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gpui::Hsla>) {
     match harness {
         HarnessId::ClaudeCode | HarnessId::Mock => (
@@ -3584,13 +3599,24 @@ impl Render for Pickers {
             });
             label.map(SharedString::from).unwrap_or_default()
         };
-        let harness_icon: (&'static str, Option<gpui::Hsla>) = self
-            .effective_harness(cx)
+        // Nothing to name. The skeleton branch below cannot cover this: it
+        // treats `Error` as settled (deliberately — a skeleton that never
+        // resolves is the forbidden forever-wait), so an errored catalog draws
+        // the REAL chip. On a fresh install with nothing remembered the label
+        // bottomed out empty and the mark fell back to Claude — a brand nobody
+        // chose, beside no words at all.
+        let harness = self.effective_harness(cx);
+        let model_label = if model_label.is_empty() {
+            SharedString::from(unresolved_chip_label(harness.is_some()))
+        } else {
+            model_label
+        };
+        let harness_icon: (&'static str, Option<gpui::Hsla>) = harness
             .map(harness_brand_icon)
-            .unwrap_or((
-                crate::icons::CLAUDE_MARK,
-                Some(crate::icons::claude_brand()),
-            ));
+            // No harness means no brand to draw. The triangle says the chip is
+            // a problem to open, not a pick to change; the popover behind it
+            // carries the reason and the Retry row.
+            .unwrap_or((crate::icons::DANGER_TRIANGLE, None));
         // The reasoning chip is hidden when the model offers neither a ladder
         // nor any options — an empty menu is worse than no affordance.
         let ladder = self.trait_ladder(cx);
@@ -3871,6 +3897,48 @@ const SKELETON_PERMISSIONS_W: f32 = 128.0;
 mod tests {
     use super::*;
     use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice, SandboxLevel};
+
+    /// Both failures reach the same empty label and they are not the same
+    /// sentence — a missing agent is not a missing model list.
+    #[test]
+    fn the_unresolved_chip_names_which_half_is_missing() {
+        assert_eq!(unresolved_chip_label(false), "Agent unavailable");
+        assert_eq!(unresolved_chip_label(true), "Model unavailable");
+    }
+
+    /// Pinned by source scan because this crate has no entity harness to render
+    /// the chip in. The state is a fresh install whose harness discovery
+    /// errored: `chips_pending` treats `Error` as settled, so the real chip
+    /// draws with nothing resolved behind it, and it used to draw a Claude mark
+    /// with no words beside it.
+    #[test]
+    fn the_unresolved_chip_neither_guesses_a_brand_nor_goes_blank() {
+        let source = include_str!("pickers.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("pickers test-module boundary")
+            .0;
+        let block = production
+            .split_once("let harness = self.effective_harness(cx);")
+            .expect("the chip's fallback block")
+            .1
+            .split_once("// The reasoning chip is hidden")
+            .expect("the end of the chip's fallback block")
+            .0;
+
+        assert!(
+            block.contains("unresolved_chip_label(harness.is_some())"),
+            "an empty label must be replaced, not rendered: {block}"
+        );
+        assert!(
+            block.contains("crate::icons::DANGER_TRIANGLE"),
+            "the no-harness fallback must draw the problem glyph: {block}"
+        );
+        assert!(
+            !block.contains("CLAUDE_MARK"),
+            "the fallback must not name a brand nobody picked: {block}"
+        );
+    }
 
     /// The wedge starts at twelve o'clock and sweeps clockwise. Screen y grows
     /// downward, so getting the sign wrong fills anticlockwise or starts at
