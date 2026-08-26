@@ -81,8 +81,9 @@ pub const DRAG_SCROLL_FRAME_MS: u64 = 16;
 /// capacity — expanding and collapsing share no boundary, so a width right at
 /// the flip threshold can't oscillate between the two layouts.
 pub const COLLAPSE_HYSTERESIS: f32 = 32.0;
-/// During an interactive window resize the current mode is frozen until the
-/// measured widths have been stable this long.
+/// During an interactive resize, collapsing back to the compact mode waits
+/// until the measured widths have been stable this long. Expansion stays
+/// immediate, so a narrowing panel never traps the controls in a compact row.
 pub const RESIZE_SETTLE_MS: u64 = 150;
 
 /// Compact↔expanded flip with hysteresis. `capacity` is the *compact-mode*
@@ -90,7 +91,7 @@ pub const RESIZE_SETTLE_MS: u64 = 150;
 /// container-width deltas while expanded — never the post-flip measured width,
 /// which differs per mode and would feed back into the decision):
 /// - a newline always expands;
-/// - while `resizing`, the current mode is kept (no flip until sizes settle);
+/// - while `resizing`, an expanded composer stays expanded until sizes settle;
 /// - a too-narrow pill (`capacity < MIN_COMPACT_INPUT_WIDTH`) always expands;
 /// - compact expands only when `text_width > capacity`; expanded collapses
 ///   only when `text_width < capacity - COLLAPSE_HYSTERESIS`.
@@ -104,14 +105,11 @@ pub fn composer_flip(
     if has_newline {
         return true;
     }
-    if resizing {
-        return expanded;
-    }
     if capacity < MIN_COMPACT_INPUT_WIDTH {
         return true;
     }
     if expanded {
-        text_width >= capacity - COLLAPSE_HYSTERESIS
+        resizing || text_width >= capacity - COLLAPSE_HYSTERESIS
     } else {
         text_width > capacity
     }
@@ -7037,12 +7035,15 @@ mod tests {
     }
 
     #[test]
-    fn flip_frozen_during_interactive_resize() {
-        // While resizing, both modes hold even across their thresholds…
-        assert!(!composer_flip(false, 500.0, 300.0, false, true));
-        assert!(composer_flip(true, 0.0, 300.0, false, true));
+    fn resize_expands_live_but_defers_collapse() {
+        // Expansion is immediate mid-drag: a narrowing panel must never trap
+        // the controls in a compact row that no longer fits them.
+        assert!(composer_flip(false, 500.0, 300.0, false, true));
         // …including the narrow-column force-expand.
-        assert!(!composer_flip(false, 10.0, 150.0, false, true));
+        assert!(composer_flip(false, 10.0, 150.0, false, true));
+        // Collapse is the half that waits: expanded holds while resizing even
+        // though the text would otherwise fit the compact row.
+        assert!(composer_flip(true, 0.0, 300.0, false, true));
         // Once settled, the same inputs flip.
         assert!(composer_flip(false, 500.0, 300.0, false, false));
         assert!(!composer_flip(true, 0.0, 300.0, false, false));
