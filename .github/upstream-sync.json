@@ -819,8 +819,8 @@
     "2119bf0cdda721c8a0500cffabc40e3cb6fafd79": {
       "decision_date": "2026-08-26",
       "local_commit": null,
-      "note": "Deferred during interactive review.",
-      "outcome": "deferred",
+      "note": "Asserts Chat::source_context, which exists nowhere in crates/proto or crates/engine. AGENTS.md records this commit as the worked example of a clean cherry-pick that fails to compile.",
+      "outcome": "not-applicable",
       "subject": "test: diff-sync no longer rewrites chat.branch",
       "upstream_sha": "2119bf0cdda721c8a0500cffabc40e3cb6fafd79"
     },
@@ -2307,8 +2307,8 @@
     "6240cccb744bda6051d6c583daf3a7b8786e60b9": {
       "decision_date": "2026-08-26",
       "local_commit": null,
-      "note": "Deferred during interactive review.",
-      "outcome": "deferred",
+      "note": "Fixes model rows that advertise Mod+1-9 jump chips; those rows come from 19112a5f, ruled not-applicable in #109. Nothing in crates/ui/src/pickers.rs advertises a jump slot here, and #106 deliberately made the model menu swallow them, so porting this would regress that guard.",
+      "outcome": "not-applicable",
       "subject": "Forward jump slots to the open model menu",
       "upstream_sha": "6240cccb744bda6051d6c583daf3a7b8786e60b9"
     },
@@ -2811,8 +2811,8 @@
     "73ba80a0cb47c55f9aba6746608d1c4704c73c13": {
       "decision_date": "2026-08-26",
       "local_commit": null,
-      "note": "Deferred during interactive review.",
-      "outcome": "deferred",
+      "note": "Already fixed here by a wider mechanism: Pickers::render computes catalog_pending (crates/ui/src/pickers.rs:3612) and returns early with three full skeleton chips, so the chip never collapses to a bare icon while the catalog resolves. Its icon half is unportable regardless - mini_glyph_spinner and theme.glyph arrive in aeab053a, part of the accent-palette work this fork has deferred.",
+      "outcome": "not-applicable",
       "subject": "Chip loading states: never collapse to a bare icon",
       "upstream_sha": "73ba80a0cb47c55f9aba6746608d1c4704c73c13"
     },
@@ -3251,8 +3251,8 @@
     "849c0f5614fa25b6838050aaddd217894a5b28f7": {
       "decision_date": "2026-08-26",
       "local_commit": null,
-      "note": "Deferred during interactive review.",
-      "outcome": "deferred",
+      "note": "Edits upstream's numbered PARITY table row 1.4. This fork's docs/PARITY.md is 'LAN-only feature status' and carries no keyboard-shortcut row at all - a different document, not a stale one.",
+      "outcome": "not-applicable",
       "subject": "PARITY \u00a71.4 records the jump and archive shortcuts",
       "upstream_sha": "849c0f5614fa25b6838050aaddd217894a5b28f7"
     },
@@ -4395,8 +4395,8 @@
     "bd6f7df6ea62199c6d1c53a86ca65ed4b7ed6713": {
       "decision_date": "2026-08-26",
       "local_commit": null,
-      "note": "Deferred during interactive review.",
-      "outcome": "deferred",
+      "note": "Upstream version bump to v0.2.28 (Cargo.toml + Cargo.lock only). This fork versions independently.",
+      "outcome": "not-applicable",
       "subject": "v0.2.28",
       "upstream_sha": "bd6f7df6ea62199c6d1c53a86ca65ed4b7ed6713"
     },
@@ -5771,8 +5771,8 @@
     "f442dcc6dac7eb91ec8bdbff8a953282daeb95f0": {
       "decision_date": "2026-08-26",
       "local_commit": null,
-      "note": "Deferred during interactive review.",
-      "outcome": "deferred",
+      "note": "Adds source_context: None to a test fixture. This fork has no source_context field on the chat row, so there is nothing to initialize.",
+      "outcome": "not-applicable",
       "subject": "test: initialize conversation source context",
       "upstream_sha": "f442dcc6dac7eb91ec8bdbff8a953282daeb95f0"
     },
@@ -37552,6 +37552,2955 @@
       "kind": "sync",
       "run_id": "sync/upstream-2026-08-26",
       "sync_branch": "sync/upstream-2026-08-26",
+      "target_branch": "main"
+    },
+    {
+      "date": "2026-08-26",
+      "decisions": [
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Run Codex in yolo mode: force danger-full-access, drop the worktree escalation",
+          "upstream_sha": "335079eb71b18e7982e4f51163bd93c529a3c3dc"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Send-in-flight overlay: no phantom Completed flash / done-chime on remote sends",
+          "upstream_sha": "d3141ef09b0392be1f0043959db6e35acf763a64"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Tool detail cards: clip fix, open/close tween, queued-steer hint (#27)",
+          "upstream_sha": "4ae68eed981772fe6c607f226c94781f2c93269f"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Harness settings page, model prefetch, picker highlight fix (#31)",
+          "upstream_sha": "e00c6b97c51a8e3727bcb6412ed424040b63ce93"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Refresh composer harness catalog live on Settings \u2192 Agents toggles (#32)",
+          "upstream_sha": "80ba9cadcb46c3a91f7ecac6d491af78f96d5b76"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Traits dropdown: restore the 2px row gap between menu rows (#33)",
+          "upstream_sha": "6fbd788c98bd9d7a8eaa0004e6fd8dd8c005c09c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ACP polish: configOptions-first models, codex yolo, completion + transcript fixes",
+          "upstream_sha": "ad3b31d17328f4682d0058fe143dd33306ca5af9"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Tool chips are one-liners again: outputs stay out of the doc, sidecar parked",
+          "upstream_sha": "1fc8fd56c62f5fc8d008e54c065df1f1fe8db3d5"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Session timers are per-message; Steered can never trail Done",
+          "upstream_sha": "e9705076687e117886f7edb9592c9904823c1acf"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Robustness batch: seed races closed, steer ledger, watch resubscribe, plan chip",
+          "upstream_sha": "4570eadfd8021c9ad7bd0787539ee4b07e7beb07"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Cutover converges live watchers; smoke driver speaks the framed protocol",
+          "upstream_sha": "349f4837d6fb963fcd659f99c027aaf639dcf8f5"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Device-local tabs + spaces as a sidebar filter dropdown",
+          "upstream_sha": "8289a4cd313cba328a02b06c0787b617902395da"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Space-filter trigger: caret at the right edge, names truncate",
+          "upstream_sha": "de7f8861027af6e0fcf7240bd399b32cae82056c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Space-filter dropdown opens below the trigger",
+          "upstream_sha": "708f701cb2368edb7a2d68946a168ff3002bedd8"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Space-filter dropdown: drop the check glyph",
+          "upstream_sha": "f528e9844a4bb469061a00ca5e8c0c8cfcd03ba0"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Wash-only selection across every menu: drop the check glyphs",
+          "upstream_sha": "22ef2ddc3f1f785f13f3d461a06154d38a8eb0d6"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Popovers animate out: Popup closing phase, wall-clock fade, blur ride-down",
+          "upstream_sha": "e3e7161cb23fa11e1a925d46445c2150017774e1"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Space triggers carry the \"@ device\" tag: sidebar filter + composer chip",
+          "upstream_sha": "d24b8b61580dc411dd4d862fdd3d27b86ec759c1"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Space selectors list alphabetically",
+          "upstream_sha": "c1a925d90fc55f433923283f7085f3a915455e0f"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Fix merge fallout: new popover closing param at HEAD-side call sites, open_kind() accessors",
+          "upstream_sha": "bf714e4cbbc6832f6f0117e92fb059109ae9344b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Engine: project-less chats (createChat deviceId, cwd ~ expanded at spawn); UI state grows device pick + no-project opt-out",
+          "upstream_sha": "b46d28673579234d7a10ed708a2ba17d35db3ac0"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Composer footer: device + project selectors; refs locked after creation",
+          "upstream_sha": "dc75065412ff326eaaecfa8464887326503f4e4b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Kill the tab strip: titlebar names the session, sidebar goes activity-first",
+          "upstream_sha": "b3f3179e4492c506fe581324dccf1dbc150c6861"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Rename spaces\u2192projects in UI copy; onboarding allows project-less start",
+          "upstream_sha": "2a755f6f67aded6c718e023c826b3d07815c8a10"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Boot restore respects the no-project opt-out; picker capture knobs for project/device",
+          "upstream_sha": "64070b70ea84ecdebb306a724cecbfa25599c16c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Sidebar/composer polish round: archive-on-hover, device search, richer status text",
+          "upstream_sha": "eb0657e0b9397dc7022d80db737a11f87935ab78"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Titlebar + joins the window-control cluster; archive swap is corner-hover only",
+          "upstream_sha": "45eceef35e5e5a068798e12b10c90f4ec3f8eaa2"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Engine test: the project-less flow end to end",
+          "upstream_sha": "5be6f23e29f8bb01753078d0af318addd8a74680"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Glass-native transcript + t3 archived shelf + canvas target selectors",
+          "upstream_sha": "38b480fb77a3e5967e44da770b1c50c5ee34f6db"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "gpui pins \u2192 53518c0: edge-fade line merged into comet/line-wrap-closing-punctuation",
+          "upstream_sha": "89afa24f730cd675a713874ef74cde2e7c2a327d"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Unarchive on send + glass-forward light chrome + shared sidebar tokens",
+          "upstream_sha": "37966d16fafafa7ecb22ad0f167a3d60863f76ae"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Sidebar edge fade: gate on scroll overflow at paint time",
+          "upstream_sha": "86fb62bc84ba54d6c1e4aab8206be447f022116b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Host: reopen chat doc after cutover drop so nudged commands execute",
+          "upstream_sha": "885c9fcf56019183eb36239a79067ede336b2377"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Attachment polish: pending photos, strip \u00d7 stacking/click-through, Esc-close, Show-more gap",
+          "upstream_sha": "a198b99a23d079fd005526fc2ba17954e08fa8b1"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Engine: boot-time transcript salvage for blanked born-gen2 chats",
+          "upstream_sha": "7558fad1b7b66cadeeeb5d8032ec651fafaff03c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Terminal dock: glass fill, floating resize handle, transcript stops at its top",
+          "upstream_sha": "6dd17f76bc76b30cfa8729ae0a528e3d34bbb073"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Composer: drop \"Don't work in a project\", gate sends on a project pick",
+          "upstream_sha": "2876bf9a96c8ae78169139dce4707f63fc492d09"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Changes panel: flush glass pane, diff scopes, ref selector",
+          "upstream_sha": "e53dc3ef9f7472a1098a21974c40eb973e9217c6"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Changes header: controls in the titlebar band, full takeover expand",
+          "upstream_sha": "1fdc48545fdd3b2cc20a15849c1b540d889a080b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Changes header polish: family fold glyph, takeover alignment + border",
+          "upstream_sha": "c6bebdb698229062a9d4b023d1c5389e6d2b1416"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Changes header: searchable refs, menu gaps, skew copy, collapsed-sidebar takeover",
+          "upstream_sha": "dbc6faaa130a9b7760dd5d115e388e095bf790c7"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Changes header: truncate long refs, tighten collapsed-takeover inset",
+          "upstream_sha": "54b064cc6b47a347cebca98378a1ebc250f2e4ff"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Changes scope menu: the 2px row gap every other menu has",
+          "upstream_sha": "3541f71e50e2c8e5bb2a3dd563ee4921715021c1"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Collapsed-takeover header: scope dropdown on the cluster's 2px rhythm",
+          "upstream_sha": "8f6a79a3a342245987dc1c77350ed44126f41e60"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Landing: hero-anchored edge ascii, mobile pass, deploy on push",
+          "upstream_sha": "8c36da2e7c5f633ea9df201fceab94f4480d767d"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Folder picker: slash-to-descend, tab completion, ctrl-n/p",
+          "upstream_sha": "a8df3fd471a8ae90bef9b9770efdbf47a7eeeaf5"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Slash-descend: exact casing wins over a case-colliding sibling",
+          "upstream_sha": "6904151b4afd9ec9e5981c195a1c22f72607a1b5"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Desktop notifications: banners on the session ping edges",
+          "upstream_sha": "e1d90b99d98abc2d1138db805bac48c863ba338c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "notify: dash-leading titles are summaries, not notify-send flags",
+          "upstream_sha": "e14ef1cb7df1997f61adff0f8996cf9d859d517f"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Fix initial desktop chat message positioning",
+          "upstream_sha": "a9e38775805d839fbcc41c1d5ff655efa5566665"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "First-turn anchor: trust the chat row, clamp the wheel",
+          "upstream_sha": "47a0c29cbb8f5d3a238e77a95f6cc3fc43ab83b0"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Traits chip: name the effective picks instead of a bare \"Traits\" label",
+          "upstream_sha": "ff7a0316a5e5539288ac64ecc608961f732a86dc"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Popovers: clicking an open menu's trigger closes it, never close-and-reopen",
+          "upstream_sha": "d788a01b39a72aee54f1f79fdafdb7ba791f8777"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ACP: starved-turn recovery on noRunningTurn evidence (root-cause fix)",
+          "upstream_sha": "430dbec85d22ca969d709fb960ff638bca0ecc97"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ACP: settle dropped replies off the turn-end cost frame (~1s, not watchdog)",
+          "upstream_sha": "225f484a356538699da011231b1cbee781b9ce5d"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ACP: full-stack starve verification against the real adapter",
+          "upstream_sha": "485dcc96a57f5fafd9611b06dfc68bea6856e988"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ACP: blanket dropped-reply settle for every adapter",
+          "upstream_sha": "d9f13cbd9ee2406e02333cf98aa3c789410b110b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ACP: cancel-before-prompt into self-continuing sessions (starve prevention)",
+          "upstream_sha": "e1a027308f2f9d5ea465e91f26764f17ef3d01a0"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ACP: Claude busy steers ride native queueing, not cancellation",
+          "upstream_sha": "a6eefc2d4700c150c5f4621abf79ba13dd295a10"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ACP: injection cost frames must not settle steered turns; all-agent sweep",
+          "upstream_sha": "4f4bf8ad562590448828b43bcd1200b1441ac7e1"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ACP: exempt Claude from the blanket quiet settle (false mid-thought Done + stuck-Working orphan)",
+          "upstream_sha": "58427f204ed3e0c530a01e65dba89aefbf5fa8b5"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ACP: real-stack A/B evidence probe for the Claude quiet-settle exemption",
+          "upstream_sha": "61518edeffc444fb1530aa818fbbf3eb8e397122"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ACP: scale the evidence probes \u2014 10-run A/B series + all-harness survey",
+          "upstream_sha": "3c67fd474ca7f0952a6dd233eb1411cd808c6e68"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Changes header: budget the row gaps so the buttons hold still on expand",
+          "upstream_sha": "ae4576ec4f8f907c009f5a6172723ed2c1877d11"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Working trailer: \"Sending\u2026\" bridge with no timer until the turn starts",
+          "upstream_sha": "29b76c306ad3304f1fdfc2932f1f38f1c0866aa4"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Changes header: truncate the branch and base ref evenly",
+          "upstream_sha": "2d4b51e0ebf56fa5fd8d2252066398163b62be8e"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Transcript: every send glides the prompt to the top with reserved space",
+          "upstream_sha": "ecb88a6d491be31fd0e68adc3d2703a115ec072e"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "feat: add git history graph view",
+          "upstream_sha": "6c81e750360cce7a8a30f963425dc04f432398a1"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix: center history load more button",
+          "upstream_sha": "fc785b23b922831171f1173762b1264e22d4e604"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "style: soften history graph palette",
+          "upstream_sha": "c773dfe5942486ce949636f74d5be8538350df86"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix: center active history commit ring",
+          "upstream_sha": "968d48f870b740e22875198876b364ae699104a5"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix: contain history reference badges",
+          "upstream_sha": "139fcb6b25afd97320692f14218195963f46e15c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "feat: add icons to history refs",
+          "upstream_sha": "f6c6bcff77c9ec57a1a9e66a90ba8f13e04cced7"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "feat: add tooltips to history refs",
+          "upstream_sha": "e5ad3f8fa0d76ea3b3d810fccaf4c6efeeadfedd"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix: fit history ref tooltips to content",
+          "upstream_sha": "3a8c89c13e12a4961b756b2ca5db029f863267df"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix: adapt history refs to available width",
+          "upstream_sha": "524fe279f677c0f32f18391f6723b5d2f9e9919c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "perf: stabilize history row hover state",
+          "upstream_sha": "9ee1e47956fd044261eebb95c745c5beb13b9817"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "feat: show active branch history context",
+          "upstream_sha": "90e8c265e47eb5aef51b9ed1f71d9fd57e2188eb"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "feat: fetch remote history from the history pane",
+          "upstream_sha": "99eebc40ab348af614197c16d33dad78d4303298"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "perf: batch visible history graph paths",
+          "upstream_sha": "3d8936094900790af86f1b8baf3fddffc2fa6b7b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix: preserve history ref overflow affordance",
+          "upstream_sha": "cdafdfcabd88ab503770a4e3300ca872a2b9c386"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "style: simplify history ref badges",
+          "upstream_sha": "ba62496294907fd4abdd5c3bca0f2d8b42ddf8aa"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Transcript: eased runway entry, absolute hold, and scroll release",
+          "upstream_sha": "41cec8bbab530d5d2bf4cae0b4b1beb84bec927f"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Sessions: settle self-continued turns \u2014 extension turn-end + short quiesce",
+          "upstream_sha": "6d086d808a0a4d7a51869223050f58fb06a71c67"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Transcript: a restick during a runway re-arms the hold, never the pin",
+          "upstream_sha": "0ff655e0fad214d7acb1fbd24c6e7ce4a5b85992"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Transcript: only a chat switch clears the runway",
+          "upstream_sha": "67333a5d96c836509868364bbaa4f0a5e7130f21"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Tool chips expand to the full tool call",
+          "upstream_sha": "9571c9054a7c16a5a38dedc2a537395f274ed50a"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Transcript: provisional runway overshoots \u2014 short chats have no bounds",
+          "upstream_sha": "65d97725c3c1bcece9dfd7d63e37068896956936"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Transcript: keep the held layout scrollable; row 0 carries its own inset",
+          "upstream_sha": "78a23f86a851e61297935a2102ec3909e9c3cd81"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "gpui: bump fork to 8a8954c \u2014 macOS 26 window blur fix",
+          "upstream_sha": "85648e4aca86ed0d614aa3feed295781bbb6fa57"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Transcript: the runway bottom is a hard stop",
+          "upstream_sha": "6c2655355a9f8fb9db6a629a7bb31cce7a16c7bd"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Transcript: runway ends at the app bottom, rigid stop, streams in place",
+          "upstream_sha": "447d5f913c606caf2786f78818de375ee8e56bec"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Transcript: rail reads from the reading line; chip toggles tween the group body",
+          "upstream_sha": "a1c19028d5100de7abad2794afbf3aa5265c9cd6"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ui: real glass tint + reference blur for popovers/dropdowns",
+          "upstream_sha": "f644464338b6b0d2e39b47c99f1b72495d038730"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "pickers: t3-style model picker, model list hygiene, glassy new-project palette",
+          "upstream_sha": "bfcc8792f429c1688f1cc174d18d50ef7cc3b33e"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "pickers: model picker polish \u2014 aligned header band, purple rail indicator, star re-anchor, versioned labels",
+          "upstream_sha": "cdc754e0099fb73847514c1441886cbc4540c36b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "pickers: single moving highlight in the model picker",
+          "upstream_sha": "b07a0c742997dc1bd314d556f4689f5d3335a0e2"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "pickers: rail indicator is a left half-capsule pressed on the border",
+          "upstream_sha": "0fa4d7cf01a48a59c5fe36c56ae682fa01d796d9"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "docs: document local-first usage and optional sync",
+          "upstream_sha": "f4fb12902a6664558fb51d41a7cd1ed2c7c0fc49"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(engine): require a bearer for development sync",
+          "upstream_sha": "f1419428dc0836e258dd3080f7b5dd4d0df307a7"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): share pending sync restart across viewports",
+          "upstream_sha": "c37dafcbb919396ecd5db1a2cf9091057d310194"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): stop remote daemon before runtime changes",
+          "upstream_sha": "a8246568bb0636170b0f9738a38fc9fa1ececf88"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(engine): recover truncated device identity",
+          "upstream_sha": "4b985d877b78c871683bc37ebf8f19b74769ff27"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): wait for remote engine shutdown",
+          "upstream_sha": "5dee4fc3d00e9ce390d52aab247d5731bba24d76"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): clear stale sync restart after revocation",
+          "upstream_sha": "15c006b0c23e6d63aacdd3ce32e30244ce428185"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "style(ui): order settings imports",
+          "upstream_sha": "c46bddab27d90ea0835bce61f797b88569f28fc3"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(daemon): restore systemd start limits",
+          "upstream_sha": "fecadbc550ed07d37695a0eb968f9964f312cac2"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): remove projectless onboarding action",
+          "upstream_sha": "2a7e942deb840a066902b810d9ea6a3341c61ccc"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(engine): own every Edge worker across runtime shutdown",
+          "upstream_sha": "ad1ea9ecaf23612a2bd1050189fb0aa3628cfcff"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): elect one replacement engine across viewports",
+          "upstream_sha": "a1a58107b448f0c85bc2b2e4be8519c35816e27c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "engine: camelCase import-event fields on the wire",
+          "upstream_sha": "9e2373c24264080671897c24ac0637ac1c50807d"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ui: trim wizard copy",
+          "upstream_sha": "451b6ea76bd30d02c28c83953756826aadc982ee"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "review: fail loudly on partial imports, durable marker, spaces-aware offer, fmt",
+          "upstream_sha": "4468a70682793d952295c551bce8f95938479723"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "shell: right pane becomes a tabbed surface host (t3 RightPanelTabs)",
+          "upstream_sha": "b67ccd70a161dc217386de61aa42f99fbeb07adc"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "shell: surface-tab x renders, embedded terminal shares the pane surface",
+          "upstream_sha": "e751932773eb8443a76eb73ddd3693d7149b60af"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "shell: surface tabs \u2014 hover x, drag reorder, multiple diff panels, takeover alignment",
+          "upstream_sha": "8b77cc1ade97880e0507c346ea2f65c42e105ba5"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "shell: surface-tab drag matches the terminal drawer's animated reorder",
+          "upstream_sha": "d2c1799a4dfa7ec5c96aa75e4979baac35f12dc0"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "changes: contextual diff tab titles + per-commit diff tabs from History",
+          "upstream_sha": "82c5f3b8ddfabc40034830edca8fd2fef9c7590d"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "shell: + menu row reads Git, not Git diff",
+          "upstream_sha": "c9fbe10027223703aa6b5b30f7293be8e9689cd9"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "shell: surface-tab strip scrolls horizontally",
+          "upstream_sha": "9fb44d58118f2606a432c2f0b688223e5904c4f5"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "shell: surface strip actually scrolls, with glass edge fades on overflow",
+          "upstream_sha": "5b3065ff9aa20514843960707616a12a6caf10f6"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "shell: wheel-scroll the surface strip through occluding chips",
+          "upstream_sha": "0dce652bb2f03a9951194cb28e0f2c221ac29813"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "shell: port the old session-tab strip's solved scroll recipe",
+          "upstream_sha": "dee20449ee9b11161128cca294dac292184a10fd"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "shell: chip washes fade at the strip edges",
+          "upstream_sha": "692fdc01eabf54f395036b0a253f8660b026499c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "shell: true per-pixel horizontal wash fade (gpui bump) + Capy-style picker",
+          "upstream_sha": "78f617c3ddd2efef21776f6640879ee180fcde48"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "shell: surface picker keeps its heading instead of a logo",
+          "upstream_sha": "34fed4f192726d44fca2fc6e8cb0463a2db8cb1a"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "shell: right pane opens by default; splash gets the landing hero in glass",
+          "upstream_sha": "a9cf1f1436cc8faf1c30da3b7e3ff2e9fccd7ea2"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "loaders: splash ascii disables ligatures too",
+          "upstream_sha": "eca4aaa050ba771ff3ff3550ce8f0bbd4cfa6869"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "shell: right pane closed by default again",
+          "upstream_sha": "0d4ba313fcab0dc58b2dd2e79fb21d56c99b9918"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(syntax): highlight pinned commit diffs",
+          "upstream_sha": "d903bd7332b822d4ad1c76313af96dca017e398c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ui: expose settings from application menu",
+          "upstream_sha": "48a2da4dbdf2c0ddaf9bffb74c6920f288bcf281"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "linux: draw caption controls under client-side decorations",
+          "upstream_sha": "f406c5bd5a61d47f1da7e19a7317d4366b47ca40"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #97 from zeronsh/zeron/linux-window-controls-platform-fix",
+          "upstream_sha": "3ad28b5dfb9ccf7004b3c0f2fbdd0e6912bd38e8"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "harness: native Claude driver over stream-json (A1)",
+          "upstream_sha": "579678dbeafa196e330518cd429eae82a1f44b37"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "harness: native Codex driver over app-server JSON-RPC (A2)",
+          "upstream_sha": "0ce7fc2fff359400fdcaacfe8e4381081db1f032"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "harness: Cursor driver via the pinned @cursor/sdk shim (A3)",
+          "upstream_sha": "c7c7ce6c846e0b290304d6fea62ff331c2dc6e62"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "harness/engine: retire adapter machinery for claude/codex/cursor (A4)",
+          "upstream_sha": "60887f79e0c8b39cba3d0b34886a9c0e090358a7"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "harness: Grok ACP hardening (A5)",
+          "upstream_sha": "2133bae5a2a1e650476ee24d5ec6dcb13f6b4a5c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "subagent visualization: per-subagent docs, spawn chips, right-pane tab (B)",
+          "upstream_sha": "06da4c45d65218d1d375745931f0a4dc5be21f9c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "subagent viz: three live-rig findings fixed",
+          "upstream_sha": "bed83ba1c830e58114218bf59fedd26a7142c545"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "subagent tabs: contextual titles + top-aligned streaming runway",
+          "upstream_sha": "e713383d2630d5048a2e893c7b33eea0bd79ad48"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "subagent UX: real terminal statuses, bare tab titles, designed chip",
+          "upstream_sha": "7fd861e113f079ecdadbbaf74613a2690e6e5b88"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "subagent polish: Agent chip label + codex message paragraphing",
+          "upstream_sha": "0c31ec41de6d7b9ed73b8340ec683f70e376c06c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "subagent tab: scroll follow + jump pill; chip quiets down; top fade",
+          "upstream_sha": "06fe8d1db15bf80e8bb2f7746eb07ee0ad3d4e70"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "shell: jump pills go glass",
+          "upstream_sha": "1fdf1495c3ce24f128f91bb1d142ecfc7ec574ac"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "subagent tab: every open lands at the end",
+          "upstream_sha": "1eb0bef9416ec151a6b69abeae9fc80b888cebb5"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "subagent iconography: bot glyph for tabs and spawn chips",
+          "upstream_sha": "9a125476007f717c639c6fae228c0066b83e2278"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "net: cap mobile warm dials, overlap checkpoint with backfill, flush sends at state",
+          "upstream_sha": "42a7303c20b93a502a7fbcd9a757753c1b0e6f2b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "sync: pull-first HTTPS transport \u2014 1-RTT bootstrap, WS demoted to enhancement",
+          "upstream_sha": "22b5a67dc6cdd66333c23cfe17a69d9131ea2b31"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "sync: audit fixes \u2014 heal waits for known server state, iOS retires pushes only on edge verdicts",
+          "upstream_sha": "3bea7a58720d1cd261e5f55951f221c8f66e9e66"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "sync: pull-path failures are loud on both platforms",
+          "upstream_sha": "3bb7d11a1983574713c29cc0af1fbbe7f35dcdb7"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "sync: empty checkpoint frontier is NOT contained \u2014 fetch, never skip history",
+          "upstream_sha": "2c9e306edfa184853c98a3544606a3cfd2a3b35b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "sync: an encoded-empty frontier is a vacuous claim \u2014 fetch, never skip",
+          "upstream_sha": "786e2d6b4b24f3e281a963e52022f0bdac47b275"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "sync: cursor amnesty \u2014 a cursor above the checkpoint is re-verified, once",
+          "upstream_sha": "e8ca1f31a769f366e1a669305aede153d81b6b9f"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'origin/main' into zeron/native-drivers-subagent-visualization",
+          "upstream_sha": "97221af8a3ddb12b3f8ec4bd83dc5a6c9b50a97e"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #136 from zeronsh/zeron/native-drivers-subagent-visualization",
+          "upstream_sha": "7840ef8770bec27de9f2954e10cf86fb8b5897b0"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "chat2: claim rooms on HTTP first-contact, not just WS join",
+          "upstream_sha": "7e1eaea9fdc6cd17fa71c4014490ff31b2c3ea67"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #147 from zeronsh/zeron/remote-session-sending-stall",
+          "upstream_sha": "a19f95d5d0bc302ced342d119d37fe8d65cb549d"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "grok: subagent visualization over ACP \u2014 lifecycle wire events + disk-tailed transcripts",
+          "upstream_sha": "a46b7010e67c4765482c086a801ba106f35db495"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #149 from zeronsh/zeron/grok-subagent-viz",
+          "upstream_sha": "76582a05f71376e3f31e2201b21d51994549b91b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "cursor: in-app Connect via the SDK's browser login + accounts integration",
+          "upstream_sha": "e21d146758c0016aff333af137a4aa118c69b573"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #152 from zeronsh/zeron/cursor-connect",
+          "upstream_sha": "0d322e6c1e7ff9aac5ba8535f4ec03c8db9f3812"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "cursor: live model discovery + typed model options actually applied",
+          "upstream_sha": "bb90e2489e8180e2097ce3e85097a99958c42dab"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #153 from zeronsh/zeron/cursor-model-discovery",
+          "upstream_sha": "683358c9429292817619e9a9b37b381729413927"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "cursor: isolate each SDK run's agent store \u2014 concurrent runs no longer lock",
+          "upstream_sha": "69778b7622cb76a3e8c49195a2160553167e141a"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #154 from zeronsh/zeron/cursor-store-isolation",
+          "upstream_sha": "840f3c6a66eeb1bbd30d22311714ae6eca0ca0d9"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "opencode: ACP harness with subagent viz off the sidecar event bus",
+          "upstream_sha": "0213cacfda75156dfaf47fb8a351c0dd9beff1e2"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #157 from zeronsh/zeron/opencode-harness",
+          "upstream_sha": "2f86b8a5ab0371561b847d1345a4443a500d6047"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "send: worktree creation rides the durable command plane; relay calls get deadlines",
+          "upstream_sha": "3e777c432dc82aab63d23e5b3e67c413b8490232"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #159 from zeronsh/zeron/worktree-send-durability",
+          "upstream_sha": "913b532894337fd930f8c222332585a6929449b5"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "harness: native drivers rediscover slash commands",
+          "upstream_sha": "c06ed221eef0b01dca50991a316ce264c5511e07"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #160 from zeronsh/zeron/native-slash-commands",
+          "upstream_sha": "1afd4ee238deec4e2bc3cd2ad3904af6a8111f2a"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "spaces: reach other drives from the add-project palette",
+          "upstream_sha": "1d30023e22d491e2d433bc1fca07665b202e596c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "spaces: enumerate custom mounts and accept typed paths (PR #144 feedback)",
+          "upstream_sha": "c6ad564bb3c8e794e6a69f35ab9afefab71027fe"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #144 from zeronsh/zeron/multi-drive-project-picker",
+          "upstream_sha": "196aeb28a42e63cef3a7d71ca1b8605563a0dee1"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "harness: opencode probe example builds again post-worktree field",
+          "upstream_sha": "479a341cd4684ec07875732e60f961e60daf34ec"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #162 from zeronsh/zeron/account-order-stability",
+          "upstream_sha": "d33f79828e4ace73001b9a05ed083ba2fdd0a006"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "sync: event-driven reconnects \u2014 online-bus everywhere, path monitor, tighter caps",
+          "upstream_sha": "ed8cd608b3e0e354df16e6839c2c74db69c523c0"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "attachments: ride the durable queue \u2014 QueueCommand first, bytes chase in drain",
+          "upstream_sha": "8f3bce84cb70968a221eb6ee30bd1ead6e18e412"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "relay: end-to-end peer-link liveness + registry-dark dial parking",
+          "upstream_sha": "449a1dbe0cee0f7f4b0591cee64d8fd775bef2d5"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ui: connection truth \u2014 pill, composer honesty, Queued badges (Phase 1)",
+          "upstream_sha": "b98d698ac0e785e5a7854cecad67231af69a530c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "delivery: peer-relay QueueCommand fallback + deterministic flaky-network suite (Phase 3)",
+          "upstream_sha": "9055e016afb6f7a1daa67781694acd6a8bbdf06b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "delivery: explicit failed state + retry, send-time timestamps (Phase 4)",
+          "upstream_sha": "d4d4045fda2cf5e7cd4b9695fc953a33e3ef92b6"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "style: rustfmt pass over the durability work",
+          "upstream_sha": "bebc0580a23f3f0da134c0c33635a04ab1379d39"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "attachments: 10x chunks, parallel window, overall deadline, live progress",
+          "upstream_sha": "48ff7775004aaeefe7b03e76f16af95bd47ef309"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "attachments: progress ring on the sending thumbnail instead of label swap",
+          "upstream_sha": "a729ed4a058e6160e0810fc9effc509169e5fa7b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #164 from zeronsh/zeron/upload-crawl-fix",
+          "upstream_sha": "17fc449bd5f264e3e1b84b286f087cadb121e141"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "send: New-worktree never silently degrades; undelivered sends say \"Queued\"",
+          "upstream_sha": "c53ecd12afb568f3bf843fddb77edd2b2209d945"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "doc_host: new-chat join backoff resets on sibling dial success",
+          "upstream_sha": "989be0ae58f7093c1fc06f87a4174315dd32c0d3"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "feat(proto): model checkout change request status",
+          "upstream_sha": "e2d6ea2bd5018d24a37519062ba3a3d6a5f1041e"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "feat(engine): resolve GitHub pull requests with gh",
+          "upstream_sha": "7fb1158610dc83a2bb08964c252dae17d1632fec"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "feat(engine): stream cached checkout change request status",
+          "upstream_sha": "3adc1551e16c41881b84b355eb21308748621a56"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "feat(ui): track pull requests for local and remote sessions",
+          "upstream_sha": "bdc8363d36d7259a3cf001022602a1812617f719"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "feat(ui): show pull request badges in sidebar and composer",
+          "upstream_sha": "72ab1d9c69e856397c99bee3a7e71c47c42787a4"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "test: cover pull request status across device boundaries",
+          "upstream_sha": "ede19ac938478927b2f50018a02225030df510b1"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): frost pull request tooltip",
+          "upstream_sha": "0cb68c7767761d50ec32630f88ba88608d9dc1c2"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(engine): resolve gh from login shell path",
+          "upstream_sha": "46ddcf9b902d1b324ca15f4511ab61fc0268293a"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): retry pull request watch after host upgrade",
+          "upstream_sha": "2998ca4593ba353ba5fe32ce86e3ca2fb58b4a51"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(engine): use origin for untracked branches",
+          "upstream_sha": "819fc4c199a4476f37278174ee37dff8399f1242"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(engine): resolve uncached remote default branch",
+          "upstream_sha": "048798d046033bf457c3b390f07c0a1884025f4a"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(engine): evict inactive change request cache entries",
+          "upstream_sha": "60965ade5f65b2e56075fd0da2b9b8cd61b0b40b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'upstream/main' into feature/pull-request-status",
+          "upstream_sha": "eee087c1049c461f0327ae89f5005e5ab4222b01"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "test(engine): isolate login shell gh path fixture",
+          "upstream_sha": "0e7c6e5a5fd73d858dc6d9e2e1a868ec7a70ba98"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "merge: sync with upstream main",
+          "upstream_sha": "fc30c3bfe085161f6b97f249e4ad5f360100b47d"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "merge: sync with upstream main",
+          "upstream_sha": "4a4e862b07b71ec042b4fa85fda2fa91d6c58394"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "merge: sync with upstream main",
+          "upstream_sha": "dd8932d71a82dd553b47225d7c912600d7e3e499"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "transcript: spawn chips link to the subagent tab, not an accordion",
+          "upstream_sha": "6d00440b8de41eb40c69199b12b714a1db495b13"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "subagent tabs: working trailer + parent steer messages",
+          "upstream_sha": "80a3f306b3608dcf86a2e7e8b6922914dea967cc"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "codex: child userMessage items are steers, not delta-channel echoes",
+          "upstream_sha": "1f944051ad8a41cf4566cb3af8b22278113199b0"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "subagent transcripts open with their prompt; opencode+grok forward user messages",
+          "upstream_sha": "54b2d45eb55e11074e7900383b8ccba394275b5b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #163 from zeronsh/zeron/subagent-tab-navigation-refactor",
+          "upstream_sha": "c36d4034844e85301fdd06db3f87b96615a5cfba"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "merge: sync with upstream main",
+          "upstream_sha": "417888b81ce831fe29a7c0226f68f78c4b9e527b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "source control: resolve the default branch through gh, never git transport",
+          "upstream_sha": "f4383e3682e0d85d127756353f3ae2cdf653576c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #116 from jsgrrchg/feature/pull-request-status",
+          "upstream_sha": "d9e55d91d0cb1f65d17dbbb0d1b16ec9de98436e"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge origin/main (subagent trailer restructure + PR #116)",
+          "upstream_sha": "0e086b9cdcdce07f5b3a76b5f03e5c98b818a3c9"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #165 from zeronsh/zeron/worktree-base-default-queued-state",
+          "upstream_sha": "43a6b447122df1898a756d7428bd5a02efad18ec"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge origin/main (v0.2.11: upload progress + parallel chunks, subagent trailer, PR badges)",
+          "upstream_sha": "77cb93d0fdb44e1554504867af79f537a01419bf"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "subagent steers: durable across harnesses (claude re-key, engine gates, opencode resume)",
+          "upstream_sha": "454a1dd32ff5027ec6b277efe29c74e8cd64c3bf"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #167 from zeronsh/zeron/subagent-steer-durability",
+          "upstream_sha": "43965392286762441dd78684f2365de82e6398c7"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ui: real frosted floats on Linux (wgpu backdrop blur)",
+          "upstream_sha": "4e0a89d20c1e90bff8b7279b0b9bae0de680a9b4"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'origin/main' into pr146-audit",
+          "upstream_sha": "23ddd733f9f1b36597b4e766c88bffa3e6113429"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "gpui: repoint at wingleeio/zed post-merge; frost the change-request card",
+          "upstream_sha": "ce35a1a2b4e826fc0f027b08cbb7af9b0d3124f4"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #146 from rabden/pr/linux-frost",
+          "upstream_sha": "9af4dc179297e04c9deb0f05d711416a87b6b4f9"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'origin/main' into zeron/resilient-delivery-on-bad-networks",
+          "upstream_sha": "fcaae386ec50462a41c8962d8ea65e4d8406e129"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #168 from zeronsh/zeron/resilient-delivery-on-bad-networks",
+          "upstream_sha": "7616469b530ed8d5a66b233c5b896c0a76523246"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "opencode: surface provider failures instead of silent forever-Working",
+          "upstream_sha": "7c6c1236d3338772aa0776df3049e575d4979269"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "opencode: effort picker rides model variants \u2014 the wire had it all along",
+          "upstream_sha": "296813f695f3f18be7c945412d6ca1e15f504beb"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #169 from zeronsh/zeron/opencode-error-surfacing",
+          "upstream_sha": "b8d9996838599da22e5731af96bc0212bd253214"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Calm connectivity truth: degrade hysteresis, staging sweep race, quiet pill",
+          "upstream_sha": "061e6ec616dd772fbea32c90608240766be2dc75"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Connection line: bare spinner, no surface",
+          "upstream_sha": "3bfe30650c03f880ea077a524f6fb8e98523e199"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Connection spinner goes grayscale (mini_mono_spinner)",
+          "upstream_sha": "9116ff6b9a71e4a68b63ab28157d39eae3c6660b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Atomic new-chat sends: stage first, restore to canvas on failure",
+          "upstream_sha": "da792dadeac13be3f2ca0f2bdec1b6c2a74f6e36"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #170 from zeronsh/zeron/connectivity-ui-calm",
+          "upstream_sha": "e800e8eb8ed00e9f3d6936fb2697d9a5a303b927"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #166 from 0854321/fix/composer-overscroll",
+          "upstream_sha": "3614040cb5ff582eb6375cda7ef0210ed7910a10"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): round project picker section corners",
+          "upstream_sha": "7ac14e66633b98e7b02bae244ecc8530a9702a3c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #141 from augustoFranke/fix/project-picker-rounded-corners",
+          "upstream_sha": "35f2b7aac79f837b655dc10f37ae916cdf375553"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Retry mints a fresh attempt; dead commands terminalize instead of ghosting",
+          "upstream_sha": "446ffbff3ddc953b73c7bab2459173f164b73823"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Expired undelivered sends are re-issuable too",
+          "upstream_sha": "abacb45b57192bdd0eb9589349b87006c9320288"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "chat2: cursor contiguity + gap repair \u2014 the new-session random-hang root cause",
+          "upstream_sha": "7754391672ad451365dbbaf8209bf189bd50b713"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #172 from zeronsh/zeron/retryable-send-attempts",
+          "upstream_sha": "b9deeb48097cbad05b76a9e81aee12dd479e2045"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Attachment thumbnails: sending indicator back, no post-send blink, corners clip",
+          "upstream_sha": "e8f9e037c2968c352e253bda2705156f2d634de8"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #180 from zeronsh/zeron/attachment-thumb-fixes",
+          "upstream_sha": "4e0c00de562e27f73c4cf9eb94b1fae9042a45eb"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(acp): support Grok model switching",
+          "upstream_sha": "eda27e8fd85446df03938c104568ff10c05705db"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #182 from rabden/fix/grok-acp-model-switch",
+          "upstream_sha": "685663ee5c2b5b0865c5c7b3f931fe75be9a1807"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Fix terminal rendering after sidebar reopen",
+          "upstream_sha": "889b78eb894c6aa01450d621c359754ac4590997"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #176 from rabden/fix/terminal-sidebar-reopen",
+          "upstream_sha": "2158d405a0af5feea338901f744e06915bf797a4"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #178 from gaelcado/codex/fix-inline-code-wrap-rendering",
+          "upstream_sha": "265204bc115276a83f05c15d24e3320cd060dc31"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Fix selection edge scrolling and terminal scrollbar",
+          "upstream_sha": "3536a3702ca405fec1321e95f54e280240c5d38f"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #179 from rabden/fix/selection-autoscroll-terminal-scrollbar",
+          "upstream_sha": "8ce0d998864919c8fd8b975ef97ba4e2abf8c18c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix: harden OpenCode model discovery",
+          "upstream_sha": "fde9b4b10295cab52219dd738a2717bdf1812b4b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #183 from rabden/fix/opencode-model-discovery",
+          "upstream_sha": "412f20d439f13eb7f222953a8e7655090de738a4"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Thumbnail percent ring tracks the real relay transfer, not just staging",
+          "upstream_sha": "c3d29813897e1e2420eb135a2e6a7cc3e86c4e47"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #185 from zeronsh/zeron/transfer-progress-ring",
+          "upstream_sha": "1af8ff48037cdabc9ce503e4f4a2b5d0aa09d577"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #171 from zeronsh/zeron/ios-network-reliability",
+          "upstream_sha": "c22d16937d9dea0d4b943f731d241f55291ad938"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Keep agent spawn chips visible outside the tool-group collapse",
+          "upstream_sha": "7a0515914ed720c4dc257b5e5c1fecb610257f72"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Center chip header content inside the bordered card",
+          "upstream_sha": "6530b880c78318313d1000ce45feae2cc710521d"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #189 from zeronsh/zeron/render-agent-calls-separately",
+          "upstream_sha": "983e23d0585e3aa14ded7795ceb3449f4a551332"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #190 from zeronsh/zeron/fix-mcp-account-switch-disconnect",
+          "upstream_sha": "6a84dc7100bcefa20b24293c38a1d77fe0bd7f67"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'upstream/main' into worktree/check-chat-width",
+          "upstream_sha": "7b95aa8ae42f2d699b79d2c31e5892b5b9b48ce4"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'upstream/main' into worktree/check-chat-width",
+          "upstream_sha": "3fe947686ca19c188a45c9e0ca913075e38c5154"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream/main and preserve free right-pane resizing",
+          "upstream_sha": "20940c734b77bd1230a4fc10f4744dc8d7191c67"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'upstream/main' into worktree/check-chat-width",
+          "upstream_sha": "6f15324a662e4f31d2c855f4e932cc7b5ddf5fcc"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix composer reflow during panel resize",
+          "upstream_sha": "c4e8cd448352dd98acb92ab4c16fa6c3d9add73e"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "adapt composer traits control to available width",
+          "upstream_sha": "5d20db80e6c470cec542a0ef7cade93403ba883d"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "preserve minimum chat panel width",
+          "upstream_sha": "79d05d55e9621f71d209629f99a97c76de431e4c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "format right pane resize changes",
+          "upstream_sha": "2bd9ee33a3b89acbe7c623aa3f343a2ba17b57b4"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'upstream/main' into worktree/check-chat-width",
+          "upstream_sha": "0efd627ae2e85e0f9ea92c734cb12de020b0e67d"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "restore full right pane takeover",
+          "upstream_sha": "0c84d0d342fadf43bd6ec06a736f859454cc8257"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'upstream/main' into worktree/check-chat-width",
+          "upstream_sha": "d4e1de632bd9c29f2dc900069b0398bbcf0a351a"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix composer idle redraw loop",
+          "upstream_sha": "a00aa6169691d3ce25808dd753e194ff568377f5"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #58 from jsgrrchg/worktree/check-chat-width",
+          "upstream_sha": "e42593a2b981cc45337df4fd1c56fe5f9b74562b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #175 from zeronsh/zeron/ios-bundle-id",
+          "upstream_sha": "331786f1dd71d67bedb4ff8bb8f1f0484cf2d382"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ui: let installed-only harnesses toggle off; picker requires an installed CLI",
+          "upstream_sha": "8528e3bf63a3e1695f0c8b65fa4aae34fd5236dd"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge branch 'main' into pr/settings-fixes",
+          "upstream_sha": "040d7e341cee4235188727c2a1c150b734c2b8bd"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "harnesses: no unrunnable fallback in the composer offer; uninstalled last harness can be disabled",
+          "upstream_sha": "a8ef0aadcf44c71842296bbb52d49b64b9de3103"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #145 from rabden/pr/settings-fixes",
+          "upstream_sha": "6e9ea1f959a879184495aed4e3d1f23c0900fe1e"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "sync: pull/push hardening \u2014 bearer headers everywhere, body caps, bounded rows response",
+          "upstream_sha": "0bd6a6bb6104bc1f6a2171bd4ae9de24087395c2"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #140 from zeronsh/zeron/pullpush-hardening",
+          "upstream_sha": "80c7da73d3c739ffcd95e46a214f3e0333063a4e"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "registry: gate default agent enablement on the installed probe",
+          "upstream_sha": "76b49f0e6ff4311597d894a28f1c90263c1c94bd"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ui: handle empty agent catalogs safely",
+          "upstream_sha": "aacb6210c41a98727de40378b211cdf5139de9fc"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge branch 'main' into engine/harness-installed-gate",
+          "upstream_sha": "dff80b166665d9f25b6b340de609c4d9efeab3d3"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #134 from danperks/engine/harness-installed-gate",
+          "upstream_sha": "dd994c4114d941f575f861c4b64572a506985d9c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #191 from zeronsh/zeron/ios-warning-cleanup",
+          "upstream_sha": "f1e0b30e4b10d483f18b5253e8746d219c789388"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Fix tool rendering: only agent calls with docs render as subagent chips",
+          "upstream_sha": "5019dc193ecbd1cdfabf53355fd93f63664dc442"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Background shell settlements must not bind subagent refs onto Run chips",
+          "upstream_sha": "18987da3ef208bf3b5a976f6d1023e612efad3c8"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Genus-gate subagent binding for every harness",
+          "upstream_sha": "569793ed2eea65f52646f3e34837fe4f64105cb2"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #192 from zeronsh/zeron/lucky-quartz",
+          "upstream_sha": "bead2e67200ab0b0b4c1beee5f67eaa3a619fcfb"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #127 from danperks/comet/diff-sync-churn-fix",
+          "upstream_sha": "0545b3c621586b3dee262eb694071ef4df49d788"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "changes: read a diff side by side, not just top to bottom",
+          "upstream_sha": "89aa28dc4df1a666a921da7739abd0f1afaf0abf"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "changes: keep an edit paired across no-newline markers",
+          "upstream_sha": "46de8088519d37f7f8dea6cd055b341ac3d0c2d3"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #84 from neo773/feat/diff-split-view",
+          "upstream_sha": "d2b4a7d71396c7db117164086cce991118171114"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Composer: full-width @-mention panel, indexed file search",
+          "upstream_sha": "447b6895f1a8e6070e7396afe136b8e5315bd1f4"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #173 from neo773/comet/mention-panel-fast-search",
+          "upstream_sha": "6e81686b58752fa8861d016ee1a9b45469530fec"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "An interruption marker is not a steer",
+          "upstream_sha": "181d667047b98f6214340d4f8e8b4143acb56500"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Spawn chips name the model their subagent runs on",
+          "upstream_sha": "cb2f30d72c9e9887964c0eff6387146a25bccea0"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #193 from neo773/zeron/subagent-model-chip",
+          "upstream_sha": "fe0e02bcd95addc437e3b7908af2ffaef9e8bf10"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Fix transcript viewport restoration",
+          "upstream_sha": "e744d55648cbe4a507aba1304f41dd0314f1ad25"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): refine panel resizing and alignment",
+          "upstream_sha": "89cfeef16f05a4a72d04d1f10396a4f19fcb0edf"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): gate Git add menu by workspace",
+          "upstream_sha": "00799720eab944c75c1cd4ce07d61508806f5bb7"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): unify new-session action in titlebar",
+          "upstream_sha": "276121304c86c6a46a683b86dfaa18c7040b3e9d"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): size project menu with sidebar",
+          "upstream_sha": "be01c6503525a05addcea142895601432a2ad33e"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): reverse right-pane takeover icon",
+          "upstream_sha": "a2db751ed8833f7be49e99e8638acd9bf8b1a028"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #194 from gaelcado/codex/panel-resize-stability",
+          "upstream_sha": "086db2ec7b03cb81fa8bd39f6b02fe71c4979147"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'upstream/main' into fix/chat-viewport-restoration",
+          "upstream_sha": "f417d18370e08b02a5c2cfa83a257d07acbd0bd6"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Anchor live streams at the transcript end",
+          "upstream_sha": "f8437ea5fc83b40efe1545eaa6edc719d3745c6b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Add entry-level message copying and spacing refinements",
+          "upstream_sha": "6f9f834f9a96239377a20713ba319fb849c72017"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Fix transcript copy fidelity and spacing parity",
+          "upstream_sha": "3a3fdca4a4284c7076cec5c8cac707b11524ac47"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #200 from gaelcado/fix/streaming-transcript-reasoning-layout",
+          "upstream_sha": "9c8e2132347f446e9c9445f6f8aeca8230e3442b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'upstream/main' into fix/chat-viewport-restoration",
+          "upstream_sha": "2d718d9b5fb0576a82697748e75634bdc159fd5a"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Fix viewport test row after upstream merge",
+          "upstream_sha": "048f8a2bd6aa1d25d2604097bed10fdfba80a28c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #195 from jsgrrchg/fix/chat-viewport-restoration",
+          "upstream_sha": "b14e9899d549139d33f604389394c27dff3b98eb"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Reasoning becomes a first-class transcript part",
+          "upstream_sha": "aa9f8bf1c23a4242462cedf31666e880c361c267"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "opencode: native HTTP/SSE driver replaces the ACP path",
+          "upstream_sha": "bf634445b40acb9491a6601638f7599241772a82"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "opencode: bound every HTTP call; a boot-window request parks forever",
+          "upstream_sha": "0b421cc2c3f6b51627151c13ea719170e069561b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "opencode: rustfmt the new driver module",
+          "upstream_sha": "705470cb730563e47ba96909919e6d0bea10dd00"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "opencode: gate the first prompt on a live event subscription",
+          "upstream_sha": "a401432f49fc7050e3ac14c1c107c95d3596bf77"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #202 from zeronsh/zeron/opencode-done-signal-and-thinking",
+          "upstream_sha": "59e3b0a312a6b01287d2704608aa15d1f0839bf9"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "opencode: the picker offers only connected providers' models",
+          "upstream_sha": "4fd355791b0190ef8d210b70e02b8c7aba72ae3e"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #205 from zeronsh/zeron/opencode-picker-connected",
+          "upstream_sha": "59a29685a229434e34cafe281365e201b46b84cd"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Model picker scales to thousand-model catalogs; rows attribute their provider",
+          "upstream_sha": "0434895656a5691557262bc7daadfe020d7bb4c0"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #207 from zeronsh/zeron/model-picker-scale",
+          "upstream_sha": "d45d32a66d30c5c8dc666e92309097f7aa766d49"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Thinking rides the tool-group accordion",
+          "upstream_sha": "fed1d64075f43e7c7f22655b572e6b1b0caf425d"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #209 from zeronsh/zeron/thinking-in-tool-groups",
+          "upstream_sha": "e18dad49d4d312da1dfb41a5021871cdecd5dc56"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Chat rows survive configs from newer peers; iOS learns opencode",
+          "upstream_sha": "5306be20a2bcf9a6a29430ad13fe3e9128ab971f"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #210 from zeronsh/zeron/unknown-harness-rows",
+          "upstream_sha": "6e2ec4145db7d4682f75b2354b08e7e584b98110"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Registry cursor can no longer jump over unapplied rows",
+          "upstream_sha": "1fc68435e3637f38963add78757d3076365cf2f1"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #211 from zeronsh/zeron/registry-cursor-jump",
+          "upstream_sha": "eac49385f0eb6c16b683ba7de4ca864ae2525757"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Orphan sweep waits for server truth; unreadable HTTP ack retries",
+          "upstream_sha": "28eb39b685068f36a6e0dd0c7223d9234b3beb9c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #212 from zeronsh/zeron/sweep-gate-and-ack-strand",
+          "upstream_sha": "2e17a87746d35931ae5571776291a892ff49cbae"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "ci: add permanent internal TestFlight workflow (#213)",
+          "upstream_sha": "92b573262affbfadd505fe1d7b4b929ca1f26177"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "docs: plan sidebar view options",
+          "upstream_sha": "22f1b55b0926e981c537cb8d42b314ae364e6ed6"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "feat: add conversation-aware sidebar views",
+          "upstream_sha": "054c17e68a4e8e4f2f3b75826b8855912be02895"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix: polish sidebar view options menu",
+          "upstream_sha": "d539c71b5cc2cf02fd13a0c0689b652d52f1cfe0"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix: simplify sidebar view controls",
+          "upstream_sha": "12f9fcc3e93b4b0bda85a11592721e771a7b2d8c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix: stabilize sidebar view menu state",
+          "upstream_sha": "6667860319fae2cad285fd94a7f9eb30d5ea6c2a"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix: refine sidebar dropdown controls",
+          "upstream_sha": "6ff38dd77100d1518872ab23870a41f1e421ec62"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix: use canonical Solar sort icon",
+          "upstream_sha": "34ac9a540d898064aaa17cbfd893c4417b4beb31"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "feat: animate sidebar disclosures",
+          "upstream_sha": "59b63c831459636eab67ef70f7acdba18e53806b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "polish sidebar disclosure rhythm",
+          "upstream_sha": "eab54b531e18c6f4643cf91f2026d5c41ddd753a"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix sidebar group height accounting",
+          "upstream_sha": "270bf09a730b5be7ba1e64278dd8a6c54354d738"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "polish sidebar disclosure and status layout",
+          "upstream_sha": "5b9677b0772fa52768fa8457c8d6c36538f29107"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "refine sidebar device and row layout",
+          "upstream_sha": "04d917e12a13c3f064e9363fe6484c47da40863c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "balance sidebar harness spacing",
+          "upstream_sha": "b1a811427afe5706dde405a8d134e89ba8dd6c05"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "feat(ui): add coherent accent color palettes",
+          "upstream_sha": "aeab053a3fe4283ff7ab754a2cb608e321796d7a"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Add theme registry and VS Code imports",
+          "upstream_sha": "eeeb537065d92eae162f8ebc61e14268c146dfe6"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Add theme registry and VS Code importer",
+          "upstream_sha": "52f08ff2d2fb8d90c2408f66b894ef1f1b589c57"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Harden custom themes and polish appearance settings",
+          "upstream_sha": "dbdeb816faf19fa3030514a3701a0ecaa7b3a11b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "chore(theme): refresh lockfile for v0.2.21",
+          "upstream_sha": "997de8daddc3053ff5a057e79f2d1a6b7c063ab1"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "refine theme import experience",
+          "upstream_sha": "6a343b6d31ea7b20ffde74411f285aa6a29b5c8b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "chore(theme): refresh lockfile for v0.2.27",
+          "upstream_sha": "8d2d2bc29f7f433e47bc0f7d3136bef2921fde5c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(theme): harden linked imports and persistence",
+          "upstream_sha": "222f63228dad3248337fc84136dbe291d4e40d31"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix: address sidebar view options review",
+          "upstream_sha": "6da4e9f9e7346b3bf20b334a27310793a3b68f86"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge updated sidebar fixes into theme stack",
+          "upstream_sha": "eea6726bc997b77826da2a440b6d4dddb740528e"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "chore: format theme contribution",
+          "upstream_sha": "42bcf74eba0ff6535a0eca7fe2babc9b1db04283"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "chore: format sidebar contribution",
+          "upstream_sha": "da659ff67ffdc82964f9a6dcd80fafeffcb6882c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge final sidebar formatting into theme stack",
+          "upstream_sha": "42765ce420bde58b569e6d1f497636ce8ad8846c"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "shortcuts: label the alt modifier Opt on macOS",
+          "upstream_sha": "35791f280d36911e5308fc07d7ac8331ab8fa81b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'upstream/main' into session-cycling",
+          "upstream_sha": "9daadcd72104e68708fdefb7523117ca658db9f6"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #125 from ShayanAbbas1/session-cycling",
+          "upstream_sha": "006ffbf32411bde948ff01c340b04f674a0a2d69"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge latest upstream main into sidebar stack",
+          "upstream_sha": "79013bee1470f73e5ef176c5a574c28f6c08bd46"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge latest upstream sidebar stack into themes",
+          "upstream_sha": "d0a8ec7effd6b934a99a810ff07614ed66cbbbaf"
+        },
+        {
+          "local_commit": null,
+          "note": "Adds source_context: None to a test fixture. This fork has no source_context field on the chat row, so there is nothing to initialize.",
+          "outcome": "not-applicable",
+          "subject": "test: initialize conversation source context",
+          "upstream_sha": "f442dcc6dac7eb91ec8bdbff8a953282daeb95f0"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream test compatibility into themes",
+          "upstream_sha": "5342491526f37cfdb2ce9ac015675767a6c3fc9a"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #203 from tobi404/fix/double-click-selects-whole-text-field",
+          "upstream_sha": "20483e6fdf200cfd025bf6680b5a08089fbe45fa"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Cycling reads the one sidebar-list function",
+          "upstream_sha": "27c499f64af9124aee74ab4eb320a7ecfe81570e"
+        },
+        {
+          "local_commit": null,
+          "note": "Edits upstream's numbered PARITY table row 1.4. This fork's docs/PARITY.md is 'LAN-only feature status' and carries no keyboard-shortcut row at all - a different document, not a stale one.",
+          "outcome": "not-applicable",
+          "subject": "PARITY \u00a71.4 records the jump and archive shortcuts",
+          "upstream_sha": "849c0f5614fa25b6838050aaddd217894a5b28f7"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "The jump hint wears the app's badge",
+          "upstream_sha": "acce63082a33d9750304ba23c2b2035d74bd81c8"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "The jump hint is the keyboard-hint badge, \u2318-glyphed on macOS",
+          "upstream_sha": "10d1889922f30f8fa1838d9f019afb5919b6f168"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "The jump hint matches the sidebar PR badge exactly",
+          "upstream_sha": "4ce66a96730e8203ccb8caf0a66fd735d883cf8f"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #208 from tobi404/zeron/session-hotkeys",
+          "upstream_sha": "7c9f009f669f337a5ea8367b3968c4f50d1ec044"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): full-width scrollable composer completion popups",
+          "upstream_sha": "2ac0e7e5fdf2cb6f31483e9f49fde6740790cfe9"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #218 from rabden/fix/composer-completion-popups",
+          "upstream_sha": "5826d5792e965f398266fb318d14622496779c5a"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "The new-session target row sits above the composer, left-aligned",
+          "upstream_sha": "45dcb4433a01aacdfc5f47ee5d425168f2b1d367"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #219 from zeronsh/zeron/session-bootstrap-ui-and-layout",
+          "upstream_sha": "bb1f4d7d60ffc66469b028b52e685d05ac4ff653"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream main (session hotkeys) into sidebar stack",
+          "upstream_sha": "52e72564258413ae79a475ef044509a790fe2cca"
+        },
+        {
+          "local_commit": null,
+          "note": "Asserts Chat::source_context, which exists nowhere in crates/proto or crates/engine. AGENTS.md records this commit as the worked example of a clean cherry-pick that fails to compile.",
+          "outcome": "not-applicable",
+          "subject": "test: diff-sync no longer rewrites chat.branch",
+          "upstream_sha": "2119bf0cdda721c8a0500cffabc40e3cb6fafd79"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #214 from gaelcado/publish/sidebar-view-options",
+          "upstream_sha": "4f59c8bf4edf4361924f42217f8574fb6cdb7d29"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream main (sidebar stack landing) into themes",
+          "upstream_sha": "d3280e785c1ea62d9ca8877ff3c46bd71933ce83"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #215 from gaelcado/publish/accent-themes",
+          "upstream_sha": "3f4b731c29198a309e61572a840d568397193a50"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Thinking renders as markdown inside the tool-group accordion",
+          "upstream_sha": "da56a6f9d49b45e6cc1c7a1a4587f3b9f9d6069e"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #220 from zeronsh/comet/thought-markdown",
+          "upstream_sha": "750c1a9799c7333fca5ddca0941529126860484e"
+        },
+        {
+          "local_commit": null,
+          "note": "Already fixed here by a wider mechanism: Pickers::render computes catalog_pending (crates/ui/src/pickers.rs:3612) and returns early with three full skeleton chips, so the chip never collapses to a bare icon while the catalog resolves. Its icon half is unportable regardless - mini_glyph_spinner and theme.glyph arrive in aeab053a, part of the accent-palette work this fork has deferred.",
+          "outcome": "not-applicable",
+          "subject": "Chip loading states: never collapse to a bare icon",
+          "upstream_sha": "73ba80a0cb47c55f9aba6746608d1c4704c73c13"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #221 from zeronsh/zeron/model-picker-tabs",
+          "upstream_sha": "eb5a59cb5fc4c0af8430e3a80ee1c127ab13ad1c"
+        },
+        {
+          "local_commit": null,
+          "note": "Upstream version bump to v0.2.28 (Cargo.toml + Cargo.lock only). This fork versions independently.",
+          "outcome": "not-applicable",
+          "subject": "v0.2.28",
+          "upstream_sha": "bd6f7df6ea62199c6d1c53a86ca65ed4b7ed6713"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'origin/main' into HEAD",
+          "upstream_sha": "aedd43467061d3bf9bec40ab5918aac6ce9f7979"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #88 from kjj6198/fix/settings-menu-shortcut",
+          "upstream_sha": "0cd9f2c1a32b29babcc2978e0771a77878f0c477"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "docs: add Simplified Chinese README",
+          "upstream_sha": "aad6c59482505e8e473a633a3247de2e0480428a"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #142 from 0xfelixli/docs/readme-zh-cn",
+          "upstream_sha": "e8b6a90a8809e7cd0bdb40ad4cc4af1363f283e2"
+        },
+        {
+          "local_commit": null,
+          "note": "Fixes model rows that advertise Mod+1-9 jump chips; those rows come from 19112a5f, ruled not-applicable in #109. Nothing in crates/ui/src/pickers.rs advertises a jump slot here, and #106 deliberately made the model menu swallow them, so porting this would regress that guard.",
+          "outcome": "not-applicable",
+          "subject": "Forward jump slots to the open model menu",
+          "upstream_sha": "6240cccb744bda6051d6c583daf3a7b8786e60b9"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #224 from zeronsh/zeron/picker-jump-forward",
+          "upstream_sha": "bf5c4cbd2d3ce326a91bbe02a082135f9a6dbec4"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "feat(ui): add bundled interface font catalog",
+          "upstream_sha": "befd129a5c5ff6d844aeceade76f38af253c48c7"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "feat(ui): add interface font picker",
+          "upstream_sha": "76fdfb6a52d734e7b9ddc66b6fd4e2d8f299c10e"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): preserve typography on code-related surfaces",
+          "upstream_sha": "81957b11f609a95cc22cc6fe05a1cc9ad081d46e"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Add configurable UI font size",
+          "upstream_sha": "42df80573786d30e01e35ba60fa2b7ff1a22f190"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): serialize settings persistence",
+          "upstream_sha": "9b811c321c1b3ea8c3884e5a2b24e65159f605a0"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): remeasure transcript after typography changes",
+          "upstream_sha": "e87c37ee9dc405fbf04aa3d7224ab2887cc0caa0"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream/main into configurable typography",
+          "upstream_sha": "4a8a3e1566a260d4a676dbba8732b4a11be95ecd"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'upstream/main' into t3code/implementar-tipografia-ui-configurable",
+          "upstream_sha": "34c2d9ed4d3d0d85386f6fd48ba4de48d2c52a40"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream/main into typography PR",
+          "upstream_sha": "fa327fa46e78c047e5bba3bbb9d7c185495f7512"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream/main into typography PR",
+          "upstream_sha": "ee36caf1a611350af844204f7c240e73e370633b"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "feat(ui): offer installed interface fonts",
+          "upstream_sha": "01ead4e03685b3acff5436d63855c853fbdb5d91"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): filter incompatible system fonts",
+          "upstream_sha": "40fb371ec12dd2708cc23f425951eb8a10bb0a78"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream/main into typography PR",
+          "upstream_sha": "629396ecdba1b3ce3b8505b938ff626f79521b45"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream/main into typography PR",
+          "upstream_sha": "fbcd9819b9d9a7099fee4dcf59242a238261f70a"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream/main into typography PR",
+          "upstream_sha": "540537a75f9609a5ba8826f5f7f225d52959b34f"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream/main into typography PR",
+          "upstream_sha": "a0ca2bfa7a96baad8dc13b8699a8ff18e7f47b99"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream/main into typography PR",
+          "upstream_sha": "fb5d0fa62ed6429286c231e70e147e7e19e6c3d3"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream/main into typography PR",
+          "upstream_sha": "0de409e5390d15563fe498f7c15becd2dae636a2"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream/main into typography PR",
+          "upstream_sha": "34062cbe267755752e8e48151af1cf7d70cfc535"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream/main into typography PR",
+          "upstream_sha": "24de9322c88f8473ed3fd67a535e43def1f81db0"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream/main into typography PR",
+          "upstream_sha": "4101c57fd167abc93f4f34e2ac401635c59ddd31"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream/main into typography PR",
+          "upstream_sha": "ae3b89e09f6f11cc00579662adf679e3b371b4b1"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream/main into typography PR",
+          "upstream_sha": "86cf9b0800d0ad5e2c1a08feec85d3581f64efe6"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "fix(ui): use official Geist release fonts",
+          "upstream_sha": "c3d29cd6280582edca46d7961be2034ae05fa0eb"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #49 from jsgrrchg/t3code/implementar-tipografia-ui-configurable",
+          "upstream_sha": "cd6cb22a09033f481eb45c0c6533cfb1e3a8d025"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge upstream/main into feature/sticky-diff-headers",
+          "upstream_sha": "3a7c384c1a7183926cc9575df57f5ba0d79d9fc5"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'upstream/main' into feature/sticky-diff-headers",
+          "upstream_sha": "fc600003e235f4f876daf396c8c230921fe8d8b6"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'upstream/main' into feature/sticky-diff-headers",
+          "upstream_sha": "3e69d2d60dda32252eedea7af16445f5055bdb11"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge remote-tracking branch 'upstream/main' into feature/sticky-diff-headers",
+          "upstream_sha": "faff9621879ef16f40050b53e85f3638030a14f0"
+        },
+        {
+          "local_commit": null,
+          "note": "Deferred during interactive review.",
+          "outcome": "deferred",
+          "subject": "Merge pull request #110 from jsgrrchg/feature/sticky-diff-headers",
+          "upstream_sha": "b3fa51872f70c8f973c241b659cf0c166766f4f5"
+        }
+      ],
+      "kind": "sync",
+      "run_id": "sync/upstream-2026-08-26-2",
+      "sync_branch": "sync/upstream-2026-08-26-2",
       "target_branch": "main"
     }
   ],
