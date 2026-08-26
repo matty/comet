@@ -860,7 +860,13 @@ fn subagent_row_state(
             SubagentPaint::LastSeenRunning,
             "last seen running",
             None,
-            Some("You sent a new message before this finished.".into()),
+            // Covers BOTH routes into this state, which the card cannot tell
+            // apart and should not try to: a steer (D57), and a turn that
+            // completed cleanly while the agent was still working — Claude's
+            // `Agent` tool is not synchronous with its parent's turn. Naming
+            // the steer specifically, as this line first did, was wrong the
+            // moment a real run took the second route.
+            Some("Still running when the turn ended. Comet never saw how it finished.".into()),
         ),
         SubagentStatus::Running => (
             SubagentPaint::Running,

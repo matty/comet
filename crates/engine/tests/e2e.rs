@@ -2835,6 +2835,217 @@ async fn a_steer_over_a_running_subagent_does_not_stamp_it_cancelled() {
     );
 }
 
+/// A cleanly completed turn that leaves its child running — Claude's real
+/// shape, not a contrived one.
+///
+/// Replays the event ORDER of a captured 2.1.246 run (2026-08-26, one `Agent`
+/// delegation), journal seq in comments. The parent's turn ends `Completed`
+/// while the background agent is still working, carrying Claude's own
+/// "Agent is running. Waiting for completion notification." as its result, and
+/// the child reports its real outcome afterwards.
+struct BackgroundSubagentOutlivesTurnHarness;
+
+#[async_trait]
+impl Harness for BackgroundSubagentOutlivesTurnHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "BackgroundSubagentOutlivesTurn"
+    }
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities {
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: vec![ReasoningLevel::Medium],
+            runtime_modes: Vec::new(),
+            ..HarnessCapabilities::default()
+        }
+    }
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tokio::spawn(async move {
+            // seq 46
+            let _ = tx.send(AgentEvent::SubagentStarted {
+                task_id: "t1".into(),
+                tool_use_id: "tu1".into(),
+                agent_type: "general-purpose".into(),
+                description: "List current directory and count entries".into(),
+                prompt: None,
+            });
+            // seq 48
+            let _ = tx.send(AgentEvent::SubagentUpdated {
+                task_id: "t1".into(),
+                status: SubagentStatus::Running,
+                activity: None,
+                summary: None,
+                total_tokens: None,
+                duration_ms: None,
+                tool_uses: None,
+            });
+            let _ = tx.send(AgentEvent::TextDelta {
+                text: "delegated".into(),
+            });
+            // seq 57 — the turn ends CLEANLY with the child still live.
+            let _ = tx.send(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("Agent is running. Waiting for completion notification.".into()),
+                error: None,
+                session_id: None,
+            });
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (Ok(event), rx))
+        })
+        .boxed())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cleanly_completed_turn_does_not_cancel_a_still_running_subagent() {
+    // The regression: `cancel_running_subagents` used to run on EVERY `Done`,
+    // on the premise that Claude's `Agent` tool is synchronous with its
+    // parent's turn. It is not. A real 2.1.246 run completed its turn with the
+    // child still working and the child reported `completed` — with its answer
+    // and full usage — four events later. The sweep had already stamped it
+    // `Cancelled`, which is precisely the manufactured outcome
+    // `cancel_running_subagents`'s own doc forbids.
+    //
+    // `Running` is the honest reading here: the turn ended without Comet
+    // seeing how the child finished. What it must NOT be is `Cancelled`.
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(BackgroundSubagentOutlivesTurnHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-bg-subagent",
+        SessionCommandPayload::Run {
+            request: run_request("delegate this"),
+            message_id: "m-user".into(),
+        },
+    );
+
+    wait_for(
+        || entries_text_now(&core).contains("delegated"),
+        "the turn to complete",
+    )
+    .await;
+
+    let subagent_status = entries_now(&core)
+        .iter()
+        .flat_map(|e| e.parts.iter())
+        .find_map(|p| match p {
+            MessagePart::Subagent { status, .. } => Some(*status),
+            _ => None,
+        })
+        .expect("subagent card still present");
+    assert_eq!(
+        subagent_status,
+        SubagentStatus::Running,
+        "a cleanly completed turn must not claim to know a background child's fate"
+    );
+}
+
+/// The same shape, but the turn is CUT SHORT. This is the case the sweep
+/// exists for, and the half that narrowing it must not disable.
+struct ErroredTurnWithRunningSubagentHarness;
+
+#[async_trait]
+impl Harness for ErroredTurnWithRunningSubagentHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "ErroredTurnWithRunningSubagent"
+    }
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities {
+            reasoning_levels: vec![ReasoningLevel::Medium],
+            runtime_modes: Vec::new(),
+            ..HarnessCapabilities::default()
+        }
+    }
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tokio::spawn(async move {
+            let _ = tx.send(AgentEvent::SubagentStarted {
+                task_id: "t1".into(),
+                tool_use_id: "tu1".into(),
+                agent_type: "general-purpose".into(),
+                description: "List current directory and count entries".into(),
+                prompt: None,
+            });
+            let _ = tx.send(AgentEvent::TextDelta {
+                text: "delegated".into(),
+            });
+            let _ = tx.send(AgentEvent::Done {
+                status: DoneStatus::Errored,
+                result: None,
+                error: Some("the CLI died".into()),
+                session_id: None,
+            });
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (Ok(event), rx))
+        })
+        .boxed())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_short_turn_still_cancels_a_running_subagent() {
+    // The other side of the narrowing above. A turn that errored or was
+    // interrupted really did end everything under it, and a card left
+    // `Running` there would spin forever with nothing able to settle it.
+    // Without this test, narrowing the sweep to non-`Completed` could be
+    // narrowed all the way to nothing and the suite would stay green.
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ErroredTurnWithRunningSubagentHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-errored-subagent",
+        SessionCommandPayload::Run {
+            request: run_request("delegate this"),
+            message_id: "m-user".into(),
+        },
+    );
+
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        MessagePart::Subagent {
+                            status: SubagentStatus::Cancelled,
+                            ..
+                        }
+                    )
+                })
+            })
+        },
+        "the cut-short turn to cancel its running subagent",
+    )
+    .await;
+}
+
 /// Asks permission AFTER its run has ended. That is the state a run whose
 /// handle was replaced reaches — its `ApprovalRequested` is dropped by the
 /// authority guard (which reads whatever handle now owns the chat) and no
