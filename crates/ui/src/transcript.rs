@@ -2524,40 +2524,45 @@ impl Transcript {
                             .flex_col()
                             .gap(px(3.0))
                             .children(steps.iter().map(|step| {
-                                let (ring, fill, label_color) = match step.status {
-                                    ChecklistStatus::Completed => {
-                                        (theme.success_muted, None, theme.text_muted)
-                                    }
-                                    ChecklistStatus::InProgress => {
-                                        (theme.accent, Some(theme.accent), theme.text.opacity(0.85))
-                                    }
-                                    ChecklistStatus::Pending | ChecklistStatus::Unknown => {
-                                        (theme.text_faint, None, theme.text.opacity(0.85))
-                                    }
+                                let label_color = match step.status {
+                                    ChecklistStatus::Completed => theme.text_muted,
+                                    _ => theme.text.opacity(0.85),
                                 };
+                                // Filled discs, not hollow rings: an outlined
+                                // circle reads as a radio button offering a
+                                // choice, which a plan step is not. The disc
+                                // grows through the states — small faint dot,
+                                // full accent, full success with the tick
+                                // knocked out in the plane behind the card — so
+                                // the column still separates them without
+                                // leaning on hue alone. The 12px box is fixed
+                                // across all three, so the column never shifts.
                                 let glyph = div()
                                     .flex_none()
                                     .size(px(12.0))
                                     .mt(px(3.0))
-                                    .rounded(px(6.0))
-                                    .border_1()
-                                    .border_color(ring)
                                     .flex()
                                     .items_center()
                                     .justify_center();
-                                let glyph =
-                                    match step.status {
-                                        // A tick, drawn inside the ring the other
-                                        // states use, so the column never shifts.
-                                        ChecklistStatus::Completed => glyph.child(
+                                let glyph = match step.status {
+                                    ChecklistStatus::Completed => {
+                                        glyph.rounded(px(6.0)).bg(theme.success).child(
                                             crate::icons::icon(crate::icons::CHECK)
                                                 .size(px(8.0))
-                                                .text_color(theme.success_muted),
+                                                .text_color(theme.bg),
+                                        )
+                                    }
+                                    ChecklistStatus::InProgress => {
+                                        glyph.rounded(px(6.0)).bg(theme.accent)
+                                    }
+                                    ChecklistStatus::Pending | ChecklistStatus::Unknown => glyph
+                                        .child(
+                                            div()
+                                                .size(px(6.0))
+                                                .rounded(px(3.0))
+                                                .bg(theme.text_faint),
                                         ),
-                                        _ => glyph.children(fill.map(|fill| {
-                                            div().size(px(5.0)).rounded(px(2.5)).bg(fill)
-                                        })),
-                                    };
+                                };
                                 div()
                                     .flex()
                                     .flex_row()
