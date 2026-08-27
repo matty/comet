@@ -1,6 +1,10 @@
 //! Session doc schema over `loro` — Rust port of `packages/session-doc/src/schema.ts`.
 //!
-//! Container layout (MUST stay shape-compatible with the TS edge/tail materializer):
+//! Container layout. The TS materializer this was first written against is gone
+//! (removed with the hosted service in 41cb5ab6), but the shape is still read by
+//! a second language: `apps/ios/Comet/Sync/SessionStore.swift` indexes `messages`
+//! and `commands` by these names. Nothing checks that automatically, so renaming a
+//! container here fails only on the Swift side, at runtime.
 //! - `meta`:     LoroMap  { chatId: string, schemaVersion: number }         (host-only writer)
 //! - `messages`: LoroList of LoroMap {
 //!   id, role, parts: LoroList<part map>, createdAt, deviceId, status?, continuationOf? }
