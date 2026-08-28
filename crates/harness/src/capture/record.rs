@@ -1480,6 +1480,52 @@ mod tests {
     ///   none carry machine- or session-specific data.
     #[test]
     fn every_scenario_launch_matches_its_committed_corpus_manifest() {
+        // The two ACP adapter rows resolve their launch through
+        // `adapter_entry`, which needs an npm global root that genuinely
+        // holds the package -- real on this machine (the adapters are
+        // installed here) and real nowhere in CI, which runs
+        // `ubuntu-24.04` with neither adapter present
+        // (`comet-provider-sanitize` CI job, PR #127, 2026-08-29:
+        // "npm's global node_modules could not be located"). Promoting the
+        // ACP captures gave this test its first ACP rows to check, and
+        // turned a comparison that had always passed vacuously into one
+        // that depends on the machine running it.
+        //
+        // Fixed the same way `codex_home` below keeps the Codex discovery
+        // rows hermetic: supply a deterministic answer explicitly rather
+        // than let production fall back to auto-discovering one from
+        // whatever the real machine happens to have. `adapter_entry` reads
+        // its root from `COMET_ACP_ADAPTER_ROOT`, not from `ScenarioInput`
+        // the way `codex_home` does, so the equivalent here is a stub
+        // directory this test creates itself and points that variable at,
+        // unconditionally, on every machine -- not a variable the test
+        // reads and branches on, which would just move the CI dependency
+        // rather than remove it. The suffix-based argv comparison
+        // (`normalize_argv` below) already treats everything before the
+        // package name as environment-specific and never compares it, so
+        // a synthetic root changes nothing about what this test actually
+        // verifies: the real package name and `dist/index.js` layout still
+        // have to match the committed manifest, on every machine, with no
+        // skip anywhere.
+        let adapter_root = tempfile::tempdir().expect("tempdir for stub ACP adapters");
+        for package in [
+            scenarios::acp::CODEX_ACP_PACKAGE,
+            scenarios::acp::CLAUDE_ACP_PACKAGE,
+        ] {
+            let entry_dir = adapter_root.path().join(package).join("dist");
+            std::fs::create_dir_all(&entry_dir)
+                .unwrap_or_else(|error| panic!("stub adapter dir for {package}: {error}"));
+            std::fs::write(
+                entry_dir.join("index.js"),
+                "// stub, for argv-shape comparison only\n",
+            )
+            .unwrap_or_else(|error| panic!("stub adapter entry for {package}: {error}"));
+        }
+        // SAFETY: single-threaded per nextest's one-process-per-test model
+        // (`.config/nextest.toml`); no other test in this process reads or
+        // writes this variable while this one runs.
+        unsafe { std::env::set_var("COMET_ACP_ADAPTER_ROOT", adapter_root.path()) };
+
         // codex-acp and claude-agent-acp discovery are promoted in this same
         // change (evidence: `tests/corpus/{codex-acp,claude-agent-acp}/`).
         // Grok stays exempt: `comet-provider-sanitize` structurally REJECTS
@@ -1639,6 +1685,9 @@ mod tests {
             failures.len(),
             failures.join("\n\n")
         );
+
+        // SAFETY: see the matching set_var above.
+        unsafe { std::env::remove_var("COMET_ACP_ADAPTER_ROOT") };
     }
 
     /// The final path component of `program` with a trailing `.exe` stripped.
