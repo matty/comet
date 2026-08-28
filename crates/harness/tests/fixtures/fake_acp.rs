@@ -76,6 +76,21 @@ fn main() {
     let steering = std::env::var_os("FAKE_ACP_NO_STEERING").is_none();
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
+    // A vendor session-config surface on `session/new`, shaped from the grok
+    // 1.0.5 capture (2026-08-28). Off by default: the fixture is
+    // provider-neutral and most tests want the bare reply. `FAKE_ACP_SESSION_
+    // CONFIG=grok` turns it on for the tests that exercise a config-carrying
+    // agent.
+    let session_config = match std::env::var("FAKE_ACP_SESSION_CONFIG").as_deref() {
+        Ok("grok") => Some(json!({"options": [
+            {"category": "model", "id": "fake-model", "label": "Fake Model", "selected": true},
+            {"category": "model", "id": "fake-mini", "label": "Fake Mini", "selected": false},
+            // Grok spells its EFFORT ladder `mode`, not `thought_level`.
+            {"category": "mode", "id": "high", "label": "High Effort", "selected": true},
+            {"category": "mode", "id": "low", "label": "Low Effort", "selected": false},
+        ]})),
+        _ => None,
+    };
     let mut session_counter = 0_u64;
     // The id of a `session/prompt` deliberately left unanswered (`drop-reply`
     // and `starve`). A `session/cancel` settles exactly this one.
@@ -93,15 +108,45 @@ fn main() {
         let method = frame["method"].as_str().unwrap_or_default().to_owned();
 
         match method.as_str() {
-            "initialize" => emit(&json!({
-                "jsonrpc": "2.0", "id": id, "result": initialize_result(steering),
-            })),
+            "initialize" => {
+                emit(&json!({
+                    "jsonrpc": "2.0", "id": id, "result": initialize_result(steering),
+                }));
+                // **An unsolicited notification, the way a real agent does.**
+                // grok 1.0.5 emits a burst of `_x.ai/*` frames right after the
+                // handshake, and that burst is load-bearing for the client: a
+                // client that has dropped its `Incoming` receiver kills its own
+                // reader task on the first one, and every later reply goes
+                // unparsed. This fixture was silent until prompted, so it could
+                // not reproduce that — and the bug shipped to the model picker.
+                emit(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "_fake/ready",
+                    "params": {"note": "unsolicited; see the comment above"},
+                }));
+            }
             "session/new" => {
                 session_counter += 1;
-                emit(&json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "result": {"sessionId": format!("fake-session-{session_counter}")},
-                }));
+                let mut result = json!({"sessionId": format!("fake-session-{session_counter}")});
+                if let Some(config) = session_config.clone() {
+                    result["_meta"] = json!({"x.ai/sessionConfig": config});
+                    // The deprecated surface, alongside the config one and
+                    // DISAGREEING with it on purpose: it enumerates model x
+                    // effort, which is what an agent that has both really
+                    // sends. A decode that reads it as the model list gets
+                    // four rows instead of two, and the test says so.
+                    result["models"] = json!({
+                        "currentModelId": "fake-model",
+                        "availableModels": [
+                            {"modelId": "fake-model", "name": "Fake Model",
+                             "description": "the fixture's model"},
+                            {"modelId": "fake-model-low", "name": "Fake Model (low)"},
+                            {"modelId": "fake-mini", "name": "Fake Mini"},
+                            {"modelId": "fake-mini-low", "name": "Fake Mini (low)"},
+                        ],
+                    });
+                }
+                emit(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
             }
             "session/prompt" => pending_prompt = handle_prompt(&frame, &id),
             "session/cancel" => {

@@ -437,6 +437,18 @@ pub fn default_registry() -> HarnessRegistry {
         },
         Box::new(|| Ok(Arc::new(comet_harness::CodexHarness::new()) as Arc<dyn Harness>)),
     );
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Grok,
+            // Must match GrokHarness::display_name().
+            name: "Grok".into(),
+            capabilities: comet_harness::acp::grok::GrokHarness::capabilities(),
+            availability: HarnessAvailability::Unknown,
+            install: None,
+            update: None,
+        },
+        Box::new(|| Ok(Arc::new(comet_harness::acp::grok::GrokHarness::new()) as Arc<dyn Harness>)),
+    );
     registry
 }
 
@@ -476,20 +488,29 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    /// The registered slots and their ORDER. Order is asserted because it is
+    /// what the picker renders, and because a registration appended in the
+    /// wrong place is otherwise invisible.
     #[test]
-    fn default_registry_lists_mock_claude_and_codex_slots() {
+    fn default_registry_lists_every_slot_in_picker_order() {
         let registry = default_registry();
         let ids: Vec<HarnessId> = registry.descriptors().iter().map(|d| d.id).collect();
         assert_eq!(
             ids,
-            vec![HarnessId::Mock, HarnessId::ClaudeCode, HarnessId::Codex]
+            vec![
+                HarnessId::Mock,
+                HarnessId::ClaudeCode,
+                HarnessId::Codex,
+                HarnessId::Grok,
+            ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
         assert!(registry.resolve(HarnessId::ClaudeCode).is_ok());
-        // A codex-configured chat resolves the right harness (construction is
-        // cheap; CLI discovery is deferred to models()/run()).
-        let codex = registry.resolve(HarnessId::Codex).unwrap();
-        assert_eq!(codex.id(), HarnessId::Codex);
+        // Resolving answers the right harness (construction is cheap; CLI
+        // discovery is deferred to models()/run()).
+        for id in [HarnessId::Codex, HarnessId::Grok] {
+            assert_eq!(registry.resolve(id).unwrap().id(), id);
+        }
     }
 
     /// A lazy descriptor must be indistinguishable from `describe()` after the
@@ -506,7 +527,7 @@ mod tests {
     /// as a guard against someone re-inlining a literal.
     #[test]
     fn lazy_descriptors_match_resolved_harnesses() {
-        for id in [HarnessId::ClaudeCode, HarnessId::Codex] {
+        for id in [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Grok] {
             let registry = default_registry();
             let find = |registry: &HarnessRegistry| {
                 registry

@@ -10,6 +10,8 @@ pub enum HarnessId {
     ClaudeCode,
     Codex,
     Cursor,
+    /// Grok Build, over the Agent Client Protocol (`crates/harness/src/acp`).
+    Grok,
     /// Test harness; never shown in production pickers.
     Mock,
 }
