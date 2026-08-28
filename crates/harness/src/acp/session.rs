@@ -15,8 +15,13 @@
 //! `_x.ai/models/update`, `_x.ai/settings/update`, `_x.ai/announcements/update`
 //! and `_x.ai/mcp_initialized` around every session, and two `session/update`
 //! frames arrive *before* the `session/new` reply that names the session they
-//! belong to. Anything unrecognized is dropped quietly — that is the honest
-//! answer for a protocol whose vendors extend it, not a gap.
+//! belong to. A non-`session/update` method outside that vendor namespace is
+//! still dropped quietly — that is the honest answer for a protocol whose
+//! vendors extend it, not a gap. **A `session/update` whose `sessionUpdate`
+//! kind this build has no arm for is different**: see
+//! `normalize::session_update`'s doc comment for the three-tier split —
+//! routine vendor pushes stay silent, but a kind nobody has ever wired up
+//! reaches the diagnostics channel instead of vanishing the way it used to.
 //!
 //! **Steering rides the turn boundary, always, in this module.** No recorded
 //! agent advertises the steering extension: grok sends no `_meta.steering` at
@@ -26,6 +31,7 @@
 //! extension appears, `AgentDescription::supports_steering` is the gate that
 //! would pick the faster path.
 
+use std::collections::HashSet;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -454,7 +460,7 @@ async fn run_session(
         interrupt,
     } = controls;
 
-    let assistant_message_id = uuid::Uuid::new_v4().to_string();
+    let mut assistant_message_id = uuid::Uuid::new_v4().to_string();
     if !send(
         &event_tx,
         AgentEvent::SessionStarted {
@@ -463,7 +469,7 @@ async fn run_session(
             tools: Vec::new(),
             cwd: request.cwd.clone(),
             session_id: session_id.clone(),
-            assistant_message_id,
+            assistant_message_id: assistant_message_id.clone(),
             runtime_mode: request.runtime_mode,
         },
     )
@@ -477,6 +483,10 @@ async fn run_session(
     // One tracker for the SESSION, not per turn: a tool announced in one turn
     // and completed in the next would otherwise lose its announcement.
     let mut tools = normalize::ToolTracker::default();
+    // Also session-scoped, for the same reason `tools` is: a kind reported
+    // once in an earlier turn must stay suppressed in a later one on the same
+    // session, not report again just because the turn boundary reset it.
+    let mut seen_diagnostics: HashSet<String> = HashSet::new();
 
     // **One `Done` per turn that started, not one per run.** The session is
     // persistent: a steer opens a second turn on the same session, and a UI
@@ -485,6 +495,13 @@ async fn run_session(
     // reason. The corollary is that nothing is emitted after the loop — every
     // exit below has already sent its own.
     loop {
+        // Reset every turn: whether THIS turn streamed any assistant text or
+        // reasoning, which is what decides whether a boundary marker fires
+        // below. ACP has no in-band "message segment finished" push distinct
+        // from turn end (see `normalize::session_update`'s doc comment for
+        // what the wire does carry), so the turn boundary IS the boundary
+        // this build can honestly mark.
+        let mut streamed_this_turn = false;
         let end = drive_turn(
             &mut Turn {
                 client: &client,
@@ -494,6 +511,8 @@ async fn run_session(
                 interrupt: &interrupt,
                 cancel_grace: timeouts.cancel_grace,
                 tools: &mut tools,
+                diagnostics: &mut seen_diagnostics,
+                streamed: &mut streamed_this_turn,
                 context_window,
                 usage_reader,
             },
@@ -532,6 +551,29 @@ async fn run_session(
             // ceremony, not information.
             TurnEnd::ConsumerGone => (None, false),
         };
+
+        // **The boundary marker precedes `Done`, and only fires when there is
+        // a `Done` to precede.** A turn that streamed nothing (an immediate
+        // crash, say) closes no message, so nothing rotates; `ConsumerGone`
+        // sends neither. Claude and Codex fire this per completed message
+        // item; ACP gives this build only the turn boundary to hang it on
+        // (see the `streamed_this_turn` comment above), so one turn is one
+        // message here.
+        if streamed_this_turn
+            && done.is_some()
+            && !send(
+                &event_tx,
+                AgentEvent::AssistantMessageCompleted {
+                    assistant_message_id: std::mem::replace(
+                        &mut assistant_message_id,
+                        uuid::Uuid::new_v4().to_string(),
+                    ),
+                },
+            )
+            .await
+        {
+            break;
+        }
 
         if let Some(done) = done
             && !send(&event_tx, done).await
@@ -590,6 +632,15 @@ struct Turn<'a> {
     interrupt: &'a crate::CancellationToken,
     cancel_grace: Duration,
     tools: &'a mut normalize::ToolTracker,
+    /// Kind-names already reported this SESSION, for
+    /// [`normalize::session_update_once`]'s rate limit. Outlives the turn for
+    /// the same reason `tools` does.
+    diagnostics: &'a mut HashSet<String>,
+    /// Whether THIS turn has streamed any assistant text or reasoning yet —
+    /// reset fresh per turn by the caller. Read back after [`drive_turn`]
+    /// returns to decide whether an `AssistantMessageCompleted` boundary
+    /// marker is owed.
+    streamed: &'a mut bool,
     context_window: Option<u64>,
     /// This agent's own reading of a `session/prompt` result — see
     /// [`UsageReader`].
@@ -606,6 +657,8 @@ async fn drive_turn(turn: &mut Turn<'_>, prompt: &str) -> TurnEnd {
         interrupt,
         cancel_grace,
         tools,
+        diagnostics,
+        streamed,
         context_window,
         usage_reader,
     } = turn;
@@ -638,7 +691,9 @@ async fn drive_turn(turn: &mut Turn<'_>, prompt: &str) -> TurnEnd {
                         // whatever `try_recv` finds now provably preceded the
                         // reply on the wire, and nothing later can appear.
                         while let Ok(message) = incoming.try_recv() {
-                            match handle_incoming(message, client, event_tx, tools).await {
+                            match handle_incoming(message, client, event_tx, tools, diagnostics, streamed)
+                                .await
+                            {
                                 Handled::Continue => {}
                                 Handled::ConsumerGone => return TurnEnd::ConsumerGone,
                                 // EOF after a settled turn is just the agent
@@ -668,7 +723,9 @@ async fn drive_turn(turn: &mut Turn<'_>, prompt: &str) -> TurnEnd {
             }
 
             message = incoming.recv() => match message {
-                Some(message) => match handle_incoming(message, client, event_tx, tools).await {
+                Some(message) => match handle_incoming(message, client, event_tx, tools, diagnostics, streamed)
+                    .await
+                {
                     Handled::Continue => {}
                     Handled::ConsumerGone => return TurnEnd::ConsumerGone,
                     Handled::AgentExited => return TurnEnd::AgentExited,
@@ -718,12 +775,16 @@ async fn handle_incoming(
     client: &RpcClient,
     event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
     tools: &mut normalize::ToolTracker,
+    diagnostics: &mut HashSet<String>,
+    streamed: &mut bool,
 ) -> Handled {
     match message {
         Incoming::Notification { method, params } => {
             if method == "session/update" {
                 // Tool frames carry state across updates, so they go through
-                // the tracker; everything else is a pure per-frame decode.
+                // the tracker; everything else is a pure per-frame decode,
+                // rate-limited by kind-name (`session_update_once`'s own doc
+                // comment says why plain `session_update` is not enough here).
                 let update = &params["update"];
                 let kind = update["sessionUpdate"].as_str().unwrap_or_default();
                 if kind == "tool_call" || kind == "tool_call_update" {
@@ -732,10 +793,16 @@ async fn handle_incoming(
                             return Handled::ConsumerGone;
                         }
                     }
-                } else if let Some(event) = normalize::session_update(&params)
-                    && !send(event_tx, event).await
-                {
-                    return Handled::ConsumerGone;
+                } else if let Some(event) = normalize::session_update_once(diagnostics, &params) {
+                    if matches!(
+                        event,
+                        AgentEvent::TextDelta { .. } | AgentEvent::ReasoningDelta { .. }
+                    ) {
+                        *streamed = true;
+                    }
+                    if !send(event_tx, event).await {
+                        return Handled::ConsumerGone;
+                    }
                 }
             } else {
                 // Vendor and lifecycle chatter -- `_x.ai/*` and friends.

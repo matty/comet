@@ -27,20 +27,129 @@ pub(crate) fn done_status(stop_reason: &str) -> DoneStatus {
 
 /// A `session/update` notification's payload → zero or one `AgentEvent`.
 ///
-/// `None` means "nothing Comet renders", which is a real answer and not a
-/// failure: ACP carries update kinds this build does not consume, and an
-/// unrecognized one must be dropped quietly rather than surfaced or errored.
+/// **Three tiers, not two.** `None` used to be the honest answer for every
+/// `sessionUpdate` kind this build does not render, and that collapsed two
+/// different situations into one: a kind that fires on every healthy turn
+/// (Grok pushes `available_commands_update`, `user_message_chunk` and
+/// `session_info_update` continuously — see the arms below) and a kind
+/// nobody has ever wired up at all, which used to vanish with nothing to
+/// show for it. Now:
+///
+/// 1. **Mapped** — `agent_message_chunk`, `agent_thought_chunk`: a real
+///    `AgentEvent`.
+/// 2. **Known, deliberately unmapped** — an explicit arm, still `None`, with
+///    a comment naming the wire evidence and why it is ignored. Routine on a
+///    healthy turn; must never become a diagnostic.
+/// 3. **Genuinely unknown** — `Some(Diagnostic)`. Includes real ACP spec
+///    kinds this build has never observed on the wire (`plan`,
+///    `current_mode_update`, `usage_update`, `config_option_update` — see
+///    `agent_client_protocol` 0.9.0's schema) as well as anything a future
+///    agent invents. `docs/testing/supported-provider-versions.md`'s rule is
+///    "a frame no supported version emits does not get a decode" — that
+///    governs Tier 1/2 arms, not this fallback. A kind with zero wire
+///    evidence gets no special-cased arm of EITHER kind; it falls through
+///    here, which is the fix: a later agent version that starts sending
+///    `plan` is reported, not silently dropped the way this whole function
+///    used to drop it.
+///
+/// Callers wanting the kind-name rate limit described on
+/// [`AgentEvent::Diagnostic`]'s emit site use [`session_update_once`], not
+/// this function directly — this one stays a plain, statelessly-testable
+/// decode, the same discipline `tool_update`'s pure `typed_call` follows.
 pub(crate) fn session_update(params: &Value) -> Option<AgentEvent> {
     let update = &params["update"];
-    match update["sessionUpdate"].as_str()? {
+    let Some(kind) = update["sessionUpdate"].as_str() else {
+        // Well-formed JSON, but the one field every real `sessionUpdate`
+        // carries is missing or not a string. A different failure from an
+        // unknown kind — reporting THIS as `Unknown` would name an empty
+        // string as the drift, which points whoever reads it at nothing.
+        return Some(AgentEvent::Diagnostic {
+            discriminator: "sessionUpdate/missing".into(),
+            severity: comet_proto::DiagnosticSeverity::Malformed,
+            code: None,
+            summary: "The agent sent a session update that named no update kind.".into(),
+        });
+    };
+    match kind {
         "agent_message_chunk" => {
             text_of(&update["content"]).map(|text| AgentEvent::TextDelta { text })
         }
         "agent_thought_chunk" => {
             text_of(&update["content"]).map(|text| AgentEvent::ReasoningDelta { text })
         }
-        _ => None,
+
+        // ---- Tier 2: known, deliberately unmapped ----
+        // `session.rs::handle_incoming` intercepts these before this function
+        // is ever called in production, routing them through `tool_update`'s
+        // stateful tracker instead. Listed here too so this function stays
+        // correct if anything ever calls it directly on one — the existing
+        // `unreadable_updates_are_dropped_not_surfaced` test below does
+        // exactly that.
+        "tool_call" | "tool_call_update" => None,
+        // Pushed unsolicited, repeatedly, across a session — grok 1.0.5's
+        // whole slash-command snapshot arrives twice before `session/new`
+        // even replies (see `commands()`'s doc comment) and again whenever
+        // the list changes. `AcpSession::open_for_discovery` already reads
+        // the snapshot it needs at handshake time; nothing renders a
+        // mid-session copy.
+        "available_commands_update" => None,
+        // Grok echoes the user's own prompt back on this kind — captured
+        // 2026-08-28 (`acp-raw-2026-08-28-run-steer`), literal frame:
+        // `{"sessionUpdate":"user_message_chunk","content":{"type":"text",
+        // "text":"<the prompt>"}}`. Mapping it to `TextDelta` would print the
+        // question into the answer; `grok_live.rs`'s
+        // `a_real_turn_streams_and_settles` asserts the leak stays fixed.
+        "user_message_chunk" => None,
+        // Grok's auto-generated session TITLE (`update.title`), re-pushed as
+        // the agent revises it — captured 2026-08-28, same run, literal
+        // frame: `{"sessionUpdate":"session_info_update","title":"..."}`.
+        // Titling is `agent-authored-title`'s surface, not this slice's;
+        // this arm only keeps the routine push from tripping Tier 3.
+        "session_info_update" => None,
+
+        // ---- Tier 3: genuinely unknown, see this function's doc comment ----
+        other => {
+            let discriminator =
+                comet_proto::sanitize_discriminator(&format!("sessionUpdate/{other}"));
+            Some(AgentEvent::Diagnostic {
+                summary: format!(
+                    "Comet doesn't recognize the \"{discriminator}\" update this agent sent."
+                ),
+                discriminator,
+                severity: comet_proto::DiagnosticSeverity::Unknown,
+                code: None,
+            })
+        }
     }
+}
+
+/// [`session_update`], rate-limited by kind-name: a stream of the SAME
+/// unrecognized `sessionUpdate` reports once per run, not once per frame.
+///
+/// **Grok's vendor stream would storm without this.** `_x.ai/*` methods are
+/// already dropped before reaching `session_update` at all (see
+/// `acp::session`'s module doc), but a genuinely unknown `sessionUpdate` kind
+/// — the case this exists for — has no such filter upstream, and nothing
+/// stops a chatty future agent from sending one every turn. Neither Claude's
+/// nor Codex's own `Diagnostic` emit sites suppress repeats at all (grep
+/// `claude::normalize`'s `Frame::Unknown` arm and `codex::normalize::map_item`'s
+/// `item/untyped` arm — neither carries any dedup state), so there is no
+/// existing convention to match; this is the kind-name-keyed fallback the
+/// task brief calls for when that's the case.
+///
+/// `seen` is the caller's state, scoped to one session's lifetime — the same
+/// scope `ToolTracker` holds, not a fresh instance per turn.
+pub(crate) fn session_update_once(
+    seen: &mut HashSet<String>,
+    params: &Value,
+) -> Option<AgentEvent> {
+    let event = session_update(params)?;
+    if let AgentEvent::Diagnostic { discriminator, .. } = &event
+        && !seen.insert(discriminator.clone())
+    {
+        return None;
+    }
+    Some(event)
 }
 
 /// A content block's text. ACP blocks are `{type, text}`, but a block whose
@@ -840,22 +949,151 @@ mod tests {
         ));
     }
 
-    /// Break caught: an unrecognized update kind returning a rendered event, or
-    /// panicking. Both are wrong — ACP carries kinds this build does not read,
-    /// and the honest answer is to drop them.
+    /// **This test used to pin the opposite behaviour**, under the name
+    /// `unreadable_updates_are_dropped_not_surfaced`: every one of these
+    /// payloads asserted `session_update(&payload).is_none()`, `plan` and
+    /// `invented_in_2027` included. That was the blind spot task PR4 exists
+    /// to close — an unrecognized `sessionUpdate` vanished with nothing to
+    /// show for it, so a later agent version's new frame kind was
+    /// indistinguishable from an agent that sent nothing at all. Only
+    /// `tool_call` still drops here: `session.rs::handle_incoming` intercepts
+    /// it before this function is ever called in production, and this test
+    /// pins that this function agrees if ever called on one directly.
     #[test]
-    fn unreadable_updates_are_dropped_not_surfaced() {
-        for payload in [
-            json!({"update": {"sessionUpdate": "tool_call", "content": {"text": "x"}}}),
-            json!({"update": {"sessionUpdate": "plan"}}),
-            // A kind that does not exist at all.
-            json!({"update": {"sessionUpdate": "invented_in_2027"}}),
-            // No `sessionUpdate` key whatsoever.
-            json!({"update": {}}),
-            // No `update` key whatsoever.
-            json!({}),
-        ] {
-            assert!(session_update(&payload).is_none(), "must drop: {payload}");
+    fn tool_call_is_still_dropped_and_everything_else_is_now_reported() {
+        // Still silently dropped: handled elsewhere (see this function's own
+        // doc comment).
+        assert!(
+            session_update(
+                &json!({"update": {"sessionUpdate": "tool_call", "content": {"text": "x"}}})
+            )
+            .is_none()
+        );
+
+        // Now reported, Tier 3 — a real ACP spec kind (`plan`) this build has
+        // never observed on the wire (see Step 2 of the task report: three
+        // real grok 1.0.5 captures and a live probe, zero `plan` frames), and
+        // an invented one.
+        for kind in ["plan", "invented_in_2027"] {
+            let event = session_update(&json!({"update": {"sessionUpdate": kind}}))
+                .unwrap_or_else(|| panic!("{kind} must be reported, not dropped"));
+            assert!(
+                matches!(event, AgentEvent::Diagnostic { .. }),
+                "{kind}: {event:?}"
+            );
+        }
+
+        // Now reported, Malformed — no `sessionUpdate` key to name at all.
+        for payload in [json!({"update": {}}), json!({})] {
+            let event = session_update(&payload).unwrap_or_else(|| {
+                panic!("a missing sessionUpdate key must be reported: {payload}")
+            });
+            assert!(
+                matches!(
+                    event,
+                    AgentEvent::Diagnostic {
+                        severity: comet_proto::DiagnosticSeverity::Malformed,
+                        ..
+                    }
+                ),
+                "{payload}: {event:?}"
+            );
+        }
+    }
+
+    /// Break caught: dropping an unrecognized `sessionUpdate` silently. A frame
+    /// kind a later agent version introduces must reach the diagnostics
+    /// channel, or a stale decode is indistinguishable from an agent that
+    /// sends nothing.
+    #[test]
+    fn an_unknown_session_update_raises_a_diagnostic() {
+        let event =
+            session_update(&json!({"update": {"sessionUpdate": "invented_in_2027", "x": 1}}))
+                .expect("an unrecognized update kind must be reported, not dropped");
+        // The kind name is what makes the report actionable; the payload is
+        // not, and must not be echoed — it is provider prose and may carry
+        // user content.
+        match event {
+            AgentEvent::Diagnostic { summary, .. } => {
+                assert!(summary.contains("invented_in_2027"), "{summary}");
+                assert!(
+                    !summary.contains("\"x\""),
+                    "the payload must not be echoed: {summary}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A frame with no `sessionUpdate` key at all is a different failure from
+    /// an unknown kind, and reporting it as an unknown kind would name an
+    /// empty string as the drift.
+    #[test]
+    fn a_frame_with_no_update_kind_is_reported_as_malformed_not_unknown() {
+        let event = session_update(&json!({"update": {"toolCallId": "a"}}))
+            .expect("a frame with no sessionUpdate key must still be reported");
+        match event {
+            AgentEvent::Diagnostic {
+                severity, summary, ..
+            } => {
+                assert_eq!(severity, comet_proto::DiagnosticSeverity::Malformed);
+                assert!(
+                    summary.contains("no update kind") || summary.contains("named no"),
+                    "must say the key is missing, not that \"\" is unknown: {summary}"
+                );
+                assert!(!summary.contains("\"\""), "{summary}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **Rate-limited by kind-name.** A stream of 60 unknown frames of the
+    /// SAME kind must not produce 60 diagnostics — Grok's vendor stream is
+    /// exactly this shape for kinds this build has no arm for at all, and a
+    /// diagnostic per frame would storm every healthy turn. A DIFFERENT
+    /// unknown kind still gets its own report: suppression is per-kind, not
+    /// global.
+    #[test]
+    fn an_unknown_kind_reports_once_per_run_not_once_per_frame() {
+        let mut seen = HashSet::new();
+        let frame = json!({"update": {"sessionUpdate": "invented_in_2027"}});
+
+        let first = session_update_once(&mut seen, &frame);
+        assert!(
+            matches!(first, Some(AgentEvent::Diagnostic { .. })),
+            "{first:?}"
+        );
+        for _ in 0..59 {
+            assert_eq!(
+                session_update_once(&mut seen, &frame),
+                None,
+                "a repeat of the same kind must not report again"
+            );
+        }
+
+        // A different kind is a different report.
+        let other_frame = json!({"update": {"sessionUpdate": "also_invented"}});
+        let second = session_update_once(&mut seen, &other_frame);
+        assert!(
+            matches!(second, Some(AgentEvent::Diagnostic { .. })),
+            "{second:?}"
+        );
+    }
+
+    /// A known, mapped kind is unaffected by the dedup wrapper — it is not a
+    /// `Diagnostic`, so nothing about it is ever suppressed.
+    #[test]
+    fn session_update_once_does_not_touch_mapped_events() {
+        let mut seen = HashSet::new();
+        for _ in 0..3 {
+            let frame = json!({"update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "hi"},
+            }});
+            assert!(matches!(
+                session_update_once(&mut seen, &frame),
+                Some(AgentEvent::TextDelta { text }) if text == "hi"
+            ));
         }
     }
 
