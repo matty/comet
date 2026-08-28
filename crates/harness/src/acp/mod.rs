@@ -24,6 +24,7 @@
 #![allow(dead_code)]
 
 pub mod grok;
+pub mod hermes;
 pub(crate) mod normalize;
 pub mod session;
 

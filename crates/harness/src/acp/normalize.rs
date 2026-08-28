@@ -89,27 +89,41 @@ pub(crate) fn commands(raw: &Value) -> Vec<AgentCommand> {
         .unwrap_or_default()
 }
 
-/// The turn's token reading, from the `session/prompt` response's `_meta`.
+/// The turn's token reading, from the ACP spec's own (unstable) `usage` block
+/// on the `session/prompt` response — `result.usage.inputTokens` /
+/// `.outputTokens`, a TOP-LEVEL field, never `_meta`.
 ///
-/// **`inputTokens` is the prompt size and it is cache-INCLUSIVE**, which is
-/// exactly what [`AgentEvent::Usage::prompt_tokens`] is defined to mean — read
-/// that field's own doc comment before changing this, because the two existing
-/// providers disagree on this axis and the disagreement is invisible. Measured
-/// on grok 1.0.5: `inputTokens: 14500` with `cachedReadTokens: 10624`, so the
-/// cached read is part of the prompt rather than beside it.
+/// **This is genuinely spec-general, not a second vendor path wearing a
+/// generic name.** Grok does not use it at all: its reading is vendor-
+/// namespaced under `_meta.inputTokens` (see `grok::usage`), so the split
+/// between the two functions is real, not cosmetic — moving Grok's reader out
+/// of this file is what slice PR1 did when Hermes' shape turned out to
+/// disagree with it. Hermes' own `session/prompt` puts its numbers here
+/// instead, at the path the ACP Python/TS SDKs both define for this
+/// capability.
 ///
-/// **`totalTokens` is deliberately NOT used.** It is input + output and it
-/// accumulates, so drawing it against the window would show a session filling
-/// up from its own replies — the mistake `AgentEvent::Usage`'s doc comment
-/// records Codex's `total` making, at 41% of the window after three trivial
-/// turns.
+/// **Not pinned against a live capture.** Hermes' `session/new` requires a
+/// configured LLM provider before it will even open a session — unlike
+/// Grok's, whose handshake needs no auth — and no authenticated Hermes turn
+/// could be run to capture one (see the PR1 task report). The field names and
+/// their placement are confirmed from Hermes' own installed `acp`/
+/// `acp_adapter` source (`server.py`'s `prompt()` builds `Usage(input_tokens=
+/// result["prompt_tokens"], output_tokens=result["completion_tokens"], ...)`
+/// from the underlying provider's own per-call completion usage) — ground
+/// truth for what bytes it emits, but not a wire capture. That source shows
+/// the numbers come from ONE turn's own completion call, which is the
+/// cache-inclusive, per-turn reading `AgentEvent::Usage::prompt_tokens`
+/// requires, not the "across all turns" wording the SDK's own docstring
+/// carries (docstring text copied from the shared schema, not necessarily
+/// accurate to this one implementation). Flagged as unverified until a real
+/// capture confirms it.
 ///
 /// `None` when the agent reported no numbers at all: an empty meter that says
 /// "not measured" is honest, where zeros would read as a measurement of zero.
 pub(crate) fn usage(result: &Value, context_window: Option<u64>) -> Option<AgentEvent> {
-    let meta = &result["_meta"];
-    let prompt_tokens = meta["inputTokens"].as_u64();
-    let output_tokens = meta["outputTokens"].as_u64();
+    let usage = &result["usage"];
+    let prompt_tokens = usage["inputTokens"].as_u64();
+    let output_tokens = usage["outputTokens"].as_u64();
     if prompt_tokens.is_none() && output_tokens.is_none() {
         return None;
     }
@@ -380,21 +394,22 @@ mod tests {
         }
     }
 
-    /// The real `session/prompt` response `_meta`, captured from grok 1.0.5 on
-    /// 2026-08-28. **`inputTokens` is cache-inclusive**: 14500 with 10624 of it
-    /// a cached read, so the cache is part of the prompt rather than beside it.
+    /// A hand-built literal matching the top-level shape Hermes' own installed
+    /// `acp`/`acp_adapter` source builds (`Usage(inputTokens=...,
+    /// outputTokens=..., totalTokens=...)` on the `PromptResponse`, never under
+    /// `_meta`). **Not a live capture** — see [`usage`]'s doc comment for why
+    /// none could be taken — so this pins the field NAMES and LOCATION the
+    /// source proves, not a wire exchange this build has watched happen.
     #[test]
-    fn the_captured_response_meta_reads_as_prompt_and_output() {
+    fn the_spec_shaped_reply_reads_as_prompt_and_output() {
         let result = json!({
             "stopReason": "end_turn",
-            "_meta": {
-                "totalTokens": 14671,
-                "modelId": "grok-4.6",
+            "usage": {
                 "inputTokens": 14500,
                 "outputTokens": 171,
+                "totalTokens": 14671,
                 "cachedReadTokens": 10624,
-                "reasoningTokens": 169,
-                "usage": {"numTurns": 1, "modelCalls": 1},
+                "thoughtTokens": 169,
             },
         });
 
@@ -404,12 +419,12 @@ mod tests {
                 output_tokens,
                 context_window,
             } => {
-                assert_eq!(prompt_tokens, 14500, "the prompt, cache included");
+                assert_eq!(prompt_tokens, 14500);
                 assert_eq!(output_tokens, 171);
                 assert_eq!(context_window, Some(500_000));
-                // **Not 14671.** `totalTokens` accumulates input + output, so
-                // metering it against the window shows a session filling up
-                // from its own replies.
+                // **Not 14671.** `totalTokens` is a different quantity and
+                // must not be drawn against the window — see `AgentEvent::
+                // Usage`'s own doc comment.
                 assert_ne!(prompt_tokens, 14671);
             }
             other => panic!("{other:?}"),
@@ -422,8 +437,10 @@ mod tests {
     fn an_absent_usage_block_yields_no_event() {
         for result in [
             json!({"stopReason": "end_turn"}),
-            json!({"stopReason": "end_turn", "_meta": {}}),
-            json!({"_meta": {"totalTokens": 999}}),
+            json!({"stopReason": "end_turn", "usage": {}}),
+            json!({"usage": {"totalTokens": 999}}),
+            // `_meta` is not this path — that is Grok's vendor reader.
+            json!({"_meta": {"inputTokens": 100, "outputTokens": 1}}),
             json!({}),
         ] {
             assert!(
@@ -437,7 +454,7 @@ mod tests {
     /// the other.
     #[test]
     fn a_half_reported_usage_still_counts() {
-        let only_input = json!({"_meta": {"inputTokens": 100}});
+        let only_input = json!({"usage": {"inputTokens": 100}});
         match usage(&only_input, None).expect("input alone is a reading") {
             AgentEvent::Usage {
                 prompt_tokens,

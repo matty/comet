@@ -196,6 +196,7 @@ fn harness_from_env() -> comet_engine::HarnessId {
         Ok("codex") => comet_engine::HarnessId::Codex,
         Ok("cursor") => comet_engine::HarnessId::Cursor,
         Ok("grok") => comet_engine::HarnessId::Grok,
+        Ok("hermes") => comet_engine::HarnessId::Hermes,
         // A catch-all, so a NEW `HarnessId` variant does not fail the build
         // here — it silently defaults instead. Adding a variant means adding
         // its arm; nothing else will tell you.

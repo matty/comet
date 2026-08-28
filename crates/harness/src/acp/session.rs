@@ -41,6 +41,18 @@ use super::{AgentDescription, initialize_params, new_session_params, normalize, 
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{HarnessError, RunControls, StderrTail, shutdown_child};
 
+/// How a turn's token reading is read off a `session/prompt` result.
+///
+/// **Per-agent, injected by the caller, never dispatched on [`HarnessId`]
+/// here.** Grok's numbers live under a vendor `_meta` key and Hermes' live at
+/// the ACP spec's own top-level `usage` — this loop does not choose between
+/// them; each harness's `run()` hands in its own reader (`grok::usage` or
+/// `normalize::usage`) when it calls [`run`]. Keeping the choice out of this
+/// file is the same discipline `normalize.rs`'s module doc states: a vendor
+/// path does not belong in the shared decode, even disguised as a `match` on
+/// `HarnessId`.
+pub(crate) type UsageReader = fn(&Value, Option<u64>) -> Option<AgentEvent>;
+
 /// The timeouts the loop is built from. A struct rather than four arguments so
 /// a test can shrink them without every call site naming all four.
 #[derive(Clone, Copy, Debug)]
@@ -382,9 +394,17 @@ pub fn run(
     harness: HarnessId,
     request: RunRequest,
     controls: RunControls,
+    usage_reader: UsageReader,
 ) -> BoxStream<'static, Result<AgentEvent, HarnessError>> {
     let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
-    tokio::spawn(run_session(session, harness, request, controls, event_tx));
+    tokio::spawn(run_session(
+        session,
+        harness,
+        request,
+        controls,
+        usage_reader,
+        event_tx,
+    ));
     futures::stream::unfold(event_rx, |mut rx| async move {
         rx.recv().await.map(|ev| (ev, rx))
     })
@@ -408,6 +428,7 @@ async fn run_session(
     harness: HarnessId,
     request: RunRequest,
     controls: RunControls,
+    usage_reader: UsageReader,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
 ) {
     let AcpSession {
@@ -473,6 +494,7 @@ async fn run_session(
                 cancel_grace: timeouts.cancel_grace,
                 tools: &mut tools,
                 context_window,
+                usage_reader,
             },
             &prompt,
         )
@@ -568,6 +590,9 @@ struct Turn<'a> {
     cancel_grace: Duration,
     tools: &'a mut normalize::ToolTracker,
     context_window: Option<u64>,
+    /// This agent's own reading of a `session/prompt` result — see
+    /// [`UsageReader`].
+    usage_reader: UsageReader,
 }
 
 /// One `session/prompt`, from send to `stopReason`.
@@ -581,9 +606,11 @@ async fn drive_turn(turn: &mut Turn<'_>, prompt: &str) -> TurnEnd {
         cancel_grace,
         tools,
         context_window,
+        usage_reader,
     } = turn;
     let cancel_grace = *cancel_grace;
     let context_window = *context_window;
+    let usage_reader = *usage_reader;
     let reply = client.request("session/prompt", prompt_params(session_id, prompt));
     tokio::pin!(reply);
 
@@ -621,7 +648,7 @@ async fn drive_turn(turn: &mut Turn<'_>, prompt: &str) -> TurnEnd {
                         // The turn's token reading rides just ahead of its
                         // `Done`, so the meter is current at the moment the
                         // turn is reported finished.
-                        if let Some(usage) = normalize::usage(&result, context_window)
+                        if let Some(usage) = usage_reader(&result, context_window)
                             && !send(event_tx, usage).await
                         {
                             return TurnEnd::ConsumerGone;

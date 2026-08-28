@@ -12,6 +12,9 @@ pub enum HarnessId {
     Cursor,
     /// Grok Build, over the Agent Client Protocol (`crates/harness/src/acp`).
     Grok,
+    /// Hermes Agent, over the Agent Client Protocol (`crates/harness/src/acp`).
+    /// No steering extension and no effort ladder — see `acp::hermes`.
+    Hermes,
     /// Test harness; never shown in production pickers.
     Mock,
 }

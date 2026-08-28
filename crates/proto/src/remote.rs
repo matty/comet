@@ -50,7 +50,11 @@ use serde::{Deserialize, Serialize};
 ///    Note `HarnessId::Cursor` already exists with no harness behind it. It
 ///    predates this list and is **not** precedent that variants are free: it has
 ///    simply never been sent, and a variant nobody emits breaks nobody.
-pub const PROTOCOL_VERSION: u32 = 9;
+/// 10: `HarnessId::Hermes`. The same decode problem as 9, on the same fields:
+///     `HarnessId` still carries no `#[serde(other)]` arm, so an older peer
+///     meeting `"hermes"` fails the whole containing value — a harness list,
+///     a chat row, or a `RunRequest` — not one field.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

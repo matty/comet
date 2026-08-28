@@ -449,6 +449,20 @@ pub fn default_registry() -> HarnessRegistry {
         },
         Box::new(|| Ok(Arc::new(comet_harness::acp::grok::GrokHarness::new()) as Arc<dyn Harness>)),
     );
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Hermes,
+            // Must match HermesHarness::display_name().
+            name: "Hermes".into(),
+            capabilities: comet_harness::acp::hermes::HermesHarness::capabilities(),
+            availability: HarnessAvailability::Unknown,
+            install: None,
+            update: None,
+        },
+        Box::new(|| {
+            Ok(Arc::new(comet_harness::acp::hermes::HermesHarness::new()) as Arc<dyn Harness>)
+        }),
+    );
     registry
 }
 
@@ -502,13 +516,14 @@ mod tests {
                 HarnessId::ClaudeCode,
                 HarnessId::Codex,
                 HarnessId::Grok,
+                HarnessId::Hermes,
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
         assert!(registry.resolve(HarnessId::ClaudeCode).is_ok());
         // Resolving answers the right harness (construction is cheap; CLI
         // discovery is deferred to models()/run()).
-        for id in [HarnessId::Codex, HarnessId::Grok] {
+        for id in [HarnessId::Codex, HarnessId::Grok, HarnessId::Hermes] {
             assert_eq!(registry.resolve(id).unwrap().id(), id);
         }
     }
@@ -527,7 +542,12 @@ mod tests {
     /// as a guard against someone re-inlining a literal.
     #[test]
     fn lazy_descriptors_match_resolved_harnesses() {
-        for id in [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Grok] {
+        for id in [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Grok,
+            HarnessId::Hermes,
+        ] {
             let registry = default_registry();
             let find = |registry: &HarnessRegistry| {
                 registry

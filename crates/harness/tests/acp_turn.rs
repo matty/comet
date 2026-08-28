@@ -42,6 +42,18 @@ fn request(prompt: &str) -> RunRequest {
     }
 }
 
+/// This suite drives the generic turn loop's mechanics (settle, cancel,
+/// refusal, drop-reply, exit) against `HarnessId::Mock`, never a real
+/// provider's usage shape — `normalize::usage` and `grok::usage` are both
+/// `pub(crate)` and unreachable from here besides. `session::run` takes a
+/// per-agent reader since PR1 (`crates/harness/src/acp/session.rs`'s
+/// `UsageReader`); Mock has no reader of its own, so this always answers
+/// `None`, which is the honest "no usage" case every real reader already
+/// treats as such.
+fn no_usage(_: &serde_json::Value, _: Option<u64>) -> Option<AgentEvent> {
+    None
+}
+
 /// A `cancel_grace` long enough that giving up cannot be what ends a run
 /// inside `drain`'s own limit.
 ///
@@ -118,8 +130,13 @@ async fn a_turn_runs_from_handshake_to_done() {
     assert!(session_id.starts_with("fake-session-"), "got {session_id}");
 
     let (controls, steer, _token) = controls();
-    let stream =
-        comet_harness::acp::session::run(session, HarnessId::Mock, request("hello"), controls);
+    let stream = comet_harness::acp::session::run(
+        session,
+        HarnessId::Mock,
+        request("hello"),
+        controls,
+        no_usage,
+    );
     // One turn only: closing the mailbox is what tells the persistent session
     // no steer is coming. Held open, it would correctly wait for one.
     drop(steer);
@@ -159,6 +176,7 @@ async fn a_refusal_ends_the_run_without_an_error_message() {
         HarnessId::Mock,
         request("please refusal"),
         controls,
+        no_usage,
     );
     drop(steer);
     let events = drain(stream).await;
@@ -188,8 +206,13 @@ async fn a_queued_steer_runs_as_the_next_prompt_on_the_same_session() {
     );
 
     let (controls, steer, _token) = controls();
-    let stream =
-        comet_harness::acp::session::run(session, HarnessId::Mock, request("first"), controls);
+    let stream = comet_harness::acp::session::run(
+        session,
+        HarnessId::Mock,
+        request("first"),
+        controls,
+        no_usage,
+    );
 
     steer
         .send(SteerMessage {
@@ -249,6 +272,7 @@ async fn an_interrupt_the_agent_settles_reports_one_interrupted_done() {
         // Streams, then waits: the cancel is what settles it.
         request("please drop-reply"),
         controls,
+        no_usage,
     );
     token.cancel();
 
@@ -275,6 +299,7 @@ async fn an_interrupt_a_silent_agent_ignores_still_ends_the_run() {
         HarnessId::Mock,
         request("please starve ignore-cancel"),
         controls,
+        no_usage,
     );
     token.cancel();
 
@@ -295,6 +320,7 @@ async fn an_agent_that_exits_mid_turn_errors_with_an_explanation() {
         HarnessId::Mock,
         request("please exit-now"),
         controls,
+        no_usage,
     );
     drop(steer);
     let events = drain(stream).await;

@@ -284,6 +284,43 @@ fn models_from_discovery(discovered: &Discovered) -> Discovery {
     }
 }
 
+/// Grok's own token reading, from the `session/prompt` response's `_meta` —
+/// vendor-namespaced, unlike Hermes' reading of the ACP spec's own top-level
+/// `usage` block (`normalize::usage`). Moved out of `normalize.rs` in PR1: it
+/// only ever looked spec-general because Grok was the only agent exercising
+/// it, and Hermes' shape genuinely disagreeing is what proved the split real.
+///
+/// **`inputTokens` is the prompt size and it is cache-INCLUSIVE**, which is
+/// exactly what [`comet_proto::AgentEvent::Usage::prompt_tokens`] is defined
+/// to mean — read that field's own doc comment before changing this, because
+/// the two existing providers disagree on this axis and the disagreement is
+/// invisible. Measured on grok 1.0.5: `inputTokens: 14500` with
+/// `cachedReadTokens: 10624`, so the cached read is part of the prompt rather
+/// than beside it.
+///
+/// **`totalTokens` is deliberately NOT used.** It is input + output and it
+/// accumulates, so drawing it against the window would show a session filling
+/// up from its own replies — the mistake `AgentEvent::Usage`'s doc comment
+/// records Codex's `total` making, at 41% of the window after three trivial
+/// turns.
+///
+/// `None` when the agent reported no numbers at all: an empty meter that says
+/// "not measured" is honest, where zeros would read as a measurement of zero.
+pub(crate) fn usage(result: &Value, context_window: Option<u64>) -> Option<AgentEvent> {
+    let meta = &result["_meta"];
+    let prompt_tokens = meta["inputTokens"].as_u64();
+    let output_tokens = meta["outputTokens"].as_u64();
+    if prompt_tokens.is_none() && output_tokens.is_none() {
+        return None;
+    }
+    Some(AgentEvent::Usage {
+        prompt_tokens: prompt_tokens.unwrap_or(0),
+        output_tokens: output_tokens.unwrap_or(0),
+        // `None` is "the agent did not say", never "no limit".
+        context_window,
+    })
+}
+
 /// One effort id from Grok's vocabulary. An unrecognized rung is dropped rather
 /// than guessed at: offering one the picker cannot send is worse than a shorter
 /// ladder.
@@ -522,6 +559,7 @@ impl Harness for GrokHarness {
             HarnessId::Grok,
             request,
             controls,
+            usage,
         ))
     }
 }
@@ -863,6 +901,80 @@ mod tests {
             !catalog.models.is_empty(),
             "a discovery failure must not degrade to an empty list"
         );
+    }
+
+    /// The real `session/prompt` response `_meta`, captured from grok 1.0.5 on
+    /// 2026-08-28. **`inputTokens` is cache-inclusive**: 14500 with 10624 of it
+    /// a cached read, so the cache is part of the prompt rather than beside it.
+    #[test]
+    fn the_captured_response_meta_reads_as_prompt_and_output() {
+        let result = json!({
+            "stopReason": "end_turn",
+            "_meta": {
+                "totalTokens": 14671,
+                "modelId": "grok-4.6",
+                "inputTokens": 14500,
+                "outputTokens": 171,
+                "cachedReadTokens": 10624,
+                "reasoningTokens": 169,
+                "usage": {"numTurns": 1, "modelCalls": 1},
+            },
+        });
+
+        match usage(&result, Some(500_000)).expect("the agent reported numbers") {
+            AgentEvent::Usage {
+                prompt_tokens,
+                output_tokens,
+                context_window,
+            } => {
+                assert_eq!(prompt_tokens, 14500, "the prompt, cache included");
+                assert_eq!(output_tokens, 171);
+                assert_eq!(context_window, Some(500_000));
+                // **Not 14671.** `totalTokens` accumulates input + output, so
+                // metering it against the window shows a session filling up
+                // from its own replies.
+                assert_ne!(prompt_tokens, 14671);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **No numbers means no reading, not a reading of zero.** An empty meter
+    /// that says "not measured" is honest; zeros claim a measurement.
+    #[test]
+    fn an_absent_usage_block_yields_no_event() {
+        for result in [
+            json!({"stopReason": "end_turn"}),
+            json!({"stopReason": "end_turn", "_meta": {}}),
+            json!({"_meta": {"totalTokens": 999}}),
+            // The spec-general path, not Grok's `_meta` reading.
+            json!({"usage": {"inputTokens": 100, "outputTokens": 1}}),
+            json!({}),
+        ] {
+            assert!(
+                usage(&result, Some(500_000)).is_none(),
+                "must not report: {result}"
+            );
+        }
+    }
+
+    /// A partial report is still a report — one half missing does not discard
+    /// the other.
+    #[test]
+    fn a_half_reported_usage_still_counts() {
+        let only_input = json!({"_meta": {"inputTokens": 100}});
+        match usage(&only_input, None).expect("input alone is a reading") {
+            AgentEvent::Usage {
+                prompt_tokens,
+                output_tokens,
+                context_window,
+            } => {
+                assert_eq!(prompt_tokens, 100);
+                assert_eq!(output_tokens, 0);
+                assert_eq!(context_window, None, "absent window is unknown, not zero");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// Grok declares only `FullAccess` while approvals are unrouted. Break
