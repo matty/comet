@@ -179,6 +179,7 @@ fn built_in_caption(harness: HarnessId) -> &'static str {
         HarnessId::ClaudeCode => "Built-in list — couldn't reach Claude",
         HarnessId::Codex => "Built-in list — couldn't reach Codex",
         HarnessId::Cursor => "Built-in list — couldn't reach Cursor",
+        HarnessId::Grok => "Built-in list — couldn't reach Grok",
         HarnessId::Mock => "Built-in list",
     }
 }
@@ -3288,6 +3289,13 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         ),
         HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
         HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
+        // **Deliberately not a brand mark.** The embedded set has no Grok
+        // glyph, and the other three are ports of comet's own `icons.tsx`
+        // rather than something drawn here. Inventing an xAI logo from memory
+        // would ship a wrong mark that looks deliberate; a neutral glyph reads
+        // as "no mark yet", which is true. Replace it when a real asset is
+        // added to `crates/ui/assets/icons/`.
+        HarnessId::Grok => (crate::icons::WIDGET, None),
     }
 }
 

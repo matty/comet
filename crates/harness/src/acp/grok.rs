@@ -1,0 +1,822 @@
+//! Grok Build, over ACP.
+//!
+//! The first harness on [`crate::acp`], and the first agent built ground-up on
+//! the protocol rather than adapted onto it. Everything specific to Grok lives
+//! here — the launch line, where the CLI installs, the curated catalog, and how
+//! its models are discovered. The session loop itself is provider-neutral.
+//!
+//! **Discovery is a handshake plus one `session/new`, and no turn.** Both are
+//! token-free, and the second is where the answer actually lives: Grok's
+//! session config — which models it offers, and which effort is selected —
+//! arrives at `_meta["x.ai/sessionConfig"]` on that reply and nowhere else.
+//!
+//! **The model paths are Grok's alone.** codex-acp puts models at
+//! `models.availableModels`, claude-agent-acp answers `modes.availableModes`,
+//! and the ACP org adapters use a top-level `configOptions` with the effort
+//! ladder under `thought_level`. Grok matches none of them: its config is
+//! vendor-namespaced and it spells the effort ladder `category: "mode"` — a
+//! word another vendor's adapters use for a PERMISSION mode. Reading one shared
+//! shape across the four would find nothing, or the wrong thing.
+
+use std::path::{Path, PathBuf};
+
+use async_trait::async_trait;
+use futures::stream::BoxStream;
+use serde_json::Value;
+
+use comet_proto::{
+    AgentEvent, HarnessCapabilities, HarnessId, HarnessProbe, InstallMethod, Model, ModelCatalog,
+    ReasoningLevel, RunRequest, RuntimeMode, SteeringMode,
+};
+
+use super::session::{AcpSession, Discovered, Timeouts};
+use crate::discovery::{DiscoveredModel, Discovery, DiscoveryFailure};
+use crate::launch::{LaunchDescriptor, StdioMode};
+use crate::{Harness, HarnessError, RunControls};
+
+/// Grok's ACP entry point.
+///
+/// **Every token was verified against grok 1.0.5 on 2026-08-28, because the
+/// placement is not guessable.** `--no-auto-update` is a TOP-LEVEL flag and is
+/// **hidden** — it appears in neither `grok --help` nor `grok agent --help`, and
+/// the only way to tell it from a typo is that clap rejects unknown flags (a
+/// `--no-such-flag` control errors with "unexpected argument"; this one exits
+/// 0). `--no-leader` belongs to the `agent` SUBCOMMAND, not the top level, and
+/// `stdio` is a sub-subcommand of `agent`. The plausible-looking
+/// `grok agent stdio --no-leader` does not parse.
+///
+/// `--no-leader` is the load-bearing one: without it, `agent stdio` may attach
+/// to a shared leader process over `~/.grok/leader.sock` instead of starting its
+/// own agent, and Comet would be driving a session belonging to another client.
+pub const GROK_ARGS: [&str; 4] = ["--no-auto-update", "agent", "--no-leader", "stdio"];
+
+/// Locate the device's installed Grok CLI: `GROK_EXECUTABLE`, then our own
+/// PATH, then the system's persisted PATH, then known install locations. Same
+/// ladder and the same reasons as [`crate::codex::resolve_codex_executable`].
+pub fn resolve_grok_executable() -> Option<PathBuf> {
+    crate::resolve_cli(
+        "GROK_EXECUTABLE",
+        "grok",
+        crate::all_known_dirs(grok_install_dirs()),
+    )
+}
+
+/// Where a Grok CLI lands when PATH does not name it.
+///
+/// `~/.grok/bin` is the installer's own location and holds `grok` alongside an
+/// identical `agent` binary — observed on this machine, and the reason the list
+/// names the directory rather than either file.
+fn grok_install_dirs() -> Vec<crate::KnownDir> {
+    let mut dirs: Vec<crate::KnownDir> = Vec::new();
+    if let Some(home) = crate::home_dir() {
+        dirs.push((home.join(".grok").join("bin"), InstallMethod::Native));
+        dirs.push((home.join(".local").join("bin"), InstallMethod::Native));
+    }
+    if cfg!(windows) {
+        dirs.extend(
+            crate::env_dir("LOCALAPPDATA")
+                .map(|d| (d.join("Programs").join("grok"), InstallMethod::Native)),
+        );
+    } else {
+        dirs.push((PathBuf::from("/opt/homebrew/bin"), InstallMethod::Homebrew));
+        // Untagged for the same reason as the other providers' lists:
+        // `/usr/local/bin` is Intel Homebrew, a manual copy, and several
+        // installers' fallback all at once.
+        dirs.push((PathBuf::from("/usr/local/bin"), InstallMethod::Unknown));
+    }
+    dirs
+}
+
+/// Describe the exact process launch used for a Grok run.
+///
+/// **Production's builder, and the one the capture recorder's Grok rows spawn**
+/// — the same seam `claude::run_launch` and `codex::run_launch` sit on. A
+/// recorder with its own copy would make the corpus evidence of the recorder.
+///
+/// The request contributes nothing to argv today: model and effort are selected
+/// over the wire per session (`_x.ai/models/update` and the session's own
+/// `models` block), not as spawn flags. It is taken anyway so the signature
+/// matches the launch seam `capture::record::derive_launch` calls, and so a
+/// future flag has an obvious home.
+pub(crate) fn run_launch(exe: &Path, _request: &RunRequest) -> LaunchDescriptor {
+    LaunchDescriptor {
+        program: crate::discovery::program_path(exe),
+        args: GROK_ARGS.iter().map(Into::into).collect(),
+        cwd: None,
+        configured_env: std::collections::BTreeMap::new(),
+        stdin: StdioMode::Piped,
+        stdout: StdioMode::Piped,
+        stderr: StdioMode::Piped,
+        kill_on_drop: true,
+        #[cfg(windows)]
+        creation_flags: 0,
+    }
+}
+
+/// The effort ladder Grok reports.
+///
+/// Observed in the `initialize` reply's `reasoningEfforts` on grok-4.6:
+/// `xhigh`, `high` (default), `medium`, `low`. Ordered low to high here, which
+/// is how the traits picker renders a ladder.
+///
+/// **`ultra`, `ultracode` and `ultrathink` are absent deliberately.** The first
+/// is not in Grok's vocabulary, and the other two are Comet-layered rather than
+/// provider-reported (`discovery::is_comet_special`).
+const REASONING_LEVELS: [ReasoningLevel; 4] = [
+    ReasoningLevel::Low,
+    ReasoningLevel::Medium,
+    ReasoningLevel::High,
+    ReasoningLevel::XHigh,
+];
+
+/// The curated list, used when discovery cannot run or cannot be read.
+///
+/// **Its job is to never be empty.** `DiscoveryCache::catalog` falls back to
+/// this on any failure, and a picker showing "this agent has no models" when the
+/// truth is "we could not reach Grok" is the confident-wrong-answer shape this
+/// repository has hit twice.
+///
+/// One entry, because one is what `grok models` lists: grok-4.6 is the only
+/// model the account offers. A live discovery unions over this, so an account
+/// with more gets them.
+fn static_models() -> Vec<Model> {
+    vec![Model {
+        id: "grok-4.6".into(),
+        label: "Grok 4.6".into(),
+        description: Some("SpaceXAI's latest frontier model".into()),
+        reasoning_levels: REASONING_LEVELS.to_vec(),
+        options: Vec::new(),
+        // Grok's `promptCapabilities.image` reads false on this build, and
+        // unlike an absent field that is the provider saying so.
+        accepts_images: false,
+    }]
+}
+
+/// Grok's session config: a FLAT list keyed by `category`, under a vendor
+/// `_meta` key rather than ACP's own `configOptions`.
+///
+/// Observed on grok 1.0.5 (`session/new`, captured 2026-08-28): five entries,
+/// one `category: "model"` and four `category: "mode"`.
+fn config_options(session: &Value) -> &[Value] {
+    session["_meta"]["x.ai/sessionConfig"]["options"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// Rows of one `category` from the session config.
+fn options_in<'a>(session: &'a Value, category: &str) -> Vec<&'a Value> {
+    config_options(session)
+        .iter()
+        .filter(|o| o["category"].as_str() == Some(category))
+        .collect()
+}
+
+/// **Grok spells its effort ladder `category: "mode"`.**
+///
+/// Not `thought_level`, which is what the ACP org adapters use and what a port
+/// of upstream's mapping would look for. That mapping additionally reads a
+/// `mode` category as a PERMISSION mode and forces it to the no-prompts choice
+/// — applied to Grok that would drive reasoning effort as if it were a
+/// permission setting. Read the categories the capture shows, not the ones
+/// another vendor's adapters send.
+///
+/// Wire order is preserved: the agent lists strongest first and the picker
+/// renders the ladder in the order it is given.
+fn ladder_from_config(session: &Value) -> Vec<ReasoningLevel> {
+    options_in(session, "mode")
+        .iter()
+        .filter_map(|o| effort_from_id(o["id"].as_str()?))
+        .collect()
+}
+
+/// The model list, config surface first.
+///
+/// **`availableModels` is the deprecated surface and must not be read as a
+/// model list when a config surface exists.** Agents that have both enumerate
+/// one `availableModels` entry per model × effort there, so a five-model agent
+/// with a four-rung ladder would arrive as twenty picker rows. Grok 1.0.5 has
+/// one model, so nothing multiplies today — which is exactly why this would
+/// have shipped unnoticed.
+///
+/// The two surfaces carry different halves, so both are read: `category:
+/// "model"` rows are authoritative for WHICH models exist, and `availableModels`
+/// is joined onto them by id for the richer per-model detail (description, the
+/// per-model effort list) that the config rows do not carry.
+///
+/// Tolerant throughout: a row without an id is skipped rather than failing the
+/// list, and an agent with neither surface yields an empty [`Discovery`] rather
+/// than an error. "Listed nothing" and "could not be reached" are different
+/// answers, and only the second is a [`DiscoveryFailure`].
+fn models_from_discovery(discovered: &Discovered) -> Discovery {
+    let session = &discovered.session;
+
+    // Every `availableModels` entry we can find, keyed by id, as enrichment
+    // ONLY. `session/new` carries the fresher copy; `initialize` is the
+    // fallback for an agent that answers one and not the other.
+    let detail: Vec<&Value> = [
+        session["models"]["availableModels"].as_array(),
+        discovered.initialized["_meta"]["modelState"]["availableModels"].as_array(),
+    ]
+    .into_iter()
+    .flatten()
+    .flatten()
+    .collect();
+    let detail_for = |id: &str| {
+        detail
+            .iter()
+            .copied()
+            .find(|m| m["modelId"].as_str() == Some(id))
+    };
+
+    let shared_ladder = ladder_from_config(session);
+    let build = |id: String, label: Option<&str>| {
+        let extra = detail_for(&id);
+        let per_model = extra.map(efforts_of).unwrap_or_default();
+        DiscoveredModel {
+            label: label
+                .or_else(|| extra.and_then(|m| m["name"].as_str()))
+                .unwrap_or(&id)
+                .to_owned(),
+            description: extra.and_then(|m| m["description"].as_str().map(str::to_owned)),
+            // The per-model list wins where it exists: a ladder declared on the
+            // model is more specific than the session-wide one. Falling back to
+            // the session ladder keeps an agent that only declares it once.
+            reasoning_levels: if per_model.is_empty() {
+                shared_ladder.clone()
+            } else {
+                per_model
+            },
+            // Per-model modality is in neither surface; the handshake's
+            // `promptCapabilities` is agent-wide. `None` is "the provider did
+            // not say", which leaves the curated entry's answer standing.
+            accepts_images: None,
+            id,
+        }
+    };
+
+    let configured = options_in(session, "model");
+    if !configured.is_empty() {
+        return Discovery {
+            models: configured
+                .iter()
+                .filter_map(|o| {
+                    let id = o["id"].as_str()?.to_owned();
+                    let label = o["label"].as_str();
+                    Some(build(id, label))
+                })
+                .collect(),
+        };
+    }
+
+    // No config surface: the deprecated block is all there is. An agent this
+    // old cannot be enumerating model × effort on it, because that convention
+    // arrived with the config surface it lacks.
+    Discovery {
+        models: detail
+            .iter()
+            .filter_map(|m| {
+                let id = m["modelId"].as_str()?.to_owned();
+                Some(build(id, None))
+            })
+            .collect(),
+    }
+}
+
+/// One effort id from Grok's vocabulary. An unrecognized rung is dropped rather
+/// than guessed at: offering one the picker cannot send is worse than a shorter
+/// ladder.
+fn effort_from_id(id: &str) -> Option<ReasoningLevel> {
+    match id {
+        "low" => Some(ReasoningLevel::Low),
+        "medium" => Some(ReasoningLevel::Medium),
+        "high" => Some(ReasoningLevel::High),
+        "xhigh" => Some(ReasoningLevel::XHigh),
+        _ => None,
+    }
+}
+
+/// A model's `_meta.reasoningEfforts[].id`, keeping only levels Comet knows.
+///
+/// An unrecognized effort is dropped rather than guessed at: offering a rung
+/// the picker cannot send is worse than a shorter ladder.
+fn efforts_of(model: &Value) -> Vec<ReasoningLevel> {
+    model["_meta"]["reasoningEfforts"]
+        .as_array()
+        .map(|efforts| {
+            efforts
+                .iter()
+                .filter_map(|effort| effort_from_id(effort["id"].as_str()?))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One short-lived ACP session, just to read the handshake's model block.
+///
+/// Token-free: `initialize` never reaches a model. The session is dropped
+/// immediately, which reaps the child through `kill_on_drop`.
+async fn discover(exe: PathBuf, timeouts: Timeouts) -> Result<Discovery, DiscoveryFailure> {
+    let request = RunRequest::for_session(RuntimeMode::default());
+    let command = run_launch(&exe, &request).command();
+
+    let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+    match AcpSession::open_for_discovery(command, &cwd, timeouts).await {
+        Ok(discovered) => Ok(models_from_discovery(&discovered)),
+        Err(error) => {
+            tracing::debug!(target: "comet_harness::acp", "grok discovery failed: {error}");
+            // Every failure here is `Unreachable`, not `Unparseable`: the
+            // handshake either answered or it did not, and reading the model
+            // block cannot fail — an unrecognized shape yields an empty list,
+            // which is a real answer. `Unparseable` is reserved for a provider
+            // that answered something we could not decode, and would raise a
+            // protocol-drift `Diagnostic` this does not warrant.
+            Err(DiscoveryFailure::Unreachable)
+        }
+    }
+}
+
+/// The Grok harness. Construct with [`GrokHarness::new`]; tests point it at the
+/// `fake-acp` fixture with [`GrokHarness::with_executable`].
+///
+/// The derived `Default` is the real one: `Timeouts` carries its own non-zero
+/// defaults, so deriving here picks them up rather than zeroing them.
+#[derive(Default)]
+pub struct GrokHarness {
+    executable: Option<PathBuf>,
+    timeouts: Timeouts,
+    /// One handshake per boot. `models()` is on the picker's render path AND is
+    /// called by titling, so an uncached discovery would spawn an agent on a
+    /// path the user never sees.
+    discovery_cache: crate::discovery::DiscoveryCache,
+}
+
+impl GrokHarness {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The single declaration of what Grok can honor, named by both the
+    /// registry's lazy descriptor and the trait impl so the two cannot drift.
+    ///
+    /// **Steering is at the turn boundary, and that is Grok's own limit, not a
+    /// gap here.** Grok advertises no steering extension at all — its
+    /// `initialize` carries no `_meta.steering` — so a steer is delivered as
+    /// the next prompt on the same session. Declaring `StepBoundary` would be
+    /// a promise the run breaks.
+    pub fn capabilities() -> HarnessCapabilities {
+        HarnessCapabilities {
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: REASONING_LEVELS.to_vec(),
+            // **One mode, deliberately.** Grok's ACP surface has a
+            // `session/request_permission` this harness answers `-32601` — it
+            // does not route approvals to the user yet, so every mode that
+            // promises to ask is a promise the run cannot keep. `FullAccess`
+            // is the only one that describes what actually happens. The other
+            // three arrive with approvals, not before.
+            runtime_modes: vec![RuntimeMode::FullAccess],
+            // Nothing to attach a note to while approvals are unrouted.
+            carries_deny_note: false,
+        }
+    }
+
+    /// Use a fixed CLI binary instead of PATH/known-location resolution.
+    pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
+        self.executable = Some(path.into());
+        // A cached answer belongs to the CLI that gave it; replayed for a
+        // binary that was never asked, it would show one agent's models under
+        // another's name.
+        self.discovery_cache = crate::discovery::DiscoveryCache::default();
+        self
+    }
+
+    /// Shrink the handshake and reap bounds. Tests use it; running turns are
+    /// unbounded either way.
+    pub fn with_timeouts(mut self, timeouts: Timeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
+    fn resolve_executable(&self) -> Result<PathBuf, HarnessError> {
+        if let Some(p) = &self.executable {
+            return Ok(p.clone());
+        }
+        resolve_grok_executable().ok_or_else(|| {
+            HarnessError::NotInstalled(crate::not_installed_message("grok", "GROK_EXECUTABLE"))
+        })
+    }
+}
+
+#[async_trait]
+impl Harness for GrokHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Grok
+    }
+
+    fn display_name(&self) -> &str {
+        // Matches the registry's lazy descriptor, so the catalog entry does not
+        // change after the first resolve.
+        "Grok"
+    }
+
+    fn capabilities(&self) -> HarnessCapabilities {
+        Self::capabilities()
+    }
+
+    async fn probe(&self) -> HarnessProbe {
+        crate::probe_installed_cli(
+            self.resolve_executable(),
+            "grok",
+            "GROK_EXECUTABLE",
+            crate::all_known_dirs(grok_install_dirs()),
+        )
+        .await
+    }
+
+    /// The curated catalog unioned with whatever the handshake reported.
+    ///
+    /// An absent CLI surfaces as [`HarnessError::NotInstalled`] rather than as
+    /// a failed discovery: the user's action is different, and the picker's
+    /// built-in caption is not the place to say "no CLI".
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        let exe = self.resolve_executable()?;
+        let timeouts = self.timeouts;
+        let curated = static_models();
+        let discovery = self
+            .discovery_cache
+            .get(move || discover(exe, timeouts))
+            .await;
+        Ok(self.discovery_cache.catalog(curated, discovery))
+    }
+
+    fn clear_discovery(&self) {
+        self.discovery_cache.clear();
+    }
+
+    fn take_unreported_discovery_failure(&self) -> Option<DiscoveryFailure> {
+        self.discovery_cache.take_unreported_failure()
+    }
+
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let exe = self.resolve_executable()?;
+        let command = run_launch(&exe, &request).command();
+        let session = AcpSession::open(command, &request.cwd, self.timeouts).await?;
+        Ok(super::session::run(
+            session,
+            HarnessId::Grok,
+            request,
+            controls,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// Break caught: reordering Grok's launch tokens. `--no-auto-update` is
+    /// top-level, `--no-leader` belongs to `agent`, and `stdio` is under
+    /// `agent`; any other arrangement fails to parse, and none of the three
+    /// flags is documented in `--help` output where a reader could check.
+    #[test]
+    fn the_launch_line_keeps_its_verified_token_order() {
+        assert_eq!(
+            GROK_ARGS,
+            ["--no-auto-update", "agent", "--no-leader", "stdio"]
+        );
+        let launch = run_launch(
+            Path::new("/usr/local/bin/grok"),
+            &RunRequest::for_session(RuntimeMode::default()),
+        );
+        assert_eq!(
+            launch.args,
+            GROK_ARGS
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The two replies grok 1.0.5 really sent on 2026-08-28, trimmed to the
+    /// keys this decode reads. One helper rather than a literal per test, so
+    /// every test that says "the captured wire" means the same bytes.
+    fn captured() -> Discovered {
+        Discovered {
+            initialized: json!({
+                "protocolVersion": 1,
+                "_meta": {"agentVersion": "1.0.5", "modelState": {
+                    "currentModelId": "grok-4.6",
+                    "availableModels": [{"modelId": "grok-4.6", "name": "Grok 4.6"}],
+                }},
+            }),
+            session: json!({
+                "sessionId": "01a047b8-53a0-7342-b63b-3241fa0b25c2",
+                "_meta": {"x.ai/sessionConfig": {"options": [
+                    {"category": "model", "id": "grok-4.6", "label": "Grok 4.6", "selected": true},
+                    {"category": "mode", "id": "xhigh", "label": "Extra High Effort", "selected": false},
+                    {"category": "mode", "id": "high", "label": "High Effort", "selected": true},
+                    {"category": "mode", "id": "medium", "label": "Medium Effort", "selected": false},
+                    {"category": "mode", "id": "low", "label": "Low Effort", "selected": false},
+                ]}},
+                "models": {"currentModelId": "grok-4.6", "availableModels": [{
+                    "modelId": "grok-4.6",
+                    "name": "Grok 4.6",
+                    "description": "SpaceXAI's latest frontier model",
+                    "_meta": {"totalContextTokens": 500000, "reasoningEfforts": [
+                        {"id": "xhigh"}, {"id": "high"}, {"id": "medium"}, {"id": "low"},
+                    ]},
+                }]},
+            }),
+        }
+    }
+
+    /// The real replies, captured from grok 1.0.5 on 2026-08-28. Pinned against
+    /// the literal wire rather than a Rust round-trip: a reshaped reply must
+    /// fail here, which a type-mediated test would not catch.
+    #[test]
+    fn the_captured_replies_yield_the_model_list() {
+        let discovered = captured();
+        let discovery = models_from_discovery(&discovered);
+
+        assert_eq!(discovery.models.len(), 1);
+        let model = &discovery.models[0];
+        assert_eq!(model.id, "grok-4.6");
+        assert_eq!(model.label, "Grok 4.6");
+        assert_eq!(
+            model.description.as_deref(),
+            Some("SpaceXAI's latest frontier model"),
+            "the description comes off availableModels, which the config rows do not carry"
+        );
+        assert_eq!(
+            model.reasoning_levels,
+            vec![
+                ReasoningLevel::XHigh,
+                ReasoningLevel::High,
+                ReasoningLevel::Medium,
+                ReasoningLevel::Low,
+            ],
+            "efforts keep the order the agent listed them in"
+        );
+        assert_eq!(
+            model.accepts_images, None,
+            "per-model modality is in neither surface; None means the agent did not say"
+        );
+    }
+
+    /// **The model × effort trap.** `availableModels` is the deprecated surface,
+    /// and agents that have both enumerate one entry there per model × effort.
+    /// Reading it as the model list turns a 2-model, 3-rung agent into six
+    /// picker rows.
+    ///
+    /// Grok 1.0.5 has one model, so nothing multiplies on the real wire — which
+    /// is exactly why this would have shipped unnoticed. The fixture is
+    /// therefore built by hand rather than captured, and deliberately so.
+    #[test]
+    fn the_config_surface_wins_over_the_combinatorial_one() {
+        let discovered = Discovered {
+            initialized: json!({}),
+            session: json!({
+                "_meta": {"x.ai/sessionConfig": {"options": [
+                    {"category": "model", "id": "grok-4.6", "label": "Grok 4.6"},
+                    {"category": "model", "id": "grok-mini", "label": "Grok Mini"},
+                    {"category": "mode", "id": "high", "label": "High Effort"},
+                    {"category": "mode", "id": "low", "label": "Low Effort"},
+                ]}},
+                // Six rows for two models: the shape that must NOT be read.
+                "models": {"availableModels": [
+                    {"modelId": "grok-4.6", "name": "Grok 4.6 (high)"},
+                    {"modelId": "grok-4.6-medium", "name": "Grok 4.6 (medium)"},
+                    {"modelId": "grok-4.6-low", "name": "Grok 4.6 (low)"},
+                    {"modelId": "grok-mini", "name": "Grok Mini (high)"},
+                    {"modelId": "grok-mini-medium", "name": "Grok Mini (medium)"},
+                    {"modelId": "grok-mini-low", "name": "Grok Mini (low)"},
+                ]},
+            }),
+        };
+
+        let discovery = models_from_discovery(&discovered);
+        let ids: Vec<&str> = discovery.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["grok-4.6", "grok-mini"],
+            "the config surface names the models; availableModels only enriches them"
+        );
+    }
+
+    /// **Grok's effort ladder is `category: "mode"`.** Break caught: reading it
+    /// as `thought_level` (what the ACP org adapters send, and what a port of
+    /// upstream's mapping looks for), which finds no ladder here — or worse,
+    /// treating `mode` as a permission mode and driving reasoning effort as if
+    /// it were a permission setting.
+    #[test]
+    fn the_effort_ladder_is_read_from_the_mode_category() {
+        let session = json!({"_meta": {"x.ai/sessionConfig": {"options": [
+            {"category": "mode", "id": "xhigh"},
+            {"category": "mode", "id": "high"},
+            {"category": "mode", "id": "medium"},
+            {"category": "mode", "id": "low"},
+        ]}}});
+        assert_eq!(
+            ladder_from_config(&session),
+            vec![
+                ReasoningLevel::XHigh,
+                ReasoningLevel::High,
+                ReasoningLevel::Medium,
+                ReasoningLevel::Low,
+            ]
+        );
+
+        // The name another vendor uses. Present here, it must contribute
+        // nothing — Grok does not send it, and a decode that read both would
+        // be guessing at which one this agent means.
+        let other_vendor = json!({"_meta": {"x.ai/sessionConfig": {"options": [
+            {"category": "thought_level", "id": "high"},
+        ]}}});
+        assert!(
+            ladder_from_config(&other_vendor).is_empty(),
+            "thought_level is not Grok's spelling and must not be read as one"
+        );
+    }
+
+    /// A session ladder covers models that declare none of their own, and a
+    /// per-model ladder wins where it exists — the more specific answer.
+    #[test]
+    fn a_per_model_ladder_beats_the_session_wide_one() {
+        let discovered = Discovered {
+            initialized: json!({}),
+            session: json!({
+                "_meta": {"x.ai/sessionConfig": {"options": [
+                    {"category": "model", "id": "shared"},
+                    {"category": "model", "id": "specific"},
+                    {"category": "mode", "id": "high"},
+                ]}},
+                "models": {"availableModels": [
+                    {"modelId": "specific", "_meta": {"reasoningEfforts": [{"id": "low"}]}},
+                ]},
+            }),
+        };
+
+        let models = models_from_discovery(&discovered).models;
+        let by_id = |id: &str| {
+            models
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("{id} missing"))
+                .clone()
+        };
+        assert_eq!(
+            by_id("shared").reasoning_levels,
+            vec![ReasoningLevel::High],
+            "a model declaring no ladder of its own inherits the session's"
+        );
+        assert_eq!(
+            by_id("specific").reasoning_levels,
+            vec![ReasoningLevel::Low],
+            "a model's own ladder is the more specific answer and wins"
+        );
+    }
+
+    /// **The other speakers' model paths are not Grok's.** Break caught:
+    /// reading codex-acp's `models.availableModels` on `session/new`, or
+    /// claude-agent-acp's `modes.availableModes` — the first would pick up an
+    /// unrelated list, the second finds nothing at all.
+    #[test]
+    fn another_speakers_shape_is_not_mistaken_for_groks() {
+        let claude_acp_shape = Discovered {
+            initialized: json!({}),
+            session: json!({"modes": {"availableModes": [{"id": "not-grok"}]}}),
+        };
+        assert!(
+            models_from_discovery(&claude_acp_shape).models.is_empty(),
+            "claude-agent-acp's path must not be mistaken for Grok's"
+        );
+
+        // The org adapters' top-level `configOptions`, which Grok does not
+        // send: its config is vendor-namespaced under `_meta`.
+        let org_adapter_shape = Discovered {
+            initialized: json!({}),
+            session: json!({"configOptions": [
+                {"category": "model", "options": [{"value": "not-grok"}]},
+            ]}),
+        };
+        assert!(
+            models_from_discovery(&org_adapter_shape).models.is_empty(),
+            "a top-level configOptions is not where Grok puts its config"
+        );
+    }
+
+    /// An unreadable or absent pair of surfaces is an empty list, never an
+    /// error: "listed nothing" and "could not be reached" are different
+    /// answers, and only the second earns a `DiscoveryFailure`.
+    #[test]
+    fn absent_surfaces_are_empty_rather_than_a_failure() {
+        for session in [
+            json!({}),
+            json!({"_meta": {}}),
+            json!({"_meta": {"x.ai/sessionConfig": {}}}),
+            json!({"_meta": {"x.ai/sessionConfig": {"options": []}}}),
+            // Present but not an array.
+            json!({"_meta": {"x.ai/sessionConfig": {"options": "grok-4.6"}}}),
+            json!({"models": {"availableModels": "grok-4.6"}}),
+        ] {
+            let discovered = Discovered {
+                initialized: json!({}),
+                session: session.clone(),
+            };
+            assert!(
+                models_from_discovery(&discovered).models.is_empty(),
+                "must be empty: {session}"
+            );
+        }
+    }
+
+    /// **A failed `session/new` still discovers.** The handshake answered, so
+    /// the agent is reachable; only the richer surface is missing, and
+    /// `initialize`'s own block carries the fallback. Degrading this to a
+    /// discovery failure would show the built-in caption for an agent that
+    /// answered.
+    #[test]
+    fn initialize_alone_still_yields_models() {
+        let discovered = Discovered {
+            initialized: json!({"_meta": {"modelState": {"availableModels": [
+                {"modelId": "grok-4.6", "name": "Grok 4.6"},
+            ]}}}),
+            // What `open_for_discovery` substitutes when session/new did not
+            // answer.
+            session: Value::Null,
+        };
+        let models = models_from_discovery(&discovered).models;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "grok-4.6");
+    }
+
+    /// A row with no id is skipped rather than poisoning the list, and an
+    /// effort this build does not know is dropped rather than guessed at.
+    #[test]
+    fn unreadable_entries_are_skipped_not_guessed() {
+        let discovered = Discovered {
+            initialized: json!({}),
+            session: json!({
+                "_meta": {"x.ai/sessionConfig": {"options": [
+                    {"category": "model", "label": "No Id At All"},
+                    {"category": "model", "id": "grok-9"},
+                    {"category": "mode", "id": "low"},
+                    {"category": "mode", "id": "an_effort_from_2027"},
+                ]}},
+            }),
+        };
+
+        let models = models_from_discovery(&discovered).models;
+        assert_eq!(models.len(), 1, "the id-less row is skipped");
+        assert_eq!(models[0].id, "grok-9");
+        assert_eq!(
+            models[0].label, "grok-9",
+            "a row with no label falls back to its id rather than to an empty string"
+        );
+        assert_eq!(
+            models[0].reasoning_levels,
+            vec![ReasoningLevel::Low],
+            "the unknown rung is dropped, not guessed at"
+        );
+    }
+
+    /// **The curated list must never be empty**, because it is what the picker
+    /// shows when discovery fails. An empty one turns "couldn't reach Grok"
+    /// into "this agent has no models".
+    #[test]
+    fn the_curated_list_is_never_empty() {
+        let curated = static_models();
+        assert!(!curated.is_empty());
+        assert!(curated.iter().all(|m| !m.id.is_empty()));
+
+        // And the fallback path itself produces it, rather than an empty list.
+        let cache = crate::discovery::DiscoveryCache::default();
+        let catalog = cache.catalog(static_models(), Err(DiscoveryFailure::Unreachable));
+        assert_eq!(catalog.source, comet_proto::CatalogSource::BuiltIn);
+        assert!(
+            !catalog.models.is_empty(),
+            "a discovery failure must not degrade to an empty list"
+        );
+    }
+
+    /// Grok declares only `FullAccess` while approvals are unrouted. Break
+    /// caught: advertising a mode that promises to ask the user, when
+    /// `session/request_permission` is answered `-32601`.
+    #[test]
+    fn only_the_mode_the_harness_can_actually_keep_is_declared() {
+        let capabilities = GrokHarness::capabilities();
+        assert_eq!(capabilities.runtime_modes, vec![RuntimeMode::FullAccess]);
+        assert_eq!(
+            capabilities.steering_mode,
+            SteeringMode::TurnBoundary,
+            "Grok advertises no steering extension, so the boundary is the honest answer"
+        );
+    }
+}

@@ -23,6 +23,7 @@
 // against the literal wire two real adapters answered on 2026-08-28.
 #![allow(dead_code)]
 
+pub mod grok;
 pub(crate) mod normalize;
 pub mod session;
 

@@ -88,71 +88,46 @@ impl AcpSession {
     /// (grok's four tokens are not codex-acp's `node <entry>`), and because
     /// production and the capture recorder must derive it from the same place.
     pub async fn open(
-        mut command: Command,
+        command: Command,
         cwd: &str,
         timeouts: Timeouts,
     ) -> Result<Self, HarnessError> {
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let program = command
-            .as_std()
-            .get_program()
-            .to_string_lossy()
-            .into_owned();
-        let mut child = command.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(program.clone())
-            } else {
-                HarnessError::Io(e)
-            }
-        })?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("ACP agent has no stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("ACP agent has no stdout".into()))?;
-        let stderr_tail = StderrTail::default();
-        if let Some(stderr) = child.stderr.take() {
-            let tail = stderr_tail.clone();
-            tokio::spawn(async move {
-                let mut lines = tokio::io::BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "comet_harness::acp", "stderr: {line}");
-                    tail.push(&line);
-                }
-            });
-        }
-
-        let (client, incoming) = RpcClient::new(stdin, stdout);
-
-        let initialized = with_timeout(
-            timeouts.handshake,
-            "initialize",
-            client.request("initialize", initialize_params()),
-        )
-        .await?;
-        check_protocol_version(&initialized)?;
+        let Connected {
+            mut child,
+            client,
+            incoming,
+            stderr_tail,
+            initialized,
+        } = connect(command, timeouts).await?;
         let agent = AgentDescription::from_initialize(&initialized);
 
-        let opened = with_timeout(
+        let opened = match with_timeout(
             timeouts.handshake,
             "session/new",
             client.request("session/new", new_session_params(cwd)),
         )
-        .await?;
-        let session_id = opened["sessionId"]
-            .as_str()
-            .ok_or_else(|| {
-                HarnessError::Protocol("session/new answered without a sessionId".into())
-            })?
-            .to_owned();
+        .await
+        {
+            Ok(opened) => opened,
+            Err(error) => {
+                // The handshake succeeded and this did not, so a live child is
+                // holding stdio nobody will read again. `kill_on_drop` would
+                // reach it eventually, but only once every clone of the client
+                // is dropped too — reap it here instead of leaving the timing
+                // to drop order.
+                shutdown_child(&mut child, timeouts.kill_grace).await;
+                return Err(error);
+            }
+        };
+        let session_id = match opened["sessionId"].as_str() {
+            Some(id) => id.to_owned(),
+            None => {
+                shutdown_child(&mut child, timeouts.kill_grace).await;
+                return Err(HarnessError::Protocol(
+                    "session/new answered without a sessionId".into(),
+                ));
+            }
+        };
 
         Ok(Self {
             child,
@@ -165,6 +140,57 @@ impl AcpSession {
         })
     }
 
+    /// Spawn and handshake ONLY, answering with the raw `initialize` result.
+    ///
+    /// For discovery, which needs the handshake and nothing else. The child is
+    /// reaped before this returns: an agent's capability block costs one spawn
+    /// and no `session/new`, and holding an idle session open on the picker's
+    /// render path would be a process per boot for a reply already in hand.
+    ///
+    /// The raw `Value` rather than [`AgentDescription`] because what a given
+    /// agent publishes here is agent-specific — Grok's model list lives at
+    /// `_meta.modelState`, a path no other recorded speaker uses, and pushing
+    /// every such field onto the shared description would make it a union of
+    /// vendors.
+    pub async fn open_for_discovery(
+        command: Command,
+        cwd: &str,
+        timeouts: Timeouts,
+    ) -> Result<Discovered, HarnessError> {
+        let Connected {
+            mut child,
+            client,
+            initialized,
+            ..
+        } = connect(command, timeouts).await?;
+
+        // **`session/new` is worth the extra round trip.** It is token-free like
+        // the handshake, and it is the only reply that carries the session
+        // config — which model rows the agent really offers and which effort is
+        // selected. `initialize` carries a model block too, but that surface is
+        // the deprecated one: agents that have both enumerate one entry per
+        // model x effort there, so reading it as a model list multiplies a
+        // 5-model agent into 20 picker rows.
+        let session = with_timeout(
+            timeouts.handshake,
+            "session/new",
+            client.request("session/new", new_session_params(cwd)),
+        )
+        .await;
+
+        shutdown_child(&mut child, timeouts.kill_grace).await;
+        Ok(Discovered {
+            initialized,
+            // A failed `session/new` is NOT a failed discovery. The handshake
+            // answered, so the agent is reachable and its `initialize` block is
+            // real; losing the richer surface degrades what we can read, not
+            // whether we read anything. `Null` reads as absent at every path
+            // below it, which is exactly the fallback the caller already writes
+            // for an agent that has no config surface at all.
+            session: session.unwrap_or(Value::Null),
+        })
+    }
+
     pub fn agent(&self) -> &AgentDescription {
         &self.agent
     }
@@ -172,6 +198,101 @@ impl AcpSession {
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
+}
+
+/// What a handshake-only probe learned, both replies kept whole.
+///
+/// Raw `Value`s rather than a parsed shape because what an agent publishes here
+/// is vendor-specific: Grok's config lives at `_meta["x.ai/sessionConfig"]`,
+/// which no other recorded speaker sends. Only the agent's own harness knows
+/// how to read it, so the seam hands over the bytes.
+pub struct Discovered {
+    /// The `initialize` result.
+    pub initialized: Value,
+    /// The `session/new` result, or `Value::Null` if that call did not answer.
+    /// Null rather than an error: see [`AcpSession::open_for_discovery`].
+    pub session: Value,
+}
+
+/// A spawned agent that has completed `initialize`, before anything has been
+/// decided about what to do with it. Both [`AcpSession::open`] and
+/// [`AcpSession::open_for_discovery`] are built on it, so the two cannot
+/// disagree about how a child is started or how the handshake is checked.
+struct Connected {
+    child: Child,
+    client: RpcClient,
+    incoming: mpsc::Receiver<Incoming>,
+    stderr_tail: StderrTail,
+    /// The raw `initialize` result, kept whole: an agent's own `_meta` block is
+    /// vendor-shaped and only its harness knows how to read it.
+    initialized: Value,
+}
+
+async fn connect(mut command: Command, timeouts: Timeouts) -> Result<Connected, HarnessError> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let program = command
+        .as_std()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+    let mut child = command.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            HarnessError::NotInstalled(program.clone())
+        } else {
+            HarnessError::Io(e)
+        }
+    })?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| HarnessError::Protocol("ACP agent has no stdin".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| HarnessError::Protocol("ACP agent has no stdout".into()))?;
+    let stderr_tail = StderrTail::default();
+    if let Some(stderr) = child.stderr.take() {
+        let tail = stderr_tail.clone();
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::debug!(target: "comet_harness::acp", "stderr: {line}");
+                tail.push(&line);
+            }
+        });
+    }
+
+    let (client, incoming) = RpcClient::new(stdin, stdout);
+
+    let initialized = match with_timeout(
+        timeouts.handshake,
+        "initialize",
+        client.request("initialize", initialize_params()),
+    )
+    .await
+    .and_then(|result| check_protocol_version(&result).map(|()| result))
+    {
+        Ok(initialized) => initialized,
+        Err(error) => {
+            // A child that spawned but could not handshake is still running.
+            // Reap it here rather than leaving it to drop order.
+            shutdown_child(&mut child, timeouts.kill_grace).await;
+            return Err(error);
+        }
+    };
+
+    Ok(Connected {
+        child,
+        client,
+        incoming,
+        stderr_tail,
+        initialized,
+    })
 }
 
 /// The agent's answer to our `protocolVersion`.

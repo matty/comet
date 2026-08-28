@@ -38,7 +38,19 @@ use serde::{Deserialize, Serialize};
 ///    it as absent, but an older LAN peer would silently ignore a user's
 ///    provider choice and execute under its own default. Same safety class as
 ///    4: refusing the pairing is more honest than running the wrong provider.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// 9: `HarnessId::Grok`. A decode problem of the same class as 2, 3, 6 and 7,
+///    and the reason is worth stating because `HarnessId` does not look like a
+///    transcript type: it rides `HarnessDescriptor.id` in every `ListHarnesses`
+///    reply, `Chat.harness` in every workspace row, and `RunRequest.harness`
+///    (see 8). Five sibling enums in `agent.rs` carry `#[serde(other)]` and each
+///    says why; **`HarnessId` deliberately does not**, so an older peer meeting
+///    `"grok"` fails the whole containing value rather than the one field —
+///    losing a harness list, or a chat row, not a label.
+///
+///    Note `HarnessId::Cursor` already exists with no harness behind it. It
+///    predates this list and is **not** precedent that variants are free: it has
+///    simply never been sent, and a variant nobody emits breaks nobody.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
