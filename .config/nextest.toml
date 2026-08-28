@@ -1,0 +1,20 @@
+# A test still running at 180s is killed and reported as TIMEOUT with its name.
+#
+# This is a bound, not a diagnosis. It exists because a hung test blocks an
+# unattended run with nothing to report and presents in CI as a job running to
+# timeout with nothing to point at — which is what D101 does today. nextest also
+# runs each test in its own process, so a wedged test cannot take the suite with
+# it, and a cross-test deadlock cannot form at all.
+#
+# 60s is far above any real test here: the whole workspace suite finishes in
+# about 3m16s in CI, so a single test past a minute is already wrong.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# CI gets the same bound plus retries, so a genuine flake is reported as a flake
+# rather than failing the run — and shows in the summary as one, which a bare
+# re-run would hide.
+[profile.ci]
+slow-timeout = { period = "60s", terminate-after = 3 }
+retries = 1
+failure-output = "immediate-final"
