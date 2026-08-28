@@ -35,7 +35,6 @@ pub(crate) mod approval;
 mod catalog;
 pub(crate) mod discovery;
 mod normalize;
-mod rpc;
 mod update;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -57,6 +56,7 @@ use comet_proto::{
     RunRequest, RuntimeMode, SteeringMode,
 };
 
+use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
 use catalog::{
     REASONING_LEVELS, approval_policy, approvals_reviewer, sandbox_mode, sandbox_policy_value,
@@ -67,7 +67,6 @@ use normalize::{
     map_item, notice_for, plan_update_event, rate_limit_notice, turn_error_message, turn_id,
     usage_event,
 };
-use rpc::{Incoming, RpcClient};
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
 /// PATH, then the system's own PATH (a GUI/service launch's PATH misses what

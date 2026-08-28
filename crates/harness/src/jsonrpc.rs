@@ -1,5 +1,10 @@
-//! Minimal JSON-RPC 2.0 client over the app server's stdio (newline-delimited
+//! Minimal JSON-RPC 2.0 client over a child agent's stdio (newline-delimited
 //! frames, id-multiplexed), ported from codex.ts's `startAppServer`.
+//!
+//! Shared by the Codex app-server harness and the ACP harness: both protocols
+//! are newline-framed JSON-RPC 2.0 over stdio, so the framing, id multiplexing
+//! and child-stdin handling below are the same code for both. Nothing here is
+//! Codex-specific — keep it that way, or the ACP side grows a second copy.
 //!
 //! - Responses are matched to callers by numeric id (a shared pending map the
 //!   reader task resolves directly, so requests can be awaited from anywhere —
