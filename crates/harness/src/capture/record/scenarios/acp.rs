@@ -221,20 +221,22 @@ pub(in crate::capture::record) fn resolve_node_executable() -> Option<PathBuf> {
 /// **codex-acp and claude-agent-acp never reach this function.** Both rows
 /// stay `ScenarioLaunch::Discovery` (`codex_acp_launch`/`claude_acp_launch`
 /// above) — `derive_launch` only calls a `Run` launch for
-/// `ScenarioLaunch::Run` rows, and Grok is the only ACP agent with a
-/// production `Harness`: `comet_proto::agent::HarnessId` has no
-/// `CodexAcp`/`ClaudeAgentAcp` variant, only `ClaudeCode`, `Codex`,
-/// `Cursor`, `Grok` and `Mock` — check that enum, not a design document,
-/// if this ever needs re-verifying.
+/// `ScenarioLaunch::Run` rows, and neither has a production `Harness` to
+/// register one against: `comet_proto::agent::HarnessId` has no
+/// `CodexAcp`/`ClaudeAgentAcp` variant, only `ClaudeCode`, `Codex`, `Cursor`,
+/// `Grok`, `Hermes` and `Mock` — check that enum, not a design document, if
+/// this ever needs re-verifying.
 ///
 /// **This hard-delegates to Grok specifically, not to "whichever ACP agent
-/// the row names."** Fine today — Grok is the only `Run` row this provider
-/// has — but a fourth ACP agent (Hermes, landing in a parallel PR) adding its
-/// OWN `Run` row would silently derive Grok's argv here unless this function
-/// is taught to dispatch on the row first. Nothing pins that today the way
-/// `every_acp_row_is_discovery` used to pin "no run rows exist at all": a
-/// Hermes row wired to this function fails loudly instead, at
-/// `every_scenario_launch_matches_its_committed_corpus_manifest`'s argv
+/// the row names."** Fine today because Grok is the only ACP agent with a
+/// `Run` row registered in `SCENARIOS` — Hermes already has its own
+/// production `HermesHarness` and its own `crate::acp::hermes::run_launch`
+/// (landed in a parallel PR before this one), but no capture scenario row
+/// yet. The day one is added, wiring it to THIS function unchanged would
+/// silently derive Grok's argv for a Hermes recording. Nothing pins that
+/// today the way `every_acp_row_is_discovery` used to pin "no run rows
+/// exist at all": a Hermes row wired to this function fails loudly instead,
+/// at `every_scenario_launch_matches_its_committed_corpus_manifest`'s argv
 /// comparison (Hermes's launch and Grok's would disagree) — deliberately not
 /// worth a real dispatch mechanism for a row that does not exist yet.
 pub(in crate::capture::record) fn run_launch(

@@ -14,11 +14,12 @@ instead of being carried forever on "someone might have an older one".
 row above. This table is about *adapters* -- CLIs a Comet `Harness` actually drives and
 therefore might one day drop a decode for -- and Comet registers no `Harness` for either:
 `comet_proto::agent::HarnessId` has no `CodexAcp`/`ClaudeAgentAcp` variant, only `ClaudeCode`,
-`Codex`, `Cursor`, `Grok` and `Mock`. codex-acp and claude-agent-acp exist in the corpus purely
-as the ACP protocol's own two-speaker comparison points for Grok, the one ACP agent Comet does
-drive (`crates/harness/src/acp/grok.rs`). "No supported version can produce it" has no floor to
-be measured against for a CLI nothing decodes. If either ever gains a real `Harness`, add its
-row then, from the same evidence already sitting in the corpus.
+`Codex`, `Cursor`, `Grok`, `Hermes` and `Mock`. codex-acp and claude-agent-acp exist in the
+corpus purely as the ACP protocol's own two-speaker comparison points for the agents Comet
+does drive over ACP (`crates/harness/src/acp/{grok,hermes}.rs`). "No supported version can
+produce it" has no floor to be measured against for a CLI nothing decodes. If either ever
+gains a real `Harness`, add its row then, from the same evidence already sitting in the
+corpus.
 
 ## What the floor means
 

@@ -1484,9 +1484,10 @@ mod tests {
         // `adapter_entry`, which needs an npm global root that genuinely
         // holds the package -- real on this machine (the adapters are
         // installed here) and real nowhere in CI, which runs
-        // `ubuntu-24.04` with neither adapter present
-        // (`comet-provider-sanitize` CI job, PR #127, 2026-08-29:
-        // "npm's global node_modules could not be located"). Promoting the
+        // `ubuntu-24.04` with neither adapter present. Confirmed on
+        // `.github/workflows/ci.yml`'s "fmt + clippy + test" job (PR #127,
+        // 2026-08-29): this test panicked with "npm's global node_modules
+        // could not be located" there and nowhere locally. Promoting the
         // ACP captures gave this test its first ACP rows to check, and
         // turned a comparison that had always passed vacuously into one
         // that depends on the machine running it.
