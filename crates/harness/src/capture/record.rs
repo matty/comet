@@ -1141,6 +1141,12 @@ mod tests {
                 None,
                 FenceKind::None,
             ),
+            (
+                Provider::Acp,
+                "session-discovery-grok",
+                None,
+                FenceKind::None,
+            ),
             (Provider::Claude, "model-discovery", None, FenceKind::None),
             (Provider::Claude, "command-discovery", None, FenceKind::None),
             (
@@ -1468,6 +1474,7 @@ mod tests {
         const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[
             (Provider::Acp, "session-discovery-codex-acp"),
             (Provider::Acp, "session-discovery-claude-acp"),
+            (Provider::Acp, "session-discovery-grok"),
         ];
 
         let root = crate::capture::corpus_root();
@@ -1605,6 +1612,7 @@ mod tests {
             vec![
                 "acp/session-discovery-claude-acp".to_owned(),
                 "acp/session-discovery-codex-acp".to_owned(),
+                "acp/session-discovery-grok".to_owned(),
             ],
             "exactly the rows in EXEMPT_UNCAPTURED may land in unevidenced — a row losing \
              corpus evidence must update this assertion deliberately, not pass through silently. \

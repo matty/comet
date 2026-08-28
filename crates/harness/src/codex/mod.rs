@@ -57,7 +57,7 @@ use comet_proto::{
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
-use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
+use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 use catalog::{
     REASONING_LEVELS, approval_policy, approvals_reviewer, sandbox_mode, sandbox_policy_value,
     static_models, to_effort,
@@ -1401,22 +1401,6 @@ fn handle_server_request(
 // ---------------------------------------------------------------------------
 // Child lifecycle
 // ---------------------------------------------------------------------------
-
-/// Reap the child: graceful SIGTERM first, SIGKILL after `kill_grace`.
-/// (`kill_on_drop` remains the last-resort backstop.)
-async fn shutdown_child(child: &mut Child, kill_grace: Duration) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
-    }
-    if let Some(pid) = child.id() {
-        send_signal(pid, Signal::Term);
-        if tokio::time::timeout(kill_grace, child.wait()).await.is_ok() {
-            return;
-        }
-    }
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
 
 #[cfg(test)]
 mod install_dir_tests {

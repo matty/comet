@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::bail;
-use serde_json::json;
 
 use crate::capture::record::provider::CaptureProvider;
 use crate::capture::record::providers::acp::{AcpProvider, rpc_request};
@@ -91,6 +90,60 @@ fn npm_global_root() -> anyhow::Result<PathBuf> {
     )
 }
 
+/// Grok Build's ACP entry point, verified against grok 1.0.5 on 2026-08-28.
+///
+/// **Every token here was checked against the installed build, because the
+/// placement is not guessable.** `--no-auto-update` is a TOP-LEVEL flag and is
+/// hidden — it appears in neither `grok --help` nor `grok agent --help`, and the
+/// only way to tell it from a typo is that clap rejects unknown flags (a
+/// `--no-such-flag` control errors with "unexpected argument"; this one exits
+/// 0). `--no-leader` is on the `agent` SUBCOMMAND, not the top level, and
+/// `stdio` is a sub-subcommand of `agent`. Reordering any of the four breaks the
+/// spawn.
+///
+/// `--no-leader` is the load-bearing one: without it, `agent stdio` may attach
+/// to a shared leader process over `~/.grok/leader.sock` instead of starting its
+/// own agent, and the capture would then record a session belonging to somebody
+/// else's process.
+pub(in crate::capture::record) const GROK_ARGS: [&str; 4] =
+    ["--no-auto-update", "agent", "--no-leader", "stdio"];
+
+/// SPAWN for the Grok row.
+///
+/// Unlike the adapter rows, `executable` here is a real agent CLI rather than
+/// node — Grok is a native binary that speaks ACP itself. The ACP provider's
+/// DEFAULT executable is still node (the adapters are the common case), so a
+/// Grok capture must pass `--executable <grok>`; the guard below turns
+/// forgetting that into a sentence naming the flag rather than a node process
+/// that exits on an argument it cannot parse.
+pub(in crate::capture::record) fn grok_launch(
+    input: &ScenarioInput,
+    executable: &Path,
+) -> anyhow::Result<LaunchDescriptor> {
+    let looks_like_grok = executable
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("grok"));
+    if !looks_like_grok {
+        bail!(
+            "the grok row spawns the grok CLI, but --executable resolved to {}. Pass --executable <path to grok>; the ACP default resolves node, which is right for the adapter rows and wrong for this one.",
+            executable.display()
+        );
+    }
+    Ok(LaunchDescriptor {
+        program: executable.to_path_buf(),
+        args: GROK_ARGS.iter().map(Into::into).collect(),
+        cwd: Some(input.cwd.clone().unwrap_or_else(std::env::temp_dir)),
+        configured_env: BTreeMap::new(),
+        stdin: StdioMode::Piped,
+        stdout: StdioMode::Piped,
+        stderr: StdioMode::Piped,
+        kill_on_drop: true,
+        #[cfg(windows)]
+        creation_flags: 0,
+    })
+}
+
 /// `executable` is **node**, not an agent CLI: an ACP adapter is a Node program
 /// and the recorder spawns the interpreter directly. The capture binary resolves
 /// it the same way it resolves any provider executable, so `--executable` points
@@ -133,7 +186,7 @@ pub(in crate::capture::record) async fn session_discovery(
         .send(&rpc_request(
             id,
             "session/new",
-            json!({"cwd": cwd, "mcpServers": []}),
+            crate::acp::new_session_params(&cwd),
         ))
         .await?;
     session
@@ -213,6 +266,53 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    /// Break caught: reordering Grok's four launch tokens. `--no-auto-update`
+    /// is top-level, `--no-leader` belongs to `agent`, and `stdio` is under
+    /// `agent` — a plausible-looking `grok agent stdio --no-leader` does not
+    /// parse. Pinned as an exact sequence because that is the property, and
+    /// because the flags are hidden from `--help` so nothing else records them.
+    #[test]
+    fn the_grok_launch_line_keeps_its_verified_token_order() {
+        assert_eq!(
+            GROK_ARGS,
+            ["--no-auto-update", "agent", "--no-leader", "stdio"]
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir
+            .path()
+            .join(if cfg!(windows) { "grok.exe" } else { "grok" });
+        let input = ScenarioInput {
+            cwd: Some(dir.path().to_path_buf()),
+            ..ScenarioInput::default()
+        };
+        let launch = grok_launch(&input, &exe).expect("grok launch builds");
+        assert_eq!(launch.program, exe);
+        assert_eq!(
+            launch.args,
+            GROK_ARGS
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Break caught: the Grok row silently spawning node, which is the ACP
+    /// provider's default executable and correct for every OTHER row. Node
+    /// would exit on `--no-auto-update` and the capture would fail with
+    /// nothing naming the real mistake.
+    #[test]
+    fn the_grok_row_refuses_a_non_grok_executable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let node = dir
+            .path()
+            .join(if cfg!(windows) { "node.exe" } else { "node" });
+        let err = grok_launch(&ScenarioInput::default(), &node).expect_err("must refuse node");
+        let text = err.to_string();
+        assert!(text.contains("--executable"), "no flag named: {text}");
+        assert!(text.contains("node"), "no path named: {text}");
     }
 
     #[test]

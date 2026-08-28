@@ -1,0 +1,597 @@
+//! Spawn, handshake, one session, and the turn loop.
+//!
+//! The shape of an ACP turn, and the two ways it differs from Codex's:
+//!
+//! 1. **There is no `initialized` notification.** ACP is `initialize` →
+//!    `session/new` and the agent is ready. The `initialized` follow-up is
+//!    Codex's app-server; sending one here would put a frame on the wire no
+//!    agent asked for.
+//! 2. **A turn ends with the RESPONSE to `session/prompt`**, which carries a
+//!    `stopReason` — not with a notification. Reading turn-end off `.method`,
+//!    the way the Codex loop legitimately does, hangs here forever.
+//!
+//! Everything else is a notification stream the loop drains while it waits.
+//! **Most of that stream is not addressed to Comet at all**: grok 1.0.5 emits
+//! `_x.ai/models/update`, `_x.ai/settings/update`, `_x.ai/announcements/update`
+//! and `_x.ai/mcp_initialized` around every session, and two `session/update`
+//! frames arrive *before* the `session/new` reply that names the session they
+//! belong to. Anything unrecognized is dropped quietly — that is the honest
+//! answer for a protocol whose vendors extend it, not a gap.
+//!
+//! **Steering rides the turn boundary, always, in this module.** No recorded
+//! agent advertises the steering extension: grok sends no `_meta.steering` at
+//! all. A queued steer is therefore delivered as the next `session/prompt` on
+//! the same session, which is slower than an in-turn steer and correct. When an
+//! agent that does advertise the extension appears, `AgentDescription::
+//! supports_steering` is the gate that would pick the faster path.
+
+use std::process::Stdio;
+use std::time::Duration;
+
+use futures::StreamExt;
+use futures::stream::BoxStream;
+use serde_json::Value;
+use tokio::io::AsyncBufReadExt;
+use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
+
+use comet_proto::{AgentEvent, DiagnosticSeverity, DoneStatus, HarnessId, RunRequest};
+
+use super::{AgentDescription, initialize_params, new_session_params, normalize, prompt_params};
+use crate::jsonrpc::{Incoming, RpcClient};
+use crate::{HarnessError, RunControls, StderrTail, shutdown_child};
+
+/// The timeouts the loop is built from. A struct rather than four arguments so
+/// a test can shrink them without every call site naming all four.
+#[derive(Clone, Copy, Debug)]
+pub struct Timeouts {
+    /// How long `initialize` and `session/new` may take before the open fails
+    /// with something a user can act on. Bounded because a child that spawns
+    /// and then says nothing is indistinguishable from a hang, and the rule in
+    /// `.agents/rules/user-facing-errors.md` is that no waiting state lasts
+    /// forever.
+    pub handshake: Duration,
+    /// After `session/cancel`, how long the agent gets to settle the in-flight
+    /// prompt with `stopReason: "cancelled"` before the loop stops waiting and
+    /// reports the interrupt itself.
+    pub cancel_grace: Duration,
+    /// SIGTERM → SIGKILL gap when reaping the child.
+    pub kill_grace: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            handshake: Duration::from_secs(30),
+            cancel_grace: Duration::from_secs(5),
+            kill_grace: Duration::from_secs(3),
+        }
+    }
+}
+
+/// A live ACP conversation: a spawned agent that has completed `initialize` and
+/// holds one open session.
+pub struct AcpSession {
+    child: Child,
+    client: RpcClient,
+    incoming: mpsc::Receiver<Incoming>,
+    stderr_tail: StderrTail,
+    agent: AgentDescription,
+    session_id: String,
+    timeouts: Timeouts,
+}
+
+impl AcpSession {
+    /// Spawn `command`, handshake, and open one session rooted at `cwd`.
+    ///
+    /// `command` is built by the caller because the launch line is per-agent
+    /// (grok's four tokens are not codex-acp's `node <entry>`), and because
+    /// production and the capture recorder must derive it from the same place.
+    pub async fn open(
+        mut command: Command,
+        cwd: &str,
+        timeouts: Timeouts,
+    ) -> Result<Self, HarnessError> {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let program = command
+            .as_std()
+            .get_program()
+            .to_string_lossy()
+            .into_owned();
+        let mut child = command.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                HarnessError::NotInstalled(program.clone())
+            } else {
+                HarnessError::Io(e)
+            }
+        })?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| HarnessError::Protocol("ACP agent has no stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| HarnessError::Protocol("ACP agent has no stdout".into()))?;
+        let stderr_tail = StderrTail::default();
+        if let Some(stderr) = child.stderr.take() {
+            let tail = stderr_tail.clone();
+            tokio::spawn(async move {
+                let mut lines = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!(target: "comet_harness::acp", "stderr: {line}");
+                    tail.push(&line);
+                }
+            });
+        }
+
+        let (client, incoming) = RpcClient::new(stdin, stdout);
+
+        let initialized = with_timeout(
+            timeouts.handshake,
+            "initialize",
+            client.request("initialize", initialize_params()),
+        )
+        .await?;
+        check_protocol_version(&initialized)?;
+        let agent = AgentDescription::from_initialize(&initialized);
+
+        let opened = with_timeout(
+            timeouts.handshake,
+            "session/new",
+            client.request("session/new", new_session_params(cwd)),
+        )
+        .await?;
+        let session_id = opened["sessionId"]
+            .as_str()
+            .ok_or_else(|| {
+                HarnessError::Protocol("session/new answered without a sessionId".into())
+            })?
+            .to_owned();
+
+        Ok(Self {
+            child,
+            client,
+            incoming,
+            stderr_tail,
+            agent,
+            session_id,
+            timeouts,
+        })
+    }
+
+    pub fn agent(&self) -> &AgentDescription {
+        &self.agent
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
+/// The agent's answer to our `protocolVersion`.
+///
+/// **A missing key is tolerated; a mismatched one is not.** ACP has the agent
+/// reply with the version it will speak, which must be no higher than the one
+/// asked for — so a number that is not ours means an agent talking a protocol
+/// this build cannot read, and continuing would produce silent nonsense rather
+/// than an error anybody could act on. Absence is different: it says the agent
+/// did not answer the question, not that it disagreed, and every recorded agent
+/// does answer.
+fn check_protocol_version(result: &Value) -> Result<(), HarnessError> {
+    match result["protocolVersion"].as_u64() {
+        None => Ok(()),
+        Some(super::PROTOCOL_VERSION) => Ok(()),
+        Some(other) => Err(HarnessError::Protocol(format!(
+            "this agent speaks ACP v{other}, and Comet speaks v{}",
+            super::PROTOCOL_VERSION
+        ))),
+    }
+}
+
+/// Await one handshake request under a deadline, naming the method in both
+/// failure directions so the message says which half of the handshake stalled.
+async fn with_timeout(
+    limit: Duration,
+    method: &str,
+    request: impl Future<Output = Result<Value, HarnessError>>,
+) -> Result<Value, HarnessError> {
+    match tokio::time::timeout(limit, request).await {
+        Ok(result) => result,
+        Err(_) => Err(HarnessError::Protocol(format!(
+            "the agent did not answer {method} within {}s",
+            limit.as_secs()
+        ))),
+    }
+}
+
+/// Drive `session`'s turns until the consumer hangs up or the agent exits.
+///
+/// The stream always ends with a `Done` unless the consumer dropped first —
+/// a run that simply stopped producing events would leave the transcript
+/// spinning with nothing to explain it.
+pub fn run(
+    session: AcpSession,
+    harness: HarnessId,
+    request: RunRequest,
+    controls: RunControls,
+) -> BoxStream<'static, Result<AgentEvent, HarnessError>> {
+    let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
+    tokio::spawn(run_session(session, harness, request, controls, event_tx));
+    futures::stream::unfold(event_rx, |mut rx| async move {
+        rx.recv().await.map(|ev| (ev, rx))
+    })
+    .boxed()
+}
+
+/// How a single turn stopped.
+enum TurnEnd {
+    /// The agent answered `session/prompt`.
+    Settled(DoneStatus),
+    /// Interrupted, and the agent did not settle within the grace period.
+    CancelledUnsettled,
+    /// stdout EOF: the agent is gone and no further turn is possible.
+    AgentExited,
+    /// The consumer dropped the stream; stop without ceremony.
+    ConsumerGone,
+}
+
+async fn run_session(
+    session: AcpSession,
+    harness: HarnessId,
+    request: RunRequest,
+    controls: RunControls,
+    event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
+) {
+    let AcpSession {
+        mut child,
+        client,
+        mut incoming,
+        stderr_tail,
+        agent: _agent,
+        session_id,
+        timeouts,
+    } = session;
+    let RunControls {
+        // Unclaimed here. ACP's permission request is `session/request_permission`,
+        // and this module answers every server->client request with -32601 rather
+        // than half-wiring one: an approval that reached the user through a
+        // synthesized question would put a card in the doc under an id no
+        // resolver knows. Whichever slice adds approvals claims both fields.
+        request_input: _request_input,
+        request_approval: _request_approval,
+        mut steering,
+        interrupt,
+    } = controls;
+
+    let assistant_message_id = uuid::Uuid::new_v4().to_string();
+    if !send(
+        &event_tx,
+        AgentEvent::SessionStarted {
+            harness,
+            model: request.model.clone().unwrap_or_default(),
+            tools: Vec::new(),
+            cwd: request.cwd.clone(),
+            session_id: session_id.clone(),
+            assistant_message_id,
+            runtime_mode: request.runtime_mode,
+        },
+    )
+    .await
+    {
+        shutdown_child(&mut child, timeouts.kill_grace).await;
+        return;
+    }
+
+    let mut prompt = request.prompt.clone();
+
+    // **One `Done` per turn that started, not one per run.** The session is
+    // persistent: a steer opens a second turn on the same session, and a UI
+    // that saw no `Done` for the first would leave it spinning while the
+    // second streamed over it. Codex's loop reports per turn for the same
+    // reason. The corollary is that nothing is emitted after the loop — every
+    // exit below has already sent its own.
+    loop {
+        let end = drive_turn(
+            &client,
+            &mut incoming,
+            &event_tx,
+            &session_id,
+            &prompt,
+            &interrupt,
+            timeouts.cancel_grace,
+        )
+        .await;
+
+        let (done, more_turns_possible) = match end {
+            // Only a completed turn can be followed by another. A refusal or a
+            // cancellation ends the conversation: delivering a queued steer
+            // into either would read as Comet ignoring what just happened.
+            TurnEnd::Settled(status) => (
+                Some(done_event(status, None, &session_id)),
+                status == DoneStatus::Completed,
+            ),
+            TurnEnd::CancelledUnsettled => (
+                Some(done_event(DoneStatus::Interrupted, None, &session_id)),
+                false,
+            ),
+            // The agent's stdout closed with a turn in flight. That is a crash,
+            // not a quiet success, and the stderr tail is the only thing that
+            // can explain it to whoever is looking at the transcript.
+            TurnEnd::AgentExited => (
+                Some(done_event(
+                    DoneStatus::Errored,
+                    Some(crate::crash_message(
+                        "the ACP agent",
+                        child.try_wait().ok().flatten(),
+                        &stderr_tail,
+                    )),
+                    &session_id,
+                )),
+                false,
+            ),
+            // Nobody is reading. Sending a Done into a closed channel would be
+            // ceremony, not information.
+            TurnEnd::ConsumerGone => (None, false),
+        };
+
+        if let Some(done) = done
+            && !send(&event_tx, done).await
+        {
+            break;
+        }
+        if !more_turns_possible || interrupt.is_cancelled() {
+            break;
+        }
+
+        // Between turns: deliver a queued steer as the next prompt, or end.
+        match steering.recv().await {
+            Some(steer) => {
+                if !send(
+                    &event_tx,
+                    AgentEvent::Steered {
+                        assistant_message_id: None,
+                        next_assistant_message_id: None,
+                    },
+                )
+                .await
+                {
+                    break;
+                }
+                prompt = steer.prompt;
+            }
+            // The mailbox closed: the host is finished with this run.
+            None => break,
+        }
+    }
+
+    shutdown_child(&mut child, timeouts.kill_grace).await;
+}
+
+fn done_event(status: DoneStatus, error: Option<String>, session_id: &str) -> AgentEvent {
+    AgentEvent::Done {
+        status,
+        result: None,
+        error,
+        session_id: Some(session_id.to_owned()),
+    }
+}
+
+/// One `session/prompt`, from send to `stopReason`.
+async fn drive_turn(
+    client: &RpcClient,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    session_id: &str,
+    prompt: &str,
+    interrupt: &crate::CancellationToken,
+    cancel_grace: Duration,
+) -> TurnEnd {
+    let reply = client.request("session/prompt", prompt_params(session_id, prompt));
+    tokio::pin!(reply);
+
+    // Absolute, so re-creating the sleep on each loop pass does not extend it.
+    let mut give_up_at: Option<tokio::time::Instant> = None;
+
+    loop {
+        tokio::select! {
+            // Biased so a reply that arrives in the same pass as the cancel
+            // deadline is read as the agent settling, not as it failing to.
+            biased;
+
+            answer = &mut reply => {
+                return match answer {
+                    Ok(result) => {
+                        // **Drain first.** The reply and the last deltas of the
+                        // message it settles arrive in one batch, and a biased
+                        // select takes the reply — so returning here directly
+                        // silently truncates the end of every assistant
+                        // message. (`fake-acp` sends " done" immediately before
+                        // its `end_turn`; that text vanished until this drain
+                        // existed.) The reader task pushes notifications into
+                        // the channel BEFORE resolving the response, so
+                        // whatever `try_recv` finds now provably preceded the
+                        // reply on the wire, and nothing later can appear.
+                        while let Ok(message) = incoming.try_recv() {
+                            match handle_incoming(message, client, event_tx).await {
+                                Handled::Continue => {}
+                                Handled::ConsumerGone => return TurnEnd::ConsumerGone,
+                                // EOF after a settled turn is just the agent
+                                // shutting down; the turn itself succeeded.
+                                Handled::AgentExited => break,
+                            }
+                        }
+                        let reason = result["stopReason"].as_str().unwrap_or_default();
+                        TurnEnd::Settled(normalize::done_status(reason))
+                    }
+                    // The request failed rather than answering: the reader hit
+                    // EOF, or the agent returned a JSON-RPC error. Either way
+                    // this turn is over and the agent is not usable.
+                    Err(error) => {
+                        tracing::debug!(target: "comet_harness::acp", "session/prompt failed: {error}");
+                        TurnEnd::AgentExited
+                    }
+                };
+            }
+
+            message = incoming.recv() => match message {
+                Some(message) => match handle_incoming(message, client, event_tx).await {
+                    Handled::Continue => {}
+                    Handled::ConsumerGone => return TurnEnd::ConsumerGone,
+                    Handled::AgentExited => return TurnEnd::AgentExited,
+                },
+                None => return TurnEnd::AgentExited,
+            },
+
+            _ = interrupt.cancelled(), if give_up_at.is_none() => {
+                // A notification in ACP: the in-flight `session/prompt` is what
+                // reports the outcome, so the loop keeps running and waits for
+                // it to come back with `cancelled`.
+                client.notify("session/cancel", Some(serde_json::json!({"sessionId": session_id})));
+                give_up_at = Some(tokio::time::Instant::now() + cancel_grace);
+            }
+
+            _ = async {
+                match give_up_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Cancelled, and the agent never settled the prompt. Reporting
+                // the interrupt anyway is the bounded end the waiting rule
+                // requires; the child is reaped by the caller.
+                tracing::debug!(target: "comet_harness::acp", "agent did not settle a cancelled turn");
+                return TurnEnd::CancelledUnsettled;
+            }
+
+            _ = event_tx.closed() => return TurnEnd::ConsumerGone,
+        }
+    }
+}
+
+/// What the turn loop should do after one incoming frame.
+enum Handled {
+    Continue,
+    ConsumerGone,
+    AgentExited,
+}
+
+/// Serve one frame from the agent. Shared by the loop's waiting arm and by the
+/// post-settle drain, so a frame is treated identically whichever of the two
+/// picks it up — the alternative is two copies that quietly disagree about, say,
+/// whether an unsupported request still gets its `-32601`.
+async fn handle_incoming(
+    message: Incoming,
+    client: &RpcClient,
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+) -> Handled {
+    match message {
+        Incoming::Notification { method, params } => {
+            if method == "session/update" {
+                if let Some(event) = normalize::session_update(&params)
+                    && !send(event_tx, event).await
+                {
+                    return Handled::ConsumerGone;
+                }
+            } else {
+                // Vendor and lifecycle chatter -- `_x.ai/*` and friends.
+                // Dropped on purpose; see this module's header.
+                tracing::trace!(target: "comet_harness::acp", method, "unconsumed notification");
+            }
+            Handled::Continue
+        }
+
+        Incoming::Request { id, method, .. } => {
+            // Always answer. An unanswered server->client request leaves the
+            // agent waiting on a reply that never comes, which presents as a
+            // hung turn with no error anywhere.
+            tracing::debug!(target: "comet_harness::acp", method, "declining unsupported request");
+            client.respond_error(&id, -32601, "method not supported by this client");
+            Handled::Continue
+        }
+
+        Incoming::Malformed => {
+            let ev = crate::diagnostic(crate::UNPARSEABLE, DiagnosticSeverity::Malformed);
+            if send(event_tx, ev).await {
+                Handled::Continue
+            } else {
+                Handled::ConsumerGone
+            }
+        }
+
+        Incoming::Eof => Handled::AgentExited,
+    }
+}
+
+async fn send(tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>, ev: AgentEvent) -> bool {
+    tx.send(Ok(ev)).await.is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// Break caught: treating a missing `protocolVersion` as a mismatch, which
+    /// would refuse an agent that simply did not answer the question, or
+    /// treating a mismatch as tolerable, which would decode a protocol this
+    /// build cannot read and produce silent nonsense.
+    #[test]
+    fn only_a_stated_and_different_protocol_version_is_refused() {
+        assert!(check_protocol_version(&json!({"protocolVersion": 1})).is_ok());
+        assert!(check_protocol_version(&json!({})).is_ok());
+        assert!(check_protocol_version(&json!({"protocolVersion": null})).is_ok());
+        // Not a number at all: unreadable, not a disagreement.
+        assert!(check_protocol_version(&json!({"protocolVersion": "1"})).is_ok());
+
+        let refused =
+            check_protocol_version(&json!({"protocolVersion": 2})).expect_err("v2 must be refused");
+        let text = refused.to_string();
+        assert!(text.contains("v2"), "must name the agent's version: {text}");
+        assert!(text.contains("v1"), "must name Comet's version: {text}");
+    }
+
+    /// The handshake params are production's, not a copy — the capture
+    /// recorder re-exports this exact function so the corpus records the
+    /// handshake Comet performs. Asserts on the value itself for the reason
+    /// its own doc comment gives.
+    #[test]
+    fn the_handshake_declines_fs_and_terminal() {
+        let params = initialize_params();
+        assert_eq!(params["protocolVersion"], 1);
+        assert_eq!(params["clientCapabilities"]["terminal"], false);
+        assert_eq!(params["clientCapabilities"]["fs"]["readTextFile"], false);
+        assert_eq!(params["clientCapabilities"]["fs"]["writeTextFile"], false);
+    }
+
+    /// ACP carries a prompt as content blocks. Break caught: sending the text
+    /// as a bare string, which every recorded agent rejects.
+    #[test]
+    fn a_prompt_is_an_array_of_content_blocks() {
+        let params = prompt_params("s-1", "hello");
+        assert_eq!(params["sessionId"], "s-1");
+        let blocks = params["prompt"].as_array().expect("prompt is an array");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "hello");
+    }
+
+    /// `mcpServers: []` is declared rather than omitted: "none" and "the key
+    /// was not sent" are different statements to an agent that reads it.
+    #[test]
+    fn a_new_session_declares_no_mcp_servers_rather_than_omitting_them() {
+        let params = new_session_params("/tmp/x");
+        assert_eq!(params["cwd"], "/tmp/x");
+        assert_eq!(
+            params["mcpServers"].as_array().map(Vec::len),
+            Some(0),
+            "mcpServers must be present and empty"
+        );
+    }
+}

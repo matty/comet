@@ -32,6 +32,10 @@ tempfile.workspace = true
 # `CARGO_BIN_EXE_*`. Rust rather than shell scripts so they are spawnable on
 # Windows too — `CreateProcess` rejects a `#!/bin/sh` file (os error 193).
 [[bin]]
+name = "fake-acp"
+path = "tests/fixtures/fake_acp.rs"
+
+[[bin]]
 name = "fake-claude"
 path = "tests/fixtures/fake_claude.rs"
 

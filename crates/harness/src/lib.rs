@@ -8,6 +8,8 @@
 //! - Codex: spawn `codex app-server`, JSON-RPC 2.0 over stdio (thread/start, turn/start,
 //!   turn/steer{expectedTurnId}, turn/interrupt, item/* + delta notifications).
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use tokio::sync::{mpsc, oneshot};
@@ -132,6 +134,7 @@ pub trait Harness: Send + Sync {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError>;
 }
 
+pub mod acp;
 pub mod capture;
 pub mod claude;
 pub mod codex;
@@ -850,6 +853,27 @@ pub(crate) fn send_signal(pid: u32, signal: Signal) {
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn send_signal(_pid: u32, _signal: Signal) {
     // `start_kill`/`kill_on_drop` are the only lever on other platforms.
+}
+
+/// Reap the child: graceful SIGTERM first, SIGKILL after `kill_grace`.
+/// (`kill_on_drop` remains the last-resort backstop.)
+///
+/// Lives here rather than in one adapter because every adapter that spawns a
+/// child ends the same way, and a second copy would be a second place for the
+/// escalation order to drift. `send_signal` directly above it is the part that
+/// varies by platform.
+pub(crate) async fn shutdown_child(child: &mut tokio::process::Child, kill_grace: Duration) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    if let Some(pid) = child.id() {
+        send_signal(pid, Signal::Term);
+        if tokio::time::timeout(kill_grace, child.wait()).await.is_ok() {
+            return;
+        }
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 pub use claude::{ClaudeHarness, resolve_claude_executable};
