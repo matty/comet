@@ -17,6 +17,7 @@ use std::pin::Pin;
 
 use comet_proto::RunRequest;
 use provider::CaptureProvider;
+use providers::acp::AcpProvider;
 use providers::claude::ClaudeProvider;
 use providers::codex::CodexProvider;
 pub use scenarios::{Requirements, SCENARIOS, ScenarioSpec, scenario};
@@ -49,6 +50,7 @@ pub async fn record(config: CaptureConfig) -> anyhow::Result<RawCapture> {
     match &spec.body {
         ScenarioBody::Claude(body) => record_claude(&config, spec, input, *body).await,
         ScenarioBody::Codex(body) => record_codex(&config, spec, input, *body).await,
+        ScenarioBody::Acp(body) => record_acp(&config, spec, input, *body).await,
     }
 }
 
@@ -107,6 +109,24 @@ async fn record_codex(
         body,
         crate::codex::resolve_codex_executable,
         crate::codex::run_launch,
+    )
+    .await
+}
+
+async fn record_acp(
+    config: &CaptureConfig,
+    spec: &ScenarioSpec,
+    input: ScenarioInput,
+    body: ScenarioBodyFn<AcpProvider>,
+) -> anyhow::Result<RawCapture> {
+    record_provider(
+        AcpProvider::new(),
+        config,
+        spec,
+        input,
+        body,
+        crate::capture::record::scenarios::acp::resolve_node_executable,
+        crate::capture::record::scenarios::acp::run_launch_unreachable,
     )
     .await
 }
@@ -1109,6 +1129,18 @@ mod tests {
         // assertion instead of the gap going unnoticed.
         type RunBuilder = fn(&ScenarioInput) -> anyhow::Result<RunRequest>;
         const EXPECTED_ROWS: &[(Provider, &str, Option<RunBuilder>, FenceKind)] = &[
+            (
+                Provider::Acp,
+                "session-discovery-codex-acp",
+                None,
+                FenceKind::None,
+            ),
+            (
+                Provider::Acp,
+                "session-discovery-claude-acp",
+                None,
+                FenceKind::None,
+            ),
             (Provider::Claude, "model-discovery", None, FenceKind::None),
             (Provider::Claude, "command-discovery", None, FenceKind::None),
             (
@@ -1236,6 +1268,7 @@ mod tests {
             let provider_str = match spec.provider {
                 Provider::Claude => "claude",
                 Provider::Codex => "codex",
+                Provider::Acp => "acp",
             };
             let cfg = config(
                 spec.name,
@@ -1350,6 +1383,14 @@ mod tests {
                             Provider::Codex => {
                                 (absolute_program("codex"), crate::codex::run_launch)
                             }
+                            // Every ACP row is discovery, so the run launch is
+                            // never invoked; `every_acp_row_is_discovery` pins
+                            // that rather than this arm hoping for it.
+                            Provider::Acp => (
+                                absolute_program("node"),
+                                crate::capture::record::scenarios::acp::run_launch_unreachable
+                                    as fn(&Path, &RunRequest) -> LaunchDescriptor,
+                            ),
                         };
                     let (derived, _request) = derive_launch(&spec.launch, &input, &exe, run_launch)
                         .unwrap_or_else(|err| {
@@ -1421,7 +1462,13 @@ mod tests {
     ///   none carry machine- or session-specific data.
     #[test]
     fn every_scenario_launch_matches_its_committed_corpus_manifest() {
-        const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[];
+        // Registered but not yet recorded: both rows spawn a real ACP adapter,
+        // so their corpus has to come from an actual run on a machine with the
+        // adapters installed. There is no fake to record instead.
+        const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[
+            (Provider::Acp, "session-discovery-codex-acp"),
+            (Provider::Acp, "session-discovery-claude-acp"),
+        ];
 
         let root = crate::capture::corpus_root();
         let promoted = crate::capture::promoted_scenarios(&root)
@@ -1434,6 +1481,7 @@ mod tests {
             let provider_str = match spec.provider {
                 Provider::Claude => "claude",
                 Provider::Codex => "codex",
+                Provider::Acp => "acp",
             };
             let label = format!("{provider_str}/{}", spec.name);
 
@@ -1471,6 +1519,11 @@ mod tests {
                 match spec.provider {
                     Provider::Claude => (absolute_program("claude"), crate::claude::run_launch),
                     Provider::Codex => (absolute_program("codex"), crate::codex::run_launch),
+                    Provider::Acp => (
+                        absolute_program("node"),
+                        crate::capture::record::scenarios::acp::run_launch_unreachable
+                            as fn(&Path, &RunRequest) -> LaunchDescriptor,
+                    ),
                 };
 
             for scenario_dir in &scenario_dirs {
@@ -1549,9 +1602,13 @@ mod tests {
         unevidenced_sorted.sort();
         assert_eq!(
             unevidenced_sorted,
-            Vec::<String>::new(),
-            "EXEMPT_UNCAPTURED is empty, so nothing should land in unevidenced — a row losing \
-             corpus evidence must update this assertion deliberately, not pass through silently"
+            vec![
+                "acp/session-discovery-claude-acp".to_owned(),
+                "acp/session-discovery-codex-acp".to_owned(),
+            ],
+            "exactly the rows in EXEMPT_UNCAPTURED may land in unevidenced — a row losing \
+             corpus evidence must update this assertion deliberately, not pass through silently. \
+             Delete a row here once its capture is promoted."
         );
 
         assert!(

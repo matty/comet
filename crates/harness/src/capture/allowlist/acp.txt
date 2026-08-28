@@ -1,0 +1,16 @@
+# Paths whose values survive sanitizing, for ACP.
+# Anything not listed here is replaced. Adding a line is a
+# decision to publish that field's values forever.
+#
+# Deliberately near-empty. Nothing in Comet decodes ACP yet, so the standing
+# rule applies at its strictest: "nothing decodes it, so it goes." The four
+# paths below are the adapter's own published identity — the same strings npm
+# already serves — and they are here because the corpus version directory and
+# the capability sheet are named from them. Everything else, including every
+# capability flag, waits for a decode that reads it.
+.jsonrpc
+.method
+.result.protocolVersion
+.result.agentInfo.name
+.result.agentInfo.title
+.result.agentInfo.version

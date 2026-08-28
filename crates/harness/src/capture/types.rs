@@ -72,6 +72,10 @@ impl CommandSnapshot {
 pub enum Provider {
     Claude,
     Codex,
+    /// Every agent recorded through an Agent Client Protocol adapter. One
+    /// variant, not one per adapter: the wire is the protocol, and which agent
+    /// sits behind it is the scenario row's business.
+    Acp,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

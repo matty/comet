@@ -42,6 +42,10 @@ fn provider_display_name(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "Claude",
         Provider::Codex => "Codex",
+        // The family, not an agent: an ACP row names its adapter in the
+        // scenario, and the operator-facing "not found" message here is about
+        // node, which every adapter row spawns.
+        Provider::Acp => "ACP",
     }
 }
 
