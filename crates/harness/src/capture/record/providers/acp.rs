@@ -5,11 +5,6 @@ use crate::capture::record::provider::CaptureProvider;
 use crate::capture::record::scenarios::ScenarioInput;
 use crate::capture::record::session::Session;
 
-/// The ACP protocol version this recorder speaks. Both adapters answered
-/// `"protocolVersion": 1` to a `1` request (probed 2026-08-28 against
-/// codex-acp 1.7.0 and claude-agent-acp 0.70.0).
-pub(in crate::capture::record) const ACP_PROTOCOL_VERSION: u64 = 1;
-
 /// Holds the JSON-RPC id counter. Same reason as Codex's: the handshake
 /// spends the first id and a scenario body keeps drawing more.
 pub(in crate::capture::record) struct AcpProvider {
@@ -36,24 +31,10 @@ pub(in crate::capture::record) fn rpc_request(id: u64, method: &str, params: Val
     json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string()
 }
 
-/// The `initialize` params the handshake sends. A free function, not a literal
-/// inside `handshake`, so its test pins the bytes that actually go on the wire:
-/// a test that rebuilt this shape itself passed happily while the real
-/// handshake advertised a capability Comet cannot honor.
-pub(in crate::capture::record) fn initialize_params() -> Value {
-    json!({
-        "protocolVersion": ACP_PROTOCOL_VERSION,
-        "clientInfo": {
-            "name": "comet-native",
-            "title": "Comet",
-            "version": env!("CARGO_PKG_VERSION"),
-        },
-        "clientCapabilities": {
-            "fs": {"readTextFile": false, "writeTextFile": false},
-            "terminal": false,
-        },
-    })
-}
+/// The `initialize` params the handshake sends — **production's**, so the
+/// corpus records the handshake Comet really performs rather than one the
+/// recorder invented. See [`crate::acp::initialize_params`].
+pub(in crate::capture::record) use crate::acp::initialize_params;
 
 impl CaptureProvider for AcpProvider {
     const NAME: &'static str = "acp";

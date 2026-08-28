@@ -38,6 +38,7 @@ const EXEMPT_UNCAPTURED: &[(&str, &str)] = &[
     // operator can record, and so this gate names them until it exists.
     ("acp", "session-discovery-codex-acp"),
     ("acp", "session-discovery-claude-acp"),
+    ("acp", "session-discovery-grok"),
 ];
 
 fn provider_str(provider: Provider) -> &'static str {

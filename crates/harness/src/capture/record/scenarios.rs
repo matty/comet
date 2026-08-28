@@ -201,6 +201,21 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         body: ScenarioBody::Acp(|s, i| Box::pin(acp::session_discovery(s, i))),
     },
     ScenarioSpec {
+        name: "session-discovery-grok",
+        purpose: "the same ACP surface from Grok Build, the first ground-up ACP agent",
+        provider: Provider::Acp,
+        runtime_mode: None,
+        // `session/new` carries a cwd, so these rows genuinely read one --
+        // unlike the neutral CLI discovery aliases, which do not.
+        requirements: Requirements {
+            needs_cwd: true,
+            ..Requirements::discovery()
+        },
+        launch: ScenarioLaunch::Discovery(acp::grok_launch),
+        fence: no_fence,
+        body: ScenarioBody::Acp(|s, i| Box::pin(acp::session_discovery(s, i))),
+    },
+    ScenarioSpec {
         name: "model-discovery",
         purpose: "capture Claude's token-free model initialize reply",
         provider: Provider::Claude,
@@ -461,6 +476,9 @@ mod tests {
     #[test]
     fn every_scenario_name_the_binary_advertises_is_in_the_table() {
         for (provider, name) in [
+            ("acp", "session-discovery-codex-acp"),
+            ("acp", "session-discovery-claude-acp"),
+            ("acp", "session-discovery-grok"),
             ("claude", "model-discovery"),
             ("claude", "command-discovery"),
             ("claude", "fresh-text"),
@@ -491,7 +509,7 @@ mod tests {
         assert!(scenario("codex", "model-discovery-logged-out").is_some());
         assert_eq!(
             SCENARIOS.len(),
-            22,
+            23,
             "an added or removed row must update this count too"
         );
     }
