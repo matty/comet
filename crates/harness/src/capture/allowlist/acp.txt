@@ -2,15 +2,85 @@
 # Anything not listed here is replaced. Adding a line is a
 # decision to publish that field's values forever.
 #
-# Deliberately near-empty. Nothing in Comet decodes ACP yet, so the standing
-# rule applies at its strictest: "nothing decodes it, so it goes." The four
-# paths below are the adapter's own published identity — the same strings npm
-# already serves — and they are here because the corpus version directory and
-# the capability sheet are named from them. Everything else, including every
-# capability flag, waits for a decode that reads it.
+# Grown past "nothing decodes ACP yet" in the promote-the-captures slice
+# (2026-08-28): `crates/harness/src/acp/{mod,session,grok}.rs` now reads a
+# real subset of the handshake, the session-config/model surface, the usage
+# reading on a `session/prompt` reply, the tool-call state machine, and the
+# `session/update` discriminator. Every line below names its own decode site
+# in the task report; the standing rule is unchanged - a path earns a line
+# only because something in Comet reads it, never because the value looked
+# harmless.
+#
+# `_meta` is deliberately NOT a declared map (`surface::MAP_PATHS`). Its
+# immediate children are vendor-namespaced FIELD NAMES (`x.ai/sessionConfig`,
+# `claudeCode`, `steering`, `goal`, `jetbrains`, ...), one per vendor, and
+# AGENTS.md's rule publishes field names on purpose. Declaring `_meta` a map
+# would anonymize `.result._meta.steering.supported`'s own key and silently
+# break that entry below - worse than publishing a vendor namespace string.
+#
+# `.params.update.rawInput` and `.result._meta.usage.modelUsage` ARE declared
+# maps (`surface::MAP_PATHS`), so their contents never reach this file at all:
+# a tool call's own parameters are keyed by that tool's parameter names (a
+# union across every tool, D73's shape for Claude), and a real `steer-grok`
+# capture (2026-08-28) populated `rawInput.target_file` with this operator's
+# own filesystem paths.
+#
+# `.params.update.title` and a tool result's `content`/`rawOutput` are
+# deliberately OFF this list despite `title` being read on the announcing
+# `tool_call` frame (the raw tool name, e.g. "read_file" - harmless): the
+# SAME dotted path is overwritten on the following `tool_call_update` frame
+# with human prose that embeds a real file path ("Read `C:\Users\...`"), and
+# a leaf allowlist entry cannot tell the two frames apart. `content`/
+# `rawOutput` carried this operator's real file contents in that same
+# capture (Grok's `read_file` tool ran during the turn) and are wholly
+# undecoded regardless (`normalize::tool_update` sets `diff`/`diff_ref`/
+# `diff_stats` to `None` unconditionally). `locations[].path` is genuinely
+# decoded (`ReadFile.path`) but its only observed values so far are this
+# operator's own paths, so it stays off pending a clean sample. `kind` and
+# `status` are on this list: decoded, small fixed vocabularies
+# (`read`/`search`/`other`, `pending`/`in_progress`/`completed`/`failed`),
+# never personal data. See D102 for the fuller record.
+#
+# `.params.update.availableCommands[].name`/`.description`/`.input.hint` ARE
+# decoded (`normalize::commands`, feeds the slash-command picker) and are
+# still NOT on this list. Grok's `session/update` push mixes its own built-in
+# commands with every skill installed on the capturing machine - this
+# repository's own personal skill/plugin inventory showed up verbatim,
+# `_meta.path` included, even under an isolated `GROK_HOME` with a seeded
+# credential. See D102. Every `_meta` sibling on a command entry
+# (`.scope`/`.path`/`.bareName`/`.qualifiedName`/`.pluginName`) stays off this
+# list on ordinary undecoded grounds regardless.
 .jsonrpc
 .method
-.result.protocolVersion
+.params.clientCapabilities.fs.readTextFile
+.params.clientCapabilities.fs.writeTextFile
+.params.clientCapabilities.terminal
+.params.clientInfo.name
+.params.clientInfo.title
+.params.clientInfo.version
+.params.protocolVersion
+.params.update.kind
+.params.update.sessionUpdate
+.params.update.status
+.result._meta.inputTokens
+.result._meta.modelState.availableModels[].description
+.result._meta.modelState.availableModels[].modelId
+.result._meta.modelState.availableModels[].name
+.result._meta.modelState.availableModels[]._meta.reasoningEfforts[].id
+.result._meta.outputTokens
+.result._meta.steering.supported
+.result._meta.x.ai/sessionConfig.options[].category
+.result._meta.x.ai/sessionConfig.options[].id
+.result._meta.x.ai/sessionConfig.options[].label
 .result.agentInfo.name
 .result.agentInfo.title
 .result.agentInfo.version
+.result.authMethods[].id
+.result.models.availableModels[].description
+.result.models.availableModels[].modelId
+.result.models.availableModels[].name
+.result.models.availableModels[]._meta.reasoningEfforts[].id
+.result.models.availableModels[]._meta.totalContextTokens
+.result.models.currentModelId
+.result.protocolVersion
+.result.stopReason

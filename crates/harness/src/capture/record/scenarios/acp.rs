@@ -211,20 +211,168 @@ pub(in crate::capture::record) fn resolve_node_executable() -> Option<PathBuf> {
     })
 }
 
-/// ACP has no run rows yet, so this is never reached: every registered ACP
-/// scenario is `ScenarioLaunch::Discovery`, and `derive_launch` only calls a
-/// run launch for `ScenarioLaunch::Run`.
+/// SPAWN for the two Grok run rows (`run-grok`, `steer-grok`).
 ///
-/// The invariant is pinned by `every_acp_row_is_discovery` below rather than
-/// left to hope — an added run row fails that test instead of panicking during
-/// somebody's capture.
-pub(in crate::capture::record) fn run_launch_unreachable(
-    _executable: &Path,
-    _request: &comet_proto::RunRequest,
+/// Delegates to production's own [`crate::acp::grok::run_launch`] — the same
+/// launch `GrokHarness` uses for a real session — rather than building argv a
+/// second time here. That builder's own doc comment records why: a recorder
+/// with its own copy would be evidence of the recorder, not of Comet.
+///
+/// **codex-acp and claude-agent-acp never reach this function.** Both rows
+/// stay `ScenarioLaunch::Discovery` (`codex_acp_launch`/`claude_acp_launch`
+/// above) — `derive_launch` only calls a `Run` launch for
+/// `ScenarioLaunch::Run` rows, and Grok is the only ACP agent with a
+/// production `Harness` (AGENTS.md: "Claude and Codex keep their native
+/// drivers... Registering either as an ACP harness is out of scope").
+pub(in crate::capture::record) fn run_launch(
+    executable: &Path,
+    request: &comet_proto::RunRequest,
 ) -> LaunchDescriptor {
-    unreachable!(
-        "ACP registers only discovery rows today; a run row must supply its own launch builder"
-    )
+    crate::acp::grok::run_launch(executable, request)
+}
+
+/// The cheap text turn `run-grok` records: a fresh session, one prompt, one
+/// reply. `model`/`reasoning` are left `None` — Grok's `run_launch` ignores
+/// the request for argv (model/effort ride the session-config wire surface
+/// instead, per that function's own doc comment), and `GrokHarness` offers
+/// exactly one model, so there is nothing cheaper to select.
+pub(in crate::capture::record) fn run_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<comet_proto::RunRequest> {
+    let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
+    Ok(comet_proto::RunRequest {
+        prompt: "Reply with the single word capture.".into(),
+        cwd: cwd.display().to_string(),
+        ..comet_proto::RunRequest::for_session(comet_proto::RuntimeMode::FullAccess)
+    })
+}
+
+/// Handshake, open a session, send one `session/prompt`, wait for its reply.
+///
+/// Reads the request `record.rs`'s `derive_launch` already built for the
+/// launch (`Session::request`) rather than rebuilding it — same
+/// one-call-per-recording contract `codex::fresh_text_request`'s own doc
+/// comment names, so the recorded argv and the recorded wire line can never
+/// describe two different requests.
+pub(in crate::capture::record) async fn run(
+    session: &mut Session<AcpProvider>,
+    input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    AcpProvider::handshake(session, input).await?;
+    let request = session
+        .request
+        .clone()
+        .expect("run-grok is a Run scenario and always carries a request");
+
+    let cwd = input
+        .cwd
+        .clone()
+        .unwrap_or_else(std::env::temp_dir)
+        .to_string_lossy()
+        .into_owned();
+    let new_id = session.provider.next_id();
+    session
+        .send(&rpc_request(
+            new_id,
+            "session/new",
+            crate::acp::new_session_params(&cwd),
+        ))
+        .await?;
+    let session_id = session
+        .wait_for("JSON-RPC reply", |frame| {
+            (frame["id"].as_u64() == Some(new_id))
+                .then(|| frame["result"]["sessionId"].as_str().map(str::to_owned))
+                .flatten()
+        })
+        .await?;
+
+    let prompt_id = session.provider.next_id();
+    session
+        .send(&rpc_request(
+            prompt_id,
+            "session/prompt",
+            crate::acp::prompt_params(&session_id, &request.prompt),
+        ))
+        .await?;
+    session.wait_for_turn_end().await
+}
+
+/// Same request as [`run_request`] — the queued steer is a second, differently
+/// worded prompt, not a different turn shape.
+pub(in crate::capture::record) fn steer_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<comet_proto::RunRequest> {
+    let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
+    Ok(comet_proto::RunRequest {
+        prompt: "Begin a short response, then accept the follow-up instruction.".into(),
+        cwd: cwd.display().to_string(),
+        ..comet_proto::RunRequest::for_session(comet_proto::RuntimeMode::FullAccess)
+    })
+}
+
+/// The exact text `steer-grok` sends as its queued follow-up prompt. Named,
+/// like `codex::STEER_MESSAGE`, so the driving code and its own test cannot
+/// drift into two separate literals.
+const STEER_MESSAGE: &str = "Capture steering message.";
+
+/// **Grok has no in-turn steering extension** (`session.rs`'s module doc:
+/// "grok sends no `_meta.steering` at all"), so `GrokHarness` delivers a
+/// queued steer as the next `session/prompt` on the same session once the
+/// first one's reply lands — there is no `turn/steer` method to send here the
+/// way Codex's capture does. This records exactly that: two sequential
+/// `session/prompt` calls on one session, each awaited to completion before
+/// the next is sent, matching `session.rs`'s own "between turns" delivery.
+pub(in crate::capture::record) async fn steer(
+    session: &mut Session<AcpProvider>,
+    input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    AcpProvider::handshake(session, input).await?;
+    let request = session
+        .request
+        .clone()
+        .expect("steer-grok is a Run scenario and always carries a request");
+
+    let cwd = input
+        .cwd
+        .clone()
+        .unwrap_or_else(std::env::temp_dir)
+        .to_string_lossy()
+        .into_owned();
+    let new_id = session.provider.next_id();
+    session
+        .send(&rpc_request(
+            new_id,
+            "session/new",
+            crate::acp::new_session_params(&cwd),
+        ))
+        .await?;
+    let session_id = session
+        .wait_for("JSON-RPC reply", |frame| {
+            (frame["id"].as_u64() == Some(new_id))
+                .then(|| frame["result"]["sessionId"].as_str().map(str::to_owned))
+                .flatten()
+        })
+        .await?;
+
+    let first_id = session.provider.next_id();
+    session
+        .send(&rpc_request(
+            first_id,
+            "session/prompt",
+            crate::acp::prompt_params(&session_id, &request.prompt),
+        ))
+        .await?;
+    session.wait_for_turn_end().await?;
+
+    let steer_id = session.provider.next_id();
+    session
+        .send(&rpc_request(
+            steer_id,
+            "session/prompt",
+            crate::acp::prompt_params(&session_id, STEER_MESSAGE),
+        ))
+        .await?;
+    session.wait_for_turn_end().await
 }
 
 #[cfg(test)]
@@ -248,24 +396,6 @@ mod tests {
 
         assert_eq!(entry.extension().and_then(|e| e.to_str()), Some("js"));
         assert!(entry.ends_with("dist/index.js") || entry.ends_with("dist\\index.js"));
-    }
-
-    /// A missing adapter must name the install command. The alternative — a
-    /// bare "not found" — sends the reader hunting for a path they have no
-    /// reason to know.
-    /// Guards `run_launch_unreachable`. If an ACP run row is ever registered,
-    /// this fails here rather than panicking mid-capture on someone's machine.
-    #[test]
-    fn every_acp_row_is_discovery() {
-        use crate::capture::Provider;
-        use crate::capture::record::scenarios::{SCENARIOS, ScenarioLaunch};
-        for spec in SCENARIOS.iter().filter(|s| s.provider == Provider::Acp) {
-            assert!(
-                matches!(spec.launch, ScenarioLaunch::Discovery(_)),
-                "{} is an ACP run row; give it a real run launch and drop run_launch_unreachable",
-                spec.name
-            );
-        }
     }
 
     /// Break caught: reordering Grok's four launch tokens. `--no-auto-update`

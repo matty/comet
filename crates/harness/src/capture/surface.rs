@@ -94,7 +94,21 @@ pub enum SurfaceError {
 /// path declared here but not there would redact a key the snapshot still
 /// expects to see, and the reverse publishes an identifier the snapshot has
 /// already agreed is data.
-pub const MAP_PATHS: &[&str] = &[".modelUsage"];
+pub const MAP_PATHS: &[&str] = &[
+    ".modelUsage",
+    // ACP, promote-the-captures slice (2026-08-28). A tool call's own
+    // parameters, keyed by that tool's parameter names (`pattern`, `path`,
+    // `target_file`, ...) — a union across every tool an agent offers, the
+    // same shape of problem D73 tracks for Claude's tool-argument paths.
+    // First seen in `steer-grok` (grok 1.0.5): Grok's own read/search tools
+    // populate this from real filesystem paths on the capturing machine.
+    ".params.update.rawInput",
+    // ACP, same slice. `session/prompt`'s usage breakdown, keyed by model
+    // id — the ACP analog of Claude's `.modelUsage` above, at a different
+    // path because ACP nests usage under the prompt reply's own `_meta`
+    // rather than the frame root.
+    ".result._meta.usage.modelUsage",
+];
 
 /// Discriminator paths whose observed *values* form a provider's vocabulary —
 /// not every field, only the ones whose few distinct values answer "what

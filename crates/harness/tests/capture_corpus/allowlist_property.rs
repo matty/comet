@@ -427,6 +427,7 @@ fn manifest_provider(manifest_path: &Path, scenario: &str) -> Provider {
     match manifest["provider"].as_str() {
         Some("claude") => Provider::Claude,
         Some("codex") => Provider::Codex,
+        Some("acp") => Provider::Acp,
         other => panic!("{scenario}: manifest has an unknown provider: {other:?}"),
     }
 }

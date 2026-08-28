@@ -1,0 +1,26 @@
+{
+  "captured_at_unix_ms": 1787956614494,
+  "cli_version": "v22.23.2",
+  "command": {
+    "args": [
+      "<HOME>\\AppData\\Roaming\\npm\\node_modules\\@agentclientprotocol/codex-acp\\dist\\index.js"
+    ],
+    "configured_env": {},
+    "creation_flags": 0,
+    "cwd": "<CWD>",
+    "kill_on_drop": true,
+    "program": "<HOME>\\AppData\\Local\\hermes\\node\\node.exe",
+    "stderr": "Piped",
+    "stdin": "Piped",
+    "stdout": "Piped"
+  },
+  "exit_code": 0,
+  "platform": {
+    "arch": "x86_64",
+    "os": "windows"
+  },
+  "provider": "acp",
+  "purpose": "capture the ACP initialize + session/new surface through codex-acp",
+  "scenario": "session-discovery-codex-acp",
+  "schema_version": 1
+}
