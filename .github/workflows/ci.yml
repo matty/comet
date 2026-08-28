@@ -26,15 +26,15 @@ jobs:
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      # Pinned to the version installed and verified in PR0. A hung test would
-      # otherwise block this job with nothing to point at (D101); nextest kills
-      # and names it instead — see .config/nextest.toml.
+      # Pinned to cargo-nextest 0.9.143. A hung test would otherwise block this
+      # job with nothing to point at (D101); nextest kills and names it instead
+      # — see .config/nextest.toml.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.143
       - name: fmt
         run: cargo fmt --all -- --check
-      # No `-D warnings` yet: the workspace currently carries ~24 clippy warnings
+      # No `-D warnings` yet: the workspace currently carries 26 clippy warnings
       # (mostly `cloned_ref_to_slice_refs` in comet-ui/comet-engine and doc-list
       # indentation). Clear those, then add `-- -D warnings` here to keep it clean.
       - name: clippy

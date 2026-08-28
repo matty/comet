@@ -61,11 +61,14 @@ cd edge && npm install && npm run typecheck && npm test   # edge/
 python -m unittest discover -s scripts/tests              # scripts/*.py
 ```
 
-`.github/workflows/ci.yml` runs the same commands on every PR (with `fmt --check`).
+`.github/workflows/ci.yml` runs the same commands on every PR (with `fmt --check`), except
+tests run with `--profile ci`, which adds one retry — a timeout that passes on retry reports as
+flaky rather than failing the job, so a green CI run does not guarantee the local
+`--profile default` run (no retries) would also be green.
 `.github/workflows/release.yml` is separate and only builds nightly releases. Run the gate
 locally first — don't use CI as the first place a change is checked.
 
-Clippy is not yet `-D warnings`: the workspace carries ~24 pre-existing warnings. Don't add
+Clippy is not yet `-D warnings`: the workspace carries 26 pre-existing warnings. Don't add
 new ones, and prefer fixing any you touch.
 
 A failure you write off as a known flake must name where it is recorded. "The documented

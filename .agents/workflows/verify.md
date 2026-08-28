@@ -4,8 +4,10 @@ Run the project's gate and report the real output. Never claim a change works, b
 passes without having run these and read the result.
 
 `.github/workflows/ci.yml` runs the same commands on every PR, with `cargo fmt --all --
---check` instead of the rewriting form. Run them locally first — CI is the backstop, not the
-first check.
+--check` instead of the rewriting form, and tests run with `--profile ci`, which adds one
+retry — a timeout that passes on retry reports as flaky rather than failing the job, so a green
+CI run does not guarantee the local `--profile default` run (no retries) would also be green.
+Run them locally first — CI is the backstop, not the first check.
 
 ## Always (Rust)
 
@@ -23,8 +25,11 @@ cargo nextest run --workspace
   PATH), not plain `cargo test`: `.config/nextest.toml` kills and names a test still running
   at 180s instead of letting it block the run forever — a hung test must be reported, not
   waited on. `.config/nextest.toml` does not change what plain `cargo test` does, so
-  `cargo test` still reproduces a hang if you need to demonstrate one.
-- Clippy is not `-D warnings` — the workspace carries ~24 pre-existing warnings (mostly
+  `cargo test` still reproduces a hang if you need to demonstrate one. **nextest runs no
+  doctests** — the workspace has none runnable today, but if you add a `rust`-fenced doc
+  example later, `cargo nextest run` will not run it; `cargo test --workspace --doc` is the
+  check.
+- Clippy is not `-D warnings` — the workspace carries 26 pre-existing warnings (mostly
   `cloned_ref_to_slice_refs` in `comet-ui`/`comet-engine` and doc-list indentation). Compare
   against that baseline: don't add new ones, and fix any in code you touched.
 - The first build after a `gpui` change is slow — gpui and its deps build at `opt-level = 2`
