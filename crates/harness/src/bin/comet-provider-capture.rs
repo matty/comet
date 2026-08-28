@@ -9,6 +9,7 @@ fn provider_key(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "claude",
         Provider::Codex => "codex",
+        Provider::Acp => "acp",
     }
 }
 
@@ -25,7 +26,7 @@ const SCENARIO_LINE_WIDTH: usize = 92;
 /// first name, the same shape the hand-typed text used.
 fn scenario_help_lines() -> String {
     let mut lines = String::new();
-    for provider in [Provider::Claude, Provider::Codex] {
+    for provider in [Provider::Claude, Provider::Codex, Provider::Acp] {
         let names: Vec<&str> = SCENARIOS
             .iter()
             .filter(|spec| spec.provider == provider)
@@ -58,7 +59,7 @@ fn scenario_help_lines() -> String {
 
 fn help_text() -> String {
     format!(
-        r#"Record a raw Claude Code or Codex provider session.
+        r#"Record a raw Claude Code, Codex, or ACP provider session.
 
 Usage:
   comet-provider-capture <PROVIDER> <SCENARIO> [OPTIONS]
@@ -66,6 +67,7 @@ Usage:
 Providers:
   claude    Claude Code stream-json
   codex     Codex app-server JSON-RPC
+  acp       Agent Client Protocol adapters (pass --executable <node>)
 
 Scenarios:
 {}
@@ -633,8 +635,14 @@ mod tests {
             .to_owned();
         for line in &lines[start + 1..] {
             let trimmed = line.trim_start();
-            if trimmed.is_empty() || trimmed.starts_with("claude:") || trimmed.starts_with("codex:")
-            {
+            // Stop at the NEXT provider's block, whichever it is. Listing the
+            // keys by hand here meant a third provider's line was read as a
+            // continuation of the second's, and the divergence surfaced as
+            // codex advertising a scenario named "full-access acp:    …".
+            let next_block = [Provider::Claude, Provider::Codex, Provider::Acp]
+                .iter()
+                .any(|p| trimmed.starts_with(&format!("{}:", provider_key(*p))));
+            if trimmed.is_empty() || next_block {
                 break;
             }
             joined.push(' ');
@@ -663,7 +671,7 @@ mod tests {
     #[test]
     fn every_help_text_scenario_is_a_table_row_and_dispatches() {
         let help = help_text();
-        for provider in [Provider::Claude, Provider::Codex] {
+        for provider in [Provider::Claude, Provider::Codex, Provider::Acp] {
             let key = provider_key(provider);
             let prefix = format!("{key}:");
             let advertised = advertised_scenario_names(&help, &prefix);

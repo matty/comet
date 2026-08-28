@@ -55,6 +55,7 @@ use super::types::Provider;
 
 const CLAUDE_TXT: &str = include_str!("allowlist/claude.txt");
 const CODEX_TXT: &str = include_str!("allowlist/codex.txt");
+const ACP_TXT: &str = include_str!("allowlist/acp.txt");
 
 fn parse(source: &'static str) -> BTreeSet<&'static str> {
     source
@@ -74,6 +75,11 @@ fn codex_paths() -> &'static BTreeSet<&'static str> {
     PATHS.get_or_init(|| parse(CODEX_TXT))
 }
 
+fn acp_paths() -> &'static BTreeSet<&'static str> {
+    static PATHS: OnceLock<BTreeSet<&'static str>> = OnceLock::new();
+    PATHS.get_or_init(|| parse(ACP_TXT))
+}
+
 /// Whether `path`'s value survives sanitizing for `provider`.
 ///
 /// `path` is a full dotted key path, matched exactly against the provider's
@@ -85,6 +91,7 @@ pub fn allows(provider: Provider, path: &str) -> bool {
     match provider {
         Provider::Claude => claude_paths().contains(path),
         Provider::Codex => codex_paths().contains(path),
+        Provider::Acp => acp_paths().contains(path),
     }
 }
 
@@ -113,6 +120,7 @@ pub fn allows_prefix(provider: Provider, path: &str) -> bool {
     let paths = match provider {
         Provider::Claude => claude_paths(),
         Provider::Codex => codex_paths(),
+        Provider::Acp => acp_paths(),
     };
     paths.iter().any(|listed| {
         listed

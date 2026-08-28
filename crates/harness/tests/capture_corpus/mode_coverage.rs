@@ -41,6 +41,7 @@ fn provider_str(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "claude",
         Provider::Codex => "codex",
+        Provider::Acp => "acp",
     }
 }
 

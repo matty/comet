@@ -30,12 +30,21 @@ use comet_harness::capture::{Provider, SCENARIOS, corpus_root, promoted_scenario
 /// than deleting the constant — the stale-exemption direction of the gate
 /// below is what would have caught these seven going stale, and it needs a
 /// (possibly empty) list to check against.
-const EXEMPT_UNCAPTURED: &[(&str, &str)] = &[];
+const EXEMPT_UNCAPTURED: &[(&str, &str)] = &[
+    // Registered, not yet recorded. Both rows spawn a real ACP adapter, so the
+    // corpus behind them has to come from an actual run on a machine with the
+    // adapters installed -- there is no fake to record instead. They are listed
+    // here rather than left out of SCENARIOS so `--help` shows what a capture
+    // operator can record, and so this gate names them until it exists.
+    ("acp", "session-discovery-codex-acp"),
+    ("acp", "session-discovery-claude-acp"),
+];
 
 fn provider_str(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "claude",
         Provider::Codex => "codex",
+        Provider::Acp => "acp",
     }
 }
 

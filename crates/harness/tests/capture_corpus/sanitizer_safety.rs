@@ -190,6 +190,7 @@ fn sanitizer_rejects_a_credential_riding_an_allowlisted_path() {
         capture["provider"] = Value::String(match provider {
             Provider::Claude => "claude".into(),
             Provider::Codex => "codex".into(),
+            Provider::Acp => "acp".into(),
         });
         std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
 

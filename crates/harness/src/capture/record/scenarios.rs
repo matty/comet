@@ -8,6 +8,7 @@
 //! arguments off this table, and `record()` dispatches off it directly by
 //! `(provider, name)`. There is no other place a scenario's name is spelled.
 
+pub(super) mod acp;
 pub(super) mod claude;
 pub(super) mod codex;
 
@@ -17,6 +18,7 @@ use std::pin::Pin;
 
 use comet_proto::{RunRequest, RuntimeMode};
 
+use super::providers::acp::AcpProvider;
 use super::providers::claude::ClaudeProvider;
 use super::providers::codex::CodexProvider;
 use super::session::{FenceOutcome, Session};
@@ -164,9 +166,40 @@ type BoxedFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
 pub(super) enum ScenarioBody {
     Claude(for<'a> fn(&'a mut Session<ClaudeProvider>, &'a ScenarioInput) -> BoxedFuture<'a>),
     Codex(for<'a> fn(&'a mut Session<CodexProvider>, &'a ScenarioInput) -> BoxedFuture<'a>),
+    Acp(for<'a> fn(&'a mut Session<AcpProvider>, &'a ScenarioInput) -> BoxedFuture<'a>),
 }
 
 pub const SCENARIOS: &[ScenarioSpec] = &[
+    ScenarioSpec {
+        name: "session-discovery-codex-acp",
+        purpose: "capture the ACP initialize + session/new surface through codex-acp",
+        provider: Provider::Acp,
+        runtime_mode: None,
+        // `session/new` carries a cwd, so these rows genuinely read one --
+        // unlike the neutral CLI discovery aliases, which do not.
+        requirements: Requirements {
+            needs_cwd: true,
+            ..Requirements::discovery()
+        },
+        launch: ScenarioLaunch::Discovery(acp::codex_acp_launch),
+        fence: no_fence,
+        body: ScenarioBody::Acp(|s, i| Box::pin(acp::session_discovery(s, i))),
+    },
+    ScenarioSpec {
+        name: "session-discovery-claude-acp",
+        purpose: "the same ACP surface through claude-agent-acp, for the two-speaker diff",
+        provider: Provider::Acp,
+        runtime_mode: None,
+        // `session/new` carries a cwd, so these rows genuinely read one --
+        // unlike the neutral CLI discovery aliases, which do not.
+        requirements: Requirements {
+            needs_cwd: true,
+            ..Requirements::discovery()
+        },
+        launch: ScenarioLaunch::Discovery(acp::claude_acp_launch),
+        fence: no_fence,
+        body: ScenarioBody::Acp(|s, i| Box::pin(acp::session_discovery(s, i))),
+    },
     ScenarioSpec {
         name: "model-discovery",
         purpose: "capture Claude's token-free model initialize reply",
@@ -412,6 +445,7 @@ pub fn scenario(provider: &str, name: &str) -> Option<&'static ScenarioSpec> {
         let spec_provider = match spec.provider {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
+            Provider::Acp => "acp",
         };
         spec_provider == provider && spec.name == name
     })
@@ -457,7 +491,7 @@ mod tests {
         assert!(scenario("codex", "model-discovery-logged-out").is_some());
         assert_eq!(
             SCENARIOS.len(),
-            20,
+            22,
             "an added or removed row must update this count too"
         );
     }
