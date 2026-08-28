@@ -130,9 +130,19 @@ pub(crate) fn run_launch(exe: &Path, _request: &RunRequest) -> LaunchDescriptor 
 /// machine). `accepts_images: true` comes from the real captured `initialize`
 /// reply: `agentCapabilities.promptCapabilities.image` read `true` on
 /// hermes-agent 0.15.2, 2026-08-28.
+///
+/// **The id is `openai:gpt-5.4-mini`, in `provider:model` form, not the bare
+/// model name.** Hermes encodes every wire `modelId` this way
+/// (`_encode_model_choice`, `acp_adapter/server.py:568-576`, consumed by
+/// `_build_model_state` at `:595` and `:612`) — `models_from_discovery`'s own
+/// fixtures below assume it. `discovery::merge` dedupes by exact id equality
+/// (`discovery.rs:102,112`), so a curated entry in the bare-name space would
+/// never match a live row for the same model and would duplicate it in the
+/// picker instead of enriching it — see
+/// `the_curated_id_matches_the_encoded_space_discovery_uses` below.
 fn static_models() -> Vec<Model> {
     vec![Model {
-        id: "gpt-5.4-mini".into(),
+        id: "openai:gpt-5.4-mini".into(),
         label: "GPT-5.4 Mini".into(),
         description: Some("OpenAI's compact model, routed through Hermes".into()),
         reasoning_levels: Vec::new(),
@@ -143,11 +153,21 @@ fn static_models() -> Vec<Model> {
 
 /// The model list, read off `session/new`'s ACP-spec-shape `models` block.
 ///
-/// **No vendor config surface, unlike Grok's `_meta["x.ai/sessionConfig"]`.**
-/// Hermes' installed `acp_adapter.server._build_model_state` (source, not a
-/// capture -- see this module's header) populates only the spec's own
-/// (unstable) `models.availableModels[].modelId/.name` and
-/// `models.currentModelId`, the same top-level path Grok itself falls back to
+/// **No vendor `_meta` config surface, unlike Grok's
+/// `_meta["x.ai/sessionConfig"]` — and no `configOptions` either.** But
+/// `session/new` is not bare: Hermes' installed `acp_adapter.server` DOES
+/// return a `modes` block (`new_session` returns `modes=self._session_modes
+/// (state)`, `server.py:1083`), and that method's own docstring
+/// (`:530-536`) says plainly what it is for: "Hermes maps edit approval
+/// policy onto modes instead of advertising config options." `modes` is
+/// Hermes' edit-approval-policy selector, not a model or effort surface — see
+/// `HermesHarness::capabilities()` for what that mapping means for approvals
+/// — so it has nothing this function needs to read.
+///
+/// The one surface this function DOES read is the spec's own (unstable)
+/// `models.availableModels[].modelId/.name` and `models.currentModelId`
+/// (`acp_adapter.server._build_model_state`, source, not a capture -- see
+/// this module's header), the same top-level path Grok itself falls back to
 /// when its own vendor surface is absent
 /// (`grok::models_from_discovery`'s "no config surface" branch). Reusing that
 /// reading here is not a guess at Hermes' shape; it is the one path Hermes'
@@ -260,13 +280,22 @@ impl HermesHarness {
     /// The single declaration of what Hermes can honor, named by both the
     /// registry's lazy descriptor and the trait impl so the two cannot drift.
     ///
-    /// **No steering extension, and no effort ladder -- both confirmed
-    /// absent from the real `initialize` reply** (hermes-agent 0.15.2,
-    /// captured 2026-08-28): no `_meta.steering` anywhere in the result, and
-    /// no reasoning/effort vocabulary in the handshake or the session config.
-    /// A steer is therefore delivered as the next prompt on the same session
-    /// -- slower than an in-turn steer and correct -- and a populated ladder
-    /// here would be a promise the run breaks.
+    /// **No steering extension**, confirmed absent from the real `initialize`
+    /// reply (hermes-agent 0.15.2, captured 2026-08-28): no `_meta.steering`
+    /// anywhere in the result. Pinned against production's own decode of that
+    /// literal in `the_captured_initialize_reply_has_no_steering` below, via
+    /// `AgentDescription::from_initialize`. A steer is therefore delivered as
+    /// the next prompt on the same session -- slower than an in-turn steer
+    /// and correct.
+    ///
+    /// **No effort ladder**, on two different kinds of evidence. The
+    /// handshake carries none: the captured `initialize` reply has no
+    /// reasoning/effort vocabulary anywhere. The session config carries none
+    /// either, but that half is a SOURCE read, not a capture -- no
+    /// `session/new` reply was ever obtained (this module's header) -- and
+    /// rests on `acp.schema.SessionModelState` (the type
+    /// `_build_model_state` returns) having no effort-level field at all. A
+    /// populated ladder here would be a promise the run breaks.
     pub fn capabilities() -> HarnessCapabilities {
         HarnessCapabilities {
             supports_steering: true,
@@ -275,6 +304,21 @@ impl HermesHarness {
             // **One mode, deliberately.** Same reasoning as Grok: approvals
             // are unrouted until PR6, and every mode that promises to ask is
             // a promise the run cannot keep.
+            //
+            // **This is not a hypothetical gap for Hermes.** Its OWN default
+            // session mode maps to edit-approval policy "ask"
+            // (`_MODE_TO_EDIT_APPROVAL_POLICY["default"] == "ask"`,
+            // `acp_adapter/server.py:504-511`, and `_session_modes` falls
+            // back to that default whenever the session's own mode is unset
+            // or unrecognized, `:538-540`) -- while this crate's ACP session
+            // loop answers EVERY server->client request, including
+            // `session/request_permission`, with `-32601`
+            // (`acp/session.rs:752`). So a real Hermes turn that edits a file
+            // asks a client that cannot answer. `FullAccess` stays the only
+            // declared mode regardless (a mode that promises to ask is worse
+            // than one that is honest about not asking yet), but whichever
+            // slice wires approvals needs to know Hermes' default is
+            // ask-before-edits, not silent-allow.
             runtime_modes: vec![RuntimeMode::FullAccess],
             // Nothing to attach a note to while approvals are unrouted.
             carries_deny_note: false,
@@ -406,6 +450,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::acp::AgentDescription;
 
     /// Break caught: reordering or adding to Hermes' launch tokens.
     #[test]
@@ -425,17 +470,22 @@ mod tests {
     }
 
     /// The real `initialize` reply hermes-agent 0.15.2 sent on 2026-08-28,
-    /// captured with an OpenRouter provider selected (a fake key, so the
-    /// handshake succeeded and the later LLM-client construction did not):
-    /// `agentCapabilities.promptCapabilities.image: true`, and — like the
-    /// unconfigured run — no `_meta.steering` anywhere in the result.
+    /// from the UNCONFIGURED run (`raw-session.jsonl`) -- no provider
+    /// selected, `authMethods` a single `hermes-setup` entry pointing at
+    /// `--setup`. (The OpenRouter-provider run, `raw-session-2.jsonl`, is a
+    /// different literal with two `authMethods` entries; this one is not
+    /// it.) `agentCapabilities.promptCapabilities.image: true`, and no
+    /// `_meta.steering` anywhere in the result.
     ///
-    /// This module's `models_from_discovery` reads `session/new`, not
-    /// `initialize`; this test exists so the capability facts this file's
-    /// doc comments cite have one literal pinning them, matching the style
-    /// `grok.rs` and `mod.rs` already use for their own captured replies.
+    /// **Routed through production's own decode, not just indexed as raw
+    /// JSON.** `AgentDescription::from_initialize` (`acp/mod.rs`, private to
+    /// `acp` and therefore reachable from this child module) is the actual
+    /// function that turns this literal into `HermesHarness::capabilities()`
+    /// 's `SteeringMode::TurnBoundary` -- so this is a test that can go red
+    /// if that decode ever changes, not a description of the literal it
+    /// wrote three lines above itself.
     #[test]
-    fn the_captured_initialize_reply_has_no_steering_and_no_ladder() {
+    fn the_captured_initialize_reply_has_no_steering() {
         let initialized = json!({
             "agentCapabilities": {
                 "loadSession": true,
@@ -459,10 +509,35 @@ mod tests {
             initialized["agentCapabilities"]["promptCapabilities"]["image"],
             true
         );
-        assert!(
-            initialized["_meta"]["steering"].is_null(),
+
+        let agent = AgentDescription::from_initialize(&initialized);
+        assert_eq!(
+            agent.steering, None,
             "the real reply carries no _meta.steering at all"
         );
+        assert!(
+            !agent.supports_steering(),
+            "absent steering must decode as unknown, not as enabled"
+        );
+    }
+
+    /// The handshake half of the "no effort ladder" claim: no reasoning/
+    /// effort vocabulary anywhere in the real `initialize` reply. The OTHER
+    /// half -- that `session/new`'s own model surface carries no effort
+    /// field either -- is a source read of `acp.schema.SessionModelState`,
+    /// not a capture (see `HermesHarness::capabilities()`'s doc comment), and
+    /// is not what this test checks.
+    #[test]
+    fn the_captured_initialize_reply_has_no_effort_vocabulary() {
+        let initialized = json!({
+            "agentCapabilities": {
+                "loadSession": true,
+                "promptCapabilities": {"image": true},
+                "sessionCapabilities": {"fork": {}, "list": {}, "resume": {}},
+            },
+            "agentInfo": {"name": "hermes-agent", "version": "0.15.2"},
+            "protocolVersion": 1,
+        });
         assert!(
             initialized.get("reasoningEfforts").is_none(),
             "no effort vocabulary anywhere in the handshake"
@@ -567,6 +642,40 @@ mod tests {
         assert!(
             !catalog.models.is_empty(),
             "a discovery failure must not degrade to an empty list"
+        );
+    }
+
+    /// **The curated id must live in the same space discovery uses, or the
+    /// picker shows the same model twice.** Hermes encodes every wire
+    /// `modelId` as `provider:model` (`_encode_model_choice`,
+    /// `acp_adapter/server.py:568-576`, consumed by `_build_model_state` at
+    /// `:595` and `:612`) -- `openai:gpt-5.4-mini`, never the bare
+    /// `gpt-5.4-mini`. `discovery::merge` dedupes by exact id equality
+    /// (`discovery.rs:102,112`), so a curated entry in the wrong space would
+    /// never match a live row for the same model: "GPT-5.4 Mini" from the
+    /// curated list AND "gpt-5.4-mini" from discovery, two rows for one
+    /// model. Break caught: reverting `static_models()`'s id to the bare
+    /// form makes the two counted below stop being one.
+    #[test]
+    fn the_curated_id_matches_the_encoded_space_discovery_uses() {
+        let discovered = Discovered {
+            initialized: json!({}),
+            session: json!({"models": {"availableModels": [
+                {"modelId": "openai:gpt-5.4-mini", "name": "GPT-5.4 Mini (live)"},
+            ]}}),
+            ..Default::default()
+        };
+        let discovery = models_from_discovery(&discovered);
+        let merged = crate::discovery::merge(static_models(), &discovery);
+
+        let matches: Vec<&Model> = merged
+            .iter()
+            .filter(|m| m.id == "openai:gpt-5.4-mini")
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "the curated and discovered rows must be the SAME row, not two: {merged:#?}"
         );
     }
 

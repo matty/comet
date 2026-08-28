@@ -20,10 +20,11 @@
 //!
 //! **Steering rides the turn boundary, always, in this module.** No recorded
 //! agent advertises the steering extension: grok sends no `_meta.steering` at
-//! all. A queued steer is therefore delivered as the next `session/prompt` on
-//! the same session, which is slower than an in-turn steer and correct. When an
-//! agent that does advertise the extension appears, `AgentDescription::
-//! supports_steering` is the gate that would pick the faster path.
+//! all, and neither does Hermes. A queued steer is therefore delivered as the
+//! next `session/prompt` on the same session, which is slower than an
+//! in-turn steer and correct. When an agent that does advertise the
+//! extension appears, `AgentDescription::supports_steering` is the gate that
+//! would pick the faster path.
 
 use std::process::Stdio;
 use std::time::Duration;
