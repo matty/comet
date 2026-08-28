@@ -119,3 +119,43 @@ async fn a_real_turn_streams_and_settles() {
         other => unreachable!("{other:?}"),
     }
 }
+
+/// **The path the model picker actually runs, against the real CLI.**
+///
+/// The fixture covers the decode and `grok_live`'s turn test covers `run()`;
+/// neither covers `models()` against real Grok, and that is the gap the picker
+/// hung in. Token-free: `initialize` and `session/new` never reach a model.
+#[tokio::test]
+#[ignore = "spawns the real Grok CLI; run with --ignored"]
+async fn discovery_answers_within_its_own_timeouts() {
+    let harness = GrokHarness::new();
+
+    // Deliberately longer than the harness's own handshake bound, so a failure
+    // here means the bound did not fire — which is a different bug from a slow
+    // agent, and the one worth telling apart.
+    let started = std::time::Instant::now();
+    let catalog = tokio::time::timeout(Duration::from_secs(90), harness.models())
+        .await
+        .expect("models() answers within its own timeouts rather than hanging")
+        .expect("an installed CLI resolves");
+    let elapsed = started.elapsed();
+
+    // **Asserting the CLOCK, not just the answer.** The bug this test was
+    // written for returned a correct catalog after 33s — a handshake timeout
+    // plus a reap — and the picker sat on "loading models" the whole time. A
+    // test that only checked the models passed happily through it. Grok really
+    // answers `initialize` and `session/new` in well under a second; the budget
+    // here is loose enough for a cold start on a VM and still an order of
+    // magnitude under a single 30s bound.
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "discovery took {elapsed:?} — a timeout fired instead of the agent answering"
+    );
+    println!("discovery took {elapsed:?}");
+
+    println!("source={:?}", catalog.source);
+    for m in &catalog.models {
+        println!("  {} — {} {:?}", m.id, m.label, m.reasoning_levels);
+    }
+    assert!(!catalog.models.is_empty());
+}

@@ -108,9 +108,23 @@ fn main() {
         let method = frame["method"].as_str().unwrap_or_default().to_owned();
 
         match method.as_str() {
-            "initialize" => emit(&json!({
-                "jsonrpc": "2.0", "id": id, "result": initialize_result(steering),
-            })),
+            "initialize" => {
+                emit(&json!({
+                    "jsonrpc": "2.0", "id": id, "result": initialize_result(steering),
+                }));
+                // **An unsolicited notification, the way a real agent does.**
+                // grok 1.0.5 emits a burst of `_x.ai/*` frames right after the
+                // handshake, and that burst is load-bearing for the client: a
+                // client that has dropped its `Incoming` receiver kills its own
+                // reader task on the first one, and every later reply goes
+                // unparsed. This fixture was silent until prompted, so it could
+                // not reproduce that — and the bug shipped to the model picker.
+                emit(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "_fake/ready",
+                    "params": {"note": "unsolicited; see the comment above"},
+                }));
+            }
             "session/new" => {
                 session_counter += 1;
                 let mut result = json!({"sessionId": format!("fake-session-{session_counter}")});

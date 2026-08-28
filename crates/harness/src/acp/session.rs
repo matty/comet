@@ -161,7 +161,20 @@ impl AcpSession {
             mut child,
             client,
             initialized,
-            ..
+            // **`incoming` MUST stay alive across `session/new`.** Dropping the
+            // receiver makes the reader task's `tx.send` fail on the very next
+            // notification, and `read_loop` RETURNS on that error — so nothing
+            // parses stdout any more and the reply this function is waiting for
+            // never resolves. Discovery then burns the full handshake timeout
+            // and falls back, on an agent that answered in 550ms.
+            //
+            // That is not hypothetical: it shipped. Destructuring this field
+            // away with `..` made the Grok model picker sit on "loading models"
+            // for 30s, while `open()` — which keeps the receiver in its struct —
+            // was fine, and while `fake-acp` (silent until prompted) could not
+            // reproduce it.
+            incoming,
+            stderr_tail: _,
         } = connect(command, timeouts).await?;
 
         // **`session/new` is worth the extra round trip.** It is token-free like
@@ -178,6 +191,8 @@ impl AcpSession {
         )
         .await;
 
+        // Only now: the reply is in hand, so the reader has nothing left to do.
+        drop(incoming);
         shutdown_child(&mut child, timeouts.kill_grace).await;
         Ok(Discovered {
             initialized,
