@@ -46,8 +46,13 @@ Run all three and report the actual output — never claim a change works withou
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets
-cargo test --workspace
+cargo nextest run --workspace
 ```
+
+Tests run under `cargo-nextest`, not plain `cargo test`: a hung test must be killed and named
+instead of blocking the run forever, which `.config/nextest.toml`'s `slow-timeout` does — see
+its comment for why. `cargo nextest run` needs `cargo-nextest` installed
+(`cargo install cargo-nextest --locked`); CI installs a pinned version.
 
 Also run, when the change touches them:
 

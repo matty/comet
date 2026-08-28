@@ -12,13 +12,18 @@ first check.
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets
-cargo test --workspace
+cargo nextest run --workspace
 ```
 
 - `cargo fmt --all` rewrites files; run it first so clippy and tests see formatted code.
   In a check-only context use `cargo fmt --all -- --check`.
 - `--all-targets` matters: it covers the integration suites under `crates/*/tests/`, which
   plain `cargo clippy` skips.
+- Tests run under `cargo-nextest` (`cargo install cargo-nextest --locked` if it isn't on
+  PATH), not plain `cargo test`: `.config/nextest.toml` kills and names a test still running
+  at 180s instead of letting it block the run forever — a hung test must be reported, not
+  waited on. `.config/nextest.toml` does not change what plain `cargo test` does, so
+  `cargo test` still reproduces a hang if you need to demonstrate one.
 - Clippy is not `-D warnings` — the workspace carries ~24 pre-existing warnings (mostly
   `cloned_ref_to_slice_refs` in `comet-ui`/`comet-engine` and doc-list indentation). Compare
   against that baseline: don't add new ones, and fix any in code you touched.
