@@ -78,6 +78,9 @@ pub struct AcpSession {
     stderr_tail: StderrTail,
     agent: AgentDescription,
     session_id: String,
+    /// The current model's ceiling, read once from `session/new`. `None` is
+    /// "the agent did not say", never "no limit".
+    context_window: Option<u64>,
     timeouts: Timeouts,
 }
 
@@ -136,6 +139,7 @@ impl AcpSession {
             stderr_tail,
             agent,
             session_id,
+            context_window: normalize::context_window(&opened),
             timeouts,
         })
     }
@@ -173,7 +177,7 @@ impl AcpSession {
             // for 30s, while `open()` — which keeps the receiver in its struct —
             // was fine, and while `fake-acp` (silent until prompted) could not
             // reproduce it.
-            incoming,
+            mut incoming,
             stderr_tail: _,
         } = connect(command, timeouts).await?;
 
@@ -191,6 +195,20 @@ impl AcpSession {
         )
         .await;
 
+        // **Drain what the agent pushed while we were waiting.** Grok sends its
+        // whole slash-command list unsolicited, before the `session/new` reply
+        // lands — so it is already sitting in the channel, and collecting it
+        // here costs nothing and no tokens. Anything else is dropped: this is a
+        // discovery probe, not a session anyone is watching.
+        let mut commands = Value::Null;
+        while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
+            if method == "session/update"
+                && params["update"]["sessionUpdate"].as_str() == Some("available_commands_update")
+            {
+                commands = params["update"]["availableCommands"].clone();
+            }
+        }
+
         // Only now: the reply is in hand, so the reader has nothing left to do.
         drop(incoming);
         shutdown_child(&mut child, timeouts.kill_grace).await;
@@ -203,6 +221,7 @@ impl AcpSession {
             // below it, which is exactly the fallback the caller already writes
             // for an agent that has no config surface at all.
             session: session.unwrap_or(Value::Null),
+            commands,
         })
     }
 
@@ -221,12 +240,19 @@ impl AcpSession {
 /// is vendor-specific: Grok's config lives at `_meta["x.ai/sessionConfig"]`,
 /// which no other recorded speaker sends. Only the agent's own harness knows
 /// how to read it, so the seam hands over the bytes.
+#[derive(Default)]
 pub struct Discovered {
     /// The `initialize` result.
     pub initialized: Value,
     /// The `session/new` result, or `Value::Null` if that call did not answer.
     /// Null rather than an error: see [`AcpSession::open_for_discovery`].
     pub session: Value,
+    /// The `availableCommands` array from the last `available_commands_update`
+    /// seen while opening, or `Null` if the agent pushed none.
+    ///
+    /// **A full snapshot, not a delta** — a later frame replaces an earlier
+    /// one, which is why only the last is kept.
+    pub commands: Value,
 }
 
 /// A spawned agent that has completed `initialize`, before anything has been
@@ -391,6 +417,7 @@ async fn run_session(
         stderr_tail,
         agent: _agent,
         session_id,
+        context_window,
         timeouts,
     } = session;
     let RunControls {
@@ -425,6 +452,9 @@ async fn run_session(
     }
 
     let mut prompt = request.prompt.clone();
+    // One tracker for the SESSION, not per turn: a tool announced in one turn
+    // and completed in the next would otherwise lose its announcement.
+    let mut tools = normalize::ToolTracker::default();
 
     // **One `Done` per turn that started, not one per run.** The session is
     // persistent: a steer opens a second turn on the same session, and a UI
@@ -434,13 +464,17 @@ async fn run_session(
     // exit below has already sent its own.
     loop {
         let end = drive_turn(
-            &client,
-            &mut incoming,
-            &event_tx,
-            &session_id,
+            &mut Turn {
+                client: &client,
+                incoming: &mut incoming,
+                event_tx: &event_tx,
+                session_id: &session_id,
+                interrupt: &interrupt,
+                cancel_grace: timeouts.cancel_grace,
+                tools: &mut tools,
+                context_window,
+            },
             &prompt,
-            &interrupt,
-            timeouts.cancel_grace,
         )
         .await;
 
@@ -518,16 +552,38 @@ fn done_event(status: DoneStatus, error: Option<String>, session_id: &str) -> Ag
     }
 }
 
-/// One `session/prompt`, from send to `stopReason`.
-async fn drive_turn(
-    client: &RpcClient,
-    incoming: &mut mpsc::Receiver<Incoming>,
-    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
-    session_id: &str,
-    prompt: &str,
-    interrupt: &crate::CancellationToken,
+/// Everything a turn needs that OUTLIVES it.
+///
+/// One struct rather than eight arguments: every field here is owned by the
+/// session and borrowed for each turn, so the grouping is the real lifetime
+/// rather than a way to appease the arity lint. `tools` is the one that makes
+/// the point — a tool announced in one turn and completed in the next has to
+/// survive the boundary.
+struct Turn<'a> {
+    client: &'a RpcClient,
+    incoming: &'a mut mpsc::Receiver<Incoming>,
+    event_tx: &'a mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    session_id: &'a str,
+    interrupt: &'a crate::CancellationToken,
     cancel_grace: Duration,
-) -> TurnEnd {
+    tools: &'a mut normalize::ToolTracker,
+    context_window: Option<u64>,
+}
+
+/// One `session/prompt`, from send to `stopReason`.
+async fn drive_turn(turn: &mut Turn<'_>, prompt: &str) -> TurnEnd {
+    let Turn {
+        client,
+        incoming,
+        event_tx,
+        session_id,
+        interrupt,
+        cancel_grace,
+        tools,
+        context_window,
+    } = turn;
+    let cancel_grace = *cancel_grace;
+    let context_window = *context_window;
     let reply = client.request("session/prompt", prompt_params(session_id, prompt));
     tokio::pin!(reply);
 
@@ -554,13 +610,21 @@ async fn drive_turn(
                         // whatever `try_recv` finds now provably preceded the
                         // reply on the wire, and nothing later can appear.
                         while let Ok(message) = incoming.try_recv() {
-                            match handle_incoming(message, client, event_tx).await {
+                            match handle_incoming(message, client, event_tx, tools).await {
                                 Handled::Continue => {}
                                 Handled::ConsumerGone => return TurnEnd::ConsumerGone,
                                 // EOF after a settled turn is just the agent
                                 // shutting down; the turn itself succeeded.
                                 Handled::AgentExited => break,
                             }
+                        }
+                        // The turn's token reading rides just ahead of its
+                        // `Done`, so the meter is current at the moment the
+                        // turn is reported finished.
+                        if let Some(usage) = normalize::usage(&result, context_window)
+                            && !send(event_tx, usage).await
+                        {
+                            return TurnEnd::ConsumerGone;
                         }
                         let reason = result["stopReason"].as_str().unwrap_or_default();
                         TurnEnd::Settled(normalize::done_status(reason))
@@ -576,7 +640,7 @@ async fn drive_turn(
             }
 
             message = incoming.recv() => match message {
-                Some(message) => match handle_incoming(message, client, event_tx).await {
+                Some(message) => match handle_incoming(message, client, event_tx, tools).await {
                     Handled::Continue => {}
                     Handled::ConsumerGone => return TurnEnd::ConsumerGone,
                     Handled::AgentExited => return TurnEnd::AgentExited,
@@ -625,11 +689,22 @@ async fn handle_incoming(
     message: Incoming,
     client: &RpcClient,
     event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    tools: &mut normalize::ToolTracker,
 ) -> Handled {
     match message {
         Incoming::Notification { method, params } => {
             if method == "session/update" {
-                if let Some(event) = normalize::session_update(&params)
+                // Tool frames carry state across updates, so they go through
+                // the tracker; everything else is a pure per-frame decode.
+                let update = &params["update"];
+                let kind = update["sessionUpdate"].as_str().unwrap_or_default();
+                if kind == "tool_call" || kind == "tool_call_update" {
+                    for event in normalize::tool_update(tools, update) {
+                        if !send(event_tx, event).await {
+                            return Handled::ConsumerGone;
+                        }
+                    }
+                } else if let Some(event) = normalize::session_update(&params)
                     && !send(event_tx, event).await
                 {
                     return Handled::ConsumerGone;

@@ -159,3 +159,189 @@ async fn discovery_answers_within_its_own_timeouts() {
     }
     assert!(!catalog.models.is_empty());
 }
+
+/// **The gap that made a real chat unreadable.** Grok said "I'll list the
+/// files", a tool ran and returned, and the answer appeared with nothing in
+/// between — because `tool_call` / `tool_call_update` were dropped.
+///
+/// Asserts the transcript ORDER, not just presence: a card that arrives after
+/// the answer it produced explains nothing.
+#[tokio::test]
+#[ignore = "spends tokens against the real Grok CLI; run with --ignored"]
+async fn a_tool_using_turn_shows_its_tools() {
+    let cwd = std::env::temp_dir().join("comet-grok-live-tools");
+    std::fs::create_dir_all(&cwd).expect("disposable cwd");
+    std::fs::write(
+        cwd.join("alpha.txt"),
+        "hello alpha
+",
+    )
+    .expect("seed a file");
+
+    let harness = GrokHarness::new();
+    let (steer_tx, steer_rx) = mpsc::channel(1);
+    let controls = RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        request_approval: Box::new(|_| oneshot::channel().1),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+    };
+
+    let request = RunRequest {
+        prompt: "Read alpha.txt with your tools, then say DONE.".into(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        ..RunRequest::for_session(RuntimeMode::default())
+    };
+
+    let mut stream = harness
+        .run(request, controls)
+        .await
+        .expect("the agent starts");
+    drop(steer_tx);
+
+    let mut events: Vec<AgentEvent> = Vec::new();
+    tokio::time::timeout(Duration::from_secs(180), async {
+        while let Some(event) = stream.next().await {
+            let event = event.expect("no transport error");
+            let settled = matches!(event, AgentEvent::Done { .. });
+            match &event {
+                AgentEvent::ToolCall { id, call } => println!("[tool {id}] {call:?}"),
+                AgentEvent::ToolResult { id, is_error, .. } => {
+                    println!("[result {id}] is_error={is_error}")
+                }
+                AgentEvent::TextDelta { text } => print!("{text}"),
+                _ => {}
+            }
+            events.push(event);
+            if settled {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the turn settles rather than hanging");
+    println!();
+
+    let call_at = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolCall { .. }))
+        .expect("the tool the agent ran is visible in the transcript");
+    let result_at = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolResult { .. }))
+        .expect("and so is its result");
+    assert!(
+        call_at < result_at,
+        "the call is drawn before its result: {events:#?}"
+    );
+
+    let done_at = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .expect("the turn settles");
+    assert!(
+        result_at < done_at,
+        "the tool finishes before the turn does: {events:#?}"
+    );
+
+    // **The context meter has something to show.** It read empty before this
+    // slice, because nothing mapped the response's token block.
+    let usage_at = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Usage { .. }))
+        .expect("the turn reports its tokens");
+    assert!(
+        usage_at < done_at,
+        "the reading lands before the turn is reported finished: {events:#?}"
+    );
+    match &events[usage_at] {
+        AgentEvent::Usage {
+            prompt_tokens,
+            output_tokens,
+            context_window,
+        } => {
+            println!(
+                "[usage] prompt={prompt_tokens} output={output_tokens} window={context_window:?}"
+            );
+            assert!(*prompt_tokens > 0, "a real turn has a real prompt size");
+            assert!(*output_tokens > 0, "and a real answer");
+            assert_eq!(
+                *context_window,
+                Some(500_000),
+                "grok-4.6's ceiling, read off session/new"
+            );
+            assert!(
+                *prompt_tokens < context_window.unwrap(),
+                "occupancy must be under the ceiling it is drawn against"
+            );
+        }
+        other => unreachable!("{other:?}"),
+    }
+
+    // Exactly one card per call, not one per frame: ACP sends three frames for
+    // one call and drawing each would triple the transcript.
+    let ids: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCall { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
+    assert_eq!(ids.len(), unique.len(), "a call was drawn twice: {ids:?}");
+}
+
+/// **The `/` menu, against the real CLI.** Grok pushes its command list
+/// unsolicited before `session/new` even replies, so this costs one handshake
+/// and no tokens — which is the whole reason `commands()` is implemented as a
+/// discovery probe rather than left at the trait's empty default.
+#[tokio::test]
+#[ignore = "spawns the real Grok CLI; run with --ignored"]
+async fn the_slash_menu_is_populated_from_the_agent() {
+    let cwd = std::env::temp_dir().join("comet-grok-live-cmds");
+    std::fs::create_dir_all(&cwd).expect("disposable cwd");
+
+    let harness = GrokHarness::new();
+    let started = std::time::Instant::now();
+    let commands = tokio::time::timeout(
+        Duration::from_secs(60),
+        harness.commands(&cwd.to_string_lossy()),
+    )
+    .await
+    .expect("commands() answers within its own timeouts")
+    .expect("an installed CLI resolves");
+    let elapsed = started.elapsed();
+
+    println!("{} commands in {elapsed:?}", commands.len());
+    for c in commands.iter().take(4) {
+        println!(
+            "  /{} — {:?} hint={:?}",
+            c.name, c.description, c.argument_hint
+        );
+    }
+
+    assert!(
+        commands.len() > 10,
+        "grok 1.0.5 advertises 45; got {}",
+        commands.len()
+    );
+    assert!(
+        commands.iter().any(|c| c.name == "compact"),
+        "a command the capture named is present"
+    );
+    assert!(
+        commands.iter().all(|c| !c.name.starts_with('/')),
+        "names carry no leading slash: the composer adds it"
+    );
+    assert!(
+        commands.iter().any(|c| c.argument_hint.is_some()),
+        "18 of the 45 carry an argument hint; none arriving means the hint path is dead"
+    );
+
+    // Same bound and the same reason as the model discovery test: this is one
+    // handshake, and a timeout firing instead would still "pass" on content.
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "took {elapsed:?} — a timeout fired instead of the agent answering"
+    );
+}

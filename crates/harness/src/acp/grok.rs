@@ -25,10 +25,11 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 
 use comet_proto::{
-    AgentEvent, HarnessCapabilities, HarnessId, HarnessProbe, InstallMethod, Model, ModelCatalog,
-    ReasoningLevel, RunRequest, RuntimeMode, SteeringMode,
+    AgentCommand, AgentEvent, HarnessCapabilities, HarnessId, HarnessProbe, InstallMethod, Model,
+    ModelCatalog, ReasoningLevel, RunRequest, RuntimeMode, SteeringMode,
 };
 
+use super::normalize;
 use super::session::{AcpSession, Discovered, Timeouts};
 use crate::discovery::{DiscoveredModel, Discovery, DiscoveryFailure};
 use crate::launch::{LaunchDescriptor, StdioMode};
@@ -316,24 +317,48 @@ fn efforts_of(model: &Value) -> Vec<ReasoningLevel> {
 ///
 /// Token-free: `initialize` never reaches a model. The session is dropped
 /// immediately, which reaps the child through `kill_on_drop`.
-async fn discover(exe: PathBuf, timeouts: Timeouts) -> Result<Discovery, DiscoveryFailure> {
+async fn probe_session(
+    exe: &Path,
+    cwd: &str,
+    timeouts: Timeouts,
+) -> Result<Discovered, DiscoveryFailure> {
     let request = RunRequest::for_session(RuntimeMode::default());
-    let command = run_launch(&exe, &request).command();
-
-    let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-    match AcpSession::open_for_discovery(command, &cwd, timeouts).await {
-        Ok(discovered) => Ok(models_from_discovery(&discovered)),
-        Err(error) => {
+    let command = run_launch(exe, &request).command();
+    AcpSession::open_for_discovery(command, cwd, timeouts)
+        .await
+        .map_err(|error| {
             tracing::debug!(target: "comet_harness::acp", "grok discovery failed: {error}");
             // Every failure here is `Unreachable`, not `Unparseable`: the
-            // handshake either answered or it did not, and reading the model
-            // block cannot fail — an unrecognized shape yields an empty list,
-            // which is a real answer. `Unparseable` is reserved for a provider
-            // that answered something we could not decode, and would raise a
+            // handshake either answered or it did not, and reading the reply
+            // cannot fail — an unrecognized shape yields an empty list, which is
+            // a real answer. `Unparseable` is reserved for a provider that
+            // answered something we could not decode, and would raise a
             // protocol-drift `Diagnostic` this does not warrant.
-            Err(DiscoveryFailure::Unreachable)
-        }
+            DiscoveryFailure::Unreachable
+        })
+}
+
+async fn discover(exe: PathBuf, timeouts: Timeouts) -> Result<Discovery, DiscoveryFailure> {
+    let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+    match probe_session(&exe, &cwd, timeouts).await {
+        Ok(discovered) => Ok(models_from_discovery(&discovered)),
+        Err(failure) => Err(failure),
     }
+}
+
+/// **Grok's slash commands are free and pushed, so this costs one handshake.**
+///
+/// The agent sends its whole list unsolicited before `session/new` even
+/// replies, so a discovery probe collects it without a prompt and without
+/// tokens. Cwd-scoped like every other provider's, because a project's own
+/// commands are discovered from the directory.
+async fn discover_commands(
+    exe: PathBuf,
+    cwd: String,
+    timeouts: Timeouts,
+) -> Result<Vec<AgentCommand>, DiscoveryFailure> {
+    let discovered = probe_session(&exe, &cwd, timeouts).await?;
+    Ok(normalize::commands(&discovered.commands))
 }
 
 /// The Grok harness. Construct with [`GrokHarness::new`]; tests point it at the
@@ -349,6 +374,10 @@ pub struct GrokHarness {
     /// called by titling, so an uncached discovery would spawn an agent on a
     /// path the user never sees.
     discovery_cache: crate::discovery::DiscoveryCache,
+    /// One handshake per DIRECTORY per boot. Separate from the model cache
+    /// because commands are cwd-scoped and models are not — the same reason
+    /// `CommandCache` exists at all (debt row D32).
+    command_cache: crate::discovery::CommandCache,
 }
 
 impl GrokHarness {
@@ -450,8 +479,30 @@ impl Harness for GrokHarness {
         Ok(self.discovery_cache.catalog(curated, discovery))
     }
 
+    /// The `/` menu for `cwd`.
+    ///
+    /// Overridden rather than left at the default empty list: Grok really does
+    /// have 45 commands, and the default would present a working surface as
+    /// absent. An unreachable agent answers an empty list rather than an error
+    /// — the menu says so on screen, where the user who typed `/` is looking,
+    /// and a command list that cannot be read is not the protocol-drift signal
+    /// the diagnostics channel exists for.
+    async fn commands(&self, cwd: &str) -> Result<Vec<AgentCommand>, HarnessError> {
+        let exe = self.resolve_executable()?;
+        let timeouts = self.timeouts;
+        let owned_cwd = cwd.to_owned();
+        Ok(self
+            .command_cache
+            .get(cwd, move || discover_commands(exe, owned_cwd, timeouts))
+            .await
+            .unwrap_or_default())
+    }
+
     fn clear_discovery(&self) {
         self.discovery_cache.clear();
+        // The Retry row clears both: a user who hits it after fixing an install
+        // means "ask again", not "ask again about models only".
+        self.command_cache.clear();
     }
 
     fn take_unreported_discovery_failure(&self) -> Option<DiscoveryFailure> {
@@ -534,6 +585,7 @@ mod tests {
                     ]},
                 }]},
             }),
+            ..Default::default()
         }
     }
 
@@ -599,6 +651,7 @@ mod tests {
                     {"modelId": "grok-mini-low", "name": "Grok Mini (low)"},
                 ]},
             }),
+            ..Default::default()
         };
 
         let discovery = models_from_discovery(&discovered);
@@ -661,6 +714,7 @@ mod tests {
                     {"modelId": "specific", "_meta": {"reasoningEfforts": [{"id": "low"}]}},
                 ]},
             }),
+            ..Default::default()
         };
 
         let models = models_from_discovery(&discovered).models;
@@ -692,6 +746,7 @@ mod tests {
         let claude_acp_shape = Discovered {
             initialized: json!({}),
             session: json!({"modes": {"availableModes": [{"id": "not-grok"}]}}),
+            ..Default::default()
         };
         assert!(
             models_from_discovery(&claude_acp_shape).models.is_empty(),
@@ -705,6 +760,7 @@ mod tests {
             session: json!({"configOptions": [
                 {"category": "model", "options": [{"value": "not-grok"}]},
             ]}),
+            ..Default::default()
         };
         assert!(
             models_from_discovery(&org_adapter_shape).models.is_empty(),
@@ -729,6 +785,7 @@ mod tests {
             let discovered = Discovered {
                 initialized: json!({}),
                 session: session.clone(),
+                ..Default::default()
             };
             assert!(
                 models_from_discovery(&discovered).models.is_empty(),
@@ -751,6 +808,7 @@ mod tests {
             // What `open_for_discovery` substitutes when session/new did not
             // answer.
             session: Value::Null,
+            ..Default::default()
         };
         let models = models_from_discovery(&discovered).models;
         assert_eq!(models.len(), 1);
@@ -771,6 +829,7 @@ mod tests {
                     {"category": "mode", "id": "an_effort_from_2027"},
                 ]}},
             }),
+            ..Default::default()
         };
 
         let models = models_from_discovery(&discovered).models;
