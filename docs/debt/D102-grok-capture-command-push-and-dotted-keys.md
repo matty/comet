@@ -97,9 +97,81 @@ under this task's time budget.** A narrow, reviewable shape worth considering wh
 take it up: a small, explicitly-enumerated allowlist of literal key strings permitted to contain a
 path delimiter (the same "declare it once, review it once" shape `surface::MAP_PATHS` and
 `allowlist::NAMED_LEAVES` already use), checked before `AmbiguousObjectKey` fires — which would
-leave the check's actual protection (anything NOT on that reviewed list still rejects
-unconditionally) fully intact. Not attempted here; recorded as the shape worth trying, not a
-decision to build it this way.
+### The three session-config paths that were reviewed but cannot be spelled yet
+
+Task review (2026-08-28) confirmed the allowlist review itself was sound but ruled that three
+lines should not have shipped in `crates/harness/src/capture/allowlist/acp.txt` alongside
+everything else: `.result._meta.x.ai/sessionConfig.options[].category`, `...[].id`, and
+`...[].label`. Each is genuinely decoded — `grok.rs`'s `config_options`/`ladder_from_config`/
+`models_from_discovery` reads exactly these three fields to build the model and reasoning-effort
+picker — but Blocker 2 above makes the question of how to spell that path in the allowlist file
+*undecided*, not merely unreachable. `comet-provider-sanitize` never gets far enough to check
+`acp.txt` against a real Grok capture at all (it rejects the capture at the raw key first), so
+any spelling committed today is unverified against the mechanism `validate_key` will eventually
+use to admit it: escaped somehow, it matches nothing the sanitizer would ever produce; written
+as a plain dotted path the way every other line in that file is, `.result._meta.x.ai/sessionConfig`
+is byte-for-byte the same string a nested path `.result` → `._meta` → `.x` → `.ai/sessionConfig`
+would build — precisely the ambiguity `validate_key` exists to refuse. Committing a spelling
+before the design that determines it decides the encoding by accident, in the wrong order.
+
+**The review is preserved here rather than in `acp.txt`.** Once Blocker 2 resolves (whatever
+shape that takes — a reviewed literal-key allowlist checked before `AmbiguousObjectKey`, or
+something else), add these three back to `acp.txt`, spelled however that mechanism requires:
+
+```
+.result._meta.x.ai/sessionConfig.options[].category
+.result._meta.x.ai/sessionConfig.options[].id
+.result._meta.x.ai/sessionConfig.options[].label
+```
+
+Reviewed and approved as PATHS worth publishing — genuinely decoded, small fixed vocabularies
+or model/effort identifiers, never personal data. Not approved as a SPELLING; that is Blocker 2's
+decision, not this row's.
+
+## An unrelated third sanitizer gap, worked around rather than blocking (found promoting codex-acp/claude-agent-acp)
+
+Distinct from both blockers above — neither is a Grok-specific dotted-key problem, and neither
+blocked promotion; it required a workaround this row records so the next capture operator does
+not hit the same wall from scratch.
+
+`comet-provider-sanitize` also failed sanitizing the codex-acp and claude-agent-acp discovery
+captures on first attempt: `capture contains an unrecognized absolute path at command.object[5]`.
+The cause is `command.program` — on this machine, the ACP-adapter rows spawn `node`, and the
+system-wide install resolves to `C:\Program Files\nodejs\node.exe`. `sanitize_paths_and_validate`
+only redacts an absolute path that matches one of `RedactionRoots`' known categories (`cwd`,
+`home`, `temp`, `codex_home`, `claude_config_dir`, `approval_target`, `trusted_powershell`) —
+`C:\Program Files\nodejs\` is a genuinely different location, under none of them, and
+`sanitize_paths_and_validate` hard-fails on anything left over rather than publishing an
+unrecognized path verbatim.
+
+**Worked around, not fixed: both captures were recorded again with `--executable` pointed at a
+different, valid `node.exe` that happens to already live under `<HOME>` on this machine** —
+`C:\Users\coding\AppData\Local\hermes\node\node.exe` (Node v22.23.2, bundled with the Hermes
+agent tool, versus the system install's v24.16.0). That is why both promoted manifests
+(`crates/harness/tests/corpus/{codex-acp,claude-agent-acp}/*/*/manifest.json`) and both
+capability sheets (`docs/providers/{codex-acp-1.7.0,claude-agent-acp-0.70.0}.md`) show argv
+launching a Hermes-bundled interpreter rather than this machine's ordinary Node install — an
+ordinary capture-operator choice (`--executable`, ordinary CLI usage), not a code change, and
+the ACP wire content itself is unaffected by which Node binary runs the adapter's JS entry.
+**A capture operator with only a standard system-wide Node install (the common case: nvm,
+Program Files, `/usr/local/bin`, most package managers) has no such alternate binary to reach
+for and will hit the identical `UnrecognizedAbsolutePath` failure with nothing in the tree
+explaining why**, until `RedactionRoots` grows a category for wherever the resolved interpreter
+actually lives (the same shape of fix `program_stem`'s comparison-time leniency already applies
+at test time, just not yet at sanitize time) or the two ACP adapter rows gain their own
+`--node-home`-style override the way Codex has `--codex-home`.
+
+**One more thing this same divergence explains, worth stating plainly rather than leaving
+implicit: the manifest's `cli_version` field and the corpus/sheet's version number name two
+different programs.** `cli_version` is `probe_version(&launch.program)` — literally `node
+--version` for both ACP adapter rows, because `program` for those rows genuinely is `node`, not
+the agent. Both promoted manifests read `"cli_version": "v22.23.2"` for exactly that reason (the
+Hermes-bundled interpreter's own version). The corpus directory (`1.7.0`, `0.70.0`) and the sheet
+title come from an entirely different field, `agentInfo.version` in the `initialize` reply — the
+adapter package's own version, read once at review time and used to name the promotion, never
+recorded in the manifest itself. Nothing in the manifest or the sheet says these are two
+different fields describing two different programs; a reader comparing `cli_version` against the
+sheet title and finding them unrelated has found this, not a data-entry error.
 
 ## What is preserved for whoever picks this up
 

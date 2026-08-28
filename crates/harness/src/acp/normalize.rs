@@ -626,6 +626,66 @@ mod tests {
         }
     }
 
+    /// **Pins `rawInput["pattern"]` and `rawInput["path"]` against the
+    /// literal frame `steer-grok` recorded (grok 1.0.5, 2026-08-28), not a
+    /// hand-written fixture.** `.params.update.rawInput` is a declared
+    /// `surface::MAP_PATHS` map (real filesystem paths ride it -- see that
+    /// declaration's own doc comment for why), which means the
+    /// capability-sheet golden test can no longer see `pattern`/`path` as
+    /// named fields: `Visit::walk` folds every key under a declared map to
+    /// `.{}`, so a future agent version dropping `pattern` from a search
+    /// frame would break `typed_call`'s `Search` decode with nothing in the
+    /// sheet ever failing. This test is what stands in for that lost
+    /// coverage. The extra fields below (`variant`, `glob`, `-i`, `type`,
+    /// `multiline`, the `_meta.x.ai/tool` echo) are exactly what the real
+    /// frame carried alongside `pattern`/`path` -- kept rather than trimmed,
+    /// so the test also proves the decode tolerates the fields it does not
+    /// read, not only the two it does.
+    #[test]
+    fn the_captured_search_tool_decodes_pattern_and_path() {
+        let events = drain(&[
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-a2ece7b1-7202-4f1a-916e-8d58b5ff814a-4",
+                "title": "grep",
+                "rawInput": {"variant": "Grep", "pattern": "steering",
+                              "path": "C:\\Users\\coding\\AppData\\Local\\Temp\\comet-acp-capture-cwd",
+                              "glob": null, "-i": false, "type": null, "multiline": false},
+            }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-a2ece7b1-7202-4f1a-916e-8d58b5ff814a-4",
+                "kind": "search",
+                "title": "steering",
+                "locations": [],
+                "rawInput": {"variant": "Grep", "pattern": "steering",
+                              "path": "C:\\Users\\coding\\AppData\\Local\\Temp\\comet-acp-capture-cwd",
+                              "glob": null, "-i": false, "type": null, "multiline": false},
+                "_meta": {"x.ai/tool": {
+                    "version": 1, "name": "grep", "kind": "search",
+                    "namespace": "grok_build", "label": "Search", "read_only": true,
+                    "input": {"pattern": "steering",
+                              "path": "C:\\Users\\coding\\AppData\\Local\\Temp\\comet-acp-capture-cwd"}
+                }},
+            }),
+        ]);
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::ToolCall { call, .. } => assert_eq!(
+                call,
+                &ToolCall::Search {
+                    pattern: "steering".into(),
+                    path: Some(
+                        "C:\\Users\\coding\\AppData\\Local\\Temp\\comet-acp-capture-cwd".into()
+                    ),
+                },
+                "the captured frame's pattern and path must decode verbatim"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// **An unrecognized kind is an honest chip, not a guess.** `list_dir`
     /// arrives as `kind: "other"`; the card carries the real tool name and its
     /// input rather than being forced into a typed variant that would claim

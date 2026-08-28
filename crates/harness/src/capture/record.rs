@@ -1664,22 +1664,35 @@ mod tests {
         derived: &CommandSnapshot,
         corpus: &CommandSnapshot,
     ) -> Vec<String> {
-        // ACP's two adapter rows (codex-acp, claude-agent-acp) are the first
-        // whose argv element IS a path rather than a flag: `args[0]` is the
+        // Any argv element containing `/` or `\`, for every row this
+        // function compares (not only ACP's) -- collapses to its last THREE
+        // path components, dropping everything before them. Written for ACP's
+        // two adapter rows (codex-acp, claude-agent-acp), the first whose
+        // argv element IS a path rather than a flag: `args[0]` is the
         // resolved absolute path to the adapter's own JS entry file, and the
-        // corpus redacts its home-directory prefix to `<HOME>`. Comparing that
-        // byte-for-byte against a freshly derived launch on THIS machine can
-        // never agree -- same reason `program` is compared by stem alone below,
-        // not full equality. Unlike `program`, one final component (`index.js`)
-        // is identical for every npm package that follows this convention and
-        // would compare two different adapters' entries as equal, so this keeps
-        // the last three components (`<package>/dist/index.js`) instead -- still
-        // insensitive to where npm's global root sits on a given machine or OS,
-        // but distinguishing the package itself. Split on both separators by
-        // hand, same reasoning as `program_stem`'s own doc comment: the corpus
-        // string mixes `\` (Windows path joins) and `/` (the npm scope
-        // separator inside `@agentclientprotocol/codex-acp`) in the same string,
-        // and `std::path::Path` treats `\` as an ordinary character on a
+        // corpus redacts its home-directory prefix to `<HOME>`. Comparing
+        // that byte-for-byte against a freshly derived launch on THIS machine
+        // can never agree -- same reason `program` is compared by stem alone
+        // below, not full equality. Unlike `program`, one final component
+        // (`index.js`) is identical for every npm package that follows this
+        // convention and would compare two different adapters' entries as
+        // equal, so this keeps three instead -- still insensitive to where
+        // npm's global root sits on a given machine or OS, but distinguishing
+        // the package itself.
+        //
+        // **The condition is "contains a separator", not "is this row's
+        // adapter-entry argument"**, so it applies uniformly to any path-
+        // shaped arg on any provider. No row today has one other than the two
+        // above, but a future Codex or Claude flag carrying a real path (a
+        // `--config-dir=/a/b/c/d`, say) would compare as `b/c/d`, silently
+        // dropping everything before it rather than comparing the flag
+        // verbatim the way every other argv token here still does.
+        //
+        // Split on both separators by hand, same reasoning as
+        // `program_stem`'s own doc comment: the corpus string mixes `\`
+        // (Windows path joins) and `/` (the npm scope separator inside
+        // `@agentclientprotocol/codex-acp`) in the same string, and
+        // `std::path::Path` treats `\` as an ordinary character on a
         // non-Windows host (this workspace's CI runs `ubuntu-24.04`).
         fn normalize_argv(args: &[String]) -> Vec<String> {
             fn path_suffix(raw: &str, components: usize) -> String {

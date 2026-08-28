@@ -222,8 +222,21 @@ pub(in crate::capture::record) fn resolve_node_executable() -> Option<PathBuf> {
 /// stay `ScenarioLaunch::Discovery` (`codex_acp_launch`/`claude_acp_launch`
 /// above) — `derive_launch` only calls a `Run` launch for
 /// `ScenarioLaunch::Run` rows, and Grok is the only ACP agent with a
-/// production `Harness` (AGENTS.md: "Claude and Codex keep their native
-/// drivers... Registering either as an ACP harness is out of scope").
+/// production `Harness`: `comet_proto::agent::HarnessId` has no
+/// `CodexAcp`/`ClaudeAgentAcp` variant, only `ClaudeCode`, `Codex`,
+/// `Cursor`, `Grok` and `Mock` — check that enum, not a design document,
+/// if this ever needs re-verifying.
+///
+/// **This hard-delegates to Grok specifically, not to "whichever ACP agent
+/// the row names."** Fine today — Grok is the only `Run` row this provider
+/// has — but a fourth ACP agent (Hermes, landing in a parallel PR) adding its
+/// OWN `Run` row would silently derive Grok's argv here unless this function
+/// is taught to dispatch on the row first. Nothing pins that today the way
+/// `every_acp_row_is_discovery` used to pin "no run rows exist at all": a
+/// Hermes row wired to this function fails loudly instead, at
+/// `every_scenario_launch_matches_its_committed_corpus_manifest`'s argv
+/// comparison (Hermes's launch and Grok's would disagree) — deliberately not
+/// worth a real dispatch mechanism for a row that does not exist yet.
 pub(in crate::capture::record) fn run_launch(
     executable: &Path,
     request: &comet_proto::RunRequest,
@@ -297,8 +310,12 @@ pub(in crate::capture::record) async fn run(
     session.wait_for_turn_end().await
 }
 
-/// Same request as [`run_request`] — the queued steer is a second, differently
-/// worded prompt, not a different turn shape.
+/// The turn `steer-grok` opens before its queued follow-up: a different,
+/// deliberately open-ended prompt from [`run_request`]'s (which asks for a
+/// single word and leaves nothing to steer). This is the request the FIRST
+/// `session/prompt` carries; [`STEER_MESSAGE`] below is the second, sent only
+/// after this one's reply lands — see [`steer`]'s own doc comment for why
+/// that is two sequential prompts rather than an in-turn steer.
 pub(in crate::capture::record) fn steer_request(
     input: &ScenarioInput,
 ) -> anyhow::Result<comet_proto::RunRequest> {
@@ -445,6 +462,9 @@ mod tests {
         assert!(text.contains("node"), "no path named: {text}");
     }
 
+    /// A missing adapter must name the install command. The alternative — a
+    /// bare "not found" — sends the reader hunting for a path they have no
+    /// reason to know.
     #[test]
     fn a_missing_adapter_names_how_to_install_it() {
         let dir = tempfile::tempdir().expect("tempdir");
