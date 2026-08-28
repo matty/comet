@@ -651,11 +651,16 @@ mod tests {
     /// `acp_adapter/server.py:568-576`, consumed by `_build_model_state` at
     /// `:595` and `:612`) -- `openai:gpt-5.4-mini`, never the bare
     /// `gpt-5.4-mini`. `discovery::merge` dedupes by exact id equality
-    /// (`discovery.rs:102,112`), so a curated entry in the wrong space would
-    /// never match a live row for the same model: "GPT-5.4 Mini" from the
-    /// curated list AND "gpt-5.4-mini" from discovery, two rows for one
-    /// model. Break caught: reverting `static_models()`'s id to the bare
-    /// form makes the two counted below stop being one.
+    /// (`discovery.rs:102,112`): a curated row and a live row with DIFFERENT
+    /// ids never match, so `merge` treats them as two different models and
+    /// appends the live one alongside the curated one instead of folding it
+    /// in. Break caught: reverting `static_models()`'s id to the bare form
+    /// makes `merge` return TWO rows here -- the curated `gpt-5.4-mini` and
+    /// the discovered `openai:gpt-5.4-mini` -- because they no longer share
+    /// an id for `merge` to fold on. Asserting `merged.len() == 1` is what
+    /// catches that; counting only the rows that already carry the encoded
+    /// id would not -- the stray bare-id row would simply go uncounted, and
+    /// the assertion would pass with the bug present.
     #[test]
     fn the_curated_id_matches_the_encoded_space_discovery_uses() {
         let discovered = Discovered {
@@ -668,14 +673,14 @@ mod tests {
         let discovery = models_from_discovery(&discovered);
         let merged = crate::discovery::merge(static_models(), &discovery);
 
-        let matches: Vec<&Model> = merged
-            .iter()
-            .filter(|m| m.id == "openai:gpt-5.4-mini")
-            .collect();
         assert_eq!(
-            matches.len(),
+            merged.len(),
             1,
-            "the curated and discovered rows must be the SAME row, not two: {merged:#?}"
+            "the curated and discovered rows must merge into ONE row, not two: {merged:#?}"
+        );
+        assert_eq!(
+            merged[0].id, "openai:gpt-5.4-mini",
+            "the surviving row must carry the encoded id, not the bare one"
         );
     }
 
