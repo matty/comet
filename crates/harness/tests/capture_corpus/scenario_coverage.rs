@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 
-use comet_harness::capture::{Provider, SCENARIOS, corpus_root, promoted_scenarios};
+use comet_harness::capture::{SCENARIOS, corpus_provider_name, corpus_root, promoted_scenarios};
 
 /// Declared scenarios with no corpus evidence at all, named explicitly rather
 /// than silently skipped: `(provider, scenario name)`.
@@ -22,32 +22,19 @@ use comet_harness::capture::{Provider, SCENARIOS, corpus_root, promoted_scenario
 /// stale — that second direction is what stops the exemption list itself from
 /// becoming the next place a coverage gap hides unnoticed.
 ///
-/// Empty as of the stage-6 promotion: the seven rows this list used to carry
-/// (`codex/approval`, `codex/approval-on-request`, `codex/interruption`,
-/// `claude/auto`, `claude/full-access`, `codex/auto`, `codex/full-access`)
-/// all landed in the same live re-capture (Claude 2.1.233, Codex 0.147.0),
-/// promoted under `crates/harness/tests/corpus/`. Leave this empty rather
-/// than deleting the constant — the stale-exemption direction of the gate
-/// below is what would have caught these seven going stale, and it needs a
-/// (possibly empty) list to check against.
+/// Empty of the Claude/Codex rows the stage-6 promotion used to carry here
+/// (all landed in that live re-capture) — but not empty overall. Grok's
+/// three rows are exempt again, for a reason distinct from "not yet
+/// recorded": `comet-provider-sanitize` structurally rejects every Grok
+/// capture (its own `_meta["x.ai/..."]` keys trip the ambiguous-object-key
+/// check unconditionally). codex-acp and claude-agent-acp discovery ARE
+/// promoted in this same change and are correctly absent from this list.
+/// See D102.
 const EXEMPT_UNCAPTURED: &[(&str, &str)] = &[
-    // Registered, not yet recorded. Both rows spawn a real ACP adapter, so the
-    // corpus behind them has to come from an actual run on a machine with the
-    // adapters installed -- there is no fake to record instead. They are listed
-    // here rather than left out of SCENARIOS so `--help` shows what a capture
-    // operator can record, and so this gate names them until it exists.
-    ("acp", "session-discovery-codex-acp"),
-    ("acp", "session-discovery-claude-acp"),
-    ("acp", "session-discovery-grok"),
+    ("grok", "session-discovery-grok"),
+    ("grok", "run-grok"),
+    ("grok", "steer-grok"),
 ];
-
-fn provider_str(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Claude => "claude",
-        Provider::Codex => "codex",
-        Provider::Acp => "acp",
-    }
-}
 
 /// Break caught: a scenario declared in `SCENARIOS` (and rendered in
 /// `--help`) with no promoted corpus directory behind it anywhere, for any
@@ -79,7 +66,7 @@ fn every_declared_scenario_has_corpus_evidence_or_a_named_exemption() {
     let mut stale_exemptions = Vec::new();
 
     for spec in SCENARIOS {
-        let provider = provider_str(spec.provider);
+        let provider = corpus_provider_name(spec.provider, spec.name);
         let key = (provider.to_owned(), spec.name.to_owned());
         let is_covered = covered.contains(&key);
         let is_exempt = exempt.contains(&(provider, spec.name));

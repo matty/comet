@@ -216,6 +216,28 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         body: ScenarioBody::Acp(|s, i| Box::pin(acp::session_discovery(s, i))),
     },
     ScenarioSpec {
+        name: "run-grok",
+        purpose: "capture a plain Grok text turn, including its session/update command push",
+        provider: Provider::Acp,
+        runtime_mode: Some(RuntimeMode::FullAccess),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(acp::run_request),
+        fence: no_fence,
+        body: ScenarioBody::Acp(|s, i| Box::pin(acp::run(s, i))),
+    },
+    ScenarioSpec {
+        name: "steer-grok",
+        purpose: "capture a Grok run receiving a queued steer, delivered as the next \
+                   session/prompt on the same session (Grok advertises no in-turn \
+                   steering extension)",
+        provider: Provider::Acp,
+        runtime_mode: Some(RuntimeMode::FullAccess),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(acp::steer_request),
+        fence: no_fence,
+        body: ScenarioBody::Acp(|s, i| Box::pin(acp::steer(s, i))),
+    },
+    ScenarioSpec {
         name: "model-discovery",
         purpose: "capture Claude's token-free model initialize reply",
         provider: Provider::Claude,
@@ -509,7 +531,7 @@ mod tests {
         assert!(scenario("codex", "model-discovery-logged-out").is_some());
         assert_eq!(
             SCENARIOS.len(),
-            23,
+            25,
             "an added or removed row must update this count too"
         );
     }

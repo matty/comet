@@ -126,7 +126,7 @@ async fn record_acp(
         input,
         body,
         crate::capture::record::scenarios::acp::resolve_node_executable,
-        crate::capture::record::scenarios::acp::run_launch_unreachable,
+        crate::capture::record::scenarios::acp::run_launch,
     )
     .await
 }
@@ -1147,6 +1147,18 @@ mod tests {
                 None,
                 FenceKind::None,
             ),
+            (
+                Provider::Acp,
+                "run-grok",
+                Some(scenarios::acp::run_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Acp,
+                "steer-grok",
+                Some(scenarios::acp::steer_request),
+                FenceKind::None,
+            ),
             (Provider::Claude, "model-discovery", None, FenceKind::None),
             (Provider::Claude, "command-discovery", None, FenceKind::None),
             (
@@ -1394,7 +1406,7 @@ mod tests {
                             // that rather than this arm hoping for it.
                             Provider::Acp => (
                                 absolute_program("node"),
-                                crate::capture::record::scenarios::acp::run_launch_unreachable
+                                crate::capture::record::scenarios::acp::run_launch
                                     as fn(&Path, &RunRequest) -> LaunchDescriptor,
                             ),
                         };
@@ -1468,13 +1480,66 @@ mod tests {
     ///   none carry machine- or session-specific data.
     #[test]
     fn every_scenario_launch_matches_its_committed_corpus_manifest() {
-        // Registered but not yet recorded: both rows spawn a real ACP adapter,
-        // so their corpus has to come from an actual run on a machine with the
-        // adapters installed. There is no fake to record instead.
+        // The two ACP adapter rows resolve their launch through
+        // `adapter_entry`, which needs an npm global root that genuinely
+        // holds the package -- real on this machine (the adapters are
+        // installed here) and real nowhere in CI, which runs
+        // `ubuntu-24.04` with neither adapter present. Confirmed on
+        // `.github/workflows/ci.yml`'s "fmt + clippy + test" job (PR #127,
+        // 2026-08-29): this test panicked with "npm's global node_modules
+        // could not be located" there and nowhere locally. Promoting the
+        // ACP captures gave this test its first ACP rows to check, and
+        // turned a comparison that had always passed vacuously into one
+        // that depends on the machine running it.
+        //
+        // Fixed the same way `codex_home` below keeps the Codex discovery
+        // rows hermetic: supply a deterministic answer explicitly rather
+        // than let production fall back to auto-discovering one from
+        // whatever the real machine happens to have. `adapter_entry` reads
+        // its root from `COMET_ACP_ADAPTER_ROOT`, not from `ScenarioInput`
+        // the way `codex_home` does, so the equivalent here is a stub
+        // directory this test creates itself and points that variable at,
+        // unconditionally, on every machine -- not a variable the test
+        // reads and branches on, which would just move the CI dependency
+        // rather than remove it. The suffix-based argv comparison
+        // (`normalize_argv` below) already treats everything before the
+        // package name as environment-specific and never compares it, so
+        // a synthetic root changes nothing about what this test actually
+        // verifies: the real package name and `dist/index.js` layout still
+        // have to match the committed manifest, on every machine, with no
+        // skip anywhere.
+        let adapter_root = tempfile::tempdir().expect("tempdir for stub ACP adapters");
+        for package in [
+            scenarios::acp::CODEX_ACP_PACKAGE,
+            scenarios::acp::CLAUDE_ACP_PACKAGE,
+        ] {
+            let entry_dir = adapter_root.path().join(package).join("dist");
+            std::fs::create_dir_all(&entry_dir)
+                .unwrap_or_else(|error| panic!("stub adapter dir for {package}: {error}"));
+            std::fs::write(
+                entry_dir.join("index.js"),
+                "// stub, for argv-shape comparison only\n",
+            )
+            .unwrap_or_else(|error| panic!("stub adapter entry for {package}: {error}"));
+        }
+        // SAFETY: single-threaded per nextest's one-process-per-test model
+        // (`.config/nextest.toml`); no other test in this process reads or
+        // writes this variable while this one runs.
+        unsafe { std::env::set_var("COMET_ACP_ADAPTER_ROOT", adapter_root.path()) };
+
+        // codex-acp and claude-agent-acp discovery are promoted in this same
+        // change (evidence: `tests/corpus/{codex-acp,claude-agent-acp}/`).
+        // Grok stays exempt: `comet-provider-sanitize` structurally REJECTS
+        // every Grok capture today, `initialize` reply onward -- Grok's own
+        // `_meta["x.ai/..."]` vendor-namespace keys contain a literal `.`,
+        // which `validate_key`'s `AmbiguousObjectKey` check refuses
+        // unconditionally, and that check's own doc comment says explicitly
+        // this is "a design question about path encoding, not something to
+        // escape past on the day it arrives." See D102.
         const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[
-            (Provider::Acp, "session-discovery-codex-acp"),
-            (Provider::Acp, "session-discovery-claude-acp"),
             (Provider::Acp, "session-discovery-grok"),
+            (Provider::Acp, "run-grok"),
+            (Provider::Acp, "steer-grok"),
         ];
 
         let root = crate::capture::corpus_root();
@@ -1485,11 +1550,7 @@ mod tests {
         let mut unevidenced: Vec<String> = Vec::new();
 
         for spec in SCENARIOS {
-            let provider_str = match spec.provider {
-                Provider::Claude => "claude",
-                Provider::Codex => "codex",
-                Provider::Acp => "acp",
-            };
+            let provider_str = crate::capture::corpus_provider_name(spec.provider, spec.name);
             let label = format!("{provider_str}/{}", spec.name);
 
             // EVERY corpus directory for this scenario, across every version — not just the
@@ -1528,7 +1589,7 @@ mod tests {
                     Provider::Codex => (absolute_program("codex"), crate::codex::run_launch),
                     Provider::Acp => (
                         absolute_program("node"),
-                        crate::capture::record::scenarios::acp::run_launch_unreachable
+                        crate::capture::record::scenarios::acp::run_launch
                             as fn(&Path, &RunRequest) -> LaunchDescriptor,
                     ),
                 };
@@ -1610,9 +1671,9 @@ mod tests {
         assert_eq!(
             unevidenced_sorted,
             vec![
-                "acp/session-discovery-claude-acp".to_owned(),
-                "acp/session-discovery-codex-acp".to_owned(),
-                "acp/session-discovery-grok".to_owned(),
+                "grok/run-grok".to_owned(),
+                "grok/session-discovery-grok".to_owned(),
+                "grok/steer-grok".to_owned(),
             ],
             "exactly the rows in EXEMPT_UNCAPTURED may land in unevidenced — a row losing \
              corpus evidence must update this assertion deliberately, not pass through silently. \
@@ -1625,6 +1686,9 @@ mod tests {
             failures.len(),
             failures.join("\n\n")
         );
+
+        // SAFETY: see the matching set_var above.
+        unsafe { std::env::remove_var("COMET_ACP_ADAPTER_ROOT") };
     }
 
     /// The final path component of `program` with a trailing `.exe` stripped.
@@ -1650,11 +1714,48 @@ mod tests {
         derived: &CommandSnapshot,
         corpus: &CommandSnapshot,
     ) -> Vec<String> {
+        // Any argv element containing `/` or `\`, for every row this
+        // function compares (not only ACP's) -- collapses to its last THREE
+        // path components, dropping everything before them. Written for ACP's
+        // two adapter rows (codex-acp, claude-agent-acp), the first whose
+        // argv element IS a path rather than a flag: `args[0]` is the
+        // resolved absolute path to the adapter's own JS entry file, and the
+        // corpus redacts its home-directory prefix to `<HOME>`. Comparing
+        // that byte-for-byte against a freshly derived launch on THIS machine
+        // can never agree -- same reason `program` is compared by stem alone
+        // below, not full equality. Unlike `program`, one final component
+        // (`index.js`) is identical for every npm package that follows this
+        // convention and would compare two different adapters' entries as
+        // equal, so this keeps three instead -- still insensitive to where
+        // npm's global root sits on a given machine or OS, but distinguishing
+        // the package itself.
+        //
+        // **The condition is "contains a separator", not "is this row's
+        // adapter-entry argument"**, so it applies uniformly to any path-
+        // shaped arg on any provider. No row today has one other than the two
+        // above, but a future Codex or Claude flag carrying a real path (a
+        // `--config-dir=/a/b/c/d`, say) would compare as `b/c/d`, silently
+        // dropping everything before it rather than comparing the flag
+        // verbatim the way every other argv token here still does.
+        //
+        // Split on both separators by hand, same reasoning as
+        // `program_stem`'s own doc comment: the corpus string mixes `\`
+        // (Windows path joins) and `/` (the npm scope separator inside
+        // `@agentclientprotocol/codex-acp`) in the same string, and
+        // `std::path::Path` treats `\` as an ordinary character on a
+        // non-Windows host (this workspace's CI runs `ubuntu-24.04`).
         fn normalize_argv(args: &[String]) -> Vec<String> {
+            fn path_suffix(raw: &str, components: usize) -> String {
+                let mut parts: Vec<&str> = raw.rsplit(['/', '\\']).take(components).collect();
+                parts.reverse();
+                parts.join("/")
+            }
             args.iter()
                 .map(|arg| {
                     if arg.starts_with("--resume=") {
                         "--resume=<REDACTED>".to_owned()
+                    } else if arg.contains('/') || arg.contains('\\') {
+                        path_suffix(arg, 3)
                     } else {
                         arg.clone()
                     }

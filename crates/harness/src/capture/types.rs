@@ -78,6 +78,71 @@ pub enum Provider {
     Acp,
 }
 
+/// The corpus TOP-LEVEL directory name a scenario's evidence is promoted
+/// under — `crates/harness/tests/corpus/<this>/<version>/<scenario>/`.
+///
+/// `Provider::Claude`/`Provider::Codex` answer their own lowercase name, same
+/// as before this function existed. `Provider::Acp` is the one case the enum's
+/// own doc comment names as "the scenario row's business": Claude and Codex
+/// each speak one wire to one CLI, so the enum variant IS the corpus
+/// provider. ACP is one wire spoken by several unrelated agents with their
+/// own, unrelated version numbers (grok 1.0.5, codex-acp 1.7.0,
+/// claude-agent-acp 0.70.0) — collapsing them under a single `acp/<version>/`
+/// directory would force one version number to stand for three CLIs, so each
+/// gets its own top-level directory instead, matched off the scenario's own
+/// name rather than the wire it happens to share.
+///
+/// Matched by substring rather than an exhaustive enum-of-agents: adding a
+/// fourth ACP agent (Hermes, PR1) means adding its scenarios' names here, not
+/// widening `Provider` and every `match` that already exhausts it.
+pub fn corpus_provider_name(provider: Provider, scenario_name: &str) -> &'static str {
+    match provider {
+        Provider::Claude => "claude",
+        Provider::Codex => "codex",
+        Provider::Acp => {
+            if scenario_name.contains("codex-acp") {
+                "codex-acp"
+            } else if scenario_name.contains("claude-acp") {
+                "claude-agent-acp"
+            } else {
+                "grok"
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod corpus_provider_name_tests {
+    use super::*;
+
+    /// Break caught: a scenario row named for one agent silently promoting
+    /// under another agent's corpus directory, or under the bare "acp" name
+    /// the enum's own doc comment says must not stand in for any of them.
+    #[test]
+    fn each_acp_scenario_maps_to_its_own_agent_directory() {
+        assert_eq!(
+            corpus_provider_name(Provider::Acp, "session-discovery-grok"),
+            "grok"
+        );
+        assert_eq!(
+            corpus_provider_name(Provider::Acp, "session-discovery-codex-acp"),
+            "codex-acp"
+        );
+        assert_eq!(
+            corpus_provider_name(Provider::Acp, "session-discovery-claude-acp"),
+            "claude-agent-acp"
+        );
+        assert_eq!(corpus_provider_name(Provider::Acp, "run-grok"), "grok");
+        assert_eq!(corpus_provider_name(Provider::Acp, "steer-grok"), "grok");
+    }
+
+    #[test]
+    fn claude_and_codex_ignore_the_scenario_name() {
+        assert_eq!(corpus_provider_name(Provider::Claude, "anything"), "claude");
+        assert_eq!(corpus_provider_name(Provider::Codex, "anything"), "codex");
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Channel {

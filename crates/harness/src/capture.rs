@@ -40,5 +40,5 @@ pub use surface::{
 };
 pub use types::{
     CaptureConfig, CaptureEvent, Channel, CommandSnapshot, PlatformMetadata, Provider, RawCapture,
-    RedactionRoots,
+    RedactionRoots, corpus_provider_name,
 };

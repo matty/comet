@@ -132,6 +132,18 @@ impl<P: CaptureProvider> Session<P> {
         request: Option<RunRequest>,
     ) -> anyhow::Result<Self> {
         let command = CommandSnapshot::from_launch(&launch);
+        // `cli_version` is the LAUNCHED PROGRAM's own `--version`, not the
+        // agent's -- the same thing for Claude and Codex, where `program`
+        // IS the agent's own binary, but a different program entirely for
+        // ACP's two adapter rows (codex-acp, claude-agent-acp), whose
+        // `program` is `node`. Both promoted ACP-adapter manifests read
+        // `cli_version: "v22.23.2"` for exactly that reason -- Node's own
+        // version, not the adapter package's. The corpus directory those
+        // captures promote under (and the capability sheet's own title) is
+        // named from a different field entirely, `agentInfo.version` off
+        // the `initialize` reply, read once at promotion time rather than
+        // stored here. See D102's "unrelated third sanitizer gap" section
+        // for the fuller record.
         let cli_version = probe_version(&launch.program).await;
         let captured_at_unix_ms = i64::try_from(
             std::time::SystemTime::now()

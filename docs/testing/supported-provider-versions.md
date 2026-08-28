@@ -9,6 +9,18 @@ instead of being carried forever on "someone might have an older one".
 | Claude Code | **2.1.228** | `crates/harness/tests/corpus/claude/2.1.228/`, `…/2.1.229/`, `…/2.1.233/`, `…/2.1.241/` |
 | codex-cli | **0.147.0** | `crates/harness/tests/corpus/codex/0.147.0/` |
 
+**A promoted corpus does not always earn a floor row.** codex-acp 1.7.0 and claude-agent-acp
+0.70.0 are both promoted (`crates/harness/tests/corpus/{codex-acp,claude-agent-acp}/`) with no
+row above. This table is about *adapters* -- CLIs a Comet `Harness` actually drives and
+therefore might one day drop a decode for -- and Comet registers no `Harness` for either:
+`comet_proto::agent::HarnessId` has no `CodexAcp`/`ClaudeAgentAcp` variant, only `ClaudeCode`,
+`Codex`, `Cursor`, `Grok`, `Hermes` and `Mock`. codex-acp and claude-agent-acp exist in the
+corpus purely as the ACP protocol's own two-speaker comparison points for the agents Comet
+does drive over ACP (`crates/harness/src/acp/{grok,hermes}.rs`). "No supported version can
+produce it" has no floor to be measured against for a CLI nothing decodes. If either ever
+gains a real `Harness`, add its row then, from the same evidence already sitting in the
+corpus.
+
 ## What the floor means
 
 **A tool or frame no supported version emits does not get a decode.** Writing one produces a

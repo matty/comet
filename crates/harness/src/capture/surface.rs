@@ -94,7 +94,42 @@ pub enum SurfaceError {
 /// path declared here but not there would redact a key the snapshot still
 /// expects to see, and the reverse publishes an identifier the snapshot has
 /// already agreed is data.
-pub const MAP_PATHS: &[&str] = &[".modelUsage"];
+pub const MAP_PATHS: &[&str] = &[
+    ".modelUsage",
+    // ACP, promote-the-captures slice (2026-08-28). A tool call's own
+    // parameters, keyed by that tool's parameter names (`pattern`, `path`,
+    // `target_file`, ...) — a union across every tool an agent offers, the
+    // same shape of problem D73 tracks for Claude's tool-argument paths.
+    // First seen in `steer-grok` (grok 1.0.5): Grok's own read/search tools
+    // populate this from real filesystem paths on the capturing machine.
+    //
+    // **The declaration is right and it costs something, and both halves are
+    // worth stating — the same trade-off `acp.txt`'s header already records
+    // for `_meta`/`steering.supported`, just not repeated here the first
+    // time.** Declaring this a map is what stops `target_file` (and every
+    // other tool's own argument names) from publishing as if they were
+    // reviewed field names. But `normalize::typed_call` (`normalize.rs`)
+    // genuinely reads two of this map's children on a `search`-kind frame —
+    // `rawInput["pattern"]` and `rawInput["path"]` — and once a path is a
+    // declared map, `Visit::walk` folds every child under it to `.{}`
+    // (`.params.update.rawInput.{}`), so this sheet can no longer distinguish
+    // "pattern" from "path" from any other tool's own key. A future ACP
+    // agent version that drops `pattern` from its search frames breaks
+    // `typed_call`'s `Search` decode silently — the capability-sheet golden
+    // test stays green, because the field it would have caught is no longer
+    // a field this walker can see at all. That is exactly the failure the
+    // sheets exist to prevent, reopened by the one declaration that also
+    // prevents a worse one (publishing a filesystem path as a field value).
+    // `normalize.rs`'s own `pattern`/`path` decode test is what covers this
+    // gap instead — see that test's doc comment for why a unit test has to
+    // stand in for the sheet here.
+    ".params.update.rawInput",
+    // ACP, same slice. `session/prompt`'s usage breakdown, keyed by model
+    // id — the ACP analog of Claude's `.modelUsage` above, at a different
+    // path because ACP nests usage under the prompt reply's own `_meta`
+    // rather than the frame root.
+    ".result._meta.usage.modelUsage",
+];
 
 /// Discriminator paths whose observed *values* form a provider's vocabulary —
 /// not every field, only the ones whose few distinct values answer "what
