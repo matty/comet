@@ -97,6 +97,10 @@ under this task's time budget.** A narrow, reviewable shape worth considering wh
 take it up: a small, explicitly-enumerated allowlist of literal key strings permitted to contain a
 path delimiter (the same "declare it once, review it once" shape `surface::MAP_PATHS` and
 `allowlist::NAMED_LEAVES` already use), checked before `AmbiguousObjectKey` fires — which would
+leave the check's actual protection (anything NOT on that reviewed list still rejects
+unconditionally) fully intact. Not attempted here; recorded as the shape worth trying, not a
+decision to build it this way.
+
 ### The three session-config paths that were reviewed but cannot be spelled yet
 
 Task review (2026-08-28) confirmed the allowlist review itself was sound but ruled that three
