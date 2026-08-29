@@ -1,6 +1,6 @@
 # D87 — the stage-7 extraction trigger has fired
 
-**Status: open, REOPENED 2026-08-29.** This page is the PR10 (`docs/acp-closeout`) re-check the
+**Status: closed, stage 7 executed 2026-08-29 (see the section at the end).** This page is the PR10 (`docs/acp-closeout`) re-check the
 row itself names as one of two things that would reopen it. **A first pass on 2026-08-29 got
 this wrong** — it concluded neither trigger had fired and restated the wait. A review of that
 pass caught it: trigger 1 had already fired, on evidence sitting in this same tree. This page
@@ -144,7 +144,7 @@ settled-by-decision-to-wait, which is what a first, wrong pass at this page woul
 
 ## Stage 7 executed, 2026-08-29
 
-`crates/harness/src/capture/` moved to a new workspace member, `crates/capture` (package
+[PR #145](https://github.com/matty/comet/pull/145). `crates/harness/src/capture/` moved to a new workspace member, `crates/capture` (package
 `comet-capture`), `git mv`'d wholesale — sources, `allowlist/*.txt`, the two `comet-provider-*`
 bins, `tests/capture_corpus.rs` + `tests/capture_corpus/`, and `tests/corpus/`. `comet-harness`
 depends on `comet-capture` only as a **dev-dependency**; `comet-capture` depends on
