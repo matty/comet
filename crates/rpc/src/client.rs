@@ -462,6 +462,18 @@ mod cancellation_backpressure_tests {
         drop(inbound_sender);
     }
 
+    /// The budget is deliberately generous. What this test separates is "drop
+    /// returned" from "drop blocked forever" -- a regression here means a
+    /// blocking call on a full channel with nothing draining it (or a
+    /// `block_on` with no runtime), which never completes, so any finite bound
+    /// tells the two apart equally well. A tight bound instead measures how
+    /// fast the OS scheduled a thread, which on a loaded machine is noise: at
+    /// 50ms this failed 9 runs in 12 during parallel worktree builds. Same
+    /// mechanism and same resolution as D89 -- widen the budget, keep the
+    /// property, because what proves the property is the wait being bounded at
+    /// all, never the bound being small.
+    const DROP_PROMPTNESS_BUDGET: Duration = Duration::from_secs(5);
+
     #[test]
     fn dropping_with_a_full_transport_outside_a_runtime_is_prompt() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -487,7 +499,7 @@ mod cancellation_backpressure_tests {
             let _ = finished.send(());
         });
 
-        let prompt = received.recv_timeout(Duration::from_millis(50)).is_ok();
+        let prompt = received.recv_timeout(DROP_PROMPTNESS_BUDGET).is_ok();
         thread.join().unwrap();
         assert!(prompt, "PendingGuard::drop blocked outside a runtime");
     }
