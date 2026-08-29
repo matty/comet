@@ -37,9 +37,15 @@ placeholder `REPLACE_WITH_A_REAL_MODEL_ID`, which reproduces today's
 behaviour unchanged and will get an "unknown model" style error rather than
 a real answer -- pass a real id the target agent understands (e.g.
 `grok-4-fast` for Grok, whatever `session/new`'s reply or the agent's own
-docs list for another one) to see how it actually responds:
+docs list for another one) to see how it actually responds.
 
-    python scripts/probe-acp-setters.py --exe grok --args agent --no-leader stdio --model grok-4-fast
+**`--args` must come last.** It takes the whole rest of the command line,
+so a `--model` placed after it is swallowed as a launch arg: the agent gets
+a stray `--model grok-4-fast` it never asked for and the probe silently
+falls back to the placeholder, which looks exactly like the agent rejecting
+a real id. Put every other flag first:
+
+    python scripts/probe-acp-setters.py --exe grok --model grok-4-fast --args agent --no-leader stdio
 
 Sends `initialize` and `session/new` (both token-free on every agent this
 was tried against), then tries each candidate `(method, params)` pair from
@@ -127,7 +133,7 @@ def candidates(model_id: str) -> list[tuple[str, dict]]:
     ]
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--exe", required=True, help="path to (or name of) the ACP agent's executable")
     parser.add_argument(
@@ -145,7 +151,11 @@ def main() -> None:
         "e.g. grok-4-fast for Grok (default: a placeholder that exercises the same "
         "candidates without needing a real id)",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     cwd = args.cwd or tempfile.gettempdir()
     proc = spawn(args.exe, args.args)
