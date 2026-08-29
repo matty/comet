@@ -167,13 +167,49 @@ pub(crate) fn session_update(params: &Value) -> Option<AgentEvent> {
 /// not the same silence the dedup itself produces on the event stream, so a
 /// verbose run can still show the frequency, but not a warn-level line per
 /// frame, which is exactly the storm this function exists to avoid.
+/// Bound on `seen`'s size (D113) — the same "cannot become an allocator"
+/// concern `ToolTracker`'s `MAX_TRACKED_CALLS` exists for
+/// (`docs/debt/README.md`'s D10 is the standing version of the mistake both
+/// avoid), applied to a different registry with a different failure mode.
+///
+/// **`ToolTracker`'s cap cannot be copied verbatim — it would invert the
+/// purpose of this one.** `ToolTracker` stops TRACKING past its cap, and a
+/// call whose id it never tracked risks being re-emitted as a duplicate card
+/// later — a real but bounded and rare cost. `seen` here is not an in-flight
+/// registry the same way: it only ever grows by DISTINCT unrecognized
+/// `sessionUpdate` *kind strings*, and its whole job is rate-limiting — a
+/// kind's presence in `seen` is what turns its second and later occurrence
+/// into a suppressed repeat. If a full `seen` still called `insert` on a
+/// brand-new kind and got `true` back (as `ToolTracker`'s "refuse once full"
+/// does), every kind arriving after the cap would look "newly seen" FOREVER,
+/// since it would never actually be recorded — reintroducing, at the cap
+/// boundary, exactly the per-frame warn storm this function exists to stop.
+///
+/// So past this cap, a NEW kind is treated as an already-suppressed repeat
+/// instead: no `warn!`, no `AgentEvent::Diagnostic` reaching the caller, only
+/// a `trace!`. The cost is diagnostic SIGNAL, never real content — a
+/// legitimate agent's vocabulary of kinds this build doesn't map is a
+/// handful at most (this function's own Tier 3 doc), so only a buggy or
+/// adversarial agent minting a fresh kind string every frame would ever
+/// reach 64 distinct ones in one session, and that is precisely the runaway
+/// case this cap exists to bound rather than a session worth degrading for.
+const MAX_TRACKED_UPDATE_KINDS: usize = 64;
+
 pub(crate) fn session_update_once(
     seen: &mut HashSet<String>,
     params: &Value,
 ) -> Option<AgentEvent> {
     let event = session_update(params)?;
     if let AgentEvent::Diagnostic { discriminator, .. } = &event {
-        if seen.insert(discriminator.clone()) {
+        if seen.contains(discriminator) {
+            tracing::trace!(
+                target: "comet_harness::acp",
+                discriminator = %discriminator,
+                "repeated unrecognized session/update suppressed"
+            );
+            return None;
+        } else if seen.len() < MAX_TRACKED_UPDATE_KINDS {
+            seen.insert(discriminator.clone());
             tracing::warn!(
                 target: "comet_harness::acp",
                 update = %params,
@@ -183,7 +219,8 @@ pub(crate) fn session_update_once(
             tracing::trace!(
                 target: "comet_harness::acp",
                 discriminator = %discriminator,
-                "repeated unrecognized session/update suppressed"
+                cap = MAX_TRACKED_UPDATE_KINDS,
+                "unrecognized session/update kind suppressed: seen-kind cap reached"
             );
             return None;
         }
@@ -1181,6 +1218,63 @@ mod tests {
         assert!(
             matches!(second, Some(AgentEvent::Diagnostic { .. })),
             "{second:?}"
+        );
+    }
+
+    /// **D113, pinned.** `seen` must not grow past `MAX_TRACKED_UPDATE_KINDS`
+    /// distinct kinds — a session sending that many different unrecognized
+    /// `sessionUpdate` strings stops getting a fresh report for any FURTHER
+    /// new one (suppressed like a repeat), rather than growing the set
+    /// without bound. Also proves the cap's own failure mode does not
+    /// resurrect the storm the dedup exists to prevent: a kind arriving
+    /// after the cap is full must not report EVERY time just because it was
+    /// never actually recorded.
+    #[test]
+    fn the_seen_kind_set_is_capped_not_unbounded() {
+        let mut seen = HashSet::new();
+
+        // Fill the cap with distinct kinds, each reporting exactly once.
+        for i in 0..MAX_TRACKED_UPDATE_KINDS {
+            let frame = json!({"update": {"sessionUpdate": format!("kind-{i}")}});
+            let first = session_update_once(&mut seen, &frame);
+            assert!(
+                matches!(first, Some(AgentEvent::Diagnostic { .. })),
+                "kind {i} should report the first time: {first:?}"
+            );
+        }
+        assert_eq!(seen.len(), MAX_TRACKED_UPDATE_KINDS);
+
+        // A kind past the cap must not report...
+        let overflow = json!({"update": {"sessionUpdate": "kind-overflow"}});
+        assert_eq!(
+            session_update_once(&mut seen, &overflow),
+            None,
+            "a brand-new kind arriving after the cap must not grow `seen` \
+             or report as though it were newly seen"
+        );
+        assert_eq!(
+            seen.len(),
+            MAX_TRACKED_UPDATE_KINDS,
+            "an overflowing kind must never be inserted"
+        );
+
+        // ...and asking again for the SAME overflow kind must not report
+        // either — the failure mode this test exists to catch is a kind that
+        // was never recorded reporting AGAIN AND AGAIN, which is the storm
+        // the whole function exists to prevent.
+        assert_eq!(
+            session_update_once(&mut seen, &overflow),
+            None,
+            "an overflowing kind must stay suppressed on every later frame too"
+        );
+
+        // A kind that filled the cap before it was full is unaffected —
+        // still correctly deduped, not evicted to make room.
+        let already_tracked = json!({"update": {"sessionUpdate": "kind-0"}});
+        assert_eq!(
+            session_update_once(&mut seen, &already_tracked),
+            None,
+            "a kind tracked before the cap filled stays deduped"
         );
     }
 
