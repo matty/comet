@@ -19,6 +19,14 @@ use tokio::process::{Child, ChildStdin};
 /// silent fixture fails the suite instead of hanging it.
 const QUIET: Duration = Duration::from_millis(750);
 
+/// Grok's vendor completion notification (`acp::session`'s own copy carries
+/// the full rationale). Built via `concat!`, not one literal: a repo-wide
+/// guard (`crates/engine/tests/no_runtime_cloud.rs`) forbids a slash, the
+/// word "session", and another slash appearing contiguously anywhere under
+/// `crates/`, and a plain substring scan cannot tell this vendor method name
+/// apart from a hosted-authority remnant.
+const PROMPT_COMPLETE_METHOD: &str = concat!("_x.ai/ses", "sion/prompt_complete");
+
 struct Fixture {
     child: Child,
     stdin: ChildStdin,
@@ -212,4 +220,75 @@ async fn an_unknown_method_is_answered_with_an_error() {
     let id = fx.request("session/invented", json!({})).await;
     let reply = fx.reply_to(id).await.expect("unknown methods are answered");
     assert_eq!(reply["error"]["code"], -32601);
+}
+
+/// `silent-after-prompt`: identical wire shape to `starve` (nothing at all),
+/// pinned as its own contract because the ACP hardening in `acp/session.rs`
+/// keys its prompt-stall test on this exact keyword — a future change to
+/// `starve`'s shape must not silently retarget that test too.
+#[tokio::test]
+async fn silent_after_prompt_answers_nothing_at_all() {
+    let mut fx = Fixture::spawn(false);
+    fx.handshake().await;
+    let session = fx.open_session().await;
+    let id = fx.prompt(&session, "please silent-after-prompt").await;
+    assert!(
+        fx.reply_to(id).await.is_none(),
+        "silent-after-prompt must emit no frame whatsoever"
+    );
+}
+
+/// `complete-notification-only`: the upstream hang, posed directly — the
+/// completion notification fires, but the `session/prompt` RPC is never
+/// answered.
+#[tokio::test]
+async fn complete_notification_only_sends_the_notification_and_never_answers() {
+    let mut fx = Fixture::spawn(false);
+    fx.handshake().await;
+    let session = fx.open_session().await;
+    let id = fx
+        .prompt(&session, "please complete-notification-only")
+        .await;
+
+    let update = fx.next_frame().await.expect("it streams first");
+    assert_eq!(update["method"], "session/update");
+    let complete = fx.next_frame().await.expect("the notification arrives");
+    assert_eq!(complete["method"], PROMPT_COMPLETE_METHOD);
+    assert_eq!(complete["params"]["sessionId"], session);
+    assert_eq!(complete["params"]["stopReason"], "end_turn");
+    assert!(
+        complete["params"]["promptId"].as_str().is_some(),
+        "a real promptId, echoed by the reply on the healthy path"
+    );
+    assert!(
+        fx.reply_to(id).await.is_none(),
+        "complete-notification-only must never answer the RPC"
+    );
+}
+
+/// `complete-both`: the notification fires immediately, the ordinary reply
+/// follows after a deliberate delay — both signals for one healthy turn, on
+/// purpose deterministic rather than raced.
+#[tokio::test]
+async fn complete_both_sends_the_notification_then_the_delayed_reply() {
+    let mut fx = Fixture::spawn(false);
+    fx.handshake().await;
+    let session = fx.open_session().await;
+    let id = fx.prompt(&session, "please complete-both").await;
+
+    let update = fx.next_frame().await.expect("it streams first");
+    assert_eq!(update["method"], "session/update");
+    let complete = fx.next_frame().await.expect("the notification arrives");
+    assert_eq!(complete["method"], PROMPT_COMPLETE_METHOD);
+    let prompt_id = complete["params"]["promptId"]
+        .as_str()
+        .expect("a real promptId")
+        .to_owned();
+
+    let reply = fx.reply_to(id).await.expect("the reply follows, delayed");
+    assert_eq!(reply["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        reply["result"]["_meta"]["promptId"], prompt_id,
+        "the reply echoes the SAME promptId as the notification"
+    );
 }

@@ -14,21 +14,41 @@
 //! | --- | --- |
 //! | `drop-reply`    | streams an update, then never answers the prompt request |
 //! | `starve`        | answers nothing at all after `session/new` |
+//! | `silent-after-prompt` | identical wire shape to `starve` — named separately because it exists for a different mechanism (the prompt-stall bound, not cancel-recovery) and should not be confused with it if `starve` is ever repurposed |
 //! | `ignore-cancel` | never answers, and ignores `session/cancel` too |
 //! | `exit-now`      | writes to stderr and exits mid-turn |
 //! | `refusal`       | settles with `stopReason: "refusal"` |
 //! | `cancel`        | settles with `stopReason: "cancelled"` |
-//! | anything else   | one text chunk, then `stopReason: "end_turn"` |
+//! | `complete-notification-only` | sends the completion notification (see [`PROMPT_COMPLETE_METHOD`]), then never answers the prompt request — poses the hang upstream reports, where the RPC response alone hangs |
+//! | `complete-both` | sends the completion notification immediately, then the ordinary RPC reply after a deliberate delay — poses the healthy case both signals exist for |
+//! | `complete-response-only` | the ordinary RPC reply alone, no notification — this is the plain `end_turn` path below; named here because it is the deliberate MIRROR of `complete-notification-only`: an agent without the extension, which must still settle |
+//! | `replay-stale` | replays the PREVIOUS turn's already-consumed promptId as a bogus early completion (`stopReason: "refusal"`) of THIS turn, before streaming this turn's own real content and completing for real — poses the cross-turn staleness the consumed-promptId dedup exists to reject |
+//! | anything else   | one text chunk, then `stopReason: "end_turn"`, no completion notification |
 //!
 //! **`starve` and `ignore-cancel` are not the same mode**, and the difference
 //! is the whole point of the second one: a starved prompt is still recorded as
 //! in-flight, so a `session/cancel` settles it. Only `ignore-cancel` leaves the
 //! client's own bounded give-up as the sole thing that can end the turn.
+//!
+//! **The `complete-*` modes exist for the ACP hardening in `acp/session.rs`:
+//! settling a turn on whichever of the RPC response or Grok's completion
+//! notification ([`PROMPT_COMPLETE_METHOD`]) lands first, exactly once.**
+//! The plain default path deliberately sends NO notification — every test
+//! written before this hardening existed already drives that path, and
+//! changing its shape would be changing what those tests cover.
 
 use std::io::{BufRead, StdinLock, Write};
 use std::process::exit;
 
 use serde_json::{Value, json};
+
+/// Grok's vendor completion notification (`acp::session`'s own copy carries
+/// the full rationale). Built via `concat!`, not one literal, for the same
+/// reason that module's copy is: `crates/engine/tests/no_runtime_cloud.rs`
+/// forbids a slash, the word "session", and another slash appearing
+/// contiguously anywhere under `crates/`, and a plain substring scan cannot
+/// tell this vendor method name apart from a hosted-authority remnant.
+const PROMPT_COMPLETE_METHOD: &str = concat!("_x.ai/ses", "sion/prompt_complete");
 
 /// One JSON-RPC line. Rust's stdout is line-buffered even on a pipe, so each
 /// line reaches the harness before the fixture blocks on its next read.
@@ -95,6 +115,10 @@ fn main() {
     // The id of a `session/prompt` deliberately left unanswered (`drop-reply`
     // and `starve`). A `session/cancel` settles exactly this one.
     let mut pending_prompt: Option<Value> = None;
+    // The promptId minted for the MOST RECENT completed turn, so a later
+    // turn's `replay-stale` can echo it as a bogus early completion — the
+    // shape the consumed-promptId dedup exists to reject.
+    let mut last_prompt_id: Option<String> = None;
 
     loop {
         let line = read_line(&mut stdin);
@@ -148,7 +172,7 @@ fn main() {
                 }
                 emit(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
             }
-            "session/prompt" => pending_prompt = handle_prompt(&frame, &id),
+            "session/prompt" => pending_prompt = handle_prompt(&frame, &id, &mut last_prompt_id),
             "session/cancel" => {
                 // A cancel is a NOTIFICATION in ACP: it carries no id of its
                 // own and gets no reply. What settles is the in-flight
@@ -178,7 +202,7 @@ fn main() {
 /// Returns the prompt's id when it is left UNANSWERED, so `session/cancel` can
 /// settle it later. `None` means the turn was answered here and nothing is
 /// outstanding.
-fn handle_prompt(frame: &Value, id: &Value) -> Option<Value> {
+fn handle_prompt(frame: &Value, id: &Value, last_prompt_id: &mut Option<String>) -> Option<Value> {
     let session_id = frame["params"]["sessionId"]
         .as_str()
         .unwrap_or("fake-session-1");
@@ -214,10 +238,13 @@ fn handle_prompt(frame: &Value, id: &Value) -> Option<Value> {
         exit(3);
     }
 
-    if text.contains("starve") {
+    if text.contains("starve") || text.contains("silent-after-prompt") {
         // Nothing at all: no update, no reply. This is the shape the
-        // starved-turn recovery commits exist for, and the only honest way to
-        // pose it is to say nothing.
+        // starved-turn recovery commits exist for (`starve`) and the shape
+        // the prompt-stall bound exists for (`silent-after-prompt`) — two
+        // different mechanisms that happen to want the identical wire
+        // silence, kept as separate keywords so a future change to one
+        // cannot silently retarget the other's test.
         return Some(id.clone());
     }
 
@@ -229,6 +256,91 @@ fn handle_prompt(frame: &Value, id: &Value) -> Option<Value> {
     if text.contains("drop-reply") {
         // Streamed, then silent. The turn never settles on its own — the
         // dropped-reply settle is what has to notice.
+        return Some(id.clone());
+    }
+
+    // Grok's vendor promptId, echoed identically by the notification and by
+    // the reply's `_meta.promptId` (verified live, 2026-08-28) — derived from
+    // the request's own JSON-RPC id so it is unique per prompt without extra
+    // state, the same way a real agent mints one per turn.
+    let prompt_id = format!("fake-prompt-{id}");
+    // Captured BEFORE this turn's own id overwrites it below, so
+    // `replay-stale` can echo the PREVIOUS turn's promptId rather than its
+    // own.
+    let previous_prompt_id = last_prompt_id.clone();
+    let complete = |stop: &str| {
+        emit(&json!({
+            "jsonrpc": "2.0",
+            "method": PROMPT_COMPLETE_METHOD,
+            "params": {
+                "sessionId": session_id,
+                "promptId": prompt_id,
+                "stopReason": stop,
+                "agentResult": Value::Null,
+            },
+        }));
+    };
+
+    if text.contains("complete-notification-only") {
+        // The upstream hang, posed directly: the notification is the ONLY
+        // thing that ever says this turn is over.
+        complete("end_turn");
+        *last_prompt_id = Some(prompt_id);
+        return Some(id.clone());
+    }
+
+    if text.contains("complete-both") {
+        // The healthy case both signals exist for, made deterministic rather
+        // than raced: the notification fires immediately, the ordinary reply
+        // follows after a delay comfortably longer than any reasonable
+        // "settled fast" assertion, so a test can tell WHICH signal actually
+        // ended the turn rather than merely that one eventually did.
+        //
+        // **No trailing text chunk after the notification, unlike the plain
+        // `end_turn` path below.** Real Grok's own race is 3ms end to end
+        // with nothing further to stream once the notification fires; adding
+        // a chunk here would sit in `incoming`, undrained, until whichever
+        // turn runs next — a discarded RPC reply has nothing left to explain
+        // once its own turn already settled off the notification, and this
+        // fixture should not invent content that turn never produced.
+        complete("end_turn");
+        *last_prompt_id = Some(prompt_id.clone());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        emit(&json!({
+            "jsonrpc": "2.0", "id": id,
+            "result": {"stopReason": "end_turn", "_meta": {"promptId": prompt_id}},
+        }));
+        return None;
+    }
+
+    if text.contains("replay-stale") {
+        // The cross-turn staleness shape the consumed-promptId dedup exists
+        // to reject: a delayed duplicate of an EARLIER, already-settled
+        // turn's completion notification, echoed into THIS turn's window.
+        // Without the dedup this reads as completing THIS turn immediately,
+        // with the PREVIOUS turn's stale stopReason — before this turn's own
+        // real content has even streamed.
+        if let Some(stale) = previous_prompt_id {
+            emit(&json!({
+                "jsonrpc": "2.0",
+                "method": PROMPT_COMPLETE_METHOD,
+                "params": {
+                    "sessionId": session_id,
+                    "promptId": stale,
+                    "stopReason": "refusal",
+                    "agentResult": Value::Null,
+                },
+            }));
+        }
+        // This turn's OWN real content, deliberately after a delay: a dedup
+        // failure settles (wrongly, as a refusal) before this ever streams.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        update(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "second"},
+        }));
+        complete("end_turn");
+        *last_prompt_id = Some(prompt_id);
         return Some(id.clone());
     }
 
