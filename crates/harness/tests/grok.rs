@@ -175,14 +175,22 @@ async fn an_unusable_cli_probes_into_something_actionable() {
         "the hint must name WHICH binary failed — with an override set, that is          the whole diagnosis: {hint}"
     );
 
-    // **The hint is NOT leak-checked, and that is a recorded gap, not an
-    // oversight.** `probe_cli_version` interpolates the raw `io::Error` and the
-    // CLI's own stderr into it (`lib.rs`, the "could not be started" and
-    // "`--version` failed" arms), so this hint really does carry "(os error 2)".
-    // That contradicts `.agents/rules/user-facing-errors.md` rule 1, and
-    // `probe_tests::a_failing_cli_reports_its_own_error` asserts the behavior
-    // deliberately. It is shared by claude and codex alike and predates Grok, so
-    // it is not this harness's to change — see the debt row.
+    // **The hint is leak-checked too, since D100.** It used to carry
+    // "(os error 2)" verbatim — `probe_cli_version` interpolated the raw
+    // `io::Error` — which this test recorded as a gap rather than asserted on.
+    // The arm now reads `io::ErrorKind` instead of the error's Display, so the
+    // same check that guards the summary applies here.
+    //
+    // A CLI that RUNS and exits non-zero still carries one cleaned line of its
+    // own stderr by ruling, which is a different arm and not reachable from a
+    // missing binary: `probe_tests::a_failing_cli_reports_its_own_error` and
+    // `a_stderr_line_reaches_the_hint_readable_rather_than_raw` cover it.
+    for leak in ["os error", "No such file", "Error {", "io:"] {
+        assert!(
+            !hint.contains(leak),
+            "raw technical detail reached the hint: {hint}"
+        );
+    }
 }
 
 #[tokio::test]
