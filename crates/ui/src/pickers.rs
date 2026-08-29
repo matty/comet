@@ -3290,13 +3290,10 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         ),
         HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
         HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
-        // **Deliberately not a brand mark.** The embedded set has no Grok
-        // glyph, and the other three are ports of comet's own `icons.tsx`
-        // rather than something drawn here. Inventing an xAI logo from memory
-        // would ship a wrong mark that looks deliberate; a neutral glyph reads
-        // as "no mark yet", which is true. Replace it when a real asset is
-        // added to `crates/ui/assets/icons/`.
-        HarnessId::Grok => (crate::icons::WIDGET, None),
+        // Untinted on purpose: the Grok logomark is monochrome, so `theme.text`
+        // reproduces xAI's own black-on-light / white-on-dark pair. A brand
+        // colour here would invent one they don't publish.
+        HarnessId::Grok => (crate::icons::GROK_MARK, None),
         // Same reasoning as Grok immediately above: no embedded Hermes glyph
         // exists, and a neutral mark reads as "no brand mark yet" rather than
         // claiming a wrong one.
@@ -3910,6 +3907,46 @@ const SKELETON_PERMISSIONS_W: f32 = 128.0;
 mod tests {
     use super::*;
     use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice, SandboxLevel};
+
+    /// Every harness must name an icon the asset source can actually serve —
+    /// `harness_brand_icon` hands back a `&'static str` path, so a typo or a
+    /// mark that was never registered fails at paint time as a silently blank
+    /// glyph rather than at compile time.
+    ///
+    /// Grok is called out because it spent a slice on the neutral `WIDGET`
+    /// placeholder: the check is that it now names a mark of its own, not just
+    /// that the path resolves.
+    #[test]
+    fn every_harness_names_a_loadable_mark_and_grok_has_its_own() {
+        use crate::icons::Assets;
+        use gpui::AssetSource as _;
+
+        for harness in [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Cursor,
+            HarnessId::Grok,
+            HarnessId::Hermes,
+            HarnessId::Mock,
+        ] {
+            let (path, _) = harness_brand_icon(harness);
+            assert!(
+                Assets.load(path).unwrap().is_some(),
+                "{harness:?} names an unserved icon: {path}"
+            );
+        }
+
+        let (grok, tint) = harness_brand_icon(HarnessId::Grok);
+        assert_eq!(grok, crate::icons::GROK_MARK);
+        assert_ne!(
+            grok,
+            crate::icons::WIDGET,
+            "Grok wears its own mark now, not the neutral placeholder"
+        );
+        // Untinted, so `theme.text` supplies xAI's black-on-light /
+        // white-on-dark pair. A tint here would invent a brand colour.
+        assert!(tint.is_none(), "the Grok mark must take the text colour");
+    }
 
     /// Both failures reach the same empty label and they are not the same
     /// sentence — a missing agent is not a missing model list.
