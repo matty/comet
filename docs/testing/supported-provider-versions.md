@@ -8,6 +8,14 @@ instead of being carried forever on "someone might have an older one".
 | --- | --- | --- |
 | Claude Code | **2.1.228** | `crates/capture/tests/corpus/claude/2.1.228/`, `…/2.1.229/`, `…/2.1.233/`, `…/2.1.241/` |
 | codex-cli | **0.147.0** | `crates/capture/tests/corpus/codex/0.147.0/` |
+| Grok | **1.0.5** | `crates/capture/tests/corpus/grok/1.0.5/` |
+
+**Grok's row is the whole evidence, not the oldest of several.** 1.0.5 is the only version any
+Grok capture has ever been taken at, so the floor states what the adapter is written against
+rather than a version it was deliberately raised to. **Hermes still has no row**: it is a
+registered `Harness` like Grok, but nothing has ever run it here (a Python 3.14 install failure,
+`docs/debt/` D104), so there is no corpus directory to point at and a floor would be a guess —
+D110's remaining half.
 
 **A promoted corpus does not always earn a floor row.** codex-acp 1.7.0 and claude-agent-acp
 0.70.0 are both promoted (`crates/capture/tests/corpus/{codex-acp,claude-agent-acp}/`) with no

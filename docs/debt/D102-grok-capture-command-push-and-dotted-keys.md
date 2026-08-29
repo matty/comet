@@ -1,38 +1,65 @@
-# D102 — Grok's command push ships with three fields unevidenced, and no Grok capture is promoted yet
+# D102 — Grok's command push ships with three fields unevidenced (promoted 2026-08-29 with them redacted)
 
-**Status: open, unowned. Blocker 2 is CLOSED (2026-08-29); Blocker 1's fallback ruling stands and
-nothing is promoted.** The first blocker is a decision already made (redact three decoded fields
-rather than publish this operator's personal skill inventory). The second — `comet-provider-sanitize`
-rejecting every Grok capture outright — was a real design question and is now answered:
-`surface::escape_path_segment` escapes a key's own delimiters where it joins a dotted path, so a
-vendor-namespaced key can no longer impersonate nesting and no longer needs refusing. **All three
-raw Grok captures sanitize end to end today** (discovery, `run-grok`, `steer-grok`); what remains
-is the *promotion*, which publishes a real turn's evidence into a public repository and is a
-reviewed decision under `docs/testing/provider-captures.md`, not an automatic consequence.
-codex-acp and claude-agent-acp are unaffected by either blocker and are promoted
-(`crates/capture/tests/corpus/{codex-acp,claude-agent-acp}/`).
+**Status: CLOSED 2026-08-29. All three captures are promoted (`crates/capture/tests/corpus/grok/1.0.5/`),
+`docs/providers/grok-1.0.5.md` is generated and committed, and Grok has a floor row in
+`docs/testing/supported-provider-versions.md`.** Blocker 2 was answered by escaping
+(`surface::escape_path_segment`); Blocker 1 stands as a *ruling*, not an obstacle — the command
+push publishes as placeholders, deliberately, and that is the state the corpus is in. Both
+blockers' reasoning is kept below because it is what stops a later reader from "fixing" the
+redacted command push by allowlisting it.
 
-**The consequence compounds, and is worth stating plainly.** Grok is the one ACP agent this fork
-actually ships — Hermes cannot run at all yet (D104) — and it is the one with the least
-monitoring of any adapter Comet drives, entirely because this row is still open:
+Grok now has what it had none of: a drift sheet, a version floor, and a promoted corpus the
+allowlist property runs over on every PR. It still has **no runnable live suite** —
+`crates/harness/tests/grok_live.rs` is `#[ignore]`d, its usage assertion unrun since the free
+quota was exhausted on 2026-08-28 — which is D47's problem, not this row's.
 
-- **No drift sheet.** `docs/providers/` has one for every corpus version of Claude Code and
-  codex-cli, and for codex-acp and claude-agent-acp — the two ACP adapters nobody actually runs
-  in production, kept only as comparison points. Grok, the one that ships, has none: a sheet
-  needs a promoted corpus, and nothing is promoted. Since 2026-08-29 that is a decision waiting
-  to be taken rather than a mechanism that refuses — the three raw captures sanitize, so a
-  promotion is a review away, not a fix away.
-- **No supported-version floor.** `docs/testing/supported-provider-versions.md` names one for
-  Claude Code and codex-cli only (D110 names this explicitly).
-- **No runnable live suite.** `crates/harness/tests/grok_live.rs` is `#[ignore]`d — its usage
-  assertion has not run since the free quota it needs was exhausted on 2026-08-28.
+## What the promotion review actually decided (2026-08-29)
 
-Finding 1 of the 2026-08-29 whole-branch review — Grok's token usage silently dropped on every
-healthy turn, a seam bug between two otherwise-correct PRs — is exactly the shape of drift this
-gap exists to catch and did not: it surfaced from reading the settle code's own two comments
-against each other, not from a sheet, a floor check, or a live run noticing the meter stayed
-empty. Closing this row does not fix that class of bug by itself, but it is the precondition for
-every mechanism that would have caught it sooner.
+Re-sanitized all three raws into fresh staging and read the novel-path report the ordinary way.
+The report is long; almost every row was already ruled on by the two blockers below and stayed
+withheld. **One line was added to `crates/capture/src/allowlist/acp.txt`, and one only:**
+
+- **`.params.stopReason`** — the same turn-outcome reading as the already-listed
+  `.result.stopReason`, arriving on Grok's own `_x.ai/session/prompt_complete` notification
+  rather than the `session/prompt` reply, and genuinely decoded there
+  (`acp/session.rs`'s notification-settle arm → `normalize::done_status`). Its sibling
+  `.params.promptId` is decoded on that same frame and stayed OFF: it is an identifier, and the
+  placeholder already preserves the join a test would need.
+
+Three things the review checked and left alone, each for a reason worth not re-deriving:
+
+- **`.result._meta.modelState.availableModels[]._meta.totalContextTokens`** looks like the
+  allowlisted `.result.models.availableModels[]._meta.totalContextTokens` and is not the same
+  path. `normalize::context_window` reads the `session/new` copy only; the `initialize` copy is
+  enrichment (`grok.rs`'s `models_from_discovery` takes `modelId`/`name`/`description`/
+  `reasoningEfforts[].id` from it and nothing else). Undecoded, so withheld.
+- **`_meta.agentVersion`** is Grok's only version string on the wire — it sends **no
+  `agentInfo` object at all**, so `AgentDescription::from_initialize` leaves `name` and
+  `version` `None` for the one ACP agent this fork ships. It stays redacted because nothing
+  decodes it, which means `grok/1.0.5/`'s directory name comes from the manifest's
+  `cli_version`, not from anything in the promoted frames.
+- **Booleans are never redacted** (`sanitize.rs`: they carry no identifying information), so
+  `agentCapabilities.promptCapabilities.image` — read by `from_initialize` — publishes without
+  a line, and never appeared in the novel-path report at all. Do not add a line for a bool and
+  conclude it did something.
+
+Two mechanism bugs surfaced by being the first promotion with an escaped path, both fixed in the
+same change:
+
+- **`allowlist_property`'s two walkers built paths unescaped**, so the corpus-wide safety gate
+  spelled `.result._meta.x.ai/sessionConfig.options[].id` while the allowlist (correctly) spells
+  it `x\.ai/...`, and the three licensed session-config lines read as 30 escapes. Both mirrors
+  now call `escape_path_segment`, and its doc comment names four path builders instead of two —
+  a mirror in a test is a path builder.
+- **The sheet generator refused a manifest with a null `command.cwd`.** `grok::run_launch`
+  deliberately sets none (an ACP session takes its directory from `session/new`'s own
+  `params.cwd`), so `run-grok` and `steer-grok` genuinely have none. `SheetScenario::cwd` is
+  `Option<String>` now and the sheet prints "none set — the launch inherits the recorder's".
+
+**`.params.update.sessionUpdate` joined `VOCABULARY_PATHS` on this evidence.** `.method` alone
+is useless for an ACP agent — 416 of the 526 frames in `steer-grok` are `session/update` — and
+the update kind one level down is the real discriminator. Grok 1.0.5 shows thirteen values, five
+of which Comet decodes nothing from.
 
 ## Blocker 1 — the command push mixes Grok's own commands with the operator's personal skills
 
@@ -247,7 +274,7 @@ recorded in the manifest itself. Nothing in the manifest or the sheet says these
 different fields describing two different programs; a reader comparing `cli_version` against the
 sheet title and finding them unrelated has found this, not a data-entry error.
 
-## What is preserved for whoever picks this up
+## What is preserved (the raws stay; the promotion is done)
 
 - Three real, successful Grok recordings survive `comet-provider-capture`'s own run — `session/new`,
   `session/prompt`, and the queued second `session/prompt` all completed and were captured. Raw
@@ -255,22 +282,23 @@ sheet title and finding them unrelated has found this, not a data-entry error.
   `C:\dev\superpowers\comet\captures\acp-raw-2026-08-28\acp-session-discovery-grok-*\` (discovery)
   and `C:\dev\superpowers\comet\captures\acp-raw-2026-08-28-run-steer\acp-{run,steer}-grok-*\`
   (the two new scenarios this task added). These are raw, unsanitized, and carry this operator's
-  personal environment per Blocker 1 above — never promote from them directly. All three pass
-  `comet-provider-sanitize` as of 2026-08-29, so whoever takes the promotion up starts by
-  re-running them into fresh staging and reading the novel-path report the normal way. That
-  report is long (Grok's own announcements, tips, subscription fields, hostname, plus the whole
-  command push) and every row is a publish-or-withhold decision, which is the work this row's
-  remaining half consists of.
+  personal environment per Blocker 1 above — never promote from them directly, and never
+  re-sanitize one on top of a promoted capture (nothing re-sanitizes the corpus, so a
+  re-recorded row is a new promotion, not an edit). They are what the 2026-08-29 promotion
+  staged from, and what a re-record would be compared against.
 - `steer-grok`'s capture additionally confirmed `rawInput` genuinely appears on real tool-call
   frames (Grok's `read_file`/`grep` tools ran mid-turn, keyed by that tool's own parameter names —
   `target_file`, `pattern`, ...) and populated it with this operator's own filesystem paths, the
   same shape of problem as the command push. `.params.update.rawInput` and the ACP usage
   breakdown's `.result._meta.usage.modelUsage` are declared in `surface::MAP_PATHS` in this same
-  change, so neither publishes a key by accident once Grok capture is unblocked.
+  change, so neither publishes a key by accident. Confirmed against the promoted corpus: the
+  sheet records `.params.update.rawInput.path` and `.pattern` as fields (their values still
+  placeholders) and no other tool parameter name anywhere.
 - All Step 4/5 code — `run-grok`/`steer-grok` scenario rows, production's shared
   `crate::acp::grok::run_launch` wired as the recorder's launch builder, `corpus_provider_name`
   routing each ACP agent to its own top-level corpus directory — is in place, built, and passes its
-  own unit tests. Nothing there is blocked; only the sanitize step is.
+  own unit tests, and all three rows are out of `EXEMPT_UNCAPTURED` in both
+  `record.rs` and `scenario_coverage.rs` — that list is empty now.
 
 ## Related
 

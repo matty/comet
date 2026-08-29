@@ -63,6 +63,16 @@
 # (`read`/`search`/`other`, `pending`/`in_progress`/`completed`/`failed`),
 # never personal data. See D102 for the fuller record.
 #
+# `.params.stopReason` is the SAME reading as the already-listed
+# `.result.stopReason`, arriving by Grok's own completion notification
+# (`_x.ai/session/prompt_complete`) instead of the `session/prompt` reply.
+# `session.rs`'s notification-settle arm reads it and hands it to
+# `normalize::done_status`, so a turn's outcome is decoded from this path on
+# every Grok turn that settles that way. Same tiny vocabulary as the reply's
+# (`end_turn`, `cancelled`, `refusal`, ...), never personal data. Its sibling
+# `.params.promptId` on that frame is decoded too and stays OFF: it is an
+# identifier, and the placeholder already preserves the join a test needs.
+#
 # `.params.update.availableCommands[].name`/`.description`/`.input.hint` ARE
 # decoded (`normalize::commands`, feeds the slash-command picker) and are
 # still NOT on this list. Grok's `session/update` push mixes its own built-in
@@ -81,6 +91,7 @@
 .params.clientInfo.title
 .params.clientInfo.version
 .params.protocolVersion
+.params.stopReason
 .params.update.kind
 .params.update.sessionUpdate
 .params.update.status

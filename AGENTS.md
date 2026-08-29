@@ -150,11 +150,11 @@ production decodes it: `.params.update.rawInput` names `pattern` and `path` beca
 
 `docs/providers/<provider>-<version>.md` is a generated **capability sheet**, one per corpus
 version directory (`claude-2.1.228.md`, `claude-2.1.229.md`, `claude-2.1.233.md`,
-`claude-2.1.241.md`, `codex-0.147.0.md`, `claude-agent-acp-0.70.0.md`, `codex-acp-1.7.0.md`
-today): every
+`claude-2.1.241.md`, `codex-0.147.0.md`, `claude-agent-acp-0.70.0.md`, `codex-acp-1.7.0.md`,
+`grok-1.0.5.md` today): every
 dotted field path the promoted corpus shows for that version, split by direction; the observed
-value vocabulary for a small declared set of discriminator paths (`.type`, `.method`, the
-tool-name paths, …); and the exact scenario list — argv, cwd and configured environment — the
+value vocabulary for a small declared set of discriminator paths (`.type`, `.method`,
+`.params.update.sessionUpdate`, the tool-name paths, …); and the exact scenario list — argv, cwd and configured environment — the
 evidence was drawn from. It exists for the reason the deleted field snapshot did: a newly
 promoted capture, or a new CLI version's added or removed field, **fails the golden test**
 (`crates/capture/tests/capture_corpus/capability_sheets.rs`) instead of arriving unnoticed. Grep

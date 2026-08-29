@@ -252,9 +252,15 @@ pub fn is_named_map_child(path: &str, key: &str) -> bool {
 /// because field names publish, and a map key still faces `allows_prefix`'s
 /// default-deny.
 ///
-/// **Both path builders must use this**, or a sheet and an allowlist would
-/// spell the same field two ways: [`Visit::walk`] here, and
-/// `sanitize::Redactor::sanitize_value_tree`. The `[]`/`{}` markers those two
+/// **Every path builder must use this**, or a sheet and an allowlist would
+/// spell the same field two ways. Four of them, not the two this comment
+/// listed until the first escaped path was actually promoted (Grok's
+/// `x\.ai/sessionConfig` lines, 2026-08-29): [`Visit::walk`] here,
+/// `sanitize::Redactor::sanitize_value_tree`, and the two mirrors in
+/// `tests/capture_corpus/allowlist_property.rs` (`collect_scalars`,
+/// `collect_map_keys`) — which built theirs unescaped and so failed the whole
+/// corpus gate on a path its own allowlist licensed. A mirror is a path
+/// builder; being in a test does not exempt it. The `[]`/`{}` markers these
 /// emit for an array element and a map entry are generated, never escaped —
 /// only the characters that came out of a real key are.
 pub fn escape_path_segment(key: &str) -> Cow<'_, str> {
@@ -337,6 +343,20 @@ pub fn escape_path_segment(key: &str) -> Cow<'_, str> {
 ///   Stage 3's allowlist ledger already names `.method` as "the vocabulary
 ///   the stage-5 capability sheet reads", which is why `.method` is on
 ///   `allowlist/codex.txt` even though this const didn't read it until now.
+/// - `.params.update.sessionUpdate` — **ACP's own frame kind, added
+///   2026-08-29 with the first ACP turn evidence.** `.method` alone is not
+///   enough for an ACP agent the way it is for Codex: nearly every frame an
+///   agent sends is `session/update`, and what kind of update it is lives one
+///   level down. Grok 1.0.5's corpus shows thirteen values
+///   (`agent_message_chunk`, `agent_thought_chunk`, `tool_call`,
+///   `tool_call_update`, `tool_call_delta_chunk`, `available_commands_update`,
+///   `pending_interaction`, `interaction_resolved`, `response_completed`,
+///   `turn_completed`, `user_message_chunk`, `session_summary_generated`,
+///   `session_info_update`) — five of which Comet decodes nothing from, which
+///   is exactly the kind of thing a sheet exists to keep visible. It reads
+///   `(none observed)` for the discovery-only codex-acp and claude-agent-acp
+///   corpora, and for Claude and Codex, which is the honest answer: those
+///   scenarios never opened a turn.
 ///
 /// **No Codex tool-name path is declared.** Codex's turn items carry a kind
 /// at `.params.item.type` (`agentMessage`, `reasoning`, `userMessage`, …),
@@ -354,6 +374,7 @@ pub const VOCABULARY_PATHS: &[&str] = &[
     ".method",
     ".message.content[].name",
     ".event.content_block.name",
+    ".params.update.sessionUpdate",
 ];
 
 /// Distinct scalar values seen at each [`VOCABULARY_PATHS`] entry, keyed by

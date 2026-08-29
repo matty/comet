@@ -1,0 +1,29 @@
+{
+  "captured_at_unix_ms": 1787909657136,
+  "cli_version": "grok 1.0.5 (5115b46bc9) [stable]",
+  "command": {
+    "args": [
+      "--no-auto-update",
+      "agent",
+      "--no-leader",
+      "stdio"
+    ],
+    "configured_env": {},
+    "creation_flags": 0,
+    "cwd": "<CWD>",
+    "kill_on_drop": true,
+    "program": "<HOME>\\.grok\\bin\\grok.exe",
+    "stderr": "Piped",
+    "stdin": "Piped",
+    "stdout": "Piped"
+  },
+  "exit_code": 0,
+  "platform": {
+    "arch": "x86_64",
+    "os": "windows"
+  },
+  "provider": "acp",
+  "purpose": "the same ACP surface from Grok Build, the first ground-up ACP agent",
+  "scenario": "session-discovery-grok",
+  "schema_version": 1
+}

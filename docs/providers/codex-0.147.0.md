@@ -498,6 +498,10 @@ The observed value set for a small declared list of discriminator paths — not 
 - `turn/start`
 - `turn/steer`
 
+#### `.params.update.sessionUpdate`
+
+(none observed)
+
 #### `.request.subtype`
 
 (none observed)
@@ -549,6 +553,10 @@ The observed value set for a small declared list of discriminator paths — not 
 - `turn/completed`
 - `turn/diff/updated`
 - `turn/started`
+
+#### `.params.update.sessionUpdate`
+
+(none observed)
 
 #### `.request.subtype`
 

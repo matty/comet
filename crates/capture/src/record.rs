@@ -1564,21 +1564,13 @@ mod tests {
         // env var while this section runs.
         unsafe { std::env::set_var("COMET_ACP_ADAPTER_ROOT", adapter_root.path()) };
 
-        // codex-acp and claude-agent-acp discovery are promoted (evidence:
-        // `tests/corpus/{codex-acp,claude-agent-acp}/`). Grok's three rows
-        // stay exempt, but no longer for the reason this comment used to
-        // give: `comet-provider-sanitize` rejected every Grok capture
-        // outright until `surface::escape_path_segment` answered the
-        // path-encoding question its own doc comment asked (D102 Blocker 2).
-        // All three raw captures sanitize now. What is left is the
-        // *promotion*, which publishes a real turn's evidence into a public
-        // repository and is a reviewed decision (`provider-captures.md`),
-        // not something this change made automatic.
-        const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[
-            (Provider::Acp, "session-discovery-grok"),
-            (Provider::Acp, "run-grok"),
-            (Provider::Acp, "steer-grok"),
-        ];
+        // Empty: every ACP row is promoted now. codex-acp and
+        // claude-agent-acp discovery landed with the adapters
+        // (`tests/corpus/{codex-acp,claude-agent-acp}/`), and Grok's three
+        // rows landed in `grok/1.0.5/` when D102's promotion review was
+        // done. Keep the mechanism: a scenario that genuinely cannot be
+        // captured gets a row here plus the reason, never a silent skip.
+        const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[];
 
         let root = crate::corpus_root();
         let promoted = crate::promoted_scenarios(&root)
@@ -1630,8 +1622,18 @@ mod tests {
                     Provider::Codex => {
                         (absolute_program("codex"), comet_harness::codex::run_launch)
                     }
+                    // ACP rows do not share one executable, and which one a
+                    // row needs is a property of the row's own launch — the
+                    // same reason spawn lives on the row rather than on
+                    // `CaptureProvider` (see that trait's doc comment).
+                    // Reading it off the launch rather than off the scenario
+                    // name is deliberate: D79 and D80 are the record of
+                    // deriving a row's wiring from something adjacent to it.
+                    // Unpinned until Grok was promoted, because the adapter
+                    // rows were the only ACP evidence and `node` was right
+                    // for all of them.
                     Provider::Acp => (
-                        absolute_program("node"),
+                        absolute_program(acp_program(spec)),
                         crate::record::scenarios::acp::run_launch
                             as fn(&Path, &RunRequest) -> LaunchDescriptor,
                     ),
@@ -1713,14 +1715,12 @@ mod tests {
         unevidenced_sorted.sort();
         assert_eq!(
             unevidenced_sorted,
-            vec![
-                "grok/run-grok".to_owned(),
-                "grok/session-discovery-grok".to_owned(),
-                "grok/steer-grok".to_owned(),
-            ],
+            Vec::<String>::new(),
             "exactly the rows in EXEMPT_UNCAPTURED may land in unevidenced — a row losing \
              corpus evidence must update this assertion deliberately, not pass through silently. \
-             Delete a row here once its capture is promoted."
+             Both sides are empty now that Grok's three rows are promoted, and they move \
+             together: this list is the second copy of EXEMPT_UNCAPTURED, kept so a row \
+             vanishing from the corpus cannot be absorbed by editing the exemption alone."
         );
 
         assert!(
@@ -1745,6 +1745,30 @@ mod tests {
         match name.rsplit_once('.') {
             Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") => stem.to_owned(),
             _ => name.to_owned(),
+        }
+    }
+
+    /// Which executable an ACP row's launch spawns: `grok` for Grok's own
+    /// rows, `node` for the two adapter rows, whose JS entry node runs.
+    ///
+    /// Declared by reading the row's launch, never its name. Every ACP `Run`
+    /// row is Grok's today and `scenarios::acp::run_launch` hard-delegates to
+    /// `grok::run_launch` — that function's doc comment carries the note for
+    /// the day a second agent gains a run row, and this arm inherits it.
+    fn acp_program(spec: &ScenarioSpec) -> &'static str {
+        type DiscoveryLaunch = fn(&ScenarioInput, &Path) -> anyhow::Result<LaunchDescriptor>;
+        match spec.launch {
+            ScenarioLaunch::Run(_) => "grok",
+            ScenarioLaunch::Discovery(launch) => {
+                if std::ptr::fn_addr_eq(
+                    launch,
+                    crate::record::scenarios::acp::grok_launch as DiscoveryLaunch,
+                ) {
+                    "grok"
+                } else {
+                    "node"
+                }
+            }
         }
     }
 

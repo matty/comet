@@ -48,8 +48,8 @@
 use std::path::Path;
 
 use comet_capture::{
-    Provider, allows, allows_prefix, corpus_root, frames, is_map_path, is_named_map_child,
-    is_placeholder_token, promoted_scenarios,
+    Provider, allows, allows_prefix, corpus_root, escape_path_segment, frames, is_map_path,
+    is_named_map_child, is_placeholder_token, promoted_scenarios,
 };
 use serde_json::Value;
 
@@ -220,7 +220,7 @@ fn collect_map_keys(value: &Value, path: &str, out: &mut Vec<(String, String)>) 
                 if is_map {
                     out.push((path.to_owned(), key.clone()));
                 }
-                collect_map_keys(child, &format!("{path}.{key}"), out);
+                collect_map_keys(child, &format!("{path}.{}", escape_path_segment(key)), out);
             }
         }
         _ => {}
@@ -386,7 +386,7 @@ fn collect_scalars(value: &Value, path: &str, out: &mut Vec<(String, Value)>) {
         }
         Value::Object(object) => {
             for (key, child) in object {
-                let child_path = format!("{path}.{key}");
+                let child_path = format!("{path}.{}", escape_path_segment(key));
                 collect_scalars(child, &child_path, out);
             }
         }
@@ -464,7 +464,7 @@ mod self_check {
             temp.path(),
             "path-equivalence",
             &[
-                r#"{"type":"user","mystery":"unlisted-value","nested":{"list":[{"unknown":"a"},{"unknown":"b"}]},"mcp_servers":[{"status":"connected"}],"request":{"tool_name":"mcp__linear__create_issue"}}"#,
+                r#"{"type":"user","mystery":"unlisted-value","nested":{"list":[{"unknown":"a"},{"unknown":"b"}]},"mcp_servers":[{"status":"connected"}],"request":{"tool_name":"mcp__linear__create_issue"},"x.ai/vendor":{"leaf":"vendor-value"}}"#,
             ],
         );
         let report = sanitize_dir(&raw, &staging_dir(temp.path(), "path-equivalence")).unwrap();
@@ -530,6 +530,26 @@ mod self_check {
                 by_path[".request.tool_name"],
             ),
             "the real sanitizer's redacted mcp__ placeholder must not read as an escape"
+        );
+
+        // A key carrying a path delimiter is escaped where it joins, exactly
+        // as `sanitize_value_tree` and `Visit::walk` escape it -- so the
+        // mirror spells a vendor-namespaced key the same way an allowlist
+        // line has to. Unpinned until Grok's promotion, when three licensed
+        // `x\.ai/sessionConfig` lines read as 30 escapes over the whole
+        // corpus because this walker built `.x.ai/vendor` instead.
+        assert!(
+            by_path.contains_key(r".x\.ai/vendor.leaf"),
+            "a dotted key must be escaped where it joins the path, got: {:?}",
+            by_path.keys().collect::<Vec<_>>()
+        );
+        assert!(!allows(Provider::Claude, r".x\.ai/vendor.leaf"));
+        assert!(
+            by_path[r".x\.ai/vendor.leaf"]
+                .as_str()
+                .unwrap()
+                .starts_with('<'),
+            "the value under a dotted key is default-deny like any other"
         );
 
         // Sanity: every path `collect_scalars` produced agrees in aggregate

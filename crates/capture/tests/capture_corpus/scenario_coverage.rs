@@ -22,22 +22,14 @@ use comet_capture::{SCENARIOS, corpus_provider_name, corpus_root, promoted_scena
 /// stale — that second direction is what stops the exemption list itself from
 /// becoming the next place a coverage gap hides unnoticed.
 ///
-/// Empty of the Claude/Codex rows the stage-6 promotion used to carry here
-/// (all landed in that live re-capture) — but not empty overall. Grok's
-/// three rows are exempt again, for a reason distinct from "not yet
-/// recorded" *and* distinct from what this comment said before: the
-/// sanitizer used to reject every Grok capture on its `_meta["x.ai/..."]`
-/// keys, which `surface::escape_path_segment` fixed (D102 Blocker 2), and
-/// all three raw captures sanitize today. They stay listed because
-/// promotion — publishing a real turn's evidence into a public repository —
-/// is a separate reviewed decision (`docs/testing/provider-captures.md`).
-/// codex-acp and claude-agent-acp discovery ARE promoted and are correctly
-/// absent from this list. See D102.
-const EXEMPT_UNCAPTURED: &[(&str, &str)] = &[
-    ("grok", "session-discovery-grok"),
-    ("grok", "run-grok"),
-    ("grok", "steer-grok"),
-];
+/// **Empty, and that is the state to keep it in.** Every declared scenario
+/// now has promoted evidence: the Claude/Codex rows landed in the stage-6
+/// re-capture, and Grok's three (`session-discovery-grok`, `run-grok`,
+/// `steer-grok`) landed in `grok/1.0.5/` once the promotion review D102
+/// tracked was actually done. A new row belongs here only with the reason it
+/// cannot be captured written beside it — an empty list is not an invariant
+/// this test enforces, it is just where the coverage happens to stand.
+const EXEMPT_UNCAPTURED: &[(&str, &str)] = &[];
 
 /// Break caught: a scenario declared in `SCENARIOS` (and rendered in
 /// `--help`) with no promoted corpus directory behind it anywhere, for any

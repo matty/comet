@@ -128,6 +128,10 @@ The observed value set for a small declared list of discriminator paths — not 
 
 (none observed)
 
+#### `.params.update.sessionUpdate`
+
+(none observed)
+
 #### `.request.subtype`
 
 - `initialize`
@@ -159,6 +163,10 @@ The observed value set for a small declared list of discriminator paths — not 
 (none observed)
 
 #### `.method`
+
+(none observed)
+
+#### `.params.update.sessionUpdate`
 
 (none observed)
 
