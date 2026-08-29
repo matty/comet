@@ -17,8 +17,10 @@ events where a real run would have supplied them. A gallery that constructs its 
 satisfies neither for free.
 
 **What they are not.** A knob scripts a *provider*. Anything the provider is not the source of —
-a steer boundary, an engine sweep, a device going offline — is out of reach here, and no value of
-any variable below changes that. Where a state has that shape it is called out in the table.
+an engine sweep, a device going offline — is out of reach here, and no value of any variable below
+changes that. Where a state has that shape it is called out in the table. A steer is the near
+miss worth naming: no knob produces one, because it is a gesture the user makes, but the mock does
+now answer one when you make it (D99), which is what puts a steer-boundary state on screen.
 
 ## Running the app against them
 
@@ -58,18 +60,20 @@ exists to produce. Keep both in step.
 
 Knobs compose: `COMET_MOCK_SUBAGENT=1 COMET_MOCK_CHECKLIST=1` puts both new cards in one run.
 
+**A subagent's `last seen running` card needs a steer, and the mock can take one now.** Run with
+`COMET_MOCK_SUBAGENT=1` and a `COMET_MOCK_DELAY_MS` high enough to type into (1500 is comfortable),
+then steer while the cards are still running. The engine finishes the open segment on
+`AgentEvent::Steered` and deliberately leaves a still-`Running` subagent alone — that is the state
+(`docs/debt/README.md`'s D57). Until D99 the mock declared `supports_steering: true` and never read
+the mailbox, so the steer was dropped, the run ended, and the `Done` sweep stamped the agent
+`Cancelled`; roughly half an hour went into hunting for a knob value that could not exist. Without
+the pacing the script still outruns you and you get `Cancelled` again — that is the script
+finishing first, not the drain failing. Pinned independently by
+`a_running_subagent_in_a_finished_entry_reads_last_seen_running` in `crates/ui/src/transcript.rs`.
+
 ## States no knob reaches
 
 Recorded so the next person does not spend a session hunting for a value that does not exist.
-
-**A subagent's `last seen running` card.** It needs a genuine steer boundary — the state exists
-precisely because Comet never learns the outcome (`docs/debt/D57`). A steer becomes that boundary
-only when the harness emits `AgentEvent::Steered`, which only the Claude and Codex adapters do.
-The mock advertises `supports_steering: true` and then never drains `controls.steering`, so a
-steer sent to it is dropped and the run simply ends; the engine's `Done` sweep then stamps the
-agent `Cancelled` like any other unfinished one. Pinned instead by
-`a_running_subagent_in_a_finished_entry_reads_last_seen_running` in `crates/ui/src/transcript.rs`.
-Seeing it needs a real Claude run that delegates, steered mid-flight.
 
 **A genuinely shorter resumed plan.** `COMET_MOCK_CHECKLIST` reproduces the *rows* a resumed run
 produces, including the subject-less one, but a second message re-runs the same script rather than
