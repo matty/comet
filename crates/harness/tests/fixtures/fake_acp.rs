@@ -25,6 +25,7 @@
 //! | `replay-stale` | replays the PREVIOUS turn's already-consumed promptId as a bogus early completion (`stopReason: "refusal"`) of THIS turn, before streaming this turn's own real content and completing for real — poses the cross-turn staleness the consumed-promptId dedup exists to reject |
 //! | `request-permission` | sends `session/request_permission` mid-turn with all four ACP option kinds, then — once answered — echoes `"chosen:<optionId or cancelled>"` as a text chunk and settles `end_turn`. Lets a test observe which option the client picked without reading raw wire bytes. |
 //! | `request-permission-unrecognized` | identical, but the options carry no kind this build recognizes (`vendor_custom` only) — poses the protocol-drift case, which a correct client answers `cancelled` on its own, never touching the approval bridge |
+//! | `request-permission-edit` | identical, but `toolCall.kind` is `"edit"` with a `diff` content block and the options are Hermes' real two-option edit shape (`allow_once`/`reject_once`, no `allow_always` at all) — poses the shape `AllowForSession`'s narrow-to-`allow_once` fallback exists for |
 //! | anything else   | one text chunk, then `stopReason: "end_turn"`, no completion notification |
 //!
 //! **`starve` and `ignore-cancel` are not the same mode**, and the difference
@@ -355,14 +356,27 @@ fn handle_prompt(
     let text = prompt_text(frame);
 
     if text.contains("request-permission") {
+        let unrecognized = text.contains("request-permission-unrecognized");
+        // Hermes' own edit-approval shape (`_build_permission_tool_call`,
+        // `acp_adapter/edit_approval.py`, source-read): `kind: "edit"`, a
+        // `diff` content block, and exactly TWO options — no `allow_always`
+        // at all. This is the shape `AllowForSession`'s narrowing exists
+        // for: the four-kind mode below never exercised it, which is how
+        // the bug it fixes got through review.
+        let edit = text.contains("request-permission-edit");
         // The four ACP option kinds, one real optionId each, so a test can
         // tell which was picked from the echoed `chosen:<id>` text. `execute`
         // + `rawInput.command` is Hermes' own shape for a dangerous-command
         // approval (`acp_adapter/permissions.py`, source-read — see
         // `crate::acp::approval`'s module doc).
-        let options = if text.contains("request-permission-unrecognized") {
+        let options = if unrecognized {
             json!([
                 {"optionId": "vendor-1", "kind": "vendor_custom", "name": "Do it anyway"},
+            ])
+        } else if edit {
+            json!([
+                {"optionId": "opt-allow-once", "kind": "allow_once", "name": "Allow edit"},
+                {"optionId": "opt-reject-once", "kind": "reject_once", "name": "Deny"},
             ])
         } else {
             json!([
@@ -372,6 +386,28 @@ fn handle_prompt(
                 {"optionId": "opt-reject-always", "kind": "reject_always", "name": "Reject always"},
             ])
         };
+        let tool_call = if edit {
+            json!({
+                "toolCallId": format!("call-{id}"),
+                "kind": "edit",
+                "content": [{
+                    "type": "diff",
+                    "path": "/tmp/edited.txt",
+                    "oldText": "old",
+                    "newText": "new",
+                }],
+            })
+        } else {
+            json!({
+                "toolCallId": format!("call-{id}"),
+                "kind": "execute",
+                "content": [{
+                    "type": "content",
+                    "content": {"type": "text", "text": "$ rm -rf /tmp/x"},
+                }],
+                "rawInput": {"command": "rm -rf /tmp/x"},
+            })
+        };
         let request_id = format!("perm-{id}");
         emit(&json!({
             "jsonrpc": "2.0",
@@ -379,15 +415,7 @@ fn handle_prompt(
             "method": "session/request_permission",
             "params": {
                 "sessionId": session_id,
-                "toolCall": {
-                    "toolCallId": format!("call-{id}"),
-                    "kind": "execute",
-                    "content": [{
-                        "type": "content",
-                        "content": {"type": "text", "text": "$ rm -rf /tmp/x"},
-                    }],
-                    "rawInput": {"command": "rm -rf /tmp/x"},
-                },
+                "toolCall": tool_call,
                 "options": options,
             },
         }));

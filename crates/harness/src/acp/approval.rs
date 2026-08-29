@@ -68,16 +68,22 @@ pub(crate) fn has_recognized_kind(options: &[Value]) -> bool {
 
 /// [`ApprovalRequest`] from ACP's `toolCall` param. See the module doc for
 /// which shapes are evidenced and which fall back to `Unknown`.
+///
+/// **`kind` is checked first, before looking for a `diff` content block.**
+/// `kind` is ACP's own declared classification of the call and the stronger
+/// signal; a `content` block is free-form and an `execute` call carrying one
+/// that happens to be shaped like a diff (a command's output, say) must not
+/// be read as a file change just because the block matched first.
 pub(crate) fn approval_request(tool_call: &Value) -> ApprovalRequest {
+    if tool_call["kind"] == "execute" {
+        return command(tool_call);
+    }
     let content = tool_call["content"]
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     if let Some(diff) = content.iter().find(|block| block["type"] == "diff") {
         return file_change(tool_call, diff);
-    }
-    if tool_call["kind"] == "execute" {
-        return command(tool_call);
     }
     ApprovalRequest::Unknown {
         summary: "Take an action Comet could not identify".to_owned(),
@@ -163,13 +169,26 @@ fn kind_for(decision: &ApprovalDecision) -> Option<&'static str> {
 
 /// The `session/request_permission` JSON-RPC result for one decision.
 ///
-/// **`Expired` always cancels, and so does a decision whose exact kind the
-/// options never offered.** Never widen to a kind that WAS offered but is not
-/// the one this decision means: `reject_once` picked for a
-/// `reject_always`-only offer would silently turn a one-time denial into a
-/// session-wide one — the break `each_decision_selects_the_matching_option_kind`
-/// exists to catch. `cancelled` is always a true statement about what
-/// happened; a `selected` naming the wrong kind never is.
+/// **`Expired` always cancels.** **Widening to a DIFFERENT kind than the one
+/// this decision means is never done**, whether or not the exact kind was
+/// offered: `reject_once` picked for a `reject_always`-only offer would
+/// silently turn a one-time denial into a session-wide one — the break
+/// `each_decision_selects_the_matching_option_kind` exists to catch.
+/// `cancelled` is always a true statement about what happened; a `selected`
+/// naming the wrong kind never is.
+///
+/// **Narrowing is different, and it is the common case, not the exception.**
+/// `AllowForSession` alone has an honest narrower fallback: a single-use
+/// grant (`allow_once`) is strictly LESS than the session-wide one the user
+/// asked for, never more, so offering it instead of cancelling outright is a
+/// true statement about a smaller action, not a wrong one about the
+/// requested action. `Allow` and `Deny` have no such fallback — `allow_once`
+/// and `reject_once` are already the least-scoped member of their pair — so
+/// a missing exact kind cancels for them. (An earlier version of this
+/// function cancelled on ANY missing exact kind, including
+/// `AllowForSession`'s — that read a real Hermes shape as a denial while the
+/// transcript recorded "Allowed for this session"; see
+/// `hermes_edit_shape_narrows_allow_for_session_to_allow_once`.)
 ///
 /// No branch here attaches a message to a denial: neither `PermissionOption`
 /// nor the outcome ACP defines carries a note field, and Grok's and Hermes'
@@ -180,15 +199,38 @@ pub(crate) fn outcome_for(decision: &ApprovalDecision, options: &[Value]) -> Val
     let Some(kind) = kind_for(decision) else {
         return cancelled;
     };
-    match options
+    if let Some(option) = find_kind(options, kind) {
+        return selected(option);
+    }
+    if matches!(decision, ApprovalDecision::AllowForSession)
+        && let Some(option) = find_kind(options, ALLOW_ONCE)
+    {
+        return selected(option);
+    }
+    cancelled
+}
+
+/// The first option of the given `kind`.
+///
+/// **First, not unique, and that is an assumption worth naming.** Hermes'
+/// command-approval builder (`_build_permission_options`,
+/// `acp_adapter/permissions.py`) can offer TWO options sharing
+/// `kind: "allow_always"` — `allow_session` (listed first) and `allow_always`
+/// (listed second, only when the call allows a permanent grant). ACP's kind
+/// vocabulary cannot distinguish "for this session" from "forever"; taking
+/// the first is correct for Hermes today only because Hermes happens to list
+/// the narrower, session-scoped one first. A future agent that orders the
+/// other way, or a real `session/request_permission` capture that shows
+/// Hermes doing the same, would need `outcome_for` to read something more
+/// than `kind` to pick correctly — nothing here can express that yet.
+fn find_kind<'a>(options: &'a [Value], kind: &str) -> Option<&'a Value> {
+    options
         .iter()
         .find(|option| option["kind"].as_str() == Some(kind))
-    {
-        Some(option) => json!({
-            "outcome": {"outcome": "selected", "optionId": option["optionId"]},
-        }),
-        None => cancelled,
-    }
+}
+
+fn selected(option: &Value) -> Value {
+    json!({"outcome": {"outcome": "selected", "optionId": option["optionId"]}})
 }
 
 #[cfg(test)]
@@ -307,14 +349,78 @@ mod tests {
         );
     }
 
-    /// A decision whose exact kind is not among the options offered cancels
-    /// rather than borrowing a different kind that happens to be present.
+    /// `Allow` and `Deny` have no narrower fallback of their own — `allow_once`
+    /// and `reject_once` are already the least-scoped member of their pair —
+    /// so a missing exact kind cancels rather than widening to a different
+    /// kind that happens to be present. This is the "never widen" guarantee
+    /// `deny_selects_reject_once_not_reject_always` also covers, from the
+    /// other direction: no substitute exists here at all, widened or not.
     #[test]
-    fn a_decision_with_no_matching_kind_cancels_rather_than_substitutes() {
-        let only_allow_once = [json!({"optionId": "a", "kind": "allow_once", "name": "Allow"})];
+    fn allow_and_deny_cancel_rather_than_widen_when_their_exact_kind_is_missing() {
+        let only_the_other_pair_member = [
+            json!({"optionId": "a", "kind": "allow_always", "name": "Allow always"}),
+            json!({"optionId": "d", "kind": "reject_always", "name": "Deny always"}),
+        ];
         assert_eq!(
-            outcome_for(&ApprovalDecision::AllowForSession, &only_allow_once),
+            outcome_for(&ApprovalDecision::Allow, &only_the_other_pair_member),
             json!({"outcome": {"outcome": "cancelled"}})
+        );
+        assert_eq!(
+            outcome_for(
+                &ApprovalDecision::Deny {
+                    message: "no".into()
+                },
+                &only_the_other_pair_member
+            ),
+            json!({"outcome": {"outcome": "cancelled"}})
+        );
+    }
+
+    /// **The bug this narrowing exists to fix.** Hermes' edit-approval
+    /// builder (`_build_permission_tool_call`, `acp_adapter/edit_approval.py`
+    /// — source-read) offers exactly two options: `allow_once` and
+    /// `reject_once`. No `allow_always` at all. Before this fix,
+    /// `AllowForSession` against this exact shape cancelled — denying the
+    /// edit — while the engine's own `request_approval` closure
+    /// (`sessions.rs`) had already written the signature into
+    /// `session_allowed` and stamped the card "Allowed for this session": a
+    /// false record of an action that was actually declined, and every LATER
+    /// matching edit would then auto-resolve to the same silent denial. A
+    /// single-use grant is strictly less than what the user asked for, never
+    /// more, so narrowing to it is the honest answer instead.
+    #[test]
+    fn hermes_edit_shape_narrows_allow_for_session_to_allow_once() {
+        let hermes_edit_options = [
+            json!({"optionId": "allow_once", "kind": "allow_once", "name": "Allow edit"}),
+            json!({"optionId": "deny", "kind": "reject_once", "name": "Deny"}),
+        ];
+        assert_eq!(
+            outcome_for(&ApprovalDecision::AllowForSession, &hermes_edit_options),
+            json!({"outcome": {"outcome": "selected", "optionId": "allow_once"}}),
+            "a session-wide grant must narrow to a one-time one, not cancel and read as a denial"
+        );
+    }
+
+    /// The narrowing above is `AllowForSession`-only. A denial has no
+    /// analogous narrower fallback to reach for, and must still cancel
+    /// outright when its own kind is entirely absent — covered here against
+    /// the exact two-option Hermes edit shape (no `reject_once` at all this
+    /// time), not just the four-kind set
+    /// `allow_and_deny_cancel_rather_than_widen_when_their_exact_kind_is_missing`
+    /// uses.
+    #[test]
+    fn hermes_edit_shape_denies_by_cancelling_when_no_reject_kind_is_offered_at_all() {
+        let allow_only =
+            [json!({"optionId": "allow_once", "kind": "allow_once", "name": "Allow edit"})];
+        assert_eq!(
+            outcome_for(
+                &ApprovalDecision::Deny {
+                    message: "no".into()
+                },
+                &allow_only
+            ),
+            json!({"outcome": {"outcome": "cancelled"}}),
+            "no reject kind at all leaves nothing to narrow OR widen to"
         );
     }
 }

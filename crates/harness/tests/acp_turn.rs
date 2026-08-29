@@ -728,6 +728,41 @@ async fn each_decision_selects_the_matching_option_kind() {
     );
 }
 
+/// **The bug a review found in this task, posed end to end.** Hermes' real
+/// edit-approval shape (`fake-acp`'s `request-permission-edit` mode) offers
+/// only `allow_once`/`reject_once` — no `allow_always` at all. Before the
+/// fix, `AllowForSession` against this shape answered the agent `cancelled`
+/// — denying the edit on the wire — while a cardless test could not see that
+/// the engine's own `request_approval` bridge had already recorded "Allowed
+/// for this session" for it. This drives the real production path (not just
+/// `approval::outcome_for` in isolation) against the real fixture shape, so
+/// a regression here fails at the same layer the four brief-mandated tests
+/// do.
+#[tokio::test]
+async fn allow_for_session_narrows_to_allow_once_on_hermes_real_edit_shape() {
+    let (controls, steer, _token) = controls_with_approval(|_request| {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(ApprovalDecision::AllowForSession);
+        rx
+    });
+    let stream = comet_harness::acp::session::run(
+        open(false).await,
+        HarnessId::Mock,
+        request("please request-permission-edit"),
+        controls,
+        no_usage,
+    );
+    drop(steer);
+    let events = drain(stream).await;
+
+    assert!(
+        text_of(&events).contains("chosen:opt-allow-once"),
+        "AllowForSession must narrow to allow_once when allow_always is not \
+         offered, never cancel and read as a denial: {:?}",
+        text_of(&events)
+    );
+}
+
 /// `ApprovalDecision::Expired` is host-stamped when a run ends with an approval
 /// still pending, and is never a decision a client may send. The agent must be
 /// answered `cancelled`, not left waiting on a dead channel.
@@ -804,5 +839,51 @@ async fn an_unrecognized_option_set_denies_and_reports_drift() {
                     && *severity == DiagnosticSeverity::Unknown
         )),
         "protocol drift must be reported, not silently swallowed: {events:#?}"
+    );
+}
+
+/// The drift diagnostic is rate-limited per session, the same way
+/// `normalize::session_update_once` rate-limits an unrecognized
+/// `session/update` kind (both share the same `diagnostics` set) — a vendor
+/// that drifts on every turn must report once per session, not once per
+/// request.
+#[tokio::test]
+async fn repeated_protocol_drift_reports_only_once_per_session() {
+    let (controls, steer, _token) = controls_with_approval(|_request| {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(ApprovalDecision::Allow);
+        rx
+    });
+    let stream = comet_harness::acp::session::run(
+        open(false).await,
+        HarnessId::Mock,
+        request("please request-permission-unrecognized"),
+        controls,
+        no_usage,
+    );
+    steer
+        .send(SteerMessage {
+            prompt: "please request-permission-unrecognized".into(),
+            message_id: None,
+        })
+        .await
+        .expect("queue a second drifting turn");
+    drop(steer);
+    let events = drain(stream).await;
+
+    let diagnostics = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::Diagnostic { discriminator, .. }
+                    if discriminator == "session/request_permission"
+            )
+        })
+        .count();
+    assert_eq!(
+        diagnostics, 1,
+        "a vendor that drifts every turn must report once per session, not \
+         once per request: {events:#?}"
     );
 }

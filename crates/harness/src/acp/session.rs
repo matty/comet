@@ -1238,26 +1238,54 @@ enum Handled {
 /// through the bridge at all: **guessing which of the four a vendor's own
 /// vocabulary means is the difference between asking and not asking**, so a
 /// request this build cannot honestly represent to the user is declined
-/// without ever reaching them. `None` means the request was well-formed and
-/// has been handed off to [`RunControls::request_approval`].
+/// without ever reaching them. `None` means either that the request was
+/// well-formed and has been handed off to [`RunControls::request_approval`],
+/// or that this session already reported the drift once —
+/// [`normalize::session_update_once`]'s rate limit, reused here on the same
+/// `diagnostics` set, so a vendor that drifts on every turn does not emit one
+/// diagnostic per request for the rest of the session.
+///
+/// **The summary is written for what actually happened, not reused from
+/// [`crate::diagnostic`].** That helper's two fixed sentences are written for
+/// a dropped or unrecognized FRAME — background protocol noise the user was
+/// never going to see acted on. This is different: an action the agent tried
+/// to take was declined on the user's behalf, and [`AgentEvent::Diagnostic`]
+/// has no separate `hint` field the way `.agents/rules/user-facing-errors.md`
+/// asks for elsewhere, so the one `summary` string has to carry both the
+/// cause and the effect.
 fn handle_permission_request(
     client: &RpcClient,
     id: Value,
     params: &Value,
     request_approval: &Arc<RequestApprovalFn>,
+    diagnostics: &mut HashSet<String>,
 ) -> Option<AgentEvent> {
     let options = params["options"].as_array().cloned().unwrap_or_default();
     if !approval::has_recognized_kind(&options) {
         client.respond(&id, json!({"outcome": {"outcome": "cancelled"}}));
+        let discriminator =
+            comet_proto::sanitize_discriminator(approval::REQUEST_PERMISSION_METHOD);
+        if !diagnostics.insert(discriminator.clone()) {
+            tracing::trace!(
+                target: "comet_harness::acp",
+                "repeated unrecognized session/request_permission options suppressed"
+            );
+            return None;
+        }
         tracing::warn!(
             target: "comet_harness::acp",
             options = %serde_json::Value::Array(options),
             "session/request_permission offered no option kind this build recognizes"
         );
-        return Some(crate::diagnostic(
-            approval::REQUEST_PERMISSION_METHOD,
-            DiagnosticSeverity::Unknown,
-        ));
+        return Some(AgentEvent::Diagnostic {
+            discriminator,
+            severity: DiagnosticSeverity::Unknown,
+            code: None,
+            summary: "The agent asked Comet to approve an action, but the choices it offered \
+                      weren't ones Comet understands, so Comet declined the action rather than \
+                      guess."
+                .to_owned(),
+        });
     }
     let request = approval::approval_request(&params["toolCall"]);
     let client = client.clone();
@@ -1325,7 +1353,7 @@ async fn handle_incoming(
         Incoming::Request { id, method, params } => {
             if method == approval::REQUEST_PERMISSION_METHOD {
                 if let Some(drift) =
-                    handle_permission_request(client, id, &params, request_approval)
+                    handle_permission_request(client, id, &params, request_approval, diagnostics)
                     && !send(event_tx, drift).await
                 {
                     return Handled::ConsumerGone;
