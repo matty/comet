@@ -595,9 +595,12 @@ fn handle_prompt(
     if text.contains("complete-both") {
         // The healthy case both signals exist for, made deterministic rather
         // than raced: the notification fires immediately, the ordinary reply
-        // follows after a delay comfortably longer than any reasonable
-        // "settled fast" assertion, so a test can tell WHICH signal actually
-        // ended the turn rather than merely that one eventually did.
+        // follows after a delay comfortably longer than
+        // `POST_NOTIFICATION_REPLY_BOUND` (`acp/session.rs`), so the client's
+        // own harvest of that reply always times out rather than actually
+        // receiving it — this scenario is about proving the notification
+        // arm decided the turn and stayed bounded, not about what a
+        // received reply would have added.
         //
         // **No trailing text chunk after the notification, unlike the plain
         // `end_turn` path below.** Real Grok's own race is 3ms end to end
@@ -608,7 +611,7 @@ fn handle_prompt(
         // fixture should not invent content that turn never produced.
         complete("end_turn");
         *last_prompt_id = Some(prompt_id.clone());
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(std::time::Duration::from_millis(600));
         emit(&json!({
             "jsonrpc": "2.0", "id": id,
             "result": {"stopReason": "end_turn", "_meta": {"promptId": prompt_id}},

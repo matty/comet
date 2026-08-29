@@ -1532,8 +1532,14 @@ mod tests {
         let _adapter_root_guard = scenarios::acp::ADAPTER_ROOT_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // SAFETY: `_adapter_root_guard` above excludes every other test that
-        // touches this var.
+        // SAFETY: not a soundness proof by itself — `set_var`'s actual
+        // requirement is exclusion of every concurrent *env* access in the
+        // process, any key, not just concurrent writers to this one.
+        // `_adapter_root_guard` above is a strict improvement over the
+        // previous single-test reasoning (it excludes the other two tests
+        // in this crate that are known to touch this same key), not a
+        // guarantee that nothing else in the process reads or writes any
+        // env var while this section runs.
         unsafe { std::env::set_var("COMET_ACP_ADAPTER_ROOT", adapter_root.path()) };
 
         // codex-acp and claude-agent-acp discovery are promoted in this same

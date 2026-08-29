@@ -179,12 +179,13 @@ impl AgentDescription {
 }
 
 // The live session loop (`session/new`, `session/prompt`, the update stream)
-// lives in `session.rs`, not here -- it is `pub(crate)` on purpose, and its
-// caller is the `Harness` impl each of `grok.rs` and `hermes.rs` gives it
-// (`GrokHarness`/`HermesHarness`, both calling `session::run`), not something
-// still pending. `CARGO_BIN_EXE_*` reaches integration tests only, so the
-// live wire behavior itself is exercised there (`acp_turn.rs` and friends)
-// rather than by a unit test in this module.
+// lives in `session.rs`, not here. It is public (`mod.rs`'s `pub mod
+// session`, `session.rs`'s `pub fn run`, under `lib.rs`'s `pub mod acp`) --
+// not `pub(crate)` -- and that is exactly what lets `acp_turn.rs`, an
+// integration test in a separate crate, exercise it directly. Its caller is
+// the `Harness` impl each of `grok.rs` and `hermes.rs` gives it
+// (`GrokHarness`/`HermesHarness`, both calling `session::run`), not
+// something still pending.
 
 #[cfg(test)]
 mod tests {

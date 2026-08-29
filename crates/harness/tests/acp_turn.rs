@@ -440,7 +440,10 @@ async fn a_turn_settles_on_the_rpc_response_alone() {
 ///
 /// **Asserts on SPEED, not merely on the final count.** The fixture's
 /// `complete-both` sends the notification immediately and delays its RPC
-/// reply by 200ms; settling well under that delay is only possible via the
+/// reply by 600ms — comfortably past `POST_NOTIFICATION_REPLY_BOUND`'s
+/// 250ms (`acp/session.rs`), so the client's own harvest of that reply
+/// always times out rather than receiving it. Settling near the BOUND
+/// rather than near the reply's full 600ms delay is only possible via the
 /// notification arm, so this fails if the dedup/fast-path is removed even
 /// though the slower RPC-reply fallback would still, eventually, produce
 /// exactly one `Done` on its own — the failure mode the brief calls "passing
@@ -459,8 +462,8 @@ async fn both_signals_arriving_produce_exactly_one_done() {
     // `drain`'s end-to-end time also includes `shutdown_child` reaping the
     // fixture process afterward (on Windows, a no-op SIGTERM means that reap
     // waits out its own grace period regardless of how fast the turn
-    // settled), which would swamp a 150ms budget on teardown alone and prove
-    // nothing about which signal ended the turn.
+    // settled), which would swamp the budget below on teardown alone and
+    // prove nothing about which signal ended the turn.
     let started = tokio::time::Instant::now();
     let mut events = Vec::new();
     let mut done_at = Vec::new();
@@ -501,27 +504,43 @@ async fn both_signals_arriving_produce_exactly_one_done() {
          must still produce exactly one Done per turn: {events:#?}"
     );
 
-    // Turn 1: settled off the fast notification, well under its RPC reply's
-    // 200ms delay.
+    // Turn 1: settled off the notification, bounded by
+    // `POST_NOTIFICATION_REPLY_BOUND` (250ms) rather than by the fixture's
+    // 600ms reply delay. Measured 254-266ms across five runs on this
+    // machine (2026-08-29, the harvest bound landing in this same fix wave);
+    // 500ms gives ample margin above the bound for scheduler jitter while
+    // staying well under the 600ms delay it must not be waiting on.
     assert!(
-        done_at[0] < Duration::from_millis(150),
+        done_at[0] < Duration::from_millis(500),
         "turn 1 Done arrived at {:?} — the fixture's RPC reply is delayed \
-         200ms, so anything this close to that delay means the notification \
-         arm did not settle the turn and the slow fallback did instead",
+         600ms and POST_NOTIFICATION_REPLY_BOUND is 250ms, so anything this \
+         close to the reply's delay means the notification arm (plus its \
+         bounded harvest) did not settle the turn and the slow fallback did \
+         instead",
         done_at[0]
     );
 
     // Turn 2: `fake_acp` is single-threaded and blocks in `complete-both`'s
-    // own 200ms sleep before it can even READ turn 2's `session/prompt`, so
-    // the earliest the stale replay can reach the client is ~200ms after
-    // turn 1's Done. If the dedup is missing, that stale replay settles
-    // turn 2 immediately on arrival (measured ~195ms here). If the dedup is
-    // present, it is ignored and turn 2 waits for its OWN real completion
-    // instead — one more 200ms sleep past that (measured ~395ms). 300ms
-    // sits between the two with ~100ms margin either side, so it is the
-    // assertion that actually discriminates a missing dedup from a present
-    // one; a lower threshold (this used to be 120ms) would pass in BOTH
-    // cases and prove nothing. The text_of/status assertions below are
+    // own 600ms sleep before it can even READ turn 2's `session/prompt`, so
+    // the earliest the stale replay can reach the client is ~600ms after
+    // turn 1's prompt was sent (not after turn 1's Done, which now arrives
+    // earlier, bound-limited at ~250ms). If the dedup is missing, that
+    // stale replay settles turn 2 immediately on arrival — measured
+    // turn2_gap ~601-602ms across three runs (dedup temporarily disabled to
+    // measure this, then restored; falsifying only the dedup, same
+    // procedure `a test you have not seen fail is not evidence` requires).
+    // If the dedup is present, it is ignored and turn 2 waits for its OWN
+    // real completion instead — one more 200ms sleep past the stale
+    // replay's arrival, plus its own 250ms harvest bound (turn 2's real
+    // completion never gets an RPC reply either) — measured turn2_gap
+    // ~792-808ms across five runs. 700ms sits between the two clusters with
+    // ~90-100ms margin either side, so it is the assertion that actually
+    // discriminates a missing dedup from a present one; a lower threshold
+    // would pass in BOTH cases and prove nothing — the OLD 300ms threshold,
+    // measured against the OLD 200ms fixture delay and the pre-harvest
+    // near-zero turn-1 latency, no longer discriminates now that both
+    // clusters shifted upward by the harvest bound plus the larger fixture
+    // delay it required. The text_of/status assertions below are
     // corroborating, not load-bearing on their own for THIS distinction —
     // falsifying just the dedup (leaving the notification arm and its
     // method/session match intact) settles turn 2 as Errored off the stale
@@ -530,7 +549,7 @@ async fn both_signals_arriving_produce_exactly_one_done() {
     // happened to look otherwise plausible.
     let turn2_gap = done_at[1] - done_at[0];
     assert!(
-        turn2_gap > Duration::from_millis(300),
+        turn2_gap > Duration::from_millis(700),
         "turn 2 settled only {turn2_gap:?} after turn 1 — the replayed, \
          already-consumed promptId from turn 1 must not be read as \
          completing turn 2; this fails when the consumed-id dedup is \

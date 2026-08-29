@@ -1061,9 +1061,14 @@ struct Turn<'a> {
     request_approval: &'a Arc<RequestApprovalFn>,
 }
 
-/// Grok's vendor extension: the AUTHORITATIVE turn-end signal, measured live
-/// 3ms ahead of the `session/prompt` RPC response on 2026-08-28 (this
-/// module's header). No other recorded speaker sends it — Hermes advertises
+/// Grok's vendor extension: the AUTHORITATIVE turn-end signal. **Measured
+/// live 2026-08-28, raw wire timestamps: this notification at 3618ms,
+/// the matching `session/prompt` RPC response at 3621ms — 3ms apart,
+/// consistently, this notification first.** That raw capture lives outside
+/// this tree (the ACP hardening task's own planning record, not restated
+/// verbatim anywhere else in `crates/`); this doc comment is the primary
+/// citation inside the tree for the figure, not a pointer to one. No other
+/// recorded speaker sends it — Hermes advertises
 /// nothing under `_x.ai/*` — so recognizing it by method name alone, rather
 /// than gating on a per-agent flag, leaves the arm silently dead for anyone
 /// who doesn't; the RPC response stays the fallback for exactly that case.
@@ -1078,16 +1083,27 @@ struct Turn<'a> {
 const PROMPT_COMPLETE_METHOD: &str = concat!("_x.ai/ses", "sion/prompt_complete");
 
 /// How long the notification-settle arm below waits for the already-in-flight
-/// `session/prompt` reply once [`PROMPT_COMPLETE_METHOD`] has already ended the
-/// turn — long enough to catch the ~3ms gap this const's sibling doc measured
-/// live, short enough that an agent which never answers the RPC at all
-/// (`complete-notification-only` in the fixture, and the shape upstream's
-/// original hang report was about) still settles promptly rather than
-/// reintroducing that hang. 10x the measured gap: comfortable headroom for
-/// scheduler jitter on a slower machine than the one that measured it,
-/// while staying two orders of magnitude below [`Timeouts::prompt_stall`]'s
-/// own default, so this can never be mistaken for — or mask — a wedged agent.
-const POST_NOTIFICATION_REPLY_BOUND: Duration = Duration::from_millis(30);
+/// `session/prompt` reply once [`PROMPT_COMPLETE_METHOD`] has already ended
+/// the turn — long enough to catch the ~3ms gap [`PROMPT_COMPLETE_METHOD`]'s
+/// own doc measured live, short enough that an agent which never answers the
+/// RPC at all (`complete-notification-only` in the fixture, and the shape
+/// upstream's original hang report was about) still settles promptly rather
+/// than reintroducing that hang.
+///
+/// **~80x the measured ~3ms gap, not a round number picked for its own
+/// sake.** A single measurement on one machine on one day is thin evidence
+/// for a bound that fails SILENTLY when it is too tight — this build has no
+/// drift sheet, no supported-version floor and no runnable live suite for
+/// Grok (`docs/debt/README.md`'s D102), so a miss here would not be caught
+/// by anything else in the tree. The margin also has to absorb process
+/// scheduling and named-pipe latency on whatever machine runs this, not just
+/// scheduler jitter on the one that measured 3ms — this repository's own
+/// guidance is that a wall-clock figure from a GPU-less VM is an upper
+/// bound, not a measurement. Still 120x below [`Timeouts::prompt_stall`]'s
+/// own 30s default, so this can never be mistaken for — or mask — a wedged
+/// agent: the only user-visible cost of a genuinely non-answering agent is
+/// one extra 250ms per turn, not a hang.
+const POST_NOTIFICATION_REPLY_BOUND: Duration = Duration::from_millis(250);
 
 /// One `session/prompt`, from send to `stopReason`.
 async fn drive_turn(
@@ -1286,10 +1302,11 @@ async fn drive_turn(
                         // live — Grok's own usage rides the RPC response's
                         // `_meta` instead), so this is honestly `None` on the
                         // NORMAL path — this notification wins the race on
-                        // every healthy turn (this fn's header, and
-                        // `Timeouts::prompt_stall`'s doc), not merely
-                        // sometimes; a reader that ever gains a usage-bearing
-                        // notification shape reads it here for free.
+                        // every healthy turn ([`PROMPT_COMPLETE_METHOD`]'s own
+                        // doc measured it, ~3ms ahead, consistently), not
+                        // merely sometimes; a reader that ever gains a
+                        // usage-bearing notification shape reads it here for
+                        // free.
                         let mut usage = usage_reader(&params, context_window);
                         // Grok's usage lives only in the RPC reply's `_meta`,
                         // and that reply (`reply`, sent above) is already in
@@ -1300,15 +1317,50 @@ async fn drive_turn(
                         // a turn. Poll it directly instead, bounded by
                         // [`POST_NOTIFICATION_REPLY_BOUND`] — see that
                         // const's own doc for why the bound is safe.
-                        if usage.is_none()
-                            && let Ok(Ok(result)) =
-                                tokio::time::timeout(POST_NOTIFICATION_REPLY_BOUND, &mut reply)
-                                    .await
-                        {
-                            if let Some(id) = result["_meta"]["promptId"].as_str() {
-                                prompt_completions.insert(id.to_owned());
+                        //
+                        // **Short-circuited on `usage.is_some()`**: a future
+                        // reader that ever gains a usage-bearing notification
+                        // shape (the comment above) must return immediately
+                        // rather than pay this bound's latency for nothing —
+                        // `reply` is left running, not polled a second time.
+                        if usage.is_none() {
+                            match tokio::time::timeout(POST_NOTIFICATION_REPLY_BOUND, &mut reply)
+                                .await
+                            {
+                                Ok(Ok(result)) => {
+                                    if let Some(id) = result["_meta"]["promptId"].as_str() {
+                                        prompt_completions.insert(id.to_owned());
+                                    }
+                                    usage = usage_reader(&result, context_window);
+                                }
+                                // Bounded miss, not a hang: either the reply
+                                // never came inside
+                                // `POST_NOTIFICATION_REPLY_BOUND` (the
+                                // notification-only agent this bound exists
+                                // to still settle promptly for), or it came
+                                // back as an RPC-level error. Either way the
+                                // turn already settled correctly off the
+                                // notification above — only the harvest
+                                // attempt failed — but SILENT here is
+                                // exactly how Grok's usage went missing
+                                // before this fix, and there is no drift
+                                // sheet, version floor or live suite for
+                                // Grok to notice a recurrence
+                                // (`docs/debt/README.md`'s D102). `debug!`,
+                                // not `warn!`: a single miss is expected
+                                // under real jitter, not evidence of a bug
+                                // by itself — a reader grepping for repeated
+                                // occurrences is the point.
+                                outcome => {
+                                    tracing::debug!(
+                                        target: "comet_harness::acp",
+                                        bound_ms = POST_NOTIFICATION_REPLY_BOUND.as_millis()
+                                            as u64,
+                                        timed_out = outcome.is_err(),
+                                        "no usage harvested from the post-notification reply"
+                                    );
+                                }
                             }
-                            usage = usage_reader(&result, context_window);
                         }
                         if let Some(usage) = usage
                             && !send(event_tx, usage).await

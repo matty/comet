@@ -87,6 +87,15 @@ fn adapter_entry(package: &str) -> anyhow::Result<PathBuf> {
 /// (`record.rs`) specifically; the other two call sites here share the
 /// exact same env var and the exact same exposure, so they take the same
 /// lock rather than leaving two of three sites fixed and one not.
+///
+/// **Not a soundness proof for the `unsafe` `set_var`/`remove_var` calls it
+/// guards.** Their real requirement, per `std::env::set_var`'s own doc, is
+/// exclusion of every concurrent access to the process environment — any
+/// key, not just a concurrent writer of this one. This lock only excludes
+/// the three call sites known to touch `COMET_ACP_ADAPTER_ROOT`; a strict
+/// improvement over the single-test SAFETY reasoning that stood here
+/// before, not a guarantee that no other test anywhere in this crate reads
+/// or writes any env var while one of these three runs.
 #[cfg(test)]
 pub(crate) static ADAPTER_ROOT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -437,8 +446,11 @@ mod tests {
         let _guard = ADAPTER_ROOT_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // SAFETY: `_guard` above excludes every other test that touches this
-        // var; the var is read back immediately below.
+        // SAFETY: not a full soundness proof -- see `ADAPTER_ROOT_ENV_LOCK`'s
+        // own doc on the gap between "excludes this key's other writers"
+        // and `set_var`'s actual requirement. `_guard` above excludes the
+        // other two known call sites; the var is read back immediately
+        // below.
         unsafe { std::env::set_var("COMET_ACP_ADAPTER_ROOT", dir.path()) };
         let entry = adapter_entry(CODEX_ACP_PACKAGE).expect("entry resolves");
         unsafe { std::env::remove_var("COMET_ACP_ADAPTER_ROOT") };
