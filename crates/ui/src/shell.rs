@@ -167,12 +167,85 @@ fn windows_caption_font_for_build(build: u32) -> &'static str {
 /// §1.4). Invalid persisted combos fall back to that shortcut's default.
 fn valid_or_default(combo: &str, fallback: &str) -> String {
     let candidate = platform_combo(combo);
-    if Keystroke::parse(&candidate).is_ok() {
-        candidate
-    } else {
-        tracing::warn!(%combo, "unparseable shortcut combo; using default");
-        platform_combo(fallback)
+    match Keystroke::parse(&candidate) {
+        Ok(parsed) if is_emittable_key(&parsed.key) => candidate,
+        // Parsed, and names a key no keyboard will ever produce. Falling back
+        // is what this function's name has always promised; before D95 it
+        // returned the combo and the shortcut simply never fired.
+        Ok(parsed) => {
+            tracing::warn!(
+                %combo,
+                key = %parsed.key,
+                "shortcut names a key no platform emits; using default"
+            );
+            platform_combo(fallback)
+        }
+        Err(_) => {
+            tracing::warn!(%combo, "unparseable shortcut combo; using default");
+            platform_combo(fallback)
+        }
     }
+}
+
+/// Every named key gpui's platform layers actually emit, read off the pinned
+/// fork rev (`ac135eb`) rather than guessed: `gpui_windows/src/events.rs`,
+/// `gpui_macos/src/events.rs` and `gpui_linux/src/linux/platform.rs`. `menu`
+/// and `back`/`forward` are Windows/Linux-only and stay listed anyway — a
+/// keymap file is portable and binding one on macOS is a dead shortcut, not a
+/// corrupt config.
+///
+/// **`Keystroke::parse` is not a validity check, which is what D95 was.** It
+/// rejects an unknown *modifier* and nothing else, so `ctrl-nosuchkey`, `zzz`,
+/// `ctrl-` and `""` all parse — the last two with an EMPTY key. A hand-edited
+/// `ui-settings.json` therefore bound a shortcut that could never fire, with
+/// no warning and no fallback, across nine `jumpSession` slots since #105.
+const NAMED_KEYS: &[&str] = &[
+    "backspace",
+    "delete",
+    "down",
+    "end",
+    "enter",
+    "escape",
+    "forward",
+    "back",
+    "home",
+    "insert",
+    "left",
+    "menu",
+    "pagedown",
+    "pageup",
+    "right",
+    "space",
+    "tab",
+    "up",
+];
+
+/// The five names `Keystroke::parse` mints when a combo is a bare modifier
+/// (`shift`, `ctrl`, …): it moves the modifier into the key position rather
+/// than leaving the key empty, so these are real, bindable and must not be
+/// rejected as unknown names.
+const MODIFIER_KEYS: &[&str] = &["shift", "control", "alt", "platform", "function"];
+
+/// Whether a parsed keystroke's key is one a platform can actually deliver.
+///
+/// **A single character is accepted without further question**, whatever it is:
+/// `a`, `7`, `[`, `/` and a dead `-` are all legitimate on some layout, and
+/// this guard is not in the business of deciding which keyboard someone owns.
+/// What it catches is the shape a typo actually takes — a multi-character name
+/// nothing emits, and the empty key two parseable combos produce.
+fn is_emittable_key(key: &str) -> bool {
+    if key.chars().count() == 1 {
+        return true;
+    }
+    if NAMED_KEYS.contains(&key) || MODIFIER_KEYS.contains(&key) {
+        return true;
+    }
+    // f1..f35, as a range rather than 35 literals — macOS emits the whole
+    // span, Windows stops at f24, and a keymap naming f30 on Windows is a dead
+    // shortcut rather than a corrupt file, exactly like `menu` on macOS.
+    key.strip_prefix('f')
+        .and_then(|number| number.parse::<u8>().ok())
+        .is_some_and(|number| (1..=35).contains(&number))
 }
 
 fn shell_key_bindings(keymap: &KeymapConfig) -> Vec<KeyBinding> {
@@ -4656,6 +4729,74 @@ impl Render for Shell {
 
 #[cfg(test)]
 mod tests {
+
+    /// Break caught (D95): `Keystroke::parse` rejects an unknown MODIFIER and
+    /// nothing else, so every combo below used to pass the guard and bind a
+    /// shortcut that could never fire — silently, and without the fallback
+    /// this function's name promises. #105 widened the exposure to nine
+    /// `jumpSession` slots.
+    ///
+    /// The two empty-key cases are the ones a reader doubts: `ctrl-` splits
+    /// into `["ctrl", ""]` and `""` into `[""]`, and `parse` stores the empty
+    /// string as the key in both.
+    #[test]
+    fn a_combo_naming_a_key_no_platform_emits_falls_back_to_the_default() {
+        for combo in ["ctrl-nosuchkey", "zzz", "ctrl-", "", "mod-notakey"] {
+            assert!(
+                Keystroke::parse(&platform_combo(combo)).is_ok(),
+                "{combo:?} must still PARSE, or this test is proving something else"
+            );
+            assert_eq!(
+                valid_or_default(combo, "mod-s"),
+                platform_combo("mod-s"),
+                "{combo:?} names no emittable key and must fall back"
+            );
+        }
+    }
+
+    /// The other direction, so the guard cannot be "reject everything": every
+    /// shape a real keymap uses survives untouched.
+    #[test]
+    fn every_shape_a_real_keymap_uses_survives_the_guard() {
+        for combo in [
+            "mod-s",
+            "mod-shift-a",
+            "ctrl-tab",
+            "ctrl-shift-tab",
+            "mod-1",
+            "f5",
+            "ctrl-f13",
+            "mod-[",
+            "alt-pageup",
+            "mod-enter",
+            "shift-escape",
+        ] {
+            assert_eq!(
+                valid_or_default(combo, "mod-s"),
+                platform_combo(combo),
+                "{combo:?} is a legitimate binding and must be kept as written"
+            );
+        }
+    }
+
+    /// Every default this file ships has to survive its own guard — a fallback
+    /// that is itself rejected would leave the shortcut bound to nothing, and
+    /// the guard would be the thing that broke it.
+    #[test]
+    fn every_shipped_default_combo_passes_the_guard() {
+        for id in ShortcutId::ALL {
+            let default = id.default_combo();
+            if default.is_empty() {
+                continue;
+            }
+            assert_eq!(
+                valid_or_default(default, default),
+                platform_combo(default),
+                "{id:?}'s own default must be emittable"
+            );
+        }
+    }
+
     use super::*;
 
     fn space_ids(ids: &[&str]) -> Vec<String> {
