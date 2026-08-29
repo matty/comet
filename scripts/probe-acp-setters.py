@@ -31,11 +31,21 @@ For Hermes (or any other ACP agent), pass its own launch line the same way:
 
     python scripts/probe-acp-setters.py --exe hermes --args acp
 
+`--model` supplies the model id the `session/set_model` and
+`session/set_config_option` candidates probe with. It defaults to the
+placeholder `REPLACE_WITH_A_REAL_MODEL_ID`, which reproduces today's
+behaviour unchanged and will get an "unknown model" style error rather than
+a real answer -- pass a real id the target agent understands (e.g.
+`grok-4-fast` for Grok, whatever `session/new`'s reply or the agent's own
+docs list for another one) to see how it actually responds:
+
+    python scripts/probe-acp-setters.py --exe grok --args agent --no-leader stdio --model grok-4-fast
+
 Sends `initialize` and `session/new` (both token-free on every agent this
-was tried against), then tries each candidate `(method, params)` pair in
-`CANDIDATES` below and prints the raw reply -- extend that list to probe a
-setter this file does not already know about. Never sends `session/prompt`,
-so it never spends tokens on its own.
+was tried against), then tries each candidate `(method, params)` pair from
+`candidates()` below and prints the raw reply -- extend that function to
+probe a setter this file does not already know about. Never sends
+`session/prompt`, so it never spends tokens on its own.
 """
 
 from __future__ import annotations
@@ -100,15 +110,21 @@ class Client:
         return None
 
 
-# Extend this list to probe a setter this file does not already know about.
-# Each entry is (method, params-minus-sessionId); `sessionId` is filled in
-# once the real session id is known.
-CANDIDATES: list[tuple[str, dict]] = [
-    ("session/set_model", {"modelId": "REPLACE_WITH_A_REAL_MODEL_ID"}),
-    ("session/set_config_option", {"configId": "model", "value": "REPLACE_WITH_A_REAL_MODEL_ID"}),
-    ("session/set_mode", {"modeId": "low"}),
-    ("session/set_mode", {"modeId": "not-a-real-mode-xyz"}),
-]
+DEFAULT_MODEL_ID = "REPLACE_WITH_A_REAL_MODEL_ID"
+
+
+def candidates(model_id: str) -> list[tuple[str, dict]]:
+    """Build the (method, params-minus-sessionId) list to try.
+
+    Extend this to probe a setter this file does not already know about.
+    `sessionId` is filled in once the real session id is known.
+    """
+    return [
+        ("session/set_model", {"modelId": model_id}),
+        ("session/set_config_option", {"configId": "model", "value": model_id}),
+        ("session/set_mode", {"modeId": "low"}),
+        ("session/set_mode", {"modeId": "not-a-real-mode-xyz"}),
+    ]
 
 
 def main() -> None:
@@ -122,6 +138,13 @@ def main() -> None:
         "e.g. --args --no-auto-update agent --no-leader stdio",
     )
     parser.add_argument("--cwd", default=None, help="cwd to open the session in (defaults to a temp dir)")
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL_ID,
+        help="model id to probe session/set_model and session/set_config_option with, "
+        "e.g. grok-4-fast for Grok (default: a placeholder that exercises the same "
+        "candidates without needing a real id)",
+    )
     args = parser.parse_args()
 
     cwd = args.cwd or tempfile.gettempdir()
@@ -147,7 +170,7 @@ def main() -> None:
     session_id = new_reply["result"]["sessionId"]
     print("session_id:", session_id)
 
-    for method, params in CANDIDATES:
+    for method, params in candidates(args.model):
         full_params = {"sessionId": session_id, **params}
         reply = client.request(method, full_params)
         print(f"{method} {full_params}: {json.dumps(reply)}")
