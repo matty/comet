@@ -158,15 +158,54 @@ pub(crate) fn session_update(params: &Value) -> Option<AgentEvent> {
 /// since it would never actually be recorded — reintroducing, at the cap
 /// boundary, exactly the per-frame warn storm this function exists to stop.
 ///
-/// So past this cap, a NEW kind is treated as an already-suppressed repeat
-/// instead: no `warn!`, no `AgentEvent::Diagnostic` reaching the caller, only
-/// a `trace!`. The cost is diagnostic SIGNAL, never real content — a
-/// legitimate agent's vocabulary of kinds this build doesn't map is a
-/// handful at most ([`session_update`]'s own Tier 3 doc), so only a buggy or
-/// adversarial agent minting a fresh kind string every frame would ever
-/// reach 64 distinct ones in one session, and that is precisely the runaway
-/// case this cap exists to bound rather than a session worth degrading for.
+/// So past this cap a NEW kind is treated as an already-suppressed repeat —
+/// with ONE exception, which is the whole design: the first kind to arrive
+/// past the cap emits a single `Diagnostic` saying reporting has stopped for
+/// this session, and every kind after it is silent (`trace!` only).
+///
+/// **Saying so once is the point.** Silently capping would leave a reader
+/// unable to tell "this agent sent nothing unfamiliar" apart from "Comet
+/// stopped looking", and the cap is keyed on a string the AGENT chooses: a
+/// provider that embeds an id in its `sessionUpdate` kind fills all 64 slots
+/// in 64 frames, after which a genuinely new kind — the drift this channel
+/// exists to raise — would never be reported again. `AGENTS.md`'s "nothing
+/// decodes it, so it goes" is a rule for the capture SANITIZER, not for
+/// diagnostics. One escalation costs one event per session and closes that
+/// gap; a per-frame version would recreate the warn storm the cap exists to
+/// prevent, so [`CAP_REACHED_SENTINEL`] is what makes it once-only.
+///
+/// What is still given up past the cap is diagnostic SIGNAL, never real
+/// content: which further kinds arrived is lost to everything but `trace!`.
+/// A legitimate agent's vocabulary of kinds this build doesn't map is a
+/// handful at most ([`session_update`]'s own Tier 3 doc), so a real session
+/// never reaches 64 distinct ones in the first place.
 const MAX_TRACKED_UPDATE_KINDS: usize = 64;
+
+/// The one entry in `seen` that is not a kind name: the marker that the
+/// cap's own escalation has already been emitted, so it fires once per
+/// session rather than once per frame.
+///
+/// **It holds a space on purpose.** `seen`'s other entries are all
+/// `comet_proto::sanitize_discriminator` output, whose charset is ASCII
+/// alphanumerics plus `.`, `_`, `/` and `-` (anything else collapses to the
+/// literal `"malformed"`). A space cannot appear in that output, so no
+/// `sessionUpdate` kind an agent could invent collides with this and
+/// consumes the escalation before it fires. That matters here specifically
+/// because every OTHER key in this set is chosen by the agent.
+///
+/// It costs one slot, so [`session_update_once`] leaves `seen` at
+/// `MAX_TRACKED_UPDATE_KINDS + 1` and never larger. `acp::session`'s
+/// `handle_permission_request` shares the set and inserts one further fixed
+/// entry of its own, which is why the whole set's bound is 66 rather than 65
+/// — still a constant, which is all D113 asked for.
+const CAP_REACHED_SENTINEL: &str = "cap reached";
+
+/// The `discriminator` on the cap's escalation event. Deliberately NOT
+/// [`CAP_REACHED_SENTINEL`]: this one crosses the wire and is grouped on by
+/// consumers, so it has to be legal `sanitize_discriminator` output — which
+/// is exactly what makes it unusable as the sentinel, since an agent could
+/// send a kind that produces it.
+const CAP_REACHED_DISCRIMINATOR: &str = "sessionUpdate/reporting-capped";
 
 /// [`session_update`], rate-limited by kind-name: a stream of the SAME
 /// unrecognized `sessionUpdate` reports once per run, not once per frame.
@@ -215,6 +254,42 @@ pub(crate) fn session_update_once(
                 update = %params,
                 "unrecognized session/update (recorded as a diagnostic)"
             );
+        } else if seen.insert(CAP_REACHED_SENTINEL.to_string()) {
+            // First kind past the cap, and only this one: the `insert`
+            // returning `true` IS the once-per-session latch, so there is no
+            // separate flag to keep in step with the set. The raw frame is
+            // warn-logged here for the same reason every other branch does it
+            // — this is the drop site, and nothing downstream keeps it.
+            tracing::warn!(
+                target: "comet_harness::acp",
+                update = %params,
+                cap = MAX_TRACKED_UPDATE_KINDS,
+                "unrecognized session/update kind cap reached; reporting stops for this session"
+            );
+            // Hand-built rather than through `crate::diagnostic`, on sink 6's
+            // precedent and for its reason: the copy has to say what stopped
+            // and what to do about it, which that helper's fixed sentence
+            // cannot. The kind that happened to trip the cap is deliberately
+            // NOT named — it is agent-chosen, arbitrary, and naming it would
+            // point the reader at the wrong thing.
+            return Some(AgentEvent::Diagnostic {
+                discriminator: CAP_REACHED_DISCRIMINATOR.to_string(),
+                severity: comet_proto::DiagnosticSeverity::Unknown,
+                code: None,
+                // `concat!` rather than a backslash-continued literal:
+                // rustfmt rejoins those onto one line and the
+                // continuation indentation becomes a run of real spaces
+                // inside the sentence. That shipped once in this very
+                // string, and it is invisible in the source.
+                summary: concat!(
+                    "This agent sent too many kinds of message Comet ",
+                    "doesn't recognize, so Comet has stopped reporting ",
+                    "them for the rest of this session. Nothing in your ",
+                    "conversation was affected. Start a new session to ",
+                    "report them again.",
+                )
+                .to_string(),
+            });
         } else {
             tracing::trace!(
                 target: "comet_harness::acp",
@@ -1221,19 +1296,11 @@ mod tests {
         );
     }
 
-    /// **D113, pinned.** `seen` must not grow past `MAX_TRACKED_UPDATE_KINDS`
-    /// distinct kinds — a session sending that many different unrecognized
-    /// `sessionUpdate` strings stops getting a fresh report for any FURTHER
-    /// new one (suppressed like a repeat), rather than growing the set
-    /// without bound. Also proves the cap's own failure mode does not
-    /// resurrect the storm the dedup exists to prevent: a kind arriving
-    /// after the cap is full must not report EVERY time just because it was
-    /// never actually recorded.
-    #[test]
-    fn the_seen_kind_set_is_capped_not_unbounded() {
+    /// Fill `seen` with the cap's worth of distinct unrecognized kinds, each
+    /// reporting exactly once on its way in. Shared by both cap tests below
+    /// so neither can drift from the other's idea of "full".
+    fn seen_filled_to_the_cap() -> HashSet<String> {
         let mut seen = HashSet::new();
-
-        // Fill the cap with distinct kinds, each reporting exactly once.
         for i in 0..MAX_TRACKED_UPDATE_KINDS {
             let frame = json!({"update": {"sessionUpdate": format!("kind-{i}")}});
             let first = session_update_once(&mut seen, &frame);
@@ -1243,29 +1310,39 @@ mod tests {
             );
         }
         assert_eq!(seen.len(), MAX_TRACKED_UPDATE_KINDS);
+        seen
+    }
 
-        // A kind past the cap must not report...
-        let overflow = json!({"update": {"sessionUpdate": "kind-overflow"}});
-        assert_eq!(
-            session_update_once(&mut seen, &overflow),
-            None,
-            "a brand-new kind arriving after the cap must not grow `seen` \
-             or report as though it were newly seen"
-        );
-        assert_eq!(
-            seen.len(),
-            MAX_TRACKED_UPDATE_KINDS,
-            "an overflowing kind must never be inserted"
-        );
+    /// **D113, pinned.** `seen` must stop growing. Past the cap it takes one
+    /// further slot — [`CAP_REACHED_SENTINEL`], the latch that makes the
+    /// escalation once-only — and then never grows again however many
+    /// distinct kinds arrive, so this function's contribution to the set is
+    /// `MAX_TRACKED_UPDATE_KINDS + 1` and nothing more.
+    ///
+    /// Also pins the two things the cap must NOT break: an overflowing kind
+    /// is never recorded (so it cannot evict anything), and a kind tracked
+    /// before the cap filled stays deduped rather than being pushed out to
+    /// make room.
+    #[test]
+    fn the_seen_kind_set_stops_growing_one_slot_past_the_cap() {
+        let mut seen = seen_filled_to_the_cap();
 
-        // ...and asking again for the SAME overflow kind must not report
-        // either — the failure mode this test exists to catch is a kind that
-        // was never recorded reporting AGAIN AND AGAIN, which is the storm
-        // the whole function exists to prevent.
-        assert_eq!(
-            session_update_once(&mut seen, &overflow),
-            None,
-            "an overflowing kind must stay suppressed on every later frame too"
+        // 200 distinct kinds past the cap. The FIRST spends the sentinel's
+        // slot; not one of the other 199 may add anything.
+        for i in 0..200 {
+            let frame = json!({"update": {"sessionUpdate": format!("overflow-{i}")}});
+            session_update_once(&mut seen, &frame);
+            assert_eq!(
+                seen.len(),
+                MAX_TRACKED_UPDATE_KINDS + 1,
+                "`seen` grew past the cap plus its one sentinel slot at \
+                 overflow kind {i}"
+            );
+        }
+        assert!(
+            !seen.contains("sessionUpdate/overflow-0"),
+            "an overflowing kind must never be recorded — it is not tracked, \
+             it is only reported about"
         );
 
         // A kind that filled the cap before it was full is unaffected —
@@ -1276,6 +1353,82 @@ mod tests {
             None,
             "a kind tracked before the cap filled stays deduped"
         );
+    }
+
+    /// **The escalation is once per session, not once per frame.** Reaching
+    /// the cap says so — once — and then goes quiet: a reader can tell "this
+    /// agent sent nothing unfamiliar" from "Comet stopped looking", which
+    /// silently capping could not. Reporting it per frame instead would
+    /// recreate the exact warn storm the cap exists to prevent, so this test
+    /// drives 500 frames across 250 distinct kinds and demands exactly one
+    /// event out of all of them.
+    #[test]
+    fn reaching_the_cap_reports_itself_exactly_once() {
+        let mut seen = seen_filled_to_the_cap();
+
+        let mut events = Vec::new();
+        for i in 0..250 {
+            // Each kind twice: once as a first sighting, once as a repeat.
+            // Neither route may report a second time.
+            let frame = json!({"update": {"sessionUpdate": format!("overflow-{i}")}});
+            events.extend(session_update_once(&mut seen, &frame));
+            events.extend(session_update_once(&mut seen, &frame));
+        }
+
+        assert_eq!(
+            events.len(),
+            1,
+            "reaching the cap must report exactly once for the whole session, \
+             not once per kind and not once per frame: {events:#?}"
+        );
+        match &events[0] {
+            AgentEvent::Diagnostic {
+                discriminator,
+                severity,
+                summary,
+                ..
+            } => {
+                assert_eq!(discriminator, CAP_REACHED_DISCRIMINATOR);
+                assert_eq!(*severity, comet_proto::DiagnosticSeverity::Unknown);
+                // The kind that happened to trip the cap is agent-chosen, so
+                // naming it would point the reader at an arbitrary string —
+                // and it is provider text on a user-facing surface, which
+                // `.agents/rules/user-facing-errors.md` rules out outright.
+                assert!(
+                    !summary.contains("overflow-"),
+                    "the tripping kind must not reach the user: {summary}"
+                );
+                assert!(
+                    summary.contains("stopped reporting"),
+                    "the copy must say what stopped: {summary}"
+                );
+            }
+            other => unreachable!("{other:?}"),
+        }
+    }
+
+    /// The sentinel cannot be minted from the wire, which is what makes the
+    /// escalation un-consumable: `sanitize_discriminator`'s charset has no
+    /// space in it, so no `sessionUpdate` kind — however hostile — produces
+    /// [`CAP_REACHED_SENTINEL`] and burns the latch before the cap is even
+    /// reached.
+    #[test]
+    fn no_agent_chosen_kind_can_mint_the_sentinel() {
+        for kind in [
+            "cap reached",
+            "cap-reached",
+            "cap_reached",
+            "sessionUpdate/cap reached",
+            "",
+        ] {
+            let mut seen = HashSet::new();
+            let frame = json!({"update": {"sessionUpdate": kind}});
+            session_update_once(&mut seen, &frame);
+            assert!(
+                !seen.contains(CAP_REACHED_SENTINEL),
+                "kind {kind:?} minted the sentinel"
+            );
+        }
     }
 
     /// A known, mapped kind is unaffected by the dedup wrapper — it is not a
