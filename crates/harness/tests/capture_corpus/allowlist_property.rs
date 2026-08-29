@@ -48,8 +48,8 @@
 use std::path::Path;
 
 use comet_harness::capture::{
-    MAP_PATHS, Provider, allows, allows_prefix, corpus_root, frames, is_placeholder_token,
-    promoted_scenarios,
+    Provider, allows, allows_prefix, corpus_root, frames, is_map_path, is_named_map_child,
+    is_placeholder_token, promoted_scenarios,
 };
 use serde_json::Value;
 
@@ -122,7 +122,10 @@ fn every_committed_value_is_allowlisted_or_a_placeholder() {
 }
 
 /// The same total property, in key position: every object key committed at a
-/// **map path** is either a prefix of an allowlisted path or a placeholder.
+/// **map path** is either a prefix of an allowlisted path, a placeholder, or
+/// a declared `named_children` entry (D123) — a key whose survival is a
+/// reviewed decision about the *field name*, unrelated to whether its value
+/// is allowlisted.
 ///
 /// Split from the scalar property rather than folded into it because the two
 /// answer different questions. A key that is a *field name* is published on
@@ -159,7 +162,14 @@ fn every_committed_map_key_is_allowlisted_or_a_placeholder() {
             collect_map_keys(&payload, "", &mut keys);
             for (parent_path, key) in keys {
                 let formed = format!("{parent_path}.{key}");
-                if allows_prefix(provider, &formed) || is_placeholder_token(&key) {
+                // A named child (D123) is the third way a committed map key
+                // can be legitimate: its spelling survives on purpose, as a
+                // reviewed field name, not because its value happened to be
+                // allowlisted or its identity happened to be placeholdered.
+                if allows_prefix(provider, &formed)
+                    || is_placeholder_token(&key)
+                    || is_named_map_child(&parent_path, &key)
+                {
                     continue;
                 }
                 escapes.push(Escape {
@@ -205,7 +215,7 @@ fn collect_map_keys(value: &Value, path: &str, out: &mut Vec<(String, String)>) 
             }
         }
         Value::Object(object) => {
-            let is_map = MAP_PATHS.contains(&path);
+            let is_map = is_map_path(path);
             for (key, child) in object {
                 if is_map {
                     out.push((path.to_owned(), key.clone()));

@@ -81,8 +81,40 @@ pub enum SurfaceError {
     UnreadableEvents { scenario: String },
 }
 
-/// Paths whose object keys are **data**, not field names.
+/// A path whose object keys are **data**, not field names — plus, optionally,
+/// a short list of that map's own children which are reviewed field names
+/// after all, and stay visible to the sheet despite the fold.
 ///
+/// D123: `MAP_PATHS` used to be `&[&str]`, and one declaration served two
+/// jobs at once — "these keys are data, don't publish them as field names"
+/// and "stop seeing anything under here at all." Only the first was ever
+/// wanted; the second was a side effect of the fold having no finer grain
+/// than the whole path. `named_children` is that finer grain: a key listed
+/// here is exempted from the fold and walked like an ordinary field (visible
+/// to the sheet, its own path recorded), while every key *not* listed still
+/// folds to `.{}` exactly as before. See `.params.update.rawInput` below for
+/// the motivating case.
+///
+/// **This does not change what a value earns.** `named_children` is read by
+/// this module (the capability sheet) and, for the matching key-survival
+/// decision, by `sanitize.rs` — but only to let the *key* spelling survive
+/// like any other field name. A named child's *value* still has to earn
+/// verbatim survival the ordinary way, one dotted path at a time on
+/// `allowlist/{claude,codex,acp}.txt`; naming a child here does not add it to
+/// either list, and neither `pattern` nor `path` is on `acp.txt` today.
+/// Conflating the two would let a search string or a filesystem path publish
+/// verbatim the moment its field name looked reviewed — exactly the leak the
+/// map declaration exists to prevent in the first place.
+pub struct MapPath {
+    pub path: &'static str,
+    /// Reviewed field names among this map's own children. Opt-in and static
+    /// only — never a heuristic that guesses a key "looks like" a field
+    /// name. A model id (`grok-4.6`) rides `.modelUsage` as a map key in real
+    /// captures, and any cleverness meant to recognize a field-shaped key
+    /// would eventually promote one of those instead.
+    pub named_children: &'static [&'static str],
+}
+
 /// Declared rather than inferred. A model-keyed map is indistinguishable from a
 /// struct by shape alone — every capture on this machine used one model, so its
 /// key set looks perfectly stable — and a wrong guess silently renames a field.
@@ -90,58 +122,113 @@ pub enum SurfaceError {
 /// data-shaped name, which triage catches and adds here.
 ///
 /// **`sanitize.rs` reads this same list**, so one declaration decides both
-/// questions a map key raises: this module stops recording it as a field name,
-/// and the sanitizer stops publishing it verbatim. They must not drift — a
-/// path declared here but not there would redact a key the snapshot still
-/// expects to see, and the reverse publishes an identifier the snapshot has
-/// already agreed is data.
-pub const MAP_PATHS: &[&str] = &[
-    ".modelUsage",
-    // ACP, promote-the-captures slice (2026-08-28). A tool call's own
-    // parameters, keyed by that tool's parameter names (`pattern`, `path`,
-    // `target_file`, ...) — a union across every tool an agent offers, the
-    // same shape of problem D73 tracks for Claude's tool-argument paths.
-    // First seen in `steer-grok` (grok 1.0.5): Grok's own read/search tools
-    // populate this from real filesystem paths on the capturing machine.
-    //
-    // **The declaration is right and it costs something, and both halves are
-    // worth stating — the same trade-off `acp.txt`'s header already records
-    // for `_meta`/`steering.supported`, just not repeated here the first
-    // time.** Declaring this a map is what stops `target_file` (and every
-    // other tool's own argument names) from publishing as if they were
-    // reviewed field names. But `normalize::typed_call` (`normalize.rs`)
-    // genuinely reads two of this map's children on a `search`-kind frame —
-    // `rawInput["pattern"]` and `rawInput["path"]` — and once a path is a
-    // declared map, `Visit::walk` folds every child under it to `.{}`
-    // (`.params.update.rawInput.{}`), so this sheet can no longer distinguish
-    // "pattern" from "path" from any other tool's own key. A future ACP
-    // agent version that drops `pattern` from its search frames breaks
-    // `typed_call`'s `Search` decode silently — the capability-sheet golden
-    // test stays green, because the field it would have caught is no longer
-    // a field this walker can see at all. That is exactly the failure the
-    // sheets exist to prevent, reopened by the one declaration that also
-    // prevents a worse one (publishing a filesystem path as a field value).
-    // `normalize.rs`'s own `pattern`/`path` decode test is what covers this
-    // gap instead — see that test's doc comment for why a unit test has to
-    // stand in for the sheet here.
-    ".params.update.rawInput",
-    // ACP, same slice. `session/prompt`'s usage breakdown, keyed by model
-    // id — the ACP analog of Claude's `.modelUsage` above, at a different
-    // path because ACP nests usage under the prompt reply's own `_meta`
-    // rather than the frame root.
-    ".result._meta.usage.modelUsage",
-    // The same map again, on the `turn_completed` notification rather than
-    // the reply — Grok sends both, with byte-identical contents. Declared
-    // separately because a declaration is matched against the whole path,
-    // and this one is reached through `params.update` instead of `result`.
-    // Missed when the reply path was declared (2026-08-28): the raw
-    // `run-grok`/`steer-grok` captures carry it on every `turn_completed`
-    // frame, so leaving it undeclared was a live instance of D77 — the map
-    // key `grok-4.6` would have published as if it were a reviewed field
-    // name, and the capability sheet would have recorded a model id as a
-    // field.
-    ".params.update.usage.modelUsage",
+/// questions a map key raises: this module stops recording an unnamed child
+/// as a field name, and the sanitizer stops publishing an unnamed child's key
+/// verbatim. They must not drift — a path declared here but not there would
+/// redact a key the snapshot still expects to see, and the reverse publishes
+/// an identifier the snapshot has already agreed is data. A *named* child is
+/// the one exception both sides make in the same direction: its key survives
+/// in both the sheet and the sanitized corpus, while its value stays governed
+/// by the ordinary allowlist, unaffected by this declaration.
+pub const MAP_PATHS: &[MapPath] = &[
+    MapPath {
+        path: ".modelUsage",
+        named_children: &[],
+    },
+    MapPath {
+        path: ".params.update.rawInput",
+        named_children: &[
+            // ACP, promote-the-captures slice (2026-08-28), narrowed by D123
+            // (2026-08-29). A tool call's own parameters, keyed by that
+            // tool's parameter names (`pattern`, `path`, `target_file`,
+            // ...) — a union across every tool an agent offers, the same
+            // shape of problem D73 tracks for Claude's tool-argument paths.
+            // First seen in `steer-grok` (grok 1.0.5): Grok's own
+            // read/search tools populate this from real filesystem paths on
+            // the capturing machine.
+            //
+            // **The declaration is right and it costs something, and both
+            // halves are worth stating — the same trade-off `acp.txt`'s
+            // header already records for `_meta`/`steering.supported`, just
+            // not repeated here the first time.** Declaring this a map is
+            // what stops `target_file` (and every other tool's own argument
+            // names) from publishing as if they were reviewed field names.
+            // But `normalize::typed_call` (`normalize.rs`) genuinely reads
+            // two of this map's children on a `search`-kind frame —
+            // `rawInput["pattern"]` and `rawInput["path"]` — and folding
+            // every child to `.{}` made the sheet unable to distinguish
+            // "pattern" from "path" from any other tool's own key: a future
+            // ACP agent version that drops `pattern` from its search frames
+            // would have broken `typed_call`'s `Search` decode silently, the
+            // capability-sheet golden test staying green because the field
+            // it would have caught was no longer one the walker could see.
+            //
+            // Naming `pattern` and `path` here closes that gap without
+            // reopening the one the map declaration exists to prevent: their
+            // *values* are not added to `acp.txt` by this, and a real
+            // filesystem path or search string typed into either still
+            // redacts to a placeholder like any other unlisted field — see
+            // this type's own doc comment for why the two are decoupled.
+            // Every other key `rawInput` carries for any tool (`target_file`,
+            // `content`, `glob`, `variant`, ...) still folds to `.{}`, unless
+            // a future change decides one of those is worth the same
+            // treatment. `normalize.rs`'s own `pattern`/`path` decode test
+            // remains useful cover regardless — it is a fixture pinned
+            // against a real captured frame, and the corpus has not yet
+            // promoted a scenario that exercises this path at all, so this
+            // declaration is presently latent: it takes effect the day such
+            // a scenario is promoted, not before.
+            "pattern", "path",
+        ],
+    },
+    MapPath {
+        path: ".result._meta.usage.modelUsage",
+        // ACP, same slice. `session/prompt`'s usage breakdown, keyed by
+        // model id — the ACP analog of Claude's `.modelUsage` above, at a
+        // different path because ACP nests usage under the prompt reply's
+        // own `_meta` rather than the frame root. No named children: every
+        // key here is a model id, which is data, never a field name.
+        named_children: &[],
+    },
+    MapPath {
+        path: ".params.update.usage.modelUsage",
+        // The same map again, on the `turn_completed` notification rather
+        // than the reply — Grok sends both, with byte-identical contents.
+        // Declared separately because a declaration is matched against the
+        // whole path, and this one is reached through `params.update`
+        // instead of `result`. Missed when the reply path was declared
+        // (2026-08-28): the raw `run-grok`/`steer-grok` captures carry it on
+        // every `turn_completed` frame, so leaving it undeclared was a live
+        // instance of D77 — the map key `grok-4.6` would have published as
+        // if it were a reviewed field name, and the capability sheet would
+        // have recorded a model id as a field.
+        named_children: &[],
+    },
 ];
+
+/// The declared entry for `path`, if any. The one place both this module and
+/// its two other readers (`sanitize.rs`'s key-survival check,
+/// `allowlist_property.rs`'s audit of the committed corpus) look up a
+/// [`MapPath`], so the three cannot drift on how the lookup itself works.
+fn map_path(path: &str) -> Option<&'static MapPath> {
+    MAP_PATHS.iter().find(|declared| declared.path == path)
+}
+
+/// Whether `path` is a declared map at all, irrespective of any named child.
+/// `sanitize.rs`'s object arm needs exactly this boolean to decide whether an
+/// *un*named child's key is data (default-deny) or an ordinary field name.
+pub fn is_map_path(path: &str) -> bool {
+    map_path(path).is_some()
+}
+
+/// Whether `key` is a reviewed, named child of the map declared at `path` —
+/// a field name that stays visible in both the sheet and the sanitized
+/// corpus despite the map's default fold, per [`MapPath::named_children`]'s
+/// own doc comment. `false` for a path that is not a declared map at all, so
+/// a caller never needs to check [`is_map_path`] first.
+pub fn is_named_map_child(path: &str, key: &str) -> bool {
+    map_path(path).is_some_and(|declared| declared.named_children.contains(&key))
+}
 
 /// One object key, escaped so that it cannot impersonate the notation a
 /// dotted path is built from.
@@ -356,16 +443,21 @@ impl Visit<'_> {
     fn walk(&mut self, value: &Value, path: String) {
         match value {
             Value::Object(object) => {
-                let is_map = MAP_PATHS.contains(&path.as_str());
+                let declared = map_path(&path);
                 for (key, child) in object {
-                    let child_path = if is_map {
+                    let named_child = declared
+                        .is_some_and(|declared| declared.named_children.contains(&key.as_str()));
+                    let folds = declared.is_some() && !named_child;
+                    let child_path = if folds {
                         format!("{path}.{{}}")
                     } else {
                         format!("{path}.{}", escape_path_segment(key))
                     };
-                    // A map entry is data, not a field, so only its contents
-                    // are recorded.
-                    if !is_map {
+                    // An unnamed map entry is data, not a field, so only its
+                    // contents are recorded. A named child (`MapPath`'s own
+                    // doc comment) is the opt-in exception: it is walked like
+                    // any ordinary field, own path recorded and all.
+                    if !folds {
                         self.record(&child_path);
                     }
                     self.walk(child, child_path);
