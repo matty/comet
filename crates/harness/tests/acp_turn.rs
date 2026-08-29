@@ -657,6 +657,85 @@ async fn a_notification_settled_turn_still_reports_usage_from_the_reply() {
     }
 }
 
+/// **D121, pinned.** The notification-settle arm's two existing drains
+/// (`drain_buffered` immediately on receiving the notification, then again
+/// on the RPC-reply arm) only cover what was buffered BEFORE each of their
+/// own settle signals. Neither covers the window this test poses: the
+/// fixture's `complete-race-drain` mode pushes a THIRD frame from the reader
+/// task strictly between the notification and the reply — i.e. while the
+/// harvest is still bounded-polling `reply`, not before it.
+///
+/// Steered to a plain second turn so a misattributed frame has somewhere
+/// else to land: without the post-harvest drain this fix adds, "raced-in"
+/// is never drained on turn 1 at all — it sits in `incoming` untouched until
+/// turn 2's own PRE-send `drain_buffered` (the "drain any backlog before
+/// sending" comment at the top of `drive_turn`) picks it up as leftover
+/// backlog, so it turns up glued onto turn 2's text instead of turn 1's.
+#[tokio::test]
+async fn a_frame_racing_the_post_notification_harvest_lands_on_its_own_turn() {
+    let (controls, steer, _token) = controls();
+    let mut stream = comet_harness::acp::session::run(
+        open(true).await,
+        HarnessId::Mock,
+        request("please complete-race-drain"),
+        controls,
+        no_usage,
+    );
+
+    let mut events = Vec::new();
+    let mut steer = Some(steer);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            let event = event.expect("no transport error");
+            let settled = matches!(event, AgentEvent::Done { .. });
+            events.push(event);
+            if settled && let Some(steer) = steer.take() {
+                steer
+                    .send(SteerMessage {
+                        prompt: "second".into(),
+                        message_id: None,
+                    })
+                    .await
+                    .expect("queue the second turn");
+            }
+        }
+    })
+    .await
+    .expect("both turns settle rather than hanging");
+
+    let dones = dones(&events);
+    assert_eq!(dones.len(), 2, "one Done per turn: {events:#?}");
+    let first_done_idx = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .expect("turn 1's Done is in the stream");
+
+    let turn1_text = text_of(&events[..=first_done_idx]);
+    let turn2_text = text_of(&events[first_done_idx + 1..]);
+    assert_eq!(
+        turn1_text, "workingraced-in",
+        "the frame that raced the harvest belongs to turn 1, where it was \
+         sent — without the post-harvest drain it is missing here entirely: \
+         {events:#?}"
+    );
+    assert_eq!(
+        turn2_text, "working done",
+        "turn 2 must be clean — a missing post-harvest drain on turn 1 \
+         leaves \"raced-in\" for turn 2's own pre-send drain to pick up \
+         instead, which would prefix it here: {events:#?}"
+    );
+
+    for done in dones {
+        match done {
+            AgentEvent::Done { status, error, .. } => {
+                assert_eq!(*status, DoneStatus::Completed);
+                assert!(error.is_none(), "a clean end_turn carries no error");
+            }
+            other => unreachable!("{other:?}"),
+        }
+    }
+}
+
 /// **Task 5's stall bound, made real.** `silent-after-prompt` poses total wire
 /// silence after `session/prompt` — no update, no reply, nothing — which is
 /// exactly the shape `Timeouts::prompt_stall` exists to bound. The run must
