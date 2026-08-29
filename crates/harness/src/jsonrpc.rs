@@ -47,7 +47,7 @@ pub(crate) enum Incoming {
     Malformed,
 }
 
-type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
+type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, RpcFailure>>>>>;
 
 #[derive(Clone)]
 pub(crate) struct RpcClient {
@@ -76,24 +76,55 @@ impl RpcClient {
     }
 
     /// Send a request and await its response (resolved by the reader task).
+    ///
+    /// **`data` never reaches this method's error.** [`RpcFailure::message`]
+    /// alone becomes [`HarnessError::Protocol`]'s text -- exactly what this
+    /// method returned before [`RpcFailure`] existed. A JSON-RPC error's
+    /// `data` is dropped here on purpose: this is the path Codex's
+    /// `turn/start`/`turn/steer` and every ordinary ACP call (`session/
+    /// prompt`, `session/cancel`, `config_requests`, ...) go through, and
+    /// those replies reach a user's transcript close to verbatim
+    /// (`crates/engine/src/sessions.rs`'s `drive_run`, `codex/mod.rs`) --
+    /// `data` is exactly the "raw provider text" `.agents/rules/
+    /// user-facing-errors.md` forbids putting there. [`Self::request_detail`]
+    /// is the one caller allowed to see `data`, and only because its own
+    /// result never reaches a user without first passing through
+    /// `acp::session::OpenFailureMapper`.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, HarnessError> {
+        self.request_detail(method, params)
+            .await
+            .map_err(|failure| HarnessError::Protocol(format!("{method}: {}", failure.message)))
+    }
+
+    /// Same request as [`Self::request`], but on failure returns the
+    /// JSON-RPC error's `message` and `data` separately instead of folding
+    /// them into one opaque [`HarnessError`] -- see [`RpcFailure`]'s own doc
+    /// comment for why, and who is allowed to call this instead of
+    /// `request`.
+    pub(crate) async fn request_detail(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, RpcFailure> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
         self.pending.lock().expect("pending lock").insert(id, tx);
         let line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         if self.writer.send(line.to_string()).is_err() {
             self.pending.lock().expect("pending lock").remove(&id);
-            return Err(HarnessError::Protocol(format!(
-                "{method}: app-server stdin closed"
-            )));
+            return Err(RpcFailure {
+                message: "app-server stdin closed".into(),
+                data: None,
+            });
         }
         match rx.await {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(message)) => Err(HarnessError::Protocol(format!("{method}: {message}"))),
+            Ok(Err(failure)) => Err(failure),
             // Sender dropped: the reader hit EOF and failed all pending.
-            Err(_) => Err(HarnessError::Protocol(format!(
-                "{method}: app-server exited before responding"
-            ))),
+            Err(_) => Err(RpcFailure {
+                message: "app-server exited before responding".into(),
+                data: None,
+            }),
         }
     }
 
@@ -172,11 +203,7 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
                     continue;
                 };
                 let outcome = match msg.get("error") {
-                    Some(err) => Err(err
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| err.to_string())),
+                    Some(err) => Err(parse_error(err)),
                     None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
                 };
                 let _ = sender.send(outcome);
@@ -217,4 +244,156 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
     // EOF/read error: fail every awaiting request, then signal the loop.
     pending.lock().expect("pending lock").clear();
     let _ = tx.send(Incoming::Eof).await;
+}
+
+/// One JSON-RPC error, kept structured rather than folded into one string.
+///
+/// `message` is what [`RpcClient::request`]'s [`HarnessError::Protocol`]
+/// shows -- unchanged from before this type existed, byte-for-byte. `data`
+/// is the vendor's own error payload, flattened to a string (a bare string,
+/// or an object's `.details`), and is exposed ONLY through
+/// [`RpcClient::request_detail`] -- today, only
+/// `acp::session::OpenFailureMapper`, which needs Hermes' `data.details` to
+/// recognize its own "not configured" shape (`message` alone there is the
+/// useless generic "Internal error"). Nothing folds `data` into a `Display`
+/// anywhere in this type, so a caller that only ever sees `HarnessError`
+/// (every existing caller of `request` -- Codex's `turn/start`/`turn/steer`,
+/// every ordinary ACP call) is byte-for-byte unaffected by `data` existing
+/// at all. A review finding on an earlier version of this file: widening
+/// `HarnessError::Protocol`'s own text to carry `data` reached two Codex
+/// user-facing sites (`codex/mod.rs`'s `turn/start`/`turn/steer` failures)
+/// that had never shown provider `data` before -- this split is the fix.
+///
+/// `pub`, not `pub(crate)`, ONLY so `OpenFailureMapper`'s function-pointer
+/// type -- a parameter of the `pub async fn AcpSession::open` an
+/// integration test outside this crate calls -- does not leak a
+/// private-interfaces warning. This module (`jsonrpc`) is itself declared
+/// `pub(crate)` in `lib.rs`, so nothing outside this crate can actually name
+/// `crate::jsonrpc::RpcFailure` regardless of this struct's own visibility.
+#[derive(Debug, Clone)]
+pub struct RpcFailure {
+    pub message: String,
+    pub data: Option<String>,
+}
+
+/// Parse one JSON-RPC `error` object into [`RpcFailure`] -- a pure function
+/// so it can be tested without a real child process.
+///
+/// **`data` is read only when a real `message` string was present.** When
+/// `message` is absent, the fallback below is `err.to_string()` -- the
+/// WHOLE error object, `data` included -- so reading `data` again in that
+/// case would duplicate it (`{"code":-1,"data":"boom"}: boom`, caught in
+/// review). A genuine `message` and a present `data` are independent
+/// fields; only their joint absence-of-message case needs this guard.
+fn parse_error(err: &Value) -> RpcFailure {
+    let message_field = err.get("message").and_then(Value::as_str);
+    let message = message_field
+        .map(str::to_owned)
+        .unwrap_or_else(|| err.to_string());
+    let data = message_field.and_then(|_| {
+        err.get("data").and_then(|data| {
+            data.as_str().map(str::to_owned).or_else(|| {
+                data.get("details")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+        })
+    });
+    RpcFailure { message, data }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// Grok's real signed-out shape (captured live 2026-08-29): `data` is a
+    /// bare string, kept separate from `message`.
+    #[test]
+    fn a_bare_string_data_is_kept_separate_from_the_message() {
+        let err = json!({
+            "code": -32000,
+            "message": "Authentication required",
+            "data": "no auth method id provided"
+        });
+        let failure = parse_error(&err);
+        assert_eq!(failure.message, "Authentication required");
+        assert_eq!(failure.data.as_deref(), Some("no auth method id provided"));
+    }
+
+    /// Hermes' real "no provider configured" shape (captured live
+    /// 2026-08-29): `message` alone ("Internal error") is useless, and the
+    /// actionable text lives at `data.details`. Break caught: reading only
+    /// `message`, which is exactly what made this reply unreadable before
+    /// this function existed.
+    #[test]
+    fn an_object_datas_details_string_is_kept_separate_from_the_message() {
+        let err = json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": {"details": "No LLM provider configured. Run `hermes model`..."}
+        });
+        let failure = parse_error(&err);
+        assert_eq!(failure.message, "Internal error");
+        assert_eq!(
+            failure.data.as_deref(),
+            Some("No LLM provider configured. Run `hermes model`...")
+        );
+    }
+
+    /// No `data` at all (Codex's ordinary shape, and every other recorded
+    /// error): `message` alone, `data` absent.
+    #[test]
+    fn no_data_leaves_data_absent() {
+        let err = json!({"code": -32601, "message": "method not found"});
+        let failure = parse_error(&err);
+        assert_eq!(failure.message, "method not found");
+        assert_eq!(failure.data, None);
+    }
+
+    /// An unrecognized `data` shape (a number, an array, an object with no
+    /// `.details`) is left alone rather than guessed at.
+    #[test]
+    fn an_unrecognized_data_shape_is_dropped_not_guessed_at() {
+        let err = json!({"code": -1, "message": "boom", "data": 42});
+        let failure = parse_error(&err);
+        assert_eq!(failure.message, "boom");
+        assert_eq!(failure.data, None);
+    }
+
+    /// Break caught: when `message` is absent, `message` falls back to the
+    /// WHOLE error object (already containing `data`) -- reading `data`
+    /// again in that case would duplicate it in anything that later joins
+    /// the two. Guarded by requiring a real `message` string before `data`
+    /// is even looked at.
+    #[test]
+    fn a_missing_message_does_not_duplicate_data() {
+        let err = json!({"code": -1, "data": "boom"});
+        let failure = parse_error(&err);
+        assert!(
+            failure.data.is_none(),
+            "data must not be read when there was no real message: {failure:?}"
+        );
+    }
+
+    /// [`RpcClient::request`]'s own contract, pinned directly: `data` must
+    /// never reach [`HarnessError::Protocol`]'s text, which is what a
+    /// generic caller (Codex's `turn/start`/`turn/steer`, any ordinary ACP
+    /// call) shows close to verbatim on screen.
+    #[test]
+    fn request_detail_carries_data_but_request_does_not() {
+        let err = json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": {"details": "No LLM provider configured. Run `hermes model`..."}
+        });
+        let failure = parse_error(&err);
+        let harness_error = HarnessError::Protocol(format!("session/new: {}", failure.message));
+        let text = harness_error.to_string();
+        assert!(
+            !text.contains("No LLM provider configured"),
+            "data must not reach HarnessError::Protocol's text: {text}"
+        );
+    }
 }

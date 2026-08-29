@@ -413,6 +413,56 @@ pub(crate) fn config_requests(
     }
 }
 
+/// Recognizes Grok's own signed-out shape on `session/new` and turns it into
+/// a clean instruction, in place of the raw JSON-RPC text
+/// [`HarnessError::Protocol`] would otherwise carry to the user
+/// (`.agents/rules/user-facing-errors.md`).
+///
+/// **Verified live against grok 1.0.5 on 2026-08-29**, run with `GROK_HOME`
+/// pointed at a scratch directory with no `auth.json` (the isolation D102
+/// established): `initialize` answers normally — `authMethods:
+/// [{"id": "grok.com", ...}]`, `_meta.defaultAuthMethodId: null` — and
+/// `session/new` fails outright with
+/// `{"code": -32000, "message": "Authentication required",
+/// "data": "no auth method id provided"}`. `message` alone (`"Authentication
+/// required"`) is what the check below matches on — Grok's own `data` is
+/// redundant for detection here (unlike Hermes', see `hermes::map_open_failure`),
+/// but is still available on [`crate::jsonrpc::RpcFailure::data`] if a future
+/// build of Grok ever needs it.
+///
+/// **The match is on a substring of `message`, not the whole shape (`code`
+/// included) — deliberately broad, not narrowed further.** Any Grok
+/// failure whose `message` contains this exact phrase maps to "run `grok
+/// login`", including a hypothetical mid-life token expiry that reused the
+/// same wording rather than only the fresh-install "never signed in" case
+/// this was captured against. That is still the right advice for either
+/// cause (re-running `grok login` fixes both), so the breadth was left
+/// alone rather than narrowed to the one `code`/`message` pairing this
+/// capture happens to show — recorded here so a future reader does not
+/// mistake it for an oversight.
+///
+/// **Step 5's decision: Comet never calls ACP's own `authenticate`
+/// method.** Grok's `initialize` reply advertises exactly one entry —
+/// `{"id": "grok.com", "name": "Grok", "description": "Sign in with
+/// Grok"}` — with no `_meta` marking it headless or key-based; the only
+/// sign-in flow evidenced here is the OAuth one `grok login` already drives
+/// interactively. Launching that from a background discovery probe would be
+/// a surprise the user never asked for, and the engine has never owned an
+/// agent's own credentials (`AGENTS.md`'s local/LAN authority model). Send
+/// the user to the CLI's own command instead — `grok login` is the exact
+/// subcommand (`grok login --help`: "Sign in to Grok"), read from `grok
+/// --help`'s own command list, not guessed.
+pub(crate) fn map_open_failure(failure: &crate::jsonrpc::RpcFailure) -> Option<HarnessError> {
+    if failure.message.contains("Authentication required") {
+        Some(HarnessError::NeedsSetup {
+            summary: "Sign-in required".into(),
+            hint: "Run `grok login` to sign in to Grok, then try again.".into(),
+        })
+    } else {
+        None
+    }
+}
+
 /// A model's `_meta.reasoningEfforts[].id`, keeping only levels Comet knows.
 ///
 /// An unrecognized effort is dropped rather than guessed at: offering a rung
@@ -660,6 +710,7 @@ impl Harness for GrokHarness {
             self.timeouts,
             &request,
             config_requests,
+            map_open_failure,
         )
         .await?;
         Ok(super::session::run(
@@ -1107,6 +1158,75 @@ mod tests {
             capabilities.steering_mode,
             SteeringMode::TurnBoundary,
             "Grok advertises no steering extension, so the boundary is the honest answer"
+        );
+    }
+
+    /// Break caught: failing to recognize Grok's real signed-out shape at
+    /// all, which would leave `open()` returning the raw
+    /// `HarnessError::Protocol` fallback instead of a clean instruction.
+    ///
+    /// The input is [`crate::jsonrpc::RpcFailure`] built from Grok's real
+    /// signed-out `session/new` reply (captured live 2026-08-29, see
+    /// `map_open_failure`'s own doc comment): `message` is exactly what
+    /// `jsonrpc::parse_error` reads off the wire's `.message`, `data` off
+    /// its `.data`.
+    #[test]
+    fn a_signed_out_grok_is_recognized_and_asks_the_user_to_sign_in() {
+        let failure = crate::jsonrpc::RpcFailure {
+            message: "Authentication required".into(),
+            data: Some("no auth method id provided".into()),
+        };
+        let mapped =
+            map_open_failure(&failure).expect("Grok's signed-out shape must be recognized");
+        let HarnessError::NeedsSetup { summary, hint } = mapped else {
+            panic!("expected NeedsSetup, got {mapped:?}");
+        };
+        assert_eq!(summary, "Sign-in required");
+        assert!(
+            hint.contains("grok"),
+            "the hint must name the command to run: {hint}"
+        );
+    }
+
+    /// Break caught: the mapper's copy leaking wire text — echoing part of
+    /// `message`/`data` into `summary`/`hint` instead of returning fixed,
+    /// Comet-authored strings. Unlike the test above (whose input happens to
+    /// be clean already, so it could not catch this), this feeds a
+    /// `message`/`data` that DO carry a protocol code and the word
+    /// "jsonrpc", and asserts neither survives into the mapped output —
+    /// exactly the property `.agents/rules/user-facing-errors.md` requires
+    /// and the brief's own test asks for.
+    #[test]
+    fn the_mapped_copy_never_carries_the_raw_wire_text_even_when_the_wire_text_does() {
+        let failure = crate::jsonrpc::RpcFailure {
+            message: "Authentication required (jsonrpc error -32000)".into(),
+            data: Some("no auth method id provided, jsonrpc code -32000".into()),
+        };
+        let mapped = map_open_failure(&failure).expect("still recognized by the substring match");
+        let HarnessError::NeedsSetup { summary, hint } = mapped else {
+            panic!("expected NeedsSetup, got {mapped:?}");
+        };
+        for text in [&summary, &hint] {
+            assert!(
+                !text.contains("-32000"),
+                "no protocol codes on screen: {text}"
+            );
+            assert!(!text.to_lowercase().contains("jsonrpc"), "{text}");
+        }
+    }
+
+    /// A `session/new` failure that is NOT the signed-out shape must pass
+    /// through unchanged — the mapper's whole point is to recognize one
+    /// specific wire shape, not to relabel every failure as "sign in".
+    #[test]
+    fn an_unrecognized_open_failure_is_left_alone() {
+        let failure = crate::jsonrpc::RpcFailure {
+            message: "some other failure".into(),
+            data: None,
+        };
+        assert!(
+            map_open_failure(&failure).is_none(),
+            "an unrecognized failure must not be reclassified"
         );
     }
 }

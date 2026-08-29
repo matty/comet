@@ -246,6 +246,64 @@ pub(crate) fn config_requests(
     }
 }
 
+/// Recognizes Hermes' own "not configured yet" shape on `session/new` and
+/// turns it into a clean instruction, in place of the raw JSON-RPC text
+/// [`HarnessError::Protocol`] would otherwise carry to the user
+/// (`.agents/rules/user-facing-errors.md`).
+///
+/// **Verified live against hermes-agent 0.15.2 on 2026-08-29**, run with no
+/// provider configured (this module's own header has the fuller account):
+/// `initialize` answers normally — `authMethods: [{"id": "hermes-setup",
+/// "name": "Configure Hermes provider", "type": "terminal", "args":
+/// ["--setup"], "description": "Open Hermes' interactive model/provider
+/// setup in a terminal…"}]` — and `session/new` fails with `{"code":
+/// -32603, "message": "Internal error", "data": {"details": "No LLM
+/// provider configured. Run \`hermes model\` to select a provider, or run
+/// \`hermes setup\` for first-time configuration."}}`. **The actionable text
+/// lives in `data.details`, not `message`** — `message` alone is the
+/// useless generic "Internal error" — which is why this checks
+/// [`crate::jsonrpc::RpcFailure::data`], not just `message`: unlike Grok's
+/// mapper, Hermes' phrase genuinely is not reachable from `message` alone.
+/// Checking both fields (rather than `data` only) is a small hedge against
+/// a future Hermes version moving the phrase into `message` instead —
+/// either location still means the same thing.
+///
+/// **Same category as Grok's signed-out case, deliberately generalized as
+/// one variant rather than two.** The two ARE different underlying states —
+/// Grok has never been signed in at all; a from-scratch Hermes install has
+/// no LLM provider selected, which is closer to first-run setup than to
+/// "signed out" — but both answer the same user-facing question ("this
+/// agent cannot run yet; go do one more thing in its own CLI"), so
+/// [`HarnessError::NeedsSetup`] carries either without inventing a second
+/// variant that would only ever differ in wording.
+///
+/// **Step 5's decision, same as Grok's: Comet never calls ACP's own
+/// `authenticate` method.** Hermes' own advertised method is `type:
+/// "terminal"` with `args: ["--setup"]` — not `_meta: {headless: true}`, and
+/// not key-based — so it needs an interactive terminal the same way `grok
+/// login`'s OAuth flow does. Launching it from a background discovery probe
+/// would be the same surprise either way; the hint sends the user to run
+/// `hermes model`/`hermes setup` themselves instead, the two commands
+/// Hermes' own error text names.
+pub(crate) fn map_open_failure(failure: &crate::jsonrpc::RpcFailure) -> Option<HarnessError> {
+    const PHRASE: &str = "No LLM provider configured";
+    let matches = failure.message.contains(PHRASE)
+        || failure
+            .data
+            .as_deref()
+            .is_some_and(|data| data.contains(PHRASE));
+    if matches {
+        Some(HarnessError::NeedsSetup {
+            summary: "Setup required".into(),
+            hint: "Run `hermes model` to select a provider, or `hermes setup` for \
+                   first-time configuration, then try again."
+                .into(),
+        })
+    } else {
+        None
+    }
+}
+
 /// One short-lived ACP session, just to read the handshake and `session/new`.
 ///
 /// Token-free on Grok; on an unconfigured Hermes `session/new` fails outright
@@ -515,6 +573,7 @@ impl Harness for HermesHarness {
             self.timeouts,
             &request,
             config_requests,
+            map_open_failure,
         )
         .await?;
         Ok(super::session::run(
@@ -883,6 +942,77 @@ mod tests {
             capabilities.steering_mode,
             SteeringMode::TurnBoundary,
             "Hermes advertises no steering extension, so the boundary is the honest answer"
+        );
+    }
+
+    /// Break caught: failing to recognize Hermes' real "no provider
+    /// configured" shape at all, which would leave `open()` returning the
+    /// raw `HarnessError::Protocol` fallback instead of a clean
+    /// instruction.
+    ///
+    /// The input is [`crate::jsonrpc::RpcFailure`] built from Hermes' real
+    /// "no provider configured" `session/new` reply (captured live
+    /// 2026-08-29, see `map_open_failure`'s own doc comment): `message` is
+    /// the useless generic "Internal error", and the actionable text is
+    /// where it really lives on the wire -- `data`.
+    #[test]
+    fn an_unconfigured_hermes_is_recognized_and_asks_the_user_to_run_setup() {
+        let failure = crate::jsonrpc::RpcFailure {
+            message: "Internal error".into(),
+            data: Some(
+                "No LLM provider configured. Run `hermes model` to select a provider, or run \
+                 `hermes setup` for first-time configuration."
+                    .into(),
+            ),
+        };
+        let mapped =
+            map_open_failure(&failure).expect("Hermes' unconfigured shape must be recognized");
+        let HarnessError::NeedsSetup { summary, hint } = mapped else {
+            panic!("expected NeedsSetup, got {mapped:?}");
+        };
+        assert_eq!(summary, "Setup required");
+        assert!(
+            hint.contains("hermes"),
+            "the hint must name the command to run: {hint}"
+        );
+    }
+
+    /// Break caught: the mapper's copy leaking wire text. Unlike the test
+    /// above (whose input happens to be clean already), this feeds a
+    /// `message`/`data` that carry a protocol code and the word "jsonrpc",
+    /// and asserts neither survives into the mapped output -- exactly the
+    /// property `.agents/rules/user-facing-errors.md` requires.
+    #[test]
+    fn the_mapped_copy_never_carries_the_raw_wire_text_even_when_the_wire_text_does() {
+        let failure = crate::jsonrpc::RpcFailure {
+            message: "Internal error (jsonrpc code -32603)".into(),
+            data: Some("No LLM provider configured, jsonrpc code -32603".into()),
+        };
+        let mapped = map_open_failure(&failure).expect("still recognized by the substring match");
+        let HarnessError::NeedsSetup { summary, hint } = mapped else {
+            panic!("expected NeedsSetup, got {mapped:?}");
+        };
+        for text in [&summary, &hint] {
+            assert!(
+                !text.contains("-32603"),
+                "no protocol codes on screen: {text}"
+            );
+            assert!(!text.to_lowercase().contains("jsonrpc"), "{text}");
+        }
+    }
+
+    /// Same guard as Grok's mapper: a `session/new` failure that is not the
+    /// unconfigured shape must pass through unchanged, whether the phrase is
+    /// absent from `message`, `data`, or both.
+    #[test]
+    fn an_unrecognized_open_failure_is_left_alone() {
+        let failure = crate::jsonrpc::RpcFailure {
+            message: "some other failure".into(),
+            data: Some("unrelated detail".into()),
+        };
+        assert!(
+            map_open_failure(&failure).is_none(),
+            "an unrecognized failure must not be reclassified"
         );
     }
 }

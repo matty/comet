@@ -99,6 +99,43 @@ pub(crate) type UsageReader = fn(&Value, Option<u64>) -> Option<AgentEvent>;
 /// mapping — the same discipline `UsageReader` already keeps.
 pub(crate) type ConfigRequests = fn(&RunRequest, &str) -> Vec<(&'static str, Value)>;
 
+/// What a `session/new`/`session/load` failure means when it happens before
+/// any session ever opened — the difference between "this agent needs
+/// sign-in or setup first" and any other reason the open failed.
+///
+/// **Per-agent, injected by the caller, the same way [`UsageReader`] and
+/// [`ConfigRequests`] are** — see [`UsageReader`]'s own doc comment for why
+/// the choice stays out of this file rather than a `match` on [`HarnessId`]
+/// in disguise. What "not ready yet" looks like on the wire is genuinely
+/// vendor-specific: Grok answers `-32000 Authentication required` on
+/// `session/new` itself (verified live 2026-08-29 against a `GROK_HOME` with
+/// no `auth.json`), while Hermes answers `-32603 Internal error` with the
+/// actual reason — `"No LLM provider configured. Run `hermes model`..."` —
+/// carried in the error's `data`, not its `message`.
+///
+/// **Takes the raw [`crate::jsonrpc::RpcFailure`], not a [`HarnessError`].**
+/// A review finding on an earlier version of this file: folding a JSON-RPC
+/// error's `data` into `HarnessError::Protocol`'s own text (so this mapper
+/// could see it via `.contains(...)`) widened what every OTHER caller of
+/// `RpcClient::request` shows a user, including two Codex sites
+/// (`codex/mod.rs`'s `turn/start`/`turn/steer` failures) that had never
+/// carried provider `data` before. `RpcFailure` keeps `message` and `data`
+/// separate all the way from the wire to this mapper, and the final
+/// `HarnessError` is built only AFTER this function has had its look — from
+/// `fallback` (the caller's own safe text) when this returns `None`, or
+/// from this function's own `NeedsSetup` payload when it returns `Some`.
+/// Neither path ever exposes `data` to `HarnessError::Protocol`'s `Display`.
+///
+/// Only the vendor module that captured its own shape can tell a genuine
+/// "sign in/configure first" from any other reason `open_or_resume` failed
+/// — a timeout, a malformed reply, a real bug.
+///
+/// `None` passes the original error through unchanged: a failure this
+/// build's mapper does not recognize falls back to whatever safe text the
+/// caller already had rather than being silently reclassified as "you need
+/// to sign in" on a guess.
+pub(crate) type OpenFailureMapper = fn(&crate::jsonrpc::RpcFailure) -> Option<HarnessError>;
+
 /// The timeouts the loop is built from. A struct rather than four arguments so
 /// a test can shrink them without every call site naming all four.
 #[derive(Clone, Copy, Debug)]
@@ -197,12 +234,21 @@ impl AcpSession {
     /// today has a working ACP setter for it (`grok::config_requests`'s doc
     /// comment has the evidence). Discovery never needs either — see
     /// [`Self::open_for_discovery`], which stays on plain `session/new`.
+    ///
+    /// `map_open_failure` runs on a failed `session/new` OR a failed
+    /// `session/load` below — see [`OpenFailureMapper`] and
+    /// [`open_or_resume`]'s own doc comment for why `session/load`'s
+    /// generic-looking fallback text does not shadow it. A failure from the
+    /// handshake itself (`initialize`, via `connect`, above) is never a
+    /// "sign in first" case: the agent never got far enough to say anything
+    /// about auth.
     pub async fn open(
         command: Command,
         cwd: &str,
         timeouts: Timeouts,
         request: &RunRequest,
         config_requests: ConfigRequests,
+        map_open_failure: OpenFailureMapper,
     ) -> Result<Self, HarnessError> {
         let Connected {
             mut child,
@@ -216,14 +262,19 @@ impl AcpSession {
         let (opened, session_id) =
             match open_or_resume(&client, cwd, request, &agent, timeouts).await {
                 Ok(pair) => pair,
-                Err(error) => {
+                Err(OpenFailure { raw, fallback }) => {
                     // The handshake succeeded and this did not, so a live child is
                     // holding stdio nobody will read again. `kill_on_drop` would
                     // reach it eventually, but only once every clone of the client
                     // is dropped too — reap it here instead of leaving the timing
                     // to drop order.
                     shutdown_child(&mut child, timeouts.kill_grace).await;
-                    return Err(error);
+                    // `raw` is `None` for a failure that was never a JSON-RPC
+                    // error at all (`session/new` answering without a
+                    // `sessionId`) — nothing for the mapper to recognize, so
+                    // `fallback` is used directly.
+                    let mapped = raw.as_ref().and_then(map_open_failure);
+                    return Err(mapped.unwrap_or(fallback));
                 }
             };
 
@@ -346,6 +397,27 @@ impl AcpSession {
     }
 }
 
+/// A `session/new`/`session/load` failure that reached [`AcpSession::open`]
+/// before any session ever opened.
+///
+/// **`raw` is what [`OpenFailureMapper`] inspects, and `fallback` is what's
+/// returned when the mapper does not recognize it (or there was nothing to
+/// recognize — `raw` is `None`).** Keeping the two separate, rather than
+/// building one `HarnessError` up front and text-matching it later (an
+/// earlier version of this file did exactly that), is what lets
+/// `session/load`'s branch below give a resumed-chat failure its own
+/// deliberately generic prose — "could not resume the previous session",
+/// not raw JSON-RPC text — as the fallback, WITHOUT that prose replacing
+/// the real error before the mapper ever sees it. Replacing first, the way
+/// the earlier version did, is a real bug caught in review: a signed-out
+/// user reopening a resumable Grok chat got the resume fallback with no
+/// sign-in guidance, because `map_open_failure`'s `.contains("Authentication
+/// required")` had nothing left to match against.
+struct OpenFailure {
+    raw: Option<crate::jsonrpc::RpcFailure>,
+    fallback: HarnessError,
+}
+
 /// `session/new` or `session/load`, whichever the request and the agent's own
 /// advertised capability actually call for — and the session id that goes
 /// with whichever one ran.
@@ -358,7 +430,12 @@ impl AcpSession {
 /// same as if `resume` had never been set. A REQUESTED load that the agent
 /// DOES advertise but then fails is different: that is reported as an error
 /// rather than silently starting fresh, because a resumed chat that silently
-/// begins empty loses the user's context with no signal at all.
+/// begins empty loses the user's context with no signal at all — UNLESS
+/// [`OpenFailureMapper`] recognizes the failure as "sign in first", in which
+/// case the sign-in guidance wins over the generic resume prose (see
+/// [`OpenFailure`]'s own doc comment: Grok advertises `loadSession: true`, so
+/// a signed-out user reopening an existing chat hits this exact path, not
+/// just the fresh-session one).
 ///
 /// `session/load`'s own reply carries no `sessionId` (the ACP org's own
 /// `LoadSessionResponse` schema has none — ours is already known, it is the
@@ -388,27 +465,30 @@ async fn open_or_resume(
     request: &RunRequest,
     agent: &AgentDescription,
     timeouts: Timeouts,
-) -> Result<(Value, String), HarnessError> {
+) -> Result<(Value, String), OpenFailure> {
     match request.resume.as_deref() {
         Some(resume_id) if agent.supports_load_session => {
-            match with_timeout(
+            match with_timeout_detail(
                 timeouts.handshake,
                 "session/load",
-                client.request("session/load", super::load_session_params(resume_id, cwd)),
+                client.request_detail("session/load", super::load_session_params(resume_id, cwd)),
             )
             .await
             {
                 Ok(opened) => Ok((opened, resume_id.to_owned())),
-                Err(error) => {
+                Err(raw) => {
                     tracing::warn!(
                         target: "comet_harness::acp",
                         session_id = resume_id,
-                        %error,
-                        "session/load failed; reporting rather than starting a fresh session"
+                        message = %raw.message,
+                        "session/load failed; reporting rather than starting a fresh session unless the failure mapper recognizes it as sign-in/setup first"
                     );
-                    Err(HarnessError::Protocol(
-                        "could not resume the previous session".into(),
-                    ))
+                    Err(OpenFailure {
+                        fallback: HarnessError::Protocol(
+                            "could not resume the previous session".into(),
+                        ),
+                        raw: Some(raw),
+                    })
                 }
             }
         }
@@ -431,22 +511,45 @@ async fn open_new(
     client: &RpcClient,
     cwd: &str,
     timeouts: Timeouts,
-) -> Result<(Value, String), HarnessError> {
-    let opened = with_timeout(
+) -> Result<(Value, String), OpenFailure> {
+    let opened = with_timeout_detail(
         timeouts.handshake,
         "session/new",
-        client.request("session/new", new_session_params(cwd)),
+        client.request_detail("session/new", new_session_params(cwd)),
     )
-    .await?;
+    .await
+    .map_err(|raw| {
+        // The only copy of the raw JSON-RPC text (`message` AND `data`) —
+        // logged here before `OpenFailure` either gets mapped to a clean
+        // `NeedsSetup` or falls back to `fallback` below, neither of which
+        // keeps the wire text on screen. `.agents/rules/user-facing-errors.md`
+        // requires the diagnostic detail to stay recoverable in `tracing`;
+        // this is that.
+        tracing::debug!(
+            target: "comet_harness::acp",
+            message = %raw.message,
+            data = raw.data.as_deref().unwrap_or(""),
+            "session/new failed"
+        );
+        OpenFailure {
+            fallback: HarnessError::Protocol(format!("session/new: {}", raw.message)),
+            raw: Some(raw),
+        }
+    })?;
     // The borrow of `opened["sessionId"]` ends here, at `.to_owned()` — so
     // `opened` itself can move into the `Ok` below without a full-JSON clone
     // just to outlive a `&str` that no longer exists by the time it matters.
     let session_id = opened["sessionId"].as_str().map(str::to_owned);
     match session_id {
         Some(id) => Ok((opened, id)),
-        None => Err(HarnessError::Protocol(
-            "session/new answered without a sessionId".into(),
-        )),
+        // Not a JSON-RPC error at all — the call succeeded and answered
+        // something unreadable. `raw: None`: there is nothing here that
+        // could be a vendor's "sign in first" shape, so the mapper is never
+        // asked about it (see `AcpSession::open`'s own call site).
+        None => Err(OpenFailure {
+            fallback: HarnessError::Protocol("session/new answered without a sessionId".into()),
+            raw: None,
+        }),
     }
 }
 
@@ -585,6 +688,29 @@ async fn with_timeout(
             "the agent did not answer {method} within {}s",
             limit.as_secs()
         ))),
+    }
+}
+
+/// Same as [`with_timeout`], but for a request whose failure needs to reach
+/// [`OpenFailureMapper`] with `data` intact — see
+/// [`crate::jsonrpc::RpcFailure`]'s own doc comment for why `session/new`'s
+/// and `session/load`'s calls use `RpcClient::request_detail` (and this
+/// wrapper) instead of the ordinary `with_timeout`/`RpcClient::request` pair
+/// every other call in this module still uses.
+async fn with_timeout_detail(
+    limit: Duration,
+    method: &str,
+    request: impl Future<Output = Result<Value, crate::jsonrpc::RpcFailure>>,
+) -> Result<Value, crate::jsonrpc::RpcFailure> {
+    match tokio::time::timeout(limit, request).await {
+        Ok(result) => result,
+        Err(_) => Err(crate::jsonrpc::RpcFailure {
+            message: format!(
+                "the agent did not answer {method} within {}s",
+                limit.as_secs()
+            ),
+            data: None,
+        }),
     }
 }
 

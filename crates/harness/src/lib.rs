@@ -33,6 +33,33 @@ pub enum HarnessError {
     Protocol(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// The CLI answered the handshake but refused to open a session because
+    /// it is not set up yet — signed out (Grok) or no provider configured
+    /// (Hermes). `NotInstalled`-adjacent, not `Protocol`: the agent IS
+    /// installed and DID answer, so "Agent CLI not found" would be wrong, and
+    /// `Protocol`'s raw JSON-RPC text is exactly what
+    /// `.agents/rules/user-facing-errors.md` forbids reaching the user
+    /// (`err.to_string()` is what `drive_run` shows verbatim in
+    /// `crates/engine/src/sessions.rs`, the same way `NotInstalled`'s Display
+    /// already does — see that variant's own comment).
+    ///
+    /// Two fields rather than one baked string, matching
+    /// `HarnessAvailability::Unavailable` (that type's own doc comment is the
+    /// worked example the error-copy rule points at). `Display` joins them
+    /// back into one line today (`drive_run`'s sink only ever wanted a
+    /// single string), but the split is forward-looking, not decorative: a
+    /// surface with somewhere to put a label AND a longer sentence
+    /// separately -- the harness rail row `HarnessAvailability::Unavailable`
+    /// already renders that way -- can render `summary`/`hint` apart the
+    /// moment `NeedsSetup` needs to reach one, without a field ever having
+    /// to be parsed back out of a joined string first.
+    ///
+    /// Built only by a vendor module's own `map_open_failure` (see
+    /// `acp::session::OpenFailureMapper`), never constructed directly here —
+    /// this crate does not know what "not set up yet" looks like on any
+    /// agent's wire.
+    #[error("{summary}. {hint}")]
+    NeedsSetup { summary: String, hint: String },
 }
 
 /// A steer prompt pushed into a live run; delivered at the harness's steering boundary.

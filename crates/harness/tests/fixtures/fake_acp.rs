@@ -232,6 +232,27 @@ fn main() {
                 }));
             }
             "session/new" => {
+                // A `cwd` containing `needs-setup` poses the signed-out/
+                // unconfigured `session/new` failure `acp_turn.rs`'s
+                // `a_session_new_failure_reaches_the_caller_through_the_
+                // open_failure_mapper` needs: real evidence this is the
+                // exact wire shape Grok answers with when signed out
+                // (`grok::map_open_failure`'s own doc comment), reachable
+                // only by actually driving `AcpSession::open` end to end
+                // against a real child process, not by calling a mapper
+                // function directly.
+                let cwd = frame["params"]["cwd"].as_str().unwrap_or_default();
+                if cwd.contains("needs-setup") {
+                    emit(&json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {
+                            "code": -32000,
+                            "message": "Authentication required",
+                            "data": "no auth method id provided",
+                        },
+                    }));
+                    continue;
+                }
                 session_counter += 1;
                 let mut result = json!({"sessionId": format!("fake-session-{session_counter}")});
                 if let Some(config) = session_config.clone() {
@@ -302,7 +323,23 @@ fn main() {
                     .as_str()
                     .unwrap_or_default()
                     .to_owned();
-                if session_id.contains("reject-load") {
+                if session_id.contains("needs-setup-load") {
+                    // The same signed-out shape `session/new`'s `needs-setup`
+                    // trigger answers with, above -- poses a signed-out user
+                    // reopening an EXISTING resumable chat, the case
+                    // `open_or_resume`'s own doc comment names: Grok
+                    // advertises `loadSession: true`, so this path is real,
+                    // not hypothetical, and must not lose the sign-in
+                    // guidance to the generic "could not resume" fallback.
+                    emit(&json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {
+                            "code": -32000,
+                            "message": "Authentication required",
+                            "data": "no auth method id provided",
+                        },
+                    }));
+                } else if session_id.contains("reject-load") {
                     emit(&json!({
                         "jsonrpc": "2.0", "id": id,
                         "error": {"code": -32000, "message": "unknown session"},

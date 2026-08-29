@@ -121,6 +121,18 @@ async fn open_with(no_steering: bool, timeouts: Timeouts) -> AcpSession {
         timeouts,
         &RunRequest::for_session(RuntimeMode::default()),
         no_config,
+        // This suite never drives a `session/new` failure through
+        // `AcpSession::open` (that is `acp_run_fidelity.rs` and the
+        // per-agent unit tests in `grok.rs`/`hermes.rs`), so nothing here
+        // has a "signed out" shape to recognize -- every open passes the
+        // original error through unchanged. A capture-less closure literal,
+        // not a named `fn` item: `OpenFailureMapper`'s parameter type
+        // (`comet_harness::jsonrpc::RpcFailure`) is `pub(crate)` inside
+        // `comet-harness` and unnameable from this integration-test crate,
+        // so a named item with an explicit type annotation cannot be
+        // written here at all -- only a closure whose parameter type Rust
+        // infers from `AcpSession::open`'s own signature.
+        |_| None,
     )
     .await
     .expect("the fixture handshakes")
@@ -886,4 +898,66 @@ async fn repeated_protocol_drift_reports_only_once_per_session() {
         "a vendor that drifts every turn must report once per session, not \
          once per request: {events:#?}"
     );
+}
+
+/// **The wiring line itself, not just a mapper function called in
+/// isolation.** `grok.rs`/`hermes.rs` each unit-test their own
+/// `map_open_failure` directly, but nothing before this test exercised
+/// `AcpSession::open`'s own plumbing -- the line that actually calls the
+/// mapper on a real `session/new` failure and returns its result instead of
+/// the fallback. Reverting that line to `return Err(fallback)` (ignoring
+/// `map_open_failure` entirely) leaves every other test in this suite
+/// green, because none of them drives `session/new` to fail at all -- this
+/// is the one that would catch it.
+///
+/// The fixture's `needs-setup` `cwd` trigger (`fake_acp.rs`) answers with
+/// Grok's real captured signed-out shape (`grok::map_open_failure`'s own
+/// doc comment), so this drives the exact wire text a real signed-out Grok
+/// sends, through a real child process, not a hand-built `RpcFailure`.
+#[tokio::test]
+async fn a_session_new_failure_reaches_the_caller_through_the_open_failure_mapper() {
+    let command = tokio::process::Command::new(env!("CARGO_BIN_EXE_fake-acp"));
+    let request = RunRequest {
+        cwd: "needs-setup".into(),
+        ..RunRequest::for_session(RuntimeMode::default())
+    };
+    let error = AcpSession::open(
+        command,
+        "needs-setup",
+        TEST_TIMEOUTS,
+        &request,
+        no_config,
+        // A minimal mapper matching Grok's real shape -- deliberately not
+        // `grok::map_open_failure` itself (that function is `pub(crate)`
+        // inside `comet-harness` and unreachable from this integration-test
+        // crate), but the same recognition rule, so this test still proves
+        // the plumbing carries a REAL match through to the caller.
+        |failure| {
+            if failure.message.contains("Authentication required") {
+                Some(comet_harness::HarnessError::NeedsSetup {
+                    summary: "Sign-in required".into(),
+                    hint: "Run `grok login` to sign in, then try again.".into(),
+                })
+            } else {
+                None
+            }
+        },
+    )
+    .await;
+
+    let error = match error {
+        Ok(_) => panic!("a needs-setup session/new must fail, not open a session"),
+        Err(error) => error,
+    };
+
+    match error {
+        comet_harness::HarnessError::NeedsSetup { summary, hint } => {
+            assert_eq!(summary, "Sign-in required");
+            assert!(hint.contains("grok"), "{hint}");
+        }
+        other => panic!(
+            "expected the mapper's NeedsSetup, got the raw fallback instead \
+             (the wiring line did not call the mapper): {other:?}"
+        ),
+    }
 }
