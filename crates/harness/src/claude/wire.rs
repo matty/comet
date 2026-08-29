@@ -408,7 +408,7 @@ pub(crate) struct ControlRequestBody {
     pub input: Value,
     /// Which `tool_use` block this approval request answers. The sole prior
     /// consumer was the deleted `capture::approval::claude` validators — test
-    /// tooling under `crates/harness/src/capture/`, never on the runtime
+    /// tooling under `crates/capture/`, never on the runtime
     /// path (see `AGENTS.md`'s "What the providers send") — correlating it
     /// against a tracked `tool_use` id before replying; the surviving driving half
     /// (`record::scenarios::claude::pending_approval`) replies by
@@ -484,7 +484,7 @@ pub(crate) fn user_message_line(text: &str) -> String {
 }
 
 /// One inline image for a stdin user turn (Anthropic base64 image source).
-pub(crate) struct ImageBlock {
+pub struct ImageBlock {
     /// One of the API-supported media types (png/jpeg/gif/webp).
     pub media_type: String,
     /// Raw base64 (no data-URL prefix).
@@ -495,7 +495,7 @@ pub(crate) struct ImageBlock {
 /// first, then the text — the standard Anthropic image+text message shape
 /// (verified against the real CLI: `--input-format stream-json` accepts image
 /// content blocks in user frames). Empty `images` degrades to the plain line.
-pub(crate) fn user_message_line_with_images(text: &str, images: &[ImageBlock]) -> String {
+pub fn user_message_line_with_images(text: &str, images: &[ImageBlock]) -> String {
     if images.is_empty() {
         return user_message_line(text);
     }
@@ -522,7 +522,7 @@ pub(crate) fn user_message_line_with_images(text: &str, images: &[ImageBlock]) -
 }
 
 /// Success reply to a CLI control request (`can_use_tool` allow/deny payloads).
-pub(crate) fn control_response_line(request_id: &str, response: Value) -> String {
+pub fn control_response_line(request_id: &str, response: Value) -> String {
     json!({
         "type": "control_response",
         "response": {
@@ -540,12 +540,12 @@ pub(crate) fn control_response_line(request_id: &str, response: Value) -> String
 /// No `updatedPermissions` is sent on either arm: Comet owns session grants
 /// and must not persist them into provider or repository configuration. See
 /// `comet_engine::approvals`.
-pub(crate) fn deny_response(message: String) -> Value {
+pub fn deny_response(message: String) -> Value {
     json!({ "behavior": "deny", "message": message })
 }
 
 /// `can_use_tool` allow payload with the (possibly updated) tool input.
-pub(crate) fn allow_response(updated_input: Value) -> Value {
+pub fn allow_response(updated_input: Value) -> Value {
     json!({ "behavior": "allow", "updatedInput": updated_input })
 }
 
@@ -570,7 +570,7 @@ pub(crate) fn interrupt_request_line(request_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::corpus_frame;
+    use comet_capture::corpus_frame;
 
     #[test]
     fn parses_known_and_unknown_frames() {

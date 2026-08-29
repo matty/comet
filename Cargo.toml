@@ -8,6 +8,7 @@ members = [
     "crates/doc",
     "crates/sync",
     "crates/harness",
+    "crates/capture",
     "crates/engine",
     "crates/rpc",
     "crates/update",
@@ -28,6 +29,7 @@ comet-proto = { path = "crates/proto" }
 comet-doc = { path = "crates/doc" }
 comet-sync = { path = "crates/sync" }
 comet-harness = { path = "crates/harness" }
+comet-capture = { path = "crates/capture" }
 comet-engine = { path = "crates/engine" }
 comet-rpc = { path = "crates/rpc" }
 comet-update = { path = "crates/update" }

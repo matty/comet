@@ -77,7 +77,7 @@ at the text that had just told them otherwise.
 
 **The fix.** The provider-capture-simplification design (stage 4,
 "neutral-recorder") replaced all three copies with one:
-`crates/harness/src/capture/record/scenarios.rs`'s `SCENARIOS: &[ScenarioSpec]`
+`crates/capture/src/record/scenarios.rs`'s `SCENARIOS: &[ScenarioSpec]`
 declares each scenario's name, purpose, provider, runtime mode and argument
 requirements exactly once. `comet-provider-capture.rs` generates its `--help`
 text and validates arguments by looking a `(provider, name)` pair up in the
@@ -241,7 +241,7 @@ from the code.
 **The close.** `model-discovery-neutral-cwd` and `model-discovery-project-cwd`
 are deleted from `SCENARIOS` for both providers — four rows across the two
 provider tables — along with their committed corpus directories
-(`crates/harness/tests/corpus/{claude/2.1.228,codex/0.147.0}/model-discovery-{neutral-cwd,project-cwd}/`).
+(`crates/capture/tests/corpus/{claude/2.1.228,codex/0.147.0}/model-discovery-{neutral-cwd,project-cwd}/`).
 Every reference to the deleted names (the CLI's own token-free-discovery
 tests, `record.rs`'s `EXPECTED_ROWS` wiring table, the two doc comments that
 explained the three-way split) is updated or removed, and the capability
@@ -268,12 +268,12 @@ tool shipped, or the recording account gaining or losing an MCP connector)
 was invisible to `git diff` between two sheets: the Fields section shows
 `.tools` either way, with no way to tell 29 from 59 apart.
 
-**The fix.** `SheetScenario` (`crates/harness/src/capture/sheet.rs`) grew a
+**The fix.** `SheetScenario` (`crates/capture/src/sheet.rs`) grew a
 `tool_count: Option<usize>` field, rendered as one line in the Scenarios
 section — `tools: 29`, or `tools: (not observed)` for a scenario whose
 archive holds no `system`/`init` frame (every discovery-only scenario, and
 every Codex scenario — Codex's corpus has no equivalent frame at all today).
-`crates/harness/tests/capture_corpus/capability_sheets.rs`'s `scenarios_for`
+`crates/capture/tests/capture_corpus/capability_sheets.rs`'s `scenarios_for`
 sources it by reading the scenario's own `events.jsonl` directly and taking
 the first `system`/`init` frame's `tools` array length — never a name from
 inside it, and never through `observe_surface`, which records field names
@@ -298,7 +298,7 @@ whole version-change mechanism — showed ~200 insertions and ~200 deletions
 that described *different scenarios*, not different CLI behaviour, and
 roughly a third of each sheet was caveat prose whose entire subject was that
 a reader could not tell those two cases apart. `FieldObservation::first_seen`
-(`crates/harness/src/capture/surface.rs`) computed a scenario and sequence
+(`crates/capture/src/surface.rs`) computed a scenario and sequence
 for exactly this triage and was read nowhere outside `surface_map.rs`'s own
 pinning tests.
 

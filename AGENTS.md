@@ -126,7 +126,7 @@ inherited the wrong number.
 ## What the providers send
 
 Sanitizing a capture for the corpus runs on an **allowlist**, not a blocklist.
-`crates/harness/src/capture/allowlist/{claude,codex}.txt` name every dotted key path whose value
+`crates/capture/src/allowlist/{claude,codex}.txt` name every dotted key path whose value
 may survive; everything else becomes a numbered placeholder, and equal values share a number so
 joins across frames still work. **A field nothing on the list names is redacted by default** — the
 standing rule is "nothing decodes it, so it goes," not "nothing recognized it as sensitive." Adding
@@ -157,7 +157,7 @@ value vocabulary for a small declared set of discriminator paths (`.type`, `.met
 tool-name paths, …); and the exact scenario list — argv, cwd and configured environment — the
 evidence was drawn from. It exists for the reason the deleted field snapshot did: a newly
 promoted capture, or a new CLI version's added or removed field, **fails the golden test**
-(`crates/harness/tests/capture_corpus/capability_sheets.rs`) instead of arriving unnoticed. Grep
+(`crates/capture/tests/capture_corpus/capability_sheets.rs`) instead of arriving unnoticed. Grep
 `docs/providers/` before assuming a field does not exist — and if you need to know whether a
 field is actually *read*, grep the decode sources instead; the sheet records that a field is
 present, never whether Comet consumes it.
@@ -172,7 +172,7 @@ capture, read what the failing golden test named, and commit the result in the s
 promotes the capture:
 
 ```powershell
-$env:COMET_UPDATE_SHEETS = "1"; cargo test -p comet-harness --test capture_corpus
+$env:COMET_UPDATE_SHEETS = "1"; cargo test -p comet-capture --test capture_corpus
 ```
 
 **Its blind spot is absence.** A sheet reports fields and vocabulary values that are present; a
@@ -182,15 +182,19 @@ from: before reading a field or value's absence as the CLI lacking a capability,
 any scenario in that same sheet would even have produced it. Procedure is in
 `docs/testing/provider-captures.md`.
 
-`crates/harness/src/capture/` is test tooling and nothing in it is on the runtime path. The
-one thing production shares with it is `crates/harness/src/launch.rs` — the process-launch
-description both use. Keep it that way: a production type that drifts into `capture/` makes
-the boundary unreadable, which is how a design doc came to record the opposite of the truth.
+`crates/capture/` is its own workspace member, and nothing in it is on `comet.exe`'s runtime
+path — `apps/comet` does not depend on it, `comet-harness` depends on it only as a
+**dev-dependency** (D87 stage 7: production physically cannot reach capture machinery, not
+merely by convention). The one thing production shares with it is `comet-harness`'s
+`launch.rs` — the process-launch description both use, referenced from `capture/` as
+`comet_harness::launch::LaunchDescriptor`. Keep it that way: a production type that drifts into
+`capture/` makes the boundary unreadable, which is how a design doc came to record the opposite
+of the truth.
 
 Inside `capture/`, the recorder itself is provider-neutral. The seam is four members — spawn,
 framing, handshake, turn-complete — but only three of them live on
-`capture::record::provider::CaptureProvider` (framing, handshake, turn-complete). Spawn lives on
-each row's `launch` field in `capture::record::scenarios::SCENARIOS` instead: which launch a
+`record::provider::CaptureProvider` (framing, handshake, turn-complete). Spawn lives on
+each row's `launch` field in `record::scenarios::SCENARIOS` instead: which launch a
 scenario needs varies per scenario as well as per provider (Claude alone needs three — bare model
 discovery, non-bare command discovery, and a run), which a provider-level `spawn` method could not
 express without a bypass. **Do not move it back onto the trait** — a first draft did exactly that

@@ -6,11 +6,11 @@ instead of being carried forever on "someone might have an older one".
 
 | Provider | Floor | Corpus evidence |
 | --- | --- | --- |
-| Claude Code | **2.1.228** | `crates/harness/tests/corpus/claude/2.1.228/`, `…/2.1.229/`, `…/2.1.233/`, `…/2.1.241/` |
-| codex-cli | **0.147.0** | `crates/harness/tests/corpus/codex/0.147.0/` |
+| Claude Code | **2.1.228** | `crates/capture/tests/corpus/claude/2.1.228/`, `…/2.1.229/`, `…/2.1.233/`, `…/2.1.241/` |
+| codex-cli | **0.147.0** | `crates/capture/tests/corpus/codex/0.147.0/` |
 
 **A promoted corpus does not always earn a floor row.** codex-acp 1.7.0 and claude-agent-acp
-0.70.0 are both promoted (`crates/harness/tests/corpus/{codex-acp,claude-agent-acp}/`) with no
+0.70.0 are both promoted (`crates/capture/tests/corpus/{codex-acp,claude-agent-acp}/`) with no
 row above. This table is about *adapters* -- CLIs a Comet `Harness` actually drives and
 therefore might one day drop a decode for -- and Comet registers no `Harness` for either:
 `comet_proto::agent::HarnessId` has no `CodexAcp`/`ClaudeAgentAcp` variant, only `ClaudeCode`,

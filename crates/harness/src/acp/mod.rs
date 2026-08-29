@@ -81,7 +81,7 @@ pub fn new_session_params(cwd: &str) -> Value {
 /// **Taken by value.** `image.data` is base64 capped at 5 MB apiece, and the
 /// caller drops its `Vec` the moment this returns; borrowing meant every
 /// attachment's payload was copied into the JSON and the original thrown away.
-pub(crate) fn prompt_params(
+pub fn prompt_params(
     session_id: &str,
     text: &str,
     images: Vec<crate::claude::wire::ImageBlock>,

@@ -1,6 +1,6 @@
 # D87 — the stage-7 extraction trigger has fired
 
-**Status: open, REOPENED 2026-08-29.** This page is the PR10 (`docs/acp-closeout`) re-check the
+**Status: closed, stage 7 executed 2026-08-29 (see the section at the end).** This page is the PR10 (`docs/acp-closeout`) re-check the
 row itself names as one of two things that would reopen it. **A first pass on 2026-08-29 got
 this wrong** — it concluded neither trigger had fired and restated the wait. A review of that
 pass caught it: trigger 1 had already fired, on evidence sitting in this same tree. This page
@@ -141,3 +141,64 @@ the `comet-capture` crate split — that is a Rust change, and this branch is do
 scope (the task brief is explicit: "no Rust should need to change"). Reopening records the
 corrected decision so the next slice picks up stage 7 as active work rather than reading D87 as
 settled-by-decision-to-wait, which is what a first, wrong pass at this page would have shipped.
+
+## Stage 7 executed, 2026-08-29
+
+[PR #145](https://github.com/matty/comet/pull/145). `crates/harness/src/capture/` moved to a new workspace member, `crates/capture` (package
+`comet-capture`), `git mv`'d wholesale — sources, `allowlist/*.txt`, the two `comet-provider-*`
+bins, `tests/capture_corpus.rs` + `tests/capture_corpus/`, and `tests/corpus/`. `comet-harness`
+depends on `comet-capture` only as a **dev-dependency**; `comet-capture` depends on
+`comet-harness` normally, to build launches from its production types. Cargo's dev-dependency
+cycle allowance is what makes this direction sound, and it does build — `cargo test -p
+comet-harness --no-run` links `comet-capture` for the crate's own `#[cfg(test)]` unit tests
+(five sites: `claude::{commands,discovery,wire}`, `codex::discovery`, and
+`claude::normalize` — this page's trigger-2 grep at the top of this file missed the fifth,
+`claude/normalize.rs:2269`, which is why the count here differs from the four cited above).
+
+**One thing that grep did not anticipate: `[[bin]]` targets never get dev-dependencies, in any
+Cargo build mode.** `tests/fixtures/fake_claude.rs` compiles as a `[[bin]]` (spawned via
+`CARGO_BIN_EXE_fake-claude` by harness's own integration tests), and it read one corpus frame
+through `comet_harness::capture::corpus_frame`. Pointing that call at `comet_capture::corpus_frame`
+after the move does not compile — `cargo test -p comet-harness --no-run` failed with
+`E0433: cannot find module or crate comet_capture in this scope` — because `comet-harness`'s
+dev-dependency on `comet-capture` is invisible to a `[[bin]]` target regardless of the invoking
+command (`cargo check --all-targets`, `cargo test --no-run`, `cargo build --profile test`, all
+fail the same way). `corpus_frame`'s own doc comment anticipated exactly this — it said at the
+time that it was "kept separate from `frame` so the reader can move to its own crate later" —
+so `fake_claude.rs` now reads its one frame with a small local reimplementation of the same
+`events.jsonl` convention, rather than depending on the crate. **That duplication is the one
+thing about this stage that can rot silently**, so the pointer runs both ways: `corpus::frame`'s
+doc names the copy, and the copy names `corpus::frame`. The failure mode was measured rather
+than assumed: breaking the copy's corpus root makes `comet-harness::claude
+changing_the_executable_re_runs_discovery` fail with `assertion left == right failed: the good
+fixture answers`. So it does fail — but the fixture's own panic goes to the spawned child's
+stderr, which no test reads, and the surviving symptom names discovery, not the corpus. Loud
+enough to stop a merge, useless for triage, and never a compile error. That is what the
+cross-reference is for.
+
+Visibility promoted from `pub(crate)` to `pub` on `comet-harness`, the full list actually needed
+to compile (checked directly against the source, not re-derived from the pre-move estimate
+above): `launch::LaunchDescriptor` (+ its `command()` method), `home_dir`, `resolve_cli`,
+`all_known_dirs`, `KnownDir`; `acp::prompt_params`, `acp::grok::run_launch`;
+`claude::{run_launch, load_image_blocks}`, the `claude::{commands, discovery, wire}` module
+declarations, `claude::commands::command_discovery_launch`,
+`claude::discovery::model_discovery_launch`, and five `claude::wire` items
+(`ImageBlock`, `user_message_line_with_images`, `control_response_line`, `allow_response`,
+`deny_response`); `codex::{run_launch, normalize_run_request, thread_start_params,
+thread_resume_params, turn_start_params, turn_steer_params, turn_interrupt_params}`, the
+`codex::{approval, discovery}` module declarations, `codex::discovery::{codex_home,
+discovery_launch}`, and `codex::approval::decision_literal`. `acp::hermes::run_launch` did
+**not** need promotion — capture names it only in a doc comment, never calls it (matching this
+page's D110 note above).
+
+Full workspace gate after the move: `cargo fmt --all`, `cargo clippy --workspace --all-targets`
+(zero warnings attributed to `crates/harness` or `crates/capture`, same 26-location baseline
+elsewhere), `cargo nextest run --workspace` (2027 run + 17 skipped, matching `origin/main`'s
+total exactly — confirmed against a disposable comparison worktree — so the move dropped no
+test). `cargo tree -p comet -e normal` lists `comet-harness` but never `comet-capture`, and
+`crates/harness/src/lib.rs` no longer declares `pub mod capture;` — the negative this stage
+exists to prove. The capability-sheet golden test was exercised in both directions from its new
+home: it failed first (the sheets' committed text still named `crates/harness/src/capture/...`
+after `surface.rs`'s own doc-comment path moved to `crates/capture/src/surface.rs`), and
+`$env:COMET_UPDATE_SHEETS = "1"; cargo test -p comet-capture --test capture_corpus` regenerated
+all seven sheets and restored green.

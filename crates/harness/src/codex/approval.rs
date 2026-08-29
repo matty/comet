@@ -253,7 +253,7 @@ fn unknown_command() -> ApprovalRequest {
 /// `approval_signature`, so delegating would leave two grant caches with
 /// different scopes; and `cancel` denies *and interrupts the turn*, which no
 /// button in Comet's decision triple means.
-pub(crate) fn decision_literal(decision: &ApprovalDecision) -> &'static str {
+pub fn decision_literal(decision: &ApprovalDecision) -> &'static str {
     match decision {
         // Comet's engine owns the session grant and answers the repeat itself,
         // so the wire only ever hears about this one call.

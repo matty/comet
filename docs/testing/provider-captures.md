@@ -1,7 +1,7 @@
 # Provider capture corpus
 
 The harness corpus preserves reviewed provider evidence under
-`crates/harness/tests/corpus/<provider>/<version>/<scenario>/`. Each scenario has a
+`crates/capture/tests/corpus/<provider>/<version>/<scenario>/`. Each scenario has a
 `manifest.json` and ordered `events.jsonl`. Tests read a frame by its scenario directory and
 sequence number, from the literal payload bytes, never a round trip through Comet's own wire
 types.
@@ -21,17 +21,17 @@ and rejects ambient `OPENAI_API_KEY` or `CODEX_ACCESS_TOKEN`; do not alter the r
 List the supported scenarios and options without contacting a provider:
 
 ```powershell
-cargo run -p comet-harness --bin comet-provider-capture -- --help
+cargo run -p comet-capture --bin comet-provider-capture -- --help
 ```
 
-That text is generated, not hand-maintained: `crates/harness/src/capture/record/scenarios.rs`'s
+That text is generated, not hand-maintained: `crates/capture/src/record/scenarios.rs`'s
 `SCENARIOS` table is the single place a scenario's name, provider, purpose and argument
 requirements are declared, and both `--help` and `record()`'s own dispatch read it. There is no
 scenario name or flag requirement to keep in sync with this document — if `--help` and this
 procedure ever disagree, `--help` is current and this file is stale.
 
 **What actually makes the corpus safe to commit is `comet-provider-sanitize`'s allowlist, not a
-review step downstream of it.** `crates/harness/src/capture/allowlist/{claude,codex}.txt` name
+review step downstream of it.** `crates/capture/src/allowlist/{claude,codex}.txt` name
 every dotted key path whose value may survive sanitizing, one file per provider. Everything not
 named there becomes a numbered placeholder (`<V210>`), with equal values sharing a number so joins
 across frames still work; six identifier kinds — session, thread, turn, tool-use, machine, request
@@ -61,8 +61,8 @@ naming becomes visible, so read it once per provider.
 Choose an immutable raw root for one observation. Token-free discovery, for example:
 
 ```powershell
-cargo run -p comet-harness --bin comet-provider-capture -- claude model-discovery --claude-config-dir <EMPTY_DIR> --cwd <DISPOSABLE_DIR> --raw-root .comet-provider-captures\raw\<RUN> --timeout-seconds 30
-cargo run -p comet-harness --bin comet-provider-capture -- codex model-discovery --cwd <DISPOSABLE_DIR> --codex-home <CODEX_HOME> --raw-root .comet-provider-captures\raw\<RUN> --timeout-seconds 30
+cargo run -p comet-capture --bin comet-provider-capture -- claude model-discovery --claude-config-dir <EMPTY_DIR> --cwd <DISPOSABLE_DIR> --raw-root .comet-provider-captures\raw\<RUN> --timeout-seconds 30
+cargo run -p comet-capture --bin comet-provider-capture -- codex model-discovery --cwd <DISPOSABLE_DIR> --codex-home <CODEX_HOME> --raw-root .comet-provider-captures\raw\<RUN> --timeout-seconds 30
 ```
 
 Turn scenarios add the acknowledgment only after separate authorization. Resume additionally needs
@@ -99,7 +99,7 @@ two extra were `extra-usage` and `usage-credits`, which track account state on t
 Sanitize each successful raw directory immediately into a new immutable staging name:
 
 ```powershell
-cargo run -p comet-harness --bin comet-provider-sanitize -- <RAW_CAPTURE_DIR> .comet-provider-captures\staging\<REVIEW_NAME>
+cargo run -p comet-capture --bin comet-provider-sanitize -- <RAW_CAPTURE_DIR> .comet-provider-captures\staging\<REVIEW_NAME>
 ```
 
 `partial-capture.json` is quarantined failure evidence. The sanitizer rejects it, and it must never
@@ -154,7 +154,7 @@ directory.
 Run the focused gate after every promotion:
 
 ```powershell
-cargo test -p comet-harness --test capture_corpus
+cargo test -p comet-capture --test capture_corpus
 cargo test -p comet-harness
 ```
 
@@ -196,12 +196,12 @@ configured environment — both are drawn from. Promotion is what changes what a
 scenario promoted here changes its version's sheet on the next regeneration:
 
 ```powershell
-$env:COMET_UPDATE_SHEETS = "1"; cargo test -p comet-harness --test capture_corpus
+$env:COMET_UPDATE_SHEETS = "1"; cargo test -p comet-capture --test capture_corpus
 ```
 
 **Read the failing golden test before you regenerate.**
 `every_corpus_version_matches_its_committed_sheet`
-(`crates/harness/tests/capture_corpus/capability_sheets.rs`) names the line at which the
+(`crates/capture/tests/capture_corpus/capability_sheets.rs`) names the line at which the
 generated sheet first diverges from the one committed, and that is the point of the whole
 mechanism — a new CLI version's added, removed or reshaped field arrives as a test failure rather
 than as a bug six weeks later. It does not name the individual frame or scenario a field first
@@ -212,7 +212,7 @@ the dotted path is a walker construction and never appears in `events.jsonl` ver
 spell the same field.** The sanitizer suffixes every array position with `[]`, including an array
 whose elements are plain scalars, because it decides allow-or-redact once per element regardless
 of what the element is. The sheet's walker (`Visit::walk`,
-`crates/harness/src/capture/surface.rs`) does not: it records a field's path once, when it visits
+`crates/capture/src/surface.rs`) does not: it records a field's path once, when it visits
 the *key* that names it, before it knows whether the value turns out to be an array — and a
 scalar-only array is never revisited with the `[]` suffix, because nothing inside it is an object
 whose own keys would trigger another recording. An array of *objects* does get the suffix (each

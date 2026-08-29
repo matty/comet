@@ -2266,7 +2266,7 @@ mod tests {
     fn corpus_run(scenario: &str, sequences: &[u64]) -> Vec<String> {
         sequences
             .iter()
-            .map(|sequence| crate::capture::corpus_frame(scenario, *sequence).payload)
+            .map(|sequence| comet_capture::corpus_frame(scenario, *sequence).payload)
             .collect()
     }
 

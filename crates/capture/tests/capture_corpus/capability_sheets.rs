@@ -1,0 +1,641 @@
+//! The golden test for the capability sheets (Task 4, design §3.5).
+//!
+//! Every `<provider>/<version>` directory the committed archive holds must
+//! render, byte-for-byte, into `docs/providers/<provider>-<version>.md`. The
+//! sheet is generated from the archive bytes alone — [`observe_surface`] and
+//! each scenario's `manifest.json` — never from the scenario table's
+//! declarations, so this test regenerates evidence from the same corpus
+//! `surface_map.rs` walks rather than trusting anything cached.
+//!
+//! `COMET_UPDATE_SHEETS=1` regenerates the committed files instead of
+//! asserting against them — the same shape `observed_fields.rs` used for
+//! `COMET_UPDATE_SURFACE` before this test replaced it (that file and
+//! `tests/corpus/observed-fields.json` are deleted in the same change that
+//! adds this one).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use comet_capture::{
+    Direction, FieldObservation, SheetScenario, Vocabulary, corpus_root, frames, observe_surface,
+    promoted_scenarios, render_sheet,
+};
+use serde_json::Value;
+
+/// `docs/providers/`, two directories above this crate (`crates/capture` →
+/// the repo root) — the sheets live outside any test tree so they're what a
+/// reader finds deciding what to implement, not something buried under
+/// `tests/`. Built with `parent()` rather than `.join("..")` so a failure
+/// message naming this path is actionable on sight rather than showing
+/// `...\crates\capture\..\..\docs\providers\...`.
+fn docs_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| {
+            panic!(
+                "{} has no grandparent directory",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        })
+        .join("docs")
+        .join("providers")
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Every `(provider, version)` pair `root` holds *at least one promoted
+/// scenario for*, discovered by walking the shared corpus walk rather than a
+/// hand-maintained list — a newly promoted version directory must make this
+/// test fail for want of a sheet, not silently go unchecked because nobody
+/// added its name here.
+///
+/// Narrower than "every `provider/version` directory `root` holds": this
+/// derives from [`promoted_scenarios`], which additionally requires each
+/// scenario to have an `events.jsonl`. A version directory that exists but
+/// whose scenarios all lack one would produce no expected sheet here, and if
+/// a stale sheet for it is still committed, the orphan scan below reports it
+/// with a message naming that narrower cause rather than claiming the
+/// version directory is gone. Inert today — every promoted scenario in the
+/// committed corpus has both `manifest.json` and `events.jsonl` — but real
+/// if the corpus ever holds a version directory with no promoted scenario in
+/// it (review finding, 2026-08-16).
+fn corpus_versions(root: &Path) -> Vec<(String, String)> {
+    let scenarios = promoted_scenarios(root)
+        .unwrap_or_else(|error| panic!("{} could not be walked: {error}", root.display()));
+    let versions: BTreeSet<(String, String)> = scenarios
+        .into_iter()
+        .map(|scenario| (scenario.provider, scenario.version))
+        .collect();
+    versions.into_iter().collect()
+}
+
+/// Every promoted scenario under `root/provider/version`, as [`render_sheet`]
+/// needs it: the manifest's `purpose`, its exact argv (`command.program`
+/// followed by `command.args`), its working directory (`command.cwd`) and
+/// its configured environment (`command.configured_env`) — read straight
+/// from the committed `manifest.json`, never the scenario table's declared
+/// strings, so the sheet reports what a run actually recorded rather than
+/// what the table merely claims. `cwd` and `configured_env` matter beyond
+/// argv: Codex's `model-discovery` and `fresh-text` share byte-identical
+/// argv but not `configured_env` (`CODEX_HOME` set vs. not), a distinction
+/// the argv alone cannot show (review finding, 2026-08-16).
+fn scenarios_for(root: &Path, provider: &str, version: &str) -> Vec<SheetScenario> {
+    let version_dir = root.join(provider).join(version);
+    let mut scenarios = Vec::new();
+    for entry in std::fs::read_dir(&version_dir)
+        .unwrap_or_else(|error| panic!("{} could not be read: {error}", version_dir.display()))
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let manifest_path = path.join("manifest.json");
+        if !manifest_path.is_file() {
+            continue;
+        }
+        let name = file_name(&path);
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(&manifest_path).unwrap_or_else(|error| {
+                panic!("{} could not be read: {error}", manifest_path.display())
+            }),
+        )
+        .unwrap_or_else(|error| panic!("{} is not valid JSON: {error}", manifest_path.display()));
+
+        let purpose = manifest["purpose"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{} has no string \"purpose\"", manifest_path.display()))
+            .to_owned();
+        let program = manifest["command"]["program"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{} has no command.program", manifest_path.display()))
+            .to_owned();
+        let args = manifest["command"]["args"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{} has no command.args", manifest_path.display()))
+            .iter()
+            .map(|arg| {
+                arg.as_str()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{} has a non-string command.args entry",
+                            manifest_path.display()
+                        )
+                    })
+                    .to_owned()
+            });
+        let mut argv = vec![program];
+        argv.extend(args);
+
+        let cwd = manifest["command"]["cwd"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{} has no command.cwd", manifest_path.display()))
+            .to_owned();
+        let configured_env: BTreeMap<String, String> = manifest["command"]["configured_env"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{} has no command.configured_env", manifest_path.display()))
+            .iter()
+            .map(|(key, value)| {
+                let value = value
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{} has a non-string configured_env value for {key:?}",
+                            manifest_path.display()
+                        )
+                    })
+                    .to_owned();
+                (key.clone(), value)
+            })
+            .collect();
+
+        scenarios.push(SheetScenario {
+            name,
+            purpose,
+            argv,
+            cwd,
+            configured_env,
+            tool_count: tool_count_for(&path),
+        });
+    }
+    scenarios
+}
+
+/// The length of the first `system`/`init` frame's `tools` array in
+/// `scenario_dir`'s archive, or `None` if no such frame appears there (a
+/// discovery-only scenario, or a provider with no equivalent frame at all —
+/// Codex's corpus has none today).
+///
+/// Reads `events.jsonl` directly rather than through [`observe_surface`]:
+/// that walker deliberately records field *names*, never a value, and
+/// `.tools` is redacted element-by-element on `claude.txt` — its length is
+/// the one thing about that array this sheet is allowed to show (D86), and
+/// it has to come from the array itself, not from anything the surface walk
+/// already discarded.
+fn tool_count_for(scenario_dir: &Path) -> Option<usize> {
+    let events = frames(scenario_dir)
+        .unwrap_or_else(|error| panic!("{} could not be read: {error}", scenario_dir.display()));
+    for event in events {
+        let Some(payload) = event["payload"]
+            .as_str()
+            .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+        else {
+            continue;
+        };
+        if payload["type"].as_str() == Some("system")
+            && payload["subtype"].as_str() == Some("init")
+            && let Some(tools) = payload["tools"].as_array()
+        {
+            return Some(tools.len());
+        }
+    }
+    None
+}
+
+/// Renders one version's sheet from evidence the caller already walked:
+/// scopes `observations`/`vocabulary` down to `(provider, version)` and
+/// hands the result to the pure renderer, plus that version's scenarios read
+/// straight from `corpus_root`. Takes the already-walked evidence rather
+/// than a `corpus_root` to walk itself — [`observe_surface`]'s own doc
+/// comment says one pass covers every version, and a caller invoking this
+/// once per version used to re-walk the whole ~800-frame archive every time
+/// (review finding, 2026-08-16); the walk now happens once, in the caller.
+fn render_version(
+    observations: &[FieldObservation],
+    vocabulary: &Vocabulary,
+    corpus_root: &Path,
+    provider: &str,
+    version: &str,
+) -> String {
+    let scoped_vocabulary: BTreeMap<(Direction, String), BTreeSet<String>> = vocabulary
+        .iter()
+        .filter(|((entry_provider, entry_version, _), _)| {
+            entry_provider == provider && entry_version == version
+        })
+        .flat_map(|((_, _, direction), paths)| {
+            paths
+                .iter()
+                .map(move |(path, values)| ((*direction, path.clone()), values.clone()))
+        })
+        .collect();
+
+    let scenarios = scenarios_for(corpus_root, provider, version);
+    render_sheet(
+        provider,
+        version,
+        observations,
+        &scoped_vocabulary,
+        &scenarios,
+    )
+}
+
+/// The line at which two documents first diverge, 1-indexed — enough for a
+/// reader to act on without a diff tool, and it names which of the two ran
+/// long if the content matches up to the shorter one's end.
+fn first_difference(committed: &str, generated: &str) -> String {
+    let committed_lines: Vec<&str> = committed.lines().collect();
+    let generated_lines: Vec<&str> = generated.lines().collect();
+    for (index, (committed_line, generated_line)) in committed_lines
+        .iter()
+        .zip(generated_lines.iter())
+        .enumerate()
+    {
+        if committed_line != generated_line {
+            return format!(
+                "line {} differs:\n    committed:  {committed_line:?}\n    generated:  {generated_line:?}",
+                index + 1
+            );
+        }
+    }
+    if committed_lines.len() != generated_lines.len() {
+        return format!(
+            "line count differs: committed has {}, generated has {}",
+            committed_lines.len(),
+            generated_lines.len()
+        );
+    }
+    "content matches but bytes differ (e.g. trailing newline or line ending)".to_owned()
+}
+
+/// Compares every `(provider, version)` in `corpus_root` against the sheet
+/// committed at `docs_root/<provider>-<version>.md`, returning one message
+/// per mismatch, missing sheet, or **orphaned** sheet — a committed
+/// `docs/providers/*.md` naming a `(provider, version)` the corpus no longer
+/// has, the mirror image of the missing-sheet case (review finding,
+/// 2026-08-16: deleting a corpus version directory previously left its sheet
+/// behind forever, describing evidence nobody could regenerate or check).
+/// Shared by the golden test (real corpus, real `docs/providers/`) and the
+/// missing-sheet regression test (a synthetic corpus and an empty
+/// `docs_root`), so both exercise the same comparison rather than two
+/// hand-written variants that could drift apart.
+fn compare_all_versions(corpus_root: &Path, docs_root: &Path) -> Vec<String> {
+    let mut failures = Vec::new();
+    let (observations, vocabulary) = observe_surface(corpus_root)
+        .unwrap_or_else(|error| panic!("{} could not be walked: {error}", corpus_root.display()));
+
+    let mut expected_sheets: BTreeSet<String> = BTreeSet::new();
+    for (provider, version) in corpus_versions(corpus_root) {
+        let generated =
+            render_version(&observations, &vocabulary, corpus_root, &provider, &version);
+        let sheet_name = format!("{provider}-{version}.md");
+        expected_sheets.insert(sheet_name.clone());
+        let sheet_path = docs_root.join(&sheet_name);
+
+        match std::fs::read_to_string(&sheet_path) {
+            Ok(committed) if committed == generated => {}
+            Ok(committed) => failures.push(format!(
+                "{} does not match its generated sheet ({}); rerun with \
+                 $env:COMET_UPDATE_SHEETS = \"1\" and review the diff before committing",
+                sheet_path.display(),
+                first_difference(&committed, &generated)
+            )),
+            Err(error) => failures.push(format!(
+                "{} could not be read ({error}); a version directory with no committed sheet \
+                 is the newly-promoted-capture case this test exists to catch — rerun with \
+                 $env:COMET_UPDATE_SHEETS = \"1\" to generate it",
+                sheet_path.display()
+            )),
+        }
+    }
+
+    match std::fs::read_dir(docs_root) {
+        Ok(entries) => {
+            let mut orphans: Vec<String> = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .map(|path| file_name(&path))
+                .filter(|name| looks_like_a_sheet_filename(name))
+                .filter(|name| !expected_sheets.contains(name))
+                .collect();
+            orphans.sort();
+            for orphan in orphans {
+                // `corpus_versions` only lists a (provider, version) that
+                // holds a promoted scenario (see its own doc comment), so an
+                // orphan can mean two different things: the directory is
+                // genuinely gone, or it still exists but currently promotes
+                // nothing. Naming which one it is stops a reader from
+                // deleting a directory that is still there for no reason.
+                let version_dir_still_exists = orphan
+                    .strip_suffix(".md")
+                    .and_then(|stem| stem.rsplit_once('-'))
+                    .is_some_and(|(provider, version)| {
+                        corpus_root.join(provider).join(version).is_dir()
+                    });
+                let failure = if version_dir_still_exists {
+                    format!(
+                        "{} describes a (provider, version) whose directory still exists under \
+                         {} but currently holds no promoted scenario (no events.jsonl) — \
+                         regenerate or delete the sheet, not the directory",
+                        docs_root.join(&orphan).display(),
+                        corpus_root.display()
+                    )
+                } else {
+                    format!(
+                        "{} describes a (provider, version) the corpus at {} no longer has — \
+                         delete it, or restore the corpus directory it documents",
+                        docs_root.join(&orphan).display(),
+                        corpus_root.display()
+                    )
+                };
+                failures.push(failure);
+            }
+        }
+        // The orphan scan is a detection mechanism; a directory it silently
+        // skipped would read as "no orphans" rather than "did not check" —
+        // the same shape this project keeps getting bitten by (D77's
+        // neighbourhood in docs/debt/README.md is the general case).
+        Err(error) => failures.push(format!(
+            "{} could not be read ({error}); the orphaned-sheet check could not run",
+            docs_root.display()
+        )),
+    }
+
+    failures
+}
+
+/// Whether `name` looks like a generated sheet's own filename
+/// (`claude-2.1.229.md`, `codex-0.147.0.md`) rather than merely any `.md`
+/// file that happens to sit in `docs/providers/`. A `README.md` placed
+/// there must not be treated as an orphaned sheet — the filename-shape
+/// check is what tells the two apart, so a non-sheet file fails (if it
+/// fails at all) with a message about what it actually is, not a claim
+/// that it names a `(provider, version)` the corpus no longer has.
+///
+/// A sheet's stem always splits at its *last* hyphen into a non-empty
+/// provider name and a version that starts with a digit — true of every
+/// promoted version directory (`2.1.228`, `2.1.229`, `0.147.0`) and false
+/// of `README` (no hyphen at all) or any other prose filename a reader
+/// might drop beside the generated sheets.
+fn looks_like_a_sheet_filename(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".md") else {
+        return false;
+    };
+    let Some((provider, version)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    !provider.is_empty() && version.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// Break caught: every version's generated sheet must match its committed
+/// document exactly, so a CLI update that adds, removes or reshapes a field
+/// arrives as a failing test rather than as silence. `COMET_UPDATE_SHEETS=1`
+/// regenerates the committed files instead of asserting.
+#[test]
+fn every_corpus_version_matches_its_committed_sheet() {
+    let root = corpus_root();
+
+    if std::env::var_os("COMET_UPDATE_SHEETS").is_some() {
+        let (observations, vocabulary) = observe_surface(&root)
+            .unwrap_or_else(|error| panic!("{} could not be walked: {error}", root.display()));
+        std::fs::create_dir_all(docs_root()).unwrap();
+        for (provider, version) in corpus_versions(&root) {
+            let generated = render_version(&observations, &vocabulary, &root, &provider, &version);
+            let sheet_path = docs_root().join(format!("{provider}-{version}.md"));
+            std::fs::write(&sheet_path, generated).unwrap_or_else(|error| {
+                panic!("{} could not be written: {error}", sheet_path.display())
+            });
+        }
+        return;
+    }
+
+    let failures = compare_all_versions(&root, &docs_root());
+    assert!(
+        failures.is_empty(),
+        "{} sheet(s) out of date:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
+
+fn write_minimal_scenario(root: &Path, provider: &str, version: &str, scenario: &str) {
+    let directory = root.join(provider).join(version).join(scenario);
+    std::fs::create_dir_all(&directory).unwrap();
+
+    let payload = serde_json::to_string(&serde_json::json!({"type": "system"})).unwrap();
+    let line = serde_json::json!({"sequence": 1, "channel": "stdout", "payload": payload});
+    std::fs::write(
+        directory.join("events.jsonl"),
+        format!("{}\n", serde_json::to_string(&line).unwrap()),
+    )
+    .unwrap();
+
+    let manifest = serde_json::json!({
+        "purpose": "smoke test the missing-sheet case",
+        "command": {
+            "program": "prog",
+            "args": ["--flag"],
+            "cwd": "<CWD>",
+            "configured_env": {},
+        },
+    });
+    std::fs::write(
+        directory.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Break caught: this is the newly-promoted-capture case the whole mechanism
+/// exists for — a version directory with no committed sheet must fail the
+/// suite, not render on the fly and pass silently.
+///
+/// Review finding, 2026-08-16: the original version of this test asserted
+/// only the failure count, the filename and the presence of
+/// `COMET_UPDATE_SHEETS` — all three of which the *mismatch* message also
+/// satisfies (it names the file and tells the reader to rerun with the same
+/// variable). So a bug that routed a missing sheet into the mismatch arm
+/// instead of its own arm would have left this test green while silently
+/// losing the newly-promoted-capture explanation. The `"could not be read"`
+/// assertion below appears only in the missing-sheet message, so it actually
+/// discriminates between the two.
+#[test]
+fn a_version_with_no_committed_sheet_fails() {
+    let corpus = tempfile::tempdir().unwrap();
+    write_minimal_scenario(corpus.path(), "claude", "9.9.9", "smoke");
+    let empty_docs = tempfile::tempdir().unwrap();
+
+    let failures = compare_all_versions(corpus.path(), empty_docs.path());
+
+    assert_eq!(
+        failures.len(),
+        1,
+        "exactly one version with no sheet must produce exactly one failure: {failures:?}"
+    );
+    assert!(
+        failures[0].contains("claude-9.9.9.md"),
+        "the failure must name the missing sheet file: {failures:?}"
+    );
+    assert!(
+        failures[0].contains("COMET_UPDATE_SHEETS"),
+        "the failure must tell the reader how to generate it: {failures:?}"
+    );
+    assert!(
+        failures[0].contains("could not be read"),
+        "the failure must say the sheet is missing, not merely out of date, or a missing sheet \
+         could be silently reported by the mismatch arm instead of its own: {failures:?}"
+    );
+}
+
+/// Break caught: a `docs/providers/*.md` naming a `(provider, version)` the
+/// corpus no longer has must fail the suite — the mirror image of the
+/// missing-sheet case above. Without this check, deleting a corpus version
+/// directory leaves its sheet behind forever, describing evidence that no
+/// longer exists and that `COMET_UPDATE_SHEETS=1` can never regenerate or
+/// correct (it only ever writes, never deletes).
+#[test]
+fn a_sheet_with_no_corresponding_corpus_version_fails() {
+    let corpus = tempfile::tempdir().unwrap();
+    write_minimal_scenario(corpus.path(), "claude", "9.9.9", "smoke");
+    let docs = tempfile::tempdir().unwrap();
+
+    // Seed the sheet that write_minimal_scenario's version actually needs,
+    // so the only failure is the orphan below and not a coincidental
+    // mismatch/missing-sheet failure for "claude/9.9.9" itself.
+    let (observations, vocabulary) = observe_surface(corpus.path()).unwrap();
+    let expected = render_version(&observations, &vocabulary, corpus.path(), "claude", "9.9.9");
+    std::fs::write(docs.path().join("claude-9.9.9.md"), expected).unwrap();
+
+    // A sheet for a version the corpus does not have at all.
+    std::fs::write(docs.path().join("claude-0.0.0.md"), "# stale\n").unwrap();
+
+    let failures = compare_all_versions(corpus.path(), docs.path());
+
+    assert_eq!(
+        failures.len(),
+        1,
+        "the seeded sheet must match cleanly, leaving only the orphan: {failures:?}"
+    );
+    assert!(
+        failures[0].contains("claude-0.0.0.md"),
+        "the failure must name the orphaned sheet: {failures:?}"
+    );
+    assert!(
+        !failures[0].contains("claude-9.9.9.md"),
+        "the seeded, matching sheet must not be reported: {failures:?}"
+    );
+    assert!(
+        failures[0].contains("no longer has"),
+        "claude/0.0.0 does not exist on disk at all, so this must take the genuinely-gone \
+         branch, not the still-exists-but-empty one its sibling test below covers: {failures:?}"
+    );
+}
+
+/// Break caught (review finding, 2026-08-16): the orphan scan used to report
+/// every orphan with the same "the corpus no longer has" message, which is
+/// wrong when the `provider/version` directory is still there and simply
+/// holds no promoted scenario (no `events.jsonl`) — `corpus_versions` only
+/// lists a version with at least one promoted scenario, so a directory that
+/// still exists but currently promotes nothing looks identical to a deleted
+/// one unless the message says which case it is. Deleting a still-present
+/// directory on the strength of the wrong message would be the wrong fix.
+#[test]
+fn an_orphaned_sheet_for_a_still_present_but_empty_version_names_the_real_cause() {
+    let corpus = tempfile::tempdir().unwrap();
+    write_minimal_scenario(corpus.path(), "claude", "9.9.9", "smoke");
+    let docs = tempfile::tempdir().unwrap();
+
+    // Seed the sheet that write_minimal_scenario's version actually needs,
+    // so the only failure is the orphan below.
+    let (observations, vocabulary) = observe_surface(corpus.path()).unwrap();
+    let expected = render_version(&observations, &vocabulary, corpus.path(), "claude", "9.9.9");
+    std::fs::write(docs.path().join("claude-9.9.9.md"), expected).unwrap();
+
+    // A version directory that still exists, but whose only scenario has no
+    // events.jsonl -- promoted_scenarios never yields it, so corpus_versions
+    // never lists "claude"/"0.0.0", and a stale sheet for it looks orphaned
+    // even though the directory itself is still there.
+    std::fs::create_dir_all(corpus.path().join("claude").join("0.0.0").join("empty")).unwrap();
+    std::fs::write(docs.path().join("claude-0.0.0.md"), "# stale\n").unwrap();
+
+    let failures = compare_all_versions(corpus.path(), docs.path());
+
+    assert_eq!(
+        failures.len(),
+        1,
+        "the seeded sheet must match cleanly, leaving only the orphan: {failures:?}"
+    );
+    assert!(
+        failures[0].contains("still exists") && failures[0].contains("holds no promoted scenario"),
+        "a directory that is still present must name that, not claim the corpus no longer has \
+         it: {failures:?}"
+    );
+    assert!(
+        !failures[0].contains("no longer has"),
+        "the wrong-cause message must not fire for a directory that is still there: {failures:?}"
+    );
+}
+
+/// Break caught: `first_difference`'s final fallback fires when every line
+/// matches but the raw bytes don't — the branch that catches a lost
+/// `.gitattributes` or a sheet round-tripped through an editor that
+/// normalizes line endings. `str::lines()` strips both `\n` and `\r\n`
+/// terminators, so a line-ending-only difference produces identical line
+/// vectors and would otherwise fall through both earlier branches silently.
+#[test]
+fn first_difference_reports_a_line_ending_only_mismatch() {
+    assert_eq!(
+        first_difference("a\n", "a\r\n"),
+        "content matches but bytes differ (e.g. trailing newline or line ending)"
+    );
+}
+
+/// Break caught (Task 5 review): the orphan scan used to flag every `.md`
+/// file under `docs/providers/`, not just ones shaped like a generated
+/// sheet's own filename — a `README.md` dropped in that directory would
+/// have failed the golden test with a message claiming it "describes a
+/// (provider, version) the corpus no longer has," which is the wrong
+/// problem entirely. `looks_like_a_sheet_filename` is what tells the two
+/// apart; reverting it to a bare `.md`-extension check makes this fail.
+#[test]
+fn a_non_sheet_file_in_docs_root_is_not_reported_as_an_orphan() {
+    let corpus = tempfile::tempdir().unwrap();
+    write_minimal_scenario(corpus.path(), "claude", "9.9.9", "smoke");
+    let docs = tempfile::tempdir().unwrap();
+
+    // Seed the sheet the corpus actually needs, so a real orphan or
+    // mismatch cannot be what makes the assertion below pass.
+    let (observations, vocabulary) = observe_surface(corpus.path()).unwrap();
+    let expected = render_version(&observations, &vocabulary, corpus.path(), "claude", "9.9.9");
+    std::fs::write(docs.path().join("claude-9.9.9.md"), expected).unwrap();
+
+    // Not shaped like a sheet: no `<provider>-<version>.md` split at all.
+    std::fs::write(docs.path().join("README.md"), "# providers\n").unwrap();
+
+    let failures = compare_all_versions(corpus.path(), docs.path());
+
+    assert!(
+        failures.is_empty(),
+        "a file whose name isn't shaped like a generated sheet must not be reported as an \
+         orphan: {failures:?}"
+    );
+}
+
+/// Break caught (Task 5 review): the orphan scan used to silently no-op
+/// when `docs_root` itself could not be read (`if let Ok(entries) = ...`),
+/// the swallowed-`Err` shape this project keeps getting bitten by — a
+/// check whose whole purpose is detection must report that it could not
+/// run, not read as "nothing to report." Uses a plain file rather than a
+/// missing or permission-locked directory so `read_dir` fails the same
+/// portable way on Windows and Linux.
+#[test]
+fn an_unreadable_docs_root_is_reported_not_swallowed() {
+    let corpus = tempfile::tempdir().unwrap();
+    write_minimal_scenario(corpus.path(), "claude", "9.9.9", "smoke");
+    let not_a_directory = tempfile::tempdir().unwrap();
+    let file_path = not_a_directory.path().join("not-a-directory");
+    std::fs::write(&file_path, b"").unwrap();
+
+    let failures = compare_all_versions(corpus.path(), &file_path);
+
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.contains("orphaned-sheet check could not run")),
+        "an unreadable docs_root must be reported, not silently skipped: {failures:?}"
+    );
+}

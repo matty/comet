@@ -31,7 +31,7 @@ mention them, so on paper they do not exist.
 ## Both slices that hit this went around the doc, differently
 
 **4.2** hand-sanitized a `drive_claude_plan.py` capture into
-`crates/harness/tests/corpus/claude/2.1.229/subagent/` and recorded the deviation honestly in
+`crates/capture/tests/corpus/claude/2.1.229/subagent/` and recorded the deviation honestly in
 the manifest's own `source` field:
 
 > `captures/2026-08-13-plan-todo-subagent/drive_claude_plan.py raw capture

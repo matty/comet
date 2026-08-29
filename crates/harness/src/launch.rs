@@ -32,7 +32,7 @@ impl StdioMode {
 
 /// Every process-launch choice shared by production and capture.
 #[derive(Clone, Debug)]
-pub(crate) struct LaunchDescriptor {
+pub struct LaunchDescriptor {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub cwd: Option<PathBuf>,
@@ -46,7 +46,7 @@ pub(crate) struct LaunchDescriptor {
 }
 
 impl LaunchDescriptor {
-    pub(crate) fn command(&self) -> tokio::process::Command {
+    pub fn command(&self) -> tokio::process::Command {
         let mut command = tokio::process::Command::new(&self.program);
         command
             .args(&self.args)
