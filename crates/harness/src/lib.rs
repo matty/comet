@@ -416,7 +416,7 @@ pub(crate) fn cap_prose(s: &str, max_bytes: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-/// The five places a provider frame becomes an `AgentEvent::Diagnostic`
+/// The seven places a provider frame becomes an `AgentEvent::Diagnostic`
 /// instead of vanishing silently. Numbered here so the "Sink N" comments
 /// scattered at each site resolve against something real — that numbering
 /// has no meaning outside this repository (the planning document it was
@@ -433,10 +433,24 @@ pub(crate) fn cap_prose(s: &str, max_bytes: usize) -> String {
 ///    not answering it) in `claude::mod::handle_control_request`.
 /// 4. Codex: an unclaimed item `type` inside an otherwise-claimed
 ///    notification, in `codex::normalize::map_item`.
-/// 5. Parse failures on both sides — a stdout line that never decoded at
-///    all. Always [`comet_proto::DiagnosticSeverity::Malformed`], always
-///    this fixed sentinel; the raw line stays in `tracing` and never
-///    travels with the event.
+/// 5. Parse failures across all three providers — a stdout line that never
+///    decoded at all. Always [`comet_proto::DiagnosticSeverity::Malformed`],
+///    always this fixed sentinel; the raw line stays in `tracing` and never
+///    travels with the event. Claude and Codex each have their own read-loop
+///    call site; ACP's is `acp::session::handle_incoming`'s
+///    `Incoming::Malformed` arm.
+/// 6. ACP: an unclaimed `sessionUpdate` kind inside an otherwise-well-formed
+///    `session/update` — `acp::normalize::session_update`'s Tier 3 arm,
+///    rate-limited by kind-name through `session_update_once`. **Does NOT
+///    call this function.** The summary has to embed the sanitized kind
+///    name — task-mandated, since `AgentEvent::Diagnostic`'s payload never
+///    travels and the kind name is the only thing that makes the report
+///    actionable — which this function's fixed copy cannot express. The raw
+///    frame is still warn-logged at the drop site (`session_update_once`
+///    itself), matching every other sink's contract.
+/// 7. ACP: a `session/update` whose `update` object carries no `sessionUpdate`
+///    key at all — same function, the `let Some(kind) = … else` arm. Calls
+///    this function normally.
 pub(crate) const UNPARSEABLE: &str = "unparseable";
 
 /// Build the diagnostic event for a dropped frame. The caller has already

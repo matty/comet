@@ -7,10 +7,12 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use comet_harness::Harness;
 use comet_harness::acp::grok::GrokHarness;
 use comet_harness::acp::session::Timeouts;
-use comet_proto::{CatalogSource, HarnessId, ReasoningLevel};
+use comet_harness::{CancellationToken, Harness, RunControls};
+use comet_proto::{AgentEvent, CatalogSource, HarnessId, ReasoningLevel, RunRequest, RuntimeMode};
+use futures::StreamExt;
+use tokio::sync::{mpsc, oneshot};
 
 /// Short enough that a hung probe fails the suite instead of stalling it.
 const TEST_TIMEOUTS: Timeouts = Timeouts {
@@ -187,4 +189,85 @@ async fn the_harness_identifies_itself_consistently() {
     // The registry's lazy descriptor names this same associated function, so a
     // drift between the two is unrepresentable rather than merely tested for.
     assert_eq!(harness.capabilities(), GrokHarness::capabilities());
+}
+
+/// **A turn that streams text closes with a boundary marker, before `Done`.**
+/// `fake-acp`'s default reply (anything but its named modes) streams one
+/// `agent_message_chunk`, then a second right before `stopReason: "end_turn"`
+/// — real content, so `AssistantMessageCompleted` is owed. Proves the wiring
+/// `session.rs::run_session` does around `streamed_this_turn` actually reaches
+/// the event stream, which `acp::normalize`'s unit tests cannot: they call
+/// `session_update` directly and never see the turn loop that decides WHEN to
+/// rotate the id.
+#[tokio::test]
+async fn a_turn_that_streams_text_gets_a_completion_boundary_before_done() {
+    let cwd = std::env::temp_dir().join("comet-grok-fixture-boundary");
+    std::fs::create_dir_all(&cwd).expect("disposable cwd");
+
+    let harness = against_fixture();
+    let (_steer_tx, steer_rx) = mpsc::channel(1);
+    let controls = RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        request_approval: Box::new(|_| oneshot::channel().1),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+    };
+    let request = RunRequest {
+        prompt: "say hello".into(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        ..RunRequest::for_session(RuntimeMode::default())
+    };
+
+    let mut stream = harness
+        .run(request, controls)
+        .await
+        .expect("the fixture starts");
+
+    let mut events: Vec<AgentEvent> = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(event) = stream.next().await {
+            let event = event.expect("no transport error");
+            let settled = matches!(event, AgentEvent::Done { .. });
+            events.push(event);
+            if settled {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the turn settles rather than hanging");
+
+    let boundary_at = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::AssistantMessageCompleted { .. }))
+        .expect("a turn that streamed text closes with a boundary marker");
+    let done_at = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .expect("the turn settles");
+    assert!(
+        boundary_at < done_at,
+        "the boundary must precede Done, not follow it: {events:#?}"
+    );
+
+    let text_at: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, AgentEvent::TextDelta { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        text_at.iter().all(|&i| i < boundary_at),
+        "every streamed chunk must precede the boundary that closes it: {events:#?}"
+    );
+
+    // The fixture never sends a kind this build doesn't recognize, so this is
+    // a regression guard on the wiring, not fresh evidence against Grok's own
+    // wire — that evidence is the live re-run, not this fixture.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Diagnostic { .. })),
+        "a healthy fixture turn must not report a diagnostic: {events:#?}"
+    );
 }
