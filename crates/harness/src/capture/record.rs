@@ -1542,15 +1542,16 @@ mod tests {
         // env var while this section runs.
         unsafe { std::env::set_var("COMET_ACP_ADAPTER_ROOT", adapter_root.path()) };
 
-        // codex-acp and claude-agent-acp discovery are promoted in this same
-        // change (evidence: `tests/corpus/{codex-acp,claude-agent-acp}/`).
-        // Grok stays exempt: `comet-provider-sanitize` structurally REJECTS
-        // every Grok capture today, `initialize` reply onward -- Grok's own
-        // `_meta["x.ai/..."]` vendor-namespace keys contain a literal `.`,
-        // which `validate_key`'s `AmbiguousObjectKey` check refuses
-        // unconditionally, and that check's own doc comment says explicitly
-        // this is "a design question about path encoding, not something to
-        // escape past on the day it arrives." See D102.
+        // codex-acp and claude-agent-acp discovery are promoted (evidence:
+        // `tests/corpus/{codex-acp,claude-agent-acp}/`). Grok's three rows
+        // stay exempt, but no longer for the reason this comment used to
+        // give: `comet-provider-sanitize` rejected every Grok capture
+        // outright until `surface::escape_path_segment` answered the
+        // path-encoding question its own doc comment asked (D102 Blocker 2).
+        // All three raw captures sanitize now. What is left is the
+        // *promotion*, which publishes a real turn's evidence into a public
+        // repository and is a reviewed decision (`provider-captures.md`),
+        // not something this change made automatic.
         const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[
             (Provider::Acp, "session-discovery-grok"),
             (Provider::Acp, "run-grok"),

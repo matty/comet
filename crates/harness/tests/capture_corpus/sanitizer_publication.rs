@@ -267,3 +267,80 @@ fn sanitizer_manifest_is_bare_provenance_and_placeholders_still_collide_equal_va
         report.manifest_bytes
     );
 }
+
+/// Break caught: a capture whose own program lives outside every declared
+/// redaction root cannot be sanitized at all, and the message names a JSON
+/// position rather than the reason.
+///
+/// Real failure, not hypothetical: the ACP adapter rows spawn `node`, and a
+/// system-wide install resolves to `C:\Program Files\nodejs\node.exe`, which
+/// is under none of `RedactionRoots`' categories. `sanitize_paths_and_validate`
+/// hard-fails on a leftover absolute path rather than publishing it, so
+/// `comet-provider-sanitize` rejected the capture with
+/// `capture contains an unrecognized absolute path at command.object[5]`.
+/// The 2026-08-28 promotion worked around it by re-recording with
+/// `--executable` pointed at a different interpreter that happened to live
+/// under `<HOME>`; an operator with only a standard install (nvm, Program
+/// Files, `/usr/local/bin`, most package managers) has nothing to reach for.
+///
+/// The program's own directory is a root like any other now, added only when
+/// nothing already covers it -- so a program under `<HOME>` keeps spelling
+/// itself `<HOME>\...`, exactly as every promoted capture does today.
+#[test]
+fn a_program_outside_every_declared_root_still_sanitizes() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "system-interpreter",
+        &[r#"{"type":"control_response","response":{"subtype":"success"}}"#],
+    );
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    capture["command"]["program"] = Value::String(r"C:\Program Files\nodejs\node.exe".into());
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "system-interpreter"))
+        .expect("a program outside every root must not reject the capture");
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+    let command = manifest["command"]["program"]
+        .as_str()
+        .expect("the manifest records the program it launched");
+    assert!(
+        command.starts_with("<PROGRAM_DIR>"),
+        "the program's directory must redact to its own root, got {command}"
+    );
+    assert!(
+        command.ends_with("node.exe"),
+        "the program's own name still has to survive, or the manifest stops naming what ran: \
+         {command}"
+    );
+}
+
+/// The other half: a program that already lives under a declared root keeps
+/// that root's spelling. Every promoted capture reads `<HOME>\...`, and a new
+/// root that outranked `<HOME>` because it is a longer string would silently
+/// rewrite all of them on the next re-sanitize.
+#[test]
+fn a_program_under_an_existing_root_keeps_that_roots_spelling() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "home-interpreter",
+        &[r#"{"type":"control_response","response":{"subtype":"success"}}"#],
+    );
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    capture["redaction_roots"]["home"] = Value::String(r"C:\Users\somebody".into());
+    capture["command"]["program"] = Value::String(r"C:\Users\somebody\.grok\bin\grok.exe".into());
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "home-interpreter")).unwrap();
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+    assert_eq!(
+        manifest["command"]["program"],
+        Value::String(r"<HOME>\.grok\bin\grok.exe".into()),
+        "a program under an existing root must keep that root, not gain a new one"
+    );
+}

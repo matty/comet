@@ -25,11 +25,14 @@ use comet_harness::capture::{SCENARIOS, corpus_provider_name, corpus_root, promo
 /// Empty of the Claude/Codex rows the stage-6 promotion used to carry here
 /// (all landed in that live re-capture) — but not empty overall. Grok's
 /// three rows are exempt again, for a reason distinct from "not yet
-/// recorded": `comet-provider-sanitize` structurally rejects every Grok
-/// capture (its own `_meta["x.ai/..."]` keys trip the ambiguous-object-key
-/// check unconditionally). codex-acp and claude-agent-acp discovery ARE
-/// promoted in this same change and are correctly absent from this list.
-/// See D102.
+/// recorded" *and* distinct from what this comment said before: the
+/// sanitizer used to reject every Grok capture on its `_meta["x.ai/..."]`
+/// keys, which `surface::escape_path_segment` fixed (D102 Blocker 2), and
+/// all three raw captures sanitize today. They stay listed because
+/// promotion — publishing a real turn's evidence into a public repository —
+/// is a separate reviewed decision (`docs/testing/provider-captures.md`).
+/// codex-acp and claude-agent-acp discovery ARE promoted and are correctly
+/// absent from this list. See D102.
 const EXEMPT_UNCAPTURED: &[(&str, &str)] = &[
     ("grok", "session-discovery-grok"),
     ("grok", "run-grok"),

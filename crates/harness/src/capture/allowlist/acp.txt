@@ -19,22 +19,22 @@
 # break that entry below - worse than publishing a vendor namespace string.
 #
 # Grok's session-config picker surface (`_meta["x.ai/sessionConfig"].options[].
-# {category,id,label}`) is reviewed and genuinely decoded (grok.rs's
-# `config_options`/`ladder_from_config`/`models_from_discovery`) but is NOT
-# on this list. `comet-provider-sanitize` cannot promote a capture carrying
-# this key at all yet -- `x.ai/sessionConfig`'s own literal `.` trips
-# `validate_key`'s ambiguous-object-key rejection unconditionally (D102,
-# Blocker 2), so any spelling committed here today is unreachable: escaped,
-# it matches nothing the sanitizer would ever produce; unescaped, the three
-# lines below are themselves indistinguishable from the nested path
-# `_meta` -> `x` -> `ai/sessionConfig` -- the exact ambiguity `validate_key`
-# exists to refuse. Committing a spelling before the design that decides it
-# is a decision made in the wrong order. The review stands and is recorded
-# verbatim in D102 rather than here; add these three back, correctly
-# spelled for whatever `validate_key` resolves to, once Blocker 2 closes.
+# {category,id,label}`) is reviewed, genuinely decoded (grok.rs's
+# `config_options`/`ladder_from_config`/`models_from_discovery`) and IS on
+# this list -- three lines below, the review recorded in D102. Its spelling
+# was the open question, not its approval: a key carrying a literal `.` used
+# to reject the whole capture (D102, Blocker 2), so no spelling was reachable
+# either way. It is now escaped -- `x\.ai/sessionConfig`, one backslash per
+# delimiter that came out of a real key -- which is what
+# `surface::escape_path_segment` builds and therefore what an allowlist line
+# must match. A line written the old, unescaped way would match the nested
+# path `_meta` -> `x` -> `ai/sessionConfig` instead, which is exactly the
+# impersonation the escape exists to prevent, and would match nothing real.
 #
-# `.params.update.rawInput` and `.result._meta.usage.modelUsage` ARE declared
-# maps (`surface::MAP_PATHS`), so their contents never reach this file at all:
+# `.params.update.rawInput`, `.result._meta.usage.modelUsage` and
+# `.params.update.usage.modelUsage` (the same model-keyed map on the
+# `turn_completed` notification as on the prompt reply) ARE declared maps
+# (`surface::MAP_PATHS`), so their contents never reach this file at all:
 # a tool call's own parameters are keyed by that tool's parameter names (a
 # union across every tool, D73's shape for Claude), and a real `steer-grok`
 # capture (2026-08-28) populated `rawInput.target_file` with this operator's
@@ -84,6 +84,9 @@
 .result._meta.modelState.availableModels[]._meta.reasoningEfforts[].id
 .result._meta.outputTokens
 .result._meta.steering.supported
+.result._meta.x\.ai/sessionConfig.options[].category
+.result._meta.x\.ai/sessionConfig.options[].id
+.result._meta.x\.ai/sessionConfig.options[].label
 .result.agentInfo.name
 .result.agentInfo.title
 .result.agentInfo.version

@@ -1,12 +1,15 @@
-# D102 — Grok's command push ships with three fields unevidenced, and the corpus cannot record Grok at all yet
+# D102 — Grok's command push ships with three fields unevidenced, and no Grok capture is promoted yet
 
-**Status: open, unowned, two distinct blockers.** No owner has been assigned as of 2026-08-29 —
-recorded explicitly here rather than left implicit, per the 2026-08-29 whole-branch review. The
-first blocker is a decision already made (redact three decoded fields rather than publish this
-operator's personal skill inventory). The second is a harder, unrelated finding discovered while
-trying to act on the first: `comet-provider-sanitize` structurally rejects every Grok capture
-today, so neither blocker's resolution can currently reach a promoted corpus directory.
-codex-acp and claude-agent-acp are unaffected by either and are promoted
+**Status: open, unowned. Blocker 2 is CLOSED (2026-08-29); Blocker 1's fallback ruling stands and
+nothing is promoted.** The first blocker is a decision already made (redact three decoded fields
+rather than publish this operator's personal skill inventory). The second — `comet-provider-sanitize`
+rejecting every Grok capture outright — was a real design question and is now answered:
+`surface::escape_path_segment` escapes a key's own delimiters where it joins a dotted path, so a
+vendor-namespaced key can no longer impersonate nesting and no longer needs refusing. **All three
+raw Grok captures sanitize end to end today** (discovery, `run-grok`, `steer-grok`); what remains
+is the *promotion*, which publishes a real turn's evidence into a public repository and is a
+reviewed decision under `docs/testing/provider-captures.md`, not an automatic consequence.
+codex-acp and claude-agent-acp are unaffected by either blocker and are promoted
 (`crates/harness/tests/corpus/{codex-acp,claude-agent-acp}/`).
 
 **The consequence compounds, and is worth stating plainly.** Grok is the one ACP agent this fork
@@ -15,8 +18,10 @@ monitoring of any adapter Comet drives, entirely because this row is still open:
 
 - **No drift sheet.** `docs/providers/` has one for every corpus version of Claude Code and
   codex-cli, and for codex-acp and claude-agent-acp — the two ACP adapters nobody actually runs
-  in production, kept only as comparison points. Grok, the one that ships, has none, because a
-  sheet needs a promoted corpus and this row blocks that.
+  in production, kept only as comparison points. Grok, the one that ships, has none: a sheet
+  needs a promoted corpus, and nothing is promoted. Since 2026-08-29 that is a decision waiting
+  to be taken rather than a mechanism that refuses — the three raw captures sanitize, so a
+  promotion is a review away, not a fix away.
 - **No supported-version floor.** `docs/testing/supported-provider-versions.md` names one for
   Claude Code and codex-cli only (D110 names this explicitly).
 - **No runnable live suite.** `crates/harness/tests/grok_live.rs` is `#[ignore]`d — its usage
@@ -88,7 +93,41 @@ with no personal skills, plugins, or bundled agent tooling installed under its o
 inventory," because the contamination is sourced from the real OS user profile regardless of every
 env-var and config lever Grok documents.
 
-## Blocker 2 — `comet-provider-sanitize` rejects every Grok capture outright, before Blocker 1 even matters
+## Blocker 2 — CLOSED 2026-08-29. The sanitizer rejected every Grok capture outright; keys are now escaped instead
+
+**Resolved by escaping, not by an allowlist of permitted keys.** `surface::escape_path_segment`
+escapes `\`, `.`, `[`, `]`, `{` and `}` wherever a real key is joined into a dotted path, in both
+path builders (`sanitize::Redactor::sanitize_value_tree` and `surface::Visit::walk`, which must
+agree or a sheet and an allowlist would spell one field two ways). The generated `[]` and `{}`
+markers are never escaped — only characters that came out of a provider's key. `validate_key`'s
+outright rejection is gone along with the `AmbiguousObjectKey` variant; every other fail-closed
+check in that function is untouched.
+
+**The enumerate-the-known-keys shape sketched below is what the evidence ruled out.** Reading the
+three raw captures directly turned up ten dotted keys, not the nine this page listed: the nine
+`x.ai/*` field names, plus the model id **`grok-4.6`**, which Grok uses as a *map key* under
+`usage.modelUsage`. A model id is data and cannot be pre-reviewed one literal at a time, so a
+reviewed literal-key list would have needed a carve-out for half the cases on the first day it
+shipped. Escaping needs none: a field name publishes because field names publish, and a map key
+still faces `allows_prefix`'s default-deny. What the old check protected against is protected
+better — the impersonation is now structurally impossible rather than refused — and the test that
+proves it (`a_dotted_key_cannot_borrow_a_listed_paths_permission`) fails with the flat key's value
+surviving verbatim when the escape is removed.
+
+**Also found while acting on this, and fixed in the same change**: `.params.update.usage.modelUsage`
+was not in `surface::MAP_PATHS`, only `.result._meta.usage.modelUsage` was. Grok sends the same
+map on the `turn_completed` notification as well as the prompt reply, so the notification copy was
+a live instance of D77 — `grok-4.6` would have published as if it were a reviewed field name and
+the capability sheet would have recorded a model id as a field. Both paths are declared now.
+
+**Evidence the fix works, on real captures rather than fixtures.** All three raw Grok recordings
+sanitize (`comet-provider-sanitize <raw> .comet-provider-captures/staging/…`, exit 0), and the
+staged output was checked directly: `grok-4.6` survives at four *value* positions, every one of
+them an already-allowlisted model-id path, and at zero key positions — the `modelUsage` key stages
+as `<V42>`. The command push stages as placeholders throughout, so Blocker 1's ruling holds in
+practice. No `C:\Users\…` path survives in any of the three.
+
+### What it looked like before (kept, because the mechanism explains the escape)
 
 Found while trying to sanitize the reviewed captures. `validate_key` in
 `crates/harness/src/capture/sanitize.rs` rejects any object key containing `.`, `[` or `]` before
@@ -109,56 +148,62 @@ raw capture fails with `capture contains an object key that would impersonate a 
 `run-grok` and `steer-grok` were recorded successfully (raw evidence preserved, see below) and
 independently confirmed the same rejection.
 
-This is why `session-discovery-grok`, `run-grok` and `steer-grok` are named in
-`EXEMPT_UNCAPTURED` in both `crates/harness/src/capture/record.rs` and
-`crates/harness/tests/capture_corpus/scenario_coverage.rs`, while codex-acp and claude-agent-acp
-(neither of which uses a dotted key anywhere) are promoted and correctly absent from both lists.
+`session-discovery-grok`, `run-grok` and `steer-grok` are still named in `EXEMPT_UNCAPTURED` in
+both `crates/harness/src/capture/record.rs` and
+`crates/harness/tests/capture_corpus/scenario_coverage.rs`, but the reason changed with the fix:
+not "the sanitizer refuses them" any more, only "nothing is promoted yet". Both comments were
+rewritten rather than left saying the old thing.
 
-**This needs a deliberate design decision, per the check's own comment, not a workaround chosen
-under this task's time budget.** A narrow, reviewable shape worth considering when someone does
-take it up: a small, explicitly-enumerated allowlist of literal key strings permitted to contain a
-path delimiter (the same "declare it once, review it once" shape `surface::MAP_PATHS` and
-`allowlist::NAMED_LEAVES` already use), checked before `AmbiguousObjectKey` fires — which would
-leave the check's actual protection (anything NOT on that reviewed list still rejects
-unconditionally) fully intact. Not attempted here; recorded as the shape worth trying, not a
-decision to build it this way.
-
-### The three session-config paths that were reviewed but cannot be spelled yet
+### The three session-config paths, reviewed 2026-08-28 and spelled 2026-08-29
 
 Task review (2026-08-28) confirmed the allowlist review itself was sound but ruled that three
-lines should not have shipped in `crates/harness/src/capture/allowlist/acp.txt` alongside
-everything else: `.result._meta.x.ai/sessionConfig.options[].category`, `...[].id`, and
-`...[].label`. Each is genuinely decoded — `grok.rs`'s `config_options`/`ladder_from_config`/
+lines should not ship in `crates/harness/src/capture/allowlist/acp.txt` until the spelling was
+decided: `.result._meta.x.ai/sessionConfig.options[].category`, `...[].id`, and `...[].label`.
+Each is genuinely decoded — `grok.rs`'s `config_options`/`ladder_from_config`/
 `models_from_discovery` reads exactly these three fields to build the model and reasoning-effort
-picker — but Blocker 2 above makes the question of how to spell that path in the allowlist file
-*undecided*, not merely unreachable. `comet-provider-sanitize` never gets far enough to check
-`acp.txt` against a real Grok capture at all (it rejects the capture at the raw key first), so
-any spelling committed today is unverified against the mechanism `validate_key` will eventually
-use to admit it: escaped somehow, it matches nothing the sanitizer would ever produce; written
-as a plain dotted path the way every other line in that file is, `.result._meta.x.ai/sessionConfig`
-is byte-for-byte the same string a nested path `.result` → `._meta` → `.x` → `.ai/sessionConfig`
-would build — precisely the ambiguity `validate_key` exists to refuse. Committing a spelling
-before the design that determines it decides the encoding by accident, in the wrong order.
+picker. They were approved as PATHS, not as a SPELLING, because either candidate spelling was
+wrong: escaped *somehow*, matching nothing the sanitizer would produce; unescaped,
+`.result._meta.x.ai/sessionConfig` is byte-for-byte the string a nested path `.result` →
+`._meta` → `.x` → `.ai/sessionConfig` would build.
 
-**The review is preserved here rather than in `acp.txt`.** Once Blocker 2 resolves (whatever
-shape that takes — a reviewed literal-key allowlist checked before `AmbiguousObjectKey`, or
-something else), add these three back to `acp.txt`, spelled however that mechanism requires:
+**Both are now on `acp.txt`, escaped**, which is what the sanitizer builds and therefore the only
+spelling that matches:
 
 ```
-.result._meta.x.ai/sessionConfig.options[].category
-.result._meta.x.ai/sessionConfig.options[].id
-.result._meta.x.ai/sessionConfig.options[].label
+.result._meta.x\.ai/sessionConfig.options[].category
+.result._meta.x\.ai/sessionConfig.options[].id
+.result._meta.x\.ai/sessionConfig.options[].label
 ```
 
-Reviewed and approved as PATHS worth publishing — genuinely decoded, small fixed vocabularies
-or model/effort identifiers, never personal data. Not approved as a SPELLING; that is Blocker 2's
-decision, not this row's.
+Confirmed against a real capture rather than a fixture: after the change, the discovery capture's
+novel-path report lists `.result._meta.x\.ai/sessionConfig.options[].description` (unlisted, so
+withheld) and does **not** list `.category`/`.id`/`.label` — they matched these three lines and
+survived.
 
-## An unrelated third sanitizer gap, worked around rather than blocking (found promoting codex-acp/claude-agent-acp)
+## An unrelated third sanitizer gap — FIXED 2026-08-29, was worked around
 
-Distinct from both blockers above — neither is a Grok-specific dotted-key problem, and neither
-blocked promotion; it required a workaround this row records so the next capture operator does
-not hit the same wall from scratch.
+Distinct from both blockers above — not a Grok-specific dotted-key problem — and it did not block
+the 2026-08-28 promotion because a workaround existed on this machine. It would have blocked
+anyone else's.
+
+**Fixed**: `Redactor::add_uncovered_program_root` derives a `<PROGRAM_DIR>` root from the
+capture's own `command.program` when none of the eight `RedactionRoots` categories already covers
+it. Derived at sanitize time rather than recorded as a ninth manifest field on purpose — the
+program is in every capture, including ones already recorded, so the fix reaches them. It is
+**only** added when uncovered, because `add_path` ranks roots by string length and an
+unconditional program root would outrank `<HOME>` (`C:\Users\me\.grok\bin` is the longer string)
+and silently respell every capture that works today. Both directions are tested
+(`a_program_outside_every_declared_root_still_sanitizes`,
+`a_program_under_an_existing_root_keeps_that_roots_spelling`); the first fails with
+`UnrecognizedAbsolutePath { location: "command.object[5]" }` when the fix is disabled, the second
+passes either way, which is what shows it is a preserved behaviour and not a new one.
+
+Verified against the original failing evidence rather than a fixture: the 2026-08-28 raw
+`acp-session-discovery-codex-acp-*` capture, the one recorded with the system Node, sanitizes now
+and its manifest reads `"program": "<PROGRAM_DIR>\\node.exe"` with argv still spelled
+`<HOME>\AppData\Roaming\npm\…`.
+
+The record of what it was follows, because the workaround is baked into two promoted manifests.
 
 `comet-provider-sanitize` also failed sanitizing the codex-acp and claude-agent-acp discovery
 captures on first attempt: `capture contains an unrecognized absolute path at command.object[5]`.
@@ -179,13 +224,16 @@ capability sheets (`docs/providers/{codex-acp-1.7.0,claude-agent-acp-0.70.0}.md`
 launching a Hermes-bundled interpreter rather than this machine's ordinary Node install — an
 ordinary capture-operator choice (`--executable`, ordinary CLI usage), not a code change, and
 the ACP wire content itself is unaffected by which Node binary runs the adapter's JS entry.
-**A capture operator with only a standard system-wide Node install (the common case: nvm,
-Program Files, `/usr/local/bin`, most package managers) has no such alternate binary to reach
-for and will hit the identical `UnrecognizedAbsolutePath` failure with nothing in the tree
-explaining why**, until `RedactionRoots` grows a category for wherever the resolved interpreter
-actually lives (the same shape of fix `program_stem`'s comparison-time leniency already applies
-at test time, just not yet at sanitize time) or the two ACP adapter rows gain their own
-`--node-home`-style override the way Codex has `--codex-home`.
+A capture operator with only a standard system-wide Node install (the common case: nvm, Program
+Files, `/usr/local/bin`, most package managers) had no such alternate binary to reach for and hit
+the identical `UnrecognizedAbsolutePath` failure with nothing in the tree explaining why. That is
+what `<PROGRAM_DIR>` above fixes; the `--node-home`-style per-row override this paragraph used to
+propose as the alternative is not needed and was not built.
+
+**The two promoted manifests keep the workaround's spelling**, because they were sanitized before
+the fix and nothing re-sanitizes a promoted capture. A future re-recording of those rows with an
+ordinary Node install will read `<PROGRAM_DIR>\node.exe` instead, which is a sheet-visible change
+and not a regression.
 
 **One more thing this same divergence explains, worth stating plainly rather than leaving
 implicit: the manifest's `cli_version` field and the corpus/sheet's version number name two
@@ -202,14 +250,17 @@ sheet title and finding them unrelated has found this, not a data-entry error.
 ## What is preserved for whoever picks this up
 
 - Three real, successful Grok recordings survive `comet-provider-capture`'s own run — `session/new`,
-  `session/prompt`, and the queued second `session/prompt` all completed and were captured — the
-  rejection happens at the SANITIZE step, not the record step. Raw evidence:
+  `session/prompt`, and the queued second `session/prompt` all completed and were captured. Raw
+  evidence:
   `C:\dev\superpowers\comet\captures\acp-raw-2026-08-28\acp-session-discovery-grok-*\` (discovery)
   and `C:\dev\superpowers\comet\captures\acp-raw-2026-08-28-run-steer\acp-{run,steer}-grok-*\`
   (the two new scenarios this task added). These are raw, unsanitized, and carry this operator's
-  personal environment per Blocker 1 above — do not promote from them directly even after
-  Blocker 2 is fixed; re-run them through the sanitizer once it can accept a Grok capture, and
-  read its novel-path report the normal way.
+  personal environment per Blocker 1 above — never promote from them directly. All three pass
+  `comet-provider-sanitize` as of 2026-08-29, so whoever takes the promotion up starts by
+  re-running them into fresh staging and reading the novel-path report the normal way. That
+  report is long (Grok's own announcements, tips, subscription fields, hostname, plus the whole
+  command push) and every row is a publish-or-withhold decision, which is the work this row's
+  remaining half consists of.
 - `steer-grok`'s capture additionally confirmed `rawInput` genuinely appears on real tool-call
   frames (Grok's `read_file`/`grep` tools ran mid-turn, keyed by that tool's own parameter names —
   `target_file`, `pattern`, ...) and populated it with this operator's own filesystem paths, the

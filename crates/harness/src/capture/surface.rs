@@ -11,6 +11,7 @@
 //! everything feeding it were removed. If a question needs a field's values, the
 //! corpus is right there and greppable.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -129,7 +130,60 @@ pub const MAP_PATHS: &[&str] = &[
     // path because ACP nests usage under the prompt reply's own `_meta`
     // rather than the frame root.
     ".result._meta.usage.modelUsage",
+    // The same map again, on the `turn_completed` notification rather than
+    // the reply — Grok sends both, with byte-identical contents. Declared
+    // separately because a declaration is matched against the whole path,
+    // and this one is reached through `params.update` instead of `result`.
+    // Missed when the reply path was declared (2026-08-28): the raw
+    // `run-grok`/`steer-grok` captures carry it on every `turn_completed`
+    // frame, so leaving it undeclared was a live instance of D77 — the map
+    // key `grok-4.6` would have published as if it were a reviewed field
+    // name, and the capability sheet would have recorded a model id as a
+    // field.
+    ".params.update.usage.modelUsage",
 ];
+
+/// One object key, escaped so that it cannot impersonate the notation a
+/// dotted path is built from.
+///
+/// Paths are built by joining keys with `.`, so a key that contains one is
+/// otherwise indistinguishable from nesting: a root-level
+/// `{"result.platformOs": …}` would build `.result.platformOs`, match that
+/// listed path, and publish whatever the provider put there. `[`/`]` do the
+/// same for the array marker and `{`/`}` for the map marker, and a literal
+/// backslash has to escape itself or the escape is ambiguous in turn.
+///
+/// **This is the whole answer to a question the sanitizer used to refuse.**
+/// `validate_key` rejected any key carrying a delimiter outright, and its
+/// comment asked for a design decision about path encoding on the day a real
+/// provider emitted one. Grok emits nine (`x.ai/sessionConfig`,
+/// `x.ai/hooks`, …, every `_meta` key it sends) plus a model id (`grok-4.6`)
+/// as a map key, which is why the enumerate-the-known-keys shape D102
+/// sketched is not the answer: a model id is data and cannot be reviewed one
+/// literal at a time. Escaping removes the ambiguity structurally, at which
+/// point neither kind of key needs a carve-out — a field name publishes
+/// because field names publish, and a map key still faces `allows_prefix`'s
+/// default-deny.
+///
+/// **Both path builders must use this**, or a sheet and an allowlist would
+/// spell the same field two ways: [`Visit::walk`] here, and
+/// `sanitize::Redactor::sanitize_value_tree`. The `[]`/`{}` markers those two
+/// emit for an array element and a map entry are generated, never escaped —
+/// only the characters that came out of a real key are.
+pub fn escape_path_segment(key: &str) -> Cow<'_, str> {
+    const DELIMITERS: [char; 6] = ['\\', '.', '[', ']', '{', '}'];
+    if !key.contains(DELIMITERS) {
+        return Cow::Borrowed(key);
+    }
+    let mut escaped = String::with_capacity(key.len() + 8);
+    for character in key.chars() {
+        if DELIMITERS.contains(&character) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    Cow::Owned(escaped)
+}
 
 /// Discriminator paths whose observed *values* form a provider's vocabulary —
 /// not every field, only the ones whose few distinct values answer "what
@@ -307,7 +361,7 @@ impl Visit<'_> {
                     let child_path = if is_map {
                         format!("{path}.{{}}")
                     } else {
-                        format!("{path}.{key}")
+                        format!("{path}.{}", escape_path_segment(key))
                     };
                     // A map entry is data, not a field, so only its contents
                     // are recorded.
@@ -408,5 +462,54 @@ fn scalar_string(value: &Value) -> Option<String> {
         Value::Number(number) => Some(number.to_string()),
         Value::Bool(flag) => Some(flag.to_string()),
         Value::Null | Value::Object(_) | Value::Array(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_path_segment;
+    use std::borrow::Cow;
+
+    /// Every character the path notation reserves, escaped — including the
+    /// backslash that does the escaping, which is otherwise ambiguous with a
+    /// key that genuinely contains one.
+    #[test]
+    fn every_reserved_character_in_a_key_is_escaped() {
+        assert_eq!(
+            escape_path_segment("x.ai/sessionConfig"),
+            r"x\.ai/sessionConfig"
+        );
+        assert_eq!(escape_path_segment("grok-4.6"), r"grok-4\.6");
+        assert_eq!(escape_path_segment("a[0]"), r"a\[0\]");
+        assert_eq!(escape_path_segment("{}"), r"\{\}");
+        assert_eq!(escape_path_segment(r"back\slash"), r"back\\slash");
+    }
+
+    /// An ordinary key comes back byte-identical and borrowed. Every path in
+    /// the promoted corpus, every committed capability sheet and every
+    /// allowlist line predating the escape depends on this being a no-op for
+    /// the keys real providers actually send.
+    #[test]
+    fn an_ordinary_key_is_unchanged_and_not_reallocated() {
+        assert!(matches!(
+            escape_path_segment("modelUsage"),
+            Cow::Borrowed("modelUsage")
+        ));
+    }
+
+    /// The property the whole escape exists for: the flat key
+    /// `result.platformOs` and the nested path `.result` -> `.platformOs`
+    /// must not build the same string, because `codex.txt` lists the second
+    /// one and the first is a provider-controlled impersonation of it.
+    #[test]
+    fn a_flat_dotted_key_and_the_nested_path_it_imitates_differ() {
+        let flat = format!(".{}", escape_path_segment("result.platformOs"));
+        let nested = format!(
+            ".{}.{}",
+            escape_path_segment("result"),
+            escape_path_segment("platformOs")
+        );
+        assert_ne!(flat, nested);
+        assert_eq!(nested, ".result.platformOs", "the honest path is untouched");
     }
 }

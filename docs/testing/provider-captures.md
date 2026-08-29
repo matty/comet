@@ -45,6 +45,17 @@ Adding a line to `claude.txt` or `codex.txt` is a decision to publish every valu
 ever carry, forever, in this public repository — not a judgment about whether today's capture
 happens to show something harmless.
 
+**A key that contains a `.`, `[`, `]`, `{` or `}` is escaped with a backslash where it joins the
+path, and an allowlist line has to be written the same way.** Grok names every `_meta` entry it
+sends after its own vendor namespace (`x.ai/sessionConfig`, `x.ai/hooks`, …), so its session-config
+lines in `acp.txt` read `.result._meta.x\.ai/sessionConfig.options[].id`. Written unescaped, that
+line would instead match the *nested* path `_meta` → `x` → `ai/sessionConfig` — nothing real, and
+the very impersonation the escape exists to prevent. **Never retype one of these**: the sanitize
+run prints an escaped-key section under the novel-path report listing exactly the strings a listed
+line has to equal, and copying from there is the whole procedure. That section is informational —
+an escaped key is harmless by construction — but it is the one place a new provider's vendor
+naming becomes visible, so read it once per provider.
+
 ## Capture and sanitize
 
 Choose an immutable raw root for one observation. Token-free discovery, for example:
