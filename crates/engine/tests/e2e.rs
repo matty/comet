@@ -837,7 +837,7 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
 /// remembered-request fallback. The remembered request is stamped at the
 /// previous dispatch and never updated, so without the overlay a user who
 /// tightens a chat to `approval-required` and then steers would still run
-/// under the looser mode the last turn used — the divergence `DEBT.md` D11
+/// under the looser mode the last turn used — the divergence `docs/debt/README.md` D11
 /// records, and it runs in the permissive direction.
 #[tokio::test]
 async fn a_tightened_mode_reaches_a_steer_turned_run() {

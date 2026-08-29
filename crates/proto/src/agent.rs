@@ -129,7 +129,7 @@ pub struct HarnessCapabilities {
     /// Whether the note attached to a denial reaches the model. Claude's deny
     /// response carries a message; Codex's decisions are bare literals with
     /// nowhere to put one, so the same control means different things per
-    /// provider (`DEBT.md` D24). The composer labels its note field from this:
+    /// provider (`docs/debt/README.md` D24). The composer labels its note field from this:
     /// a promise the provider cannot keep is worse than copy admitting the
     /// limit, which is why the conservative default is "cannot carry it".
     pub carries_deny_note: bool,

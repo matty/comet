@@ -449,7 +449,7 @@ pub(crate) struct ToolTracker {
 
 /// Bound on both maps. Comfortably above any turn a human watches, and small
 /// enough that a runaway agent cannot use them as an allocator — the same
-/// reasoning as `codex::track_file_change`'s cap, and `DEBT.md` D10 is the
+/// reasoning as `codex::track_file_change`'s cap, and `docs/debt/README.md` D10 is the
 /// standing version of the mistake it avoids.
 const MAX_TRACKED_CALLS: usize = 512;
 

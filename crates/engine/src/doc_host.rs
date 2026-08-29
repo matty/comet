@@ -1300,7 +1300,7 @@ impl DocHost {
     /// was spawned with its permission mode — and these fallback paths *are* a
     /// next dispatch. Without this the divergence runs in the permissive
     /// direction: a user tightens a chat to `approval-required`, steers, and
-    /// the steered run still writes unattended (`DEBT.md` D11).
+    /// the steered run still writes unattended (`docs/debt/README.md` D11).
     ///
     /// The sandbox is derived here rather than carried over, because the two
     /// must not be left disagreeing — the same rule `apply_owned_fields`

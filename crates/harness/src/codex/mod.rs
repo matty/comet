@@ -149,7 +149,7 @@ fn worktree_on_slashed_branch(cwd: &str) -> bool {
 
 /// Apply the request rewrites that must precede both launch and wire setup.
 pub fn normalize_run_request(mut request: RunRequest) -> RunRequest {
-    // Historical Codex ≤0.144.x compatibility policy (DEBT.md D13): a
+    // Historical Codex ≤0.144.x compatibility policy (docs/debt/README.md D13): a
     // workspace-write sandbox could derive a malformed mount for a linked
     // worktree whose branch contains '/'. Escalate that exact shape instead
     // of shipping a session where commands cannot run. This is maintained as
@@ -351,7 +351,7 @@ impl CodexHarness {
             // Two of the four carry a caveat worth knowing before reading this
             // list as four guarantees. `AutoAcceptEdits`'s workspace-write
             // sandbox can be silently raised to danger-full-access by the
-            // linked-worktree workaround below (`DEBT.md` D13). And `Auto`
+            // linked-worktree workaround below (`docs/debt/README.md` D13). And `Auto`
             // hands review to the provider via `approvalsReviewer:
             // "auto_review"` — no capture exercised that path, so what reaches
             // Comet in that mode follows the mapping table rather than an
@@ -364,7 +364,7 @@ impl CodexHarness {
             ],
             // `FileChangeApprovalDecision` / `CommandExecutionApprovalDecision`
             // are bare literals — the wire carries `"decline"` and nothing
-            // else, so a note has no field to travel in (`DEBT.md` D24).
+            // else, so a note has no field to travel in (`docs/debt/README.md` D24).
             carries_deny_note: false,
             // codex app-server names no chat on its wire; Comet titles it.
             self_titles: false,
@@ -1305,7 +1305,7 @@ type RequestApprovalFn =
 /// follows it — which carries only an `itemId` — can be rendered.
 ///
 /// **Bounded.** A turn that changes thousands of files must not grow this
-/// without limit (`DEBT.md` D10 is the standing version of that mistake). At the
+/// without limit (`docs/debt/README.md` D10 is the standing version of that mistake). At the
 /// cap the entry is simply not recorded, so its approval degrades to
 /// `Unknown` ("Change a file") rather than to a wrong path — vague, and on the
 /// safe side of the permission boundary, since `Unknown` is not allowlistable.
@@ -1511,7 +1511,7 @@ mod tests {
 
     #[test]
     fn tracked_file_changes_are_bounded() {
-        // An unbounded map here is `DEBT.md` D10's mistake with a new name. At
+        // An unbounded map here is `docs/debt/README.md` D10's mistake with a new name. At
         // the cap a new item is not recorded, so its approval degrades to
         // Unknown — vague, and un-allowlistable, which is the safe direction.
         let mut map = HashMap::new();
@@ -1544,7 +1544,7 @@ mod tests {
     }
 
     /// The decision literals have no message field, so a note typed into the
-    /// composer cannot reach the model (`DEBT.md` D24). This declaration is
+    /// composer cannot reach the model (`docs/debt/README.md` D24). This declaration is
     /// what stops the UI promising delivery.
     #[test]
     fn codex_cannot_carry_a_deny_note() {
