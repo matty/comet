@@ -696,21 +696,24 @@ pub(crate) async fn probe_cli_version(exe: &std::path::Path) -> HarnessAvailabil
             let stderr = String::from_utf8_lossy(&output.stderr);
             let detail = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
             tracing::debug!(cli = %name, %status, detail, "cli --version failed");
+            let detail = readable_detail(detail);
             HarnessAvailability::unavailable(
                 "Not working",
                 Some(if detail.is_empty() {
                     format!("`--version` failed ({status}).")
                 } else {
-                    format!("`--version` failed ({status}): {}", detail.trim())
+                    format!("`--version` failed ({status}): {detail}")
                 }),
             )
         }
+        // **The `io::Error`'s own Display stops here** (D100). It reads "The
+        // system cannot find the file specified. (os error 2)" — an OS error
+        // code on screen, which `.agents/rules/user-facing-errors.md` rule 1
+        // names outright. What the user can act on is the KIND, so that is what
+        // survives; the full error stays in `tracing`, one line up.
         Ok(Err(err)) => {
-            tracing::debug!(cli = %name, error = %err, "cli could not be started");
-            HarnessAvailability::unavailable(
-                "Not working",
-                Some(format!("{name} could not be started: {err}")),
-            )
+            tracing::debug!(cli = %name, error = %err, kind = ?err.kind(), "cli could not be started");
+            HarnessAvailability::unavailable("Not working", Some(start_failure_hint(&name, &err)))
         }
         Err(_) => HarnessAvailability::unavailable(
             "Not responding",
@@ -718,6 +721,59 @@ pub(crate) async fn probe_cli_version(exe: &std::path::Path) -> HarnessAvailabil
                 "{name} did not answer `--version` within {}s.",
                 PROBE_TIMEOUT.as_secs()
             )),
+        ),
+    }
+}
+
+/// One line of a CLI's stderr, made safe to render.
+///
+/// **Kept rather than dropped, by ruling (D100).** Rule 1 forbids "CLI stderr
+/// dumped verbatim", and this is not a dump: one line, trimmed, control
+/// characters removed, capped. For a CLI that runs and exits non-zero, that
+/// line usually IS the diagnosis — a half-finished npm install says so in it —
+/// and a generic sentence would lose the only actionable thing on offer.
+/// `probe_tests::a_failing_cli_reports_its_own_error` asserts the passthrough
+/// on purpose; this narrows what passes through, it does not end it.
+///
+/// The cap is a rail measurement, not a guess: the hint renders as hover text
+/// beside a 148px row, and a stderr line long enough to wrap several times
+/// pushes the actionable half out of the first glance — the same failure the
+/// summary/hint split exists to fix.
+fn readable_detail(line: &str) -> String {
+    const MAX: usize = 160;
+    let cleaned: String = line
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    match cleaned.char_indices().nth(MAX) {
+        None => cleaned,
+        Some((cut, _)) => format!("{}…", cleaned[..cut].trim_end()),
+    }
+}
+
+/// Why a resolved CLI would not start, in the user's words rather than the
+/// operating system's.
+///
+/// Reads `io::ErrorKind` instead of the error's Display, so no OS error code
+/// reaches a surface (D100). The path is still named: with an override set,
+/// WHICH path failed is the whole diagnosis, which is what
+/// `a_missing_binary_probes_as_unavailable` pins.
+fn start_failure_hint(name: &std::path::Display<'_>, err: &std::io::Error) -> String {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => {
+            format!(
+                "There is no file at {name}. Check the path, or clear the override to let Comet find the CLI itself."
+            )
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            format!(
+                "{name} is not runnable by this account. Check the file's permissions, or point Comet at a different copy."
+            )
+        }
+        _ => format!(
+            "{name} could not be started. Reinstall the CLI, or point Comet at a working copy."
         ),
     }
 }
@@ -1393,6 +1449,64 @@ mod probe_tests {
             .expect("a non-zero exit has something to say");
         assert!(hint.contains("exit code 3"), "must carry status: {hint}");
         assert!(hint.contains("boom"), "must carry stderr: {hint}");
+    }
+
+    /// Break caught (D100): the "could not be started" arm interpolated the
+    /// `io::Error`'s Display, so the hint read `... could not be started: The
+    /// system cannot find the file specified. (os error 2)` — an OS error code
+    /// on a user-facing surface, which `.agents/rules/user-facing-errors.md`
+    /// rule 1 names outright. It reached the models pane for every harness.
+    ///
+    /// Asserts the absence AND the replacement: dropping the raw text would be
+    /// no good if what replaced it said nothing to do.
+    #[tokio::test]
+    async fn a_binary_that_cannot_start_names_no_os_error() {
+        let missing = std::path::Path::new("comet-definitely-not-a-real-cli");
+        let availability = probe_cli_version(missing).await;
+        let hint = availability
+            .unavailable_hint()
+            .expect("a missing binary is unavailable");
+
+        for leak in ["os error", "(os ", "Os {", "kind:"] {
+            assert!(
+                !hint.contains(leak),
+                "raw OS detail reached the hint: {hint}"
+            );
+        }
+        assert!(
+            hint.contains("comet-definitely-not-a-real-cli"),
+            "which path failed is the diagnosis with an override set: {hint}"
+        );
+        assert!(
+            hint.contains("Check the path") || hint.contains("Reinstall"),
+            "the hint has to name an action: {hint}"
+        );
+    }
+
+    /// The stderr passthrough is KEPT by ruling (D100) and narrowed: one line,
+    /// no control characters, capped. A CLI that runs and exits non-zero says
+    /// the useful thing in that line, and a generic sentence would lose it.
+    #[test]
+    fn a_stderr_line_reaches_the_hint_readable_rather_than_raw() {
+        assert_eq!(readable_detail("  boom  "), "boom");
+        assert_eq!(
+            readable_detail(
+                "cannot find module
+	at require (node:internal)"
+            ),
+            "cannot find module at require (node:internal)",
+            "control characters must not reach a rendered string"
+        );
+
+        let long = readable_detail(&"x".repeat(400));
+        assert!(
+            long.chars().count() <= 161,
+            "a stderr line long enough to wrap several times pushes the actionable              half out of the first glance; got {} chars",
+            long.chars().count()
+        );
+        assert!(long.ends_with('…'), "a truncated line must say so: {long}");
+
+        assert_eq!(readable_detail("   "), "", "an empty line stays empty");
     }
 
     /// A binary that does not exist names itself in the hint — this is the

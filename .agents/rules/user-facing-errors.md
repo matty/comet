@@ -162,9 +162,13 @@ from the fact of an error, it has to know which kind it has.
   ("go do one more thing in the agent's own CLI") and `SettingRefused` ("pick
   something else in the picker"). `acp::session`'s `setting_refused` is the
   worked example, keyed on Comet's own method string rather than on anything
-  the agent wrote. The remaining raw site on this side is the version probe's
-  `hint` (`docs/debt/README.md`'s D100), which interpolates an `io::Error`
-  verbatim and is a decision rather than an oversight — read that row first.
+  the agent wrote. The version probe's `hint` was the other raw site here and
+  is closed (D100): it reads `io::ErrorKind` rather than the error's Display,
+  so no OS error code reaches the pane. **One cleaned line of a failing CLI's
+  own stderr is deliberately kept** — `readable_detail` trims it, strips
+  control characters and caps it — because for a CLI that runs and exits
+  non-zero that line is the diagnosis, and rule 1 forbids a verbatim dump, not
+  a bounded excerpt.
 
 The error surfaces themselves are fine: `popover::error_row` and
 `widgets::error_strip` both carry a Retry affordance. It is the *message text*
