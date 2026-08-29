@@ -1134,3 +1134,69 @@ async fn a_session_new_failure_reaches_the_caller_through_the_open_failure_mappe
         ),
     }
 }
+
+/// Break caught (D119): the `config_requests` loop returned
+/// `client.request`'s error unchanged, so the provider's own JSON-RPC message
+/// travelled to `drive_run`'s sink and onto the screen —
+/// `.agents/rules/user-facing-errors.md` RULE 1. Grok's real text for this
+/// case is `Invalid params: unknown model id`, which the fixture answers with,
+/// so the assertion below is against the exact string that used to escape.
+///
+/// The `session/new` half of this file's mapper test is deliberately NOT the
+/// same path: that one recognizes a signed-out agent before a session exists;
+/// this one opens a session successfully and is refused a setting afterwards.
+#[tokio::test]
+async fn a_refused_session_setting_reports_copy_rather_than_the_agent_s_own_words() {
+    let command = tokio::process::Command::new(env!("CARGO_BIN_EXE_fake-acp"));
+    let request = RunRequest {
+        cwd: "refuse-set-model".into(),
+        model: Some("no-such-model".into()),
+        ..RunRequest::for_session(RuntimeMode::default())
+    };
+    let error = AcpSession::open(
+        command,
+        "refuse-set-model",
+        TEST_TIMEOUTS,
+        &request,
+        |_, session_id| {
+            vec![(
+                "session/set_model",
+                serde_json::json!({"sessionId": session_id, "modelId": "no-such-model"}),
+            )]
+        },
+        |_| None,
+    )
+    .await;
+
+    let error = match error {
+        Ok(_) => panic!("a refused session/set_model must fail the open, not proceed silently"),
+        Err(error) => error,
+    };
+
+    match &error {
+        comet_harness::HarnessError::SettingRefused { summary, hint } => {
+            assert_eq!(summary, "Model refused");
+            assert!(
+                hint.contains("Pick a different model"),
+                "the hint must name the action: {hint}"
+            );
+        }
+        other => panic!("expected SettingRefused, got {other:?}"),
+    }
+
+    // The rule, asserted directly: nothing the agent wrote, and no wire
+    // vocabulary, reaches the string `drive_run` renders.
+    let shown = error.to_string();
+    for leaked in [
+        "Invalid params",
+        "unknown model id",
+        "session/set_model",
+        "harness",
+        "-32602",
+    ] {
+        assert!(
+            !shown.contains(leaked),
+            "{leaked:?} must not reach the user: {shown}"
+        );
+    }
+}

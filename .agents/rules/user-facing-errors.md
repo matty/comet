@@ -154,6 +154,18 @@ from the fact of an error, it has to know which kind it has.
   `session_move_failure` did, because "try again" is wrong advice for some of
   them.
 
+- **The harness side is the other half, and it is not `RpcError`.** A
+  `HarnessError` reaches the user through `drive_run`'s sink in
+  `crates/engine/src/sessions.rs`, rendered close to as-is — so a variant whose
+  `Display` embeds provider text breaks rule 1 without a `format!("{err}")`
+  anywhere. Two variants exist to carry the split instead: `NeedsSetup`
+  ("go do one more thing in the agent's own CLI") and `SettingRefused` ("pick
+  something else in the picker"). `acp::session`'s `setting_refused` is the
+  worked example, keyed on Comet's own method string rather than on anything
+  the agent wrote. The remaining raw site on this side is the version probe's
+  `hint` (`docs/debt/README.md`'s D100), which interpolates an `io::Error`
+  verbatim and is a decision rather than an oversight — read that row first.
+
 The error surfaces themselves are fine: `popover::error_row` and
 `widgets::error_strip` both carry a Retry affordance. It is the *message text*
 and the *`Loading` state* that break these rules, not the escape hatch.
