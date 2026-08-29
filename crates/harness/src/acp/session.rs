@@ -60,19 +60,24 @@ use crate::{HarnessError, RunControls, StderrTail, shutdown_child};
 /// `HarnessId`.
 pub(crate) type UsageReader = fn(&Value, Option<u64>) -> Option<AgentEvent>;
 
-/// How a harness applies the caller's model and effort choice to a freshly
-/// opened session: a list of extra JSON-RPC requests (method, params) to
-/// issue, in order, right after `session/new`/`session/load` and before the
-/// first prompt.
+/// How a harness applies the caller's model choice to a freshly opened
+/// session: a list of extra JSON-RPC requests (method, params) to issue, in
+/// order, right after `session/new`/`session/load` and before the first
+/// prompt.
 ///
 /// **Per-agent, injected by the caller, the same way [`UsageReader`] is** —
 /// see its own doc comment for why the choice stays out of this file rather
-/// than a `match` on [`HarnessId`] in disguise. Grok's setter
-/// (`session/set_config_option`, one call per selected category) and Hermes'
-/// (`session/set_model`, and never an effort call at all) disagree completely
-/// on shape and on whether effort is sent; `grok::config_requests` and
+/// than a `match` on [`HarnessId`] in disguise. `grok::config_requests` and
 /// `hermes::config_requests` are the two implementations, and each names its
 /// evidence in its own doc comment.
+///
+/// **Both agents turned out to send the identical single call,
+/// `session/set_model`, and neither sends effort at all** — a live probe
+/// against grok 1.0.5 corrected an earlier design that assumed the two
+/// disagreed (`grok::config_requests`'s own doc comment carries the
+/// correction). The type is still per-agent rather than one shared
+/// constant: that agreement is a fact about these two CLIs today, not a
+/// guarantee the next ACP agent registered here shares it.
 ///
 /// Plain data rather than an async closure: building the params from
 /// `RunRequest` needs no I/O, so the async mechanics of actually sending each
@@ -89,6 +94,17 @@ pub struct Timeouts {
     /// and then says nothing is indistinguishable from a hang, and the rule in
     /// `.agents/rules/user-facing-errors.md` is that no waiting state lasts
     /// forever.
+    ///
+    /// **PR7 widened what this bounds without widening the value**:
+    /// `session/load` (the resume path, in place of `session/new`) and every
+    /// `config_requests` call (`session/set_model`, today) all sit under
+    /// this same duration — see [`open_or_resume`] and [`AcpSession::open`].
+    /// That matters most for `session/load`: a value sized for an empty
+    /// handshake may be too tight for an agent replaying a long transcript
+    /// back into a resumed session, which is a real risk this build has not
+    /// measured against either agent (`open_or_resume`'s own doc comment
+    /// records why: the live check never got past the free-quota rate
+    /// limit).
     pub handshake: Duration,
     /// After `session/cancel`, how long the agent gets to settle the in-flight
     /// prompt with `stopReason: "cancelled"` before the loop stops waiting and
@@ -161,9 +177,11 @@ impl AcpSession {
     ///
     /// `request` and `config_requests` are what make this the RUN path rather
     /// than discovery: `request.resume`, gated on `agentCapabilities.loadSession`
-    /// (see [`open_or_resume`]), and `request.model`/`request.reasoning`,
-    /// applied through `config_requests` right after the session opens and
-    /// before the first prompt. Discovery never needs either — see
+    /// (see [`open_or_resume`]), and `request.model`, applied through
+    /// `config_requests` right after the session opens and before the first
+    /// prompt. `request.reasoning` is NOT applied here — no agent registered
+    /// today has a working ACP setter for it (`grok::config_requests`'s doc
+    /// comment has the evidence). Discovery never needs either — see
     /// [`Self::open_for_discovery`], which stays on plain `session/new`.
     pub async fn open(
         command: Command,
@@ -332,6 +350,24 @@ impl AcpSession {
 /// `LoadSessionResponse` schema has none — ours is already known, it is the
 /// id being resumed), unlike `session/new`'s, which is where the returned pair
 /// is read from.
+///
+/// **Known limitation: a resumed session reports no context window.**
+/// `AcpSession::open` reads `context_window` from whichever `Value` this
+/// function returns as `opened` — `normalize::context_window` expects
+/// `models.currentModelId` / `models.availableModels[]._meta.totalContextTokens`,
+/// the shape `session/new` answers with. Neither the ACP org's own
+/// `LoadSessionResponse` schema nor anything captured live says `session/load`
+/// answers the same shape (`fake-acp`'s own handler answers `{}`, and no real
+/// agent's reply was ever obtained — the live check here got only as far as
+/// the free-quota rate limit before a real `session/load` could be sent with
+/// a payload worth reading). Until that is established, every resumed run
+/// degrades to `context_window: None` — the usage meter reads "not measured"
+/// rather than showing real occupancy — which is the honest reading of an
+/// unread field, not a silent loss, but it IS a real gap: `usage_reader`
+/// callers on a resumed session cannot draw a ceiling. Whoever gets a real
+/// `session/load` reply to inspect (Grok's quota window, or a configured
+/// Hermes) should check for a `models` block or equivalent before assuming
+/// this stays `None` by design rather than by never having looked.
 async fn open_or_resume(
     client: &RpcClient,
     cwd: &str,
@@ -634,16 +670,18 @@ async fn run_session(
     // The staged attachments, loaded ONCE and only if the agent advertised
     // `promptCapabilities.image` — an unadvertised agent gets the text block
     // alone (the path refs already ride `request.prompt` itself, added
-    // upstream of the harness; see `crates/ui/src/attachments.rs`). `Option`
-    // rather than a plain `Vec` because it is spent on the FIRST turn only: a
-    // steer carries no attachments of its own (`SteerMessage` has no such
-    // field), and re-sending the run's original images on every later turn
-    // would attach files the user never staged for that message.
-    let mut first_turn_images = if agent.supports_image_attachments() {
-        Some(crate::claude::load_image_blocks(&request.attachments).await)
+    // upstream of the harness; see `crates/ui/src/attachments.rs`).
+    let loaded_images = if agent.supports_image_attachments() {
+        crate::claude::load_image_blocks(&request.attachments).await
     } else {
-        Some(Vec::new())
+        Vec::new()
     };
+    // `Option` rather than the plain `Vec` above because it is spent on the
+    // FIRST turn only: a steer carries no attachments of its own
+    // (`SteerMessage` has no such field), and re-sending the run's original
+    // images on every later turn would attach files the user never staged
+    // for that message.
+    let mut first_turn_images = Some(loaded_images);
     // One tracker for the SESSION, not per turn: a tool announced in one turn
     // and completed in the next would otherwise lose its announcement.
     let mut tools = normalize::ToolTracker::default();

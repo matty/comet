@@ -37,11 +37,37 @@
 
 use std::time::Duration;
 
-use comet_harness::acp::grok::GrokHarness;
+use comet_harness::acp::grok::{GROK_ARGS, GrokHarness, resolve_grok_executable};
+use comet_harness::acp::session::{AcpSession, Timeouts};
 use comet_harness::{CancellationToken, Harness, RunControls};
 use comet_proto::{AgentEvent, ReasoningLevel, RunRequest, RuntimeMode};
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
+
+/// Token-free: `initialize` + `session/new`, no `session/prompt`. Answers
+/// whether THIS installed Grok build actually advertises
+/// `promptCapabilities.image` right now — the assumption
+/// `a_run_with_an_attachment_completes_when_grok_lacks_image_support`'s own
+/// doc comment names and depends on staying `false`.
+///
+/// Reads the raw `initialize` reply directly (`AgentDescription::
+/// from_initialize` is private to `crate::acp`, unreachable from an external
+/// integration-test crate like this one) — the same path a decode ultimately
+/// reads, just without the production type in between.
+async fn grok_supports_image_attachments() -> bool {
+    let exe = resolve_grok_executable().expect("grok resolves on this machine");
+    let mut command = tokio::process::Command::new(&exe);
+    command.args(GROK_ARGS);
+    let discovered = AcpSession::open_for_discovery(
+        command,
+        &std::env::temp_dir().to_string_lossy(),
+        Timeouts::default(),
+    )
+    .await
+    .expect("the handshake answers");
+    discovered.initialized["agentCapabilities"]["promptCapabilities"]["image"].as_bool()
+        == Some(true)
+}
 
 fn controls() -> RunControls {
     let (_steer_tx, steer_rx) = mpsc::channel(1);
@@ -100,23 +126,40 @@ fn write_tiny_png() -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// A real image reaches Grok as an image content block, not just a path ref
-/// in the text. Grok's own `promptCapabilities.image` reads `false` on the
-/// captured 2026-08-28 handshake (`grok.rs`'s doc comment) — so this ALSO
-/// confirms that reading is still accurate on whatever version is installed
-/// today: if Grok now advertises `true`, the image rides the wire and the
-/// model can describe it; if it still advertises `false`, only the path ref
-/// does, and the model has to reason from the filename alone.
+/// **What this test does NOT prove, stated plainly: it does not confirm the
+/// model describes an attached image.** Grok's own `promptCapabilities.image`
+/// reads `false` on the captured 2026-08-28 handshake (`grok.rs`'s doc
+/// comment), so `session.rs`'s own capability gate never attaches an image
+/// content block for this agent — `crate::claude::load_image_blocks` is
+/// never even called. `session.agent().supports_image_attachments()` is
+/// asserted directly below for exactly that reason: if a future Grok build
+/// ever answers `true` here, THIS test would go on passing for the wrong
+/// reason (an attachment silently never sent) unless something notices the
+/// capability flipped. Task brief Step 8 asks to "confirm the model
+/// describes it" — that assertion needs an image-CAPABLE live agent, and
+/// none is available today: Hermes cannot open a session at all on this
+/// machine (this module's header), and Grok's own answer is `false`. What
+/// this test actually verifies is narrower and still real: a run with a
+/// staged attachment completes normally against an agent that cannot use it,
+/// rather than erroring or hanging on the unsupported field.
 #[tokio::test]
 #[ignore = "spends tokens against the real Grok CLI; run with --ignored"]
-async fn a_real_image_reaches_grok() {
+async fn a_run_with_an_attachment_completes_when_grok_lacks_image_support() {
+    assert!(
+        !grok_supports_image_attachments().await,
+        "this test's whole premise is that promptCapabilities.image reads false on this \
+         install; it now reads true, so this test is no longer exercising the unsupported \
+         path it claims to -- content-description coverage belongs in a NEW test gated on \
+         this same capability, not silently folded into this one"
+    );
+
     let cwd = std::env::temp_dir().join("comet-acp-run-fidelity-grok-live-image");
     std::fs::create_dir_all(&cwd).expect("disposable cwd");
     let image = write_tiny_png();
 
     let harness = GrokHarness::new();
     let request = RunRequest {
-        prompt: "In at most six words, describe the attached image.".into(),
+        prompt: "Reply with exactly: OK.".into(),
         attachments: vec![image],
         reasoning: Some(ReasoningLevel::Low),
         cwd: cwd.to_string_lossy().into_owned(),
@@ -125,8 +168,9 @@ async fn a_real_image_reaches_grok() {
 
     let (_session_id, text) = run_to_done(&harness, request).await;
     assert!(
-        !text.trim().is_empty(),
-        "the model answered something about the attachment"
+        text.to_uppercase().contains("OK"),
+        "the run completes normally with an attachment staged, even though this agent \
+         cannot use it: {text:?}"
     );
 }
 

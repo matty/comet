@@ -216,11 +216,18 @@ fn models_from_discovery(discovered: &Discovered) -> Discovery {
 /// session, as a single `session/set_model` request. **Hermes' own installed
 /// source implements the ACP spec's dedicated setter**
 /// (`acp_adapter/server.py:1882`, `set_session_model`, under its own comment
-/// "Model switching (ACP protocol method)") -- not the generic
-/// `session/set_config_option` Grok's flat option-list shape implies (see
-/// `grok::config_requests`'s doc comment for why that one fits Grok
-/// specifically). A source read, not a capture: no live turn ever reached a
-/// model choice on this machine (this module's header).
+/// "Model switching (ACP protocol method)") -- a source read, not a capture:
+/// no live turn ever reached a model choice on this machine (this module's
+/// header).
+///
+/// **The same method Grok's own `config_requests` sends, it turns out** — a
+/// live probe against the real grok 1.0.5 CLI found `session/set_model`
+/// working there too, and found no working `session/set_config_option` at
+/// all (`grok::config_requests`'s own doc comment carries the probe
+/// evidence and the design correction that produced it). The two functions
+/// are not merged into one shared implementation even so: today's agreement
+/// is a fact about these two CLIs, not a protocol guarantee, and each
+/// function's own evidence is worth keeping next to the code it justifies.
 ///
 /// **No effort is ever sent, unconditionally.** `request.reasoning` is never
 /// read here at all -- Hermes advertises no effort ladder anywhere in its ACP

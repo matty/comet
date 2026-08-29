@@ -188,8 +188,8 @@ async fn the_requested_model_reaches_the_agent_over_hermes_set_model() {
 /// against, so `grok::config_requests` sends neither, and this test's
 /// surviving, evidence-backed assertion is that no config call ever fires
 /// for effort — not that one fires with the correct category. See
-/// `grok.rs`'s own module doc ("No live setter exists for effort") for the
-/// full probe transcript.
+/// `grok.rs`'s own module doc ("No effort setter was found among the
+/// methods tried") for the full probe transcript.
 #[tokio::test]
 async fn the_effort_selection_uses_the_effort_category_not_the_permission_one() {
     let request = RunRequest {
@@ -227,7 +227,9 @@ async fn an_agent_without_an_effort_ladder_is_sent_no_effort() {
     let config = echo["config"].as_object().expect("config is an object");
     assert!(
         config.is_empty(),
-        "Hermes has no effort ladder; nothing must be sent to session/set_config_option: {echo}"
+        "Hermes has no effort ladder; no config-option call of ANY kind must fire for \
+         effort -- config being non-empty here means some setter landed, whichever one it \
+         was: {echo}"
     );
 }
 
@@ -238,10 +240,22 @@ async fn an_agent_without_an_effort_ladder_is_sent_no_effort() {
 /// `session/load` only where the agent advertised `loadSession`. Sending it
 /// blind produces a protocol error the user sees for a feature they did not
 /// ask for.
+///
+/// **Two independent signals, not one.** `SessionStarted.session_id` proves
+/// the CLIENT took the load branch (its value is `resume_id.to_owned()` from
+/// `session.rs`'s own code, not anything read off the wire) — but on its own
+/// that is not proof a `session/load` FRAME ever reached the child; a stubbed
+/// `open_or_resume` that skipped the RPC entirely and just returned the
+/// requested id would pass that assertion too. `echo-selection` closes that
+/// gap: `fake_acp.rs` only ever sets `last_load_session_id` inside its
+/// `session/load` REQUEST HANDLER (`main`'s `"session/load" =>` arm), so
+/// `echo["load"]` coming back non-null is evidence the fixture actually
+/// received the frame, the same standard every other assertion in this file
+/// holds itself to.
 #[tokio::test]
 async fn resume_loads_the_session_when_the_agent_advertises_it() {
     let request = RunRequest {
-        prompt: "hello".into(),
+        prompt: "echo-selection".into(),
         resume: Some("prior-session-42".into()),
         cwd: std::env::temp_dir().to_string_lossy().into_owned(),
         ..RunRequest::for_session(RuntimeMode::default())
@@ -255,6 +269,12 @@ async fn resume_loads_the_session_when_the_agent_advertises_it() {
         "session/load must be used — its reply carries no sessionId of its own, so the \
          session id stays the one the client asked to resume. session/new, by contrast, \
          always mints a fresh `fake-session-N`: {started}"
+    );
+    let echo = echoed_selection(&events);
+    assert_eq!(
+        echo["load"], "prior-session-42",
+        "the fixture's OWN session/load request handler must have actually run — this is \
+         what the SessionStarted id alone cannot prove: {echo}"
     );
 }
 

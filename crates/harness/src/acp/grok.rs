@@ -18,24 +18,37 @@
 //! word another vendor's adapters use for a PERMISSION mode. Reading one shared
 //! shape across the four would find nothing, or the wrong thing.
 //!
-//! **No live setter exists for effort, verified by probing the real CLI
-//! directly (raw JSON-RPC over stdio, grok 1.0.5, 2026-08-29) — not
-//! inferred.** `session/set_config_option`, the generic ACP setter whose
-//! params shape (`configId` + `value`) matches Grok's flat `category`-keyed
-//! option rows, answers `-32601 Method not found`: the method is not
-//! registered at all. `session/set_mode` — the ACP spec's own approval-style
-//! mode setter — DOES answer, but with `{}` for EVERY `modeId` tried,
-//! including a deliberately invalid one (`"not-a-real-mode-xyz"`); a setter
-//! that succeeds on garbage input is not validating anything, so a success
-//! reply from it is not evidence it did anything. Only `session/set_model`
-//! (the ACP spec's own dedicated, unstable method) turned out to be real: it
-//! rejects an unknown id (`-32602 Invalid params: unknown model id`) and
-//! accepts a real one (`{"_meta": {"model": {"Ok": "<id>"}}}`).
-//! [`config_requests`] is built on exactly that finding, not on the
-//! `SetSessionConfigOptionSelectRequest` shape an earlier version of this
-//! function inferred from the ACP org's reference SDK — see its own doc
-//! comment for the correction and the task report for the full probe
-//! transcript.
+//! **No effort setter was found among the methods tried, verified by
+//! probing the real CLI directly (raw JSON-RPC over stdio, grok 1.0.5,
+//! 2026-08-29) — not inferred.** `session/set_config_option`, the generic
+//! ACP setter whose params shape (`configId` + `value`) matches Grok's flat
+//! `category`-keyed option rows, answers `-32601 Method not found`: the
+//! method is not registered at all. `session/set_mode` — the ACP spec's own
+//! approval-style mode setter — DOES answer, but with `{}` for EVERY
+//! `modeId` tried, including a deliberately invalid one
+//! (`"not-a-real-mode-xyz"`); a setter that succeeds on garbage input is not
+//! validating anything, so a success reply from it is not evidence it did
+//! anything. Only `session/set_model` (the ACP spec's own dedicated,
+//! unstable method) turned out to be real: it rejects an unknown id
+//! (`-32602 Invalid params: unknown model id`) and accepts a real one
+//! (`{"_meta": {"model": {"Ok": "<id>"}}}`). [`config_requests`] is built on
+//! exactly that finding, not on the `SetSessionConfigOptionSelectRequest`
+//! shape an earlier version of this function inferred from the ACP org's
+//! reference SDK — see its own doc comment for the correction and the task
+//! report for the full probe transcript.
+//!
+//! **This is absence of evidence for the two methods a generic ACP client
+//! could plausibly reach for, not proof no mechanism exists anywhere.** A
+//! vendor `_x.ai/*` setter is plausible — Grok already speaks the vendor
+//! completion notification this module names `PROMPT_COMPLETE_METHOD` (see
+//! `session.rs`) on this exact build — and so is passing the selection
+//! inside `session/new`'s own `_meta`, neither of which this probe tried.
+//! Sending nothing is still the right call either way: a guess at an
+//! untried vendor method is no better evidenced than the two that turned
+//! out not to work. `scripts/probe-acp-setters.py` (committed, not just
+//! prose in a task report) is the script that produced the transcript
+//! above; re-run it against a newer Grok build before assuming this finding
+//! still holds.
 
 use std::path::{Path, PathBuf};
 
@@ -379,13 +392,14 @@ fn effort_from_id(id: &str) -> Option<ReasoningLevel> {
 /// `{"_meta": {"model": {"Ok": "<id>"}}}`) and is what actually changes the
 /// session's model.
 ///
-/// **No effort setter exists on the real wire — see this module's own doc
-/// comment above ("No live setter exists for effort") for the fuller account
-/// and what else was tried.** `request.reasoning` is therefore never read here, the same as
+/// **No effort setter was found among the methods tried — see this
+/// module's own doc comment above ("No effort setter was found among the
+/// methods tried") for the fuller account, what was tried, and what was
+/// NOT.** `request.reasoning` is therefore never read here, the same as
 /// Hermes' `config_requests`, though for a different underlying reason:
 /// Hermes never had an effort ladder to begin with, while Grok's ladder is
 /// real (`REASONING_LEVELS`, shown in the picker) but has no ACP setter this
-/// build could find.
+/// build's probe could find.
 pub(crate) fn config_requests(
     request: &RunRequest,
     session_id: &str,
