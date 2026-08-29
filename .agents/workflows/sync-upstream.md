@@ -34,6 +34,17 @@ that for a pick it made itself; without `adapted` the only way to stop it reappe
 run was to call it `not-applicable`, which records the opposite of what happened. Give it
 the PR or commit that carried the change.
 
+**An `adapted` row's `local_commit` is always `null`** — the interactive flow above never asks
+for one, because the schema assumes one upstream commit maps to one local commit and a
+hand-port routinely breaks that assumption: one upstream commit landed across several local
+commits, folded into unrelated work, or otherwise not traceable to a single sha. `note` is
+where the real local reference lives, including a split across several PRs — see the
+`2133bae5a2` row in `.github/upstream-sync.json`, a single upstream commit hand-ported in
+three pieces across `#123`, `#124` and `#130`, with all three named in `note`. Read a `null`
+`local_commit` on an `adapted` row as that outcome's ordinary shape, not a broken row —
+this is a decision the schema makes on purpose, not a gap to fix by inventing a multi-value
+field.
+
 After `y`/`yes` confirms the summary, the helper creates a `sync/upstream-YYYY-MM-DD`
 branch, cherry-picks chronologically, records and commits the ledger, pushes to `origin`,
 and opens a draft PR. Any other answer exits without changing anything.
