@@ -18,11 +18,11 @@
 
 mod approval;
 mod catalog;
-pub(crate) mod commands;
-pub(crate) mod discovery;
+pub mod commands;
+pub mod discovery;
 mod normalize;
 mod update;
-pub(crate) mod wire;
+pub mod wire;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -104,7 +104,7 @@ fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
 }
 
 /// Describe the exact process launch used for a Claude run.
-pub(crate) fn run_launch(exe: &Path, request: &RunRequest) -> crate::launch::LaunchDescriptor {
+pub fn run_launch(exe: &Path, request: &RunRequest) -> crate::launch::LaunchDescriptor {
     let mut args: Vec<std::ffi::OsString> = [
         "--print",
         "--input-format",
@@ -488,7 +488,7 @@ fn image_media_type(path: &std::path::Path, bytes: &[u8]) -> Option<&'static str
 /// Load `RunRequest::attachments` into inline image blocks, best-effort: an
 /// unreadable, oversized, or unsupported file is skipped — its path ref still
 /// rides the prompt text — never fatal to the run.
-pub(crate) async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
+pub async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
     use base64::Engine as _;
     let mut blocks = Vec::new();
     for path in paths {

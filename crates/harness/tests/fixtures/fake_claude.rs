@@ -100,7 +100,52 @@ fn check_permission_mode() {
 /// onto `claude-sonnet-5` and that a purely-curated id survives, both of
 /// which this real payload still exercises.
 fn initialize_reply() -> String {
-    comet_harness::capture::corpus_frame("claude/2.1.228/model-discovery", 2).payload
+    corpus_frame_payload("claude/2.1.228/model-discovery", 2)
+}
+
+/// Read one frame's `payload` field straight out of the sibling `comet-capture`
+/// crate's corpus, without depending on that crate.
+///
+/// This file compiles as a `[[bin]]` target (`fake-claude`, spawned elsewhere
+/// via `CARGO_BIN_EXE_fake-claude`), and Cargo never links a `[[bin]]`
+/// target's `[dev-dependencies]` — only `[dependencies]` — regardless of
+/// build command; `comet-harness`'s dev-only dependency on `comet-capture`
+/// (D87 stage 7, so production cannot reach capture machinery) is invisible
+/// here. `comet_capture::corpus::frame`'s own doc comment anticipated exactly
+/// this split: it takes an explicit corpus root so a caller outside its own
+/// crate never needs the crate itself, only the convention its
+/// `corpus_frame` wraps — this is that convention, reimplemented locally
+/// rather than imported. Panics rather than returning a `Result`: every
+/// caller here is a test fixture that would immediately unwrap.
+fn corpus_frame_payload(scenario: &str, sequence: u64) -> String {
+    let events_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("capture")
+        .join("tests")
+        .join("corpus")
+        .join(scenario)
+        .join("events.jsonl");
+    let text = std::fs::read_to_string(&events_path)
+        .unwrap_or_else(|error| panic!("{} could not be read: {error}", events_path.display()));
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|error| {
+            panic!(
+                "{} has an invalid event line: {error}",
+                events_path.display()
+            )
+        });
+        if event["sequence"].as_u64() != Some(sequence) {
+            continue;
+        }
+        return event["payload"]
+            .as_str()
+            .unwrap_or_else(|| panic!("corpus {scenario} frame {sequence} has no payload"))
+            .to_owned();
+    }
+    panic!("corpus {scenario} has no frame {sequence}");
 }
 
 /// The initialize reply for a **command** discovery: the same frame, with a

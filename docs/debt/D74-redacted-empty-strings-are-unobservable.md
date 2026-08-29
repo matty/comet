@@ -6,7 +6,7 @@ default.** Found in Task 5 of the allowlist-sanitizer stage, while re-sanitizing
 
 ## The mechanism
 
-`crates/harness/src/capture/sanitize.rs`'s `Redactor::sanitize_scalar` redacts every `String`
+`crates/capture/src/sanitize.rs`'s `Redactor::sanitize_scalar` redacts every `String`
 scalar on a path that is not on the provider's allowlist, with no exception for an empty string.
 An empty string and a populated one are redacted identically — both become a non-empty
 placeholder token (`<V22>`, `<SESSION_1>`, …), because a placeholder is never itself empty.

@@ -54,7 +54,7 @@ strict subset, so 42 is the CLI's own surface, and it matches the built-in count
 
 So the shape is `--claude-config-dir` on `comet-provider-capture` plus a
 `needs_empty_claude_config` requirement on the Claude rows in
-`crates/harness/src/capture/record/scenarios.rs`, mirroring `--codex-home` /
+`crates/capture/src/record/scenarios.rs`, mirroring `--codex-home` /
 `needs_empty_codex_home` exactly. That pairing already exists for one provider; this is the
 missing half, not a new mechanism.
 
@@ -79,7 +79,7 @@ Three things follow, and only the first was anticipated.
 `--bare` skips hooks, plugin sync and CLAUDE.md, and that was read as making model discovery
 immune. It is not: ambient bare discovery answers **five** models where an isolated one answers
 four. The extra is `claude-fable-5[1m]`, configured on the capturer's machine — and
-`crates/harness/tests/corpus/claude/2.1.233/model-discovery/events.jsonl` publishes it, with
+`crates/capture/tests/corpus/claude/2.1.233/model-discovery/events.jsonl` publishes it, with
 `default` resolving to `claude-opus-5[1m]`. The corpus has been asserting a model list that no
 clean install produces, on the exact reply the model picker decodes.
 

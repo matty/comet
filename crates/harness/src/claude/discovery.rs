@@ -117,7 +117,7 @@ pub(crate) fn claude_initialize_launch(
 }
 
 /// Select the exact launch used for Claude model discovery.
-pub(crate) fn model_discovery_launch(exe: &Path, cwd: &Path) -> crate::launch::LaunchDescriptor {
+pub fn model_discovery_launch(exe: &Path, cwd: &Path) -> crate::launch::LaunchDescriptor {
     claude_initialize_launch(exe, DISCOVERY_ARGS, cwd)
 }
 
@@ -306,8 +306,8 @@ pub(crate) fn discovery_from_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::corpus_frame;
     use crate::claude::catalog::static_models;
+    use comet_capture::corpus_frame;
     use comet_proto::ReasoningLevel;
 
     const MODEL_DISCOVERY: &str = "claude/2.1.228/model-discovery";

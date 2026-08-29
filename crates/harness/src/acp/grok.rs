@@ -131,7 +131,7 @@ fn grok_install_dirs() -> Vec<crate::KnownDir> {
 /// `models` block), not as spawn flags. It is taken anyway so the signature
 /// matches the launch seam `capture::record::derive_launch` calls, and so a
 /// future flag has an obvious home.
-pub(crate) fn run_launch(exe: &Path, _request: &RunRequest) -> LaunchDescriptor {
+pub fn run_launch(exe: &Path, _request: &RunRequest) -> LaunchDescriptor {
     LaunchDescriptor {
         program: crate::discovery::program_path(exe),
         args: GROK_ARGS.iter().map(Into::into).collect(),

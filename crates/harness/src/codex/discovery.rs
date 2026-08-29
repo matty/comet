@@ -88,7 +88,7 @@ fn model_list_line(id: u32, cursor: Option<&str>) -> String {
 /// (`crates/engine/src/agent_accounts.rs:103,112`) and cannot be reused here —
 /// `engine` depends on `harness`, not the other way round. Change one and read
 /// the other.
-pub(crate) fn codex_home() -> Option<PathBuf> {
+pub fn codex_home() -> Option<PathBuf> {
     crate::env_dir("CODEX_HOME").or_else(|| crate::home_dir().map(|home| home.join(".codex")))
 }
 
@@ -163,7 +163,7 @@ pub(crate) async fn discover(
 }
 
 /// Describe the exact short-lived launch used for Codex model discovery.
-pub(crate) fn discovery_launch(
+pub fn discovery_launch(
     exe: &Path,
     codex_home: &Path,
     cwd: &Path,
@@ -395,7 +395,7 @@ pub(crate) fn page_from_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::corpus_frame;
+    use comet_capture::corpus_frame;
 
     const MODEL_DISCOVERY: &str = "codex/0.147.0/model-discovery";
 

@@ -10,7 +10,7 @@ raw Grok captures sanitize end to end today** (discovery, `run-grok`, `steer-gro
 is the *promotion*, which publishes a real turn's evidence into a public repository and is a
 reviewed decision under `docs/testing/provider-captures.md`, not an automatic consequence.
 codex-acp and claude-agent-acp are unaffected by either blocker and are promoted
-(`crates/harness/tests/corpus/{codex-acp,claude-agent-acp}/`).
+(`crates/capture/tests/corpus/{codex-acp,claude-agent-acp}/`).
 
 **The consequence compounds, and is worth stating plainly.** Grok is the one ACP agent this fork
 actually ships — Hermes cannot run at all yet (D104) — and it is the one with the least
@@ -81,7 +81,7 @@ established (2026-08-28), so the next attempt does not repeat all four:
 **Ruling (human sign-off, 2026-08-28): fallback authorized.** Between publishing this operator's
 personal skill inventory in a public repository and a noisier corpus, the noisier corpus wins
 every time. `.params.update.availableCommands[].name`, `.description` and `.input.hint` stay OFF
-`crates/harness/src/capture/allowlist/acp.txt` — REDACT, so every command row sanitizes to a
+`crates/capture/src/allowlist/acp.txt` — REDACT, so every command row sanitizes to a
 placeholder — even though the path is genuinely decoded. Their `_meta` siblings
 (`.scope`/`.path`/`.bareName`/`.qualifiedName`/`.pluginName`) were already REDACT on ordinary
 undecoded grounds. Redacting publishes nothing, so this needed no further review beyond the
@@ -130,7 +130,7 @@ practice. No `C:\Users\…` path survives in any of the three.
 ### What it looked like before (kept, because the mechanism explains the escape)
 
 Found while trying to sanitize the reviewed captures. `validate_key` in
-`crates/harness/src/capture/sanitize.rs` rejects any object key containing `.`, `[` or `]` before
+`crates/capture/src/sanitize.rs` rejects any object key containing `.`, `[` or `]` before
 any allowlist question is asked of it — deliberately, to stop a key like `"result.platformOs"`
 from impersonating the nested path `.result.platformOs`. Its own doc comment: *"No key in any
 promoted capture contains one of these; if a real provider ever emits a dotted key, that is a
@@ -149,15 +149,15 @@ raw capture fails with `capture contains an object key that would impersonate a 
 independently confirmed the same rejection.
 
 `session-discovery-grok`, `run-grok` and `steer-grok` are still named in `EXEMPT_UNCAPTURED` in
-both `crates/harness/src/capture/record.rs` and
-`crates/harness/tests/capture_corpus/scenario_coverage.rs`, but the reason changed with the fix:
+both `crates/capture/src/record.rs` and
+`crates/capture/tests/capture_corpus/scenario_coverage.rs`, but the reason changed with the fix:
 not "the sanitizer refuses them" any more, only "nothing is promoted yet". Both comments were
 rewritten rather than left saying the old thing.
 
 ### The three session-config paths, reviewed 2026-08-28 and spelled 2026-08-29
 
 Task review (2026-08-28) confirmed the allowlist review itself was sound but ruled that three
-lines should not ship in `crates/harness/src/capture/allowlist/acp.txt` until the spelling was
+lines should not ship in `crates/capture/src/allowlist/acp.txt` until the spelling was
 decided: `.result._meta.x.ai/sessionConfig.options[].category`, `...[].id`, and `...[].label`.
 Each is genuinely decoded — `grok.rs`'s `config_options`/`ladder_from_config`/
 `models_from_discovery` reads exactly these three fields to build the model and reasoning-effort
@@ -219,7 +219,7 @@ unrecognized path verbatim.
 different, valid `node.exe` that happens to already live under `<HOME>` on this machine** —
 `C:\Users\coding\AppData\Local\hermes\node\node.exe` (Node v22.23.2, bundled with the Hermes
 agent tool, versus the system install's v24.16.0). That is why both promoted manifests
-(`crates/harness/tests/corpus/{codex-acp,claude-agent-acp}/*/*/manifest.json`) and both
+(`crates/capture/tests/corpus/{codex-acp,claude-agent-acp}/*/*/manifest.json`) and both
 capability sheets (`docs/providers/{codex-acp-1.7.0,claude-agent-acp-0.70.0}.md`) show argv
 launching a Hermes-bundled interpreter rather than this machine's ordinary Node install — an
 ordinary capture-operator choice (`--executable`, ordinary CLI usage), not a code change, and

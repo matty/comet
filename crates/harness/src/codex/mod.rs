@@ -31,9 +31,9 @@
 // string production's own `handle_server_request` does, instead of a second hand-copied literal
 // that could drift. Narrowing this back to private breaks that build — see `decision_response`'s
 // doc comment in `capture/record/scenarios/codex.rs`.
-pub(crate) mod approval;
+pub mod approval;
 mod catalog;
-pub(crate) mod discovery;
+pub mod discovery;
 mod normalize;
 mod update;
 
@@ -148,7 +148,7 @@ fn worktree_on_slashed_branch(cwd: &str) -> bool {
 }
 
 /// Apply the request rewrites that must precede both launch and wire setup.
-pub(crate) fn normalize_run_request(mut request: RunRequest) -> RunRequest {
+pub fn normalize_run_request(mut request: RunRequest) -> RunRequest {
     // Historical Codex ≤0.144.x compatibility policy (DEBT.md D13): a
     // workspace-write sandbox could derive a malformed mount for a linked
     // worktree whose branch contains '/'. Escalate that exact shape instead
@@ -180,7 +180,7 @@ pub(crate) fn normalize_run_request(mut request: RunRequest) -> RunRequest {
 }
 
 /// Build the provider-owned parameters for starting a new Codex thread.
-pub(crate) fn thread_start_params(request: &RunRequest) -> Value {
+pub fn thread_start_params(request: &RunRequest) -> Value {
     // Approval policy is derived, not pinned. ApprovalRequired intentionally
     // maps to `untrusted`; AutoAcceptEdits and Auto map to `on-request` now
     // that provider approvals reach Comet's approval surface (D13).
@@ -207,7 +207,7 @@ pub(crate) fn thread_start_params(request: &RunRequest) -> Value {
 }
 
 /// Build the provider-owned parameters for resuming a Codex thread.
-pub(crate) fn thread_resume_params(request: &RunRequest, thread_id: &str) -> Value {
+pub fn thread_resume_params(request: &RunRequest, thread_id: &str) -> Value {
     let Value::Object(mut params) = thread_start_params(request) else {
         unreachable!("thread parameters are always a JSON object")
     };
@@ -216,7 +216,7 @@ pub(crate) fn thread_resume_params(request: &RunRequest, thread_id: &str) -> Val
 }
 
 /// Build the provider-owned parameters for starting a Codex turn.
-pub(crate) fn turn_start_params(request: &RunRequest, thread_id: &str, text: &str) -> Value {
+pub fn turn_start_params(request: &RunRequest, thread_id: &str, text: &str) -> Value {
     let mut params = serde_json::Map::new();
     params.insert("threadId".into(), thread_id.into());
     params.insert("input".into(), json!([{ "type": "text", "text": text }]));
@@ -244,7 +244,7 @@ pub(crate) fn turn_start_params(request: &RunRequest, thread_id: &str, text: &st
     Value::Object(params)
 }
 
-pub(crate) fn turn_steer_params(thread_id: &str, turn_id: &str, text: &str) -> Value {
+pub fn turn_steer_params(thread_id: &str, turn_id: &str, text: &str) -> Value {
     json!({
         "threadId": thread_id,
         "expectedTurnId": turn_id,
@@ -252,7 +252,7 @@ pub(crate) fn turn_steer_params(thread_id: &str, turn_id: &str, text: &str) -> V
     })
 }
 
-pub(crate) fn turn_interrupt_params(thread_id: &str, turn_id: &str) -> Value {
+pub fn turn_interrupt_params(thread_id: &str, turn_id: &str) -> Value {
     json!({"threadId": thread_id, "turnId": turn_id})
 }
 
@@ -265,7 +265,7 @@ fn service_tier(request: &RunRequest) -> Option<&str> {
 }
 
 /// Describe the exact process launch used for a Codex run.
-pub(crate) fn run_launch(exe: &Path, request: &RunRequest) -> crate::launch::LaunchDescriptor {
+pub fn run_launch(exe: &Path, request: &RunRequest) -> crate::launch::LaunchDescriptor {
     let mut configured_env = std::collections::BTreeMap::new();
     if let Some(path) = crate::child_path(exe) {
         configured_env.insert("PATH".into(), path);

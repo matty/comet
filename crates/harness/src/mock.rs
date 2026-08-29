@@ -466,7 +466,7 @@ impl Harness for MockHarness {
         // driving a real CLI through a multi-step task.
         //
         // Shaped from the recorded run at
-        // `crates/harness/tests/corpus/claude/2.1.229/checklist{,-resume}`, not
+        // `crates/capture/tests/corpus/claude/2.1.229/checklist{,-resume}`, not
         // composed: three items created pending, the first driven all the way
         // through, the second left mid-flight, and a fourth that arrives as a
         // bare status change carrying only an `activeForm`.
@@ -529,7 +529,7 @@ impl Harness for MockHarness {
         // without a real Claude run that happens to delegate.
         //
         // Shaped from the recorded run at
-        // `crates/harness/tests/corpus/claude/2.1.229/subagent`, not composed.
+        // `crates/capture/tests/corpus/claude/2.1.229/subagent`, not composed.
         // Each agent here exists to produce a state a happy path never does:
         //
         // - `a` COMPLETES with a multi-paragraph summary and all three

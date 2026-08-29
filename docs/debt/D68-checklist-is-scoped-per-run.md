@@ -18,7 +18,7 @@ state.
 ## What that costs, measured
 
 Recorded 2026-08-13 against Claude Code 2.1.229, promoted as
-`crates/harness/tests/corpus/claude/2.1.229/checklist` and `…/checklist-resume`:
+`crates/capture/tests/corpus/claude/2.1.229/checklist` and `…/checklist-resume`:
 
 - Run A creates three tasks and completes task 1.
 - Run B resumes the same session and moves tasks 2 and 3.

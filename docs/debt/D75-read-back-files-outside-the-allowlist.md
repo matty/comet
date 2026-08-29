@@ -21,7 +21,7 @@ do. Found during Task 6 (documentation) of the allowlist-sanitizer stage, while 
 
 ## What is in the corpus, and what reached it
 
-`crates/harness/tests/corpus/claude/2.1.229/subagent/` holds two different kinds of evidence, and
+`crates/capture/tests/corpus/claude/2.1.229/subagent/` holds two different kinds of evidence, and
 its own `README.md` already says so: `manifest.json` + `events.jsonl` are raw provider wire frames
 from a `comet-provider-capture` run, sanitized by `comet-provider-sanitize` like every other
 scenario in the corpus. `read-back-doc-snapshot.json` and `read-back-run-journal.jsonl` are

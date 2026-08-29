@@ -162,7 +162,6 @@ pub trait Harness: Send + Sync {
 }
 
 pub mod acp;
-pub mod capture;
 pub mod claude;
 pub mod codex;
 pub mod discovery;
@@ -174,7 +173,7 @@ pub mod shell_env;
 /// The user's home directory. A Windows GUI or service launch routinely has no
 /// `HOME` (Comet's own startup seeds it, but this crate must not depend on the
 /// binary that links it), so `USERPROFILE` is the documented fallback.
-pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
+pub fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME")
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()))
@@ -210,7 +209,7 @@ pub(crate) fn executable_names(stem: &str) -> Vec<String> {
 /// One tagged list serves both jobs on purpose. The place we search and the
 /// label we report are the same entry, so they cannot drift apart — add a
 /// lookup location without saying what it implies and it will not compile.
-pub(crate) type KnownDir = (std::path::PathBuf, InstallMethod);
+pub type KnownDir = (std::path::PathBuf, InstallMethod);
 
 /// Resolve an installed CLI: `$override_var`, then our own PATH, then the
 /// system's own PATH (the login-shell snapshot on unix, the persisted machine +
@@ -226,7 +225,7 @@ pub(crate) type KnownDir = (std::path::PathBuf, InstallMethod);
 /// than through the entry that describes it. Which is exactly why
 /// classification is a separate pass over the *resolved* path instead of a
 /// by-product of the search.
-pub(crate) fn resolve_cli(
+pub fn resolve_cli(
     override_var: &str,
     stem: &str,
     known_dirs: Vec<KnownDir>,
@@ -262,7 +261,7 @@ pub(crate) fn resolve_cli(
 /// Built once per resolve and handed to both [`resolve_cli`] and
 /// [`classify_install`], so "where we looked" and "what that location means"
 /// are literally the same list.
-pub(crate) fn all_known_dirs(install_dirs: Vec<KnownDir>) -> Vec<KnownDir> {
+pub fn all_known_dirs(install_dirs: Vec<KnownDir>) -> Vec<KnownDir> {
     let mut dirs = install_dirs;
     dirs.extend(node_version_manager_bins());
     dirs
