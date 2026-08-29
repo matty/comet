@@ -29,11 +29,13 @@ pub(crate) fn done_status(stop_reason: &str) -> DoneStatus {
 ///
 /// **Three tiers, not two.** `None` used to be the honest answer for every
 /// `sessionUpdate` kind this build does not render, and that collapsed two
-/// different situations into one: a kind that fires on every healthy turn
-/// (Grok pushes `available_commands_update`, `user_message_chunk` and
-/// `session_info_update` continuously — see the arms below) and a kind
-/// nobody has ever wired up at all, which used to vanish with nothing to
-/// show for it. Now:
+/// different situations into one: a kind that fires on a healthy turn
+/// without anything having gone wrong (Grok's `available_commands_update`
+/// arrives repeatedly across a session — 2 to 10 times in the raw captures
+/// below — and `user_message_chunk` once per turn; `session_info_update` was
+/// only observed once, but is still routine rather than a drift signal — see
+/// the arms below for each one's own evidence) and a kind nobody has ever
+/// wired up at all, which used to vanish with nothing to show for it. Now:
 ///
 /// 1. **Mapped** — `agent_message_chunk`, `agent_thought_chunk`: a real
 ///    `AgentEvent`.
@@ -63,12 +65,13 @@ pub(crate) fn session_update(params: &Value) -> Option<AgentEvent> {
         // carries is missing or not a string. A different failure from an
         // unknown kind — reporting THIS as `Unknown` would name an empty
         // string as the drift, which points whoever reads it at nothing.
-        return Some(AgentEvent::Diagnostic {
-            discriminator: "sessionUpdate/missing".into(),
-            severity: comet_proto::DiagnosticSeverity::Malformed,
-            code: None,
-            summary: "The agent sent a session update that named no update kind.".into(),
-        });
+        // Sink 7 (`crate::diagnostic`'s own doc comment) — nothing here
+        // needs the kind name embedded in the summary, since there is no
+        // kind to name, so the shared fixed-copy builder serves as-is.
+        return Some(crate::diagnostic(
+            "sessionUpdate/missing",
+            comet_proto::DiagnosticSeverity::Malformed,
+        ));
     };
     match kind {
         "agent_message_chunk" => {
@@ -108,6 +111,11 @@ pub(crate) fn session_update(params: &Value) -> Option<AgentEvent> {
         "session_info_update" => None,
 
         // ---- Tier 3: genuinely unknown, see this function's doc comment ----
+        // Sink 6 (`crate::diagnostic`'s own doc comment) — hand-built rather
+        // than through that shared helper, because the summary has to embed
+        // the kind name (see the summary text below) and the helper's copy is
+        // fixed. The raw frame is warn-logged at the drop site,
+        // `session_update_once`, matching every other sink's contract.
         other => {
             let discriminator =
                 comet_proto::sanitize_discriminator(&format!("sessionUpdate/{other}"));
@@ -126,28 +134,50 @@ pub(crate) fn session_update(params: &Value) -> Option<AgentEvent> {
 /// [`session_update`], rate-limited by kind-name: a stream of the SAME
 /// unrecognized `sessionUpdate` reports once per run, not once per frame.
 ///
-/// **Grok's vendor stream would storm without this.** `_x.ai/*` methods are
-/// already dropped before reaching `session_update` at all (see
-/// `acp::session`'s module doc), but a genuinely unknown `sessionUpdate` kind
-/// — the case this exists for — has no such filter upstream, and nothing
-/// stops a chatty future agent from sending one every turn. Neither Claude's
-/// nor Codex's own `Diagnostic` emit sites suppress repeats at all (grep
-/// `claude::normalize`'s `Frame::Unknown` arm and `codex::normalize::map_item`'s
-/// `item/untyped` arm — neither carries any dedup state), so there is no
-/// existing convention to match; this is the kind-name-keyed fallback the
-/// task brief calls for when that's the case.
+/// **A stream of genuinely unknown frames would storm without this** — that
+/// is the kind this function exists for, NOT the `_x.ai/*` vendor stream,
+/// which is already dropped before reaching `session_update` at all (see
+/// `acp::session`'s module doc) and never needs this wrapper. A kind
+/// `session_update` has no arm for at all has no upstream filter, and
+/// nothing stops a chatty future agent from sending one every turn. Neither
+/// Claude's nor Codex's own `Diagnostic` emit sites suppress repeats at all
+/// (grep `claude::normalize`'s `Frame::Unknown` arm and
+/// `codex::normalize::map_item`'s `item/untyped` arm — neither carries any
+/// dedup state), so there is no existing convention to match; this is the
+/// kind-name-keyed fallback the task brief calls for when that's the case.
 ///
 /// `seen` is the caller's state, scoped to one session's lifetime — the same
 /// scope `ToolTracker` holds, not a fresh instance per turn.
+///
+/// **This is also the drop site.** `AgentEvent::Diagnostic`'s own doc
+/// comment (and `crate::diagnostic`'s) states the invariant: the payload
+/// never travels with the event, so the full raw frame has to be
+/// warn-logged HERE or it is gone — the summary and discriminator are all
+/// that survive past this point. Only the FIRST occurrence of a kind gets
+/// the full frame at `warn`; a suppressed repeat still leaves a `trace` —
+/// not the same silence the dedup itself produces on the event stream, so a
+/// verbose run can still show the frequency, but not a warn-level line per
+/// frame, which is exactly the storm this function exists to avoid.
 pub(crate) fn session_update_once(
     seen: &mut HashSet<String>,
     params: &Value,
 ) -> Option<AgentEvent> {
     let event = session_update(params)?;
-    if let AgentEvent::Diagnostic { discriminator, .. } = &event
-        && !seen.insert(discriminator.clone())
-    {
-        return None;
+    if let AgentEvent::Diagnostic { discriminator, .. } = &event {
+        if seen.insert(discriminator.clone()) {
+            tracing::warn!(
+                target: "comet_harness::acp",
+                update = %params,
+                "unrecognized session/update (recorded as a diagnostic)"
+            );
+        } else {
+            tracing::trace!(
+                target: "comet_harness::acp",
+                discriminator = %discriminator,
+                "repeated unrecognized session/update suppressed"
+            );
+            return None;
+        }
     }
     Some(event)
 }
@@ -1001,6 +1031,31 @@ mod tests {
         }
     }
 
+    /// **Tier 2 is the entire point of the three-tier ruling** — a kind
+    /// routine on a healthy turn must never become a diagnostic, or every
+    /// real session storms. Nothing else in this suite falsifies an
+    /// individual Tier 2 arm: `fake_acp` only ever sends `agent_message_chunk`,
+    /// the sibling test above covers `tool_call`/`tool_call_update` alone, and
+    /// `grok_live.rs` is `--ignored` — so deleting, say, the
+    /// `user_message_chunk` arm would compile, pass every OTHER committed
+    /// test, and turn every real Grok turn into a diagnostic storm. This test
+    /// is what stands in front of that.
+    #[test]
+    fn every_deliberately_ignored_kind_stays_silent() {
+        for kind in [
+            "tool_call",
+            "tool_call_update",
+            "available_commands_update",
+            "user_message_chunk",
+            "session_info_update",
+        ] {
+            assert!(
+                session_update(&json!({"update": {"sessionUpdate": kind}})).is_none(),
+                "{kind} must stay silent, not become a diagnostic"
+            );
+        }
+    }
+
     /// Break caught: dropping an unrecognized `sessionUpdate` silently. A frame
     /// kind a later agent version introduces must reach the diagnostics
     /// channel, or a stale decode is indistinguishable from an agent that
@@ -1034,13 +1089,17 @@ mod tests {
             .expect("a frame with no sessionUpdate key must still be reported");
         match event {
             AgentEvent::Diagnostic {
-                severity, summary, ..
+                discriminator,
+                severity,
+                summary,
+                ..
             } => {
                 assert_eq!(severity, comet_proto::DiagnosticSeverity::Malformed);
-                assert!(
-                    summary.contains("no update kind") || summary.contains("named no"),
-                    "must say the key is missing, not that \"\" is unknown: {summary}"
-                );
+                assert_eq!(discriminator, "sessionUpdate/missing");
+                // The shared `crate::diagnostic` copy for `Malformed` never
+                // names a kind at all — which is the point: an empty string
+                // must not be reported AS a kind, unknown or otherwise.
+                assert!(!summary.contains("unknown"), "{summary}");
                 assert!(!summary.contains("\"\""), "{summary}");
             }
             other => panic!("{other:?}"),
