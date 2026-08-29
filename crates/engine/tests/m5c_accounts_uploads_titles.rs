@@ -753,6 +753,305 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
     core.shutdown().await;
 }
 
+/// A harness whose titling call (the request whose prompt matches the
+/// titling prompt's own signature — see `titles::run_title_model`) blocks on
+/// a test-controlled gate, while its ordinary chat turn resolves instantly.
+/// `TitleGenerator::maybe_generate_upfront` fires at request start
+/// (`sessions.rs`'s dispatch, well before the main turn's own `drive_run`
+/// task is even spawned) and is fully detached from `dispatch`'s own await
+/// chain — by the time `dispatch(...).await` returns, an ungated titling
+/// call may already have completed. Racing it needs a handle independent of
+/// `dispatch`'s own timing, which is what this gate buys.
+struct GatedTitlingHarness {
+    id: HarnessId,
+    gate: Arc<tokio::sync::Notify>,
+    title: String,
+}
+
+#[async_trait::async_trait]
+impl comet_harness::Harness for GatedTitlingHarness {
+    fn id(&self) -> HarnessId {
+        self.id
+    }
+    fn display_name(&self) -> &str {
+        "Gated"
+    }
+    fn capabilities(&self) -> comet_proto::HarnessCapabilities {
+        comet_proto::HarnessCapabilities::default()
+    }
+    async fn models(&self) -> Result<comet_proto::ModelCatalog, comet_harness::HarnessError> {
+        Ok(comet_proto::ModelCatalog::built_in(Vec::new()))
+    }
+    async fn run(
+        &self,
+        request: comet_proto::RunRequest,
+        _controls: comet_harness::RunControls,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<comet_proto::AgentEvent, comet_harness::HarnessError>,
+        >,
+        comet_harness::HarnessError,
+    > {
+        if request.prompt.starts_with("Reply with ONLY a concise") {
+            self.gate.notified().await;
+        }
+        let events = vec![
+            Ok(AgentEvent::TextDelta {
+                text: self.title.clone(),
+            }),
+            Ok(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            }),
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+/// D116: `generate` must write the title BEFORE renaming the worktree
+/// branch, matching its sibling `apply_agent_title` — never the other way
+/// around, or a title that fails to land leaves the branch renamed for
+/// nothing the chat ever shows.
+///
+/// The titling call is held on [`GatedTitlingHarness`]'s gate so the test
+/// controls exactly when `generate`'s own model call resolves — that part
+/// is deterministic. What is NOT deterministic is catching the bug's own
+/// window: under the pre-fix ordering, the branch-doc commit and the
+/// title-doc commit sit back to back with no `.await` between them, so an
+/// external observer (the racer below) can only ever see it by a genuine,
+/// CPU-instruction-scale timing race. See the per-attempt loop's own
+/// comment for how that is made reliable without a flaky test.
+#[tokio::test]
+async fn generate_never_renames_the_branch_for_a_title_that_lost_the_write_race() {
+    // The bug's own window (see D116: the branch-doc commit and the
+    // title-doc commit sit back to back with no `.await` between them in
+    // the buggy ordering) is CPU-instruction-scale, so whether a busy-spin
+    // racer thread observes it at all is a genuine timing race rather than
+    // something the test can sequence: the check itself (a doc read through
+    // a lock) is not guaranteed faster than the window it is trying to
+    // observe. One attempt is therefore not, on its own, trustworthy
+    // evidence. Repeating the whole race up to `ATTEMPTS` times is: the
+    // fixed ordering can NEVER trip the racer's trigger condition at all
+    // (title only ever becomes visible together with, or after, the branch
+    // — never before it, by construction, since the write happens first and
+    // nothing yields between the two commits), so it always falls through
+    // to the plain success-path assertions, deterministically, every
+    // attempt. The buggy ordering trips it with the same per-attempt
+    // probability every time, and in practice that probability is high:
+    // falsified against the pre-fix ordering on Windows, 22 of 22 runs
+    // failed and 21 of them caught the window on attempt 0. The racer
+    // thread hammering the same doc lock is why — the titler has to
+    // re-acquire it to write the title, and a spinning thread usually wins
+    // that handoff. `ATTEMPTS` is insurance for a slower or more contended
+    // machine where the window IS missed, not a claim that one attempt is
+    // unreliable here: each independent attempt multiplies the miss chance,
+    // so ten of them make a silent pass against a reintroduced bug
+    // vanishingly unlikely. The repo is created once, outside the loop —
+    // only the worktree (which needs a fresh, unrenamed `comet/<name>`
+    // branch every time) and the engine's own data dir are per-attempt, to
+    // keep the whole test well under `.config/nextest.toml`'s 60s
+    // slow-test bound (measured ~5.5s for all ten on the fixed ordering).
+    const ATTEMPTS: usize = 10;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    let repos = Repos::with_worktrees_root(
+        &tmp.path().join("worktrees-data"),
+        "device-test",
+        tmp.path().join("worktrees"),
+    );
+
+    for attempt in 0..ATTEMPTS {
+        let worktree = repos
+            .create_worktree(&repo_dir, "main")
+            .await
+            .expect("worktree");
+
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let data_dir = tmp.path().join(format!("data-{attempt}"));
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(GatedTitlingHarness {
+            id: HarnessId::Mock,
+            gate: gate.clone(),
+            title: "Fix Login Flow".into(),
+        }));
+        let core = EngineCore::assemble(&data_dir, Arc::new(registry), HarnessId::Mock, None)
+            .expect("engine assembles");
+
+        let chat_id = "chat-title-race";
+        core.workspace
+            .create_space(
+                "space-title-race",
+                &core.device_id,
+                &repo_dir.to_string_lossy(),
+                None,
+                true,
+            )
+            .expect("create space");
+        core.workspace
+            .create_chat(
+                chat_id,
+                "space-title-race",
+                None,
+                Some(worktree.path.clone()),
+            )
+            .expect("create chat");
+        core.workspace
+            .set_chat_branch(chat_id, &worktree.branch)
+            .expect("set branch");
+
+        let request = comet_proto::RunRequest {
+            prompt: "please fix the login flow".into(),
+            harness: None,
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            cwd: worktree.path.clone(),
+            runtime_mode: comet_proto::RuntimeMode::default(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+            attachments: Vec::new(),
+            resume: None,
+        };
+        core.sessions
+            .dispatch(chat_id, HarnessId::Mock, request, None)
+            .await
+            .expect("dispatch");
+
+        // The upfront titling call fired inside `dispatch` (before the main
+        // turn's own task was even spawned) is parked on the gate — the
+        // chat is guaranteed untitled here, deterministically, not by luck.
+        let gated = core
+            .workspace
+            .doc()
+            .chat(chat_id)
+            .expect("chat")
+            .expect("row");
+        assert!(
+            gated.title.is_none(),
+            "the titling call must still be gated at this point"
+        );
+        let original_branch = worktree.branch.clone();
+
+        // A busy-spin racer on tokio's blocking pool (a real OS thread,
+        // checked with no sleep at all — `tokio::time::sleep`-based
+        // polling, even at 1ms, was too coarse and always observed both
+        // fields already changed together): the instant it sees the branch
+        // already renamed but the title still unset, that IS the bug's
+        // window, and it fires a manual rename right then, from that
+        // thread, so first-writer-wins makes the auto-titler's own
+        // still-pending write lose.
+        let racer_ws = core.workspace.clone();
+        let racer_chat_id = chat_id.to_string();
+        let racer_branch = original_branch.clone();
+        let racer = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Ok(Some(chat)) = racer_ws.doc().chat(&racer_chat_id) {
+                    if chat.title.is_none() && chat.branch.as_deref() != Some(racer_branch.as_str())
+                    {
+                        let _ = racer_ws.rename_chat(&racer_chat_id, "Manually Renamed Meanwhile");
+                        // Caught the bug's window: the branch had already
+                        // moved but the write had not landed yet.
+                        return true;
+                    }
+                    if chat.title.is_some() {
+                        // The write already landed before the branch could
+                        // be observed as unrenamed-but-titled — nothing to
+                        // race (always true under the fix; sometimes true
+                        // under the bug, when this attempt's racer thread
+                        // loses the underlying timing).
+                        return false;
+                    }
+                }
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+            }
+        });
+
+        gate.notify_one();
+        let caught_the_race = racer.await.expect("racer task");
+
+        if caught_the_race {
+            // The bug: the branch had already been renamed, but the write
+            // the racer caught mid-flight had NOT landed yet (the racer
+            // fired the manual rename right in that window).
+            // First-writer-wins means the auto-titler's own write, once it
+            // finally runs, must lose.
+            let chat = wait_for("the manual rename to be the final word", || {
+                core.workspace
+                    .doc()
+                    .chat(chat_id)
+                    .ok()
+                    .flatten()
+                    .filter(|c| c.title_manual)
+            })
+            .await;
+            assert_eq!(
+                chat.title.as_deref(),
+                Some("Manually Renamed Meanwhile"),
+                "first-writer-wins: the manual rename must stick (attempt {attempt})"
+            );
+
+            // Give any still in-flight branch-rename work a moment to
+            // finish, then assert it never touched the branch: the
+            // auto-titler's title LOST the write, so it must never have
+            // reached git.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let chat = core
+                .workspace
+                .doc()
+                .chat(chat_id)
+                .expect("chat")
+                .expect("row");
+            assert_eq!(
+                chat.branch.as_deref(),
+                Some(original_branch.as_str()),
+                "a title that lost the write race must not rename the worktree branch \
+                 (caught on attempt {attempt})"
+            );
+            core.shutdown().await;
+            return;
+        }
+
+        // Missed the window this attempt (or — under the fix — the window
+        // structurally never opens at all): fall through to the plain
+        // success-path assertions as a sanity check, then try again.
+        let chat = wait_for("branch renamed to the landed title", || {
+            core.workspace
+                .doc()
+                .chat(chat_id)
+                .ok()
+                .flatten()
+                .filter(|c| {
+                    c.title.as_deref() == Some("Fix Login Flow")
+                        && c.branch.as_deref().is_some_and(|b| b != original_branch)
+                })
+        })
+        .await;
+        // `starts_with`, not an exact match: attempts share one repo (kept
+        // outside the loop to stay well under the slow-test bound), so a
+        // later attempt's identical title collides with an earlier
+        // attempt's already-renamed branch and gets the hash-suffixed form
+        // (`rename_worktree_branch`'s own collision handling, exercised
+        // elsewhere by `rename_worktree_branch_guards_and_collisions`) —
+        // that is expected here, not a bug.
+        assert!(
+            chat.branch
+                .as_deref()
+                .is_some_and(|b| b.starts_with("comet/fix-login-flow")),
+            "branch should be renamed from the landed title (attempt {attempt}): {:?}",
+            chat.branch
+        );
+        core.shutdown().await;
+    }
+}
+
 /// A harness registered under an arbitrary [`HarnessId`], streaming a fixed
 /// script — stands in for Grok (out of reach in this crate's tests) the same
 /// way `crates/engine/src/rpc.rs`'s own `ScriptedHarness` does.
