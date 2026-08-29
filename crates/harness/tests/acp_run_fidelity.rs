@@ -298,6 +298,45 @@ async fn a_failed_load_reports_rather_than_starting_fresh() {
     );
 }
 
+/// Break caught: a signed-out user reopening an EXISTING resumable chat
+/// getting the generic "could not resume the previous session" fallback
+/// instead of sign-in guidance. Grok advertises `loadSession: true`
+/// (`fake-acp` matches that default), so a signed-out `session/load` is a
+/// real path, not a hypothetical one -- and an earlier version of the open
+/// path built the generic fallback text BEFORE the mapper ever saw the raw
+/// error, which meant `grok::map_open_failure`'s `"Authentication
+/// required"` match had nothing left to match against. This drives the real
+/// `GrokHarness`, not a hand-built mapper, so it proves the fix through the
+/// actual production wiring `session/load`'s callers use.
+#[tokio::test]
+async fn a_signed_out_resume_still_asks_the_user_to_sign_in() {
+    let request = RunRequest {
+        prompt: "hello".into(),
+        // `fake-acp` answers Grok's real signed-out shape for any sessionId
+        // containing "needs-setup-load" -- see `main`'s `session/load` arm.
+        resume: Some("needs-setup-load-1".into()),
+        cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+        ..RunRequest::for_session(RuntimeMode::default())
+    };
+    let result = grok_fixture().run(request, controls()).await;
+    let error = match result {
+        Ok(_) => panic!("a signed-out session/load must fail, not open a session"),
+        Err(error) => error,
+    };
+    match error {
+        comet_harness::HarnessError::NeedsSetup { summary, hint } => {
+            assert_eq!(summary, "Sign-in required");
+            assert!(
+                hint.contains("grok"),
+                "the hint must name the command to run: {hint}"
+            );
+        }
+        other => panic!(
+            "expected NeedsSetup (the sign-in guidance), got the generic resume fallback instead: {other:?}"
+        ),
+    }
+}
+
 /// Resume requested, but this agent never advertised `loadSession` at all.
 /// Sending `session/load` anyway would be a protocol error for a feature the
 /// user never asked for — the correct behavior is a plain new session, the

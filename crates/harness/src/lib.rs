@@ -45,11 +45,14 @@ pub enum HarnessError {
     ///
     /// Two fields rather than one baked string, matching
     /// `HarnessAvailability::Unavailable` (that type's own doc comment is the
-    /// worked example the error-copy rule points at): unlike `NotInstalled`,
-    /// where nothing downstream ever reads the halves apart, this variant's
-    /// own unit test asserts on `summary` and `hint` separately, to prove
-    /// neither half alone can leak wire text (a protocol code in `summary`,
-    /// "jsonrpc" in either).
+    /// worked example the error-copy rule points at). `Display` joins them
+    /// back into one line today (`drive_run`'s sink only ever wanted a
+    /// single string), but the split is forward-looking, not decorative: a
+    /// surface with somewhere to put a label AND a longer sentence
+    /// separately -- the harness rail row `HarnessAvailability::Unavailable`
+    /// already renders that way -- can render `summary`/`hint` apart the
+    /// moment `NeedsSetup` needs to reach one, without a field ever having
+    /// to be parsed back out of a joined string first.
     ///
     /// Built only by a vendor module's own `map_open_failure` (see
     /// `acp::session::OpenFailureMapper`), never constructed directly here —
