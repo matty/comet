@@ -545,18 +545,22 @@ impl Harness for MockHarness {
         // - `d` is left RUNNING and never settled, so it exercises a card that
         //   is still in flight when everything around it has finished.
         //
-        // **The card's `last seen running` state is NOT reachable from here,
-        // and no value of this knob reaches it.** That state needs a genuine
-        // steer boundary (D57), and a steer only becomes one when the harness
-        // emits `AgentEvent::Steered` — which only the Claude and Codex
-        // adapters do. This mock advertises `supports_steering: true` above
-        // and then never drains `controls.steering`, so a steer sent to it is
-        // silently dropped and the run simply ends; the engine's `Done` sweep
-        // then stamps `d` `Cancelled` like any other unfinished agent. Pinning
-        // that state is `transcript.rs`'s
-        // `a_running_subagent_in_a_finished_entry_reads_last_seen_running`,
-        // not this rig. Seeing it on screen needs a real Claude run that
-        // delegates, steered mid-flight.
+        // **The card's `last seen running` state is reachable from here since
+        // D99: set this knob, then steer the run mid-flight.** That state
+        // needs a genuine steer boundary (D57) — the engine finishes the open
+        // segment on `AgentEvent::Steered` and deliberately leaves a still-
+        // `Running` subagent alone — and until D99 this mock advertised
+        // `supports_steering: true` and never drained `controls.steering`, so
+        // the steer was dropped, the run simply ended, and the `Done` sweep
+        // stamped `d` `Cancelled` like any other unfinished agent. The drain
+        // is at the bottom of this function. Pacing matters: without
+        // `COMET_MOCK_DELAY_MS` the whole script streams before a steer can be
+        // typed, so `d` settles `Cancelled` again — not a regression, just the
+        // script outrunning the human.
+        //
+        // `transcript.rs`'s
+        // `a_running_subagent_in_a_finished_entry_reads_last_seen_running` is
+        // still what PINS the state; this rig is how it gets onto a screen.
         let mock_subagent = std::env::var("COMET_MOCK_SUBAGENT")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
@@ -728,16 +732,119 @@ impl Harness for MockHarness {
                 })
                 .collect(),
         };
-        if delay_ms == 0 {
-            return Ok(futures::stream::iter(events).boxed());
-        }
-        Ok(futures::stream::iter(events)
-            .then(move |event| async move {
-                tokio::time::sleep(delay).await;
-                event
-            })
-            .boxed())
+        // **The scripted events go out through a task that also drains
+        // `controls.steering`** (D99). `capabilities()` above declares
+        // `supports_steering: true`, and until this landed the mock never read
+        // the mailbox: a steer sent to it was silently dropped and the run
+        // just ended. A rig that advertises a capability and discards the
+        // message is worse than one that declines it — that lie cost half an
+        // hour of driving the app against a state it could not produce.
+        //
+        // It is also what makes D57's `last seen running` subagent state
+        // reachable from here at all. The engine finishes the open segment on
+        // `Steered` and deliberately leaves a still-`Running` subagent
+        // untouched, so `COMET_MOCK_SUBAGENT=1` plus a steer is now the whole
+        // recipe; before, only a real Claude run that delegates could show it.
+        let mut steering = controls.steering;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<AgentEvent, HarnessError>>();
+        tokio::spawn(async move {
+            let mut steering_open = true;
+            let mut steers = 0usize;
+            for event in events {
+                // Pacing and steering are the same wait. With
+                // `COMET_MOCK_DELAY_MS` set — every rendered check — a steer
+                // landing between two scripted events is answered before the
+                // next one goes out, which is what a step-boundary harness
+                // does (`SteeringMode::StepBoundary`, declared above).
+                if delay_ms > 0 {
+                    let sleep = tokio::time::sleep(delay);
+                    tokio::pin!(sleep);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            steer = steering.recv(), if steering_open => match steer {
+                                Some(message) => {
+                                    if !send_steer(&tx, &mut steers, &message) {
+                                        return;
+                                    }
+                                }
+                                // The mailbox closing means no further steer can
+                                // arrive, not that the run should stop: the
+                                // script still finishes, as it does for Claude.
+                                None => steering_open = false,
+                            },
+                            () = &mut sleep => break,
+                        }
+                    }
+                } else if steering_open {
+                    // Unpaced (every test, and the default): there is nothing
+                    // to wait on, so take what has already arrived rather than
+                    // parking the whole script on a steer that may never come.
+                    loop {
+                        match steering.try_recv() {
+                            Ok(message) => {
+                                if !send_steer(&tx, &mut steers, &message) {
+                                    return;
+                                }
+                            }
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                steering_open = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if tx.send(event).is_err() {
+                    return; // consumer gone
+                }
+            }
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
     }
+}
+
+/// Answer one steer: the boundary event the engine segments on, then a line of
+/// prose so the post-steer segment is not empty on screen.
+///
+/// **The message ids are minted here and are the mock's own.** Claude rotates
+/// real ids (`rotate_for_steer`) so post-steer output folds into a fresh
+/// message; the mock has no provider ids to rotate, so it numbers its own —
+/// `None` would be honest too, but it would leave the rendered check unable to
+/// show that the two segments are different messages, which is the thing a
+/// steer is being driven to demonstrate.
+///
+/// Returns `false` once the consumer is gone, which is the caller's signal to
+/// stop scripting.
+fn send_steer(
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<AgentEvent, HarnessError>>,
+    steers: &mut usize,
+    message: &crate::SteerMessage,
+) -> bool {
+    let previous = format!("mock-msg-{steers}");
+    *steers += 1;
+    let next = format!("mock-msg-{steers}");
+    if tx
+        .send(Ok(AgentEvent::Steered {
+            assistant_message_id: Some(previous),
+            next_assistant_message_id: Some(next),
+        }))
+        .is_err()
+    {
+        return false;
+    }
+    tx.send(Ok(AgentEvent::TextDelta {
+        text: format!(
+            "Picking that up instead: **{}**
+
+",
+            message.prompt
+        ),
+    }))
+    .is_ok()
 }
 
 #[cfg(test)]
@@ -856,6 +963,88 @@ mod tests {
         assert!(
             mock_approval("hang").is_some(),
             "unrecognized values fall back"
+        );
+    }
+
+    /// Break caught (D99): `capabilities()` declares `supports_steering: true`
+    /// and the run never read the mailbox, so a steer was dropped in silence
+    /// and the run just ended. Half an hour went into driving the app against
+    /// that before anyone read this file instead of the sentence claiming it
+    /// worked.
+    ///
+    /// Queues the steer BEFORE the run starts so the assertion is
+    /// deterministic without pacing: the unpaced path takes whatever has
+    /// already arrived. The paced path (`COMET_MOCK_DELAY_MS`, every rendered
+    /// check) is the same drain on the other arm of the same `select!`, and
+    /// cannot be exercised here without setting a process-global env var —
+    /// the race this file's other test avoids for the same reason.
+    #[tokio::test]
+    async fn a_steer_sent_to_the_mock_is_answered_rather_than_dropped() {
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(4);
+        steer_tx
+            .send(crate::SteerMessage {
+                prompt: "check the retry path instead".into(),
+                message_id: None,
+            })
+            .await
+            .expect("the run has not started, so the mailbox is open");
+
+        let controls = RunControls {
+            request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
+            request_approval: Box::new(|_| tokio::sync::oneshot::channel().1),
+            steering: steer_rx,
+            interrupt: tokio_util::sync::CancellationToken::new(),
+        };
+        // A script with a body, because the drain rides the gap BETWEEN
+        // scripted events — the default `MockHarness` scripts nothing at all,
+        // so there is no gap for a steer to land in.
+        let harness = MockHarness::with_script(vec![
+            AgentEvent::TextDelta {
+                text: "starting on the original ask".into(),
+            },
+            AgentEvent::TextDelta {
+                text: " and still going".into(),
+            },
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            },
+        ]);
+        let mut stream = harness
+            .run(
+                RunRequest::for_session(comet_proto::RuntimeMode::FullAccess),
+                controls,
+            )
+            .await
+            .expect("the mock always starts");
+
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event.expect("the mock never errors"));
+        }
+
+        let steered = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::Steered { .. }))
+            .expect("the steer must reach the transcript as a segment boundary");
+        match &events[steered] {
+            AgentEvent::Steered {
+                assistant_message_id,
+                next_assistant_message_id,
+            } => assert_ne!(
+                assistant_message_id, next_assistant_message_id,
+                "post-steer output has to fold into a DIFFERENT message, or the two                  segments a steer creates are indistinguishable on screen"
+            ),
+            other => panic!("expected Steered, got {other:?}"),
+        }
+        assert!(
+            events[steered + 1..].iter().any(|event| matches!(
+                event,
+                AgentEvent::TextDelta { text } if text.contains("check the retry path instead")
+            )),
+            "the steer's own prompt must show up after the boundary, or the run              acknowledged nothing"
         );
     }
 }
