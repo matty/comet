@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -15,6 +15,15 @@ pub struct SanitizationReport {
     pub manifest_path: PathBuf,
     pub events_bytes: Vec<u8>,
     pub manifest_bytes: Vec<u8>,
+    /// Every published path whose last segment is a key that carried a path
+    /// delimiter and had to be escaped, sorted. Informational, never a
+    /// rejection: the escape makes such a key harmless
+    /// ([`surface::escape_path_segment`]), but a provider that starts naming
+    /// its fields `x.ai/…` is worth one human glance, and refusing the
+    /// capture used to be what forced that glance. This is the replacement —
+    /// it reports rather than blocks, and it is also where the exact spelling
+    /// an allowlist line has to match can be copied from.
+    pub escaped_paths: Vec<String>,
     /// Every dotted path the allowlist withheld a value for, sorted by path.
     /// The allowlist's fail-closed default is only useful if what it
     /// withholds is visible: this is that visibility, without ever
@@ -86,8 +95,6 @@ pub enum SanitizationError {
     SecretLikeValue { location: String },
     #[error("capture contains a sensitive object key at {location}")]
     SensitiveObjectKey { location: String },
-    #[error("capture contains an object key that would impersonate a nested path at {location}")]
-    AmbiguousObjectKey { location: String },
     #[error("capture contains a value shaped like a generated placeholder at {location}")]
     PlaceholderShapedValue { location: String },
     #[error("capture channel contains unparseable structured JSON at sequence {sequence}")]
@@ -143,6 +150,13 @@ struct Redactor {
     /// `NovelPath`. Excludes the `mcp__` exception deliberately; see
     /// `NovelPath`'s doc comment.
     novel: BTreeMap<String, Vec<Value>>,
+    /// Every path whose last segment came from a key that had to be
+    /// escaped, and that survived as a published field name. Only
+    /// survivors: an escaped key that was *replaced* is data (a model id
+    /// keying a declared map), and spelling it here would republish
+    /// exactly what the replacement withheld -- `novel` already counts
+    /// that one at its `.{}` position.
+    escaped: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -242,6 +256,7 @@ pub fn sanitize_dir(
     // `redaction_counts` were all dropped -- nothing under `crates/` read any
     // of them.
     let novel_paths = redactor.novel_paths();
+    let escaped_paths = redactor.escaped_paths();
     let manifest = json!({
         "schema_version": 1,
         "provider": capture.provider,
@@ -273,6 +288,7 @@ pub fn sanitize_dir(
         events_bytes,
         manifest_bytes,
         novel_paths,
+        escaped_paths,
     })
 }
 
@@ -540,7 +556,59 @@ impl Redactor {
             capture.redaction_roots.trusted_powershell.as_deref(),
             "<TRUSTED_POWERSHELL>",
         );
+        redactor.add_uncovered_program_root(&capture.command.program);
         redactor
+    }
+
+    /// The directory the captured program itself was launched from, as a root
+    /// of last resort — added only when none of the eight above already
+    /// covers it.
+    ///
+    /// Without this, a capture whose program lives outside every declared
+    /// category cannot be sanitized at all: `sanitize_paths_and_validate`
+    /// refuses a leftover absolute path rather than publishing it, and
+    /// `command.program` is in the manifest, so the run dies at
+    /// `command.object[5]` with a message that names a JSON position and not
+    /// a reason. That is not hypothetical — the ACP adapter rows spawn
+    /// `node`, and a system-wide install resolves to
+    /// `C:\Program Files\nodejs\node.exe`, under none of `RedactionRoots`'
+    /// categories. The 2026-08-28 promotion worked around it by re-recording
+    /// with `--executable` pointed at an interpreter that happened to live
+    /// under `<HOME>`; an operator with only an ordinary install has nothing
+    /// to reach for (D102's third gap).
+    ///
+    /// **Only when uncovered**, because `add_path` ranks roots by string
+    /// length: `C:\Users\me\.grok\bin` is longer than `C:\Users\me`, so an
+    /// unconditional program root would outrank `<HOME>` and silently
+    /// respell every capture that sanitizes correctly today —
+    /// `<HOME>\.grok\bin\grok.exe` becoming `<PROGRAM_DIR>\grok.exe`, losing
+    /// the directory the manifest currently shows. Derived here from
+    /// `command.program` rather than recorded as a ninth `RedactionRoots`
+    /// field on purpose: the program is already in every capture, including
+    /// the ones recorded before this existed, so the fix reaches them too.
+    fn add_uncovered_program_root(&mut self, program: &str) {
+        let Some(directory) = Path::new(program).parent() else {
+            return;
+        };
+        let directory = directory.to_string_lossy();
+        // The same predicate that would later reject the leftover, not a
+        // separate notion of "absolute": this adds a root exactly when its
+        // absence is what fails the capture, and stays silent otherwise (a
+        // bare `claude` has an empty parent, and a relative one has nothing
+        // `sanitize_paths_and_validate` would object to).
+        if !contains_absolute_path(&directory) {
+            return;
+        }
+        let covered = self.paths.iter().any(|redaction| {
+            redaction
+                .values
+                .iter()
+                .any(|known| directory.starts_with(known.as_str()))
+        });
+        if covered {
+            return;
+        }
+        self.add_path(Some(directory.as_ref()), "<PROGRAM_DIR>");
     }
 
     fn add_path(&mut self, value: Option<&str>, placeholder: &'static str) {
@@ -631,9 +699,14 @@ impl Redactor {
                 {
                     let child_location = format!("{location}.object[{index}]");
                     self.validate_key(&child_key, &child_location)?;
-                    let candidate_path = format!("{path}.{child_key}");
+                    let escaped_key = surface::escape_path_segment(&child_key);
+                    let key_needed_escaping = matches!(escaped_key, std::borrow::Cow::Owned(_));
+                    let candidate_path = format!("{path}.{escaped_key}");
                     let key_survives = !is_map || allows_prefix(provider, &candidate_path);
                     let (child_key, child_path) = if key_survives {
+                        if key_needed_escaping {
+                            self.escaped.insert(candidate_path.clone());
+                        }
                         (child_key, candidate_path)
                     } else {
                         // Reported at the map-key *position* (`surface.rs`'s
@@ -723,6 +796,11 @@ impl Redactor {
     /// Reduces the accumulated withheld values into the report shape: one
     /// `NovelPath` per path, sorted by path (inherited from `BTreeMap`'s
     /// iteration order), holding a count and a shape but never a value.
+    /// The escaped, published paths, sorted (`BTreeSet` iteration order).
+    fn escaped_paths(&self) -> Vec<String> {
+        self.escaped.iter().cloned().collect()
+    }
+
     fn novel_paths(&self) -> Vec<NovelPath> {
         self.novel
             .iter()
@@ -826,25 +904,19 @@ impl Redactor {
         Ok(())
     }
 
-    /// A key is rejected outright if it carries a path delimiter, before any
-    /// allowlist question is asked of it.
+    /// A key is rejected if it carries something the *value* scan would have
+    /// redacted — a real absolute path, a secret shape — because a key is
+    /// published verbatim and cannot be placeholdered in place.
     ///
-    /// Paths are built by joining keys with `.`, so a key that contains one is
-    /// indistinguishable from nesting: a root-level `{"result.platformOs": …}`
-    /// builds `.result.platformOs`, matches that listed path, and publishes
-    /// whatever the provider put there. `[` and `]` do the same for the array
-    /// marker. Rejecting is the fail-closed answer and matches how this
-    /// sanitizer already treats an unrecognized absolute path — a capture that
-    /// hits it stops rather than being quietly reshaped. No key in any promoted
-    /// capture contains one of these; if a real provider ever emits a dotted
-    /// key, that is a design question about path encoding, not something to
-    /// escape past on the day it arrives.
+    /// It is **not** rejected for carrying a path delimiter any more. That
+    /// check existed to stop a key from impersonating nesting, and its own
+    /// comment asked for a path-encoding decision on the day a real provider
+    /// emitted a dotted key. Grok does, ten ways
+    /// ([`surface::escape_path_segment`] has the evidence), so the decision was
+    /// made there: every key is escaped as it is joined into a path, which
+    /// removes the ambiguity structurally rather than by refusing the capture.
+    /// Nothing else about this function's fail-closed posture changed.
     fn validate_key(&mut self, key: &str, location: &str) -> Result<(), SanitizationError> {
-        if key.contains(['.', '[', ']']) {
-            return Err(SanitizationError::AmbiguousObjectKey {
-                location: location.to_owned(),
-            });
-        }
         let mut sanitized = key.to_owned();
         self.sanitize_paths_and_validate(&mut sanitized, location)?;
         if sanitized != key {
@@ -1041,7 +1113,7 @@ fn is_secret_field(field: &str, value: &Value) -> bool {
 /// frame *after* the number was handed out — so the capture is rejected and
 /// the collision never enters the archive.
 ///
-/// The eight path-root placeholders `Redactor::new` writes (`<HOME>`,
+/// The nine path-root placeholders `Redactor::new` writes (`<HOME>`,
 /// `<CODEX_HOME>`, `<TRUSTED_POWERSHELL>`, …) are deliberately **not** this
 /// shape: none ends in `_<digits>`. That matters because
 /// `sanitize_paths_and_validate` legitimately puts them *inside* allowlisted
@@ -1065,13 +1137,18 @@ fn is_generated_placeholder_shape(text: &str) -> bool {
     numbered_generic || numbered_named
 }
 
-/// The eight literal path-root placeholders `Redactor::new` writes directly
+/// The nine literal path-root placeholders `Redactor::new` writes directly
 /// (`<CWD>`, `<REPO>`, `<HOME>`, `<TEMP>`, `<CODEX_HOME>`,
-/// `<CLAUDE_CONFIG_DIR>`, `<APPROVAL_TARGET>`, `<TRUSTED_POWERSHELL>`) —
-/// never through the numbered `named`/`generic` machinery, so
-/// `is_generated_placeholder_shape` alone does not recognize them (see its
-/// own doc comment: none ends in `_<digits>`, by design).
-pub const PATH_ROOT_PLACEHOLDERS: [&str; 8] = [
+/// `<CLAUDE_CONFIG_DIR>`, `<APPROVAL_TARGET>`, `<TRUSTED_POWERSHELL>`,
+/// `<PROGRAM_DIR>`) — never through the numbered `named`/`generic`
+/// machinery, so `is_generated_placeholder_shape` alone does not recognize
+/// them (see its own doc comment: none ends in `_<digits>`, by design).
+///
+/// `<PROGRAM_DIR>` is the odd one out in where it comes from: the other eight
+/// are `RedactionRoots` fields the recorder wrote, and it is derived at
+/// sanitize time from the capture's own `command.program` — see
+/// `Redactor::add_uncovered_program_root` for why that is deliberate.
+pub const PATH_ROOT_PLACEHOLDERS: [&str; 9] = [
     "<CWD>",
     "<REPO>",
     "<HOME>",
@@ -1080,11 +1157,12 @@ pub const PATH_ROOT_PLACEHOLDERS: [&str; 8] = [
     "<CLAUDE_CONFIG_DIR>",
     "<APPROVAL_TARGET>",
     "<TRUSTED_POWERSHELL>",
+    "<PROGRAM_DIR>",
 ];
 
 /// Whether `text` is shaped like *any* placeholder this sanitizer can
 /// produce: a numbered generic/named token (`is_generated_placeholder_shape`)
-/// or one of the eight literal path roots above.
+/// or one of the nine literal path roots above.
 ///
 /// Sound with no declared-per-capture list to check against: `sanitize_scalar`
 /// already rejects an allowlisted value that happens to have this shape
@@ -1234,6 +1312,25 @@ pub fn render_novel_paths_report(novel_paths: &[NovelPath]) -> String {
             shape = entry.shape,
         ));
     }
+    lines.join("\n")
+}
+
+/// The escaped-key notice that goes under the novel-path report.
+///
+/// Informational by design. Every path here is *published* — its key is a
+/// field name, and field names publish — so this is a "look once at what a
+/// new provider calls its fields" list, not a decision queue. It doubles as
+/// the place to copy an allowlist spelling from: a line in
+/// `allowlist/<provider>.txt` has to equal this string exactly, backslashes
+/// included.
+pub fn render_escaped_paths_report(escaped_paths: &[String]) -> String {
+    let header = "Keys carrying a path delimiter, escaped where they join the path (published as \
+                  field names -- copy an allowlist line from here verbatim):";
+    if escaped_paths.is_empty() {
+        return format!("{header}\n  (none -- no key on the wire carried one)");
+    }
+    let mut lines = vec![header.to_owned()];
+    lines.extend(escaped_paths.iter().map(|path| format!("  {path}")));
     lines.join("\n")
 }
 
@@ -1670,7 +1767,7 @@ mod tests {
 
     use super::{
         Redactor, SanitizationError, SanitizationReport, is_generated_placeholder_shape,
-        render_novel_paths_report,
+        render_escaped_paths_report, render_novel_paths_report,
     };
     use crate::capture::types::Provider;
 
@@ -1704,6 +1801,7 @@ mod tests {
             .expect("test value expected to sanitize cleanly");
         let events_bytes = serde_json::to_vec(&value).expect("sanitized value encodes");
         let novel_paths = redactor.novel_paths();
+        let escaped_paths = redactor.escaped_paths();
         let manifest_bytes =
             serde_json::to_vec(&json!({ "schema_version": 1 })).expect("manifest encodes");
         SanitizationReport {
@@ -1712,6 +1810,7 @@ mod tests {
             events_bytes,
             manifest_bytes,
             novel_paths,
+            escaped_paths,
         }
     }
 
@@ -2042,7 +2141,7 @@ mod tests {
         );
     }
 
-    /// The eight path-root placeholders are deliberately not that shape, and
+    /// The nine path-root placeholders are deliberately not that shape, and
     /// must keep riding through allowlisted strings: `sanitize_paths_and_
     /// validate` writes them there itself, and the archive re-pass documented
     /// in `provider-captures.md` feeds text already carrying them back in.
@@ -2145,19 +2244,111 @@ mod tests {
         );
     }
 
-    /// A key carrying a path delimiter is rejected before any allowlist
-    /// question is asked of it. Without this, a root-level key spelled
-    /// `result.platformOs` builds exactly the dotted path `codex.txt` lists
-    /// and publishes whatever the provider put there.
+    /// The attack the old outright rejection existed to stop, now stopped by
+    /// the escape instead: a root-level key spelled `result.platformOs` must
+    /// not collect the permission `codex.txt` granted the *nested* path
+    /// `.result` → `.platformOs`.
     #[test]
-    fn a_key_that_impersonates_a_nested_path_rejects() {
-        let outcome = try_sanitize_value(
+    fn a_dotted_key_cannot_borrow_a_listed_paths_permission() {
+        let sanitized = sanitize_value(
             json!({"result.platformOs": "LEAKED-LOCAL-VALUE"}),
             Provider::Codex,
         );
+        assert_ne!(
+            sanitized["result.platformOs"],
+            json!("LEAKED-LOCAL-VALUE"),
+            "a flat dotted key must not inherit the listed nested path's permission"
+        );
+    }
+
+    /// The other half of the pair, and the reason the assertion above is
+    /// `assert_ne!` on a value rather than on an error: the genuinely nested
+    /// path it is impersonating still survives, so the test above is showing
+    /// that two spellings are told apart, not that both are redacted.
+    #[test]
+    fn the_genuinely_nested_listed_path_still_survives() {
+        let sanitized = sanitize_value(
+            json!({"result": {"platformOs": "windows"}}),
+            Provider::Codex,
+        );
+        assert_eq!(sanitized["result"]["platformOs"], json!("windows"));
+    }
+
+    /// Grok's vendor namespace (`x.ai/...`) is a field name that happens to
+    /// carry a dot, and its listed children publish. This is the spelling
+    /// question D102 could not answer while the key rejected outright: a
+    /// listed path writes the key's own dot escaped, and nothing else.
+    #[test]
+    fn a_vendor_namespaced_key_publishes_its_listed_children() {
+        let sanitized = sanitize_value(
+            json!({"result": {"_meta": {"x.ai/sessionConfig": {"options": [
+                {"id": "grok-4-fast", "label": "Fast", "category": "model"}
+            ]}}}}),
+            Provider::Acp,
+        );
+        let option = &sanitized["result"]["_meta"]["x.ai/sessionConfig"]["options"][0];
+        assert_eq!(option["id"], json!("grok-4-fast"));
+        assert_eq!(option["label"], json!("Fast"));
+        assert_eq!(option["category"], json!("model"));
+    }
+
+    /// The visibility that replaced the outright rejection: an escaped key
+    /// that got published is named in the report, spelled exactly as an
+    /// allowlist line would have to be.
+    #[test]
+    fn an_escaped_key_that_publishes_is_named_in_the_report() {
+        let report = sanitize_value_reporting(
+            json!({"result": {"_meta": {"x.ai/hooks": {"decisions": ["deny"]}}}}),
+            Provider::Acp,
+        );
         assert!(
-            matches!(outcome, Err(SanitizationError::AmbiguousObjectKey { .. })),
-            "a dotted key must reject the capture, got {outcome:?}"
+            report
+                .escaped_paths
+                .contains(&r".result._meta.x\.ai/hooks".to_owned()),
+            "the escaped path must be reported: {:?}",
+            report.escaped_paths
+        );
+    }
+
+    /// The other half, and the one that would be a leak: a key that was
+    /// *replaced* is data, so naming it in the report would republish exactly
+    /// what the replacement withheld. `novel` already counts it at its `.{}`
+    /// position.
+    #[test]
+    fn an_escaped_map_key_that_was_replaced_is_never_named_in_the_report() {
+        let report = sanitize_value_reporting(
+            json!({"result": {"_meta": {"usage": {"modelUsage": {
+                "grok-4.6": {"inputTokens": 14221}
+            }}}}}),
+            Provider::Acp,
+        );
+        let rendered = render_escaped_paths_report(&report.escaped_paths);
+        assert!(
+            !rendered.contains("grok-4"),
+            "a withheld map key must never be spelled in the report: {rendered}"
+        );
+    }
+
+    /// The case that rules out enumerating dotted keys by hand: a model id is
+    /// *data* under a declared map path, and Grok's happens to contain a dot
+    /// (`grok-4.6`). It cannot be pre-reviewed one literal at a time, and it
+    /// must not reject the capture either — default-deny already covers it.
+    #[test]
+    fn a_map_key_carrying_a_dot_redacts_instead_of_rejecting() {
+        let sanitized = sanitize_value(
+            json!({"result": {"_meta": {"usage": {"modelUsage": {
+                "grok-4.6": {"inputTokens": 14221}
+            }}}}}),
+            Provider::Acp,
+        );
+        let map = sanitized["result"]["_meta"]["usage"]["modelUsage"]
+            .as_object()
+            .expect("modelUsage stays an object");
+        let key = map.keys().next().expect("the one entry survives, renamed");
+        assert_ne!(key, "grok-4.6", "an unreviewed map key must not publish");
+        assert!(
+            key.starts_with('<'),
+            "the key must be replaced by a placeholder, got {key}"
         );
     }
 }
