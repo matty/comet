@@ -140,6 +140,34 @@ pub(crate) fn session_update(params: &Value) -> Option<AgentEvent> {
     }
 }
 
+/// Bound on `seen`'s size (`docs/debt/README.md`'s D113) — the same
+/// "cannot become an allocator" concern `ToolTracker`'s `MAX_TRACKED_CALLS`
+/// exists for (that file's D10 is the standing version of the mistake both
+/// avoid), applied to a different registry with a different failure mode.
+///
+/// **`ToolTracker`'s cap cannot be copied verbatim — it would invert the
+/// purpose of this one.** `ToolTracker` stops TRACKING past its cap, and a
+/// call whose id it never tracked risks being re-emitted as a duplicate card
+/// later — a real but bounded and rare cost. `seen` here is not an in-flight
+/// registry the same way: it only ever grows by DISTINCT unrecognized
+/// `sessionUpdate` *kind strings*, and its whole job is rate-limiting — a
+/// kind's presence in `seen` is what turns its second and later occurrence
+/// into a suppressed repeat. If a full `seen` still called `insert` on a
+/// brand-new kind and got `true` back (as `ToolTracker`'s "refuse once full"
+/// does), every kind arriving after the cap would look "newly seen" FOREVER,
+/// since it would never actually be recorded — reintroducing, at the cap
+/// boundary, exactly the per-frame warn storm this function exists to stop.
+///
+/// So past this cap, a NEW kind is treated as an already-suppressed repeat
+/// instead: no `warn!`, no `AgentEvent::Diagnostic` reaching the caller, only
+/// a `trace!`. The cost is diagnostic SIGNAL, never real content — a
+/// legitimate agent's vocabulary of kinds this build doesn't map is a
+/// handful at most ([`session_update`]'s own Tier 3 doc), so only a buggy or
+/// adversarial agent minting a fresh kind string every frame would ever
+/// reach 64 distinct ones in one session, and that is precisely the runaway
+/// case this cap exists to bound rather than a session worth degrading for.
+const MAX_TRACKED_UPDATE_KINDS: usize = 64;
+
 /// [`session_update`], rate-limited by kind-name: a stream of the SAME
 /// unrecognized `sessionUpdate` reports once per run, not once per frame.
 ///
@@ -167,34 +195,6 @@ pub(crate) fn session_update(params: &Value) -> Option<AgentEvent> {
 /// not the same silence the dedup itself produces on the event stream, so a
 /// verbose run can still show the frequency, but not a warn-level line per
 /// frame, which is exactly the storm this function exists to avoid.
-/// Bound on `seen`'s size (D113) — the same "cannot become an allocator"
-/// concern `ToolTracker`'s `MAX_TRACKED_CALLS` exists for
-/// (`docs/debt/README.md`'s D10 is the standing version of the mistake both
-/// avoid), applied to a different registry with a different failure mode.
-///
-/// **`ToolTracker`'s cap cannot be copied verbatim — it would invert the
-/// purpose of this one.** `ToolTracker` stops TRACKING past its cap, and a
-/// call whose id it never tracked risks being re-emitted as a duplicate card
-/// later — a real but bounded and rare cost. `seen` here is not an in-flight
-/// registry the same way: it only ever grows by DISTINCT unrecognized
-/// `sessionUpdate` *kind strings*, and its whole job is rate-limiting — a
-/// kind's presence in `seen` is what turns its second and later occurrence
-/// into a suppressed repeat. If a full `seen` still called `insert` on a
-/// brand-new kind and got `true` back (as `ToolTracker`'s "refuse once full"
-/// does), every kind arriving after the cap would look "newly seen" FOREVER,
-/// since it would never actually be recorded — reintroducing, at the cap
-/// boundary, exactly the per-frame warn storm this function exists to stop.
-///
-/// So past this cap, a NEW kind is treated as an already-suppressed repeat
-/// instead: no `warn!`, no `AgentEvent::Diagnostic` reaching the caller, only
-/// a `trace!`. The cost is diagnostic SIGNAL, never real content — a
-/// legitimate agent's vocabulary of kinds this build doesn't map is a
-/// handful at most (this function's own Tier 3 doc), so only a buggy or
-/// adversarial agent minting a fresh kind string every frame would ever
-/// reach 64 distinct ones in one session, and that is precisely the runaway
-/// case this cap exists to bound rather than a session worth degrading for.
-const MAX_TRACKED_UPDATE_KINDS: usize = 64;
-
 pub(crate) fn session_update_once(
     seen: &mut HashSet<String>,
     params: &Value,
