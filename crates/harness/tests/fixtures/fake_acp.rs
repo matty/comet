@@ -76,13 +76,13 @@ fn read_line(stdin: &mut StdinLock<'_>) -> String {
 /// `authMethods` is deliberately EMPTY here. claude-agent-acp answers `[]`
 /// while codex-acp answers two entries, and the empty case is the one a plan's
 /// fixtures would never supply — so it is the one the fixture defaults to.
-fn initialize_result(steering: bool) -> Value {
+fn initialize_result(steering: bool, load_session: bool, image_capable: bool) -> Value {
     json!({
         "protocolVersion": 1,
         "agentInfo": {"name": "fake-acp", "title": "Fake ACP", "version": "0.0.0"},
         "agentCapabilities": {
-            "loadSession": true,
-            "promptCapabilities": {"image": false, "embeddedContext": true},
+            "loadSession": load_session,
+            "promptCapabilities": {"image": image_capable, "embeddedContext": true},
             "sessionCapabilities": {"resume": {}, "list": {}},
         },
         "authMethods": [],
@@ -94,6 +94,16 @@ fn main() {
     // Opt out of the steering extension to exercise the degraded path Hermes
     // takes: no `_session/steering`, so steering falls back to turn boundaries.
     let steering = std::env::var_os("FAKE_ACP_NO_STEERING").is_none();
+    // Both real agents in this corpus (Grok and Hermes) advertise
+    // `loadSession: true`, so that is the default here too; `FAKE_ACP_NO_
+    // LOAD_SESSION=1` poses the agent that never advertised it, for the
+    // negative resume gate.
+    let load_session = std::env::var_os("FAKE_ACP_NO_LOAD_SESSION").is_none();
+    // The opposite default from `load_session`: Grok's own captured reply
+    // answers `promptCapabilities.image: false`, so that is the default here;
+    // `FAKE_ACP_IMAGE_CAPABLE=1` poses an agent like Hermes that answers
+    // `true`.
+    let image_capable = std::env::var_os("FAKE_ACP_IMAGE_CAPABLE").is_some();
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
     // A vendor session-config surface on `session/new`, shaped from the grok
@@ -119,6 +129,17 @@ fn main() {
     // turn's `replay-stale` can echo it as a bogus early completion — the
     // shape the consumed-promptId dedup exists to reject.
     let mut last_prompt_id: Option<String> = None;
+    // **What PR7's run-fidelity tests prove was received**, not merely
+    // decoded: the client is the only one who can report what it was
+    // handed, so a `session/prompt` containing the `echo-selection` keyword
+    // reports these back as streamed text (see `handle_prompt`). Populated by
+    // `session/set_model`, `session/set_config_option` and `session/load`
+    // below — real production requests, sent by `AcpSession::open` before
+    // the first prompt, not frames a test wrote by hand.
+    let mut last_model_id: Option<String> = None;
+    let mut last_config: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut last_load_session_id: Option<String> = None;
 
     loop {
         let line = read_line(&mut stdin);
@@ -134,7 +155,8 @@ fn main() {
         match method.as_str() {
             "initialize" => {
                 emit(&json!({
-                    "jsonrpc": "2.0", "id": id, "result": initialize_result(steering),
+                    "jsonrpc": "2.0", "id": id,
+                    "result": initialize_result(steering, load_session, image_capable),
                 }));
                 // **An unsolicited notification, the way a real agent does.**
                 // grok 1.0.5 emits a burst of `_x.ai/*` frames right after the
@@ -172,7 +194,63 @@ fn main() {
                 }
                 emit(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
             }
-            "session/prompt" => pending_prompt = handle_prompt(&frame, &id, &mut last_prompt_id),
+            "session/prompt" => {
+                pending_prompt = handle_prompt(
+                    &frame,
+                    &id,
+                    &mut last_prompt_id,
+                    &last_model_id,
+                    &last_config,
+                    &last_load_session_id,
+                )
+            }
+            "session/set_model" => {
+                // The ACP org's own dedicated setter (`SetSessionModelRequest`:
+                // `{sessionId, modelId}`) -- Hermes' installed source
+                // implements exactly this (`hermes.rs::config_requests`'s doc
+                // comment).
+                last_model_id = frame["params"]["modelId"].as_str().map(str::to_owned);
+                emit(&json!({"jsonrpc": "2.0", "id": id, "result": {}}));
+            }
+            "session/set_config_option" => {
+                // The ACP org's own generic setter
+                // (`SetSessionConfigOptionSelectRequest`: `{sessionId,
+                // configId, value}`) -- the shape Grok's flat `category`-keyed
+                // option rows imply (`grok.rs::config_requests`'s doc
+                // comment). One entry per `configId`, so a later call for the
+                // same category (e.g. re-selecting effort) replaces rather
+                // than accumulates -- matching what a real setter does.
+                if let (Some(config_id), Some(value)) = (
+                    frame["params"]["configId"].as_str(),
+                    frame["params"]["value"].as_str(),
+                ) {
+                    last_config.insert(config_id.to_owned(), value.to_owned());
+                }
+                emit(&json!({
+                    "jsonrpc": "2.0", "id": id, "result": {"configOptions": []},
+                }));
+            }
+            "session/load" => {
+                // `LoadSessionRequest`'s own id is the resumed session --
+                // there is nothing to mint, unlike `session/new`. A
+                // `sessionId` containing `reject-load` poses the agent-side
+                // failure `a_failed_load_reports_rather_than_starting_fresh`
+                // needs: the id is real but the agent cannot resume it (an
+                // expired or evicted session, in practice).
+                let session_id = frame["params"]["sessionId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                if session_id.contains("reject-load") {
+                    emit(&json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32000, "message": "unknown session"},
+                    }));
+                } else {
+                    last_load_session_id = Some(session_id);
+                    emit(&json!({"jsonrpc": "2.0", "id": id, "result": {}}));
+                }
+            }
             "session/cancel" => {
                 // A cancel is a NOTIFICATION in ACP: it carries no id of its
                 // own and gets no reply. What settles is the in-flight
@@ -202,7 +280,14 @@ fn main() {
 /// Returns the prompt's id when it is left UNANSWERED, so `session/cancel` can
 /// settle it later. `None` means the turn was answered here and nothing is
 /// outstanding.
-fn handle_prompt(frame: &Value, id: &Value, last_prompt_id: &mut Option<String>) -> Option<Value> {
+fn handle_prompt(
+    frame: &Value,
+    id: &Value,
+    last_prompt_id: &mut Option<String>,
+    last_model_id: &Option<String>,
+    last_config: &std::collections::BTreeMap<String, String>,
+    last_load_session_id: &Option<String>,
+) -> Option<Value> {
     let session_id = frame["params"]["sessionId"]
         .as_str()
         .unwrap_or("fake-session-1");
@@ -215,6 +300,25 @@ fn handle_prompt(frame: &Value, id: &Value, last_prompt_id: &mut Option<String>)
             "params": {"sessionId": session_id, "update": payload},
         }));
     };
+
+    if text.contains("echo-selection") {
+        // **What was actually received, not what was decoded.** Everything
+        // here was set by a REAL `session/set_model` / `session/set_config_
+        // option` / `session/load` request this same process answered
+        // earlier -- see the doc comment on the state variables in `main`.
+        let echo = json!({
+            "model": last_model_id,
+            "config": last_config,
+            "load": last_load_session_id,
+            "images": image_block_count(frame),
+        });
+        update(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": echo.to_string()},
+        }));
+        emit(&json!({"jsonrpc": "2.0", "id": id, "result": {"stopReason": "end_turn"}}));
+        return None;
+    }
 
     if text.contains("ignore-cancel") {
         // Silent AND deaf: nothing is recorded as in-flight, so a later
@@ -376,4 +480,15 @@ fn prompt_text(frame: &Value) -> String {
                 .join(" ")
         })
         .unwrap_or_default()
+}
+
+/// How many `{"type": "image", ...}` blocks rode this prompt — what
+/// `echo-selection` reports back to prove (or disprove) that an attachment
+/// actually reached the wire, as opposed to merely being staged in the
+/// `RunRequest`.
+fn image_block_count(frame: &Value) -> usize {
+    frame["params"]["prompt"]
+        .as_array()
+        .map(|blocks| blocks.iter().filter(|b| b["type"] == "image").count())
+        .unwrap_or(0)
 }

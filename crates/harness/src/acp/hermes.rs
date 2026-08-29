@@ -38,12 +38,14 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use serde_json::{Value, json};
 
 use comet_proto::{
     AgentCommand, AgentEvent, HarnessCapabilities, HarnessId, HarnessProbe, InstallMethod, Model,
     ModelCatalog, RunRequest, RuntimeMode, SteeringMode,
 };
 
+use super::AgentDescription;
 use super::normalize;
 use super::session::{AcpSession, Discovered, Timeouts};
 use crate::discovery::{DiscoveredModel, Discovery, DiscoveryFailure};
@@ -182,6 +184,14 @@ fn models_from_discovery(discovered: &Discovered) -> Discovery {
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or_default();
+    // The handshake's own answer, agent-wide -- there is no per-model
+    // modality surface here either, but the agent as a whole DOES say:
+    // Hermes' real 2026-08-28 reply carries
+    // `agentCapabilities.promptCapabilities.image: true`. Read once and
+    // applied identically to every discovered row, the same propagation
+    // Grok's own `models_from_discovery` does.
+    let image_support =
+        AgentDescription::from_initialize(&discovered.initialized).image_attachments;
     Discovery {
         models: entries
             .iter()
@@ -194,14 +204,38 @@ fn models_from_discovery(discovered: &Discovered) -> Discovery {
                     // Hermes offers no effort ladder anywhere in its ACP
                     // surface -- see `HermesHarness::capabilities()`.
                     reasoning_levels: Vec::new(),
-                    // Per-model modality is not in this surface; `None` is
-                    // "Hermes did not say", which leaves the curated entry's
-                    // answer standing.
-                    accepts_images: None,
+                    accepts_images: image_support,
                     id,
                 })
             })
             .collect(),
+    }
+}
+
+/// What to send to apply the caller's model choice to a freshly opened
+/// session, as a single `session/set_model` request. **Hermes' own installed
+/// source implements the ACP spec's dedicated setter**
+/// (`acp_adapter/server.py:1882`, `set_session_model`, under its own comment
+/// "Model switching (ACP protocol method)") -- not the generic
+/// `session/set_config_option` Grok's flat option-list shape implies (see
+/// `grok::config_requests`'s doc comment for why that one fits Grok
+/// specifically). A source read, not a capture: no live turn ever reached a
+/// model choice on this machine (this module's header).
+///
+/// **No effort is ever sent, unconditionally.** `request.reasoning` is never
+/// read here at all -- Hermes advertises no effort ladder anywhere in its ACP
+/// surface (`HermesHarness::capabilities()`), and sending one anyway would be
+/// an error or silently ignored, both worse than not sending it.
+pub(crate) fn config_requests(
+    request: &RunRequest,
+    session_id: &str,
+) -> Vec<(&'static str, Value)> {
+    match &request.model {
+        Some(model) => vec![(
+            "session/set_model",
+            json!({"sessionId": session_id, "modelId": model}),
+        )],
+        None => Vec::new(),
     }
 }
 
@@ -430,7 +464,14 @@ impl Harness for HermesHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
         let command = run_launch(&exe, &request).command();
-        let session = AcpSession::open(command, &request.cwd, self.timeouts).await?;
+        let session = AcpSession::open(
+            command,
+            &request.cwd,
+            self.timeouts,
+            &request,
+            config_requests,
+        )
+        .await?;
         Ok(super::session::run(
             session,
             HarnessId::Hermes,
@@ -577,6 +618,30 @@ mod tests {
         assert!(
             models[0].reasoning_levels.is_empty(),
             "Hermes offers no per-model ladder either"
+        );
+    }
+
+    /// **The handshake's own answer, propagated.** There is no per-model
+    /// modality surface here either, but the agent as a whole DOES say --
+    /// hermes-agent 0.15.2's real captured `initialize` reply carries
+    /// `agentCapabilities.promptCapabilities.image: true` -- and every
+    /// discovered model now carries that same agent-wide answer, PR7 onward.
+    #[test]
+    fn discovered_models_carry_the_handshakes_image_capability() {
+        let discovered = Discovered {
+            initialized: json!({
+                "agentCapabilities": {"promptCapabilities": {"image": true}},
+            }),
+            session: json!({"models": {"availableModels": [
+                {"modelId": "openai:gpt-5.4-mini", "name": "gpt-5.4-mini"},
+            ]}}),
+            ..Default::default()
+        };
+        let models = models_from_discovery(&discovered).models;
+        assert_eq!(
+            models[0].accepts_images,
+            Some(true),
+            "the handshake said true, so the discovered row must carry that, not None"
         );
     }
 

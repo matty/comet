@@ -62,6 +62,14 @@ fn no_usage(_: &serde_json::Value, _: Option<u64>) -> Option<AgentEvent> {
     None
 }
 
+/// This suite drives the generic turn loop, not the model/effort/resume
+/// wiring PR7 adds (that is `acp_run_fidelity.rs`) — every `open*` helper
+/// below passes a bare request through `AcpSession::open`, so nothing here
+/// ever has a selection to apply.
+fn no_config(_: &RunRequest, _: &str) -> Vec<(&'static str, serde_json::Value)> {
+    Vec::new()
+}
+
 /// A `cancel_grace` long enough that giving up cannot be what ends a run
 /// inside `drain`'s own limit.
 ///
@@ -83,9 +91,15 @@ async fn open_with(no_steering: bool, timeouts: Timeouts) -> AcpSession {
     if no_steering {
         command.env("FAKE_ACP_NO_STEERING", "1");
     }
-    AcpSession::open(command, ".", timeouts)
-        .await
-        .expect("the fixture handshakes")
+    AcpSession::open(
+        command,
+        ".",
+        timeouts,
+        &RunRequest::for_session(RuntimeMode::default()),
+        no_config,
+    )
+    .await
+    .expect("the fixture handshakes")
 }
 
 /// Drain a run to its end, failing the test rather than hanging if it never
