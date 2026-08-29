@@ -60,6 +60,31 @@ use crate::{HarnessError, RunControls, StderrTail, shutdown_child};
 /// `HarnessId`.
 pub(crate) type UsageReader = fn(&Value, Option<u64>) -> Option<AgentEvent>;
 
+/// How a harness applies the caller's model choice to a freshly opened
+/// session: a list of extra JSON-RPC requests (method, params) to issue, in
+/// order, right after `session/new`/`session/load` and before the first
+/// prompt.
+///
+/// **Per-agent, injected by the caller, the same way [`UsageReader`] is** —
+/// see its own doc comment for why the choice stays out of this file rather
+/// than a `match` on [`HarnessId`] in disguise. `grok::config_requests` and
+/// `hermes::config_requests` are the two implementations, and each names its
+/// evidence in its own doc comment.
+///
+/// **Both agents turned out to send the identical single call,
+/// `session/set_model`, and neither sends effort at all** — a live probe
+/// against grok 1.0.5 corrected an earlier design that assumed the two
+/// disagreed (`grok::config_requests`'s own doc comment carries the
+/// correction). The type is still per-agent rather than one shared
+/// constant: that agreement is a fact about these two CLIs today, not a
+/// guarantee the next ACP agent registered here shares it.
+///
+/// Plain data rather than an async closure: building the params from
+/// `RunRequest` needs no I/O, so the async mechanics of actually sending each
+/// request stay here, shared, and a vendor function stays a pure decode-style
+/// mapping — the same discipline `UsageReader` already keeps.
+pub(crate) type ConfigRequests = fn(&RunRequest, &str) -> Vec<(&'static str, Value)>;
+
 /// The timeouts the loop is built from. A struct rather than four arguments so
 /// a test can shrink them without every call site naming all four.
 #[derive(Clone, Copy, Debug)]
@@ -69,6 +94,17 @@ pub struct Timeouts {
     /// and then says nothing is indistinguishable from a hang, and the rule in
     /// `.agents/rules/user-facing-errors.md` is that no waiting state lasts
     /// forever.
+    ///
+    /// **PR7 widened what this bounds without widening the value**:
+    /// `session/load` (the resume path, in place of `session/new`) and every
+    /// `config_requests` call (`session/set_model`, today) all sit under
+    /// this same duration — see [`open_or_resume`] and [`AcpSession::open`].
+    /// That matters most for `session/load`: a value sized for an empty
+    /// handshake may be too tight for an agent replaying a long transcript
+    /// back into a resumed session, which is a real risk this build has not
+    /// measured against either agent (`open_or_resume`'s own doc comment
+    /// records why: the live check never got past the free-quota rate
+    /// limit).
     pub handshake: Duration,
     /// After `session/cancel`, how long the agent gets to settle the in-flight
     /// prompt with `stopReason: "cancelled"` before the loop stops waiting and
@@ -138,10 +174,21 @@ impl AcpSession {
     /// `command` is built by the caller because the launch line is per-agent
     /// (grok's four tokens are not codex-acp's `node <entry>`), and because
     /// production and the capture recorder must derive it from the same place.
+    ///
+    /// `request` and `config_requests` are what make this the RUN path rather
+    /// than discovery: `request.resume`, gated on `agentCapabilities.loadSession`
+    /// (see [`open_or_resume`]), and `request.model`, applied through
+    /// `config_requests` right after the session opens and before the first
+    /// prompt. `request.reasoning` is NOT applied here — no agent registered
+    /// today has a working ACP setter for it (`grok::config_requests`'s doc
+    /// comment has the evidence). Discovery never needs either — see
+    /// [`Self::open_for_discovery`], which stays on plain `session/new`.
     pub async fn open(
         command: Command,
         cwd: &str,
         timeouts: Timeouts,
+        request: &RunRequest,
+        config_requests: ConfigRequests,
     ) -> Result<Self, HarnessError> {
         let Connected {
             mut child,
@@ -152,33 +199,36 @@ impl AcpSession {
         } = connect(command, timeouts).await?;
         let agent = AgentDescription::from_initialize(&initialized);
 
-        let opened = match with_timeout(
-            timeouts.handshake,
-            "session/new",
-            client.request("session/new", new_session_params(cwd)),
-        )
-        .await
-        {
-            Ok(opened) => opened,
-            Err(error) => {
-                // The handshake succeeded and this did not, so a live child is
-                // holding stdio nobody will read again. `kill_on_drop` would
-                // reach it eventually, but only once every clone of the client
-                // is dropped too — reap it here instead of leaving the timing
-                // to drop order.
+        let (opened, session_id) =
+            match open_or_resume(&client, cwd, request, &agent, timeouts).await {
+                Ok(pair) => pair,
+                Err(error) => {
+                    // The handshake succeeded and this did not, so a live child is
+                    // holding stdio nobody will read again. `kill_on_drop` would
+                    // reach it eventually, but only once every clone of the client
+                    // is dropped too — reap it here instead of leaving the timing
+                    // to drop order.
+                    shutdown_child(&mut child, timeouts.kill_grace).await;
+                    return Err(error);
+                }
+            };
+
+        // **The caller's model/effort choice, applied before anything else can
+        // run.** A failure here is reported rather than swallowed — the whole
+        // point of this PR is that the picker's selection has to reach the
+        // agent or be reported, never silently drop to the agent's own
+        // default. `config_requests` is what decides whether there is
+        // anything to send at all: Hermes' own implementation never produces
+        // an effort entry, which is how "an agent without an effort ladder is
+        // sent no effort" is actually kept rather than merely documented.
+        for (method, params) in config_requests(request, &session_id) {
+            if let Err(error) =
+                with_timeout(timeouts.handshake, method, client.request(method, params)).await
+            {
                 shutdown_child(&mut child, timeouts.kill_grace).await;
                 return Err(error);
             }
-        };
-        let session_id = match opened["sessionId"].as_str() {
-            Some(id) => id.to_owned(),
-            None => {
-                shutdown_child(&mut child, timeouts.kill_grace).await;
-                return Err(HarnessError::Protocol(
-                    "session/new answered without a sessionId".into(),
-                ));
-            }
-        };
+        }
 
         Ok(Self {
             child,
@@ -279,6 +329,110 @@ impl AcpSession {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+}
+
+/// `session/new` or `session/load`, whichever the request and the agent's own
+/// advertised capability actually call for — and the session id that goes
+/// with whichever one ran.
+///
+/// **Resume is gated on `agent.supports_load_session`, not merely on
+/// `request.resume` being present.** Sending `session/load` to an agent that
+/// never advertised `agentCapabilities.loadSession` is a protocol error the
+/// user sees for a feature they did not ask for (PR7's task brief, Step 2) —
+/// so an unsupported agent silently falls back to a fresh session instead,
+/// same as if `resume` had never been set. A REQUESTED load that the agent
+/// DOES advertise but then fails is different: that is reported as an error
+/// rather than silently starting fresh, because a resumed chat that silently
+/// begins empty loses the user's context with no signal at all.
+///
+/// `session/load`'s own reply carries no `sessionId` (the ACP org's own
+/// `LoadSessionResponse` schema has none — ours is already known, it is the
+/// id being resumed), unlike `session/new`'s, which is where the returned pair
+/// is read from.
+///
+/// **Known limitation: a resumed session reports no context window.**
+/// `AcpSession::open` reads `context_window` from whichever `Value` this
+/// function returns as `opened` — `normalize::context_window` expects
+/// `models.currentModelId` / `models.availableModels[]._meta.totalContextTokens`,
+/// the shape `session/new` answers with. Neither the ACP org's own
+/// `LoadSessionResponse` schema nor anything captured live says `session/load`
+/// answers the same shape (`fake-acp`'s own handler answers `{}`, and no real
+/// agent's reply was ever obtained — the live check here got only as far as
+/// the free-quota rate limit before a real `session/load` could be sent with
+/// a payload worth reading). Until that is established, every resumed run
+/// degrades to `context_window: None` — the usage meter reads "not measured"
+/// rather than showing real occupancy — which is the honest reading of an
+/// unread field, not a silent loss, but it IS a real gap: `usage_reader`
+/// callers on a resumed session cannot draw a ceiling. Whoever gets a real
+/// `session/load` reply to inspect (Grok's quota window, or a configured
+/// Hermes) should check for a `models` block or equivalent before assuming
+/// this stays `None` by design rather than by never having looked.
+async fn open_or_resume(
+    client: &RpcClient,
+    cwd: &str,
+    request: &RunRequest,
+    agent: &AgentDescription,
+    timeouts: Timeouts,
+) -> Result<(Value, String), HarnessError> {
+    match request.resume.as_deref() {
+        Some(resume_id) if agent.supports_load_session => {
+            match with_timeout(
+                timeouts.handshake,
+                "session/load",
+                client.request("session/load", super::load_session_params(resume_id, cwd)),
+            )
+            .await
+            {
+                Ok(opened) => Ok((opened, resume_id.to_owned())),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "comet_harness::acp",
+                        session_id = resume_id,
+                        %error,
+                        "session/load failed; reporting rather than starting a fresh session"
+                    );
+                    Err(HarnessError::Protocol(
+                        "could not resume the previous session".into(),
+                    ))
+                }
+            }
+        }
+        Some(resume_id) => {
+            // Requested, but this agent never advertised `loadSession` — fall
+            // back to a fresh session rather than sending a method the agent
+            // has no handler for.
+            tracing::debug!(
+                target: "comet_harness::acp",
+                session_id = resume_id,
+                "resume requested but this agent does not advertise loadSession; opening fresh"
+            );
+            open_new(client, cwd, timeouts).await
+        }
+        None => open_new(client, cwd, timeouts).await,
+    }
+}
+
+async fn open_new(
+    client: &RpcClient,
+    cwd: &str,
+    timeouts: Timeouts,
+) -> Result<(Value, String), HarnessError> {
+    let opened = with_timeout(
+        timeouts.handshake,
+        "session/new",
+        client.request("session/new", new_session_params(cwd)),
+    )
+    .await?;
+    // The borrow of `opened["sessionId"]` ends here, at `.to_owned()` — so
+    // `opened` itself can move into the `Ok` below without a full-JSON clone
+    // just to outlive a `&str` that no longer exists by the time it matters.
+    let session_id = opened["sessionId"].as_str().map(str::to_owned);
+    match session_id {
+        Some(id) => Ok((opened, id)),
+        None => Err(HarnessError::Protocol(
+            "session/new answered without a sessionId".into(),
+        )),
     }
 }
 
@@ -476,7 +630,7 @@ async fn run_session(
         client,
         mut incoming,
         stderr_tail,
-        agent: _agent,
+        agent,
         session_id,
         context_window,
         timeouts,
@@ -513,6 +667,21 @@ async fn run_session(
     }
 
     let mut prompt = request.prompt.clone();
+    // The staged attachments, loaded ONCE and only if the agent advertised
+    // `promptCapabilities.image` — an unadvertised agent gets the text block
+    // alone (the path refs already ride `request.prompt` itself, added
+    // upstream of the harness; see `crates/ui/src/attachments.rs`).
+    let loaded_images = if agent.supports_image_attachments() {
+        crate::claude::load_image_blocks(&request.attachments).await
+    } else {
+        Vec::new()
+    };
+    // `Option` rather than the plain `Vec` above because it is spent on the
+    // FIRST turn only: a steer carries no attachments of its own
+    // (`SteerMessage` has no such field), and re-sending the run's original
+    // images on every later turn would attach files the user never staged
+    // for that message.
+    let mut first_turn_images = Some(loaded_images);
     // One tracker for the SESSION, not per turn: a tool announced in one turn
     // and completed in the next would otherwise lose its announcement.
     let mut tools = normalize::ToolTracker::default();
@@ -543,6 +712,9 @@ async fn run_session(
         // what the wire does carry), so the turn boundary IS the boundary
         // this build can honestly mark.
         let mut streamed_this_turn = false;
+        // Spent on the first pass only — see `first_turn_images`'s own
+        // comment above.
+        let turn_images = first_turn_images.take().unwrap_or_default();
         let end = drive_turn(
             &mut Turn {
                 client: &client,
@@ -560,6 +732,7 @@ async fn run_session(
                 prompt_completions: &mut prompt_completions,
             },
             &prompt,
+            &turn_images,
         )
         .await;
 
@@ -756,7 +929,11 @@ struct Turn<'a> {
 const PROMPT_COMPLETE_METHOD: &str = concat!("_x.ai/ses", "sion/prompt_complete");
 
 /// One `session/prompt`, from send to `stopReason`.
-async fn drive_turn(turn: &mut Turn<'_>, prompt: &str) -> TurnEnd {
+async fn drive_turn(
+    turn: &mut Turn<'_>,
+    prompt: &str,
+    images: &[crate::claude::wire::ImageBlock],
+) -> TurnEnd {
     let Turn {
         client,
         incoming,
@@ -797,7 +974,7 @@ async fn drive_turn(turn: &mut Turn<'_>, prompt: &str) -> TurnEnd {
         }
     }
 
-    let reply = client.request("session/prompt", prompt_params(session_id, prompt));
+    let reply = client.request("session/prompt", prompt_params(session_id, prompt, images));
     tokio::pin!(reply);
 
     // Absolute, so re-creating the sleep on each loop pass does not extend it.
@@ -1102,7 +1279,7 @@ mod tests {
     /// as a bare string, which every recorded agent rejects.
     #[test]
     fn a_prompt_is_an_array_of_content_blocks() {
-        let params = prompt_params("s-1", "hello");
+        let params = prompt_params("s-1", "hello", &[]);
         assert_eq!(params["sessionId"], "s-1");
         let blocks = params["prompt"].as_array().expect("prompt is an array");
         assert_eq!(blocks.len(), 1);

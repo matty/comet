@@ -306,7 +306,7 @@ pub(in crate::capture::record) async fn run(
         .send(&rpc_request(
             prompt_id,
             "session/prompt",
-            crate::acp::prompt_params(&session_id, &request.prompt),
+            crate::acp::prompt_params(&session_id, &request.prompt, &[]),
         ))
         .await?;
     session.wait_for_turn_end().await
@@ -378,7 +378,7 @@ pub(in crate::capture::record) async fn steer(
         .send(&rpc_request(
             first_id,
             "session/prompt",
-            crate::acp::prompt_params(&session_id, &request.prompt),
+            crate::acp::prompt_params(&session_id, &request.prompt, &[]),
         ))
         .await?;
     session.wait_for_turn_end().await?;
@@ -388,7 +388,7 @@ pub(in crate::capture::record) async fn steer(
         .send(&rpc_request(
             steer_id,
             "session/prompt",
-            crate::acp::prompt_params(&session_id, STEER_MESSAGE),
+            crate::acp::prompt_params(&session_id, STEER_MESSAGE, &[]),
         ))
         .await?;
     session.wait_for_turn_end().await

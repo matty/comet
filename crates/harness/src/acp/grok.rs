@@ -17,18 +17,51 @@
 //! vendor-namespaced and it spells the effort ladder `category: "mode"` — a
 //! word another vendor's adapters use for a PERMISSION mode. Reading one shared
 //! shape across the four would find nothing, or the wrong thing.
+//!
+//! **No effort setter was found among the methods tried, verified by
+//! probing the real CLI directly (raw JSON-RPC over stdio, grok 1.0.5,
+//! 2026-08-29) — not inferred.** `session/set_config_option`, the generic
+//! ACP setter whose params shape (`configId` + `value`) matches Grok's flat
+//! `category`-keyed option rows, answers `-32601 Method not found`: the
+//! method is not registered at all. `session/set_mode` — the ACP spec's own
+//! approval-style mode setter — DOES answer, but with `{}` for EVERY
+//! `modeId` tried, including a deliberately invalid one
+//! (`"not-a-real-mode-xyz"`); a setter that succeeds on garbage input is not
+//! validating anything, so a success reply from it is not evidence it did
+//! anything. Only `session/set_model` (the ACP spec's own dedicated,
+//! unstable method) turned out to be real: it rejects an unknown id
+//! (`-32602 Invalid params: unknown model id`) and accepts a real one
+//! (`{"_meta": {"model": {"Ok": "<id>"}}}`). [`config_requests`] is built on
+//! exactly that finding, not on the `SetSessionConfigOptionSelectRequest`
+//! shape an earlier version of this function inferred from the ACP org's
+//! reference SDK — see its own doc comment for the correction and the task
+//! report for the full probe transcript.
+//!
+//! **This is absence of evidence for the two methods a generic ACP client
+//! could plausibly reach for, not proof no mechanism exists anywhere.** A
+//! vendor `_x.ai/*` setter is plausible — Grok already speaks the vendor
+//! completion notification this module names `PROMPT_COMPLETE_METHOD` (see
+//! `session.rs`) on this exact build — and so is passing the selection
+//! inside `session/new`'s own `_meta`, neither of which this probe tried.
+//! Sending nothing is still the right call either way: a guess at an
+//! untried vendor method is no better evidenced than the two that turned
+//! out not to work. `scripts/probe-acp-setters.py` (committed, not just
+//! prose in a task report) is the script that produced the transcript
+//! above; re-run it against a newer Grok build before assuming this finding
+//! still holds.
 
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use comet_proto::{
     AgentCommand, AgentEvent, HarnessCapabilities, HarnessId, HarnessProbe, InstallMethod, Model,
     ModelCatalog, ReasoningLevel, RunRequest, RuntimeMode, SteeringMode,
 };
 
+use super::AgentDescription;
 use super::normalize;
 use super::session::{AcpSession, Discovered, Timeouts};
 use crate::discovery::{DiscoveredModel, Discovery, DiscoveryFailure};
@@ -231,6 +264,15 @@ fn models_from_discovery(discovered: &Discovered) -> Discovery {
     };
 
     let shared_ladder = ladder_from_config(session);
+    // The handshake's own answer, agent-wide — there is no per-model modality
+    // surface for Grok (checked above), but there IS now a readable one for
+    // the agent as a whole: `agentCapabilities.promptCapabilities.image`. Read
+    // once outside the closure below and applied identically to every model,
+    // rather than left `None` the way an unreadable per-model field would be —
+    // "the agent did not say" and "we never looked" are different, and Grok's
+    // real 2026-08-28 reply DOES say (`false`).
+    let image_support =
+        AgentDescription::from_initialize(&discovered.initialized).image_attachments;
     let build = |id: String, label: Option<&str>| {
         let extra = detail_for(&id);
         let per_model = extra.map(efforts_of).unwrap_or_default();
@@ -248,10 +290,7 @@ fn models_from_discovery(discovered: &Discovered) -> Discovery {
             } else {
                 per_model
             },
-            // Per-model modality is in neither surface; the handshake's
-            // `promptCapabilities` is agent-wide. `None` is "the provider did
-            // not say", which leaves the curated entry's answer standing.
-            accepts_images: None,
+            accepts_images: image_support,
             id,
         }
     };
@@ -331,6 +370,46 @@ fn effort_from_id(id: &str) -> Option<ReasoningLevel> {
         "high" => Some(ReasoningLevel::High),
         "xhigh" => Some(ReasoningLevel::XHigh),
         _ => None,
+    }
+}
+
+/// What to send to apply the caller's model choice to a freshly opened
+/// session, as a single `session/set_model` request.
+///
+/// **Verified live against grok 1.0.5 on 2026-08-29 — and it corrects an
+/// earlier, wrong design.** A first version of this function sent
+/// `session/set_config_option` with `configId` set to the row's own
+/// `category` (`"model"` or `"mode"`), inferred from the ACP org's reference
+/// SDK schema (`SetSessionConfigOptionSelectRequest`) because Grok's session
+/// config is shaped like exactly that: a flat `category`-keyed list of rows,
+/// each carrying `id` and `selected`. **A raw JSON-RPC probe against the real
+/// CLI proved that inference wrong**: `session/set_config_option` answers
+/// `-32601 Method not found` — the method is not registered at all, not
+/// merely rejecting the params. `session/set_model` (the ACP spec's own
+/// dedicated, unstable method — the same one Hermes' installed source
+/// implements) DOES work: it validates its `modelId` (an unknown id answers
+/// `-32602 Invalid params: unknown model id`, a real model id answers
+/// `{"_meta": {"model": {"Ok": "<id>"}}}`) and is what actually changes the
+/// session's model.
+///
+/// **No effort setter was found among the methods tried — see this
+/// module's own doc comment above ("No effort setter was found among the
+/// methods tried") for the fuller account, what was tried, and what was
+/// NOT.** `request.reasoning` is therefore never read here, the same as
+/// Hermes' `config_requests`, though for a different underlying reason:
+/// Hermes never had an effort ladder to begin with, while Grok's ladder is
+/// real (`REASONING_LEVELS`, shown in the picker) but has no ACP setter this
+/// build's probe could find.
+pub(crate) fn config_requests(
+    request: &RunRequest,
+    session_id: &str,
+) -> Vec<(&'static str, Value)> {
+    match &request.model {
+        Some(model) => vec![(
+            "session/set_model",
+            json!({"sessionId": session_id, "modelId": model}),
+        )],
+        None => Vec::new(),
     }
 }
 
@@ -553,7 +632,14 @@ impl Harness for GrokHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
         let command = run_launch(&exe, &request).command();
-        let session = AcpSession::open(command, &request.cwd, self.timeouts).await?;
+        let session = AcpSession::open(
+            command,
+            &request.cwd,
+            self.timeouts,
+            &request,
+            config_requests,
+        )
+        .await?;
         Ok(super::session::run(
             session,
             HarnessId::Grok,
@@ -600,6 +686,13 @@ mod tests {
         Discovered {
             initialized: json!({
                 "protocolVersion": 1,
+                // `agentCapabilities.promptCapabilities.image: false`, exactly
+                // as grok 1.0.5 answered on 2026-08-28 — the PR7 addition this
+                // fixture omitted at PR1 time, when nothing yet read it.
+                "agentCapabilities": {
+                    "loadSession": true,
+                    "promptCapabilities": {"image": false, "audio": false, "embeddedContext": true},
+                },
                 "_meta": {"agentVersion": "1.0.5", "modelState": {
                     "currentModelId": "grok-4.6",
                     "availableModels": [{"modelId": "grok-4.6", "name": "Grok 4.6"}],
@@ -655,8 +748,12 @@ mod tests {
             "efforts keep the order the agent listed them in"
         );
         assert_eq!(
-            model.accepts_images, None,
-            "per-model modality is in neither surface; None means the agent did not say"
+            model.accepts_images,
+            Some(false),
+            "no per-model modality surface exists, but the handshake's own \
+             agentCapabilities.promptCapabilities.image DOES say (false, on the \
+             real 2026-08-28 reply) -- that agent-wide answer is what every \
+             discovered model now carries, PR7 onward"
         );
     }
 
