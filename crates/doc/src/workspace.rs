@@ -264,6 +264,7 @@ impl WorkspaceDoc {
         )?;
         set_opt_str(&row, "spaceId", chat.space_id.as_deref())?;
         set_opt_ms(&row, "lastSeenAt", chat.last_seen_at)?;
+        row.insert("titleManual", chat.title_manual)?;
         self.doc.commit();
         Ok(())
     }
@@ -340,11 +341,53 @@ impl WorkspaceDoc {
         Ok(chats)
     }
 
-    /// LWW title set from any device. `false` when no such row.
+    /// LWW title set from any device, **user-driven** (the `RenameChat` RPC a
+    /// person triggers from the UI). Always wins and always locks: stamps
+    /// `titleManual` so [`Self::rename_chat_auto`] can never overwrite it
+    /// again. `false` when no such row.
     pub fn rename_chat(&self, chat_id: &str, title: &str) -> Result<bool, DocError> {
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
+        row.insert("title", title)?;
+        row.insert("titleManual", true)?;
+        self.doc.commit();
+        Ok(true)
+    }
+
+    /// System-authored title set: Comet's own auto-titling model run
+    /// (`comet_engine::titles::TitleGenerator::generate`), or an ACP agent's
+    /// self-reported title (`AgentEvent::SessionTitled`,
+    /// `TitleGenerator::apply_agent_title`). `false`, with nothing written,
+    /// when the row does not exist, the chat's title is locked
+    /// (`titleManual` — the guard that stands between a title the user chose
+    /// by hand and a provider or a model run silently replacing it), OR the
+    /// chat already has ANY title.
+    ///
+    /// **First-writer wins, deliberately, even between two system writers.**
+    /// Comet's own model-run titling and an agent's self-reported title race
+    /// each other exactly once, on an untitled chat, and whichever lands
+    /// first keeps it — an agent revising its OWN earlier title on a later
+    /// `session_info_update` is refused the same way. This is the same
+    /// stability argument the policy is chosen for in the first place (a
+    /// title changing under the user mid-read is worse than a slightly worse
+    /// title): that argument does not stop applying just because the second
+    /// write comes from the same source as the first.
+    pub fn rename_chat_auto(&self, chat_id: &str, title: &str) -> Result<bool, DocError> {
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(false);
+        };
+        let locked = matches!(
+            row.get("titleManual"),
+            Some(loro::ValueOrContainer::Value(LoroValue::Bool(true)))
+        );
+        let already_titled = matches!(
+            row.get("title"),
+            Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if !s.trim().is_empty()
+        );
+        if locked || already_titled {
+            return Ok(false);
+        }
         row.insert("title", title)?;
         self.doc.commit();
         Ok(true)
@@ -696,6 +739,8 @@ struct RawChat {
     space_id: Option<String>,
     #[serde(default)]
     last_seen_at: Option<i64>,
+    #[serde(default)]
+    title_manual: bool,
 }
 
 impl From<RawChat> for Chat {
@@ -716,6 +761,7 @@ impl From<RawChat> for Chat {
             harness_session_cwd: raw.harness_session_cwd,
             space_id: raw.space_id,
             last_seen_at: raw.last_seen_at.map(dt),
+            title_manual: raw.title_manual,
         }
     }
 }
@@ -805,6 +851,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
+            title_manual: false,
         }
     }
 
@@ -991,6 +1038,102 @@ mod tests {
         let dev = &ws.read_devices().unwrap()[0];
         assert_eq!(dev.name, "workstation");
         assert_eq!(dev.last_seen_at, Some(ts(6_000)));
+    }
+
+    /// Question 2's falsification — the guard that matters most. A title the
+    /// user set by hand (`rename_chat`) must never be overwritten by a
+    /// provider or Comet's own auto-titling model run (`rename_chat_auto`).
+    #[test]
+    fn rename_chat_locks_the_title_against_rename_chat_auto() {
+        let ws = WorkspaceDoc::new();
+        ws.upsert_device(&device("dev-a", "laptop")).unwrap();
+        let mut untitled = chat("chat-1", "dev-a");
+        untitled.title = None;
+        ws.upsert_chat(&untitled).unwrap();
+
+        // A person renames the chat by hand.
+        assert!(ws.rename_chat("chat-1", "My Own Title").unwrap());
+        assert!(ws.chat("chat-1").unwrap().unwrap().title_manual);
+
+        let wrote = ws.rename_chat_auto("chat-1", "Agent's Guess").unwrap();
+        assert!(!wrote, "rename_chat_auto must refuse a title-locked chat");
+        assert_eq!(
+            ws.chat("chat-1").unwrap().unwrap().title.as_deref(),
+            Some("My Own Title"),
+            "a hand-renamed chat must keep the user's title"
+        );
+    }
+
+    /// The SAME guard, isolated from `rename_chat_auto`'s other guard
+    /// ("does the chat already have a title") so this test can only pass
+    /// because `titleManual` itself blocked the write. A manual rename to an
+    /// EMPTY title still locks: `title_manual` is true, but `title` reads as
+    /// empty, so `already_titled` alone would let the write through — if
+    /// this test passed with the `titleManual` check deleted, it would prove
+    /// nothing, because `rename_chat_locks_the_title_against_rename_chat_auto`
+    /// above has a non-empty title and both guards fire together there.
+    #[test]
+    fn the_manual_lock_alone_blocks_rename_chat_auto_even_with_no_title_to_protect() {
+        let ws = WorkspaceDoc::new();
+        ws.upsert_device(&device("dev-a", "laptop")).unwrap();
+        let mut untitled = chat("chat-1", "dev-a");
+        untitled.title = None;
+        ws.upsert_chat(&untitled).unwrap();
+
+        // A person clears the chat's title by hand — title_manual is set,
+        // but the title itself reads as empty.
+        assert!(ws.rename_chat("chat-1", "").unwrap());
+        let locked = ws.chat("chat-1").unwrap().unwrap();
+        assert!(locked.title_manual);
+        assert!(locked.title.as_deref().unwrap_or("").is_empty());
+
+        let wrote = ws.rename_chat_auto("chat-1", "Agent's Guess").unwrap();
+        assert!(
+            !wrote,
+            "titleManual alone must block rename_chat_auto, with no title present to make \
+             the already-titled guard fire too"
+        );
+        assert!(
+            ws.chat("chat-1")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref()
+                .unwrap_or("")
+                .is_empty(),
+            "the empty manual title must survive untouched"
+        );
+    }
+
+    /// Question 1's policy: first-writer wins, even between two system
+    /// writers (Comet's own model-run titling and an agent's self-reported
+    /// title) — and even against a later revision from the SAME writer. A
+    /// manual rename still overrides an auto-titled chat afterward.
+    #[test]
+    fn rename_chat_auto_is_first_writer_wins() {
+        let ws = WorkspaceDoc::new();
+        ws.upsert_device(&device("dev-a", "laptop")).unwrap();
+        let mut untitled = chat("chat-1", "dev-a");
+        untitled.title = None;
+        ws.upsert_chat(&untitled).unwrap();
+
+        assert!(ws.rename_chat_auto("chat-1", "First Title").unwrap());
+        let wrote_again = ws.rename_chat_auto("chat-1", "Second Title").unwrap();
+        assert!(
+            !wrote_again,
+            "a second automatic write must not overwrite the first"
+        );
+        assert_eq!(
+            ws.chat("chat-1").unwrap().unwrap().title.as_deref(),
+            Some("First Title")
+        );
+
+        // A manual rename still wins over an already auto-titled chat.
+        assert!(ws.rename_chat("chat-1", "Renamed By Hand").unwrap());
+        assert_eq!(
+            ws.chat("chat-1").unwrap().unwrap().title.as_deref(),
+            Some("Renamed By Hand")
+        );
     }
 
     #[test]

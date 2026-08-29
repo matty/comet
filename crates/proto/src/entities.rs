@@ -129,6 +129,17 @@ pub struct Chat {
     /// device clears the badge everywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<DateTime<Utc>>,
+    /// Set only by a user-driven rename (`RenameChat`, the RPC a person
+    /// triggers from the UI) — `WorkspaceDoc::rename_chat` stamps it, never
+    /// `rename_chat_auto`. The one guard standing between a title the user
+    /// chose and an automatic one overwriting it: not "does this chat already
+    /// have a title" (true of every auto-titled chat too, and would block a
+    /// self-titling agent from ever refining its own title) but "did a
+    /// PERSON set this one". A new field, additive, so it stays unlocked by
+    /// default on a chat row written before it existed — see
+    /// `PROTOCOL_VERSION`'s doc comment on why a new field never bumps it.
+    #[serde(default)]
+    pub title_manual: bool,
 }
 
 impl Chat {

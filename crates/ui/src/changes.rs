@@ -3458,6 +3458,7 @@ rename to new_name.rs
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
+            title_manual: false,
         }
     }
 
