@@ -60,6 +60,25 @@ pub enum HarnessError {
     /// agent's wire.
     #[error("{summary}. {hint}")]
     NeedsSetup { summary: String, hint: String },
+    /// The agent opened a session and then refused a SETTING sent with it —
+    /// today only `session/set_model`, from `acp::session::AcpSession::open`'s
+    /// `config_requests` loop.
+    ///
+    /// **A separate variant from `NeedsSetup`, because the user's next action
+    /// is different.** `NeedsSetup` means "go do one more thing in the agent's
+    /// own CLI"; this means "pick something else in the picker". The two would
+    /// otherwise share a variant and differ only in wording, which is the test
+    /// `hermes::map_open_failure`'s doc comment applies when it declines to
+    /// add one.
+    ///
+    /// Its reason for existing at all is D119: that loop returned the
+    /// provider's own JSON-RPC message verbatim (`HarnessError::Protocol`,
+    /// built by `RpcClient::request`), and `drive_run` renders it to the user
+    /// close to as-is — Grok answers `session/set_model: Invalid params:
+    /// unknown model id`. `.agents/rules/user-facing-errors.md` RULE 1 forbids
+    /// exactly that. The raw text is warn-logged at the refusal instead.
+    #[error("{summary}. {hint}")]
+    SettingRefused { summary: String, hint: String },
 }
 
 /// A steer prompt pushed into a live run; delivered at the harness's steering boundary.

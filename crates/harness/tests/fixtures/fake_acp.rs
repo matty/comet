@@ -148,6 +148,7 @@ fn main() {
     // `session/set_model`, `session/set_config_option` and `session/load`
     // below — real production requests, sent by `AcpSession::open` before
     // the first prompt, not frames a test wrote by hand.
+    let mut last_cwd = String::new();
     let mut last_model_id: Option<String> = None;
     let mut last_config: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
@@ -241,6 +242,10 @@ fn main() {
                 // against a real child process, not by calling a mapper
                 // function directly.
                 let cwd = frame["params"]["cwd"].as_str().unwrap_or_default();
+                // Kept for `session/set_model` below: the setter's own params
+                // carry no cwd, so the trigger has to be remembered from the
+                // call that did.
+                last_cwd = cwd.to_owned();
                 if cwd.contains("needs-setup") {
                     emit(&json!({
                         "jsonrpc": "2.0", "id": id,
@@ -286,6 +291,22 @@ fn main() {
                 )
             }
             "session/set_model" => {
+                // A `cwd` containing `refuse-set-model` poses the agent that
+                // opens a session and then rejects the model Comet selected —
+                // Grok's real shape when the picker's curated or cached id is
+                // not on the account's live list (`grok.rs`'s own doc names
+                // the wire text). Drives D119's path end to end: the raw
+                // message below must NOT be what the caller reports.
+                if last_cwd.contains("refuse-set-model") {
+                    emit(&json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {
+                            "code": -32602,
+                            "message": "Invalid params: unknown model id",
+                        },
+                    }));
+                    continue;
+                }
                 // The ACP org's own dedicated setter (`SetSessionModelRequest`:
                 // `{sessionId, modelId}`) -- Hermes' installed source
                 // implements exactly this (`hermes.rs::config_requests`'s doc

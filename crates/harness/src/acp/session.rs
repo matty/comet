@@ -290,8 +290,23 @@ impl AcpSession {
             if let Err(error) =
                 with_timeout(timeouts.handshake, method, client.request(method, params)).await
             {
+                // **The raw text stops here** (D119). `error` is
+                // `HarnessError::Protocol`, built by `RpcClient::request` from
+                // the provider's own JSON-RPC message — Grok answers
+                // `session/set_model: Invalid params: unknown model id` — and
+                // `drive_run`'s sink renders a `HarnessError` to the user
+                // close to as-is, which is RULE 1 in
+                // `.agents/rules/user-facing-errors.md`. Logged here because
+                // this is the last place that holds it: the diagnosis is the
+                // thing worth keeping, just not on screen.
+                tracing::warn!(
+                    target: "comet_harness::acp",
+                    method,
+                    %error,
+                    "the agent refused a session setting"
+                );
                 shutdown_child(&mut child, timeouts.kill_grace).await;
-                return Err(error);
+                return Err(setting_refused(method));
             }
         }
 
@@ -673,6 +688,43 @@ fn check_protocol_version(result: &Value) -> Result<(), HarnessError> {
             "this agent speaks ACP v{other}, and Comet speaks v{}",
             super::PROTOCOL_VERSION
         ))),
+    }
+}
+
+/// What the user sees when the agent refuses a setting sent with the session.
+///
+/// **Keyed on the method, not on the agent's message.** The message is the
+/// thing that must not reach a surface (D119), and the method is Comet's own
+/// string — so it can be read without quoting anything the provider wrote.
+/// Every arm names an action the user can actually take, per
+/// `.agents/rules/user-facing-errors.md`: the summary is a label, the hint is
+/// the action, and neither says "harness" or names a wire method.
+fn setting_refused(method: &str) -> HarnessError {
+    match method {
+        "session/set_model" | "session/set_config_option" => HarnessError::SettingRefused {
+            summary: "Model refused".into(),
+            // `concat!` rather than a backslash-continued literal: rustfmt
+            // rejoins those onto one line and the continuation indentation
+            // becomes a run of real spaces inside the sentence — invisible in
+            // the source, and it shipped once already in
+            // `normalize::session_update_once`'s cap copy.
+            hint: concat!(
+                "This agent would not start a session with the selected model. ",
+                "Pick a different model and try again.",
+            )
+            .into(),
+        },
+        // A method this build does not send yet. Still no raw text, and still
+        // an action: a setting Comet chose was rejected, so changing the
+        // selection is the lever the user has either way.
+        _ => HarnessError::SettingRefused {
+            summary: "Setting refused".into(),
+            hint: concat!(
+                "This agent would not accept a setting Comet sent when opening the session. ",
+                "Try a different model, or restart the agent.",
+            )
+            .into(),
+        },
     }
 }
 
