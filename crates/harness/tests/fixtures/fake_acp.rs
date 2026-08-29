@@ -23,6 +23,9 @@
 //! | `complete-both` | sends the completion notification immediately, then the ordinary RPC reply after a deliberate delay — poses the healthy case both signals exist for |
 //! | `complete-response-only` | the ordinary RPC reply alone, no notification — this is the plain `end_turn` path below; named here because it is the deliberate MIRROR of `complete-notification-only`: an agent without the extension, which must still settle |
 //! | `replay-stale` | replays the PREVIOUS turn's already-consumed promptId as a bogus early completion (`stopReason: "refusal"`) of THIS turn, before streaming this turn's own real content and completing for real — poses the cross-turn staleness the consumed-promptId dedup exists to reject |
+//! | `request-permission` | sends `session/request_permission` mid-turn with all four ACP option kinds, then — once answered — echoes `"chosen:<optionId or cancelled>"` as a text chunk and settles `end_turn`. Lets a test observe which option the client picked without reading raw wire bytes. |
+//! | `request-permission-unrecognized` | identical, but the options carry no kind this build recognizes (`vendor_custom` only) — poses the protocol-drift case, which a correct client answers `cancelled` on its own, never touching the approval bridge |
+//! | `request-permission-edit` | identical, but `toolCall.kind` is `"edit"` with a `diff` content block and the options are Hermes' real two-option edit shape (`allow_once`/`reject_once`, no `allow_always` at all) — poses the shape `AllowForSession`'s narrow-to-`allow_once` fallback exists for |
 //! | anything else   | one text chunk, then `stopReason: "end_turn"`, no completion notification |
 //!
 //! **`starve` and `ignore-cancel` are not the same mode**, and the difference
@@ -90,6 +93,16 @@ fn initialize_result(steering: bool, load_session: bool, image_capable: bool) ->
     })
 }
 
+/// One outstanding `session/request_permission` this fixture sent, and what
+/// to do once the client answers it: complete `prompt_id` (the
+/// `session/prompt` this request interrupted) with `end_turn`, after echoing
+/// which option — or `cancelled` — the client picked.
+struct PendingPermission {
+    request_id: Value,
+    prompt_id: Value,
+    session_id: String,
+}
+
 fn main() {
     // Opt out of the steering extension to exercise the degraded path Hermes
     // takes: no `_session/steering`, so steering falls back to turn boundaries.
@@ -140,6 +153,10 @@ fn main() {
     let mut last_config: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     let mut last_load_session_id: Option<String> = None;
+    // A `session/request_permission` this fixture sent and is still waiting
+    // on. `request-permission[-unrecognized]` sets it; the bare-response
+    // branch below clears it once the client answers.
+    let mut pending_permission: Option<PendingPermission> = None;
 
     loop {
         let line = read_line(&mut stdin);
@@ -150,6 +167,49 @@ fn main() {
             continue;
         };
         let id = frame["id"].clone();
+
+        // **A bare JSON-RPC response has no `method` at all** — this is the
+        // client's answer to a request THIS fixture sent, not a call FROM the
+        // client. It must be recognized before the method dispatch below:
+        // falling into that match's catch-all would misread it as an
+        // unsupported method call and answer it with a second, nonsensical
+        // `-32601` under the same id.
+        if frame["method"].is_null()
+            && (frame.get("result").is_some() || frame.get("error").is_some())
+        {
+            if let Some(pending) = &pending_permission
+                && pending.request_id == id
+            {
+                let chosen = match frame["result"]["outcome"]["outcome"].as_str() {
+                    Some("selected") => frame["result"]["outcome"]["optionId"]
+                        .as_str()
+                        .unwrap_or("<missing optionId>")
+                        .to_owned(),
+                    _ => "cancelled".to_owned(),
+                };
+                let prompt_id = pending.prompt_id.clone();
+                let session_id = pending.session_id.clone();
+                pending_permission = None;
+                pending_prompt = None;
+                emit(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": format!("chosen:{chosen}")},
+                        },
+                    },
+                }));
+                emit(&json!({
+                    "jsonrpc": "2.0", "id": prompt_id,
+                    "result": {"stopReason": "end_turn"},
+                }));
+            }
+            continue;
+        }
+
         let method = frame["method"].as_str().unwrap_or_default().to_owned();
 
         match method.as_str() {
@@ -202,6 +262,7 @@ fn main() {
                     &last_model_id,
                     &last_config,
                     &last_load_session_id,
+                    &mut pending_permission,
                 )
             }
             "session/set_model" => {
@@ -287,11 +348,87 @@ fn handle_prompt(
     last_model_id: &Option<String>,
     last_config: &std::collections::BTreeMap<String, String>,
     last_load_session_id: &Option<String>,
+    pending_permission: &mut Option<PendingPermission>,
 ) -> Option<Value> {
     let session_id = frame["params"]["sessionId"]
         .as_str()
         .unwrap_or("fake-session-1");
     let text = prompt_text(frame);
+
+    if text.contains("request-permission") {
+        let unrecognized = text.contains("request-permission-unrecognized");
+        // Hermes' own edit-approval shape (`_build_permission_tool_call`,
+        // `acp_adapter/edit_approval.py`, source-read): `kind: "edit"`, a
+        // `diff` content block, and exactly TWO options — no `allow_always`
+        // at all. This is the shape `AllowForSession`'s narrowing exists
+        // for: the four-kind mode below never exercised it, which is how
+        // the bug it fixes got through review.
+        let edit = text.contains("request-permission-edit");
+        // The four ACP option kinds, one real optionId each, so a test can
+        // tell which was picked from the echoed `chosen:<id>` text. `execute`
+        // + `rawInput.command` is Hermes' own shape for a dangerous-command
+        // approval (`acp_adapter/permissions.py`, source-read — see
+        // `crate::acp::approval`'s module doc).
+        let options = if unrecognized {
+            json!([
+                {"optionId": "vendor-1", "kind": "vendor_custom", "name": "Do it anyway"},
+            ])
+        } else if edit {
+            json!([
+                {"optionId": "opt-allow-once", "kind": "allow_once", "name": "Allow edit"},
+                {"optionId": "opt-reject-once", "kind": "reject_once", "name": "Deny"},
+            ])
+        } else {
+            json!([
+                {"optionId": "opt-allow-once", "kind": "allow_once", "name": "Allow once"},
+                {"optionId": "opt-allow-always", "kind": "allow_always", "name": "Allow always"},
+                {"optionId": "opt-reject-once", "kind": "reject_once", "name": "Reject once"},
+                {"optionId": "opt-reject-always", "kind": "reject_always", "name": "Reject always"},
+            ])
+        };
+        let tool_call = if edit {
+            json!({
+                "toolCallId": format!("call-{id}"),
+                "kind": "edit",
+                "content": [{
+                    "type": "diff",
+                    "path": "/tmp/edited.txt",
+                    "oldText": "old",
+                    "newText": "new",
+                }],
+            })
+        } else {
+            json!({
+                "toolCallId": format!("call-{id}"),
+                "kind": "execute",
+                "content": [{
+                    "type": "content",
+                    "content": {"type": "text", "text": "$ rm -rf /tmp/x"},
+                }],
+                "rawInput": {"command": "rm -rf /tmp/x"},
+            })
+        };
+        let request_id = format!("perm-{id}");
+        emit(&json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": session_id,
+                "toolCall": tool_call,
+                "options": options,
+            },
+        }));
+        *pending_permission = Some(PendingPermission {
+            request_id: Value::String(request_id),
+            prompt_id: id.clone(),
+            session_id: session_id.to_owned(),
+        });
+        // Left unanswered here, same as `starve`/`drop-reply`: the reply to
+        // THIS `session/prompt` is sent from the bare-response branch in
+        // `main`, once the client answers the permission request.
+        return Some(id.clone());
+    }
 
     let update = |payload: Value| {
         emit(&json!({

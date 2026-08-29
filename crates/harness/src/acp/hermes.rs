@@ -342,26 +342,64 @@ impl HermesHarness {
             supports_steering: true,
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: Vec::new(),
-            // **One mode, deliberately.** Same reasoning as Grok: approvals
-            // are unrouted until PR6, and every mode that promises to ask is
-            // a promise the run cannot keep.
+            // **One mode, deliberately — a PR6 review correction, not the
+            // original call.** A first draft of this branch widened to
+            // `[ApprovalRequired, FullAccess]` on source evidence (below,
+            // still true) that Hermes' own code asks unconditionally about
+            // dangerous commands and by default about edits. Review caught
+            // the flaw: `crates/harness/src/acp/session.rs` reads
+            // `RunRequest.runtime_mode` NOWHERE except as the
+            // `SessionStarted` event field, and `.sandbox()` nowhere at all —
+            // no launch flag (contrast `claude::run_launch`'s
+            // `--permission-mode`, `codex/mod.rs`'s approval policy), no
+            // `session/new` param, no `session/set_mode` call. So
+            // `ApprovalRequired` and `FullAccess` are BYTE-IDENTICAL on the
+            // wire for Hermes: whichever the user picks, Hermes runs its own
+            // fixed default regardless, which makes at least one of the two
+            // declarations false by construction, not merely optimistic.
             //
-            // **This is not a hypothetical gap for Hermes.** Its OWN default
-            // session mode maps to edit-approval policy "ask"
-            // (`_MODE_TO_EDIT_APPROVAL_POLICY["default"] == "ask"`,
-            // `acp_adapter/server.py:504-511`, and `_session_modes` falls
-            // back to that default whenever the session's own mode is unset
-            // or unrecognized, `:538-540`) -- while this crate's ACP session
-            // loop answers EVERY server->client request, including
-            // `session/request_permission`, with `-32601`
-            // (`acp/session.rs:752`). So a real Hermes turn that edits a file
-            // asks a client that cannot answer. `FullAccess` stays the only
-            // declared mode regardless (a mode that promises to ask is worse
-            // than one that is honest about not asking yet), but whichever
-            // slice wires approvals needs to know Hermes' default is
-            // ask-before-edits, not silent-allow.
+            // Concretely, neither promise holds. `ApprovalRequired` means
+            // "every tool call is asked about first" under a `ReadOnly`
+            // sandbox — the picker's own copy reads "Every file change and
+            // command waits for you". Hermes asks only about commands its own
+            // classifier flags dangerous, plus edits; everything else it
+            // considers ordinary runs unasked, and the ACP path applies no
+            // sandbox at all. `FullAccess` means "no sandbox and no
+            // approvals" — also false, because the same dangerous-command and
+            // edit asks fire regardless of what Comet declares. A user
+            // picking either gets neither of the two things it promises.
+            //
+            // What was established and is worth keeping (source-read, not a
+            // capture — no live Hermes session has ever been obtained on this
+            // machine, this module's header): `acp_adapter/permissions.py`'s
+            // `make_approval_callback` is wired into `terminal_tool`'s
+            // approval callback unconditionally for every ACP turn
+            // (`server.py`'s `_run_agent`), with no policy check anywhere in
+            // the call path — a dangerous command always asks. A file edit
+            // asks under the session's `mode`, which defaults to `"default"`
+            // -> edit-approval policy `"ask"` (`_MODE_TO_EDIT_APPROVAL_POLICY`,
+            // `_session_modes` falling back to it whenever unset); two OTHER
+            // modes exist on the wire (`accept_edits` -> `workspace_session`,
+            // `dont_ask` -> `session`) that this crate has no way to select
+            // yet (`session/set_mode` is the session-open path PR7 owns).
+            // This is real evidence about Hermes' posture, not proof that
+            // Comet can honor a mode built on it — recorded as debt row D104
+            // (`docs/debt/README.md`) rather than acted on here, so the next
+            // person with a working Hermes install widens on confirmation
+            // instead of re-deriving this source read.
+            //
+            // `AutoAcceptEdits`/`Auto` stay off regardless of the above, and
+            // permanently rather than "until PR7 wires `session/set_mode`":
+            // Hermes' command-approval path is unconditional in its own code
+            // with no session mode able to skip it, so `AutoAcceptEdits`'s
+            // contract ("nothing able to block on a question") can never be
+            // true for Hermes.
             runtime_modes: vec![RuntimeMode::FullAccess],
-            // Nothing to attach a note to while approvals are unrouted.
+            // Neither `PermissionOption` nor the `outcome` ACP defines
+            // carries a note field, and Hermes' own option builders
+            // (`_build_permission_options`, `_build_permission_tool_call`)
+            // send nothing a message could ride in either — checked against
+            // source per Step 5's instruction, not assumed (D24).
             carries_deny_note: false,
         }
     }
@@ -829,8 +867,13 @@ mod tests {
         }
     }
 
-    /// Hermes declares only `FullAccess` while approvals are unrouted, and no
-    /// effort ladder at all -- both are honest answers, not gaps.
+    /// Hermes declares only `FullAccess`, and no effort ladder at all -- both
+    /// honest answers, not gaps. `ApprovalRequired` would be dishonest in the
+    /// specific way D104 records: nothing in the ACP path reads
+    /// `runtime_mode` at all, so it would be byte-identical to `FullAccess`
+    /// on the wire while promising a `ReadOnly` sandbox and "everything
+    /// asked" that Hermes' own unconditional command-approval/edit-default
+    /// behaviour does not match either declaration honestly.
     #[test]
     fn capabilities_declare_no_ladder_and_one_runtime_mode() {
         let capabilities = HermesHarness::capabilities();

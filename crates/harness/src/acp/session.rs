@@ -33,20 +33,34 @@
 
 use std::collections::HashSet;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
-use comet_proto::{AgentEvent, DiagnosticSeverity, DoneStatus, HarnessId, RunRequest};
+use comet_proto::{
+    AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus, HarnessId,
+    RunRequest,
+};
 
-use super::{AgentDescription, initialize_params, new_session_params, normalize, prompt_params};
+use super::{
+    AgentDescription, approval, initialize_params, new_session_params, normalize, prompt_params,
+};
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{HarnessError, RunControls, StderrTail, shutdown_child};
+
+/// The run's answer to one `session/request_permission`, boxed the same way
+/// [`RunControls::request_approval`] is. A local alias rather than reusing
+/// that field's type directly: `codex::handle_server_request` names its own
+/// copy for the same reason — the call sites that need to spawn a task with
+/// it are simpler naming the closure type once.
+type RequestApprovalFn =
+    Box<dyn Fn(ApprovalRequest) -> oneshot::Receiver<ApprovalDecision> + Send + Sync>;
 
 /// How a turn's token reading is read off a `session/prompt` result.
 ///
@@ -636,16 +650,20 @@ async fn run_session(
         timeouts,
     } = session;
     let RunControls {
-        // Unclaimed here. ACP's permission request is `session/request_permission`,
-        // and this module answers every server->client request with -32601 rather
-        // than half-wiring one: an approval that reached the user through a
-        // synthesized question would put a card in the doc under an id no
-        // resolver knows. Whichever slice adds approvals claims both fields.
+        // Unclaimed here. ACP has no input-request method of its own —
+        // `UserInputQuestion`/`UserInputAnswer` have no ACP wire counterpart —
+        // so nothing in this loop ever calls it.
         request_input: _request_input,
-        request_approval: _request_approval,
+        request_approval,
         mut steering,
         interrupt,
     } = controls;
+    // `Arc`, not a bare `Box`, because [`handle_incoming`]'s approval arm
+    // spawns a task per `session/request_permission` — the message loop must
+    // keep flowing while the user thinks (a blocked read here would stall the
+    // very transcript they are reading to decide), and a spawned task needs
+    // its own owned handle to call it from.
+    let request_approval: Arc<RequestApprovalFn> = Arc::new(request_approval);
 
     let mut assistant_message_id = uuid::Uuid::new_v4().to_string();
     if !send(
@@ -730,6 +748,7 @@ async fn run_session(
                 context_window,
                 usage_reader,
                 prompt_completions: &mut prompt_completions,
+                request_approval: &request_approval,
             },
             &prompt,
             &turn_images,
@@ -910,6 +929,10 @@ struct Turn<'a> {
     /// ordinary RPC reply, must not be read as completing a later turn on the
     /// same session.
     prompt_completions: &'a mut HashSet<String>,
+    /// The run's answer to `session/request_permission`. `Arc`, not a bare
+    /// reference, because [`handle_incoming`]'s approval arm spawns a task
+    /// that outlives the borrow of this `Turn` — see [`RequestApprovalFn`].
+    request_approval: &'a Arc<RequestApprovalFn>,
 }
 
 /// Grok's vendor extension: the AUTHORITATIVE turn-end signal, measured live
@@ -948,6 +971,7 @@ async fn drive_turn(
         context_window,
         usage_reader,
         prompt_completions,
+        request_approval,
     } = turn;
     let cancel_grace = *cancel_grace;
     let prompt_stall = *prompt_stall;
@@ -967,7 +991,17 @@ async fn drive_turn(
     // `handle_incoming` rather than discarded: it is still real content,
     // just not evidence for the stall clock below.
     while let Ok(message) = incoming.try_recv() {
-        match handle_incoming(message, client, event_tx, tools, diagnostics, streamed).await {
+        match handle_incoming(
+            message,
+            client,
+            event_tx,
+            tools,
+            diagnostics,
+            streamed,
+            request_approval,
+        )
+        .await
+        {
             Handled::Continue => {}
             Handled::ConsumerGone => return TurnEnd::ConsumerGone,
             Handled::AgentExited => return TurnEnd::AgentExited,
@@ -1006,8 +1040,16 @@ async fn drive_turn(
                         // whatever `try_recv` finds now provably preceded the
                         // reply on the wire, and nothing later can appear.
                         while let Ok(message) = incoming.try_recv() {
-                            match handle_incoming(message, client, event_tx, tools, diagnostics, streamed)
-                                .await
+                            match handle_incoming(
+                                message,
+                                client,
+                                event_tx,
+                                tools,
+                                diagnostics,
+                                streamed,
+                                request_approval,
+                            )
+                            .await
                             {
                                 Handled::Continue => {}
                                 Handled::ConsumerGone => return TurnEnd::ConsumerGone,
@@ -1086,8 +1128,16 @@ async fn drive_turn(
                         // queued ahead of this notification on the wire must
                         // not be truncated by returning immediately.
                         while let Ok(message) = incoming.try_recv() {
-                            match handle_incoming(message, client, event_tx, tools, diagnostics, streamed)
-                                .await
+                            match handle_incoming(
+                                message,
+                                client,
+                                event_tx,
+                                tools,
+                                diagnostics,
+                                streamed,
+                                request_approval,
+                            )
+                            .await
                             {
                                 Handled::Continue => {}
                                 Handled::ConsumerGone => return TurnEnd::ConsumerGone,
@@ -1107,8 +1157,16 @@ async fn drive_turn(
                         let reason = params["stopReason"].as_str().unwrap_or_default();
                         return TurnEnd::Settled(normalize::done_status(reason));
                     }
-                    Some(message) => match handle_incoming(message, client, event_tx, tools, diagnostics, streamed)
-                        .await
+                    Some(message) => match handle_incoming(
+                        message,
+                        client,
+                        event_tx,
+                        tools,
+                        diagnostics,
+                        streamed,
+                        request_approval,
+                    )
+                    .await
                     {
                         Handled::Continue => {}
                         Handled::ConsumerGone => return TurnEnd::ConsumerGone,
@@ -1165,6 +1223,86 @@ enum Handled {
     AgentExited,
 }
 
+/// Serve one `session/request_permission`.
+///
+/// **Spawned, not awaited here.** The message loop must keep flowing while
+/// the user thinks — a blocked read at this call site would stall the very
+/// transcript they are reading to decide, and `Timeouts::prompt_stall` does
+/// not protect against this: that bound only watches the gap before the
+/// FIRST frame of a turn, and this request always arrives well after one.
+/// Thirty seconds of user thought is ordinary, not a wedge.
+///
+/// Returns the [`AgentEvent::Diagnostic`] to emit for an `options` set that
+/// names none of the four kinds this build recognizes — a protocol-drift
+/// report, answered `cancelled` on the wire immediately rather than asked
+/// through the bridge at all: **guessing which of the four a vendor's own
+/// vocabulary means is the difference between asking and not asking**, so a
+/// request this build cannot honestly represent to the user is declined
+/// without ever reaching them. `None` means either that the request was
+/// well-formed and has been handed off to [`RunControls::request_approval`],
+/// or that this session already reported the drift once —
+/// [`normalize::session_update_once`]'s rate limit, reused here on the same
+/// `diagnostics` set, so a vendor that drifts on every turn does not emit one
+/// diagnostic per request for the rest of the session.
+///
+/// **The summary is written for what actually happened, not reused from
+/// [`crate::diagnostic`].** That helper's two fixed sentences are written for
+/// a dropped or unrecognized FRAME — background protocol noise the user was
+/// never going to see acted on. This is different: an action the agent tried
+/// to take was declined on the user's behalf, and [`AgentEvent::Diagnostic`]
+/// has no separate `hint` field the way `.agents/rules/user-facing-errors.md`
+/// asks for elsewhere, so the one `summary` string has to carry both the
+/// cause and the effect.
+fn handle_permission_request(
+    client: &RpcClient,
+    id: Value,
+    params: &Value,
+    request_approval: &Arc<RequestApprovalFn>,
+    diagnostics: &mut HashSet<String>,
+) -> Option<AgentEvent> {
+    let options = params["options"].as_array().cloned().unwrap_or_default();
+    if !approval::has_recognized_kind(&options) {
+        client.respond(&id, json!({"outcome": {"outcome": "cancelled"}}));
+        let discriminator =
+            comet_proto::sanitize_discriminator(approval::REQUEST_PERMISSION_METHOD);
+        if !diagnostics.insert(discriminator.clone()) {
+            tracing::trace!(
+                target: "comet_harness::acp",
+                "repeated unrecognized session/request_permission options suppressed"
+            );
+            return None;
+        }
+        tracing::warn!(
+            target: "comet_harness::acp",
+            options = %serde_json::Value::Array(options),
+            "session/request_permission offered no option kind this build recognizes"
+        );
+        return Some(AgentEvent::Diagnostic {
+            discriminator,
+            severity: DiagnosticSeverity::Unknown,
+            code: None,
+            summary: "The agent asked Comet to approve an action, but the choices it offered \
+                      weren't ones Comet understands, so Comet declined the action rather than \
+                      guess."
+                .to_owned(),
+        });
+    }
+    let request = approval::approval_request(&params["toolCall"]);
+    let client = client.clone();
+    let request_approval = Arc::clone(request_approval);
+    tokio::spawn(async move {
+        // A dropped resolver means the run ended with this approval still
+        // pending — the user never answered and never will. `Expired` maps
+        // to `cancelled` on the wire (`approval::outcome_for`), never to a
+        // decision nobody made.
+        let decision = (request_approval)(request)
+            .await
+            .unwrap_or(ApprovalDecision::Expired);
+        client.respond(&id, approval::outcome_for(&decision, &options));
+    });
+    None
+}
+
 /// Serve one frame from the agent. Shared by the loop's waiting arm and by the
 /// post-settle drain, so a frame is treated identically whichever of the two
 /// picks it up — the alternative is two copies that quietly disagree about, say,
@@ -1176,6 +1314,7 @@ async fn handle_incoming(
     tools: &mut normalize::ToolTracker,
     diagnostics: &mut HashSet<String>,
     streamed: &mut bool,
+    request_approval: &Arc<RequestApprovalFn>,
 ) -> Handled {
     match message {
         Incoming::Notification { method, params } => {
@@ -1211,10 +1350,24 @@ async fn handle_incoming(
             Handled::Continue
         }
 
-        Incoming::Request { id, method, .. } => {
+        Incoming::Request { id, method, params } => {
+            if method == approval::REQUEST_PERMISSION_METHOD {
+                if let Some(drift) =
+                    handle_permission_request(client, id, &params, request_approval, diagnostics)
+                    && !send(event_tx, drift).await
+                {
+                    return Handled::ConsumerGone;
+                }
+                return Handled::Continue;
+            }
             // Always answer. An unanswered server->client request leaves the
             // agent waiting on a reply that never comes, which presents as a
-            // hung turn with no error anywhere.
+            // hung turn with no error anywhere. Every OTHER server->client
+            // method still gets -32601 here: the engine owns file access and
+            // terminals (`initialize_params` already declines `fs` and
+            // `terminal`), and widening the blanket for any method but the
+            // one approval arm above would contradict that authority
+            // argument.
             tracing::debug!(target: "comet_harness::acp", method, "declining unsupported request");
             client.respond_error(&id, -32601, "method not supported by this client");
             Handled::Continue
