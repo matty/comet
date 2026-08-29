@@ -2166,7 +2166,18 @@ mod tests {
     /// safe: it is a doc-row string, and none of this module's tests read a
     /// space's folder back off disk.
     fn unwatched_space_root(dir: &std::path::Path) -> std::path::PathBuf {
-        dir.join("space-root-not-on-disk")
+        let root = dir.join("space-root-not-on-disk");
+        // Enforces the invariant this whole module leans on: if anything ever
+        // creates this path, notify::Watcher::watch stops failing fast and the
+        // D101 race is back. A debug_assert turns that into a loud test
+        // failure at the call site instead of a silent, timing-dependent hang
+        // someone has to rediscover with a debugger.
+        debug_assert!(
+            !root.exists(),
+            "unwatched_space_root must stay unwatchable: {} exists",
+            root.display()
+        );
+        root
     }
 
     fn engine_core(dir: &std::path::Path) -> crate::EngineCore {
@@ -4651,7 +4662,9 @@ mod tests {
         rpc.mutate(MutateParams::CreateSpace {
             space_id: "space-1".into(),
             device_id: "dev-a".into(),
-            path: dir.path().to_string_lossy().to_string(),
+            path: unwatched_space_root(dir.path())
+                .to_string_lossy()
+                .to_string(),
             name: None,
             git_detected: false,
         })
