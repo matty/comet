@@ -506,7 +506,7 @@ pub fn pending_input_request(
 /// The note is worth typing either way — it is a record of the refusal that
 /// stays in the chat — but only some providers put it on the wire. Codex's
 /// decisions are bare literals with no message field, so a field labelled "for
-/// the agent" there promises a delivery that never happens (`DEBT.md` D24).
+/// the agent" there promises a delivery that never happens (`docs/debt/README.md` D24).
 pub fn deny_note_placeholder(carries_deny_note: bool) -> &'static str {
     if carries_deny_note {
         "Add a note for the agent (optional)"
@@ -6548,7 +6548,7 @@ mod tests {
     }
 
     /// A provider that cannot carry the note must not have a field promising
-    /// it will (`DEBT.md` D24). The field stays — the note is still a record
+    /// it will (`docs/debt/README.md` D24). The field stays — the note is still a record
     /// the user reads back in this chat — but the label stops overselling it.
     #[test]
     fn the_note_field_does_not_promise_what_the_provider_cannot_deliver() {

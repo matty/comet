@@ -248,7 +248,7 @@ fn unknown_command() -> ApprovalRequest {
 ///
 /// **`acceptForSession` is never produced, and neither is `cancel`.** Both are
 /// real and both work; see the module-level reasoning in the slice plan and
-/// `DEBT.md` D20/D21. In short: Codex's session grant is keyed on the path
+/// `docs/debt/README.md` D20/D21. In short: Codex's session grant is keyed on the path
 /// alone and spans the operation kind, which is broader than
 /// `approval_signature`, so delegating would leave two grant caches with
 /// different scopes; and `cancel` denies *and interrupts the turn*, which no
@@ -491,7 +491,7 @@ mod tests {
     #[test]
     fn no_decision_is_ever_accept_for_session_or_cancel() {
         // Both are real wire values that work, and both are deliberately
-        // unused — DEBT.md D20 and D21. A later reader "completing" the
+        // unused — docs/debt/README.md D20 and D21. A later reader "completing" the
         // mapping fails here rather than silently changing who owns the grant.
         for decision in [
             ApprovalDecision::Allow,

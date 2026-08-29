@@ -55,7 +55,7 @@ pub(crate) fn approval_signature(request: &ApprovalRequest) -> Option<String> {
         // So: allow the call in front of the user, remember nothing. Same
         // treatment as `Unknown` below, for the same reason one field up.
         // Carrying a discriminating digest of the arguments would fix it
-        // properly and needs a proto change (`DEBT.md` D19).
+        // properly and needs a proto change (`docs/debt/README.md` D19).
         ApprovalRequest::Mcp { .. } => return None,
         ApprovalRequest::Unknown { .. } => return None,
     };

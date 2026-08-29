@@ -31,7 +31,7 @@
 //! extension appears, `AgentDescription::supports_steering` is the gate that
 //! would pick the faster path.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -841,7 +841,7 @@ async fn run_session(
     // settled off the RPC reply — must not be read as completing a LATER
     // turn on the same session, which is exactly the "foreign/stale
     // completion" risk Grok's own hardening notes name.
-    let mut prompt_completions: HashSet<String> = HashSet::new();
+    let mut prompt_completions = PromptCompletions::default();
 
     // **One `Done` per turn that started, not one per run.** The session is
     // persistent: a steer opens a second turn on the same session, and a UI
@@ -1055,7 +1055,7 @@ struct Turn<'a> {
     /// notification, arriving late after ITS OWN turn already settled off the
     /// ordinary RPC reply, must not be read as completing a later turn on the
     /// same session.
-    prompt_completions: &'a mut HashSet<String>,
+    prompt_completions: &'a mut PromptCompletions,
     /// The run's answer to `session/request_permission`. `Arc`, not a bare
     /// reference, because [`handle_incoming`]'s approval arm spawns a task
     /// that outlives the borrow of this `Turn` — see [`RequestApprovalFn`].
@@ -1082,6 +1082,74 @@ struct Turn<'a> {
 /// `grep -r "_x.ai/session/prompt_complete" crates/` finds the constant this
 /// doc calls the method's primary citation.
 const PROMPT_COMPLETE_METHOD: &str = "_x.ai/session/prompt_complete";
+
+/// Bound on [`PromptCompletions`] (`docs/debt/README.md`'s D124) — the same
+/// "cannot become an allocator" concern `normalize`'s `MAX_TRACKED_UPDATE_KINDS`
+/// and `MAX_TRACKED_CALLS` exist for, on a third registry whose failure mode
+/// is different again.
+///
+/// **The strategy is eviction by recency, and neither sibling's would do.**
+/// `ToolTracker` refuses to insert once full; D113's `seen` treats everything
+/// past the cap as already-suppressed. Both keep the OLDEST entries, which is
+/// exactly backwards here: this set exists so that a late duplicate of a
+/// completion signal cannot settle a LATER turn, and a duplicate is a
+/// near-in-time event — it rides one push behind the reply that beat it. The
+/// id most likely to be needed is the one just inserted, so refusing to
+/// insert it would drop the single entry the guard depends on and let the
+/// stale notification through, which is the bug this set was added to
+/// prevent. Dropping the oldest instead gives up protection only against a
+/// duplicate that arrives more than [`MAX_TRACKED_PROMPT_COMPLETIONS`] turns
+/// after its own turn settled.
+///
+/// **No escalation event, unlike D113's cap.** That one gave up diagnostic
+/// SIGNAL, so a reader could no longer tell "nothing unfamiliar arrived" from
+/// "Comet stopped looking", and one event per session bought that back. This
+/// one gives up nothing observable: the ids are not reported anywhere, the
+/// eviction is invisible to the user, and a session would need 64 turns
+/// before the first one is dropped. A `trace!` is the honest weight.
+const MAX_TRACKED_PROMPT_COMPLETIONS: usize = 64;
+
+/// Every promptId that has already settled a turn this session, bounded.
+///
+/// A plain `HashSet` until D124: it is caller-owned and session-scoped, so a
+/// long-lived session grew it one entry per turn forever. See
+/// [`MAX_TRACKED_PROMPT_COMPLETIONS`] for why this evicts rather than refusing.
+#[derive(Debug, Default)]
+pub(crate) struct PromptCompletions {
+    seen: HashSet<String>,
+    /// Insertion order, oldest first — `seen`'s keys carry none of their own.
+    order: VecDeque<String>,
+}
+
+impl PromptCompletions {
+    /// Whether `id` has already settled a turn on this session.
+    fn contains(&self, id: &str) -> bool {
+        self.seen.contains(id)
+    }
+
+    /// Record `id`, evicting the oldest entry if that would exceed the cap.
+    ///
+    /// Re-inserting an id already present is a no-op rather than a refresh of
+    /// its position: an id settles exactly one turn, so a second insert is a
+    /// duplicate signal for the SAME turn, and moving it to the front would
+    /// let a repeating stale notification hold its slot indefinitely.
+    fn insert(&mut self, id: &str) {
+        if !self.seen.insert(id.to_owned()) {
+            return;
+        }
+        self.order.push_back(id.to_owned());
+        if self.order.len() > MAX_TRACKED_PROMPT_COMPLETIONS
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.seen.remove(&evicted);
+            tracing::trace!(
+                target: "comet_harness::acp",
+                cap = MAX_TRACKED_PROMPT_COMPLETIONS,
+                "settled promptId evicted from the completion guard"
+            );
+        }
+    }
+}
 
 /// How long the notification-settle arm below waits for the already-in-flight
 /// `session/prompt` reply once [`PROMPT_COMPLETE_METHOD`] has already ended
@@ -1215,7 +1283,7 @@ async fn drive_turn(
                         // the reply that beat it here — can never re-settle a
                         // LATER one; see `Turn::prompt_completions`.
                         if let Some(id) = result["_meta"]["promptId"].as_str() {
-                            prompt_completions.insert(id.to_owned());
+                            prompt_completions.insert(id);
                         }
                         // The turn's token reading rides just ahead of its
                         // `Done`, so the meter is current at the moment the
@@ -1272,7 +1340,7 @@ async fn drive_turn(
                                 .is_none_or(|id| !prompt_completions.contains(id))
                     => {
                         if let Some(id) = params["promptId"].as_str() {
-                            prompt_completions.insert(id.to_owned());
+                            prompt_completions.insert(id);
                         }
                         // Same drain rationale as the reply arm above: deltas
                         // queued ahead of this notification on the wire must
@@ -1321,7 +1389,7 @@ async fn drive_turn(
                             {
                                 Ok(Ok(result)) => {
                                     if let Some(id) = result["_meta"]["promptId"].as_str() {
-                                        prompt_completions.insert(id.to_owned());
+                                        prompt_completions.insert(id);
                                     }
                                     usage = usage_reader(&result, context_window);
                                 }
@@ -1722,6 +1790,58 @@ mod tests {
             params["mcpServers"].as_array().map(Vec::len),
             Some(0),
             "mcpServers must be present and empty"
+        );
+    }
+
+    /// Break caught (D124): a plain `HashSet` here grew one entry per turn for
+    /// a session's whole life. Asserts the bound AND the direction of the
+    /// eviction — the newest id must survive, because a late duplicate of a
+    /// completion signal arrives just behind its own turn, so keeping the
+    /// oldest ids (what `ToolTracker`'s refuse-to-insert would do) drops the
+    /// one entry the stale-completion guard actually depends on.
+    #[test]
+    fn the_completion_guard_evicts_its_oldest_promptid_rather_than_refusing_new_ones() {
+        let mut completions = PromptCompletions::default();
+        let ids: Vec<String> = (0..MAX_TRACKED_PROMPT_COMPLETIONS + 10)
+            .map(|i| format!("prompt-{i}"))
+            .collect();
+        for id in &ids {
+            completions.insert(id);
+        }
+
+        assert_eq!(
+            completions.order.len(),
+            MAX_TRACKED_PROMPT_COMPLETIONS,
+            "the guard must stay bounded across a long-lived session"
+        );
+        assert_eq!(completions.seen.len(), completions.order.len());
+
+        let newest = ids.last().expect("ids is not empty");
+        assert!(
+            completions.contains(newest),
+            "the most recent settled turn is exactly the one a late duplicate would target"
+        );
+        assert!(
+            !completions.contains(&ids[0]),
+            "the oldest entry is the one given up"
+        );
+    }
+
+    /// A duplicate signal for the SAME turn must not refresh that id's place
+    /// in the queue — a repeating stale notification would otherwise hold its
+    /// slot forever and evict live turns behind it.
+    #[test]
+    fn re_recording_a_settled_promptid_does_not_move_it_back_to_the_front() {
+        let mut completions = PromptCompletions::default();
+        completions.insert("first");
+        completions.insert("second");
+        completions.insert("first");
+
+        assert_eq!(completions.order.len(), 2, "no duplicate entry is queued");
+        assert_eq!(
+            completions.order.front().map(String::as_str),
+            Some("first"),
+            "the re-inserted id keeps its original position"
         );
     }
 }

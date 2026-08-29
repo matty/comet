@@ -497,7 +497,7 @@ impl SessionsEngine {
     /// again. Since 1.8 a user can change the mode mid-chat, so every caller
     /// that dispatches from this overlays the row's current mode first with
     /// [`DocHost::apply_chat_row_runtime_mode`]; without that the divergence
-    /// runs in the permissive direction (`DEBT.md` D11).
+    /// runs in the permissive direction (`docs/debt/README.md` D11).
     pub fn last_request(&self, chat_id: &str) -> Option<RunRequest> {
         lock(&self.inner.last_requests).get(chat_id).cloned()
     }
