@@ -155,37 +155,70 @@ fn main() -> anyhow::Result<()> {
         None => {
             // Headed: the UI probes COMET_IPC_PORT and connects to a running
             // daemon, or embeds the engine in-process (ARCHITECTURE §1).
-            comet_ui::run_app(comet_ui::UiConfig {
-                data_dir: std::env::var_os("COMET_DATA_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(dirs_data_dir),
-                ipc_port: std::env::var("COMET_IPC_PORT")
-                    .ok()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(27654),
-                releases_url: comet_update::releases_url_from_env(),
-                default_harness: comet_ui::HarnessId::ClaudeCode,
-            });
+            comet_ui::run_app(EnvDefaults::from_env().into_ui());
             Ok(())
         }
     }
 }
 
-/// The env-resolved engine configuration shared by the headed, headless, and
-/// local-administration entry points.
-fn engine_config_from_env() -> comet_engine::EngineConfig {
-    comet_engine::EngineConfig {
-        data_dir: std::env::var_os("COMET_DATA_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(dirs_data_dir),
-        ipc_port: std::env::var("COMET_IPC_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(27654),
-        default_harness: harness_from_env(),
-        releases_url: comet_update::releases_url_from_env(),
-        unattended_timeout: comet_engine::unattended_timeout_from_env(),
+/// Everything both entry points take from the environment, resolved once.
+///
+/// **One value, two configurations, because they diverged (D84).** The headed
+/// arm used to build its `UiConfig` inline and hardcode
+/// `HarnessId::ClaudeCode` while `engine_config_from_env` resolved
+/// `COMET_HARNESS` — so with `COMET_HARNESS=mock` the embedded engine
+/// defaulted to the mock and the UI to Claude, and a mock-render run paired
+/// model `mock-1` with Claude and showed "The selected model isn't available"
+/// until the chat had an explicit config row and the app was restarted. The
+/// two configurations still differ in what they CARRY (`unattended_timeout` is
+/// the engine's alone); what they must not differ in is what they read.
+struct EnvDefaults {
+    data_dir: std::path::PathBuf,
+    ipc_port: u16,
+    releases_url: String,
+    default_harness: comet_engine::HarnessId,
+}
+
+impl EnvDefaults {
+    fn from_env() -> Self {
+        Self {
+            data_dir: std::env::var_os("COMET_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(dirs_data_dir),
+            ipc_port: std::env::var("COMET_IPC_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(27654),
+            releases_url: comet_update::releases_url_from_env(),
+            default_harness: harness_from_env(),
+        }
     }
+
+    fn into_engine(self) -> comet_engine::EngineConfig {
+        comet_engine::EngineConfig {
+            data_dir: self.data_dir,
+            ipc_port: self.ipc_port,
+            default_harness: self.default_harness,
+            releases_url: self.releases_url,
+            unattended_timeout: comet_engine::unattended_timeout_from_env(),
+        }
+    }
+
+    fn into_ui(self) -> comet_ui::UiConfig {
+        comet_ui::UiConfig {
+            data_dir: self.data_dir,
+            ipc_port: self.ipc_port,
+            releases_url: self.releases_url,
+            default_harness: self.default_harness,
+        }
+    }
+}
+
+/// The env-resolved engine configuration shared by the headless and
+/// local-administration entry points; the headed one goes through
+/// [`EnvDefaults::into_ui`] instead, off the same read.
+fn engine_config_from_env() -> comet_engine::EngineConfig {
+    EnvDefaults::from_env().into_engine()
 }
 
 /// `COMET_HARNESS` (kebab-case id) picks the default harness for chats without a
@@ -215,6 +248,60 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    /// Break caught (D84): the headed arm hardcoded
+    /// `HarnessId::ClaudeCode` while the engine resolved `COMET_HARNESS`, so
+    /// `COMET_HARNESS=mock` gave the two halves of one process different
+    /// defaults and a mock-render run paired model `mock-1` with Claude.
+    ///
+    /// Asserts the property that was broken — both configurations carry the
+    /// SAME harness — rather than the value of any one of them, and does it
+    /// for every variant so a new one cannot be added to `harness_from_env`
+    /// and missed on one side. Built by hand rather than through `from_env`:
+    /// setting a process-global variable would race every other test in this
+    /// binary, and the shared read is exactly what is under test.
+    #[test]
+    fn the_headed_and_engine_configurations_default_to_the_same_harness() {
+        for harness in [
+            comet_engine::HarnessId::ClaudeCode,
+            comet_engine::HarnessId::Codex,
+            comet_engine::HarnessId::Cursor,
+            comet_engine::HarnessId::Grok,
+            comet_engine::HarnessId::Hermes,
+            comet_engine::HarnessId::Mock,
+        ] {
+            let defaults = || EnvDefaults {
+                data_dir: PathBuf::from("/tmp/comet-test"),
+                ipc_port: 27654,
+                releases_url: "https://example.invalid".into(),
+                default_harness: harness,
+            };
+            assert_eq!(
+                defaults().into_ui().default_harness,
+                defaults().into_engine().default_harness,
+                "the UI and its embedded engine must not disagree about {harness:?}"
+            );
+            assert_eq!(defaults().into_ui().default_harness, harness);
+        }
+    }
+
+    /// The other three environment-derived fields travel too — a config that
+    /// dropped one would send the UI to a different data directory or port
+    /// than the engine it embeds, which is the same class of bug D84 was.
+    #[test]
+    fn every_shared_environment_field_reaches_both_configurations() {
+        let defaults = || EnvDefaults {
+            data_dir: PathBuf::from("/tmp/comet-shared"),
+            ipc_port: 31000,
+            releases_url: "https://releases.invalid".into(),
+            default_harness: comet_engine::HarnessId::Mock,
+        };
+        let ui = defaults().into_ui();
+        let engine = defaults().into_engine();
+        assert_eq!(ui.data_dir, engine.data_dir);
+        assert_eq!(ui.ipc_port, engine.ipc_port);
+        assert_eq!(ui.releases_url, engine.releases_url);
+    }
 
     #[test]
     fn configured_home_does_not_require_initialization() {
