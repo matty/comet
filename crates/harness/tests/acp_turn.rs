@@ -94,6 +94,14 @@ fn no_config(_: &RunRequest, _: &str) -> Vec<(&'static str, serde_json::Value)> 
     Vec::new()
 }
 
+/// This suite never drives a `session/new` failure through `AcpSession::open`
+/// (that is `acp_run_fidelity.rs` and the per-agent unit tests in
+/// `grok.rs`/`hermes.rs`), so nothing here has a "signed out" shape to
+/// recognize — every open passes the original error through unchanged.
+fn no_open_failure_mapper(_: &HarnessError) -> Option<HarnessError> {
+    None
+}
+
 /// A `cancel_grace` long enough that giving up cannot be what ends a run
 /// inside `drain`'s own limit.
 ///
@@ -121,6 +129,7 @@ async fn open_with(no_steering: bool, timeouts: Timeouts) -> AcpSession {
         timeouts,
         &RunRequest::for_session(RuntimeMode::default()),
         no_config,
+        no_open_failure_mapper,
     )
     .await
     .expect("the fixture handshakes")

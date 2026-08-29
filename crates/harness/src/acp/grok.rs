@@ -413,6 +413,47 @@ pub(crate) fn config_requests(
     }
 }
 
+/// Recognizes Grok's own signed-out shape on `session/new` and turns it into
+/// a clean instruction, in place of the raw JSON-RPC text
+/// [`HarnessError::Protocol`] would otherwise carry to the user
+/// (`.agents/rules/user-facing-errors.md`).
+///
+/// **Verified live against grok 1.0.5 on 2026-08-29**, run with `GROK_HOME`
+/// pointed at a scratch directory with no `auth.json` (the isolation D102
+/// established): `initialize` answers normally — `authMethods:
+/// [{"id": "grok.com", ...}]`, `_meta.defaultAuthMethodId: null` — and
+/// `session/new` fails outright with
+/// `{"code": -32000, "message": "Authentication required",
+/// "data": "no auth method id provided"}`. After `jsonrpc.rs`'s error
+/// decode (which folds `data` onto `message` — see its own comment), the
+/// JSON-RPC client hands this back as
+/// `HarnessError::Protocol("session/new: Authentication required: no auth
+/// method id provided")`, which is what the `msg.contains(...)` check below
+/// matches on.
+///
+/// **Step 5's decision: Comet never calls ACP's own `authenticate`
+/// method.** Grok's `initialize` reply advertises exactly one entry —
+/// `{"id": "grok.com", "name": "Grok", "description": "Sign in with
+/// Grok"}` — with no `_meta` marking it headless or key-based; the only
+/// sign-in flow evidenced here is the OAuth one `grok login` already drives
+/// interactively. Launching that from a background discovery probe would be
+/// a surprise the user never asked for, and the engine has never owned an
+/// agent's own credentials (`AGENTS.md`'s local/LAN authority model). Send
+/// the user to the CLI's own command instead — `grok login` is the exact
+/// subcommand (`grok login --help`: "Sign in to Grok"), read from `grok
+/// --help`'s own command list, not guessed.
+pub(crate) fn map_open_failure(error: &HarnessError) -> Option<HarnessError> {
+    match error {
+        HarnessError::Protocol(msg) if msg.contains("Authentication required") => {
+            Some(HarnessError::NeedsSetup {
+                summary: "Sign-in required".into(),
+                hint: "Run `grok login` to sign in to Grok, then try again.".into(),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// A model's `_meta.reasoningEfforts[].id`, keeping only levels Comet knows.
 ///
 /// An unrecognized effort is dropped rather than guessed at: offering a rung
@@ -660,6 +701,7 @@ impl Harness for GrokHarness {
             self.timeouts,
             &request,
             config_requests,
+            map_open_failure,
         )
         .await?;
         Ok(super::session::run(
@@ -1107,6 +1149,47 @@ mod tests {
             capabilities.steering_mode,
             SteeringMode::TurnBoundary,
             "Grok advertises no steering extension, so the boundary is the honest answer"
+        );
+    }
+
+    /// Break caught: surfacing a raw protocol error to a signed-out user.
+    /// `.agents/rules/user-facing-errors.md`: the user never sees
+    /// `err.to_string()`, and every failure splits into a short summary and
+    /// an actionable hint with the diagnostic detail left in `tracing`.
+    ///
+    /// The input is the literal `HarnessError::Protocol` text production
+    /// builds from Grok's real signed-out `session/new` reply (captured live
+    /// 2026-08-29, see `map_open_failure`'s own doc comment) after
+    /// `jsonrpc.rs` folds the error's `data` onto its `message`.
+    #[test]
+    fn a_signed_out_grok_asks_the_user_to_sign_in() {
+        let raw = HarnessError::Protocol(
+            "session/new: Authentication required: no auth method id provided".into(),
+        );
+        let mapped = map_open_failure(&raw).expect("Grok's signed-out shape must be recognized");
+        let HarnessError::NeedsSetup { summary, hint } = mapped else {
+            panic!("expected NeedsSetup, got {mapped:?}");
+        };
+        assert!(
+            !summary.contains("-320"),
+            "no protocol codes on screen: {summary}"
+        );
+        assert!(!summary.to_lowercase().contains("jsonrpc"), "{summary}");
+        assert!(
+            hint.contains("grok"),
+            "the hint must name the command to run: {hint}"
+        );
+    }
+
+    /// A `session/new` failure that is NOT the signed-out shape must pass
+    /// through unchanged — the mapper's whole point is to recognize one
+    /// specific wire shape, not to relabel every failure as "sign in".
+    #[test]
+    fn an_unrecognized_open_failure_is_left_alone() {
+        let raw = HarnessError::Protocol("session/new: some other failure".into());
+        assert!(
+            map_open_failure(&raw).is_none(),
+            "an unrecognized failure must not be reclassified"
         );
     }
 }

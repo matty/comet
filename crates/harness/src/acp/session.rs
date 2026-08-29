@@ -99,6 +99,29 @@ pub(crate) type UsageReader = fn(&Value, Option<u64>) -> Option<AgentEvent>;
 /// mapping — the same discipline `UsageReader` already keeps.
 pub(crate) type ConfigRequests = fn(&RunRequest, &str) -> Vec<(&'static str, Value)>;
 
+/// What a `session/new`/`session/load` failure means when it happens before
+/// any session ever opened — the difference between "this agent needs
+/// sign-in or setup first" and any other reason the open failed.
+///
+/// **Per-agent, injected by the caller, the same way [`UsageReader`] and
+/// [`ConfigRequests`] are** — see [`UsageReader`]'s own doc comment for why
+/// the choice stays out of this file rather than a `match` on [`HarnessId`]
+/// in disguise. What "not ready yet" looks like on the wire is genuinely
+/// vendor-specific: Grok answers `-32000 Authentication required` on
+/// `session/new` itself (verified live 2026-08-29 against a `GROK_HOME` with
+/// no `auth.json`), while Hermes answers `-32603 Internal error` with the
+/// actual reason — `"No LLM provider configured. Run \`hermes model\`…"` —
+/// carried in the error's `data`, not its `message` (also verified live the
+/// same day). Only the vendor module that captured its own shape can tell a
+/// genuine "sign in/configure first" from any other reason `open_or_resume`
+/// failed — a timeout, a malformed reply, a real bug.
+///
+/// `None` passes the original error through unchanged: a failure this
+/// build's mapper does not recognize keeps whatever [`HarnessError`] variant
+/// it already had (usually [`HarnessError::Protocol`]) rather than being
+/// silently reclassified as "you need to sign in" on a guess.
+pub(crate) type OpenFailureMapper = fn(&HarnessError) -> Option<HarnessError>;
+
 /// The timeouts the loop is built from. A struct rather than four arguments so
 /// a test can shrink them without every call site naming all four.
 #[derive(Clone, Copy, Debug)]
@@ -197,12 +220,18 @@ impl AcpSession {
     /// today has a working ACP setter for it (`grok::config_requests`'s doc
     /// comment has the evidence). Discovery never needs either — see
     /// [`Self::open_for_discovery`], which stays on plain `session/new`.
+    ///
+    /// `map_open_failure` runs ONLY on a failed `session/new`/`session/load`
+    /// below — see [`OpenFailureMapper`]. A failure from the handshake itself
+    /// (`initialize`, via `connect`, above) is never a "sign in first" case:
+    /// the agent never got far enough to say anything about auth.
     pub async fn open(
         command: Command,
         cwd: &str,
         timeouts: Timeouts,
         request: &RunRequest,
         config_requests: ConfigRequests,
+        map_open_failure: OpenFailureMapper,
     ) -> Result<Self, HarnessError> {
         let Connected {
             mut child,
@@ -223,7 +252,7 @@ impl AcpSession {
                     // is dropped too — reap it here instead of leaving the timing
                     // to drop order.
                     shutdown_child(&mut child, timeouts.kill_grace).await;
-                    return Err(error);
+                    return Err(map_open_failure(&error).unwrap_or(error));
                 }
             };
 

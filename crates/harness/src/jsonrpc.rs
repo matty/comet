@@ -172,11 +172,7 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
                     continue;
                 };
                 let outcome = match msg.get("error") {
-                    Some(err) => Err(err
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| err.to_string())),
+                    Some(err) => Err(error_message(err)),
                     None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
                 };
                 let _ = sender.send(outcome);
@@ -217,4 +213,91 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
     // EOF/read error: fail every awaiting request, then signal the loop.
     pending.lock().expect("pending lock").clear();
     let _ = tx.send(Incoming::Eof).await;
+}
+
+/// Render one JSON-RPC `error` object as the text [`RpcClient::request`]
+/// fails with — a pure function so it can be tested without a real child
+/// process.
+///
+/// **`data` is folded onto `message`, not dropped.** Some agents (Hermes,
+/// confirmed live 2026-08-29) leave `message` a generic label — `"Internal
+/// error"` — and put the actionable reason in `data` instead: either a bare
+/// string, or an object carrying it under `.details`. Dropping `data` would
+/// make that reply unreadable to every caller downstream — `acp::grok`'s and
+/// `acp::hermes`'s own `map_open_failure` included, both of which match text
+/// this function is what makes reachable. Anything else `data` might hold
+/// (an unrecognized shape, or none at all) is left alone rather than guessed
+/// at.
+fn error_message(err: &Value) -> String {
+    let message = err
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| err.to_string());
+    let detail = err.get("data").and_then(|data| {
+        data.as_str()
+            .or_else(|| data.get("details").and_then(Value::as_str))
+    });
+    match detail {
+        Some(detail) if !message.is_empty() => format!("{message}: {detail}"),
+        Some(detail) => detail.to_owned(),
+        None => message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// Grok's real signed-out shape (captured live 2026-08-29): `data` is a
+    /// bare string, folded onto `message` with a separating colon.
+    #[test]
+    fn a_bare_string_data_is_appended_to_the_message() {
+        let err = json!({
+            "code": -32000,
+            "message": "Authentication required",
+            "data": "no auth method id provided"
+        });
+        assert_eq!(
+            error_message(&err),
+            "Authentication required: no auth method id provided"
+        );
+    }
+
+    /// Hermes' real "no provider configured" shape (captured live
+    /// 2026-08-29): `message` alone ("Internal error") is useless, and the
+    /// actionable text lives at `data.details`. Break caught: reading only
+    /// `message`, which is exactly what made this reply unreadable before
+    /// this function existed.
+    #[test]
+    fn an_object_datas_details_string_is_appended_to_the_message() {
+        let err = json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": {"details": "No LLM provider configured. Run `hermes model`…"}
+        });
+        assert_eq!(
+            error_message(&err),
+            "Internal error: No LLM provider configured. Run `hermes model`…"
+        );
+    }
+
+    /// No `data` at all (Codex's ordinary shape, and every other recorded
+    /// error): `message` alone, unchanged.
+    #[test]
+    fn no_data_leaves_the_message_unchanged() {
+        let err = json!({"code": -32601, "message": "method not found"});
+        assert_eq!(error_message(&err), "method not found");
+    }
+
+    /// An unrecognized `data` shape (a number, an array, an object with no
+    /// `.details`) is left alone rather than guessed at — `message` still
+    /// wins on its own.
+    #[test]
+    fn an_unrecognized_data_shape_is_dropped_not_guessed_at() {
+        let err = json!({"code": -1, "message": "boom", "data": 42});
+        assert_eq!(error_message(&err), "boom");
+    }
 }
