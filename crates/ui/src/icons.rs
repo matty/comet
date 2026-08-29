@@ -11,6 +11,13 @@
 //! - The harness brand marks (`claude-mark`, `openai-mark`, `cursor-mark`) are
 //!   ports of comet's `icons.tsx`. gpui tints SVGs with the text color, so the
 //!   Claude mark's brand orange is applied at the call site ([`CLAUDE_BRAND`]).
+//! - `grok-mark` comes from xAI's own asset pack. That pack ships a black
+//!   logomark and a white one; only one is checked in, because gpui rasterizes
+//!   an SVG to an alpha mask and paints it in a single colour
+//!   (`Window::paint_svg`), so a fill baked into the file never reaches the
+//!   screen. The light/dark pair is reproduced by leaving the mark untinted:
+//!   it takes `theme.text`, which is near-black on light and near-white on
+//!   dark — exactly the two variants xAI ships.
 //!
 //! Icons render via [`icon`]: `icon(icons::PAPERCLIP).size(px(16.)).text_color(…)`.
 
@@ -120,6 +127,7 @@ icon_assets![
     (CLAUDE_MARK, "claude-mark"),
     (OPENAI_MARK, "openai-mark"),
     (CURSOR_MARK, "cursor-mark"),
+    (GROK_MARK, "grok-mark"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — comet keeps it even on the
