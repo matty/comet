@@ -1,0 +1,29 @@
+{
+  "captured_at_unix_ms": 1787955732860,
+  "cli_version": "grok 1.0.5 (5115b46bc9) [stable]",
+  "command": {
+    "args": [
+      "--no-auto-update",
+      "agent",
+      "--no-leader",
+      "stdio"
+    ],
+    "configured_env": {},
+    "creation_flags": 0,
+    "cwd": null,
+    "kill_on_drop": true,
+    "program": "<HOME>\\.grok\\bin\\grok.exe",
+    "stderr": "Piped",
+    "stdin": "Piped",
+    "stdout": "Piped"
+  },
+  "exit_code": 0,
+  "platform": {
+    "arch": "x86_64",
+    "os": "windows"
+  },
+  "provider": "acp",
+  "purpose": "capture a Grok run receiving a queued steer, delivered as the next session/prompt on the same session (Grok advertises no in-turn steering extension)",
+  "scenario": "steer-grok",
+  "schema_version": 1
+}

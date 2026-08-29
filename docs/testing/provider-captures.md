@@ -139,12 +139,15 @@ frames still prove what the scenario is for:
 
 Do not edit staged output by hand.
 
-Before promoting, also check
-[`docs/debt/D73-tool-argument-union-paths.md`](../debt/D73-tool-argument-union-paths.md): seven
-paths on `claude.txt` are allowlisted as a union across today's five known tools rather than
-reviewed per tool, and that page must be settled — not merely re-read — before the next capture is
-promoted to the corpus. A new capture is exactly the event that could exercise a sixth, unreviewed
-tool (including a third-party MCP tool) through one of those already-approved paths.
+**Never allowlist a tool-argument path.** A path like `.message.content[].input.status` or
+`.params.update.rawInput.pattern` holds whatever the *currently invoked* tool puts there, so
+approving it approves every tool that will ever land on it, including the third-party MCP tool
+nobody reviewed. [`D73`](../debt/D73-tool-argument-union-paths.md) is where this was decided —
+it used to gate every promotion on settling seven such lines on `claude.txt`, and the stage-6
+promotion settled it by dropping all seven. Its page is kept for the reasoning, not as a
+checklist item. The structural answer for a whole argument object is `surface::MAP_PATHS` (its
+keys fold, so a tool's own parameter names never publish); a child production genuinely decodes
+is exempted by name there, which still leaves its value default-deny.
 
 ## Promote
 

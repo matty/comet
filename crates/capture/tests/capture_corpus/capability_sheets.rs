@@ -132,10 +132,17 @@ fn scenarios_for(root: &Path, provider: &str, version: &str) -> Vec<SheetScenari
         let mut argv = vec![program];
         argv.extend(args);
 
-        let cwd = manifest["command"]["cwd"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{} has no command.cwd", manifest_path.display()))
-            .to_owned();
+        // `null` is a recorded answer (the launch set no cwd, so the child
+        // inherited the recorder's — every ACP run row), and only a
+        // non-string, non-null value means a malformed manifest.
+        let cwd = match &manifest["command"]["cwd"] {
+            Value::Null => None,
+            Value::String(cwd) => Some(cwd.clone()),
+            _ => panic!(
+                "{} has a command.cwd that is neither a string nor null",
+                manifest_path.display()
+            ),
+        };
         let configured_env: BTreeMap<String, String> = manifest["command"]["configured_env"]
             .as_object()
             .unwrap_or_else(|| panic!("{} has no command.configured_env", manifest_path.display()))

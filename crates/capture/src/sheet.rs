@@ -50,11 +50,20 @@ pub struct SheetScenario {
     /// already put there (`<CWD>`, `<HOME>`, `<REDACTED_1>`, …). Rendering
     /// starts at `argv[0]`; there is no separate program field.
     pub argv: Vec<String>,
-    /// `command.cwd`, verbatim from the manifest (redacted to `<CWD>` in
-    /// every scenario observed so far, same as every sibling — carried
-    /// anyway so it prints beside the environment rather than being the one
-    /// field a reader has to go check the manifest for).
-    pub cwd: String,
+    /// `command.cwd`, verbatim from the manifest (redacted to `<CWD>`),
+    /// carried so it prints beside the environment rather than being the one
+    /// field a reader has to go check the manifest for.
+    ///
+    /// **`None` is a real recorded answer, not a missing field**: the launch
+    /// set no working directory and the child inherited the recorder's. Every
+    /// Claude and Codex row sets one, so this read as non-null until Grok
+    /// arrived — an ACP agent takes its session's directory from
+    /// `session/new`'s own `params.cwd`, so `grok::run_launch` deliberately
+    /// leaves the process cwd alone (`run-grok`, `steer-grok`). Rendering it
+    /// as an absent value rather than refusing the manifest keeps that
+    /// difference visible in the sheet, which is where a reader compares two
+    /// launches.
+    pub cwd: Option<String>,
     /// `command.configured_env`, verbatim from the manifest, sorted by key.
     /// Distinct from `argv`: two scenarios can share byte-identical argv and
     /// still not have been launched identically, which is exactly the case
@@ -186,7 +195,10 @@ fn scenario_lines(scenarios: &[SheetScenario]) -> Vec<String> {
         lines.push(String::new());
         lines.push(scenario.purpose.clone());
         lines.push(String::new());
-        lines.push(format!("cwd: `{}`", scenario.cwd));
+        lines.push(match &scenario.cwd {
+            Some(cwd) => format!("cwd: `{cwd}`"),
+            None => "cwd: none set — the launch inherits the recorder's".to_owned(),
+        });
         lines.push(env_line(&scenario.configured_env));
         lines.push(tools_line(scenario.tool_count));
         lines.push(String::new());
@@ -440,7 +452,7 @@ mod tests {
             name: name.to_owned(),
             purpose: purpose.to_owned(),
             argv: argv.iter().map(|arg| arg.to_string()).collect(),
-            cwd: cwd.to_owned(),
+            cwd: Some(cwd.to_owned()),
             configured_env: env
                 .iter()
                 .map(|(key, value)| (key.to_string(), value.to_string()))
