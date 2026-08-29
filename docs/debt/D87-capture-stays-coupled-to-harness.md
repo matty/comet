@@ -30,7 +30,8 @@ holds the claimant:
 - **`crates/harness/src/capture/record/scenarios/acp.rs:221-227`**, the recorder's own comment on
   why `run_launch` hard-delegates to Grok: "codex-acp and claude-agent-acp never reach this
   function... neither has a production `Harness` to register one against."
-- **`crates/harness/src/capture/record/scenarios/acp.rs:32-91`**: `adapter_launch`,
+- **`crates/harness/src/capture/record/scenarios/acp.rs:32-91` (`adapter_launch`, `adapter_entry`,
+  `npm_global_root`), `:151` (`codex_acp_launch`), `:158` (`claude_acp_launch`)**:
   `codex_acp_launch`, `claude_acp_launch` — the launch these two rows actually use — are built
   **entirely inside** `capture/`. They call no `crate::acp::{grok,hermes}` production code at
   all, because there is none to call.
@@ -96,9 +97,9 @@ thread_resume_params, turn_steer_params, turn_interrupt_params, discovery}`, `la
 **What the ACP slice actually added to that list is smaller than a first read suggests.**
 Checked directly against `crates/harness/src/acp/mod.rs`:
 
-- `initialize_params` (`:17`) — already `pub`.
-- `new_session_params` (`:35`) — already `pub`.
-- `prompt_params` (`:48`) — `pub(crate)`. Would need widening.
+- `initialize_params` (`:56`) — already `pub`.
+- `new_session_params` (`:74`) — already `pub`.
+- `prompt_params` (`:87`) — `pub(crate)`. Would need widening.
 
 And of the two agent-specific `run_launch` builders:
 
