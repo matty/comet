@@ -828,27 +828,32 @@ impl comet_harness::Harness for GatedTitlingHarness {
 async fn generate_never_renames_the_branch_for_a_title_that_lost_the_write_race() {
     // The bug's own window (see D116: the branch-doc commit and the
     // title-doc commit sit back to back with no `.await` between them in
-    // the buggy ordering) is CPU-instruction-scale — a single busy-spin
-    // racer thread misses it a meaningful fraction of the time even
-    // checking as fast as possible, because the check itself (a doc read
-    // through a lock) is not reliably faster than the window it is trying
-    // to observe. A single attempt is therefore not trustworthy evidence
-    // either way. Repeating the whole race up to `ATTEMPTS` times is: the
+    // the buggy ordering) is CPU-instruction-scale, so whether a busy-spin
+    // racer thread observes it at all is a genuine timing race rather than
+    // something the test can sequence: the check itself (a doc read through
+    // a lock) is not guaranteed faster than the window it is trying to
+    // observe. One attempt is therefore not, on its own, trustworthy
+    // evidence. Repeating the whole race up to `ATTEMPTS` times is: the
     // fixed ordering can NEVER trip the racer's trigger condition at all
     // (title only ever becomes visible together with, or after, the branch
     // — never before it, by construction, since the write happens first and
     // nothing yields between the two commits), so it always falls through
     // to the plain success-path assertions, deterministically, every
-    // attempt. The buggy ordering trips it with the same non-trivial
-    // per-attempt probability every time (observed ~50-60% while
-    // falsifying this test against the pre-fix ordering), so the chance
-    // every single one of `ATTEMPTS` independent attempts misses shrinks
-    // exponentially. Ten attempts already pushes the miss chance for a
-    // ~50%-per-attempt bug window under 0.1% (0.5^10); the repo is created
-    // once, outside the loop — only the
-    // worktree (which needs a fresh, unrenamed `comet/<name>` branch every
-    // time) and the engine's own data dir are per-attempt, to keep the
-    // whole test well under `.config/nextest.toml`'s 60s slow-test bound.
+    // attempt. The buggy ordering trips it with the same per-attempt
+    // probability every time, and in practice that probability is high:
+    // falsified against the pre-fix ordering on Windows, 22 of 22 runs
+    // failed and 21 of them caught the window on attempt 0. The racer
+    // thread hammering the same doc lock is why — the titler has to
+    // re-acquire it to write the title, and a spinning thread usually wins
+    // that handoff. `ATTEMPTS` is insurance for a slower or more contended
+    // machine where the window IS missed, not a claim that one attempt is
+    // unreliable here: each independent attempt multiplies the miss chance,
+    // so ten of them make a silent pass against a reintroduced bug
+    // vanishingly unlikely. The repo is created once, outside the loop —
+    // only the worktree (which needs a fresh, unrenamed `comet/<name>`
+    // branch every time) and the engine's own data dir are per-attempt, to
+    // keep the whole test well under `.config/nextest.toml`'s 60s
+    // slow-test bound (measured ~5.5s for all ten on the fixed ordering).
     const ATTEMPTS: usize = 10;
 
     let tmp = tempfile::tempdir().expect("tempdir");

@@ -12,7 +12,8 @@
 //!    retrying on comet's short backoff ladder; fall back to the prompt's first
 //!    words when every attempt produces nothing;
 //! 4. re-check the title (a user rename during generation wins);
-//! 5. [`WorkspaceHost::rename_chat_auto`] in the workspace doc;
+//! 5. write the title with [`WorkspaceHost::rename_chat_auto`] in the workspace
+//!    doc;
 //! 6. only once that write lands, and when the chat sits in a comet
 //!    worktree (`comet/<name>` branch), rename the branch from the title and
 //!    update the chat's branch row.
