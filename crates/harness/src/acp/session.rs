@@ -481,6 +481,7 @@ async fn open_or_resume(
                         target: "comet_harness::acp",
                         session_id = resume_id,
                         message = %raw.message,
+                        data = raw.data.as_deref().unwrap_or(""),
                         "session/load failed; reporting rather than starting a fresh session unless the failure mapper recognizes it as sign-in/setup first"
                     );
                     Err(OpenFailure {
@@ -1352,6 +1353,34 @@ async fn drive_turn(
                                     );
                                 }
                             }
+                        }
+                        // **Second drain, after the harvest above rather than
+                        // before it.** The two drains earlier in this fn only
+                        // cover what was buffered before their own settle
+                        // signal; this one covers a different window — the
+                        // up-to-`POST_NOTIFICATION_REPLY_BOUND` wait on
+                        // `reply` just above, during which the reader task
+                        // can have pushed more frames (a vendor notification
+                        // racing the reply on the wire) into `incoming`
+                        // before this arm returns. Left undrained, that
+                        // content would surface on the NEXT turn's own
+                        // leading drain instead of this turn's (D121) —
+                        // display-ordering, not loss, but cheap to close.
+                        // Same ConsumerGone-only handling as the drain above:
+                        // an EOF here is the agent shutting down after a
+                        // settled turn, not a reason to fail it.
+                        if let Handled::ConsumerGone = drain_buffered(
+                            incoming,
+                            client,
+                            event_tx,
+                            tools,
+                            diagnostics,
+                            streamed,
+                            request_approval,
+                        )
+                        .await
+                        {
+                            return TurnEnd::ConsumerGone;
                         }
                         if let Some(usage) = usage
                             && !send(event_tx, usage).await

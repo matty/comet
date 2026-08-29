@@ -22,6 +22,7 @@
 //! | `complete-notification-only` | sends the completion notification (see [`PROMPT_COMPLETE_METHOD`]), then never answers the prompt request — poses the hang upstream reports, where the RPC response alone hangs |
 //! | `complete-both` | sends the completion notification immediately, then the ordinary RPC reply after a deliberate delay — poses the healthy case both signals exist for |
 //! | `complete-both-usage` | identical to `complete-both`, except the RPC reply follows after a realistic few-ms gap (not `complete-both`'s exaggerated 200ms) and carries Grok's real usage shape (`_meta.inputTokens`/`outputTokens`) — poses the healthy turn Finding 1's fix exists for: usage that lives only in the reply, which the notification-settle path must still recover |
+//! | `complete-race-drain` | the notification, then an extra `agent_message_chunk` 50ms later, then the reply 10ms after that — so the chunk lands from the reader task strictly BETWEEN the two settle signals, during the harvest's own wait rather than before it. Poses the window D121 covers: only a drain placed AFTER the harvest, not the ones before it, can pick this up on the turn it belongs to. Unlike `complete-both-usage` the reply carries no token counts; this scenario is about frame ordering, not usage |
 //! | `complete-response-only` | the ordinary RPC reply alone, no notification — this is the plain `end_turn` path below; named here because it is the deliberate MIRROR of `complete-notification-only`: an agent without the extension, which must still settle |
 //! | `replay-stale` | replays the PREVIOUS turn's already-consumed promptId as a bogus early completion (`stopReason: "refusal"`) of THIS turn, before streaming this turn's own real content and completing for real — poses the cross-turn staleness the consumed-promptId dedup exists to reject |
 //! | `request-permission` | sends `session/request_permission` mid-turn with all four ACP option kinds, then — once answered — echoes `"chosen:<optionId or cancelled>"` as a text chunk and settles `end_turn`. Lets a test observe which option the client picked without reading raw wire bytes. |
@@ -584,6 +585,42 @@ fn handle_prompt(
             "result": {
                 "stopReason": "end_turn",
                 "_meta": {"promptId": prompt_id, "inputTokens": 111, "outputTokens": 22},
+            },
+        }));
+        return None;
+    }
+
+    if text.contains("complete-race-drain") {
+        // The exact window D121 covers, and `complete-both-usage` cannot pose
+        // it: the notification settles the turn, but a SECOND frame arrives
+        // from the reader task while the harvest below is still polling
+        // `reply`, not before it — so only a drain placed AFTER that poll
+        // returns can pick it up on THIS turn. Left undrained (the bug this
+        // scenario pins), it would sit in `incoming` until the NEXT turn's
+        // own leading drain instead (`docs/debt/README.md`'s D121).
+        //
+        // **The 50ms gap is the whole scenario, and it was 2ms first.** At
+        // 2ms the client is routinely descheduled long enough that its
+        // notification-arm drain — the one that runs BEFORE the harvest —
+        // has not executed yet when this chunk hits the pipe, so that drain
+        // scoops it and the test passes with the post-harvest drain deleted.
+        // Measured on a loaded debug build: 3 of 7 runs passed against the
+        // broken code. 50ms buys the margin, and both gaps together stay far
+        // inside `POST_NOTIFICATION_REPLY_BOUND` (250ms) so the harvest still
+        // receives the reply rather than timing out. Do not shrink them.
+        complete("end_turn");
+        *last_prompt_id = Some(prompt_id.clone());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        update(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "raced-in"},
+        }));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        emit(&json!({
+            "jsonrpc": "2.0", "id": id,
+            "result": {
+                "stopReason": "end_turn",
+                "_meta": {"promptId": prompt_id},
             },
         }));
         return None;
