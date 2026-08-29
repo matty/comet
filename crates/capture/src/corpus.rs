@@ -153,6 +153,22 @@ pub fn frames(scenario_dir: &Path) -> anyhow::Result<Vec<Value>> {
 /// Panics rather than returning an error: every caller is a test that would
 /// immediately unwrap, and the panic message carries the scenario and sequence,
 /// which is the whole triage path.
+///
+/// **One copy of this body exists outside this crate and has to move with it:**
+/// `crates/harness/tests/fixtures/fake_claude.rs`'s `corpus_frame_payload`.
+/// That file is a `[[bin]]` target, and Cargo never links a bin target's
+/// dev-dependencies, so it cannot call this function at all (D87 stage 7) — it
+/// re-spells the same addressing convention by hand: corpus root, read
+/// `events.jsonl`, skip blank lines, match `sequence`, take `payload`.
+///
+/// Change any of those and the copy keeps compiling. It fails, but only at run
+/// time and only obliquely: the fixture panics inside the spawned child, that
+/// panic goes to the child's stderr where no test reads it, and the harness
+/// suite reports a discovery mismatch instead. Checked by breaking the copy's
+/// corpus root: `comet-harness::claude changing_the_executable_re_runs_discovery`
+/// failed with `assertion left == right failed: the good fixture answers` and
+/// no mention of the corpus anywhere. So a change here means editing that file
+/// too — nothing will tell you legibly if you don't.
 pub fn frame(corpus_root: &Path, scenario: &str, sequence: u64) -> Frame {
     let scenario_dir = corpus_root.join(scenario);
     let events = frames(&scenario_dir)
@@ -176,8 +192,10 @@ pub fn frame(corpus_root: &Path, scenario: &str, sequence: u64) -> Frame {
 
 /// [`frame`] against this crate's own corpus.
 ///
-/// Kept separate from [`frame`] so the reader can move to its own crate later
-/// while this path stays anchored to `comet-harness`.
+/// Kept separate from [`frame`] so a caller can address a corpus rooted
+/// somewhere else without this wrapper's baked-in root. Written when the reader
+/// still lived inside `comet-harness` and the split was only anticipated; the
+/// split happened (D87 stage 7) and the root is now `crates/capture/tests/corpus`.
 pub fn corpus_frame(scenario: &str, sequence: u64) -> Frame {
     frame(&corpus_root(), scenario, sequence)
 }

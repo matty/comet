@@ -28,10 +28,15 @@ windows-sys.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 # Dev-only, and deliberately a cycle: comet-capture depends on comet-harness
-# normally (it reaches into harness internals to build launches), while a
-# handful of harness's own #[cfg(test)] fixtures — including the fake-claude
-# binary below — read a promoted frame back out of the corpus via
-# comet_capture::corpus_frame. Cargo permits a dev-dependency cycle; see D87.
+# normally (it reaches into harness internals to build launches), while five of
+# harness's own #[cfg(test)] unit tests — in claude::{commands,discovery,wire,
+# normalize} and codex::discovery — read a promoted frame back out of the corpus
+# via comet_capture::corpus_frame. Cargo permits a dev-dependency cycle; see D87.
+#
+# This reaches the [[bin]] targets below only in the sense that it does NOT:
+# Cargo never links a [[bin]] target's dev-dependencies, in any build mode, so
+# tests/fixtures/fake_claude.rs cannot `use comet_capture` and reads its one
+# frame through a local copy of the convention instead. See that file.
 comet-capture.workspace = true
 
 # Scripted fake CLIs for the adapter integration suites, spawned through

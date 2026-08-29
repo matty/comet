@@ -92,8 +92,9 @@ fn check_permission_mode() {
     }
 }
 
-/// The genuine captured initialize reply, `tests/corpus/claude/2.1.228/model-discovery`
-/// frame 2, loaded byte-for-byte rather than hand-typed. Its seven curated
+/// The genuine captured initialize reply,
+/// `crates/capture/tests/corpus/claude/2.1.228/model-discovery` frame 2, loaded
+/// byte-for-byte rather than hand-typed. Its seven curated
 /// models (including the double nesting and `resolvedModel`) are pinned in
 /// `claude/discovery.rs`'s own unit tests, which load this exact frame too;
 /// `models_come_back_live_and_merged` below only checks that `sonnet` merges
@@ -111,12 +112,18 @@ fn initialize_reply() -> String {
 /// target's `[dev-dependencies]` — only `[dependencies]` — regardless of
 /// build command; `comet-harness`'s dev-only dependency on `comet-capture`
 /// (D87 stage 7, so production cannot reach capture machinery) is invisible
-/// here. `comet_capture::corpus::frame`'s own doc comment anticipated exactly
-/// this split: it takes an explicit corpus root so a caller outside its own
-/// crate never needs the crate itself, only the convention its
-/// `corpus_frame` wraps — this is that convention, reimplemented locally
-/// rather than imported. Panics rather than returning a `Result`: every
-/// caller here is a test fixture that would immediately unwrap.
+/// here. `frame` in `crates/capture/src/corpus.rs` anticipated exactly this
+/// split: it takes an explicit corpus root so a caller outside its own crate
+/// never needs the crate itself, only the convention its `corpus_frame`
+/// wraps — this is that convention, reimplemented locally rather than
+/// imported. Panics rather than returning a `Result`: every caller here is a
+/// test fixture that would immediately unwrap.
+///
+/// **Keep this in step with that function.** It is a copy, and the compiler
+/// cannot see that it is: if the corpus root, the `sequence`/`payload` field
+/// names or the line framing change over there, this keeps building and dies
+/// inside the spawned child, whose stderr no test reads — the harness suite
+/// then reports a discovery mismatch that names nothing about the corpus.
 fn corpus_frame_payload(scenario: &str, sequence: u64) -> String {
     let events_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")

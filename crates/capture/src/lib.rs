@@ -6,9 +6,10 @@
 //! the recorder, sanitizer, corpus reader and sheet generator cannot link
 //! into `comet.exe` regardless of what any module here is marked `pub`.
 //! `comet-harness` depends on this crate only as a **dev-dependency**
-//! (`#[cfg(test)]` fixture reads of a promoted corpus frame, plus the
-//! `fake-claude` test binary), and this crate depends on `comet-harness`
-//! normally, to build launches from its production types
+//! (`#[cfg(test)]` unit-test reads of a promoted corpus frame — its
+//! `fake-claude` [[bin]] fixture is the one thing that *cannot* use it, since
+//! Cargo never links a bin target's dev-dependencies), and this crate depends
+//! on `comet-harness` normally, to build launches from its production types
 //! (`comet_harness::launch::LaunchDescriptor` and friends). D87 stage 7.
 //!
 //! Formerly a `pub mod capture;` inside `comet-harness` itself; extracted so

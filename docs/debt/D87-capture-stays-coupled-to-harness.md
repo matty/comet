@@ -163,10 +163,18 @@ after the move does not compile — `cargo test -p comet-harness --no-run` faile
 `E0433: cannot find module or crate comet_capture in this scope` — because `comet-harness`'s
 dev-dependency on `comet-capture` is invisible to a `[[bin]]` target regardless of the invoking
 command (`cargo check --all-targets`, `cargo test --no-run`, `cargo build --profile test`, all
-fail the same way). `corpus::frame`'s own doc comment ("Kept separate from `frame` so the reader
-can move to its own crate later while this path stays anchored to `comet-harness`") anticipated
-exactly this: `fake_claude.rs` now reads its one frame with a small local reimplementation of
-the same manifest/`events.jsonl` convention, rather than depending on the crate.
+fail the same way). `corpus_frame`'s own doc comment anticipated exactly this — it said at the
+time that it was "kept separate from `frame` so the reader can move to its own crate later" —
+so `fake_claude.rs` now reads its one frame with a small local reimplementation of the same
+`events.jsonl` convention, rather than depending on the crate. **That duplication is the one
+thing about this stage that can rot silently**, so the pointer runs both ways: `corpus::frame`'s
+doc names the copy, and the copy names `corpus::frame`. The failure mode was measured rather
+than assumed: breaking the copy's corpus root makes `comet-harness::claude
+changing_the_executable_re_runs_discovery` fail with `assertion left == right failed: the good
+fixture answers`. So it does fail — but the fixture's own panic goes to the spawned child's
+stderr, which no test reads, and the surviving symptom names discovery, not the corpus. Loud
+enough to stop a merge, useless for triage, and never a compile error. That is what the
+cross-reference is for.
 
 Visibility promoted from `pub(crate)` to `pub` on `comet-harness`, the full list actually needed
 to compile (checked directly against the source, not re-derived from the pre-move estimate
