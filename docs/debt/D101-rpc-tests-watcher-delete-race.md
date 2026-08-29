@@ -1,7 +1,10 @@
 # D101 — `rpc::tests` hung on a race between a `notify` watcher and its own `TempDir::drop()`
 
 **State:** closed, fixed in PR #128 (`fix/d101-engine-hang`). Not yet merged to `main` at time of
-writing; this page and the debt row are part of the same PR that lands the fix.
+writing; this page and the debt row are part of the same PR that lands the fix. **One caveat before
+treating this as a closed loop**: a hang on a test with no watcher exposure under any route this
+page names stays unexplained — see "What the first review round got wrong" below and the note at
+the end of the Step 5 ruling.
 
 ## The question this page answers
 
@@ -143,6 +146,12 @@ series (20 required runs) hung at run 16/20, on a different test,
 `RunRequest`, and had already been converted to the safe path at route (1). That test's own body
 has no code path that arms a `SpacesSync` watcher under the mechanism above.
 
+The base report's isolation series (six-times-each, run alone) covered five of the module's
+six known victims — every one but this one, which was found only later, during that first fix's
+falsification series, and was never run individually. So unlike the other five, there is no 6/6
+isolation data for this test either way; the gap in evidence and the gap in explanation are the
+same gap.
+
 The investigation that followed reached for route (2) (`claim_chat`/`space_for_path`) as the
 explanation and shipped a fix and a debt-row narrative built on it. **That narrative was wrong**,
 caught in the second review round: `claim_chat` returns early whenever the chat row already
@@ -178,6 +187,11 @@ teardown, and needed OS scheduling contention (or, per route (3)'s direct reprod
 needed to run at all) to lose. Production never recursively deletes a live space's folder —
 `DeleteSpace`/`DeleteChat` remove Comet's own internal rows and journals, never the user's
 directory on disk — so this mechanism has no production analogue at any of the three routes.
+
+This ruling covers the three routes this page names and traces to a mechanism. It does not cover
+the one hang neither review round could explain ("What the first review round got wrong" above)
+— that observation has no known mechanism to rule on, production or otherwise, and is not folded
+into this ruling.
 
 ## The gap this fix deliberately does not close
 
