@@ -206,6 +206,71 @@ fn inventory_folds_a_declared_map_path_into_one_entry() {
     );
 }
 
+/// Break caught (D123): a declared map path used to fold *every* child to
+/// `.{}`, so a field production genuinely decodes (`normalize::typed_call`
+/// reads `rawInput["pattern"]` and `rawInput["path"]` on a `search`-kind ACP
+/// frame) was invisible to the golden test — a future agent dropping
+/// `pattern` would break the decode with the sheet still green. `MapPath`'s
+/// `named_children` is the fix: a listed child stays visible as its own
+/// field, while every *unlisted* sibling under the same map (`glob`, a
+/// filesystem path here, or `target_file` for a different tool) still folds,
+/// which is the property that keeps this from becoming a leaf-name heuristic.
+#[test]
+fn a_named_map_child_reaches_the_sheet_while_an_unnamed_sibling_still_folds() {
+    let root = tempfile::tempdir().unwrap();
+    write_scenario(
+        root.path(),
+        "claude-agent-acp",
+        "0.70.0",
+        "steer-grok",
+        &[(
+            1,
+            "stdout",
+            json!({
+                "params": {
+                    "update": {
+                        "rawInput": {
+                            "variant": "Grep",
+                            "pattern": "needle",
+                            "path": "C:\\Users\\coding\\AppData\\Local\\Temp\\cwd",
+                            // An unnamed sibling with a nested object, the
+                            // same shape `.modelUsage.{}.costUSD` proves
+                            // folding with above: if the fold still applies,
+                            // this shows up as `.{}.mimeType`, never as
+                            // `.attachment.mimeType`.
+                            "attachment": {"mimeType": "text/plain"},
+                        }
+                    }
+                }
+            }),
+        )],
+    );
+
+    let observations = observe_surface(root.path()).unwrap().0;
+    let seen = paths(&observations);
+
+    assert!(
+        seen.contains(".params.update.rawInput.pattern"),
+        "a named child must be recorded under its own field name: {seen:?}"
+    );
+    assert!(
+        seen.contains(".params.update.rawInput.path"),
+        "a named child must be recorded under its own field name: {seen:?}"
+    );
+    assert!(
+        !seen.contains(".params.update.rawInput.variant"),
+        "an unnamed scalar sibling must not publish as a field: {seen:?}"
+    );
+    assert!(
+        !seen.contains(".params.update.rawInput.attachment"),
+        "an unnamed sibling's own key must not publish as a field: {seen:?}"
+    );
+    assert!(
+        seen.contains(".params.update.rawInput.{}.mimeType"),
+        "an unnamed sibling must still fold to `{{}}`, not disappear or leak its key: {seen:?}"
+    );
+}
+
 /// Break caught: the same key at two different places folds into one row, so
 /// `content` in a tool input and `content` in an assistant message become
 /// indistinguishable.

@@ -140,6 +140,14 @@ like a value. Declaring a new map is one edit serving both: the sheet stops reco
 a field, and the sanitizer stops publishing it. A map nobody declared still publishes its keys
 (D77).
 
+**A declared map can name individual children that are field names after all.** A `MapPath`'s
+`named_children` list exempts those keys from the fold, so the sheet records them under their own
+path and the sanitizer keeps their spelling, while every unlisted sibling still folds. It changes
+what a key is *called*, never what its value earns — a named child's value is still default-deny,
+and publishing it verbatim is still its own line in `allowlist/*.txt`. Name a child only where
+production decodes it: `.params.update.rawInput` names `pattern` and `path` because
+`acp::normalize::typed_call` reads exactly those two, and every other tool argument still folds.
+
 `docs/providers/<provider>-<version>.md` is a generated **capability sheet**, one per corpus
 version directory (`claude-2.1.228.md`, `claude-2.1.229.md`, `claude-2.1.233.md`,
 `claude-2.1.241.md`, `codex-0.147.0.md`, `claude-agent-acp-0.70.0.md`, `codex-acp-1.7.0.md`

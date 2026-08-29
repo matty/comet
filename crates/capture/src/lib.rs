@@ -40,8 +40,8 @@ pub use sanitize::{
 };
 pub use sheet::{SheetScenario, render_sheet};
 pub use surface::{
-    Direction, FieldObservation, FrameRef, MAP_PATHS, SurfaceError, VOCABULARY_PATHS, Vocabulary,
-    observe_surface,
+    Direction, FieldObservation, FrameRef, MAP_PATHS, MapPath, SurfaceError, VOCABULARY_PATHS,
+    Vocabulary, is_map_path, is_named_map_child, observe_surface,
 };
 pub use types::{
     CaptureConfig, CaptureEvent, Channel, CommandSnapshot, PlatformMetadata, Provider, RawCapture,

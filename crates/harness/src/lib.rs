@@ -474,6 +474,16 @@ pub(crate) fn cap_prose(s: &str, max_bytes: usize) -> String {
 ///    actionable — which this function's fixed copy cannot express. The raw
 ///    frame is still warn-logged at the drop site (`session_update_once`
 ///    itself), matching every other sink's contract.
+///
+///    **This site emits a second, differently-shaped diagnostic, and it is
+///    still one sink rather than an eighth.** Once `session_update_once`'s
+///    rate limiter is full (`MAX_TRACKED_UPDATE_KINDS`), the first kind past
+///    the cap emits `sessionUpdate/reporting-capped` — once per session —
+///    saying that unknown-kind reporting has stopped. It reports on the
+///    LIMITER, not on a frame, which is why it names no kind and embeds no
+///    provider text at all; the kind that tripped it is agent-chosen and
+///    would point a reader at nothing. See that const's own doc comment for
+///    why saying so once beats capping silently.
 /// 7. ACP: a `session/update` whose `update` object carries no `sessionUpdate`
 ///    key at all — same function, the `let Some(kind) = … else` arm. Calls
 ///    this function normally.

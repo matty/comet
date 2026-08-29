@@ -176,6 +176,13 @@ it decides both questions at once — the capability sheet stops recording the k
 and the sanitizer stops publishing it. Until it is declared, the keys ride through
 ([D77](../debt/README.md)).
 
+**A child of that map which production genuinely decodes goes in the declaration's own
+`named_children` list, not on the allowlist.** That keeps the key visible to the sheet — so a
+version that drops the field still fails the golden test — while leaving its value default-deny.
+Naming a child is not a decision to publish its values; that is still a separate
+`allowlist/*.txt` line, reviewed exactly as above. Everything under the same map that nothing
+decodes stays folded.
+
 Before committing, deliberately break each new contract once, observe a meaningful named failure,
 restore it, and rerun green. Finish with the repository gate from `AGENTS.md`.
 
