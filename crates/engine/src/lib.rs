@@ -532,20 +532,41 @@ fn local_device_name() -> String {
     )
 }
 
-/// How many times to re-read after losing a publish race, or after failing to
+/// How long to keep re-reading after losing a publish race, or after failing to
 /// displace an empty file because another process holds it open.
 ///
-/// Higher than the two or three a pure publish race needs, because Windows
-/// makes displacement itself contended: `rename` and `remove_file` fail with
-/// `ERROR_ACCESS_DENIED` while any other handle is open on the file, so several
-/// repairers can bounce off each other before one gets through. Not theory —
-/// 8 concurrent openers reproduced it, and the first version of this function
-/// failed startup outright when it happened.
-const DEVICE_ID_ATTEMPTS: usize = 24;
+/// **A wall-clock budget, not an attempt count (D126).** It was 24 attempts at
+/// a flat 3ms — about 72ms — sized against real contention (Windows `rename`
+/// and `remove_file` fail with `ERROR_ACCESS_DENIED` while any other handle is
+/// open, and 8 concurrent openers reproduced it) but sized on an UNLOADED
+/// machine. Under a saturated one the same 24 slices buy far less progress,
+/// and exhausting them fails startup outright. That is D89's mechanism exactly:
+/// a budget that held when idle, missed under parallel builds.
+///
+/// Five seconds sounds enormous for a startup path and is not, because of when
+/// it is spent: only while repairing a corrupt identity, only under contention,
+/// and only in place of refusing to start at all. The common path never sleeps
+/// once.
+const DEVICE_ID_RECOVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Backoff between attempts. Paid only while repairing a corrupt identity and
-/// only under contention; the common path never sleeps.
+/// The first backoff, and the step the schedule doubles from.
 const DEVICE_ID_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(3);
+
+/// The ceiling a doubled backoff stops at, so a long budget stays responsive
+/// rather than sleeping through the window in which a winner publishes.
+const DEVICE_ID_RETRY_PAUSE_CAP: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How long to wait before attempt `attempt` (0-based) tries again.
+///
+/// Exponential from [`DEVICE_ID_RETRY_PAUSE`] to [`DEVICE_ID_RETRY_PAUSE_CAP`].
+/// Backing off matters more than it looks: every repairer sleeping the same
+/// flat 3ms is a lock-step convoy that keeps colliding, which is the shape that
+/// exhausted the old fixed count.
+fn device_id_retry_pause(attempt: u32) -> std::time::Duration {
+    DEVICE_ID_RETRY_PAUSE
+        .saturating_mul(2u32.saturating_pow(attempt.min(16)))
+        .min(DEVICE_ID_RETRY_PAUSE_CAP)
+}
 
 /// Stable per-installation device id, persisted at `{data_dir}/device-id`.
 ///
@@ -566,7 +587,11 @@ const DEVICE_ID_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_mil
 fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
     std::fs::create_dir_all(data_dir)?;
     let path = data_dir.join("device-id");
-    for _ in 0..DEVICE_ID_ATTEMPTS {
+    let started = std::time::Instant::now();
+    let mut attempt = 0u32;
+    while started.elapsed() < DEVICE_ID_RECOVERY_BUDGET {
+        let pause = device_id_retry_pause(attempt);
+        attempt += 1;
         match std::fs::read_to_string(&path) {
             Ok(id) if !id.trim().is_empty() => return Ok(id.trim().to_string()),
             // Empty: displace it so the create-if-absent publish below has a
@@ -578,7 +603,7 @@ fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
                     // Another repairer holds the file open. Back off and
                     // re-read: they are most likely about to publish, and
                     // taking their result is the whole point.
-                    std::thread::sleep(DEVICE_ID_RETRY_PAUSE);
+                    std::thread::sleep(pause);
                     continue;
                 }
             }
@@ -621,15 +646,16 @@ fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
                     std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
                 ) =>
             {
-                std::thread::sleep(DEVICE_ID_RETRY_PAUSE);
+                std::thread::sleep(pause);
                 continue;
             }
             Err(err) => return Err(err.into()),
         }
     }
     Err(EngineError::Other(format!(
-        "could not establish a device identity at {}",
-        path.display()
+        "could not establish a device identity at {} ({attempt} attempts over {:?})",
+        path.display(),
+        started.elapsed()
     )))
 }
 
@@ -722,6 +748,51 @@ mod tests {
             .filter(|n| n.starts_with(".device-id."))
             .collect();
         assert!(strays.is_empty(), "left behind: {strays:?}");
+    }
+
+    /// Break caught (D126): the retry budget was 24 attempts at a flat 3ms,
+    /// sized against real contention but on an UNLOADED machine. One
+    /// full-workspace run with four other cargo builds saturating the box
+    /// exhausted it, and `concurrent_recovery_agrees_on_one_id` `.unwrap()`s
+    /// that error into a panic — D89's mechanism exactly.
+    ///
+    /// Asserts the property that makes the change a fix rather than a reshuffle:
+    /// **the new budget can never buy fewer attempts than the old constant
+    /// did.** A count is what got sized wrong, so the replacement is checked
+    /// against the count it replaced rather than against a number picked here.
+    #[test]
+    fn the_recovery_budget_never_buys_fewer_attempts_than_the_fixed_count_did() {
+        const OLD_ATTEMPTS: u32 = 24;
+
+        let mut spent = std::time::Duration::ZERO;
+        let mut attempts = 0u32;
+        while spent < DEVICE_ID_RECOVERY_BUDGET {
+            spent += device_id_retry_pause(attempts);
+            attempts += 1;
+        }
+
+        assert!(
+            attempts > OLD_ATTEMPTS,
+            "the budget bought {attempts} attempts, no better than the              {OLD_ATTEMPTS} that failed under load"
+        );
+    }
+
+    /// The backoff itself: exponential from the first pause to the cap, and
+    /// capped rather than doubling forever. Both halves matter — a flat pause
+    /// is a lock-step convoy that keeps colliding, and an uncapped one sleeps
+    /// through the window a winner publishes in.
+    #[test]
+    fn the_retry_backoff_grows_and_then_stops_growing() {
+        assert_eq!(device_id_retry_pause(0), DEVICE_ID_RETRY_PAUSE);
+        assert_eq!(device_id_retry_pause(1), DEVICE_ID_RETRY_PAUSE * 2);
+        assert_eq!(device_id_retry_pause(2), DEVICE_ID_RETRY_PAUSE * 4);
+        assert_eq!(device_id_retry_pause(60), DEVICE_ID_RETRY_PAUSE_CAP);
+        for attempt in 0..1_000 {
+            assert!(
+                device_id_retry_pause(attempt) <= DEVICE_ID_RETRY_PAUSE_CAP,
+                "attempt {attempt} slept past the cap"
+            );
+        }
     }
 
     /// The reason recovery publishes through create-if-absent rather than just
