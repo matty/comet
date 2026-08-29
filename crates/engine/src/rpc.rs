@@ -2133,12 +2133,51 @@ mod tests {
             model: None,
             reasoning: None,
             model_options: Default::default(),
-            cwd: dir.to_string_lossy().to_string(),
+            cwd: unwatched_space_root(dir).to_string_lossy().to_string(),
             runtime_mode: comet_proto::RuntimeMode::default(),
             sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
             attachments: Vec::new(),
             resume: None,
         }
+    }
+
+    /// D101: a space's folder must never be a real, existing directory in this
+    /// module. `SpacesSync` (`crate::spaces`) arms a non-recursive `notify`
+    /// filesystem watcher directly on `Space::path` — and every test here backs
+    /// its `EngineCore` with the same `tempfile::TempDir` it registers as that
+    /// path, so the watcher ends up watching the exact tree `TempDir::drop()`
+    /// recursively deletes at the end of the test.
+    ///
+    /// That used to deadlock intermittently on Windows: `notify` 7.0's
+    /// `ReadDirectoryChangesWatcher` only *posts* a stop request from `Drop`/
+    /// `unwatch` and never waits for its background thread to act on it (see
+    /// `notify-7.0.0/src/windows.rs`, `Drop for ReadDirectoryChangesWatcher` and
+    /// `stop_watch`) — so a delete racing a slow-to-stop watcher on the same
+    /// directory could starve the stop forever behind a stream of change events
+    /// the delete itself was generating. There is no synchronous, awaitable stop
+    /// this crate exposes to build a teardown-ordering fix on.
+    ///
+    /// `notify::Watcher::watch` fails fast, entirely inside `notify` and before
+    /// any OS handle is opened, when the path is neither a file nor a directory
+    /// (`windows.rs`'s `watch_inner`) — so a space folder that is never created
+    /// keeps every test's watcher permanently unarmed: no `ReadDirectoryChangesW`
+    /// call is ever issued, and the race has nothing to race. `create_space`
+    /// itself does no filesystem validation (`workspace_host.rs`), so this is
+    /// safe: it is a doc-row string, and none of this module's tests read a
+    /// space's folder back off disk.
+    fn unwatched_space_root(dir: &std::path::Path) -> std::path::PathBuf {
+        let root = dir.join("space-root-not-on-disk");
+        // Enforces the invariant this whole module leans on: if anything ever
+        // creates this path, notify::Watcher::watch stops failing fast and the
+        // D101 race is back. A debug_assert turns that into a loud test
+        // failure at the call site instead of a silent, timing-dependent hang
+        // someone has to rediscover with a debugger.
+        debug_assert!(
+            !root.exists(),
+            "unwatched_space_root must stay unwatchable: {} exists",
+            root.display()
+        );
+        root
     }
 
     fn engine_core(dir: &std::path::Path) -> crate::EngineCore {
@@ -2244,7 +2283,7 @@ mod tests {
             model: None,
             reasoning: None,
             model_options: Default::default(),
-            cwd: dir.to_string_lossy().to_string(),
+            cwd: unwatched_space_root(dir).to_string_lossy().to_string(),
             runtime_mode: comet_proto::RuntimeMode::default(),
             sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
             attachments: Vec::new(),
@@ -2379,7 +2418,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -2435,7 +2474,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -2521,7 +2560,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -2700,7 +2739,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -2801,7 +2840,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -2921,7 +2960,7 @@ mod tests {
                 .create_space(
                     "space-1",
                     "dev-a",
-                    dir.path().to_string_lossy().as_ref(),
+                    unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                     None,
                     false,
                 )
@@ -3012,7 +3051,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -3135,7 +3174,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -3173,7 +3212,9 @@ mod tests {
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
-                    cwd: dir.path().to_string_lossy().to_string(),
+                    cwd: unwatched_space_root(dir.path())
+                        .to_string_lossy()
+                        .to_string(),
                     runtime_mode: comet_proto::RuntimeMode::default(),
                     sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
                     attachments: Vec::new(),
@@ -3312,7 +3353,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -3422,7 +3463,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -3535,7 +3576,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -3555,7 +3596,9 @@ mod tests {
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
-                    cwd: dir.path().to_string_lossy().to_string(),
+                    cwd: unwatched_space_root(dir.path())
+                        .to_string_lossy()
+                        .to_string(),
                     runtime_mode: comet_proto::RuntimeMode::default(),
                     sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
                     attachments: Vec::new(),
@@ -3668,7 +3711,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -3748,7 +3791,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -3837,7 +3880,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -3904,7 +3947,9 @@ mod tests {
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
-                    cwd: dir.path().to_string_lossy().to_string(),
+                    cwd: unwatched_space_root(dir.path())
+                        .to_string_lossy()
+                        .to_string(),
                     runtime_mode: comet_proto::RuntimeMode::default(),
                     sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
                     attachments: Vec::new(),
@@ -3971,7 +4016,9 @@ mod tests {
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
-                    cwd: dir.path().to_string_lossy().to_string(),
+                    cwd: unwatched_space_root(dir.path())
+                        .to_string_lossy()
+                        .to_string(),
                     runtime_mode: comet_proto::RuntimeMode::default(),
                     sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
                     attachments: Vec::new(),
@@ -4055,7 +4102,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -4073,7 +4120,9 @@ mod tests {
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
-                    cwd: dir.path().to_string_lossy().to_string(),
+                    cwd: unwatched_space_root(dir.path())
+                        .to_string_lossy()
+                        .to_string(),
                     runtime_mode: comet_proto::RuntimeMode::default(),
                     sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
                     attachments: Vec::new(),
@@ -4112,7 +4161,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -4241,7 +4290,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -4325,7 +4374,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -4347,7 +4396,9 @@ mod tests {
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
-                    cwd: dir.path().to_string_lossy().to_string(),
+                    cwd: unwatched_space_root(dir.path())
+                        .to_string_lossy()
+                        .to_string(),
                     runtime_mode: comet_proto::RuntimeMode::default(),
                     sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
                     attachments: Vec::new(),
@@ -4437,7 +4488,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -4457,7 +4508,9 @@ mod tests {
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
-                    cwd: dir.path().to_string_lossy().to_string(),
+                    cwd: unwatched_space_root(dir.path())
+                        .to_string_lossy()
+                        .to_string(),
                     runtime_mode: comet_proto::RuntimeMode::default(),
                     sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
                     attachments: Vec::new(),
@@ -4555,7 +4608,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
@@ -4577,7 +4630,9 @@ mod tests {
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
-                    cwd: dir.path().to_string_lossy().to_string(),
+                    cwd: unwatched_space_root(dir.path())
+                        .to_string_lossy()
+                        .to_string(),
                     runtime_mode: comet_proto::RuntimeMode::default(),
                     sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
                     attachments: Vec::new(),
@@ -4607,7 +4662,9 @@ mod tests {
         rpc.mutate(MutateParams::CreateSpace {
             space_id: "space-1".into(),
             device_id: "dev-a".into(),
-            path: dir.path().to_string_lossy().to_string(),
+            path: unwatched_space_root(dir.path())
+                .to_string_lossy()
+                .to_string(),
             name: None,
             git_detected: false,
         })
@@ -4660,7 +4717,7 @@ mod tests {
             .create_space(
                 "space-1",
                 "dev-a",
-                dir.path().to_string_lossy().as_ref(),
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
                 None,
                 false,
             )
