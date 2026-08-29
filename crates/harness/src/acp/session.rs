@@ -481,6 +481,7 @@ async fn open_or_resume(
                         target: "comet_harness::acp",
                         session_id = resume_id,
                         message = %raw.message,
+                        data = raw.data.as_deref().unwrap_or(""),
                         "session/load failed; reporting rather than starting a fresh session unless the failure mapper recognizes it as sign-in/setup first"
                     );
                     Err(OpenFailure {
