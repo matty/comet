@@ -1993,6 +1993,10 @@ async fn real_claude_sees_uploaded_image_inline() {
     )
     .expect("engine core assembles");
     // Pre-title the chat so the auto-titler doesn't spend a second model call.
+    // `rename_chat` also stamps `titleManual`, so this skips the titler via
+    // the manual-rename lock, not the plain "already has a title" check —
+    // fine for this test's purpose, but not coverage of that other property
+    // (`comet_doc::workspace`'s own tests own it).
     core.workspace
         .create_chat(CHAT, &core.device_id, None, Some("/tmp".into()))
         .expect("create chat row");
@@ -2110,7 +2114,11 @@ async fn real_claude_task_tools_persist_a_checklist() {
     core.workspace
         .create_chat(CHAT, "space-checklist", None, Some("/tmp".into()))
         .expect("create chat row");
-    // Pre-title the chat so the auto-titler does not spend a second model call.
+    // Pre-title the chat so the auto-titler does not spend a second model
+    // call. `rename_chat` also stamps `titleManual`, so this skips the
+    // titler via the manual-rename lock, not the plain "already has a title"
+    // check — see the note at this file's other `rename_chat(CHAT, ...)`
+    // pre-title call.
     core.workspace
         .rename_chat(CHAT, "Pre-titled")
         .expect("rename chat");

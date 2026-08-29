@@ -753,6 +753,167 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
     core.shutdown().await;
 }
 
+/// A harness registered under an arbitrary [`HarnessId`], streaming a fixed
+/// script — stands in for Grok (out of reach in this crate's tests) the same
+/// way `crates/engine/src/rpc.rs`'s own `ScriptedHarness` does.
+struct ScriptedHarness {
+    id: HarnessId,
+    script: Vec<AgentEvent>,
+}
+
+#[async_trait::async_trait]
+impl comet_harness::Harness for ScriptedHarness {
+    fn id(&self) -> HarnessId {
+        self.id
+    }
+    fn display_name(&self) -> &str {
+        "Scripted"
+    }
+    fn capabilities(&self) -> comet_proto::HarnessCapabilities {
+        comet_proto::HarnessCapabilities::default()
+    }
+    async fn models(&self) -> Result<comet_proto::ModelCatalog, comet_harness::HarnessError> {
+        Ok(comet_proto::ModelCatalog::built_in(Vec::new()))
+    }
+    async fn run(
+        &self,
+        _request: comet_proto::RunRequest,
+        _controls: comet_harness::RunControls,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<comet_proto::AgentEvent, comet_harness::HarnessError>,
+        >,
+        comet_harness::HarnessError,
+    > {
+        let events: Vec<_> = self.script.iter().cloned().map(Ok).collect();
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+/// PR9's Important 3 fix: before it, only the model-run titling path
+/// (`TitleGenerator::generate`, exercised above) renamed the worktree branch
+/// from the title — a Grok chat (self-titling, so `generate` never runs) kept
+/// its generated branch name forever. `TitleGenerator::apply_agent_title`
+/// must do the identical rename.
+#[tokio::test]
+async fn agent_authored_title_also_renames_the_worktree_branch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    let repos = Repos::with_worktrees_root(
+        &tmp.path().join("data"),
+        "device-test",
+        tmp.path().join("worktrees"),
+    );
+    let worktree = repos
+        .create_worktree(&repo_dir, "main")
+        .await
+        .expect("worktree");
+
+    std::fs::create_dir_all(tmp.path().join("data")).expect("data dir");
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(ScriptedHarness {
+        id: HarnessId::Grok,
+        script: vec![
+            AgentEvent::SessionStarted {
+                harness: HarnessId::Grok,
+                model: "grok-code-fast".into(),
+                tools: Vec::new(),
+                cwd: worktree.path.clone(),
+                session_id: "session-1".into(),
+                assistant_message_id: "assistant-1".into(),
+                runtime_mode: comet_proto::RuntimeMode::default(),
+            },
+            AgentEvent::SessionTitled {
+                title: "Fix Login Flow".into(),
+            },
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            },
+        ],
+    }));
+    let core = EngineCore::assemble(
+        &tmp.path().join("data"),
+        Arc::new(registry),
+        HarnessId::Grok,
+        None,
+    )
+    .expect("engine assembles");
+
+    let chat_id = "chat-title-grok";
+    core.workspace
+        .create_space(
+            "space-title-grok",
+            &core.device_id,
+            &repo_dir.to_string_lossy(),
+            None,
+            true,
+        )
+        .expect("create space");
+    core.workspace
+        .create_chat(
+            chat_id,
+            "space-title-grok",
+            None,
+            Some(worktree.path.clone()),
+        )
+        .expect("create chat");
+    core.workspace
+        .set_chat_branch(chat_id, &worktree.branch)
+        .expect("set branch");
+
+    let request = comet_proto::RunRequest {
+        prompt: "please fix the login flow".into(),
+        harness: None,
+        model: None,
+        reasoning: None,
+        model_options: serde_json::Map::new(),
+        cwd: worktree.path.clone(),
+        runtime_mode: comet_proto::RuntimeMode::default(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        attachments: Vec::new(),
+        resume: None,
+    };
+    core.sessions
+        .dispatch(chat_id, HarnessId::Grok, request, None)
+        .await
+        .expect("dispatch");
+
+    // Same double-gate as the model-run test above: the branch rename is a
+    // background task spawned once the title write lands, so its visibility
+    // is not ordered against the title's.
+    let original_branch = worktree.branch.clone();
+    let chat = wait_for("agent-titled chat on its renamed branch", || {
+        core.workspace
+            .doc()
+            .chat(chat_id)
+            .ok()
+            .flatten()
+            .filter(|c| {
+                c.title.as_deref() == Some("Fix Login Flow")
+                    && c.branch.as_deref().is_some_and(|b| b != original_branch)
+            })
+    })
+    .await;
+    assert_eq!(chat.branch.as_deref(), Some("comet/fix-login-flow"));
+    let head = tokio::process::Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(&worktree.path)
+        .output()
+        .await
+        .expect("git");
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "comet/fix-login-flow"
+    );
+
+    core.shutdown().await;
+}
+
 #[tokio::test]
 async fn rename_worktree_branch_guards_and_collisions() {
     let tmp = tempfile::tempdir().expect("tempdir");

@@ -193,6 +193,11 @@ fn stored_harness_session(core: &EngineCore) -> Option<(String, Option<String>)>
 /// Create + name the chat row up front so the auto-titler (which runs its own
 /// harness request after a completed exchange on an UNTITLED chat) stays out
 /// of the recorded request log.
+/// `rename_chat` also stamps `titleManual`, so every caller of this helper
+/// skips the auto-titler via the manual-rename lock, not the plain "already
+/// has a title" check — fine for keeping these restart/resume tests off an
+/// unrelated model call, but not coverage of that other property
+/// (`comet_doc::workspace`'s own tests own it).
 fn pre_title(core: &EngineCore) {
     core.workspace
         .create_space("space-restart", &core.device_id, "/tmp", None, false)

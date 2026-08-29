@@ -51,6 +51,55 @@ struct Inner {
     repos: Repos,
 }
 
+impl Inner {
+    /// Rename the worktree branch to match `title` when the chat still sits
+    /// on its original `comet/<name>` branch (guards live inside
+    /// `rename_worktree_branch`). Shared by `TitleGenerator::generate`
+    /// (Comet's own model-run titling) and `TitleGenerator::apply_agent_title`
+    /// (an ACP agent's self-reported title) — before this method existed,
+    /// only the model-run path did this, so a Grok chat in a comet worktree
+    /// kept its generated branch name forever while every other harness got
+    /// it renamed. Best-effort and non-fatal either way: a failed branch
+    /// rename must never be mistaken for a failed title.
+    ///
+    /// Callers differ on WHEN they call this relative to the title write —
+    /// `generate` calls it before (its own prior `already_named` check has
+    /// already decided the write will proceed), `apply_agent_title` calls it
+    /// after, only once the write is confirmed to have landed — and that
+    /// difference is deliberate, not an inconsistency to fix: renaming a
+    /// branch to match a title that then FAILED to write (a last-moment
+    /// manual rename lock) would rename it to nothing that ended up on the
+    /// chat.
+    async fn rename_worktree_branch_for_title(
+        &self,
+        chat_id: &str,
+        chat: &comet_proto::Chat,
+        title: &str,
+    ) {
+        let (Some(chat_cwd), Some(branch)) = (&chat.cwd, &chat.branch) else {
+            return;
+        };
+        if !branch.starts_with("comet/") {
+            return;
+        }
+        match self
+            .repos
+            .rename_worktree_branch(std::path::Path::new(chat_cwd), branch, title)
+            .await
+        {
+            Ok(renamed) if &renamed != branch => {
+                if let Err(err) = self.workspace.set_chat_branch(chat_id, &renamed) {
+                    tracing::warn!(chat = %chat_id, error = %err, "chat branch update failed");
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(chat = %chat_id, error = %err, "automatic worktree branch rename failed");
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TitleGenerator {
     inner: Arc<Inner>,
@@ -106,12 +155,13 @@ impl TitleGenerator {
     /// sent one (a dropped notification, an older agent build) — without it, a
     /// harness wrongly believed to self-title would leave a chat named
     /// nothing, forever. That fallback still costs nothing when the agent DID
-    /// answer: `AgentEvent::SessionTitled` is applied by
-    /// [`Self::apply_agent_title`] the moment it streams in, strictly before
-    /// the turn's terminal `Done` in the same ordered event loop, so by the
-    /// time the fallback's own `generate` checks "does this chat already have
-    /// a title", the agent's write already landed and it no-ops for free — no
-    /// resolve, no model call.
+    /// answer, but only because [`Self::apply_agent_title`]'s title write is
+    /// SYNCHRONOUS, called inline from `drive_run`'s event loop rather than
+    /// spawned — see that method's own doc for why. `maybe_generate`, by
+    /// contrast, spawns its own task; two spawned tasks would have no
+    /// ordering relation to each other, and the fallback could still lose the
+    /// race and spend a real model call even though the write itself is
+    /// always safe (first-writer-wins refuses whichever side loses).
     pub fn maybe_generate_upfront(
         &self,
         chat_id: &str,
@@ -127,33 +177,72 @@ impl TitleGenerator {
 
     /// Apply a title the agent generated itself
     /// (`AgentEvent::SessionTitled`, wired from ACP's `session_info_update`
-    /// via `normalize::session_update`). Fire-and-forget, same discipline as
-    /// [`Self::maybe_generate`]: a titling failure must never surface to the
-    /// run.
+    /// via `normalize::session_update`). Called INLINE from `drive_run`'s
+    /// event loop (`sessions.rs`), not spawned — same discipline
+    /// `finish_segment`'s doc write already follows in that same loop.
     ///
-    /// Writes through [`WorkspaceHost::rename_chat_auto`], which enforces
-    /// BOTH guards this needs and needs no local check of its own: never
-    /// overwrite a title the user set by hand (`titleManual`), and
-    /// first-writer-wins against Comet's own model-run titling — see that
-    /// method's own doc for why the second guard also applies to an agent
-    /// revising a title IT gave earlier, not only to the cross-system race.
+    /// **Why synchronous is load-bearing, not just tidy.** The turn-end
+    /// fallback ([`Self::maybe_generate_upfront`]'s doc explains why it stays
+    /// unconditional) reads "does this chat already have a title" before
+    /// spending a model call. If this write were spawned, that read would
+    /// race a task with no ordering guarantee relative to it — the fallback
+    /// could read the row BEFORE this write lands, dispatch a real Grok run
+    /// (the exact cost this task exists to cut, reintroduced probabilistically),
+    /// and lose nothing but money and time, because `rename_chat_auto`'s
+    /// first-writer-wins guard still refuses whichever write arrives second.
+    /// Cost, not correctness — but a comment claiming the ordering is
+    /// guaranteed has to make it actually guaranteed. Calling this inline in
+    /// the same sequential event loop that later dispatches the fallback
+    /// (`AgentEvent::SessionTitled` is always processed, and this call
+    /// completes, before the turn's terminal `Done` reaches its own handling
+    /// a few loop iterations later) is what makes it true.
+    ///
+    /// The title write itself ([`WorkspaceHost::rename_chat_auto`], which
+    /// enforces both the manual-rename lock and first-writer-wins — see that
+    /// method's own doc) is cheap: an in-process CRDT commit, not IO. It is
+    /// blocking the caller only in the sense any doc write in `drive_run`
+    /// already is. **The worktree branch rename that follows a successful
+    /// title write is NOT similarly cheap** — it shells out to git — so it
+    /// stays a background task, deliberately: it must not stall the live
+    /// event stream this method is called from, and its own timing has no
+    /// bearing on the race described above (nothing reads the branch name to
+    /// decide whether a titling run would be wasted).
     pub fn apply_agent_title(&self, chat_id: &str, title: &str) {
         let title = title.trim();
         if title.is_empty() {
+            return;
+        }
+        // Read first (for the branch-rename step below, which needs cwd and
+        // the CURRENT branch): rename_chat_auto does not change either field,
+        // so a value read just before the write is never stale for that.
+        let chat = match self.inner.workspace.doc().chat(chat_id) {
+            Ok(Some(chat)) => chat,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::debug!(chat = %chat_id, error = %err, "agent-authored chat title read failed");
+                return;
+            }
+        };
+        let title_landed = match self.inner.workspace.rename_chat_auto(chat_id, title) {
+            Ok(true) => {
+                tracing::info!(chat = %chat_id, %title, "chat named by agent");
+                true
+            }
+            Ok(false) => false,
+            Err(err) => {
+                tracing::debug!(chat = %chat_id, error = %err, "agent-authored chat title write failed");
+                false
+            }
+        };
+        if !title_landed {
             return;
         }
         let this = self.inner.clone();
         let chat_id = chat_id.to_string();
         let title = title.to_string();
         tokio::spawn(async move {
-            match this.workspace.rename_chat_auto(&chat_id, &title) {
-                Ok(true) => tracing::info!(chat = %chat_id, %title, "chat named by agent"),
-                Ok(false) => {}
-                Err(err) => tracing::debug!(
-                    chat = %chat_id, error = %err,
-                    "agent-authored chat title write failed"
-                ),
-            }
+            this.rename_worktree_branch_for_title(&chat_id, &chat, &title)
+                .await;
         });
     }
 
@@ -198,27 +287,12 @@ impl TitleGenerator {
         }
 
         // Rename the worktree branch when the chat still sits on its original
-        // comet/<name> branch (guards live inside rename_worktree_branch).
-        if let (Some(chat_cwd), Some(branch)) = (&latest.cwd, &latest.branch)
-            && branch.starts_with("comet/")
-        {
-            match self
-                .inner
-                .repos
-                .rename_worktree_branch(std::path::Path::new(chat_cwd), branch, &title)
-                .await
-            {
-                Ok(renamed) if &renamed != branch => {
-                    if let Err(err) = self.inner.workspace.set_chat_branch(chat_id, &renamed) {
-                        tracing::warn!(chat = %chat_id, error = %err, "chat branch update failed");
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!(chat = %chat_id, error = %err, "automatic worktree branch rename failed");
-                }
-            }
-        }
+        // comet/<name> branch. Shared with `apply_agent_title`, which needs
+        // the identical behavior for a self-titling agent's title — see
+        // `rename_worktree_branch_for_title`'s own doc.
+        self.inner
+            .rename_worktree_branch_for_title(chat_id, &latest, &title)
+            .await;
 
         // `rename_chat_auto`, not `rename_chat`: this write is system-authored
         // (a model run Comet dispatched), not user-driven, and must not stamp

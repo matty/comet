@@ -131,13 +131,24 @@ pub struct Chat {
     pub last_seen_at: Option<DateTime<Utc>>,
     /// Set only by a user-driven rename (`RenameChat`, the RPC a person
     /// triggers from the UI) — `WorkspaceDoc::rename_chat` stamps it, never
-    /// `rename_chat_auto`. The one guard standing between a title the user
-    /// chose and an automatic one overwriting it: not "does this chat already
-    /// have a title" (true of every auto-titled chat too, and would block a
-    /// self-titling agent from ever refining its own title) but "did a
-    /// PERSON set this one". A new field, additive, so it stays unlocked by
-    /// default on a chat row written before it existed — see
-    /// `PROTOCOL_VERSION`'s doc comment on why a new field never bumps it.
+    /// `rename_chat_auto`. The question this answers is "did a PERSON set
+    /// this title", not "does this chat already have one" — `rename_chat_auto`
+    /// checks BOTH before writing (first-writer-wins is a separate, uniform
+    /// rule that also refuses an agent revising a title it gave earlier; see
+    /// that method's own doc), but only this field is inviolable.
+    ///
+    /// A new field, additive, so it reads back `false` (unlocked) by default
+    /// on a chat row written before it existed — see `PROTOCOL_VERSION`'s doc
+    /// comment on why a new field never bumps it. That default is only safe
+    /// because of what else is true of such a row: it was necessarily
+    /// user-named already if it carries a `title` at all (nothing wrote one
+    /// before this field did), so `rename_chat_auto`'s companion
+    /// "already has a title" check refuses an automatic overwrite there
+    /// regardless of the unlocked flag, and the UI's rename control itself
+    /// refuses an empty new title — the one case that check alone would not
+    /// catch (see `rename_chat_auto`'s doc for exactly this edge, and its own
+    /// `the_manual_lock_alone_blocks_rename_chat_auto_even_with_no_title_to_protect`
+    /// test).
     #[serde(default)]
     pub title_manual: bool,
 }
