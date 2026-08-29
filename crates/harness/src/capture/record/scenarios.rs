@@ -476,16 +476,11 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
 ];
 
 /// Look up a scenario by the exact provider and name strings the binary's
-/// `--help` and argument parsing use (`"claude"` | `"codex"`).
+/// `--help` and argument parsing use (`"claude"` | `"codex"` | `"acp"`).
 pub fn scenario(provider: &str, name: &str) -> Option<&'static ScenarioSpec> {
-    SCENARIOS.iter().find(|spec| {
-        let spec_provider = match spec.provider {
-            Provider::Claude => "claude",
-            Provider::Codex => "codex",
-            Provider::Acp => "acp",
-        };
-        spec_provider == provider && spec.name == name
-    })
+    SCENARIOS
+        .iter()
+        .find(|spec| spec.provider.wire_name() == provider && spec.name == name)
 }
 
 #[cfg(test)]

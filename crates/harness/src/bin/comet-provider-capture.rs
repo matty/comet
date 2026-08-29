@@ -3,16 +3,6 @@ use std::time::Duration;
 
 use comet_harness::capture::{CaptureConfig, Provider, SCENARIOS, record, scenario};
 
-/// `"claude"` | `"codex"` — the string form every `--help` line, argument
-/// pair and `CaptureConfig::provider` value uses.
-fn provider_key(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Claude => "claude",
-        Provider::Codex => "codex",
-        Provider::Acp => "acp",
-    }
-}
-
 /// The column budget a wrapped scenario line stays under, prefix included —
 /// matched to the hand-typed text this replaced, which broke around 90-95
 /// characters.
@@ -32,7 +22,7 @@ fn scenario_help_lines() -> String {
             .filter(|spec| spec.provider == provider)
             .map(|spec| spec.name)
             .collect();
-        let prefix = format!("  {:<7} ", format!("{}:", provider_key(provider)));
+        let prefix = format!("  {:<7} ", format!("{}:", Provider::wire_name(provider)));
         let indent = " ".repeat(prefix.len());
         let mut current = prefix;
         let mut line_has_word = false;
@@ -326,7 +316,7 @@ fn capture_config_with_env(
     };
 
     Ok(CaptureConfig {
-        provider: provider_key(spec.provider),
+        provider: Provider::wire_name(spec.provider),
         scenario_name: spec.name,
         purpose: spec.purpose,
         executable: args.executable,
@@ -641,7 +631,7 @@ mod tests {
             // codex advertising a scenario named "full-access acp:    …".
             let next_block = [Provider::Claude, Provider::Codex, Provider::Acp]
                 .iter()
-                .any(|p| trimmed.starts_with(&format!("{}:", provider_key(*p))));
+                .any(|p| trimmed.starts_with(&format!("{}:", Provider::wire_name(*p))));
             if trimmed.is_empty() || next_block {
                 break;
             }
@@ -672,7 +662,7 @@ mod tests {
     fn every_help_text_scenario_is_a_table_row_and_dispatches() {
         let help = help_text();
         for provider in [Provider::Claude, Provider::Codex, Provider::Acp] {
-            let key = provider_key(provider);
+            let key = Provider::wire_name(provider);
             let prefix = format!("{key}:");
             let advertised = advertised_scenario_names(&help, &prefix);
             let table: Vec<&str> = SCENARIOS
@@ -717,7 +707,7 @@ mod tests {
         let empty_claude_config = tempfile::tempdir().unwrap();
         let attachment = tempfile::tempdir().unwrap().path().join("image.png");
         for spec in SCENARIOS {
-            let provider = provider_key(spec.provider);
+            let provider = Provider::wire_name(spec.provider);
             let mut args = token_free_args(provider, spec.name, None);
             args.cwd = Some(cwd.path().into());
             args.acknowledge_token_spend = spec.requirements.spends_tokens;

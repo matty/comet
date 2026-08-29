@@ -4769,6 +4769,12 @@ mod tests {
     /// `drive_run` pipeline.
     struct ScriptedHarness {
         id: HarnessId,
+        /// Declared, not inferred from `id`: the engine gates its upfront
+        /// titling run on [`comet_proto::HarnessCapabilities::self_titles`],
+        /// so a stand-in for a self-titling agent has to answer that
+        /// capability the way the real one does. A stub that derived it from
+        /// its own `id` would satisfy the gate however the gate was wired.
+        self_titles: bool,
         script: Vec<comet_proto::AgentEvent>,
     }
 
@@ -4781,7 +4787,10 @@ mod tests {
             "Scripted"
         }
         fn capabilities(&self) -> comet_proto::HarnessCapabilities {
-            comet_proto::HarnessCapabilities::default()
+            comet_proto::HarnessCapabilities {
+                self_titles: self.self_titles,
+                ..Default::default()
+            }
         }
         async fn models(&self) -> Result<comet_proto::ModelCatalog, comet_harness::HarnessError> {
             Ok(comet_proto::ModelCatalog::built_in(Vec::new()))
@@ -4818,6 +4827,7 @@ mod tests {
         let registry = Arc::new(crate::registry::HarnessRegistry::new());
         registry.register(Arc::new(ScriptedHarness {
             id: HarnessId::Grok,
+            self_titles: true,
             script: vec![
                 comet_proto::AgentEvent::SessionStarted {
                     harness: HarnessId::Grok,

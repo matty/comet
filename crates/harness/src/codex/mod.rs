@@ -366,6 +366,8 @@ impl CodexHarness {
             // are bare literals — the wire carries `"decline"` and nothing
             // else, so a note has no field to travel in (`DEBT.md` D24).
             carries_deny_note: false,
+            // codex app-server names no chat on its wire; Comet titles it.
+            self_titles: false,
         }
     }
 

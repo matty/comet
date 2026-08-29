@@ -133,6 +133,21 @@ pub struct HarnessCapabilities {
     /// a promise the provider cannot keep is worse than copy admitting the
     /// limit, which is why the conservative default is "cannot carry it".
     pub carries_deny_note: bool,
+    /// Whether the agent reports its own chat title on the wire, as Grok does
+    /// with `session_info_update`. When it does, the engine's upfront titling
+    /// run is skipped: the title arrives during the turn for free, and a model
+    /// call would only race it.
+    ///
+    /// Declared here rather than as a `HarnessId` list in the engine, for the
+    /// same reason as `carries_deny_note` beside it — it is a fact about one
+    /// provider's wire, and the engine is two crates from where that wire is
+    /// read. A list there is silently incomplete the day another self-titling
+    /// agent is added.
+    ///
+    /// **Conservative default is `false`**, and a wrong `true` costs nothing
+    /// permanent: the unconditional turn-end fallback still names the chat the
+    /// moment no title lands, one turn later than it otherwise would have.
+    pub self_titles: bool,
 }
 
 /// Whether a harness's CLI is usable on this device, as of the last probe.

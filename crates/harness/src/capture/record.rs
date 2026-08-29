@@ -1283,11 +1283,7 @@ mod tests {
                 });
 
             // Fence wiring — every row, discovery and run alike.
-            let provider_str = match spec.provider {
-                Provider::Claude => "claude",
-                Provider::Codex => "codex",
-                Provider::Acp => "acp",
-            };
+            let provider_str = spec.provider.wire_name();
             let cfg = config(
                 spec.name,
                 PathBuf::from("provider"),
@@ -1401,9 +1397,13 @@ mod tests {
                             Provider::Codex => {
                                 (absolute_program("codex"), crate::codex::run_launch)
                             }
-                            // Every ACP row is discovery, so the run launch is
-                            // never invoked; `every_acp_row_is_discovery` pins
-                            // that rather than this arm hoping for it.
+                            // `node` is the ACP default executable (the adapter
+                            // rows spawn an interpreter), but the run rows
+                            // `run-grok`/`steer-grok` reach the launch below
+                            // and derive Grok's argv from it — the arm is
+                            // live, not a placeholder. It stopped being one
+                            // when those rows landed; the test that used to
+                            // pin "every ACP row is discovery" went with them.
                             Provider::Acp => (
                                 absolute_program("node"),
                                 crate::capture::record::scenarios::acp::run_launch

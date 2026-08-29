@@ -305,38 +305,15 @@ pub(crate) fn map_open_failure(failure: &crate::jsonrpc::RpcFailure) -> Option<H
     }
 }
 
-/// One short-lived ACP session, just to read the handshake and `session/new`.
+/// Hermes' model list off one handshake — [`super::discover_models`] with
+/// Hermes' launch and its own model mapping.
 ///
-/// Token-free on Grok; on an unconfigured Hermes `session/new` fails outright
-/// (see this module's header), and `open_for_discovery` already turns that
-/// into `Discovered { session: Null, .. }` rather than an error -- so this
-/// still resolves, just with nothing beyond `initialize` to read.
-async fn probe_session(
-    exe: &Path,
-    cwd: &str,
-    timeouts: Timeouts,
-) -> Result<Discovered, DiscoveryFailure> {
-    let request = RunRequest::for_session(RuntimeMode::default());
-    let command = run_launch(exe, &request).command();
-    AcpSession::open_for_discovery(command, cwd, timeouts)
-        .await
-        .map_err(|error| {
-            tracing::debug!(target: "comet_harness::acp", "hermes discovery failed: {error}");
-            // Every failure here is `Unreachable`, not `Unparseable`: the
-            // handshake either answered or it did not, and reading the reply
-            // cannot fail -- an unrecognized shape yields an empty list, which
-            // is a real answer. `Unparseable` is reserved for a provider that
-            // answered something we could not decode.
-            DiscoveryFailure::Unreachable
-        })
-}
-
+/// On an unconfigured install `session/new` fails outright (see this module's
+/// header), which `open_for_discovery` turns into
+/// `Discovered { session: Null, .. }` rather than an error — so this still
+/// resolves, with only `initialize` to read.
 async fn discover(exe: PathBuf, timeouts: Timeouts) -> Result<Discovery, DiscoveryFailure> {
-    let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-    match probe_session(&exe, &cwd, timeouts).await {
-        Ok(discovered) => Ok(models_from_discovery(&discovered)),
-        Err(failure) => Err(failure),
-    }
+    super::discover_models("hermes", run_launch, exe, timeouts, models_from_discovery).await
 }
 
 /// **Hermes pushes `available_commands_update` on session creation**, per its
@@ -350,8 +327,7 @@ async fn discover_commands(
     cwd: String,
     timeouts: Timeouts,
 ) -> Result<Vec<AgentCommand>, DiscoveryFailure> {
-    let discovered = probe_session(&exe, &cwd, timeouts).await?;
-    Ok(normalize::commands(&discovered.commands))
+    super::discover_commands("hermes", run_launch, exe, cwd, timeouts).await
 }
 
 /// The Hermes harness. Construct with [`HermesHarness::new`]; tests point it
@@ -460,6 +436,13 @@ impl HermesHarness {
             // send nothing a message could ride in either — checked against
             // source per Step 5's instruction, not assumed (D24).
             carries_deny_note: false,
+            // No `session_info_update` (or anything else naming the chat) has
+            // been observed from Hermes — its module doc already records that
+            // it carries no steering extension and no effort ladder, and a
+            // live session to check a title on cannot presently be opened on
+            // this machine. Conservative `false`: the engine spends one cheap
+            // titling call rather than leaving a chat unnamed for a turn.
+            self_titles: false,
         }
     }
 

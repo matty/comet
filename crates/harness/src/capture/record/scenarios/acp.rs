@@ -121,23 +121,14 @@ fn npm_global_root() -> anyhow::Result<PathBuf> {
     )
 }
 
-/// Grok Build's ACP entry point, verified against grok 1.0.5 on 2026-08-28.
+/// Grok Build's ACP entry point — **production's own constant**, not a copy.
 ///
-/// **Every token here was checked against the installed build, because the
-/// placement is not guessable.** `--no-auto-update` is a TOP-LEVEL flag and is
-/// hidden — it appears in neither `grok --help` nor `grok agent --help`, and the
-/// only way to tell it from a typo is that clap rejects unknown flags (a
-/// `--no-such-flag` control errors with "unexpected argument"; this one exits
-/// 0). `--no-leader` is on the `agent` SUBCOMMAND, not the top level, and
-/// `stdio` is a sub-subcommand of `agent`. Reordering any of the four breaks the
-/// spawn.
-///
-/// `--no-leader` is the load-bearing one: without it, `agent stdio` may attach
-/// to a shared leader process over `~/.grok/leader.sock` instead of starting its
-/// own agent, and the capture would then record a session belonging to somebody
-/// else's process.
-pub(in crate::capture::record) const GROK_ARGS: [&str; 4] =
-    ["--no-auto-update", "agent", "--no-leader", "stdio"];
+/// Same reason [`run_launch`] below delegates: a recorder with its own argv
+/// would make the corpus evidence of the recorder. The token order is hidden
+/// from `--help` and unguessable, so [`crate::acp::grok::GROK_ARGS`] carries
+/// the verification note; nothing pinned the two copies equal, which meant
+/// production changing its argv left the discovery row spawning the old one.
+pub(in crate::capture::record) use crate::acp::grok::GROK_ARGS;
 
 /// SPAWN for the Grok row.
 ///
@@ -227,19 +218,17 @@ pub(in crate::capture::record) async fn session_discovery(
         .await
 }
 
-/// Resolve `node` from PATH. An ACP adapter is a Node program, so this is the
-/// "default executable" an ACP row records against; `--executable` still wins.
+/// Resolve `node`. An ACP adapter is a Node program, so this is the "default
+/// executable" an ACP row records against; `--executable` still wins.
 ///
-/// Written here rather than pulled in as a dependency because it is the only
-/// PATH walk in the crate — every other harness resolves a CLI through its own
-/// provider-specific lookup.
+/// Goes through [`crate::resolve_cli`], the same provider-neutral ladder every
+/// harness uses, rather than walking PATH by hand. A hand-rolled walk missed
+/// the three things that matter for node specifically: the `.cmd`/`.bat`
+/// spellings npm and shim installs leave on Windows, the persisted system PATH
+/// a GUI-launched process needs, and the fnm/volta/nvm/pnpm bin dirs — which
+/// is exactly where a version-managed node lives.
 pub(in crate::capture::record) fn resolve_node_executable() -> Option<PathBuf> {
-    let name = if cfg!(windows) { "node.exe" } else { "node" };
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(name))
-            .find(|candidate| candidate.is_file())
-    })
+    crate::resolve_cli("NODE_EXECUTABLE", "node", crate::all_known_dirs(Vec::new()))
 }
 
 /// SPAWN for the two Grok run rows (`run-grok`, `steer-grok`).
@@ -304,11 +293,28 @@ pub(in crate::capture::record) async fn run(
     session: &mut Session<AcpProvider>,
     input: &ScenarioInput,
 ) -> anyhow::Result<()> {
+    let (session_id, request) = open_run_session(session, input, "run-grok").await?;
+    prompt_and_wait(session, &session_id, &request.prompt).await
+}
+
+/// Handshake and open one session, handing back its id and the request the
+/// launch was derived from.
+///
+/// Shared by [`run`] and [`steer`] on purpose: this prologue is what Comet
+/// actually puts on the wire to open a session, and two copies of it meant a
+/// change to that shape — a new `session/new` param, a different id predicate
+/// — could land in one scenario's evidence and not the other's, in a corpus
+/// whose whole value is being trustworthy evidence.
+async fn open_run_session(
+    session: &mut Session<AcpProvider>,
+    input: &ScenarioInput,
+    scenario: &str,
+) -> anyhow::Result<(String, comet_proto::RunRequest)> {
     AcpProvider::handshake(session, input).await?;
     let request = session
         .request
         .clone()
-        .expect("run-grok is a Run scenario and always carries a request");
+        .unwrap_or_else(|| panic!("{scenario} is a Run scenario and always carries a request"));
 
     let cwd = input
         .cwd
@@ -331,13 +337,22 @@ pub(in crate::capture::record) async fn run(
                 .flatten()
         })
         .await?;
+    Ok((session_id, request))
+}
 
+/// One `session/prompt`, awaited to completion. A turn is the unit both run
+/// rows are built from — `steer` is this twice.
+async fn prompt_and_wait(
+    session: &mut Session<AcpProvider>,
+    session_id: &str,
+    text: &str,
+) -> anyhow::Result<()> {
     let prompt_id = session.provider.next_id();
     session
         .send(&rpc_request(
             prompt_id,
             "session/prompt",
-            crate::acp::prompt_params(&session_id, &request.prompt, &[]),
+            crate::acp::prompt_params(session_id, text, Vec::new()),
         ))
         .await?;
     session.wait_for_turn_end().await
@@ -376,53 +391,9 @@ pub(in crate::capture::record) async fn steer(
     session: &mut Session<AcpProvider>,
     input: &ScenarioInput,
 ) -> anyhow::Result<()> {
-    AcpProvider::handshake(session, input).await?;
-    let request = session
-        .request
-        .clone()
-        .expect("steer-grok is a Run scenario and always carries a request");
-
-    let cwd = input
-        .cwd
-        .clone()
-        .unwrap_or_else(std::env::temp_dir)
-        .to_string_lossy()
-        .into_owned();
-    let new_id = session.provider.next_id();
-    session
-        .send(&rpc_request(
-            new_id,
-            "session/new",
-            crate::acp::new_session_params(&cwd),
-        ))
-        .await?;
-    let session_id = session
-        .wait_for("JSON-RPC reply", |frame| {
-            (frame["id"].as_u64() == Some(new_id))
-                .then(|| frame["result"]["sessionId"].as_str().map(str::to_owned))
-                .flatten()
-        })
-        .await?;
-
-    let first_id = session.provider.next_id();
-    session
-        .send(&rpc_request(
-            first_id,
-            "session/prompt",
-            crate::acp::prompt_params(&session_id, &request.prompt, &[]),
-        ))
-        .await?;
-    session.wait_for_turn_end().await?;
-
-    let steer_id = session.provider.next_id();
-    session
-        .send(&rpc_request(
-            steer_id,
-            "session/prompt",
-            crate::acp::prompt_params(&session_id, STEER_MESSAGE, &[]),
-        ))
-        .await?;
-    session.wait_for_turn_end().await
+    let (session_id, request) = open_run_session(session, input, "steer-grok").await?;
+    prompt_and_wait(session, &session_id, &request.prompt).await?;
+    prompt_and_wait(session, &session_id, STEER_MESSAGE).await
 }
 
 #[cfg(test)]

@@ -877,7 +877,7 @@ async fn run_session(
                 request_approval: &request_approval,
             },
             &prompt,
-            &turn_images,
+            turn_images,
         )
         .await;
 
@@ -1073,14 +1073,14 @@ struct Turn<'a> {
 /// than gating on a per-agent flag, leaves the arm silently dead for anyone
 /// who doesn't; the RPC response stays the fallback for exactly that case.
 ///
-/// Built via `concat!` rather than one literal: an unrelated repo-wide guard
-/// (`crates/engine/tests/no_runtime_cloud.rs`) forbids a slash, the word
-/// "session", and another slash appearing contiguously anywhere under
-/// `crates/`, as a check against reintroducing hosted-authority remnants —
-/// unrelated to this vendor method name, but a plain substring scan cannot
-/// tell the difference. Same technique that guard's own forbidden list uses
-/// on itself for the identical reason.
-const PROMPT_COMPLETE_METHOD: &str = concat!("_x.ai/ses", "sion/prompt_complete");
+/// A repo-wide guard (`crates/engine/tests/no_runtime_cloud.rs`) forbids a
+/// slash, the word "session", and another slash appearing contiguously
+/// anywhere under `crates/`, as a check against reintroducing
+/// hosted-authority remnants. This vendor method name is not one, and the
+/// guard exempts it by name — spelled plainly here so that
+/// `grep -r "_x.ai/session/prompt_complete" crates/` finds the constant this
+/// doc calls the method's primary citation.
+const PROMPT_COMPLETE_METHOD: &str = "_x.ai/session/prompt_complete";
 
 /// How long the notification-settle arm below waits for the already-in-flight
 /// `session/prompt` reply once [`PROMPT_COMPLETE_METHOD`] has already ended
@@ -1109,7 +1109,7 @@ const POST_NOTIFICATION_REPLY_BOUND: Duration = Duration::from_millis(250);
 async fn drive_turn(
     turn: &mut Turn<'_>,
     prompt: &str,
-    images: &[crate::claude::wire::ImageBlock],
+    images: Vec<crate::claude::wire::ImageBlock>,
 ) -> TurnEnd {
     let Turn {
         client,
@@ -1144,22 +1144,20 @@ async fn drive_turn(
     // after the send it is actually bound to. Processed normally through
     // `handle_incoming` rather than discarded: it is still real content,
     // just not evidence for the stall clock below.
-    while let Ok(message) = incoming.try_recv() {
-        match handle_incoming(
-            message,
-            client,
-            event_tx,
-            tools,
-            diagnostics,
-            streamed,
-            request_approval,
-        )
-        .await
-        {
-            Handled::Continue => {}
-            Handled::ConsumerGone => return TurnEnd::ConsumerGone,
-            Handled::AgentExited => return TurnEnd::AgentExited,
-        }
+    match drain_buffered(
+        incoming,
+        client,
+        event_tx,
+        tools,
+        diagnostics,
+        streamed,
+        request_approval,
+    )
+    .await
+    {
+        Handled::Continue => {}
+        Handled::ConsumerGone => return TurnEnd::ConsumerGone,
+        Handled::AgentExited => return TurnEnd::AgentExited,
     }
 
     let reply = client.request("session/prompt", prompt_params(session_id, prompt, images));
@@ -1193,24 +1191,21 @@ async fn drive_turn(
                         // the channel BEFORE resolving the response, so
                         // whatever `try_recv` finds now provably preceded the
                         // reply on the wire, and nothing later can appear.
-                        while let Ok(message) = incoming.try_recv() {
-                            match handle_incoming(
-                                message,
-                                client,
-                                event_tx,
-                                tools,
-                                diagnostics,
-                                streamed,
-                                request_approval,
-                            )
-                            .await
-                            {
-                                Handled::Continue => {}
-                                Handled::ConsumerGone => return TurnEnd::ConsumerGone,
-                                // EOF after a settled turn is just the agent
-                                // shutting down; the turn itself succeeded.
-                                Handled::AgentExited => break,
-                            }
+                        // An EOF mid-drain is just the agent shutting down
+                        // after a settled turn; the turn itself succeeded, so
+                        // only a gone consumer ends things here.
+                        if let Handled::ConsumerGone = drain_buffered(
+                            incoming,
+                            client,
+                            event_tx,
+                            tools,
+                            diagnostics,
+                            streamed,
+                            request_approval,
+                        )
+                        .await
+                        {
+                            return TurnEnd::ConsumerGone;
                         }
                         // Record the settling promptId (Grok's response
                         // carries it at `_meta.promptId`, verified live) so a
@@ -1281,22 +1276,18 @@ async fn drive_turn(
                         // Same drain rationale as the reply arm above: deltas
                         // queued ahead of this notification on the wire must
                         // not be truncated by returning immediately.
-                        while let Ok(message) = incoming.try_recv() {
-                            match handle_incoming(
-                                message,
-                                client,
-                                event_tx,
-                                tools,
-                                diagnostics,
-                                streamed,
-                                request_approval,
-                            )
-                            .await
-                            {
-                                Handled::Continue => {}
-                                Handled::ConsumerGone => return TurnEnd::ConsumerGone,
-                                Handled::AgentExited => break,
-                            }
+                        if let Handled::ConsumerGone = drain_buffered(
+                            incoming,
+                            client,
+                            event_tx,
+                            tools,
+                            diagnostics,
+                            streamed,
+                            request_approval,
+                        )
+                        .await
+                        {
+                            return TurnEnd::ConsumerGone;
                         }
                         // The notification carries no token counts (verified
                         // live — Grok's own usage rides the RPC response's
@@ -1516,6 +1507,45 @@ fn handle_permission_request(
     None
 }
 
+/// Serve everything already buffered, without waiting for more.
+///
+/// Three of [`drive_turn`]'s arms need exactly this — the pre-send backlog
+/// drain and the two settle arms — and each had the loop written out in full,
+/// so a change to [`handle_incoming`]'s argument list was a three-site edit
+/// and two of the three were character-identical.
+///
+/// Returns [`Handled::Continue`] once the channel is dry. What an agent exit
+/// *during* the drain means is the one thing the three sites genuinely
+/// disagree on — before the send it ends the turn, after it the turn already
+/// succeeded — so that stays with the caller.
+async fn drain_buffered(
+    incoming: &mut mpsc::Receiver<Incoming>,
+    client: &RpcClient,
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    tools: &mut normalize::ToolTracker,
+    diagnostics: &mut HashSet<String>,
+    streamed: &mut bool,
+    request_approval: &Arc<RequestApprovalFn>,
+) -> Handled {
+    while let Ok(message) = incoming.try_recv() {
+        match handle_incoming(
+            message,
+            client,
+            event_tx,
+            tools,
+            diagnostics,
+            streamed,
+            request_approval,
+        )
+        .await
+        {
+            Handled::Continue => {}
+            other => return other,
+        }
+    }
+    Handled::Continue
+}
+
 /// Serve one frame from the agent. Shared by the loop's waiting arm and by the
 /// post-settle drain, so a frame is treated identically whichever of the two
 /// picks it up — the alternative is two copies that quietly disagree about, say,
@@ -1645,7 +1675,7 @@ mod tests {
     /// as a bare string, which every recorded agent rejects.
     #[test]
     fn a_prompt_is_an_array_of_content_blocks() {
-        let params = prompt_params("s-1", "hello", &[]);
+        let params = prompt_params("s-1", "hello", Vec::new());
         assert_eq!(params["sessionId"], "s-1");
         let blocks = params["prompt"].as_array().expect("prompt is an array");
         assert_eq!(blocks.len(), 1);

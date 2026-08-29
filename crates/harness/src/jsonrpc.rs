@@ -113,7 +113,7 @@ impl RpcClient {
         if self.writer.send(line.to_string()).is_err() {
             self.pending.lock().expect("pending lock").remove(&id);
             return Err(RpcFailure {
-                message: "app-server stdin closed".into(),
+                message: "agent stdin closed".into(),
                 data: None,
             });
         }
@@ -122,7 +122,7 @@ impl RpcClient {
             Ok(Err(failure)) => Err(failure),
             // Sender dropped: the reader hit EOF and failed all pending.
             Err(_) => Err(RpcFailure {
-                message: "app-server exited before responding".into(),
+                message: "agent exited before responding".into(),
                 data: None,
             }),
         }
@@ -164,7 +164,7 @@ async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Strin
             stdin.flush().await
         };
         if let Err(e) = write.await {
-            tracing::debug!(target: "comet_harness::codex", "stdin write failed (tolerated): {e}");
+            tracing::debug!(target: "comet_harness::jsonrpc", "stdin write failed (tolerated): {e}");
             return;
         }
     }
@@ -184,7 +184,7 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
         }
         let Ok(msg) = serde_json::from_str::<Value>(line) else {
             tracing::warn!(
-                target: "comet_harness::codex",
+                target: "comet_harness::jsonrpc",
                 line,
                 "non-JSON stdout line (recorded as a diagnostic)"
             );
@@ -193,27 +193,53 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
             }
             continue;
         };
-        let method = msg.get("method").and_then(Value::as_str);
-        let id = msg.get("id");
-        match (method, id) {
+        // Take the frame apart rather than borrowing it: this runs once per
+        // stdout line for every harness, and cloning `params` out of a value
+        // that is dropped two lines later doubled the allocation of every
+        // streamed text delta.
+        let mut msg = match msg {
+            Value::Object(map) => map,
+            other => {
+                tracing::warn!(
+                    target: "comet_harness::jsonrpc",
+                    frame = %other,
+                    "not a JSON-RPC message (recorded as a diagnostic)"
+                );
+                if tx.send(Incoming::Malformed).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
+        // A non-string `method` is not a method; put it back so the
+        // unrecognized-frame arm below still logs the whole frame.
+        let method = match msg.remove("method") {
+            Some(Value::String(method)) => Some(method),
+            Some(other) => {
+                msg.insert("method".to_owned(), other);
+                None
+            }
+            None => None,
+        };
+        match (method, msg.remove("id")) {
             // Response: resolve the awaiting request.
             (None, Some(id)) => {
                 let Some(id) = id.as_i64() else { continue };
                 let Some(sender) = pending.lock().expect("pending lock").remove(&id) else {
                     continue;
                 };
-                let outcome = match msg.get("error") {
-                    Some(err) => Err(parse_error(err)),
-                    None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
+                let outcome = match msg.remove("error") {
+                    Some(err) => Err(parse_error(&err)),
+                    None => Ok(msg.remove("result").unwrap_or(Value::Null)),
                 };
                 let _ = sender.send(outcome);
             }
             // Server→client request (approvals).
             (Some(method), Some(id)) => {
                 let incoming = Incoming::Request {
-                    id: id.clone(),
-                    method: method.to_owned(),
-                    params: msg.get("params").cloned().unwrap_or(Value::Null),
+                    id,
+                    method,
+                    params: msg.remove("params").unwrap_or(Value::Null),
                 };
                 if tx.send(incoming).await.is_err() {
                     return;
@@ -222,17 +248,18 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
             // Notification.
             (Some(method), None) => {
                 let incoming = Incoming::Notification {
-                    method: method.to_owned(),
-                    params: msg.get("params").cloned().unwrap_or(Value::Null),
+                    method,
+                    params: msg.remove("params").unwrap_or(Value::Null),
                 };
                 if tx.send(incoming).await.is_err() {
                     return;
                 }
             }
             (None, None) => {
+                let frame = Value::Object(msg);
                 tracing::warn!(
-                    target: "comet_harness::codex",
-                    frame = %msg,
+                    target: "comet_harness::jsonrpc",
+                    %frame,
                     "not a JSON-RPC message (recorded as a diagnostic)"
                 );
                 if tx.send(Incoming::Malformed).await.is_err() {
