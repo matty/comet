@@ -798,9 +798,13 @@ impl SessionsEngine {
         // exchange completes ("called New session for a long time for no
         // reason"; the titler only needs the prompt and skips titled chats;
         // the Done-time call below stays as the retry for a failed
-        // generation).
+        // generation). `_upfront` (not `maybe_generate`): for a harness that
+        // reports its own title (`titles::harness_self_titles`), this
+        // dispatch is skipped entirely rather than racing the agent's own
+        // answer — see `TitleGenerator::maybe_generate_upfront`'s doc for
+        // the policy.
         if let Some(titles) = self.inner.titles.get() {
-            titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd);
+            titles.maybe_generate_upfront(chat_id, harness_id, &request.prompt, &request.cwd);
         }
 
         tokio::spawn(drive_run(
@@ -2149,9 +2153,19 @@ async fn drive_run(
         // exception. Handled below by writing it as its own finished entry,
         // still parked.
         let parked_notice = idle_since.is_some() && matches!(&event, AgentEvent::Notice { .. });
+        // `SessionTitled` is the same "can arrive outside a turn" class as
+        // `Notice`: a steerable session (Grok supports steering) PARKS
+        // between turns, and the agent may re-push `session_info_update`
+        // with a revised title while parked, same as it does mid-turn. It
+        // does NOT get `Notice`'s "write it as its own finished entry"
+        // treatment below — it folds to no transcript part at all
+        // (`doc::parts::fold_event_into_parts`'s no-op arm), so that would
+        // only write an empty segment. It just must not count as turn-start.
+        let parked_title =
+            idle_since.is_some() && matches!(&event, AgentEvent::SessionTitled { .. });
         // First event after parking idle = the next turn beginning (a routed
         // dispatch steered in): the session is Working again.
-        if !parked_notice && idle_since.take().is_some() {
+        if !parked_notice && !parked_title && idle_since.take().is_some() {
             inner.set_status(&chat_id, SessionStatus::Working, true);
         }
 
@@ -2319,6 +2333,15 @@ async fn drive_run(
                 let still_waiting = pending.is_some_and(|p| !lock(&p).is_empty());
                 if !still_waiting {
                     inner.set_status(&chat_id, SessionStatus::Working, false);
+                }
+            }
+            AgentEvent::SessionTitled { title } => {
+                // Fire-and-forget; every guard (manual-rename lock,
+                // first-writer-wins) lives in `WorkspaceHost::rename_chat_auto`,
+                // which `TitleGenerator::apply_agent_title` writes through —
+                // see that method's own doc.
+                if let Some(titles) = inner.titles.get() {
+                    titles.apply_agent_title(&chat_id, title);
                 }
             }
             _ => {}

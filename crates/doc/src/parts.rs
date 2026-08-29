@@ -542,9 +542,13 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 }
             }
         }
+        // `SessionTitled` is chat-row metadata (`comet_engine::titles`
+        // applies it to the `Chat.title` field, not the transcript), the
+        // same class as `Usage` — never a transcript part.
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
-        | AgentEvent::Diagnostic { .. } => {}
+        | AgentEvent::Diagnostic { .. }
+        | AgentEvent::SessionTitled { .. } => {}
         AgentEvent::ChecklistReplaced { explanation, items } => {
             // REPLACE, never merge. An item the snapshot omits is gone: Codex
             // drops a step from its plan and the card must drop it too.
@@ -1788,6 +1792,20 @@ mod tests {
                 session_id: "s1".into(),
                 assistant_message_id: "m1".into(),
                 runtime_mode: Default::default(),
+            },
+        );
+        assert!(parts.is_empty(), "{parts:?}");
+    }
+
+    /// `SessionTitled` is chat-row metadata, not message content — same
+    /// class as `Usage`. It must never become a transcript part.
+    #[test]
+    fn session_titled_is_never_a_transcript_part() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::SessionTitled {
+                title: "Fix Login Flow".into(),
             },
         );
         assert!(parts.is_empty(), "{parts:?}");

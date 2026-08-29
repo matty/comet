@@ -411,6 +411,7 @@ impl WorkspaceHost {
             harness_session_cwd: None,
             space_id: Some(space.id),
             last_seen_at: None,
+            title_manual: false,
         })?;
         Ok(())
     }
@@ -497,6 +498,12 @@ impl WorkspaceHost {
 
     pub fn rename_chat(&self, chat_id: &str, title: &str) -> Result<bool, EngineError> {
         Ok(self.inner.doc.rename_chat(chat_id, title)?)
+    }
+
+    /// System-authored rename — see `WorkspaceDoc::rename_chat_auto`'s own
+    /// doc for the guard this enforces.
+    pub fn rename_chat_auto(&self, chat_id: &str, title: &str) -> Result<bool, EngineError> {
+        Ok(self.inner.doc.rename_chat_auto(chat_id, title)?)
     }
 
     /// Backdate a chat's activity timestamps (epoch ms). Returns false when

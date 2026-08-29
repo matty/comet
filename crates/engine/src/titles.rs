@@ -14,7 +14,17 @@
 //! 4. re-check the title (a user rename during generation wins);
 //! 5. when the chat sits in a comet worktree (`comet/<name>` branch), rename the
 //!    branch from the title and update the chat's branch row;
-//! 6. `rename_chat` in the workspace doc.
+//! 6. [`WorkspaceHost::rename_chat_auto`] in the workspace doc.
+//!
+//! **An ACP agent that reports its own title skips this whole run.** Grok sends
+//! `sessionUpdate: "session_info_update"` carrying a title it generated itself,
+//! during the turn, for free (`normalize::session_update`'s doc comment has the
+//! wire evidence) — mapped to [`AgentEvent::SessionTitled`] and applied by
+//! [`TitleGenerator::apply_agent_title`]. Spawning the whole flow above for such
+//! a harness would be a second model call racing an answer already on the
+//! wire, so [`TitleGenerator::maybe_generate_upfront`] (the request-start
+//! dispatch site) skips it entirely for a harness [`harness_self_titles`]
+//! lists — see that function's own doc for the policy and its limits.
 
 use std::sync::Arc;
 
@@ -41,6 +51,55 @@ struct Inner {
     repos: Repos,
 }
 
+impl Inner {
+    /// Rename the worktree branch to match `title` when the chat still sits
+    /// on its original `comet/<name>` branch (guards live inside
+    /// `rename_worktree_branch`). Shared by `TitleGenerator::generate`
+    /// (Comet's own model-run titling) and `TitleGenerator::apply_agent_title`
+    /// (an ACP agent's self-reported title) — before this method existed,
+    /// only the model-run path did this, so a Grok chat in a comet worktree
+    /// kept its generated branch name forever while every other harness got
+    /// it renamed. Best-effort and non-fatal either way: a failed branch
+    /// rename must never be mistaken for a failed title.
+    ///
+    /// Callers differ on WHEN they call this relative to the title write —
+    /// `generate` calls it before (its own prior `already_named` check has
+    /// already decided the write will proceed), `apply_agent_title` calls it
+    /// after, only once the write is confirmed to have landed — and that
+    /// difference is deliberate, not an inconsistency to fix: renaming a
+    /// branch to match a title that then FAILED to write (a last-moment
+    /// manual rename lock) would rename it to nothing that ended up on the
+    /// chat.
+    async fn rename_worktree_branch_for_title(
+        &self,
+        chat_id: &str,
+        chat: &comet_proto::Chat,
+        title: &str,
+    ) {
+        let (Some(chat_cwd), Some(branch)) = (&chat.cwd, &chat.branch) else {
+            return;
+        };
+        if !branch.starts_with("comet/") {
+            return;
+        }
+        match self
+            .repos
+            .rename_worktree_branch(std::path::Path::new(chat_cwd), branch, title)
+            .await
+        {
+            Ok(renamed) if &renamed != branch => {
+                if let Err(err) = self.workspace.set_chat_branch(chat_id, &renamed) {
+                    tracing::warn!(chat = %chat_id, error = %err, "chat branch update failed");
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(chat = %chat_id, error = %err, "automatic worktree branch rename failed");
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TitleGenerator {
     inner: Arc<Inner>,
@@ -59,6 +118,11 @@ impl TitleGenerator {
 
     /// Fire-and-forget: title `chat_id` if it's still untitled. Called by the run
     /// task after a completed exchange; runs detached so it never delays anything.
+    ///
+    /// Unconditional by harness — this is the fallback dispatch, and that is
+    /// exactly why it stays unconditional: see [`Self::maybe_generate_upfront`]'s
+    /// doc for the request-start site this is NOT, and the policy that splits
+    /// them.
     pub fn maybe_generate(&self, chat_id: &str, harness: HarnessId, prompt: &str, cwd: &str) {
         let this = self.clone();
         let chat_id = chat_id.to_string();
@@ -68,6 +132,117 @@ impl TitleGenerator {
             if let Err(err) = this.generate(&chat_id, harness, &prompt, &cwd).await {
                 tracing::debug!(chat = %chat_id, error = %err, "chat auto-titling skipped");
             }
+        });
+    }
+
+    /// The request-start dispatch site ("name the chat NOW, off the first
+    /// prompt" — see the call site's own comment in `sessions.rs`), gated for
+    /// a harness that reports its own title.
+    ///
+    /// For most harnesses this is identical to [`Self::maybe_generate`]. For
+    /// one [`harness_self_titles`] lists, calling it here would spend a real
+    /// model call racing the agent's own answer, which streams in on the SAME
+    /// turn a few events later — the exact waste this task exists to cut.
+    /// Skipped synchronously, before `tokio::spawn`: nothing here resolves the
+    /// harness, calls its model list, or writes a fallback title. Nothing to
+    /// await, nothing to race — the skip is unconditional, not "usually wins
+    /// the race".
+    ///
+    /// **This is not the only dispatch site**, and that is deliberate: the
+    /// turn-end fallback ([`Self::maybe_generate`], called from `sessions.rs`
+    /// after a completed exchange) stays UNCONDITIONAL, because it is the
+    /// safety net for a self-titling harness that, this turn, never actually
+    /// sent one (a dropped notification, an older agent build) — without it, a
+    /// harness wrongly believed to self-title would leave a chat named
+    /// nothing, forever. That fallback still costs nothing when the agent DID
+    /// answer, but only because [`Self::apply_agent_title`]'s title write is
+    /// SYNCHRONOUS, called inline from `drive_run`'s event loop rather than
+    /// spawned — see that method's own doc for why. `maybe_generate`, by
+    /// contrast, spawns its own task; two spawned tasks would have no
+    /// ordering relation to each other, and the fallback could still lose the
+    /// race and spend a real model call even though the write itself is
+    /// always safe (first-writer-wins refuses whichever side loses).
+    pub fn maybe_generate_upfront(
+        &self,
+        chat_id: &str,
+        harness: HarnessId,
+        prompt: &str,
+        cwd: &str,
+    ) {
+        if harness_self_titles(harness) {
+            return;
+        }
+        self.maybe_generate(chat_id, harness, prompt, cwd);
+    }
+
+    /// Apply a title the agent generated itself
+    /// (`AgentEvent::SessionTitled`, wired from ACP's `session_info_update`
+    /// via `normalize::session_update`). Called INLINE from `drive_run`'s
+    /// event loop (`sessions.rs`), not spawned — same discipline
+    /// `finish_segment`'s doc write already follows in that same loop.
+    ///
+    /// **Why synchronous is load-bearing, not just tidy.** The turn-end
+    /// fallback ([`Self::maybe_generate_upfront`]'s doc explains why it stays
+    /// unconditional) reads "does this chat already have a title" before
+    /// spending a model call. If this write were spawned, that read would
+    /// race a task with no ordering guarantee relative to it — the fallback
+    /// could read the row BEFORE this write lands, dispatch a real Grok run
+    /// (the exact cost this task exists to cut, reintroduced probabilistically),
+    /// and lose nothing but money and time, because `rename_chat_auto`'s
+    /// first-writer-wins guard still refuses whichever write arrives second.
+    /// Cost, not correctness — but a comment claiming the ordering is
+    /// guaranteed has to make it actually guaranteed. Calling this inline in
+    /// the same sequential event loop that later dispatches the fallback
+    /// (`AgentEvent::SessionTitled` is always processed, and this call
+    /// completes, before the turn's terminal `Done` reaches its own handling
+    /// a few loop iterations later) is what makes it true.
+    ///
+    /// The title write itself ([`WorkspaceHost::rename_chat_auto`], which
+    /// enforces both the manual-rename lock and first-writer-wins — see that
+    /// method's own doc) is cheap: an in-process CRDT commit, not IO. It is
+    /// blocking the caller only in the sense any doc write in `drive_run`
+    /// already is. **The worktree branch rename that follows a successful
+    /// title write is NOT similarly cheap** — it shells out to git — so it
+    /// stays a background task, deliberately: it must not stall the live
+    /// event stream this method is called from, and its own timing has no
+    /// bearing on the race described above (nothing reads the branch name to
+    /// decide whether a titling run would be wasted).
+    pub fn apply_agent_title(&self, chat_id: &str, title: &str) {
+        let title = title.trim();
+        if title.is_empty() {
+            return;
+        }
+        // Read first (for the branch-rename step below, which needs cwd and
+        // the CURRENT branch): rename_chat_auto does not change either field,
+        // so a value read just before the write is never stale for that.
+        let chat = match self.inner.workspace.doc().chat(chat_id) {
+            Ok(Some(chat)) => chat,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::debug!(chat = %chat_id, error = %err, "agent-authored chat title read failed");
+                return;
+            }
+        };
+        let title_landed = match self.inner.workspace.rename_chat_auto(chat_id, title) {
+            Ok(true) => {
+                tracing::info!(chat = %chat_id, %title, "chat named by agent");
+                true
+            }
+            Ok(false) => false,
+            Err(err) => {
+                tracing::debug!(chat = %chat_id, error = %err, "agent-authored chat title write failed");
+                false
+            }
+        };
+        if !title_landed {
+            return;
+        }
+        let this = self.inner.clone();
+        let chat_id = chat_id.to_string();
+        let title = title.to_string();
+        tokio::spawn(async move {
+            this.rename_worktree_branch_for_title(&chat_id, &chat, &title)
+                .await;
         });
     }
 
@@ -84,8 +259,8 @@ impl TitleGenerator {
             .doc()
             .chat(chat_id)?
             .ok_or_else(|| EngineError::Other("chat has no workspace row".into()))?;
-        if chat.title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
-            return Ok(()); // already named
+        if already_named(&chat) {
+            return Ok(());
         }
 
         let generated = self.run_title_model(harness_id, prompt, cwd).await;
@@ -103,41 +278,28 @@ impl TitleGenerator {
             return Ok(());
         }
 
-        // Re-read after the model call: a user may have named the chat or checked
-        // out another branch while the throwaway generation was live.
+        // Re-read after the model call: a user may have named the chat (or an
+        // agent self-titled it, or checked out another branch) while the
+        // throwaway generation was live.
         let latest = self.inner.workspace.doc().chat(chat_id)?.unwrap_or(chat);
-        if latest
-            .title
-            .as_deref()
-            .is_some_and(|t| !t.trim().is_empty())
-        {
+        if already_named(&latest) {
             return Ok(());
         }
 
         // Rename the worktree branch when the chat still sits on its original
-        // comet/<name> branch (guards live inside rename_worktree_branch).
-        if let (Some(chat_cwd), Some(branch)) = (&latest.cwd, &latest.branch)
-            && branch.starts_with("comet/")
-        {
-            match self
-                .inner
-                .repos
-                .rename_worktree_branch(std::path::Path::new(chat_cwd), branch, &title)
-                .await
-            {
-                Ok(renamed) if &renamed != branch => {
-                    if let Err(err) = self.inner.workspace.set_chat_branch(chat_id, &renamed) {
-                        tracing::warn!(chat = %chat_id, error = %err, "chat branch update failed");
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!(chat = %chat_id, error = %err, "automatic worktree branch rename failed");
-                }
-            }
-        }
+        // comet/<name> branch. Shared with `apply_agent_title`, which needs
+        // the identical behavior for a self-titling agent's title — see
+        // `rename_worktree_branch_for_title`'s own doc.
+        self.inner
+            .rename_worktree_branch_for_title(chat_id, &latest, &title)
+            .await;
 
-        self.inner.workspace.rename_chat(chat_id, &title)?;
+        // `rename_chat_auto`, not `rename_chat`: this write is system-authored
+        // (a model run Comet dispatched), not user-driven, and must not stamp
+        // `titleManual` — doing so would permanently block a later
+        // self-titling agent (or a future auto-title run) from ever refining
+        // a title THIS function itself generated.
+        self.inner.workspace.rename_chat_auto(chat_id, &title)?;
         tracing::info!(chat = %chat_id, title = %title, "chat auto-titled");
         Ok(())
     }
@@ -216,6 +378,38 @@ fn title_request(
         attachments: Vec::new(),
         resume: None,
     }
+}
+
+/// True when [`Self::generate`]'s own model run should not bother: either a
+/// person set the title (`title_manual` — see `Chat`'s own doc) or the chat
+/// already has one from any source. A cheap, redundant pre-check —
+/// `WorkspaceHost::rename_chat_auto` enforces the same rule at the write
+/// itself — that exists so a titling run does not spend a model call on a
+/// chat the write would refuse anyway.
+fn already_named(chat: &comet_proto::Chat) -> bool {
+    chat.title_manual || chat.title.as_deref().is_some_and(|t| !t.trim().is_empty())
+}
+
+/// Harnesses that report their own chat title on the wire — Grok's
+/// `session_info_update`, mapped by `normalize::session_update` into
+/// [`AgentEvent::SessionTitled`] (see that variant's own doc comment for the
+/// captured wire evidence). [`TitleGenerator::maybe_generate_upfront`] skips
+/// its whole dispatch for a harness this lists, because the agent's title
+/// arrives during the turn, for free, and a model-run titling call would only
+/// race it.
+///
+/// **Conservative default: only a harness with observed wire evidence is
+/// listed.** Hermes is not — its own module doc (`acp::hermes`) already notes
+/// it carries no steering extension and no effort ladder; nothing there
+/// claims a self-reported title either, and Hermes cannot presently open a
+/// session on this machine to check. A false positive here (a harness that
+/// does NOT actually self-title, wrongly skipped) would still get named by
+/// the turn-end fallback (`maybe_generate`, unconditional) the moment the
+/// title never lands — no chat is ever left permanently unnamed by this
+/// gate, only, in the false-positive case, named one turn later than it
+/// otherwise would have been.
+fn harness_self_titles(harness: HarnessId) -> bool {
+    matches!(harness, HarnessId::Grok)
 }
 
 /// The cheapest model a harness offers (comet's `cheapestModel` heuristic):
@@ -342,5 +536,242 @@ mod tests {
         );
         assert_eq!(request.sandbox, SandboxLevel::ReadOnly);
         assert_eq!(request.runtime_mode, RuntimeMode::FullAccess);
+    }
+
+    #[test]
+    fn harness_self_titles_lists_only_grok() {
+        assert!(harness_self_titles(HarnessId::Grok));
+        for other in [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Cursor,
+            HarnessId::Hermes,
+            HarnessId::Mock,
+        ] {
+            assert!(!harness_self_titles(other), "{other:?} must not self-title");
+        }
+    }
+
+    /// A harness whose `models()` call counts every invocation — the observable
+    /// proxy for "a titling run was dispatched". `id` is a field, not fixed by
+    /// the impl, so the SAME spy can stand in for a self-titling harness
+    /// (registered under `HarnessId::Grok`) and a normal one (registered under
+    /// `HarnessId::Mock`) in one registry, each wired to its own counter.
+    struct CountingHarness {
+        id: HarnessId,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl comet_harness::Harness for CountingHarness {
+        fn id(&self) -> HarnessId {
+            self.id
+        }
+        fn display_name(&self) -> &str {
+            "Counting"
+        }
+        fn capabilities(&self) -> comet_proto::HarnessCapabilities {
+            comet_proto::HarnessCapabilities::default()
+        }
+        async fn models(&self) -> Result<comet_proto::ModelCatalog, comet_harness::HarnessError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(comet_proto::ModelCatalog::built_in(vec![model(
+                "counting-1",
+                "Counting 1",
+            )]))
+        }
+        async fn run(
+            &self,
+            _request: RunRequest,
+            _controls: RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<AgentEvent, comet_harness::HarnessError>>,
+            comet_harness::HarnessError,
+        > {
+            let events = vec![
+                Ok(AgentEvent::TextDelta {
+                    text: "Counted Title".into(),
+                }),
+                Ok(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                }),
+            ];
+            Ok(futures::stream::iter(events).boxed())
+        }
+    }
+
+    /// Question 3's pin: for a harness that reports its own title, the
+    /// request-start dispatch site never spends a model call at all — proven
+    /// by a harness whose `models()` call increments a counter this test can
+    /// read, not by "the chat ended up named" (a fallback write, or the
+    /// agent's own event, would name it too and prove nothing about whether a
+    /// run was dispatched).
+    #[tokio::test]
+    async fn maybe_generate_upfront_dispatches_no_run_for_a_self_titling_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let grok_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mock_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(CountingHarness {
+            id: HarnessId::Grok,
+            calls: grok_calls.clone(),
+        }));
+        registry.register(Arc::new(CountingHarness {
+            id: HarnessId::Mock,
+            calls: mock_calls.clone(),
+        }));
+        let core = crate::EngineCore::assemble(dir.path(), registry.clone(), HarnessId::Mock, None)
+            .expect("engine core assembles");
+        core.workspace
+            .create_space(
+                "space-1",
+                &core.device_id,
+                dir.path().to_str().unwrap(),
+                None,
+                false,
+            )
+            .unwrap();
+        core.workspace
+            .create_chat("chat-grok", "space-1", None, None)
+            .unwrap();
+        core.workspace
+            .create_chat("chat-mock", "space-1", None, None)
+            .unwrap();
+
+        let titles =
+            TitleGenerator::new(core.workspace.clone(), registry.clone(), core.repos.clone());
+
+        // Self-titling harness: the dispatch must be a synchronous no-op —
+        // nothing spawned, so nothing left to race. A couple of yields flush
+        // any task that WOULD have been spawned if the gate were broken.
+        titles.maybe_generate_upfront(
+            "chat-grok",
+            HarnessId::Grok,
+            "name this chat",
+            dir.path().to_str().unwrap(),
+        );
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            grok_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a self-titling harness must never have its model list resolved by the upfront dispatch"
+        );
+        assert!(
+            core.workspace
+                .doc()
+                .chat("chat-grok")
+                .unwrap()
+                .unwrap()
+                .title
+                .is_none(),
+            "no run means no fallback title either, at this dispatch site"
+        );
+
+        // Control: the SAME entrypoint, for a harness NOT listed as
+        // self-titling, does dispatch — proving the negative result above is
+        // the gate, not a broken dispatch mechanism.
+        titles.maybe_generate_upfront(
+            "chat-mock",
+            HarnessId::Mock,
+            "name this chat",
+            dir.path().to_str().unwrap(),
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mock_calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "control dispatch never ran"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(mock_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+
+        core.shutdown().await;
+    }
+
+    /// End-to-end wiring for `AgentEvent::SessionTitled`'s handler
+    /// (`apply_agent_title`): a fresh chat gets named, trimmed; a
+    /// hand-renamed chat keeps the user's title. The doc-layer guard itself
+    /// is `rename_chat_auto`'s own tests in `comet_doc::workspace` — this
+    /// proves the fire-and-forget spawn actually reaches the doc.
+    #[tokio::test]
+    async fn apply_agent_title_writes_through_and_respects_the_manual_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(comet_harness::mock::MockHarness::new()));
+        let core = crate::EngineCore::assemble(dir.path(), registry.clone(), HarnessId::Mock, None)
+            .expect("engine core assembles");
+        core.workspace
+            .create_space(
+                "space-1",
+                &core.device_id,
+                dir.path().to_str().unwrap(),
+                None,
+                false,
+            )
+            .unwrap();
+        core.workspace
+            .create_chat("chat-1", "space-1", None, None)
+            .unwrap();
+        let titles =
+            TitleGenerator::new(core.workspace.clone(), registry.clone(), core.repos.clone());
+
+        titles.apply_agent_title("chat-1", "  Fix Login Flow  ");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if core
+                .workspace
+                .doc()
+                .chat("chat-1")
+                .unwrap()
+                .unwrap()
+                .title
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "agent title never landed"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            core.workspace
+                .doc()
+                .chat("chat-1")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Fix Login Flow"),
+            "the title is trimmed on the way in"
+        );
+
+        // A person renames it by hand afterward — a later agent title event
+        // (Grok re-pushing a revision) must not land over it.
+        core.workspace.rename_chat("chat-1", "User Title").unwrap();
+        titles.apply_agent_title("chat-1", "Agent Retitle");
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            core.workspace
+                .doc()
+                .chat("chat-1")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("User Title"),
+            "a hand-renamed chat must keep the user's title"
+        );
+
+        core.shutdown().await;
     }
 }

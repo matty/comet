@@ -1578,6 +1578,32 @@ pub enum AgentEvent {
         active_form: Option<String>,
         status: ChecklistStatus,
     },
+    /// The agent named its own chat, during the turn, for free.
+    ///
+    /// Grok's `session_info_update` (`normalize::session_update`'s doc
+    /// comment has the captured wire evidence) — mapped here instead of
+    /// spawning `comet_engine::titles`' whole separate agent run to answer a
+    /// question this frame already answers. `title` is re-sent as the agent
+    /// revises it, but `comet_engine::titles::TitleGenerator::apply_agent_title`
+    /// does NOT accept every revision: first-writer-wins applies uniformly,
+    /// through `WorkspaceDoc::rename_chat_auto`, so only the FIRST title this
+    /// chat receives (from any source, agent or Comet's own model run) lands
+    /// — a later revision from the same agent is refused exactly like a
+    /// later write from anywhere else, and a title the user set by hand is
+    /// refused unconditionally. See `rename_chat_auto`'s own doc for why a
+    /// title changing under the user mid-read is the thing being avoided
+    /// even when the second write is the SAME source correcting itself.
+    ///
+    /// **Never a transcript part** (`doc::parts::fold_event_into_parts`'s
+    /// no-op arm) — this is chat-row metadata, not message content, the same
+    /// class as `Usage`. It IS journaled, so a journal written before this
+    /// variant existed must still decode: same rule that keeps
+    /// `ToolCall::Todo` alive, and `run_journal.rs`'s
+    /// `a_journal_without_the_title_variant_still_decodes` pins it.
+    #[serde(rename_all = "camelCase")]
+    SessionTitled {
+        title: String,
+    },
     #[serde(rename_all = "camelCase")]
     Done {
         status: DoneStatus,

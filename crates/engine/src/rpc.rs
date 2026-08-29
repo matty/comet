@@ -4760,4 +4760,171 @@ mod tests {
             Ok(PutToolDiffOutcome::Stored { .. })
         ));
     }
+
+    /// A harness registered under an arbitrary [`HarnessId`], streaming a
+    /// fixed script — `id` is a field rather than fixed like
+    /// `comet_harness::mock::MockHarness`'s, which is what lets a test stand
+    /// this in for Grok (an ACP agent, out of reach in this crate's tests)
+    /// while still going through the real `SessionsEngine::dispatch` →
+    /// `drive_run` pipeline.
+    struct ScriptedHarness {
+        id: HarnessId,
+        script: Vec<comet_proto::AgentEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl comet_harness::Harness for ScriptedHarness {
+        fn id(&self) -> HarnessId {
+            self.id
+        }
+        fn display_name(&self) -> &str {
+            "Scripted"
+        }
+        fn capabilities(&self) -> comet_proto::HarnessCapabilities {
+            comet_proto::HarnessCapabilities::default()
+        }
+        async fn models(&self) -> Result<comet_proto::ModelCatalog, comet_harness::HarnessError> {
+            Ok(comet_proto::ModelCatalog::built_in(Vec::new()))
+        }
+        async fn run(
+            &self,
+            _request: comet_proto::RunRequest,
+            _controls: comet_harness::RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<comet_proto::AgentEvent, comet_harness::HarnessError>,
+            >,
+            comet_harness::HarnessError,
+        > {
+            let events: Vec<_> = self.script.iter().cloned().map(Ok).collect();
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// End-to-end proof for `agent-authored-title` (PR9), through the real
+    /// dispatch → `drive_run` → journal/doc pipeline, not a direct call into
+    /// `titles::TitleGenerator`: a chat dispatched to a self-titling harness
+    /// (`HarnessId::Grok`, stood in for by [`ScriptedHarness`] since Grok
+    /// itself cannot run in this crate's tests) is named from
+    /// `AgentEvent::SessionTitled` mid-stream, WITHOUT the request-start
+    /// titling dispatch ever running — proven by registering NO harness
+    /// under `HarnessId::Mock` at all, so a model-based titling run dispatched
+    /// by mistake would fail loudly (`HarnessError::NotInstalled`) rather
+    /// than silently racing and possibly winning.
+    #[tokio::test]
+    async fn a_grok_chat_is_named_by_its_own_session_titled_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(crate::registry::HarnessRegistry::new());
+        registry.register(Arc::new(ScriptedHarness {
+            id: HarnessId::Grok,
+            script: vec![
+                comet_proto::AgentEvent::SessionStarted {
+                    harness: HarnessId::Grok,
+                    model: "grok-code-fast".into(),
+                    tools: Vec::new(),
+                    cwd: "/tmp".into(),
+                    session_id: "session-1".into(),
+                    assistant_message_id: "assistant-1".into(),
+                    runtime_mode: comet_proto::RuntimeMode::default(),
+                },
+                comet_proto::AgentEvent::TextDelta {
+                    text: "Listing the directory now.".into(),
+                },
+                comet_proto::AgentEvent::SessionTitled {
+                    title: "List Directory Files".into(),
+                },
+                comet_proto::AgentEvent::Done {
+                    status: comet_proto::DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                },
+            ],
+        }));
+        let core = crate::EngineCore::assemble(dir.path(), registry, HarnessId::Grok, None)
+            .expect("engine core assembles");
+        core.workspace
+            .create_space(
+                "space-1",
+                "dev-a",
+                dir.path().to_str().unwrap(),
+                None,
+                false,
+            )
+            .unwrap();
+        core.workspace
+            .create_chat("chat-1", "space-1", None, None)
+            .unwrap();
+
+        let (_replay, mut live) = core.sessions.subscribe("chat-1", 0).unwrap();
+        core.sessions
+            .dispatch(
+                "chat-1",
+                HarnessId::Grok,
+                comet_proto::RunRequest {
+                    prompt: "List directory files then say DONE".into(),
+                    harness: None,
+                    model: None,
+                    reasoning: None,
+                    model_options: Default::default(),
+                    cwd: "/tmp".into(),
+                    runtime_mode: comet_proto::RuntimeMode::default(),
+                    sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+                    attachments: Vec::new(),
+                    resume: None,
+                },
+                Some("user-1".into()),
+            )
+            .await
+            .unwrap();
+
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), live.recv())
+                .await
+                .expect("run settles")
+                .expect("live stream stays open")
+                .event;
+            if matches!(event, comet_proto::AgentEvent::Done { .. }) {
+                break;
+            }
+        }
+
+        // `apply_agent_title` and the turn-end fallback are both
+        // fire-and-forget: give them a bounded window to land.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if core
+                .workspace
+                .doc()
+                .chat("chat-1")
+                .unwrap()
+                .unwrap()
+                .title
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the chat was never named"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            core.workspace
+                .doc()
+                .chat("chat-1")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("List Directory Files"),
+            "must be Grok's own title, not a fallback/model-generated one — no other \
+             harness was even registered, so a fallback title would prove the upfront \
+             dispatch was NOT actually skipped"
+        );
+
+        core.shutdown().await;
+    }
 }

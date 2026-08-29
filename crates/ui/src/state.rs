@@ -1464,6 +1464,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: Some(space_id.into()),
             last_seen_at: None,
+            title_manual: false,
         }
     }
 
@@ -1826,6 +1827,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
+            title_manual: false,
         }
     }
 

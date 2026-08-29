@@ -454,4 +454,33 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[1].0, 2);
     }
+
+    /// A journal written before this variant existed must still decode. Same rule
+    /// that keeps `ToolCall::Todo` alive: provider-version support and
+    /// document-format support are different axes, and conflating them blanks
+    /// somebody's history.
+    ///
+    /// This journal is hand-written JSONL, not produced by `append` — deliberately,
+    /// so it stands in for a file this exact build never wrote: lines carrying only
+    /// the tags every pre-`SessionTitled` build already knew about, and none of the
+    /// new one. If `AgentEvent`'s tag match ever stopped being purely additive (an
+    /// existing tag renamed, a variant made untagged), this is the test that would
+    /// catch it — adding a variant alone cannot break it.
+    #[test]
+    fn a_journal_without_the_title_variant_still_decodes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("chat-1.jsonl"),
+            b"{\"seq\":1,\"event\":{\"type\":\"textDelta\",\"text\":\"hi\"}}\n\
+              {\"seq\":2,\"event\":{\"type\":\"done\",\"status\":\"completed\",\"result\":null,\"error\":null,\"sessionId\":null}}\n",
+        )
+        .unwrap();
+
+        let journal = RunJournal::open(dir.path()).unwrap();
+        let all = journal.replay("chat-1", 0).unwrap();
+
+        assert_eq!(all.len(), 2);
+        assert!(matches!(all[0].1, AgentEvent::TextDelta { .. }));
+        assert!(matches!(all[1].1, AgentEvent::Done { .. }));
+    }
 }

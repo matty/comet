@@ -32,13 +32,12 @@ pub(crate) fn done_status(stop_reason: &str) -> DoneStatus {
 /// different situations into one: a kind that fires on a healthy turn
 /// without anything having gone wrong (Grok's `available_commands_update`
 /// arrives repeatedly across a session — 2 to 10 times in the raw captures
-/// below — and `user_message_chunk` once per turn; `session_info_update` was
-/// only observed once, but is still routine rather than a drift signal — see
-/// the arms below for each one's own evidence) and a kind nobody has ever
-/// wired up at all, which used to vanish with nothing to show for it. Now:
+/// below — and `user_message_chunk` once per turn) and a kind nobody has
+/// ever wired up at all, which used to vanish with nothing to show for it.
+/// Now:
 ///
-/// 1. **Mapped** — `agent_message_chunk`, `agent_thought_chunk`: a real
-///    `AgentEvent`.
+/// 1. **Mapped** — `agent_message_chunk`, `agent_thought_chunk`,
+///    `session_info_update`: a real `AgentEvent`.
 /// 2. **Known, deliberately unmapped** — an explicit arm, still `None`, with
 ///    a comment naming the wire evidence and why it is ignored. Routine on a
 ///    healthy turn; must never become a diagnostic.
@@ -80,6 +79,22 @@ pub(crate) fn session_update(params: &Value) -> Option<AgentEvent> {
         "agent_thought_chunk" => {
             text_of(&update["content"]).map(|text| AgentEvent::ReasoningDelta { text })
         }
+        // Grok's auto-generated session TITLE (`update.title`), re-pushed as
+        // the agent revises it — captured 2026-08-28, literal frame:
+        // `{"sessionUpdate":"session_info_update","title":"..."}`. Promoted
+        // from Tier 2 to mapped by `agent-authored-title` (PR9): titling now
+        // reads this frame directly instead of Comet spawning a whole
+        // separate agent run to answer a question this one already answers
+        // "for free". A missing or blank `title` stays silent rather than
+        // becoming a `SessionTitled` with nothing in it — the absent case
+        // written deliberately, per `.agents/rules/optional-wire-fields.md`.
+        "session_info_update" => update["title"]
+            .as_str()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(|title| AgentEvent::SessionTitled {
+                title: title.to_string(),
+            }),
 
         // ---- Tier 2: known, deliberately unmapped ----
         // `session.rs::handle_incoming` intercepts these before this function
@@ -103,12 +118,6 @@ pub(crate) fn session_update(params: &Value) -> Option<AgentEvent> {
         // question into the answer; `grok_live.rs`'s
         // `a_real_turn_streams_and_settles` asserts the leak stays fixed.
         "user_message_chunk" => None,
-        // Grok's auto-generated session TITLE (`update.title`), re-pushed as
-        // the agent revises it — captured 2026-08-28, same run, literal
-        // frame: `{"sessionUpdate":"session_info_update","title":"..."}`.
-        // Titling is `agent-authored-title`'s surface, not this slice's;
-        // this arm only keeps the routine push from tripping Tier 3.
-        "session_info_update" => None,
 
         // ---- Tier 3: genuinely unknown, see this function's doc comment ----
         // Sink 6 (`crate::diagnostic`'s own doc comment) — hand-built rather
@@ -1040,6 +1049,12 @@ mod tests {
     /// `user_message_chunk` arm would compile, pass every OTHER committed
     /// test, and turn every real Grok turn into a diagnostic storm. This test
     /// is what stands in front of that.
+    ///
+    /// `session_info_update` left this list when `agent-authored-title`
+    /// (PR9) moved it to Tier 1 — it decodes into `AgentEvent::SessionTitled`
+    /// now, so it belongs with the mapped-frame tests below, not here. A kind
+    /// moves OFF this list the moment something maps it; this list is Tier 2
+    /// only.
     #[test]
     fn every_deliberately_ignored_kind_stays_silent() {
         for kind in [
@@ -1047,11 +1062,41 @@ mod tests {
             "tool_call_update",
             "available_commands_update",
             "user_message_chunk",
-            "session_info_update",
         ] {
             assert!(
                 session_update(&json!({"update": {"sessionUpdate": kind}})).is_none(),
                 "{kind} must stay silent, not become a diagnostic"
+            );
+        }
+    }
+
+    /// The frame this whole task exists to read: Grok's self-reported title.
+    #[test]
+    fn session_info_update_maps_to_session_titled() {
+        let event = session_update(&json!({
+            "update": {"sessionUpdate": "session_info_update", "title": "  Fix Login Flow  "}
+        }))
+        .expect("a titled session_info_update must map to an event");
+        match event {
+            AgentEvent::SessionTitled { title } => assert_eq!(title, "Fix Login Flow"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A missing or blank `title` is the absent case
+    /// (`.agents/rules/optional-wire-fields.md`), not an empty-titled event
+    /// and not a diagnostic — `session_info_update` is still routine even
+    /// when it carries nothing usable.
+    #[test]
+    fn session_info_update_without_a_usable_title_stays_silent() {
+        for payload in [
+            json!({"update": {"sessionUpdate": "session_info_update"}}),
+            json!({"update": {"sessionUpdate": "session_info_update", "title": ""}}),
+            json!({"update": {"sessionUpdate": "session_info_update", "title": "   "}}),
+        ] {
+            assert!(
+                session_update(&payload).is_none(),
+                "{payload}: must stay silent, not become SessionTitled or a diagnostic"
             );
         }
     }

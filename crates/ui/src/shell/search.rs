@@ -728,6 +728,7 @@ mod tests {
                 harness_session_cwd: None,
                 space_id: Some("fade-lab-id".into()),
                 last_seen_at: None,
+                title_manual: false,
             },
             Chat {
                 id: "c-tabs".into(),
@@ -745,6 +746,7 @@ mod tests {
                 harness_session_cwd: None,
                 space_id: Some("comet-id".into()),
                 last_seen_at: None,
+                title_manual: false,
             },
         ]
     }
@@ -766,6 +768,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
+            title_manual: false,
         }
     }
 
@@ -850,6 +853,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: Some("deleted-space-id".into()),
             last_seen_at: None,
+            title_manual: false,
         });
         let r = filter("fade", &spaces(), &all, &devices).unwrap();
         assert!(
