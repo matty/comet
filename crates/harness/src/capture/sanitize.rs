@@ -587,16 +587,15 @@ impl Redactor {
     /// field on purpose: the program is already in every capture, including
     /// the ones recorded before this existed, so the fix reaches them too.
     fn add_uncovered_program_root(&mut self, program: &str) {
-        let Some(directory) = Path::new(program).parent() else {
+        let Some(directory) = program_parent(program) else {
             return;
         };
-        let directory = directory.to_string_lossy();
         // The same predicate that would later reject the leftover, not a
         // separate notion of "absolute": this adds a root exactly when its
         // absence is what fails the capture, and stays silent otherwise (a
         // bare `claude` has an empty parent, and a relative one has nothing
         // `sanitize_paths_and_validate` would object to).
-        if !contains_absolute_path(&directory) {
+        if !contains_absolute_path(directory) {
             return;
         }
         let covered = self.paths.iter().any(|redaction| {
@@ -608,7 +607,7 @@ impl Redactor {
         if covered {
             return;
         }
-        self.add_path(Some(directory.as_ref()), "<PROGRAM_DIR>");
+        self.add_path(Some(directory), "<PROGRAM_DIR>");
     }
 
     fn add_path(&mut self, value: Option<&str>, placeholder: &'static str) {
@@ -1440,6 +1439,34 @@ fn path_occurrence_escapes_root(text: &str, root: &str) -> bool {
     false
 }
 
+/// The directory part of `program`, splitting on both separators whatever OS
+/// this is running on.
+///
+/// Deliberately not `Path::new(program).parent()`. `Path` is platform-native,
+/// so on Linux a backslash is an ordinary filename character and
+/// `C:\Program Files\nodejs\node.exe` parses as one bare component whose parent
+/// is empty -- [`add_uncovered_program_root`] then adds no root, and the
+/// capture hard-fails on the leftover absolute path it was meant to cover.
+/// [`contains_absolute_path`], the predicate right below, has always been
+/// cross-platform; deriving the parent natively was the half that disagreed
+/// with it, and a Windows-recorded capture is exactly what CI sanitizes.
+///
+/// Returns `None` for a bare name (`claude`), matching the empty parent the
+/// caller already treats as "nothing to add".
+///
+/// [`add_uncovered_program_root`]: RedactionRoots::add_uncovered_program_root
+fn program_parent(program: &str) -> Option<&str> {
+    let index = program.rfind(['/', '\\'])?;
+    // A separator at the very start, or one straight after a drive letter, is
+    // the root itself rather than a divider: keep it, or `C:\node.exe` yields
+    // the drive-relative `C:` and `/node` yields the empty string, neither of
+    // which is the directory the program lives in.
+    if index == 0 || program[..index].ends_with(':') {
+        return Some(&program[..=index]);
+    }
+    Some(&program[..index])
+}
+
 fn contains_absolute_path(value: &str) -> bool {
     let bytes = value.as_bytes();
     for index in 0..bytes.len() {
@@ -1508,9 +1535,37 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        PATH_ROOT_PLACEHOLDERS, PublicationLock, publish_staging_pair_with,
+        PATH_ROOT_PLACEHOLDERS, PublicationLock, program_parent, publish_staging_pair_with,
         publish_staging_pair_with_commit,
     };
+
+    /// Break caught: a Windows-recorded capture could not be sanitized on
+    /// Linux. `a_program_outside_every_declared_root_still_sanitizes` covers
+    /// the same fix through the whole sanitizer, but it passes on Windows
+    /// either way -- `Path::parent` there splits both separators, so the bug
+    /// was invisible to every local run and only ever showed on CI, where it
+    /// failed for three commits.
+    ///
+    /// This asserts the string logic directly for exactly that reason: the
+    /// separator handling has to be the same on both platforms, so a test that
+    /// goes through `Path` cannot state the requirement.
+    #[test]
+    fn a_program_directory_splits_on_both_separators_on_every_platform() {
+        assert_eq!(
+            program_parent(r"C:\Program Files\nodejs\node.exe"),
+            Some(r"C:\Program Files\nodejs")
+        );
+        assert_eq!(
+            program_parent("/usr/local/bin/node"),
+            Some("/usr/local/bin")
+        );
+        // A bare name is the caller's "nothing to add" case.
+        assert_eq!(program_parent("claude"), None);
+        // Roots keep their separator: without it these are the drive-relative
+        // `C:` and the empty string, neither of which names a directory.
+        assert_eq!(program_parent(r"C:\node.exe"), Some(r"C:\"));
+        assert_eq!(program_parent("/node"), Some("/"));
+    }
 
     /// Break caught: writing events directly into the destination before manifest creation can
     /// leave a mixed or half-written pair and destroy a previously reviewable staging artifact.
