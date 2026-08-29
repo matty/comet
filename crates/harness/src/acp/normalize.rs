@@ -890,17 +890,19 @@ mod tests {
     /// literal frame `steer-grok` recorded (grok 1.0.5, 2026-08-28), not a
     /// hand-written fixture.** `.params.update.rawInput` is a declared
     /// `surface::MAP_PATHS` map (real filesystem paths ride it -- see that
-    /// declaration's own doc comment for why), which means the
-    /// capability-sheet golden test can no longer see `pattern`/`path` as
-    /// named fields: `Visit::walk` folds every key under a declared map to
-    /// `.{}`, so a future agent version dropping `pattern` from a search
-    /// frame would break `typed_call`'s `Search` decode with nothing in the
-    /// sheet ever failing. This test is what stands in for that lost
-    /// coverage. The extra fields below (`variant`, `glob`, `-i`, `type`,
-    /// `multiline`, the `_meta.x.ai/tool` echo) are exactly what the real
-    /// frame carried alongside `pattern`/`path` -- kept rather than trimmed,
-    /// so the test also proves the decode tolerates the fields it does not
-    /// read, not only the two it does.
+    /// declaration's own doc comment for why). `pattern` and `path` are
+    /// `named_children` of that declaration (D123), so the capability sheet
+    /// does record them as fields again -- but only once a scenario that
+    /// exercises this path is promoted, and none is today, so the sheet
+    /// backstop is still latent and this test is the only thing standing
+    /// between a future agent version dropping `pattern` and a silent
+    /// `Search` decode break. It stays worth keeping afterwards too: the
+    /// sheet records that *some* tool sent a key spelled `pattern`, never
+    /// that the search tool did. The extra fields below (`variant`, `glob`,
+    /// `-i`, `type`, `multiline`, the `_meta.x.ai/tool` echo) are exactly
+    /// what the real frame carried alongside `pattern`/`path` -- kept rather
+    /// than trimmed, so the test also proves the decode tolerates the fields
+    /// it does not read, not only the two it does.
     #[test]
     fn the_captured_search_tool_decodes_pattern_and_path() {
         let events = drain(&[

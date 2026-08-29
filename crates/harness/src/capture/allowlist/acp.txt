@@ -40,6 +40,13 @@
 # capture (2026-08-28) populated `rawInput.target_file` with this operator's
 # own filesystem paths.
 #
+# `rawInput` does name `pattern` and `path` as `named_children` (D123), so
+# those two KEYS survive as field names -- `normalize::typed_call` decodes
+# them, and the sheet has to be able to see one disappear. That is not a line
+# here and must not become one by habit: a named child's VALUE is still
+# default-deny, and these two carry a real search string and a real
+# filesystem path off the capturing machine.
+#
 # `.params.update.title` and a tool result's `content`/`rawOutput` are
 # deliberately OFF this list despite `title` being read on the announcing
 # `tool_call` frame (the raw tool name, e.g. "read_file" - harmless): the
