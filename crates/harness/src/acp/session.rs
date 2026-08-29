@@ -1077,6 +1077,18 @@ struct Turn<'a> {
 /// on itself for the identical reason.
 const PROMPT_COMPLETE_METHOD: &str = concat!("_x.ai/ses", "sion/prompt_complete");
 
+/// How long the notification-settle arm below waits for the already-in-flight
+/// `session/prompt` reply once [`PROMPT_COMPLETE_METHOD`] has already ended the
+/// turn — long enough to catch the ~3ms gap this const's sibling doc measured
+/// live, short enough that an agent which never answers the RPC at all
+/// (`complete-notification-only` in the fixture, and the shape upstream's
+/// original hang report was about) still settles promptly rather than
+/// reintroducing that hang. 10x the measured gap: comfortable headroom for
+/// scheduler jitter on a slower machine than the one that measured it,
+/// while staying two orders of magnitude below [`Timeouts::prompt_stall`]'s
+/// own default, so this can never be mistaken for — or mask — a wedged agent.
+const POST_NOTIFICATION_REPLY_BOUND: Duration = Duration::from_millis(30);
+
 /// One `session/prompt`, from send to `stopReason`.
 async fn drive_turn(
     turn: &mut Turn<'_>,
@@ -1273,9 +1285,32 @@ async fn drive_turn(
                         // The notification carries no token counts (verified
                         // live — Grok's own usage rides the RPC response's
                         // `_meta` instead), so this is honestly `None` on the
-                        // fast path; a reader that ever gains a usage-bearing
+                        // NORMAL path — this notification wins the race on
+                        // every healthy turn (this fn's header, and
+                        // `Timeouts::prompt_stall`'s doc), not merely
+                        // sometimes; a reader that ever gains a usage-bearing
                         // notification shape reads it here for free.
-                        if let Some(usage) = usage_reader(&params, context_window)
+                        let mut usage = usage_reader(&params, context_window);
+                        // Grok's usage lives only in the RPC reply's `_meta`,
+                        // and that reply (`reply`, sent above) is already in
+                        // flight — dropping it un-polled here is exactly how
+                        // Grok's usage went missing on every healthy turn:
+                        // the settle above always wins the race, so the
+                        // `answer = &mut reply` arm that reads it never gets
+                        // a turn. Poll it directly instead, bounded by
+                        // [`POST_NOTIFICATION_REPLY_BOUND`] — see that
+                        // const's own doc for why the bound is safe.
+                        if usage.is_none()
+                            && let Ok(Ok(result)) =
+                                tokio::time::timeout(POST_NOTIFICATION_REPLY_BOUND, &mut reply)
+                                    .await
+                        {
+                            if let Some(id) = result["_meta"]["promptId"].as_str() {
+                                prompt_completions.insert(id.to_owned());
+                            }
+                            usage = usage_reader(&result, context_window);
+                        }
+                        if let Some(usage) = usage
                             && !send(event_tx, usage).await
                         {
                             return TurnEnd::ConsumerGone;

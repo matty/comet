@@ -1,11 +1,33 @@
 # D102 — Grok's command push ships with three fields unevidenced, and the corpus cannot record Grok at all yet
 
-**Status: open, two distinct blockers.** The first is a decision already made (redact three
-decoded fields rather than publish this operator's personal skill inventory). The second is a
-harder, unrelated finding discovered while trying to act on the first: `comet-provider-sanitize`
-structurally rejects every Grok capture today, so neither blocker's resolution can currently reach
-a promoted corpus directory. codex-acp and claude-agent-acp are unaffected by either and are
-promoted (`crates/harness/tests/corpus/{codex-acp,claude-agent-acp}/`).
+**Status: open, unowned, two distinct blockers.** No owner has been assigned as of 2026-08-29 —
+recorded explicitly here rather than left implicit, per the 2026-08-29 whole-branch review. The
+first blocker is a decision already made (redact three decoded fields rather than publish this
+operator's personal skill inventory). The second is a harder, unrelated finding discovered while
+trying to act on the first: `comet-provider-sanitize` structurally rejects every Grok capture
+today, so neither blocker's resolution can currently reach a promoted corpus directory.
+codex-acp and claude-agent-acp are unaffected by either and are promoted
+(`crates/harness/tests/corpus/{codex-acp,claude-agent-acp}/`).
+
+**The consequence compounds, and is worth stating plainly.** Grok is the one ACP agent this fork
+actually ships — Hermes cannot run at all yet (D104) — and it is the one with the least
+monitoring of any adapter Comet drives, entirely because this row is still open:
+
+- **No drift sheet.** `docs/providers/` has one for every corpus version of Claude Code and
+  codex-cli, and for codex-acp and claude-agent-acp — the two ACP adapters nobody actually runs
+  in production, kept only as comparison points. Grok, the one that ships, has none, because a
+  sheet needs a promoted corpus and this row blocks that.
+- **No supported-version floor.** `docs/testing/supported-provider-versions.md` names one for
+  Claude Code and codex-cli only (D110 names this explicitly).
+- **No runnable live suite.** `crates/harness/tests/grok_live.rs` is `#[ignore]`d — its usage
+  assertion has not run since the free quota it needs was exhausted on 2026-08-28.
+
+Finding 1 of the 2026-08-29 whole-branch review — Grok's token usage silently dropped on every
+healthy turn, a seam bug between two otherwise-correct PRs — is exactly the shape of drift this
+gap exists to catch and did not: it surfaced from reading the settle code's own two comments
+against each other, not from a sheet, a floor check, or a live run noticing the meter stayed
+empty. Closing this row does not fix that class of bug by itself, but it is the precondition for
+every mechanism that would have caught it sooner.
 
 ## Blocker 1 — the command push mixes Grok's own commands with the operator's personal skills
 

@@ -21,6 +21,7 @@
 //! | `cancel`        | settles with `stopReason: "cancelled"` |
 //! | `complete-notification-only` | sends the completion notification (see [`PROMPT_COMPLETE_METHOD`]), then never answers the prompt request — poses the hang upstream reports, where the RPC response alone hangs |
 //! | `complete-both` | sends the completion notification immediately, then the ordinary RPC reply after a deliberate delay — poses the healthy case both signals exist for |
+//! | `complete-both-usage` | identical to `complete-both`, except the RPC reply follows after a realistic few-ms gap (not `complete-both`'s exaggerated 200ms) and carries Grok's real usage shape (`_meta.inputTokens`/`outputTokens`) — poses the healthy turn Finding 1's fix exists for: usage that lives only in the reply, which the notification-settle path must still recover |
 //! | `complete-response-only` | the ordinary RPC reply alone, no notification — this is the plain `end_turn` path below; named here because it is the deliberate MIRROR of `complete-notification-only`: an agent without the extension, which must still settle |
 //! | `replay-stale` | replays the PREVIOUS turn's already-consumed promptId as a bogus early completion (`stopReason: "refusal"`) of THIS turn, before streaming this turn's own real content and completing for real — poses the cross-turn staleness the consumed-promptId dedup exists to reject |
 //! | `request-permission` | sends `session/request_permission` mid-turn with all four ACP option kinds, then — once answered — echoes `"chosen:<optionId or cancelled>"` as a text chunk and settles `end_turn`. Lets a test observe which option the client picked without reading raw wire bytes. |
@@ -565,6 +566,30 @@ fn handle_prompt(
         complete("end_turn");
         *last_prompt_id = Some(prompt_id);
         return Some(id.clone());
+    }
+
+    if text.contains("complete-both-usage") {
+        // The healthy case Finding 1's fix exists for, with a REALISTIC gap
+        // rather than `complete-both`'s deliberately exaggerated 200ms
+        // (checked first because "complete-both-usage" also contains the
+        // substring "complete-both"): the notification fires immediately,
+        // the ordinary reply follows a few ms later — short enough to land
+        // inside `POST_NOTIFICATION_REPLY_BOUND` — carrying Grok's real
+        // usage shape in `_meta` (`inputTokens`/`outputTokens`, the same
+        // field names `grok::usage` reads) so a test can prove the
+        // notification-settle path recovers it from the reply instead of
+        // dropping that already-in-flight future un-polled.
+        complete("end_turn");
+        *last_prompt_id = Some(prompt_id.clone());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        emit(&json!({
+            "jsonrpc": "2.0", "id": id,
+            "result": {
+                "stopReason": "end_turn",
+                "_meta": {"promptId": prompt_id, "inputTokens": 111, "outputTokens": 22},
+            },
+        }));
+        return None;
     }
 
     if text.contains("complete-both") {

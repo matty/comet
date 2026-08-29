@@ -1522,9 +1522,18 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("stub adapter entry for {package}: {error}"));
         }
-        // SAFETY: single-threaded per nextest's one-process-per-test model
-        // (`.config/nextest.toml`); no other test in this process reads or
-        // writes this variable while this one runs.
+        // Excludes every other test in this crate that touches
+        // `COMET_ACP_ADAPTER_ROOT` (`scenarios::acp::ADAPTER_ROOT_ENV_LOCK`'s
+        // own doc) -- required under plain `cargo test`, which is still
+        // directly runnable and puts every test in this crate's default
+        // unit-test binary in one process; a no-op under the documented
+        // `cargo nextest run` gate, where each test already gets its own
+        // process (`.config/nextest.toml`).
+        let _adapter_root_guard = scenarios::acp::ADAPTER_ROOT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: `_adapter_root_guard` above excludes every other test that
+        // touches this var.
         unsafe { std::env::set_var("COMET_ACP_ADAPTER_ROOT", adapter_root.path()) };
 
         // codex-acp and claude-agent-acp discovery are promoted in this same

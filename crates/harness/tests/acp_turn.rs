@@ -563,6 +563,81 @@ async fn both_signals_arriving_produce_exactly_one_done() {
     }
 }
 
+/// Grok's own reader, mirrored here rather than reused: `grok::usage` is
+/// `pub(crate)` inside `comet-harness` and unreachable from this integration-
+/// test crate (`no_usage`'s own doc comment above explains why every other
+/// test in this file passes that instead). Same field names, same shape —
+/// `_meta.inputTokens`/`outputTokens`, `None` when the reply carries neither.
+fn test_usage(result: &serde_json::Value, context_window: Option<u64>) -> Option<AgentEvent> {
+    let meta = &result["_meta"];
+    let prompt_tokens = meta["inputTokens"].as_u64();
+    let output_tokens = meta["outputTokens"].as_u64();
+    if prompt_tokens.is_none() && output_tokens.is_none() {
+        return None;
+    }
+    Some(AgentEvent::Usage {
+        prompt_tokens: prompt_tokens.unwrap_or(0),
+        output_tokens: output_tokens.unwrap_or(0),
+        context_window,
+    })
+}
+
+/// **Finding 1, pinned.** Grok's usage numbers live ONLY in the `session/
+/// prompt` RPC reply's `_meta` (this suite's `test_usage`, mirroring
+/// `grok::usage`) — never in [`comet_harness::acp::session`]'s completion
+/// notification, which settles first on every healthy turn (`session.rs`'s
+/// own measurement: the notification consistently beats the reply by about
+/// 3ms). Before the fix this notification-settle arm returned the instant it
+/// saw the notification, dropping the still in-flight reply future — and
+/// with it, Grok's only copy of the turn's usage — without ever reading it.
+///
+/// `complete-both-usage`'s reply lands a few ms after its notification,
+/// comfortably inside `POST_NOTIFICATION_REPLY_BOUND`'s 30ms, so a working
+/// harvest recovers it well within the bound; removing the harvest (leaving
+/// only `usage_reader(&params, ...)` on the notification's own empty
+/// `params`) must fail this — the notification never carries usage at all.
+#[tokio::test]
+async fn a_notification_settled_turn_still_reports_usage_from_the_reply() {
+    let (controls, steer, _token) = controls();
+    let stream = comet_harness::acp::session::run(
+        open(false).await,
+        HarnessId::Mock,
+        request("please complete-both-usage"),
+        controls,
+        test_usage,
+    );
+    drop(steer);
+    let events = drain(stream).await;
+
+    let usage: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Usage { .. }))
+        .collect();
+    assert_eq!(
+        usage.len(),
+        1,
+        "the reply's usage must reach the stream exactly once: {events:#?}"
+    );
+    match usage[0] {
+        AgentEvent::Usage {
+            prompt_tokens,
+            output_tokens,
+            ..
+        } => {
+            assert_eq!(*prompt_tokens, 111, "the fixture's own inputTokens");
+            assert_eq!(*output_tokens, 22, "the fixture's own outputTokens");
+        }
+        other => unreachable!("{other:?}"),
+    }
+    match only_done(&events) {
+        AgentEvent::Done { status, error, .. } => {
+            assert_eq!(*status, DoneStatus::Completed);
+            assert!(error.is_none());
+        }
+        other => unreachable!("{other:?}"),
+    }
+}
+
 /// **Task 5's stall bound, made real.** `silent-after-prompt` poses total wire
 /// silence after `session/prompt` — no update, no reply, nothing — which is
 /// exactly the shape `Timeouts::prompt_stall` exists to bound. The run must

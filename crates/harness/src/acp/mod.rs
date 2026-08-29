@@ -16,13 +16,6 @@
 //! must not fail the frame, and `normalize.rs` holds the decisions about what
 //! an unreadable one means.
 
-// Landing ahead of its consumer, deliberately. The `Harness` impl that
-// constructs these is coupled to a `HarnessId` variant and so to a
-// `PROTOCOL_VERSION` bump; splitting that out keeps both changes reviewable.
-// What is here is the decode, and every decision in it is pinned by a test
-// against the literal wire two real adapters answered on 2026-08-28.
-#![allow(dead_code)]
-
 pub(crate) mod approval;
 pub mod grok;
 pub mod hermes;
@@ -186,10 +179,12 @@ impl AgentDescription {
 }
 
 // The live session loop (`session/new`, `session/prompt`, the update stream)
-// lands with the `Harness` impl that gives it a caller. Putting it here first
-// would be a module nothing constructs -- dead code the compiler is right to
-// warn about, and untestable besides: `CARGO_BIN_EXE_*` reaches integration
-// tests only, and this module is `pub(crate)` on purpose.
+// lives in `session.rs`, not here -- it is `pub(crate)` on purpose, and its
+// caller is the `Harness` impl each of `grok.rs` and `hermes.rs` gives it
+// (`GrokHarness`/`HermesHarness`, both calling `session::run`), not something
+// still pending. `CARGO_BIN_EXE_*` reaches integration tests only, so the
+// live wire behavior itself is exercised there (`acp_turn.rs` and friends)
+// rather than by a unit test in this module.
 
 #[cfg(test)]
 mod tests {

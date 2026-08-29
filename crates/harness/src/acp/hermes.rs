@@ -98,10 +98,11 @@ fn hermes_install_dirs() -> Vec<crate::KnownDir> {
 ///
 /// Production's builder, and the one the capture recorder's Hermes rows would
 /// spawn -- the same seam `grok::run_launch` sits on. The request contributes
-/// nothing to argv today: model selection is not wired to the ACP wire for
-/// any agent yet (`crates/harness/src/acp/session.rs` never sends a model
-/// choice), so this takes the request only to match the launch seam
-/// `capture::record::derive_launch` calls.
+/// nothing to argv: model selection is wired to the ACP wire, but not through
+/// argv -- [`config_requests`], about 130 lines below, sends it as a
+/// `session/set_model` request once the session is open, so this fn's own
+/// job is just process launch, and it takes the request only to match the
+/// launch seam `capture::record::derive_launch` calls.
 pub(crate) fn run_launch(exe: &Path, _request: &RunRequest) -> LaunchDescriptor {
     LaunchDescriptor {
         program: crate::discovery::program_path(exe),

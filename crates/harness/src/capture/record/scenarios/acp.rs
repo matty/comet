@@ -68,6 +68,28 @@ fn adapter_entry(package: &str) -> anyhow::Result<PathBuf> {
     Ok(entry)
 }
 
+/// Serializes every test in this crate that mutates the process-wide
+/// `COMET_ACP_ADAPTER_ROOT` [`adapter_entry`] reads.
+///
+/// **Redundant under the documented gate, load-bearing under the other one
+/// that still runs.** `cargo nextest run` (`.config/nextest.toml`) gives
+/// each test its own process, so no two of these tests are ever live at
+/// once and this lock never contends -- true today, and the reason the
+/// three call sites below could each carry their own "single-threaded"
+/// SAFETY comment in isolation. But `cargo nextest run -p comet-harness`'s
+/// sibling, plain `cargo test -p comet-harness`, is still directly
+/// runnable and puts every test in this crate's default unit-test binary
+/// in ONE process, by default across multiple threads -- and under that,
+/// two of these tests can genuinely interleave their `set_var`/`remove_var`
+/// pairs and read back each other's override. Finding 5 of the ACP
+/// whole-branch review (2026-08-29) named this gap on
+/// `every_scenario_launch_matches_its_committed_corpus_manifest`
+/// (`record.rs`) specifically; the other two call sites here share the
+/// exact same env var and the exact same exposure, so they take the same
+/// lock rather than leaving two of three sites fixed and one not.
+#[cfg(test)]
+pub(crate) static ADAPTER_ROOT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// npm's global `node_modules`. Read from the environment rather than by
 /// shelling out to `npm root -g`: a capture must not depend on a second child
 /// process whose own output would not be recorded.
@@ -408,7 +430,15 @@ mod tests {
         std::fs::create_dir_all(&pkg).expect("create package dir");
         std::fs::write(pkg.join("index.js"), "// entry").expect("write entry");
 
-        // SAFETY: single-threaded test; the var is read back immediately below.
+        // Excludes every other test in this crate that touches the same env
+        // var (see `ADAPTER_ROOT_ENV_LOCK`'s own doc) -- required under plain
+        // `cargo test`, where they share this process; a no-op under the
+        // documented `cargo nextest run` gate.
+        let _guard = ADAPTER_ROOT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: `_guard` above excludes every other test that touches this
+        // var; the var is read back immediately below.
         unsafe { std::env::set_var("COMET_ACP_ADAPTER_ROOT", dir.path()) };
         let entry = adapter_entry(CODEX_ACP_PACKAGE).expect("entry resolves");
         unsafe { std::env::remove_var("COMET_ACP_ADAPTER_ROOT") };
@@ -470,6 +500,11 @@ mod tests {
     #[test]
     fn a_missing_adapter_names_how_to_install_it() {
         let dir = tempfile::tempdir().expect("tempdir");
+        // See `ADAPTER_ROOT_ENV_LOCK`'s doc: excludes every other test in
+        // this crate that touches the same env var.
+        let _guard = ADAPTER_ROOT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var("COMET_ACP_ADAPTER_ROOT", dir.path()) };
         let err = adapter_entry(CODEX_ACP_PACKAGE).expect_err("must fail");
         unsafe { std::env::remove_var("COMET_ACP_ADAPTER_ROOT") };
