@@ -461,14 +461,26 @@ async fn both_signals_arriving_produce_exactly_one_done() {
         done_at[0]
     );
 
-    // Turn 2: the fixture replays turn 1's promptId as a bogus immediate
-    // completion, THEN streams "second" and completes for real after a
-    // 200ms delay. A settle anywhere near turn 1's Done (i.e. near-zero
-    // additional wait) means the stale replay wrongly ended turn 2; only a
-    // gap close to 200ms proves it was recognized as stale and ignored.
+    // Turn 2: `fake_acp` is single-threaded and blocks in `complete-both`'s
+    // own 200ms sleep before it can even READ turn 2's `session/prompt`, so
+    // the earliest the stale replay can reach the client is ~200ms after
+    // turn 1's Done. If the dedup is missing, that stale replay settles
+    // turn 2 immediately on arrival (measured ~195ms here). If the dedup is
+    // present, it is ignored and turn 2 waits for its OWN real completion
+    // instead — one more 200ms sleep past that (measured ~395ms). 300ms
+    // sits between the two with ~100ms margin either side, so it is the
+    // assertion that actually discriminates a missing dedup from a present
+    // one; a lower threshold (this used to be 120ms) would pass in BOTH
+    // cases and prove nothing. The text_of/status assertions below are
+    // corroborating, not load-bearing on their own for THIS distinction —
+    // falsifying just the dedup (leaving the notification arm and its
+    // method/session match intact) settles turn 2 as Errored off the stale
+    // "refusal" before "second" ever streams, which is what they catch;
+    // this gap assertion is what catches it even if that stale content
+    // happened to look otherwise plausible.
     let turn2_gap = done_at[1] - done_at[0];
     assert!(
-        turn2_gap > Duration::from_millis(120),
+        turn2_gap > Duration::from_millis(300),
         "turn 2 settled only {turn2_gap:?} after turn 1 — the replayed, \
          already-consumed promptId from turn 1 must not be read as \
          completing turn 2; this fails when the consumed-id dedup is \

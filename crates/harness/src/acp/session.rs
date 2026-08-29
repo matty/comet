@@ -80,12 +80,29 @@ pub struct Timeouts {
     /// all, a notification or the reply — never the whole turn. A whole-turn
     /// timeout would kill a legitimately long turn for taking a while to
     /// think; this only watches the gap before the agent has said anything.
-    /// **Measured here 2026-08-28**: `_x.ai/sessions/changed` came back 3ms
-    /// after `session/prompt` went out, before any model work — queue
-    /// bookkeeping always precedes it, so total silence past this window
-    /// means the agent is wedged (a stale shared leader process, a stuck
-    /// update check), not merely slow. Three orders of magnitude of headroom
-    /// makes 30s safe.
+    ///
+    /// **Measured on Grok here 2026-08-28**: `_x.ai/sessions/changed` came
+    /// back 3ms after `session/prompt` went out, before any model work —
+    /// queue bookkeeping always precedes it there, so total silence past
+    /// this window means Grok is wedged (a stale shared leader process, a
+    /// stuck update check), not merely slow. Three orders of magnitude of
+    /// headroom makes 30s safe FOR GROK.
+    ///
+    /// **This one value is shared across every ACP agent, Hermes included,
+    /// and Hermes' first-frame timing is UNMEASURED** — no live turn has
+    /// ever been captured against it on this machine (no provider
+    /// configured, and the install fails; see `hermes.rs`). The 30s default
+    /// is safe here only because it inherits Grok's headroom by assumption,
+    /// not because anyone has confirmed Hermes' own queue bookkeeping (if it
+    /// has any) precedes its model work the same way. **What would falsify
+    /// this**: a real Hermes turn whose first post-prompt frame IS the first
+    /// model token itself, with no earlier bookkeeping ack — a cold or slow
+    /// model call could then legitimately take close to or past 30s to
+    /// produce that first frame, and this bound would error out a healthy
+    /// turn. Whoever gets a working Hermes install should check for exactly
+    /// that shape before trusting this default for it; `with_timeouts`
+    /// already exists to give Hermes its own value once it is measured,
+    /// rather than adding unmeasured per-agent plumbing now.
     pub prompt_stall: Duration,
 }
 
@@ -862,6 +879,22 @@ async fn drive_turn(turn: &mut Turn<'_>, prompt: &str) -> TurnEnd {
                     // settled an EARLIER turn: without that check a late
                     // duplicate would read as completing whichever turn
                     // happens to be running when it finally arrives.
+                    //
+                    // **An ABSENT promptId settles too (`is_none_or`), and
+                    // that is a deliberate reading of "unknown", not of
+                    // "definitely fresh".** Only a promptId this session has
+                    // already SEEN proves a notification stale; a missing one
+                    // carries no such evidence either way, so there is
+                    // nothing here to refuse on. The sessionId guard above is
+                    // the actual evidence bar this method needs to clear —
+                    // refusing to settle on a missing promptId would instead
+                    // silently swallow the notification as generic vendor
+                    // chatter (falling back to the slower RPC response) for
+                    // any hypothetical agent/version that speaks this method
+                    // but omits the field. Grok itself always includes it
+                    // (verified live, every capture on 2026-08-28), so this
+                    // branch of the guard is untested in practice, not unsafe
+                    // in principle.
                     Some(Incoming::Notification { method, params })
                         if method == PROMPT_COMPLETE_METHOD
                             && params["sessionId"].as_str() == Some(session_id)
