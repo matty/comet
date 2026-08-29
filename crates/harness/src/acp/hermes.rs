@@ -342,26 +342,54 @@ impl HermesHarness {
             supports_steering: true,
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: Vec::new(),
-            // **One mode, deliberately.** Same reasoning as Grok: approvals
-            // are unrouted until PR6, and every mode that promises to ask is
-            // a promise the run cannot keep.
+            // **Widened as of PR6, on source evidence rather than a capture
+            // -- no live Hermes session has ever been obtained on this
+            // machine (this module's header) -- but the evidence is
+            // unconditional, not a maybe.**
             //
-            // **This is not a hypothetical gap for Hermes.** Its OWN default
-            // session mode maps to edit-approval policy "ask"
-            // (`_MODE_TO_EDIT_APPROVAL_POLICY["default"] == "ask"`,
-            // `acp_adapter/server.py:504-511`, and `_session_modes` falls
-            // back to that default whenever the session's own mode is unset
-            // or unrecognized, `:538-540`) -- while this crate's ACP session
-            // loop answers EVERY server->client request, including
-            // `session/request_permission`, with `-32601`
-            // (`acp/session.rs:752`). So a real Hermes turn that edits a file
-            // asks a client that cannot answer. `FullAccess` stays the only
-            // declared mode regardless (a mode that promises to ask is worse
-            // than one that is honest about not asking yet), but whichever
-            // slice wires approvals needs to know Hermes' default is
-            // ask-before-edits, not silent-allow.
-            runtime_modes: vec![RuntimeMode::FullAccess],
-            // Nothing to attach a note to while approvals are unrouted.
+            // `session/request_permission` IS now routed to the user
+            // (`acp::session::handle_permission_request`), which removes the
+            // one risk that kept this at `FullAccess` alone before PR6: an
+            // agent asking a client that could only answer `-32601` would
+            // have wedged the turn.
+            //
+            // What Hermes actually asks about, read from
+            // `acp_adapter/permissions.py` and `acp_adapter/edit_approval.py`
+            // (installed 0.15.2 source):
+            // - **A dangerous command always asks. There is no mode, flag, or
+            //   session setting that skips it** -- `make_approval_callback`
+            //   is wired into `terminal_tool`'s approval callback
+            //   unconditionally for every ACP turn (`server.py`'s
+            //   `_run_agent`), with no policy check anywhere in the call
+            //   path. This is what makes `ApprovalRequired` an honest
+            //   declaration: SOMETHING will reach the bridge on a real
+            //   command-approval turn, regardless of anything Comet asks for.
+            // - A file edit asks under the session's `mode`, which defaults
+            //   to `"default"` -> edit-approval policy `"ask"`
+            //   (`_MODE_TO_EDIT_APPROVAL_POLICY`, `_session_modes` falling
+            //   back to it whenever unset). Two OTHER modes exist on the wire
+            //   (`accept_edits` -> `workspace_session`, `dont_ask` ->
+            //   `session`) that would auto-allow edits outside sensitive
+            //   paths, but selecting one means sending `session/set_mode`,
+            //   which is the session-open path PR7 owns, not this one -- so
+            //   nothing in THIS crate can select it yet, and the session
+            //   Comet opens today always runs the asking default.
+            //
+            // **`AutoAcceptEdits` and `Auto` stay off, and not merely for
+            // want of a flag.** Even once PR7 wires `session/set_mode`, the
+            // command-approval path above is unconditional in Hermes' own
+            // code -- no session mode reaches it. `AutoAcceptEdits`'s
+            // contract ("nothing able to block on a question") can therefore
+            // never be true for Hermes: a dangerous command will always ask,
+            // whatever mode is selected. Declaring it would be the exact
+            // failure this capability struct exists to prevent, permanently,
+            // not until the next slice.
+            runtime_modes: vec![RuntimeMode::ApprovalRequired, RuntimeMode::FullAccess],
+            // Neither `PermissionOption` nor the `outcome` ACP defines
+            // carries a note field, and Hermes' own option builders
+            // (`_build_permission_options`, `_build_permission_tool_call`)
+            // send nothing a message could ride in either — checked against
+            // source per Step 5's instruction, not assumed (D24).
             carries_deny_note: false,
         }
     }
@@ -829,12 +857,24 @@ mod tests {
         }
     }
 
-    /// Hermes declares only `FullAccess` while approvals are unrouted, and no
-    /// effort ladder at all -- both are honest answers, not gaps.
+    /// Hermes declares `ApprovalRequired` and `FullAccess` -- the two modes
+    /// its own dangerous-command approval (unconditional, source-read) and
+    /// PR6's now-routed approval bridge can honestly back -- and no effort
+    /// ladder at all. Both are honest answers, not gaps.
     #[test]
-    fn capabilities_declare_no_ladder_and_one_runtime_mode() {
+    fn capabilities_declare_no_ladder_and_two_runtime_modes() {
         let capabilities = HermesHarness::capabilities();
-        assert_eq!(capabilities.runtime_modes, vec![RuntimeMode::FullAccess]);
+        assert_eq!(
+            capabilities.runtime_modes,
+            vec![RuntimeMode::ApprovalRequired, RuntimeMode::FullAccess]
+        );
+        assert!(
+            !capabilities
+                .runtime_modes
+                .contains(&RuntimeMode::AutoAcceptEdits),
+            "a dangerous command always asks in Hermes' own code -- nothing \
+             this crate selects can make AutoAcceptEdits honest"
+        );
         assert!(capabilities.reasoning_levels.is_empty());
         assert_eq!(
             capabilities.steering_mode,

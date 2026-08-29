@@ -514,14 +514,36 @@ impl GrokHarness {
             supports_steering: true,
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: REASONING_LEVELS.to_vec(),
-            // **One mode, deliberately.** Grok's ACP surface has a
-            // `session/request_permission` this harness answers `-32601` — it
-            // does not route approvals to the user yet, so every mode that
-            // promises to ask is a promise the run cannot keep. `FullAccess`
-            // is the only one that describes what actually happens. The other
-            // three arrive with approvals, not before.
+            // **One mode, and this is now a measured fact, not an unrouted
+            // gap.** `session/request_permission` IS routed to the user as of
+            // PR6 (`acp::session::handle_permission_request`) — but Grok
+            // 1.0.5, probed live 2026-08-29 under this exact launch
+            // (`GROK_ARGS`, `initialize_params()`) with a prompt that writes a
+            // file outside the working directory, never put that method on
+            // the wire at all. Its own internal permission gate fired (a
+            // vendor `_x.ai/session_notification` with `sessionUpdate:
+            // "pending_interaction"`, `kind: "permission"`) and resolved
+            // itself (`"interaction_resolved"`) without ever escalating to
+            // the client, and the write completed. `grok agent --help`
+            // confirms there is no flag to force the OTHER direction either:
+            // `--always-approve` exists (redundant with what was already
+            // observed) but nothing asks for a posture that blocks on the
+            // user. Declaring `ApprovalRequired` here would be a promise a
+            // "please ask about everything" selection cannot keep — the user
+            // would pick it and nothing would ever be asked. Full trace in
+            // the PR6 task report.
+            //
+            // **Not exhaustively probed.** Only a file-write trigger was
+            // tested before this machine's free-tier Grok quota was
+            // exhausted (`subscription:free-usage-exhausted`, same probe
+            // run); a shell-command trigger was not tried. `FullAccess` is
+            // the honest set for what was actually observed, and stays that
+            // way until a command-approval scenario is captured too.
             runtime_modes: vec![RuntimeMode::FullAccess],
-            // Nothing to attach a note to while approvals are unrouted.
+            // No captured `session/request_permission` from Grok exists to
+            // check an options shape against (see above) — nothing to attach
+            // a note to either way, since the mode that would carry one is
+            // not declared.
             carries_deny_note: false,
         }
     }

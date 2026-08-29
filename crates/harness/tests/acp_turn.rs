@@ -4,11 +4,15 @@
 //! side of it. The split matters — a hardening test written against an
 //! unverified fixture passes for the wrong reason.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use comet_harness::acp::session::{AcpSession, Timeouts};
 use comet_harness::{CancellationToken, HarnessError, RunControls, SteerMessage};
-use comet_proto::{AgentEvent, DoneStatus, HarnessId, RunRequest, RuntimeMode};
+use comet_proto::{
+    AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus, HarnessId,
+    RunRequest, RuntimeMode,
+};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use tokio::sync::{mpsc, oneshot};
@@ -35,6 +39,26 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let controls = RunControls {
         request_input: Box::new(|_| oneshot::channel().1),
         request_approval: Box::new(|_| oneshot::channel().1),
+        steering: steer_rx,
+        interrupt: token.clone(),
+    };
+    (controls, steer_tx, token)
+}
+
+/// Same as [`controls`], with a caller-supplied approval bridge — every
+/// approval test below needs to see what request reached the bridge, or to
+/// control what it answers, or both.
+fn controls_with_approval(
+    request_approval: impl Fn(ApprovalRequest) -> oneshot::Receiver<ApprovalDecision>
+    + Send
+    + Sync
+    + 'static,
+) -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
+    let (steer_tx, steer_rx) = mpsc::channel(4);
+    let token = CancellationToken::new();
+    let controls = RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        request_approval: Box::new(request_approval),
         steering: steer_rx,
         interrupt: token.clone(),
     };
@@ -600,4 +624,185 @@ async fn an_agent_that_exits_mid_turn_errors_with_an_explanation() {
         }
         other => unreachable!("{other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Approvals: `session/request_permission`, via `fake-acp`'s
+// `request-permission[-unrecognized]` modes.
+// ---------------------------------------------------------------------------
+
+/// The host mints the request id and owns the lifecycle. An adapter that
+/// emitted its own `ApprovalRequested` event would put a card in the doc under
+/// an id no resolver knows, and answering it would never unblock the run —
+/// which is why the harness calls `controls.request_approval` rather than
+/// sending an event. Pinned against the literal frame the agent really sent.
+#[tokio::test]
+async fn a_permission_request_reaches_the_approval_bridge() {
+    let received: Arc<Mutex<Option<ApprovalRequest>>> = Arc::new(Mutex::new(None));
+    let received_for_bridge = received.clone();
+    let (controls, steer, _token) = controls_with_approval(move |request| {
+        *received_for_bridge.lock().unwrap() = Some(request);
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(ApprovalDecision::Allow);
+        rx
+    });
+    let stream = comet_harness::acp::session::run(
+        open(false).await,
+        HarnessId::Mock,
+        request("please request-permission"),
+        controls,
+        no_usage,
+    );
+    drop(steer);
+    let events = drain(stream).await;
+
+    assert_eq!(
+        *received.lock().unwrap(),
+        Some(ApprovalRequest::Command {
+            command: "rm -rf /tmp/x".into(),
+            cwd: None,
+        }),
+        "the literal request the wire sent must reach the bridge unchanged"
+    );
+    assert!(
+        text_of(&events).contains("chosen:opt-allow-once"),
+        "the agent must be told which option was picked: {:?}",
+        text_of(&events)
+    );
+    match only_done(&events) {
+        AgentEvent::Done { status, .. } => assert_eq!(*status, DoneStatus::Completed),
+        other => unreachable!("{other:?}"),
+    }
+}
+
+/// Break caught: mapping `Deny` to the wrong option kind. `reject_once` and
+/// `reject_always` are different answers and picking the wrong one silently
+/// changes a one-time denial into a session-wide one.
+#[tokio::test]
+async fn each_decision_selects_the_matching_option_kind() {
+    async fn run_with(decision: ApprovalDecision) -> Vec<AgentEvent> {
+        let (controls, steer, _token) = controls_with_approval(move |_request| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(decision.clone());
+            rx
+        });
+        let stream = comet_harness::acp::session::run(
+            open(false).await,
+            HarnessId::Mock,
+            request("please request-permission"),
+            controls,
+            no_usage,
+        );
+        drop(steer);
+        drain(stream).await
+    }
+
+    let allow = run_with(ApprovalDecision::Allow).await;
+    assert!(
+        text_of(&allow).contains("chosen:opt-allow-once"),
+        "Allow must select allow_once: {:?}",
+        text_of(&allow)
+    );
+
+    let allow_for_session = run_with(ApprovalDecision::AllowForSession).await;
+    assert!(
+        text_of(&allow_for_session).contains("chosen:opt-allow-always"),
+        "AllowForSession must select allow_always: {:?}",
+        text_of(&allow_for_session)
+    );
+
+    let deny = run_with(ApprovalDecision::Deny {
+        message: "no".into(),
+    })
+    .await;
+    assert!(
+        text_of(&deny).contains("chosen:opt-reject-once"),
+        "Deny must select reject_once: {:?}",
+        text_of(&deny)
+    );
+    assert!(
+        !text_of(&deny).contains("opt-reject-always"),
+        "Deny must never select reject_always — a one-time denial is not a \
+         session-wide one: {:?}",
+        text_of(&deny)
+    );
+}
+
+/// `ApprovalDecision::Expired` is host-stamped when a run ends with an approval
+/// still pending, and is never a decision a client may send. The agent must be
+/// answered `cancelled`, not left waiting on a dead channel.
+#[tokio::test]
+async fn an_expired_approval_cancels_the_agents_request() {
+    let (controls, steer, _token) = controls_with_approval(|_request| {
+        // The resolver is dropped without ever sending — the run ended (or
+        // simply never answered) with this approval still outstanding.
+        let (tx, rx) = oneshot::channel::<ApprovalDecision>();
+        drop(tx);
+        rx
+    });
+    let stream = comet_harness::acp::session::run(
+        open(false).await,
+        HarnessId::Mock,
+        request("please request-permission"),
+        controls,
+        no_usage,
+    );
+    drop(steer);
+    let events = drain(stream).await;
+
+    assert!(
+        text_of(&events).contains("chosen:cancelled"),
+        "a dropped resolver must answer the agent `cancelled` rather than \
+         hang or invent an approval: {:?}",
+        text_of(&events)
+    );
+    match only_done(&events) {
+        AgentEvent::Done { status, .. } => assert_eq!(*status, DoneStatus::Completed),
+        other => unreachable!("{other:?}"),
+    }
+}
+
+/// An option set that carries none of the four expected kinds must not silently
+/// pick the first option. It is a protocol-drift Diagnostic and a denial —
+/// guessing here is the difference between asking and not asking.
+#[tokio::test]
+async fn an_unrecognized_option_set_denies_and_reports_drift() {
+    let called = Arc::new(Mutex::new(false));
+    let called_from_bridge = called.clone();
+    let (controls, steer, _token) = controls_with_approval(move |_request| {
+        *called_from_bridge.lock().unwrap() = true;
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(ApprovalDecision::Allow);
+        rx
+    });
+    let stream = comet_harness::acp::session::run(
+        open(false).await,
+        HarnessId::Mock,
+        request("please request-permission-unrecognized"),
+        controls,
+        no_usage,
+    );
+    drop(steer);
+    let events = drain(stream).await;
+
+    assert!(
+        !*called.lock().unwrap(),
+        "an options vocabulary with none of the four recognized kinds must \
+         never reach the user — guessing which of the four a vendor's own \
+         kind names is not asking"
+    );
+    assert!(
+        text_of(&events).contains("chosen:cancelled"),
+        "the agent must be answered cancelled, not left hanging: {:?}",
+        text_of(&events)
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Diagnostic { discriminator, severity, .. }
+                if discriminator == "session/request_permission"
+                    && *severity == DiagnosticSeverity::Unknown
+        )),
+        "protocol drift must be reported, not silently swallowed: {events:#?}"
+    );
 }
