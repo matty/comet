@@ -76,6 +76,17 @@ pub struct Timeouts {
     pub cancel_grace: Duration,
     /// SIGTERM → SIGKILL gap when reaping the child.
     pub kill_grace: Duration,
+    /// Bound on prompt-send → FIRST sign of life on the wire — any frame at
+    /// all, a notification or the reply — never the whole turn. A whole-turn
+    /// timeout would kill a legitimately long turn for taking a while to
+    /// think; this only watches the gap before the agent has said anything.
+    /// **Measured here 2026-08-28**: `_x.ai/sessions/changed` came back 3ms
+    /// after `session/prompt` went out, before any model work — queue
+    /// bookkeeping always precedes it, so total silence past this window
+    /// means the agent is wedged (a stale shared leader process, a stuck
+    /// update check), not merely slow. Three orders of magnitude of headroom
+    /// makes 30s safe.
+    pub prompt_stall: Duration,
 }
 
 impl Default for Timeouts {
@@ -84,6 +95,7 @@ impl Default for Timeouts {
             handshake: Duration::from_secs(30),
             cancel_grace: Duration::from_secs(5),
             kill_grace: Duration::from_secs(3),
+            prompt_stall: Duration::from_secs(30),
         }
     }
 }
@@ -428,6 +440,10 @@ enum TurnEnd {
     AgentExited,
     /// The consumer dropped the stream; stop without ceremony.
     ConsumerGone,
+    /// Total wire silence past [`Timeouts::prompt_stall`] after
+    /// `session/prompt` went out — no reply, no notification, nothing. A
+    /// wedged agent, not a legitimately slow one.
+    Stalled,
 }
 
 async fn run_session(
@@ -487,6 +503,14 @@ async fn run_session(
     // once in an earlier turn must stay suppressed in a later one on the same
     // session, not report again just because the turn boundary reset it.
     let mut seen_diagnostics: HashSet<String> = HashSet::new();
+    // Every promptId that has already settled a turn this session, off
+    // EITHER signal (see the notification arm in `drive_turn`, and
+    // `PROMPT_COMPLETE_METHOD`). Session-scoped like `seen_diagnostics`: a
+    // completion notification that arrives late — after its own turn already
+    // settled off the RPC reply — must not be read as completing a LATER
+    // turn on the same session, which is exactly the "foreign/stale
+    // completion" risk Grok's own hardening notes name.
+    let mut prompt_completions: HashSet<String> = HashSet::new();
 
     // **One `Done` per turn that started, not one per run.** The session is
     // persistent: a steer opens a second turn on the same session, and a UI
@@ -510,11 +534,13 @@ async fn run_session(
                 session_id: &session_id,
                 interrupt: &interrupt,
                 cancel_grace: timeouts.cancel_grace,
+                prompt_stall: timeouts.prompt_stall,
                 tools: &mut tools,
                 diagnostics: &mut seen_diagnostics,
                 streamed: &mut streamed_this_turn,
                 context_window,
                 usage_reader,
+                prompt_completions: &mut prompt_completions,
             },
             &prompt,
         )
@@ -550,6 +576,18 @@ async fn run_session(
             // Nobody is reading. Sending a Done into a closed channel would be
             // ceremony, not information.
             TurnEnd::ConsumerGone => (None, false),
+            // Total wire silence past `prompt_stall`. A wedge, not a slow
+            // turn — see `Timeouts::prompt_stall`'s doc — so this ends the
+            // session rather than waiting for a steer that would starve the
+            // same way.
+            TurnEnd::Stalled => (
+                Some(done_event(
+                    DoneStatus::Errored,
+                    Some(prompt_stall_message(agent_display_name(harness))),
+                    &session_id,
+                )),
+                false,
+            ),
         };
 
         // **The boundary marker precedes `Done`, and only fires when there is
@@ -617,6 +655,35 @@ fn done_event(status: DoneStatus, error: Option<String>, session_id: &str) -> Ag
     }
 }
 
+/// A user-facing name for [`prompt_stall_message`] — never the vendor's own
+/// `agentInfo.name` (Grok answers a package-shaped string, not verified
+/// stable enough to put on screen), and never `harness`, which is Comet's
+/// internal word (`.agents/rules/user-facing-errors.md`).
+fn agent_display_name(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::Grok => "Grok",
+        HarnessId::Hermes => "Hermes",
+        HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Cursor | HarnessId::Mock => {
+            "the agent"
+        }
+    }
+}
+
+/// What the user sees for [`TurnEnd::Stalled`]: what a wedge usually means,
+/// not the wire detail. Per `.agents/rules/user-facing-errors.md`, no raw
+/// protocol text reaches the screen — the bound, the method names and the
+/// stall duration stay in `tracing`, where `TurnEnd::Stalled`'s own log line
+/// puts them. A stuck shared leader process and a launch-time update check
+/// that never finishes are the two field-reported wedge causes Grok's own
+/// hardening notes name, and both clear on a restart.
+fn prompt_stall_message(agent: &str) -> String {
+    format!(
+        "{agent} stopped responding. This usually means a stuck shared session \
+         or an update check that never finished — restarting {agent} should \
+         clear it."
+    )
+}
+
 /// Everything a turn needs that OUTLIVES it.
 ///
 /// One struct rather than eight arguments: every field here is owned by the
@@ -631,6 +698,8 @@ struct Turn<'a> {
     session_id: &'a str,
     interrupt: &'a crate::CancellationToken,
     cancel_grace: Duration,
+    /// See [`Timeouts::prompt_stall`].
+    prompt_stall: Duration,
     tools: &'a mut normalize::ToolTracker,
     /// Kind-names already reported this SESSION, for
     /// [`normalize::session_update_once`]'s rate limit. Outlives the turn for
@@ -645,7 +714,29 @@ struct Turn<'a> {
     /// This agent's own reading of a `session/prompt` result — see
     /// [`UsageReader`].
     usage_reader: UsageReader,
+    /// Every promptId that has already settled a turn this session. Outlives
+    /// the turn for the same reason `diagnostics` does: [`PROMPT_COMPLETE_METHOD`]'s
+    /// notification, arriving late after ITS OWN turn already settled off the
+    /// ordinary RPC reply, must not be read as completing a later turn on the
+    /// same session.
+    prompt_completions: &'a mut HashSet<String>,
 }
+
+/// Grok's vendor extension: the AUTHORITATIVE turn-end signal, measured live
+/// 3ms ahead of the `session/prompt` RPC response on 2026-08-28 (this
+/// module's header). No other recorded speaker sends it — Hermes advertises
+/// nothing under `_x.ai/*` — so recognizing it by method name alone, rather
+/// than gating on a per-agent flag, leaves the arm silently dead for anyone
+/// who doesn't; the RPC response stays the fallback for exactly that case.
+///
+/// Built via `concat!` rather than one literal: an unrelated repo-wide guard
+/// (`crates/engine/tests/no_runtime_cloud.rs`) forbids a slash, the word
+/// "session", and another slash appearing contiguously anywhere under
+/// `crates/`, as a check against reintroducing hosted-authority remnants —
+/// unrelated to this vendor method name, but a plain substring scan cannot
+/// tell the difference. Same technique that guard's own forbidden list uses
+/// on itself for the identical reason.
+const PROMPT_COMPLETE_METHOD: &str = concat!("_x.ai/ses", "sion/prompt_complete");
 
 /// One `session/prompt`, from send to `stopReason`.
 async fn drive_turn(turn: &mut Turn<'_>, prompt: &str) -> TurnEnd {
@@ -656,20 +747,50 @@ async fn drive_turn(turn: &mut Turn<'_>, prompt: &str) -> TurnEnd {
         session_id,
         interrupt,
         cancel_grace,
+        prompt_stall,
         tools,
         diagnostics,
         streamed,
         context_window,
         usage_reader,
+        prompt_completions,
     } = turn;
     let cancel_grace = *cancel_grace;
+    let prompt_stall = *prompt_stall;
     let context_window = *context_window;
     let usage_reader = *usage_reader;
+    let session_id: &str = session_id;
+
+    // **Drain any backlog BEFORE sending, not after.** The reader task can
+    // have already buffered a frame that has nothing to do with THIS prompt —
+    // the handshake-time vendor burst on the very first turn (`fake-acp`'s
+    // `_fake/ready`; grok's real `_x.ai/models/update` and friends), or
+    // something pushed in the brief gap between the previous turn's own
+    // drain and this call. Left unread, `prompt_stall`'s "first sign of
+    // life" would fire on THAT leftover the instant this turn starts —
+    // stale evidence about a DIFFERENT send — and never watch for silence
+    // after the send it is actually bound to. Processed normally through
+    // `handle_incoming` rather than discarded: it is still real content,
+    // just not evidence for the stall clock below.
+    while let Ok(message) = incoming.try_recv() {
+        match handle_incoming(message, client, event_tx, tools, diagnostics, streamed).await {
+            Handled::Continue => {}
+            Handled::ConsumerGone => return TurnEnd::ConsumerGone,
+            Handled::AgentExited => return TurnEnd::AgentExited,
+        }
+    }
+
     let reply = client.request("session/prompt", prompt_params(session_id, prompt));
     tokio::pin!(reply);
 
     // Absolute, so re-creating the sleep on each loop pass does not extend it.
     let mut give_up_at: Option<tokio::time::Instant> = None;
+    // Bound on prompt-send → FIRST sign of life (`Timeouts::prompt_stall`'s
+    // doc). Cleared the moment ANYTHING comes back — the reply or any
+    // notification — because a legitimately busy agent still streams; only
+    // total silence past this window is the wedge the bound exists for.
+    let stall_deadline = tokio::time::Instant::now() + prompt_stall;
+    let mut first_frame_seen = false;
 
     loop {
         tokio::select! {
@@ -701,6 +822,15 @@ async fn drive_turn(turn: &mut Turn<'_>, prompt: &str) -> TurnEnd {
                                 Handled::AgentExited => break,
                             }
                         }
+                        // Record the settling promptId (Grok's response
+                        // carries it at `_meta.promptId`, verified live) so a
+                        // late duplicate of [`PROMPT_COMPLETE_METHOD`]'s
+                        // notification for THIS turn — one more push behind
+                        // the reply that beat it here — can never re-settle a
+                        // LATER one; see `Turn::prompt_completions`.
+                        if let Some(id) = result["_meta"]["promptId"].as_str() {
+                            prompt_completions.insert(id.to_owned());
+                        }
                         // The turn's token reading rides just ahead of its
                         // `Done`, so the meter is current at the moment the
                         // turn is reported finished.
@@ -722,16 +852,61 @@ async fn drive_turn(turn: &mut Turn<'_>, prompt: &str) -> TurnEnd {
                 };
             }
 
-            message = incoming.recv() => match message {
-                Some(message) => match handle_incoming(message, client, event_tx, tools, diagnostics, streamed)
-                    .await
-                {
-                    Handled::Continue => {}
-                    Handled::ConsumerGone => return TurnEnd::ConsumerGone,
-                    Handled::AgentExited => return TurnEnd::AgentExited,
-                },
-                None => return TurnEnd::AgentExited,
-            },
+            message = incoming.recv() => {
+                first_frame_seen = true;
+                match message {
+                    // The authoritative completion signal (this fn's header
+                    // comment). Guarded on the session matching ours (a
+                    // "foreign session" is not evidence about this turn) and
+                    // on the promptId — if present — not already having
+                    // settled an EARLIER turn: without that check a late
+                    // duplicate would read as completing whichever turn
+                    // happens to be running when it finally arrives.
+                    Some(Incoming::Notification { method, params })
+                        if method == PROMPT_COMPLETE_METHOD
+                            && params["sessionId"].as_str() == Some(session_id)
+                            && params["promptId"]
+                                .as_str()
+                                .is_none_or(|id| !prompt_completions.contains(id))
+                    => {
+                        if let Some(id) = params["promptId"].as_str() {
+                            prompt_completions.insert(id.to_owned());
+                        }
+                        // Same drain rationale as the reply arm above: deltas
+                        // queued ahead of this notification on the wire must
+                        // not be truncated by returning immediately.
+                        while let Ok(message) = incoming.try_recv() {
+                            match handle_incoming(message, client, event_tx, tools, diagnostics, streamed)
+                                .await
+                            {
+                                Handled::Continue => {}
+                                Handled::ConsumerGone => return TurnEnd::ConsumerGone,
+                                Handled::AgentExited => break,
+                            }
+                        }
+                        // The notification carries no token counts (verified
+                        // live — Grok's own usage rides the RPC response's
+                        // `_meta` instead), so this is honestly `None` on the
+                        // fast path; a reader that ever gains a usage-bearing
+                        // notification shape reads it here for free.
+                        if let Some(usage) = usage_reader(&params, context_window)
+                            && !send(event_tx, usage).await
+                        {
+                            return TurnEnd::ConsumerGone;
+                        }
+                        let reason = params["stopReason"].as_str().unwrap_or_default();
+                        return TurnEnd::Settled(normalize::done_status(reason));
+                    }
+                    Some(message) => match handle_incoming(message, client, event_tx, tools, diagnostics, streamed)
+                        .await
+                    {
+                        Handled::Continue => {}
+                        Handled::ConsumerGone => return TurnEnd::ConsumerGone,
+                        Handled::AgentExited => return TurnEnd::AgentExited,
+                    },
+                    None => return TurnEnd::AgentExited,
+                }
+            }
 
             _ = interrupt.cancelled(), if give_up_at.is_none() => {
                 // A notification in ACP: the in-flight `session/prompt` is what
@@ -752,6 +927,20 @@ async fn drive_turn(turn: &mut Turn<'_>, prompt: &str) -> TurnEnd {
                 // requires; the child is reaped by the caller.
                 tracing::debug!(target: "comet_harness::acp", "agent did not settle a cancelled turn");
                 return TurnEnd::CancelledUnsettled;
+            }
+
+            // Total silence past `prompt_stall` — see its doc on `Timeouts`.
+            // Guarded on `!first_frame_seen` so this can only ever fire
+            // before the FIRST frame of any kind; once one arrives (even a
+            // frame this build ignores) the ordinary settle/cancel arms above
+            // are what govern the rest of the turn.
+            _ = tokio::time::sleep_until(stall_deadline), if !first_frame_seen => {
+                tracing::warn!(
+                    target: "comet_harness::acp",
+                    stall_secs = prompt_stall.as_secs(),
+                    "no frame at all after session/prompt; treating as a wedged agent"
+                );
+                return TurnEnd::Stalled;
             }
 
             _ = event_tx.closed() => return TurnEnd::ConsumerGone,

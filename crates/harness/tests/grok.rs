@@ -15,10 +15,14 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 /// Short enough that a hung probe fails the suite instead of stalling it.
+/// `prompt_stall` is generous (10s): this suite is about discovery and
+/// handshake, not turn behavior, so it should never be the thing that ends a
+/// test here.
 const TEST_TIMEOUTS: Timeouts = Timeouts {
     handshake: Duration::from_secs(10),
     cancel_grace: Duration::from_millis(750),
     kill_grace: Duration::from_millis(250),
+    prompt_stall: Duration::from_secs(10),
 };
 
 /// A harness pointed at the fixture, with the vendor config surface on.

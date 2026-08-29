@@ -825,10 +825,10 @@
       "upstream_sha": "2119bf0cdda721c8a0500cffabc40e3cb6fafd79"
     },
     "2133bae5a2a1e650476ee24d5ec6dcb13f6b4a5c": {
-      "decision_date": "2026-08-26",
+      "decision_date": "2026-08-29",
       "local_commit": null,
-      "note": "Every file this commit edits is absent from this fork: crates/harness/src/acp/mod.rs, crates/harness/tests/acp.rs, crates/harness/tests/fixtures/fake-acp.sh. There is nothing here to patch.",
-      "outcome": "not-applicable",
+      "note": "Re-triaged: #122 added crates/harness/src/acp/, making the old \"absent from this fork\" premise false. Hand-ported in three pieces, not a cherry-pick (file layout has fully diverged: upstream's acp/mod.rs holds Session/AcpAgentSpec directly, this fork splits session.rs/grok.rs/hermes.rs/normalize.rs): the verified spawn-arg hardening (--no-auto-update, --no-leader) landed in #123 as GROK_ARGS; the _meta usage reading landed in #124's UsageReader split; the dual completion-signal settle and the prompt_stall bound this commit also introduces are completed by this PR (fix/harness: settle ACP turns on either completion signal, and bound a stalled prompt).",
+      "outcome": "adapted",
       "subject": "harness: Grok ACP hardening (A5)",
       "upstream_sha": "2133bae5a2a1e650476ee24d5ec6dcb13f6b4a5c"
     },
@@ -849,9 +849,9 @@
       "upstream_sha": "222f63228dad3248337fc84136dbe291d4e40d31"
     },
     "225f484a356538699da011231b1cbee781b9ce5d": {
-      "decision_date": "2026-08-26",
+      "decision_date": "2026-08-29",
       "local_commit": null,
-      "note": "Every file this commit edits is absent from this fork: crates/harness/src/acp/mod.rs, crates/harness/tests/acp.rs, crates/harness/tests/fixtures/fake-acp.sh. There is nothing here to patch.",
+      "note": "Re-triaged: the old \"absent from this fork\" premise is false (#122 added crates/harness/src/acp/), but the mechanism itself still has no subject here. This settles a turn off claude-agent-acp's terminal cost-bearing usage_update, gated on `harness == HarnessId::ClaudeCode` upstream. Claude keeps its native driver in this fork (acp/mod.rs's module doc: \"The adapter compensations that conversion needed \u2014 the Claude cost-frame settle in particular \u2014 are deliberately absent: they existed because an adapter dropped prompt replies, and are not ACP facts\"), so no ACP session ever needs this compensation.",
       "outcome": "not-applicable",
       "subject": "ACP: settle dropped replies off the turn-end cost frame (~1s, not watchdog)",
       "upstream_sha": "225f484a356538699da011231b1cbee781b9ce5d"
@@ -1601,9 +1601,9 @@
       "upstream_sha": "42df80573786d30e01e35ba60fa2b7ff1a22f190"
     },
     "430dbec85d22ca969d709fb960ff638bca0ecc97": {
-      "decision_date": "2026-08-26",
+      "decision_date": "2026-08-29",
       "local_commit": null,
-      "note": "Every file this commit edits is absent from this fork: crates/harness/src/acp/mod.rs, crates/harness/tests/acp.rs, crates/harness/tests/fixtures/fake-acp.sh. There is nothing here to patch.",
+      "note": "Re-triaged per task-5's Step 5 (attempted a reproducing fixture, per its own discipline: a hardening commit ported without one is a guess). This fix keys on a `_session/steering` call answering `reason: \"noRunningTurn\"` while our prompt is outstanding \u2014 a claude-agent-acp vendor RPC extension. No recorded ACP agent advertises steering (session.rs's module doc: \"No recorded agent advertises the steering extension: grok sends no _meta.steering at all, and neither does Hermes\"), so session.rs never issues `_session/steering` and this evidence can never appear. A fixture 'reproducing' it would have to fabricate a vendor RPC no supported agent speaks, which is not an ACP fact any more than the excluded Claude-shaped commits are.",
       "outcome": "not-applicable",
       "subject": "ACP: starved-turn recovery on noRunningTurn evidence (root-cause fix)",
       "upstream_sha": "430dbec85d22ca969d709fb960ff638bca0ecc97"
@@ -1801,9 +1801,9 @@
       "upstream_sha": "484d983ef28dc16e152df7c060c13200f4286f86"
     },
     "485dcc96a57f5fafd9611b06dfc68bea6856e988": {
-      "decision_date": "2026-08-26",
+      "decision_date": "2026-08-29",
       "local_commit": null,
-      "note": "Every file this commit edits is absent from this fork: crates/harness/tests/acp.rs. There is nothing here to patch.",
+      "note": "Re-triaged per task-5's Step 5. Test-only, for the mechanism ruled not-applicable at 430dbec85d (same reasoning applies) and 225f484a35 (cost-frame settle); it also drives the real claude-agent-acp CLI directly over ACP, which this fork does not do \u2014 Claude keeps its native driver.",
       "outcome": "not-applicable",
       "subject": "ACP: full-stack starve verification against the real adapter",
       "upstream_sha": "485dcc96a57f5fafd9611b06dfc68bea6856e988"
@@ -1929,9 +1929,9 @@
       "upstream_sha": "4f46337892ae2a2087c5dd6c8cb637f63df5d0b9"
     },
     "4f4bf8ad562590448828b43bcd1200b1441ac7e1": {
-      "decision_date": "2026-08-26",
+      "decision_date": "2026-08-29",
       "local_commit": null,
-      "note": "Every file this commit edits is absent from this fork: crates/harness/src/acp/mod.rs, crates/harness/tests/acp.rs, crates/harness/tests/fixtures/fake-acp.sh. There is nothing here to patch.",
+      "note": "Re-triaged per task-5's Step 5 (fixture attempted). Fixes a false-positive in the Claude cost-hint settle (`cost_hint_enabled = harness == HarnessId::ClaudeCode`) racing an in-turn steering injection. Neither exists here: there is no cost-hint settle (see 225f484a35's ruling), and every current ACP agent delivers a steer at the turn boundary only (session.rs: \"Steering rides the turn boundary, always, in this module\"), so no agent ever injects a steer mid-turn for this to guard.",
       "outcome": "not-applicable",
       "subject": "ACP: injection cost frames must not settle steered turns; all-agent sweep",
       "upstream_sha": "4f4bf8ad562590448828b43bcd1200b1441ac7e1"
@@ -2145,9 +2145,9 @@
       "upstream_sha": "5826d5792e965f398266fb318d14622496779c5a"
     },
     "58427f204ed3e0c530a01e65dba89aefbf5fa8b5": {
-      "decision_date": "2026-08-26",
+      "decision_date": "2026-08-29",
       "local_commit": null,
-      "note": "Every file this commit edits is absent from this fork: crates/harness/src/acp/mod.rs, crates/harness/tests/acp_quiet.rs, crates/harness/tests/fixtures/fake-acp.sh. There is nothing here to patch.",
+      "note": "Re-triaged: the old \"absent from this fork\" premise is false, but the row it corrects (the blanket quiet-settle's false Done on Claude's mid-thought pauses) has no subject. The blanket quiet-settle itself is deferred here, not ported (see d9f13cbd9e), and Claude runs on its native driver rather than ACP, so there is no Claude ACP session to exempt from anything.",
       "outcome": "not-applicable",
       "subject": "ACP: exempt Claude from the blanket quiet settle (false mid-thought Done + stuck-Working orphan)",
       "upstream_sha": "58427f204ed3e0c530a01e65dba89aefbf5fa8b5"
@@ -2297,9 +2297,9 @@
       "upstream_sha": "60bfc61b66bc396cddf030326d00235579357fc4"
     },
     "61518edeffc444fb1530aa818fbbf3eb8e397122": {
-      "decision_date": "2026-08-26",
+      "decision_date": "2026-08-29",
       "local_commit": null,
-      "note": "Every file this commit edits is absent from this fork: crates/harness/tests/acp_quiet.rs. There is nothing here to patch.",
+      "note": "Re-triaged: test-only evidence probe for the exemption ruled not-applicable at 58427f204e; same reasoning \u2014 no Claude ACP session and no blanket quiet-settle exist here to probe.",
       "outcome": "not-applicable",
       "subject": "ACP: real-stack A/B evidence probe for the Claude quiet-settle exemption",
       "upstream_sha": "61518edeffc444fb1530aa818fbbf3eb8e397122"
@@ -3065,9 +3065,9 @@
       "upstream_sha": "7b95aa8ae42f2d699b79d2c31e5892b5b9b48ce4"
     },
     "7c6c1236d3338772aa0776df3049e575d4979269": {
-      "decision_date": "2026-08-26",
+      "decision_date": "2026-08-29",
       "local_commit": null,
-      "note": "Every file this commit edits is absent from this fork: crates/harness/src/acp/mod.rs, crates/harness/tests/acp_stall.rs, crates/harness/tests/fixtures/fake-acp.sh. There is nothing here to patch.",
+      "note": "Re-triaged: the old \"absent from this fork\" premise is false, but opencode over ACP is explicitly out of scope for the acp-parity-grok-hermes plan (\"opencode, Cursor over ACP. Out of scope per the design's section 6\"), so this has no subject to hold it.",
       "outcome": "not-applicable",
       "subject": "opencode: surface provider failures instead of silent forever-Working",
       "upstream_sha": "7c6c1236d3338772aa0776df3049e575d4979269"
@@ -3841,10 +3841,10 @@
       "upstream_sha": "a401432f49fc7050e3ac14c1c107c95d3596bf77"
     },
     "a46b7010e67c4765482c086a801ba106f35db495": {
-      "decision_date": "2026-08-26",
+      "decision_date": "2026-08-29",
       "local_commit": null,
-      "note": "Every file this commit edits is absent from this fork: crates/harness/src/acp/mod.rs, crates/harness/src/acp/normalize.rs, crates/harness/tests/acp.rs, crates/harness/tests/fixtures/fake-acp.sh. There is nothing here to patch.",
-      "outcome": "not-applicable",
+      "note": "Re-triaged: the old \"absent from this fork\" premise is false. Subagent visualization over ACP (735 lines plus disk-tailed transcripts) is separable upstream by file and by commit and stays deliberately deferred for this plan; PR10 files the row in docs/debt/README.md.",
+      "outcome": "deferred",
       "subject": "grok: subagent visualization over ACP \u2014 lifecycle wire events + disk-tailed transcripts",
       "upstream_sha": "a46b7010e67c4765482c086a801ba106f35db495"
     },
@@ -3889,9 +3889,9 @@
       "upstream_sha": "a6e01a95b8013771bcbbdac6514b07f7d11a229a"
     },
     "a6eefc2d4700c150c5f4621abf79ba13dd295a10": {
-      "decision_date": "2026-08-26",
+      "decision_date": "2026-08-29",
       "local_commit": null,
-      "note": "Every file this commit edits is absent from this fork: crates/harness/src/acp/mod.rs, crates/harness/tests/acp.rs, crates/harness/tests/fixtures/fake-acp.sh. There is nothing here to patch.",
+      "note": "Re-triaged per task-5's Step 5 (explicitly named a Claude-shaped commit not to port). Routes a Claude ACP busy-steer through native queueing rather than cancellation; Claude runs on its native driver in this fork, not ACP, so there is no Claude ACP busy-steer for this to change.",
       "outcome": "not-applicable",
       "subject": "ACP: Claude busy steers ride native queueing, not cancellation",
       "upstream_sha": "a6eefc2d4700c150c5f4621abf79ba13dd295a10"
@@ -5105,10 +5105,10 @@
       "upstream_sha": "d9e55d91d0cb1f65d17dbbb0d1b16ec9de98436e"
     },
     "d9f13cbd9ee2406e02333cf98aa3c789410b110b": {
-      "decision_date": "2026-08-26",
+      "decision_date": "2026-08-29",
       "local_commit": null,
-      "note": "Every file this commit edits is absent from this fork: crates/harness/src/acp/mod.rs, crates/harness/tests/fixtures/fake-acp.sh. There is nothing here to patch.",
-      "outcome": "not-applicable",
+      "note": "Re-triaged: the old \"absent from this fork\" premise is false, and unlike its siblings in this lineage this mechanism is genuinely adapter-agnostic (keys only on core-ACP signals: streamed content, resolved tool calls, no pending question, then quiet past a window) \u2014 it could in principle apply to Grok or Hermes. Task-5's brief scopes this PR's hardening to the dual completion-signal settle (Step 2) and the prompt-send-to-first-frame stall bound (Step 4) only; a mid-turn quiet-settle for a dropped terminal reply is a different, broader mechanism this task was not asked to build. Deferred for a future slice to design and fixture deliberately, not folded in here as extra scope.",
+      "outcome": "deferred",
       "subject": "ACP: blanket dropped-reply settle for every adapter",
       "upstream_sha": "d9f13cbd9ee2406e02333cf98aa3c789410b110b"
     },
@@ -5313,9 +5313,9 @@
       "upstream_sha": "e19c5c8397427484703e92a9128ed34ea1d3467e"
     },
     "e1a027308f2f9d5ea465e91f26764f17ef3d01a0": {
-      "decision_date": "2026-08-26",
+      "decision_date": "2026-08-29",
       "local_commit": null,
-      "note": "Every file this commit edits is absent from this fork: crates/harness/src/acp/mod.rs, crates/harness/tests/acp.rs, crates/harness/tests/fixtures/fake-acp.sh. There is nothing here to patch.",
+      "note": "Re-triaged per task-5's Step 5 (fixture attempted). Prevents prompting into a session that is \"visibly mid a self-continued turn\" (an open tool call, or stream traffic within 3s, with no prompt of ours outstanding) by cancelling first. That state cannot arise in session.rs's turn loop: incoming notifications are read only inside drive_turn while a prompt IS outstanding, and a queued steer is only ever dispatched after the previous drive_turn call has already returned (session.rs: \"Steering rides the turn boundary, always\"), so there is no gap in which the agent can be 'visibly busy' with nothing of ours in flight. A fixture posing this scenario would have to add a state the production loop cannot enter.",
       "outcome": "not-applicable",
       "subject": "ACP: cancel-before-prompt into self-continuing sessions (starve prevention)",
       "upstream_sha": "e1a027308f2f9d5ea465e91f26764f17ef3d01a0"
