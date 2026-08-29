@@ -12,9 +12,10 @@
 //!    retrying on comet's short backoff ladder; fall back to the prompt's first
 //!    words when every attempt produces nothing;
 //! 4. re-check the title (a user rename during generation wins);
-//! 5. when the chat sits in a comet worktree (`comet/<name>` branch), rename the
-//!    branch from the title and update the chat's branch row;
-//! 6. [`WorkspaceHost::rename_chat_auto`] in the workspace doc.
+//! 5. [`WorkspaceHost::rename_chat_auto`] in the workspace doc;
+//! 6. only once that write lands, and when the chat sits in a comet
+//!    worktree (`comet/<name>` branch), rename the branch from the title and
+//!    update the chat's branch row.
 //!
 //! **An ACP agent that reports its own title skips this whole run.** Grok sends
 //! `sessionUpdate: "session_info_update"` carrying a title it generated itself,
@@ -63,14 +64,13 @@ impl Inner {
     /// it renamed. Best-effort and non-fatal either way: a failed branch
     /// rename must never be mistaken for a failed title.
     ///
-    /// Callers differ on WHEN they call this relative to the title write —
-    /// `generate` calls it before (its own prior `already_named` check has
-    /// already decided the write will proceed), `apply_agent_title` calls it
-    /// after, only once the write is confirmed to have landed — and that
-    /// difference is deliberate, not an inconsistency to fix: renaming a
-    /// branch to match a title that then FAILED to write (a last-moment
-    /// manual rename lock) would rename it to nothing that ended up on the
-    /// chat.
+    /// **Both callers call this only after their own title write has
+    /// landed, never before (D116).** Renaming the branch first and only
+    /// then attempting the write would leave the branch renamed for a title
+    /// that then failed to write or lost its first-writer-wins race (a
+    /// last-moment manual rename, or another writer's title landing first) —
+    /// `generate` used to do exactly that; it predates `apply_agent_title`,
+    /// and nothing forced the two orderings to agree until this fix.
     async fn rename_worktree_branch_for_title(
         &self,
         chat_id: &str,
@@ -287,21 +287,31 @@ impl TitleGenerator {
             return Ok(());
         }
 
-        // Rename the worktree branch when the chat still sits on its original
-        // comet/<name> branch. Shared with `apply_agent_title`, which needs
-        // the identical behavior for a self-titling agent's title — see
-        // `rename_worktree_branch_for_title`'s own doc.
-        self.inner
-            .rename_worktree_branch_for_title(chat_id, &latest, &title)
-            .await;
-
         // `rename_chat_auto`, not `rename_chat`: this write is system-authored
         // (a model run Comet dispatched), not user-driven, and must not stamp
         // `titleManual` — doing so would permanently block a later
         // self-titling agent (or a future auto-title run) from ever refining
         // a title THIS function itself generated.
-        self.inner.workspace.rename_chat_auto(chat_id, &title)?;
+        //
+        // Write BEFORE renaming the worktree branch (D116), matching
+        // `apply_agent_title` — see `rename_worktree_branch_for_title`'s own
+        // doc for why the two orderings now agree: a write that loses the
+        // first-writer-wins race between the re-read above and this write
+        // must never leave the branch renamed for a title the chat never
+        // shows.
+        if !self.inner.workspace.rename_chat_auto(chat_id, &title)? {
+            return Ok(());
+        }
         tracing::info!(chat = %chat_id, title = %title, "chat auto-titled");
+
+        // Rename the worktree branch when the chat still sits on its original
+        // comet/<name> branch, now that the write is confirmed landed.
+        // Shared with `apply_agent_title`, which needs the identical
+        // behavior for a self-titling agent's title — see
+        // `rename_worktree_branch_for_title`'s own doc.
+        self.inner
+            .rename_worktree_branch_for_title(chat_id, &latest, &title)
+            .await;
         Ok(())
     }
 
