@@ -273,6 +273,21 @@ impl HarnessRegistry {
         out
     }
 
+    /// One harness's declared capabilities, without forcing a lazy resolve —
+    /// the lazy descriptor names the harness's own `capabilities()`, so the
+    /// answer is the same either side of a resolve.
+    ///
+    /// `None` when nothing is registered under `id`. A caller reading a
+    /// capability must decide what an unregistered harness means for it; there
+    /// is no safe blanket default (`carries_deny_note` and `self_titles` are
+    /// conservative in opposite directions).
+    pub fn capabilities(&self, id: HarnessId) -> Option<HarnessCapabilities> {
+        match self.slots().get(&id)? {
+            Slot::Ready(harness) => Some(harness.capabilities()),
+            Slot::Lazy { descriptor, .. } => Some(descriptor.capabilities.clone()),
+        }
+    }
+
     /// Catalog for `ListHarnesses` — never forces a lazy resolve.
     pub fn descriptors(&self) -> Vec<HarnessDescriptor> {
         let slots = self.slots();

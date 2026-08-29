@@ -77,17 +77,23 @@ pub fn new_session_params(cwd: &str) -> Value {
 /// `images` reuses `crate::claude::wire::ImageBlock` rather than a second
 /// image type — one reading, staging and size-limiting policy
 /// (`crate::claude::load_image_blocks`), not a duplicate.
+///
+/// **Taken by value.** `image.data` is base64 capped at 5 MB apiece, and the
+/// caller drops its `Vec` the moment this returns; borrowing meant every
+/// attachment's payload was copied into the JSON and the original thrown away.
 pub(crate) fn prompt_params(
     session_id: &str,
     text: &str,
-    images: &[crate::claude::wire::ImageBlock],
+    images: Vec<crate::claude::wire::ImageBlock>,
 ) -> Value {
     let mut blocks = vec![json!({"type": "text", "text": text})];
-    blocks.extend(
-        images.iter().map(
-            |image| json!({"type": "image", "data": image.data, "mimeType": image.media_type}),
-        ),
-    );
+    blocks.extend(images.into_iter().map(|image| {
+        json!({
+            "type": "image",
+            "data": Value::String(image.data),
+            "mimeType": image.media_type,
+        })
+    }));
     json!({
         "sessionId": session_id,
         "prompt": blocks,
@@ -176,6 +182,74 @@ impl AgentDescription {
     pub fn supports_image_attachments(&self) -> bool {
         self.image_attachments == Some(true)
     }
+}
+
+/// One short-lived ACP session, opened only to read what the handshake and
+/// `session/new` volunteer.
+///
+/// **Provider-neutral, like the rest of this module.** Everything here —
+/// `open_for_discovery`, the temp-dir cwd, the failure classification — is a
+/// protocol fact, and the only per-agent input is the launch, which the caller
+/// passes as `launch`. Grok and Hermes each carried a byte-identical copy of
+/// this and the two functions below (~45 lines, differing in one `tracing`
+/// string); a third ACP agent would have copied them again.
+///
+/// Token-free on an agent that answers: `initialize` never reaches a model. On
+/// an unconfigured one `session/new` can fail outright, which
+/// `open_for_discovery` already turns into `Discovered { session: Null, .. }`
+/// rather than an error, so this still resolves with only `initialize` to read.
+/// The session is dropped immediately, which reaps the child through
+/// `kill_on_drop`.
+pub(crate) async fn probe_session(
+    agent: &str,
+    launch: fn(&std::path::Path, &comet_proto::RunRequest) -> crate::launch::LaunchDescriptor,
+    exe: &std::path::Path,
+    cwd: &str,
+    timeouts: session::Timeouts,
+) -> Result<session::Discovered, crate::discovery::DiscoveryFailure> {
+    let request = comet_proto::RunRequest::for_session(comet_proto::RuntimeMode::default());
+    let command = launch(exe, &request).command();
+    session::AcpSession::open_for_discovery(command, cwd, timeouts)
+        .await
+        .map_err(|error| {
+            tracing::debug!(target: "comet_harness::acp", "{agent} discovery failed: {error}");
+            // Every failure here is `Unreachable`, not `Unparseable`: the
+            // handshake either answered or it did not, and reading the reply
+            // cannot fail — an unrecognized shape yields an empty list, which is
+            // a real answer. `Unparseable` is reserved for a provider that
+            // answered something we could not decode, and would raise a
+            // protocol-drift `Diagnostic` this does not warrant.
+            crate::discovery::DiscoveryFailure::Unreachable
+        })
+}
+
+/// The model list one handshake reports, read in a temp directory because
+/// models are not cwd-scoped. `models_from_discovery` is the per-agent half:
+/// which of its own names the agent's reply maps to.
+pub(crate) async fn discover_models(
+    agent: &str,
+    launch: fn(&std::path::Path, &comet_proto::RunRequest) -> crate::launch::LaunchDescriptor,
+    exe: std::path::PathBuf,
+    timeouts: session::Timeouts,
+    models_from_discovery: fn(&session::Discovered) -> crate::discovery::Discovery,
+) -> Result<crate::discovery::Discovery, crate::discovery::DiscoveryFailure> {
+    let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+    let discovered = probe_session(agent, launch, &exe, &cwd, timeouts).await?;
+    Ok(models_from_discovery(&discovered))
+}
+
+/// The slash commands one handshake reports. **Both registered ACP agents push
+/// their list unsolicited**, so this costs a handshake and no prompt. Scoped to
+/// `cwd` because a project's own commands are discovered from the directory.
+pub(crate) async fn discover_commands(
+    agent: &str,
+    launch: fn(&std::path::Path, &comet_proto::RunRequest) -> crate::launch::LaunchDescriptor,
+    exe: std::path::PathBuf,
+    cwd: String,
+    timeouts: session::Timeouts,
+) -> Result<Vec<comet_proto::AgentCommand>, crate::discovery::DiscoveryFailure> {
+    let discovered = probe_session(agent, launch, &exe, &cwd, timeouts).await?;
+    Ok(normalize::commands(&discovered.commands))
 }
 
 // The live session loop (`session/new`, `session/prompt`, the update stream)
@@ -347,7 +421,7 @@ mod tests {
                 data: "BBB".into(),
             },
         ];
-        let params = prompt_params("s-1", "look at this", &images);
+        let params = prompt_params("s-1", "look at this", images);
         let blocks = params["prompt"].as_array().expect("prompt is an array");
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0]["type"], "text");

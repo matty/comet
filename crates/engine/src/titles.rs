@@ -23,8 +23,9 @@
 //! [`TitleGenerator::apply_agent_title`]. Spawning the whole flow above for such
 //! a harness would be a second model call racing an answer already on the
 //! wire, so [`TitleGenerator::maybe_generate_upfront`] (the request-start
-//! dispatch site) skips it entirely for a harness [`harness_self_titles`]
-//! lists — see that function's own doc for the policy and its limits.
+//! dispatch site) skips it entirely for a harness that declares
+//! [`harness_self_titles`] — see that function's own doc for the policy and
+//! its limits.
 
 use std::sync::Arc;
 
@@ -169,7 +170,7 @@ impl TitleGenerator {
         prompt: &str,
         cwd: &str,
     ) {
-        if harness_self_titles(harness) {
+        if harness_self_titles(&self.inner.registry, harness) {
             return;
         }
         self.maybe_generate(chat_id, harness, prompt, cwd);
@@ -390,26 +391,27 @@ fn already_named(chat: &comet_proto::Chat) -> bool {
     chat.title_manual || chat.title.as_deref().is_some_and(|t| !t.trim().is_empty())
 }
 
-/// Harnesses that report their own chat title on the wire — Grok's
+/// Whether `harness` reports its own chat title on the wire — Grok's
 /// `session_info_update`, mapped by `normalize::session_update` into
 /// [`AgentEvent::SessionTitled`] (see that variant's own doc comment for the
 /// captured wire evidence). [`TitleGenerator::maybe_generate_upfront`] skips
-/// its whole dispatch for a harness this lists, because the agent's title
-/// arrives during the turn, for free, and a model-run titling call would only
-/// race it.
+/// its whole dispatch when this is true, because the agent's title arrives
+/// during the turn, for free, and a model-run titling call would only race it.
 ///
-/// **Conservative default: only a harness with observed wire evidence is
-/// listed.** Hermes is not — its own module doc (`acp::hermes`) already notes
-/// it carries no steering extension and no effort ladder; nothing there
-/// claims a self-reported title either, and Hermes cannot presently open a
-/// session on this machine to check. A false positive here (a harness that
-/// does NOT actually self-title, wrongly skipped) would still get named by
-/// the turn-end fallback (`maybe_generate`, unconditional) the moment the
-/// title never lands — no chat is ever left permanently unnamed by this
-/// gate, only, in the false-positive case, named one turn later than it
-/// otherwise would have been.
-fn harness_self_titles(harness: HarnessId) -> bool {
-    matches!(harness, HarnessId::Grok)
+/// **Read off [`comet_proto::HarnessCapabilities::self_titles`], not a list
+/// kept here.** Which frames an agent puts on the wire is a fact about that
+/// agent, declared beside its `carries_deny_note` in the harness crate. An
+/// enumeration in the engine is silently incomplete the day a second
+/// self-titling agent is registered, and nothing fails when it is — the
+/// turn-end fallback names the chat anyway, one wasted model call later.
+///
+/// An unregistered harness answers `false`: the conservative direction here is
+/// "run the titling call", since a wrong skip costs a turn's delay and a wrong
+/// run costs one cheap model call.
+fn harness_self_titles(registry: &HarnessRegistry, harness: HarnessId) -> bool {
+    registry
+        .capabilities(harness)
+        .is_some_and(|caps| caps.self_titles)
 }
 
 /// The cheapest model a harness offers (comet's `cheapestModel` heuristic):
@@ -538,9 +540,15 @@ mod tests {
         assert_eq!(request.runtime_mode, RuntimeMode::FullAccess);
     }
 
+    /// Break caught: a harness declaring `self_titles` that has no observed
+    /// wire evidence for it, or Grok losing the declaration and paying for a
+    /// titling model call it does not need. Read through the real registry
+    /// rather than a list here, so the answer is the harness's own
+    /// `capabilities()` and cannot drift from it.
     #[test]
-    fn harness_self_titles_lists_only_grok() {
-        assert!(harness_self_titles(HarnessId::Grok));
+    fn only_grok_declares_that_it_titles_its_own_chats() {
+        let registry = crate::registry::default_registry();
+        assert!(harness_self_titles(&registry, HarnessId::Grok));
         for other in [
             HarnessId::ClaudeCode,
             HarnessId::Codex,
@@ -548,17 +556,25 @@ mod tests {
             HarnessId::Hermes,
             HarnessId::Mock,
         ] {
-            assert!(!harness_self_titles(other), "{other:?} must not self-title");
+            assert!(
+                !harness_self_titles(&registry, other),
+                "{other:?} must not self-title"
+            );
         }
     }
 
     /// A harness whose `models()` call counts every invocation — the observable
-    /// proxy for "a titling run was dispatched". `id` is a field, not fixed by
-    /// the impl, so the SAME spy can stand in for a self-titling harness
-    /// (registered under `HarnessId::Grok`) and a normal one (registered under
-    /// `HarnessId::Mock`) in one registry, each wired to its own counter.
+    /// proxy for "a titling run was dispatched". `id` and `self_titles` are
+    /// both fields, so the SAME spy can stand in for a self-titling harness
+    /// and a normal one in one registry, each wired to its own counter.
+    ///
+    /// `self_titles` is declared here rather than inferred from `id` on
+    /// purpose: the gate reads the capability, so a spy that claimed the
+    /// capability by virtue of its id would pass whichever way the gate was
+    /// wired.
     struct CountingHarness {
         id: HarnessId,
+        self_titles: bool,
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
@@ -571,7 +587,10 @@ mod tests {
             "Counting"
         }
         fn capabilities(&self) -> comet_proto::HarnessCapabilities {
-            comet_proto::HarnessCapabilities::default()
+            comet_proto::HarnessCapabilities {
+                self_titles: self.self_titles,
+                ..Default::default()
+            }
         }
         async fn models(&self) -> Result<comet_proto::ModelCatalog, comet_harness::HarnessError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -617,10 +636,12 @@ mod tests {
         let registry = Arc::new(HarnessRegistry::new());
         registry.register(Arc::new(CountingHarness {
             id: HarnessId::Grok,
+            self_titles: true,
             calls: grok_calls.clone(),
         }));
         registry.register(Arc::new(CountingHarness {
             id: HarnessId::Mock,
+            self_titles: false,
             calls: mock_calls.clone(),
         }));
         let core = crate::EngineCore::assemble(dir.path(), registry.clone(), HarnessId::Mock, None)

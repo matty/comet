@@ -187,11 +187,7 @@ fn sanitizer_rejects_a_credential_riding_an_allowlisted_path() {
         let raw = write_raw_capture(temp.path(), name, &[payload]);
         let path = raw.join("capture.json");
         let mut capture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        capture["provider"] = Value::String(match provider {
-            Provider::Claude => "claude".into(),
-            Provider::Codex => "codex".into(),
-            Provider::Acp => "acp".into(),
-        });
+        capture["provider"] = Value::String(provider.wire_name().to_owned());
         std::fs::write(&path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
 
         let error = sanitize_dir(&raw, &staging_dir(temp.path(), name)).unwrap_err();

@@ -257,6 +257,8 @@ impl ClaudeHarness {
             // `deny_response(message)` puts the user's note on the provider
             // wire, so the adapter can truthfully advertise this capability.
             carries_deny_note: true,
+            // Claude Code names no chat on its wire; Comet titles it.
+            self_titles: false,
         }
     }
 

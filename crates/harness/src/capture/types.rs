@@ -78,6 +78,25 @@ pub enum Provider {
     Acp,
 }
 
+impl Provider {
+    /// The lowercase name this provider goes by on the wire: every `--help`
+    /// line, every `--provider` argument, every `CaptureConfig::provider`
+    /// value, and what `rename_all = "lowercase"` above writes into a
+    /// manifest.
+    ///
+    /// One spelling because it was five — the binary's argument parsing, the
+    /// `scenario()` lookup, the fence-wiring test and two corpus tests each
+    /// hand-wrote this match, so a fourth variant compiles fine having missed
+    /// one of them.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Provider::Claude => "claude",
+            Provider::Codex => "codex",
+            Provider::Acp => "acp",
+        }
+    }
+}
+
 /// The corpus TOP-LEVEL directory name a scenario's evidence is promoted
 /// under — `crates/harness/tests/corpus/<this>/<version>/<scenario>/`.
 ///
@@ -95,19 +114,30 @@ pub enum Provider {
 /// Matched by substring rather than an exhaustive enum-of-agents: adding a
 /// fourth ACP agent (Hermes, PR1) means adding its scenarios' names here, not
 /// widening `Provider` and every `match` that already exhausts it.
+///
+/// **An unrecognized ACP scenario name is a panic, not a default.** The
+/// unmatched case used to fall through to `"grok"`, so the very row this
+/// function's own doc says to expect next — a Hermes one — would have been
+/// promoted under Grok's corpus directory with nothing reporting it. Failing
+/// here instead surfaces it at the first `scenario_coverage` run, which walks
+/// every row through this function.
 pub fn corpus_provider_name(provider: Provider, scenario_name: &str) -> &'static str {
     match provider {
-        Provider::Claude => "claude",
-        Provider::Codex => "codex",
         Provider::Acp => {
             if scenario_name.contains("codex-acp") {
                 "codex-acp"
             } else if scenario_name.contains("claude-acp") {
                 "claude-agent-acp"
-            } else {
+            } else if scenario_name.contains("grok") {
                 "grok"
+            } else {
+                panic!(
+                    "ACP scenario {scenario_name:?} names no agent this function knows — add its \
+                     corpus directory here, next to grok/codex-acp/claude-agent-acp"
+                )
             }
         }
+        other => other.wire_name(),
     }
 }
 

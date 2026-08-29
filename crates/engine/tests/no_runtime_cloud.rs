@@ -37,9 +37,23 @@ fn no_runtime_cloud_sources_do_not_reintroduce_hosted_authority_or_migration() {
         concat!("RECOVERY_", "COMMAND"),
     ];
 
+    // Literals that legitimately contain a route-shaped needle and are not
+    // hosted authority. Removed from the text before the search rather than
+    // spelled `concat!("_x.ai/ses", "sion/…")` at each call site: this repo's
+    // conventions lean on grepping a wire method name, and obfuscating the
+    // constant made `grep -r "_x.ai/session/prompt_complete" crates/` find
+    // nothing — in the very file whose doc calls itself that method's primary
+    // citation. The guard's own needles are split because they must not match
+    // this file, which is an unavoidable self-reference; nothing else here is.
+    let exempt = [
+        // Grok's ACP completion notification: a JSON-RPC method name over the
+        // agent's stdio, not an HTTP route to any hosted service.
+        "_x.ai/session/prompt_complete",
+    ];
+
     let mut violations = Vec::new();
     for root in roots {
-        collect_violations(&root, &forbidden, &mut violations);
+        collect_violations(&root, &forbidden, &exempt, &mut violations);
     }
     assert!(
         violations.is_empty(),
@@ -48,17 +62,25 @@ fn no_runtime_cloud_sources_do_not_reintroduce_hosted_authority_or_migration() {
     );
 }
 
-fn collect_violations(root: &Path, forbidden: &[&str], violations: &mut Vec<String>) {
+fn collect_violations(
+    root: &Path,
+    forbidden: &[&str],
+    exempt: &[&str],
+    violations: &mut Vec<String>,
+) {
     for entry in fs::read_dir(root).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() {
-            collect_violations(&path, forbidden, violations);
+            collect_violations(&path, forbidden, exempt, violations);
         } else if path.extension().is_some_and(|ext| ext == "rs")
             && path
                 .file_name()
                 .is_none_or(|name| name != "no_runtime_cloud.rs")
         {
-            let source = fs::read_to_string(&path).unwrap();
+            let mut source = fs::read_to_string(&path).unwrap();
+            for allowed in exempt {
+                source = source.replace(allowed, "");
+            }
             for needle in forbidden {
                 if source.contains(needle) {
                     violations.push(format!("{}: {needle}", path.display()));

@@ -62,7 +62,6 @@ use comet_proto::{
 };
 
 use super::AgentDescription;
-use super::normalize;
 use super::session::{AcpSession, Discovered, Timeouts};
 use crate::discovery::{DiscoveredModel, Discovery, DiscoveryFailure};
 use crate::launch::{LaunchDescriptor, StdioMode};
@@ -479,37 +478,11 @@ fn efforts_of(model: &Value) -> Vec<ReasoningLevel> {
         .unwrap_or_default()
 }
 
-/// One short-lived ACP session, just to read the handshake's model block.
-///
-/// Token-free: `initialize` never reaches a model. The session is dropped
-/// immediately, which reaps the child through `kill_on_drop`.
-async fn probe_session(
-    exe: &Path,
-    cwd: &str,
-    timeouts: Timeouts,
-) -> Result<Discovered, DiscoveryFailure> {
-    let request = RunRequest::for_session(RuntimeMode::default());
-    let command = run_launch(exe, &request).command();
-    AcpSession::open_for_discovery(command, cwd, timeouts)
-        .await
-        .map_err(|error| {
-            tracing::debug!(target: "comet_harness::acp", "grok discovery failed: {error}");
-            // Every failure here is `Unreachable`, not `Unparseable`: the
-            // handshake either answered or it did not, and reading the reply
-            // cannot fail — an unrecognized shape yields an empty list, which is
-            // a real answer. `Unparseable` is reserved for a provider that
-            // answered something we could not decode, and would raise a
-            // protocol-drift `Diagnostic` this does not warrant.
-            DiscoveryFailure::Unreachable
-        })
-}
-
+/// Grok's model list off one handshake — [`super::discover_models`] with
+/// Grok's launch and Grok's own model mapping. The probe itself is protocol,
+/// not vendor, so it lives in `acp/mod.rs`.
 async fn discover(exe: PathBuf, timeouts: Timeouts) -> Result<Discovery, DiscoveryFailure> {
-    let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-    match probe_session(&exe, &cwd, timeouts).await {
-        Ok(discovered) => Ok(models_from_discovery(&discovered)),
-        Err(failure) => Err(failure),
-    }
+    super::discover_models("grok", run_launch, exe, timeouts, models_from_discovery).await
 }
 
 /// **Grok's slash commands are free and pushed, so this costs one handshake.**
@@ -523,8 +496,7 @@ async fn discover_commands(
     cwd: String,
     timeouts: Timeouts,
 ) -> Result<Vec<AgentCommand>, DiscoveryFailure> {
-    let discovered = probe_session(&exe, &cwd, timeouts).await?;
-    Ok(normalize::commands(&discovered.commands))
+    super::discover_commands("grok", run_launch, exe, cwd, timeouts).await
 }
 
 /// The Grok harness. Construct with [`GrokHarness::new`]; tests point it at the
@@ -595,6 +567,11 @@ impl GrokHarness {
             // a note to either way, since the mode that would carry one is
             // not declared.
             carries_deny_note: false,
+            // Grok pushes `session_info_update` with its own title during the
+            // turn — see `AgentEvent::SessionTitled`'s doc for the captured
+            // wire evidence. The engine skips its upfront titling call on
+            // this.
+            self_titles: true,
         }
     }
 

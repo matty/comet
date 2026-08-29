@@ -37,14 +37,6 @@ fn all_modes() -> Vec<RuntimeMode> {
     .collect()
 }
 
-fn provider_str(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Claude => "claude",
-        Provider::Codex => "codex",
-        Provider::Acp => "acp",
-    }
-}
-
 /// Break caught: a `RuntimeMode` Comet can put on the wire with no scenario recording it, for one
 /// or both providers — `Auto` and `FullAccess` were both this, for both providers, before this
 /// stage's four new rows landed.
@@ -54,14 +46,14 @@ fn every_runtime_mode_has_a_scenario_per_provider() {
         .iter()
         .filter_map(|spec| {
             spec.runtime_mode
-                .map(|mode| (provider_str(spec.provider), mode))
+                .map(|mode| (spec.provider.wire_name(), mode))
         })
         .collect();
 
     let mut missing = Vec::new();
     for provider in [Provider::Claude, Provider::Codex] {
         for mode in all_modes() {
-            let key = (provider_str(provider), mode);
+            let key = (provider.wire_name(), mode);
             if !declared.contains(&key) {
                 missing.push(format!("{}/{:?}", key.0, key.1));
             }

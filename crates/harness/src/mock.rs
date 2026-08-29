@@ -95,6 +95,9 @@ impl MockHarness {
             // The mock scripts Claude-flavoured runs, so the approval surface
             // it drives for a rendered check has to read as Claude's does.
             carries_deny_note: true,
+            // The mock scripts a Claude-flavoured run, which titles nothing
+            // itself — a rendered check should exercise Comet's own titling.
+            self_titles: false,
         }
     }
 }

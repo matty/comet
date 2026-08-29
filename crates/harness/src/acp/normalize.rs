@@ -378,17 +378,20 @@ fn is_terminal(status: &str) -> bool {
 /// guessed typed card claims to know what a tool did. When those two compete,
 /// the wrong claim is worse than the plain one.
 fn typed_call(kind: &str, announced: &Announced, update: &Value) -> ToolCall {
-    let input = announced.input.clone();
+    // Built on demand, not up front: `input` is the tool's whole `rawInput`,
+    // which for a write is the file content, and the typed arms below discard
+    // it.
+    let unknown = || ToolCall::Unknown {
+        name: announced.name.clone(),
+        input: announced.input.clone(),
+    };
     match kind {
         // `locations[0].path` is where ACP puts what a read touched. Falling
         // back to Unknown rather than an empty path: a ReadFile card with no
         // file names nothing.
         "read" => match first_location(update) {
             Some(path) => ToolCall::ReadFile { path },
-            None => ToolCall::Unknown {
-                name: announced.name.clone(),
-                input,
-            },
+            None => unknown(),
         },
         // The search input carries its own `pattern`/`path` names.
         "search" => match update["rawInput"]["pattern"].as_str() {
@@ -396,15 +399,9 @@ fn typed_call(kind: &str, announced: &Announced, update: &Value) -> ToolCall {
                 pattern: pattern.to_owned(),
                 path: update["rawInput"]["path"].as_str().map(str::to_owned),
             },
-            None => ToolCall::Unknown {
-                name: announced.name.clone(),
-                input,
-            },
+            None => unknown(),
         },
-        _ => ToolCall::Unknown {
-            name: announced.name.clone(),
-            input,
-        },
+        _ => unknown(),
     }
 }
 
@@ -438,13 +435,16 @@ pub(crate) fn tool_update(tracker: &mut ToolTracker, update: &Value) -> Vec<Agen
     let terminal = status.is_some_and(is_terminal);
 
     // Emit the card once: as soon as a frame names the call, or at the latest
-    // when it finishes.
-    if !tracker.emitted.contains(id)
-        && let Some(announced) = tracker.announced.get(id).cloned()
-    {
-        let kind = update["kind"].as_str();
-        if kind.is_some() || terminal {
-            let call = typed_call(kind.unwrap_or("other"), &announced, update);
+    // when it finishes. The gate is tested before the map lookup because the
+    // announcing frame usually fails it, and ACP splits one call over three
+    // frames — a lookup that copies `Announced` here paid for every one.
+    let kind = update["kind"].as_str();
+    if !tracker.emitted.contains(id) && (kind.is_some() || terminal) {
+        let call = tracker
+            .announced
+            .get(id)
+            .map(|announced| typed_call(kind.unwrap_or("other"), announced, update));
+        if let Some(call) = call {
             out.push(AgentEvent::ToolCall {
                 id: id.to_owned(),
                 call,

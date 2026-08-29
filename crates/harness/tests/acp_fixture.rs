@@ -20,12 +20,9 @@ use tokio::process::{Child, ChildStdin};
 const QUIET: Duration = Duration::from_millis(750);
 
 /// Grok's vendor completion notification (`acp::session`'s own copy carries
-/// the full rationale). Built via `concat!`, not one literal: a repo-wide
-/// guard (`crates/engine/tests/no_runtime_cloud.rs`) forbids a slash, the
-/// word "session", and another slash appearing contiguously anywhere under
-/// `crates/`, and a plain substring scan cannot tell this vendor method name
-/// apart from a hosted-authority remnant.
-const PROMPT_COMPLETE_METHOD: &str = concat!("_x.ai/ses", "sion/prompt_complete");
+/// the full rationale, and the note on why the repo-wide hosted-authority
+/// guard exempts this name rather than each site obfuscating it).
+const PROMPT_COMPLETE_METHOD: &str = "_x.ai/session/prompt_complete";
 
 struct Fixture {
     child: Child,
