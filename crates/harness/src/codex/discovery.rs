@@ -20,7 +20,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-use comet_proto::ReasoningLevel;
+use comet_proto::{ModelDeprecation, ReasoningLevel};
 
 use crate::discovery::{DiscoveredModel, Discovery, DiscoveryFailure, program_path};
 
@@ -329,10 +329,10 @@ struct ModelListResult {
     next_cursor: Option<String>,
 }
 
-/// Only the fields this slice consumes. The reply carries eleven more —
-/// `upgrade`/`upgradeInfo` (real deprecation copy), `defaultReasoningEffort`,
-/// `serviceTiers`, `supportsPersonality`, `availabilityNux`, `modelSpecialty`
-/// and the rest — all deliberately unmodelled; see the debt rows.
+/// Only the fields Comet consumes. The reply carries several more —
+/// `defaultReasoningEffort`, `serviceTiers`, `supportsPersonality`,
+/// `availabilityNux`, `modelSpecialty` and the rest — still deliberately
+/// unmodelled; see their debt rows.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListedModel {
@@ -341,6 +341,12 @@ struct ListedModel {
     display_name: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    /// `upgrade` is the actionable replacement id. `upgradeInfo` adds display
+    /// copy, but without an id it cannot become a picker action.
+    #[serde(default)]
+    upgrade: Option<String>,
+    #[serde(default)]
+    upgrade_info: Option<UpgradeInfo>,
     /// `hidden` is required in the schema, but defaulting it to `false` here
     /// keeps an older server that omits it visible rather than invisible.
     #[serde(default)]
@@ -359,6 +365,13 @@ struct ListedModel {
     /// the absence as a pick. See `.agents/rules/optional-wire-fields.md`.
     #[serde(default)]
     is_default: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpgradeInfo {
+    #[serde(default)]
+    migration_markdown: Option<String>,
 }
 
 /// An effort is an object, not a string: `{reasoningEffort, description}`.
@@ -426,22 +439,42 @@ pub(crate) fn page_from_reply(line: &str) -> Result<ModelPage, DiscoveryFailure>
         // A hidden model is not pickable. The default already excludes them;
         // this is what keeps that true if the default ever changes.
         .filter(|model| !model.hidden)
-        .map(|model| DiscoveredModel {
-            label: model.display_name.unwrap_or_else(|| model.id.clone()),
-            id: model.id,
-            description: model.description,
-            reasoning_levels: model
-                .supported_reasoning_efforts
-                .iter()
-                .filter_map(|effort| to_level(&effort.reasoning_effort))
-                .collect(),
-            accepts_images: Some(match model.input_modalities {
-                Some(modalities) => modalities.iter().any(|m| m == "image"),
-                // The documented default, written by hand because no live model
-                // omits the field and this branch would otherwise ship never
-                // having been constructed.
-                None => true,
-            }),
+        .map(|model| {
+            let deprecation = model.upgrade.map(|replacement| {
+                let migration_markdown = model
+                    .upgrade_info
+                    .and_then(|info| info.migration_markdown)
+                    .map(|markdown| {
+                        tracing::debug!(
+                            model = %model.id,
+                            migration_markdown = %markdown,
+                            "codex reported model migration guidance"
+                        );
+                        crate::cap_prose(&markdown, crate::MODEL_MIGRATION_MARKDOWN_MAX)
+                    });
+                ModelDeprecation {
+                    replacement,
+                    migration_markdown,
+                }
+            });
+            DiscoveredModel {
+                label: model.display_name.unwrap_or_else(|| model.id.clone()),
+                id: model.id,
+                description: model.description,
+                deprecation,
+                reasoning_levels: model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .filter_map(|effort| to_level(&effort.reasoning_effort))
+                    .collect(),
+                accepts_images: Some(match model.input_modalities {
+                    Some(modalities) => modalities.iter().any(|m| m == "image"),
+                    // The documented default, written by hand because no live model
+                    // omits the field and this branch would otherwise ship never
+                    // having been constructed.
+                    None => true,
+                }),
+            }
         })
         .collect();
     Ok((models, result.next_cursor, default_id))
@@ -471,6 +504,63 @@ mod tests {
             Some("gpt-5.6-sol"),
             "the captured reply flags gpt-5.6-sol isDefault: true"
         );
+        let retiring = models
+            .iter()
+            .find(|model| model.id == "gpt-5.4")
+            .expect("captured retiring model");
+        let advice = retiring
+            .deprecation
+            .as_ref()
+            .expect("captured upgrade advice");
+        assert_eq!(advice.replacement, "gpt-5.6-terra");
+        assert!(
+            advice
+                .migration_markdown
+                .as_deref()
+                .is_some_and(|markdown| markdown.contains("Switch to GPT-5.6 Terra"))
+        );
+    }
+
+    /// Break caught: decoding only catalog identity/capability fields drops
+    /// Codex's one warning before a model is retired. This literal is the
+    /// provider's wire shape; production structs do not manufacture it.
+    #[test]
+    fn upgrade_advice_decodes_and_bounds_provider_markdown() {
+        let long_markdown = "x".repeat(crate::MODEL_MIGRATION_MARKDOWN_MAX + 80);
+        let line = serde_json::json!({
+            "id": 2,
+            "result": {
+                "data": [{
+                    "id": "gpt-old",
+                    "displayName": "Old",
+                    "hidden": false,
+                    "supportedReasoningEfforts": [],
+                    "upgrade": "gpt-new",
+                    "upgradeInfo": { "migrationMarkdown": long_markdown }
+                }],
+                "nextCursor": null
+            }
+        })
+        .to_string();
+
+        let (models, _, _) = page_from_reply(&line).expect("decodes");
+        let advice = models[0].deprecation.as_ref().expect("upgrade advice");
+        assert_eq!(advice.replacement, "gpt-new");
+        let markdown = advice
+            .migration_markdown
+            .as_deref()
+            .expect("migration markdown");
+        assert!(markdown.ends_with('…'));
+        assert!(markdown.len() <= crate::MODEL_MIGRATION_MARKDOWN_MAX + '…'.len_utf8());
+    }
+
+    /// Optional-wire absent case: an ordinary model is not deprecated merely
+    /// because an older Codex omitted the advisory fields.
+    #[test]
+    fn absent_upgrade_advice_stays_absent() {
+        let line = r#"{"id":2,"result":{"data":[{"id":"gpt-current","displayName":"Current","hidden":false,"supportedReasoningEfforts":[]}],"nextCursor":null}}"#;
+        let (models, _, _) = page_from_reply(line).expect("decodes");
+        assert_eq!(models[0].deprecation, None);
     }
 
     /// The wire fact this whole change reads: `isDefault` can name a row that

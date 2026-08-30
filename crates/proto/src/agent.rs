@@ -922,6 +922,11 @@ pub struct Model {
     /// mirroring the Electron app's `ModelInfo.description`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Provider advisory for a model approaching retirement. This is catalog
+    /// metadata only: choosing whether and when to switch remains a picker
+    /// action, never an automatic run rewrite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecation: Option<ModelDeprecation>,
     #[serde(default)]
     pub reasoning_levels: Vec<ReasoningLevel>,
     #[serde(default)]
@@ -936,6 +941,16 @@ pub struct Model {
     /// `inputModalities`.
     #[serde(default = "accepts_images_default")]
     pub accepts_images: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDeprecation {
+    /// Model id the provider recommends in place of this one.
+    pub replacement: String,
+    /// Provider migration copy, bounded before entering this RPC type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_markdown: Option<String>,
 }
 
 fn accepts_images_default() -> bool {
@@ -2227,6 +2242,21 @@ mod tests {
         assert!(!model.accepts_images);
         let back: Model = serde_json::from_str(&serde_json::to_string(&model).unwrap()).unwrap();
         assert!(!back.accepts_images);
+    }
+
+    /// An older engine sends no retirement metadata. That absence is ordinary
+    /// catalog state and must keep the whole model reply decodable.
+    #[test]
+    fn absent_model_deprecation_decodes_and_stays_omitted() {
+        let model: Model =
+            serde_json::from_str(r#"{"id":"m","label":"M","reasoningLevels":[],"options":[]}"#)
+                .unwrap();
+        assert_eq!(model.deprecation, None);
+        let encoded = serde_json::to_value(model).unwrap();
+        assert!(
+            encoded.get("deprecation").is_none(),
+            "an old peer should keep receiving the pre-advisory shape: {encoded}"
+        );
     }
 
     /// The reply shape the picker decodes. `source` is what the caption reads.

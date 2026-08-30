@@ -19,9 +19,9 @@ use comet_harness::mock::MockHarness;
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, CatalogSource, DiagnosticSeverity, DoneStatus,
-    FileOperation, HarnessCapabilities, HarnessId, ModelCatalog, NoticeKind, NoticeSeverity,
-    ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel, SessionStatus, SteeringMode,
-    SubagentStatus, ToolCall,
+    FileOperation, HarnessCapabilities, HarnessId, ModelCatalog, ModelDeprecation, NoticeKind,
+    NoticeSeverity, ReasoningLevel, RunRequest, RuntimeMode, SandboxLevel, SessionStatus,
+    SteeringMode, SubagentStatus, ToolCall,
 };
 use comet_rpc::RpcService;
 use comet_sync::DocsStore;
@@ -4545,6 +4545,10 @@ async fn a_discovered_model_reaches_the_client_and_the_list_reads_live() {
             id: "mock-tomorrow".into(),
             label: "Tomorrow".into(),
             description: None,
+            deprecation: Some(ModelDeprecation {
+                replacement: "mock-1".into(),
+                migration_markdown: Some("Tomorrow is retiring.".into()),
+            }),
             reasoning_levels: vec![ReasoningLevel::High],
             accepts_images: None,
         }],
@@ -4567,6 +4571,28 @@ async fn a_discovered_model_reaches_the_client_and_the_list_reads_live() {
             .unwrap()
             .accepts_images,
         "absent modality means images work"
+    );
+
+    // Literal RPC shape: this is the object the picker's single decoder sees,
+    // not a Rust round trip that could drift with both producer and consumer.
+    let wire = engine
+        .client
+        .call(
+            comet_rpc::methods::LIST_MODELS,
+            serde_json::json!({"harness": "mock"}),
+        )
+        .await
+        .unwrap();
+    let tomorrow = wire["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == "mock-tomorrow")
+        .expect("discovered model on the wire");
+    assert_eq!(tomorrow["deprecation"]["replacement"], "mock-1");
+    assert_eq!(
+        tomorrow["deprecation"]["migrationMarkdown"],
+        "Tomorrow is retiring."
     );
 }
 

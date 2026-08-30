@@ -509,6 +509,7 @@ mod tests {
             id: id.into(),
             label: label.into(),
             description: None,
+            deprecation: None,
             reasoning_levels: vec![],
             options: vec![],
             accepts_images: true,
