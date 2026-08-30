@@ -63,6 +63,10 @@ name = "fake-codex-init-crash"
 path = "tests/fixtures/fake_codex_init_crash.rs"
 
 [[bin]]
+name = "fake-codex-thread-setup-stall"
+path = "tests/fixtures/fake_codex_thread_setup_stall.rs"
+
+[[bin]]
 name = "fake-claude-bad-discovery"
 path = "tests/fixtures/fake_claude_bad_discovery.rs"
 

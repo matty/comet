@@ -949,6 +949,290 @@ async fn turn_failed_maps_to_errored_done() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// D45: reusable provider lifecycle fault primitives
+// (docs/debt/D45-provider-lifecycle-fault-matrix.md)
+// ---------------------------------------------------------------------------
+
+fn thread_setup_stall_fixture_path() -> &'static str {
+    env!("CARGO_BIN_EXE_fake-codex-thread-setup-stall")
+}
+
+/// `codex_startup_timeout_is_terminal_private_and_reaped` (above) proves the
+/// timeout covers `initialize`. This proves it also covers `thread/start` —
+/// the SECOND await inside `run_session`'s `setup` future — which nothing
+/// exercised before this fixture: before it existed, changing the timeout to
+/// wrap only the first await would have left every other test in this suite
+/// green.
+#[tokio::test]
+async fn codex_startup_timeout_covers_thread_setup_not_just_initialize() {
+    let (controls, _steer, _token) = controls("Yes");
+    let harness = CodexHarness::new()
+        .with_executable(thread_setup_stall_fixture_path())
+        .with_startup_timeout(Duration::from_millis(50))
+        .with_graces(Duration::from_millis(10), Duration::from_millis(10));
+    let stream = harness
+        .run(request("scenario:happy"), controls)
+        .await
+        .expect("stall fixture starts");
+    let events = tokio::time::timeout(
+        Duration::from_secs(2),
+        stream
+            .map(|event| event.expect("normalized event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("startup timeout must close the stream after reaping the child");
+
+    assert_eq!(
+        events,
+        vec![AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: Some(
+                "Codex didn't finish starting. Open Codex in a terminal to sign in, then try again."
+                    .into(),
+            ),
+            session_id: None,
+        }]
+    );
+    assert!(
+        !format!("{events:?}").contains("D45_THREAD_SETUP_STALL_PRIVATE_DIAGNOSTIC"),
+        "owner-local stderr leaked into the transcript event: {events:?}"
+    );
+}
+
+/// Runs `scenario:crash-mid-turn` until `describe_exit`'s status settles to
+/// "exit code 66", bounded rather than accepting whichever status the first
+/// attempt happens to read.
+///
+/// `Incoming::Eof` (this fixture's stdout closing) and the OS actually
+/// marking the process exited (what `child.try_wait()` reads, right after
+/// `Eof`, in `run_session`'s post-loop teardown) are two independent
+/// observations. Under `cargo nextest`'s parallel load a single attempt
+/// reliably read "still running" in a five-test batch on this machine even
+/// though the fixture had already called `exit(66)`; a single isolated run
+/// just as reliably read "exit code 66". Per `.agents/workflows/verify.md`'s
+/// "poll the condition with a generous deadline instead", this polls by
+/// re-running the whole scenario — each run spawns an independent process, so
+/// a retry is a fresh trial of the same race, not a re-read of stale state —
+/// rather than accepting either outcome as a matter of test-authoring
+/// convenience. The deadline only ever bounds a FAILURE: on this machine
+/// every observed run has settled to "exit code 66" within the first two
+/// attempts.
+async fn crash_mid_turn_settled_error() -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        let (controls, _steer, _token) = controls("Yes");
+        let harness = CodexHarness::new().with_executable(fixture_path());
+        let events = run_to_end(&harness, request("scenario:crash-mid-turn"), controls).await;
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Done {
+                    status: DoneStatus::Errored,
+                    error,
+                    ..
+                } => error.clone(),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no Errored Done in {events:?}"));
+        let settled = error.contains("exit code 66");
+        if settled || tokio::time::Instant::now() >= deadline {
+            assert!(
+                settled,
+                "describe_exit never settled to \"exit code 66\" across {attempts} \
+                 attempts within a 10s deadline (last message: {error}) — if this \
+                 fires, it is evidence the Eof-vs-try_wait race is worse than a \
+                 first-attempt hiccup and worth its own debt row, not a widened \
+                 assertion"
+            );
+            return error;
+        }
+    }
+}
+
+/// D45 primitive: stderr_then_exit, mid-turn (not at startup). Uses a harness
+/// with NO `CODEX_HOME` set (via `crash_mid_turn_settled_error`), deliberately
+/// unlike `harness()`: with it set, `fake_codex.rs::fill_stderr()` writes
+/// ~1MB of undelimited `x` bytes to stderr before the handshake even starts,
+/// which would still be sitting in the stderr reader's line buffer (no
+/// newline yet) when this scenario's own diagnostic line supplies the first
+/// `\n` — `StderrTail`'s 700-byte-per-line cap would then keep the FRONT of
+/// that combined line (`x` padding), not this scenario's own text. That
+/// collision is an artifact of the OTHER fixture's own discovery-only setup,
+/// not a fault this primitive means to express, so this test sidesteps it
+/// rather than fold a workaround into it.
+#[tokio::test]
+async fn codex_mid_turn_crash_reports_exit_code_and_a_bounded_stderr_excerpt() {
+    let error = crash_mid_turn_settled_error().await;
+    assert!(
+        error.contains("boom: fake codex crashed mid-turn"),
+        "expected the bounded stderr excerpt, got: {error}"
+    );
+}
+
+/// D45 primitive: partial_line — "stdout closes halfway through a frame".
+#[tokio::test]
+async fn codex_partial_stdout_frame_is_malformed_not_silently_dropped() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:partial-frame"), controls).await;
+
+    let diagnostics: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Diagnostic {
+                discriminator,
+                severity,
+                ..
+            } => Some((discriminator.clone(), *severity)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        diagnostics,
+        vec![("unparseable".to_string(), DiagnosticSeverity::Malformed)],
+        "{events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Errored,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+}
+
+/// D45 primitive: "stdin breaks while Comet writes a decision" — an approval
+/// request the provider never sticks around to see answered.
+#[tokio::test]
+async fn codex_provider_dying_before_an_approval_decision_still_ends_bounded() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:die-after-approval"), controls).await;
+
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "{events:?}"
+    );
+    let error = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Done {
+                status: DoneStatus::Errored,
+                error,
+                ..
+            } => error.clone(),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no Errored Done in {events:?}"));
+    assert_ne!(
+        error, "unknown scenario",
+        "the fixture's die-after-approval branch never ran: {events:?}"
+    );
+    assert!(error.contains("exited unexpectedly"), "{error}");
+}
+
+/// D45 primitive: duplicate (plus "arrives among unrelated notifications").
+///
+/// This documents CURRENT behavior, not an aspiration. `TurnRouter::is_completed`
+/// (`crates/harness/src/codex/mod.rs:609`) is a real, consulted guard —
+/// `note_started` refuses to revive a completed turn with it (`:614`), so
+/// does `adopt_started` (`:640`), and the steer-queue decision consults it
+/// too (`:1182`). What it does NOT cover is the one path that matters here:
+/// the `"turn/completed"` notification arm itself (`:957`) calls
+/// `router.note_completed(&id)` to RECORD the id, but never calls
+/// `is_completed` to check whether `id` was already recorded before running
+/// its full send-`Done` sequence (`:977`-`:990`). So a duplicate
+/// `turn/completed` for an already-finished turn produces a SECOND `Done` —
+/// not because no guard exists, but because the guard that does exist was
+/// never wired into this one arm. This test is the evidence for that gap,
+/// not a fix for it (fixing it needs a change in
+/// `crates/harness/src/codex/mod.rs`, out of scope for a tests-only slice).
+#[tokio::test]
+async fn codex_duplicate_turn_completed_is_not_deduplicated_today() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(
+        &harness(),
+        request("scenario:duplicate-completion"),
+        controls,
+    )
+    .await;
+
+    let done_count = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Done { .. }))
+        .count();
+    assert_eq!(
+        done_count, 2,
+        "known gap (see this test's doc comment): expected two Done events \
+         for a duplicated turn/completed, got {done_count} in {events:?}"
+    );
+    // Neither Done reports anything worse than a normal completion — the gap
+    // is an extra terminal event, not a wrong or crashing one.
+    assert!(
+        events.iter().all(|e| !matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Errored,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+}
+
+/// D45 primitive: late_reply — "delayed until after cancellation". The
+/// provider's own `turn/completed` beats `turn/aborted` to the wire, arriving
+/// after the harness already committed to `interrupted = true`.
+#[tokio::test]
+async fn codex_completion_delayed_past_cancellation_still_reports_interrupted() {
+    let harness = CodexHarness::new()
+        .with_executable(fixture_path())
+        .with_codex_home(logged_in_home())
+        // Comfortably longer than the fixture's own 100ms delay, so the kill
+        // escalation this deliberately races against never fires.
+        .with_graces(Duration::from_secs(2), Duration::from_secs(2));
+    let (controls, _steer, token) = controls("Yes");
+    let mut stream = harness
+        .run(
+            request("scenario:late-completion-after-interrupt"),
+            controls,
+        )
+        .await
+        .expect("run starts");
+
+    let events = tokio::time::timeout(Duration::from_secs(10), async move {
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(&ev, AgentEvent::TextDelta { text } if text == "working") {
+                token.cancel();
+            }
+            events.push(ev);
+        }
+        events
+    })
+    .await
+    .expect("run settled in time");
+
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            result: None,
+            error: None,
+            session_id: Some("th-1".into()),
+        }),
+        "a late-arriving completion must not overrule an already-committed \
+         interrupt: {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn resume_falls_back_to_fresh_thread() {
     let (controls, _steer, _token) = controls("Yes");
