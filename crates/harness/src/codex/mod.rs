@@ -1090,10 +1090,12 @@ async fn run_session(session: Session) {
                     }
                 }
 
-                Some(Incoming::Malformed) => {
+                Some(Incoming::Malformed(kind)) => {
                     // Sink 5 (Codex side): the reader already warn-logged the
-                    // raw line; only the sentinel travels.
-                    let ev = crate::diagnostic(crate::UNPARSEABLE, DiagnosticSeverity::Malformed);
+                    // raw line; only the KIND travels (D9) — a bare sentinel
+                    // could not tell log noise on stdout from a protocol that
+                    // moved.
+                    let ev = crate::diagnostic(kind.discriminator(), DiagnosticSeverity::Malformed);
                     if !send(&event_tx, ev).await {
                         break 'main;
                     }
