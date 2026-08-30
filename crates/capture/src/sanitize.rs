@@ -2044,6 +2044,59 @@ mod tests {
         assert_eq!(entry.shape, "mixed", "{entry:?}");
     }
 
+    /// D76's own mechanism check: `resolve` keys a placeholder on the raw
+    /// value, not on a per-call counter, so two distinct unlisted counter
+    /// values sanitized together must never collide, and two genuinely equal
+    /// ones must share -- the "equal values share a number so joins across
+    /// frames still work" contract `AGENTS.md`'s "What the providers send"
+    /// section states. `claude/2.1.229/subagent`'s committed corpus once
+    /// violated this for `input_tokens`/`output_tokens`/
+    /// `cache_creation_input_tokens`/`cache_read_input_tokens` (D76), but not
+    /// because this function mishandled fresh raw input: a one-off script
+    /// reconstructing that capture's `capture.json` from its own
+    /// already-sanitized `manifest.json`/`events.jsonl` patched 172
+    /// already-redacted counter placeholders to a shared dummy `0` *before*
+    /// handing them back to `sanitize_dir` -- by the time this module saw
+    /// them, the distinctness was already gone. This test proves the live
+    /// code has nothing to fix: given genuinely distinct raw counters in one
+    /// call, it keeps them distinct.
+    #[test]
+    fn distinct_unlisted_counter_values_get_distinct_placeholders_equal_ones_share() {
+        let sanitized = sanitize_value(
+            json!({
+                "cache_creation_input_tokens": 12156,
+                "cache_read_input_tokens": 12156,
+                "input_tokens": 10,
+                "output_tokens": 4
+            }),
+            Provider::Claude,
+        );
+
+        let cache_creation = sanitized["cache_creation_input_tokens"]
+            .as_str()
+            .expect("unlisted numeric field redacts to a placeholder string");
+        let cache_read = sanitized["cache_read_input_tokens"].as_str().unwrap();
+        let input = sanitized["input_tokens"].as_str().unwrap();
+        let output = sanitized["output_tokens"].as_str().unwrap();
+
+        assert_eq!(
+            cache_creation, cache_read,
+            "equal raw values (12156 == 12156) must share one placeholder: {sanitized}"
+        );
+        assert_ne!(
+            cache_creation, input,
+            "distinct raw values (12156 != 10) must never collide: {sanitized}"
+        );
+        assert_ne!(
+            cache_creation, output,
+            "distinct raw values (12156 != 4) must never collide: {sanitized}"
+        );
+        assert_ne!(
+            input, output,
+            "distinct raw values (10 != 4) must never collide: {sanitized}"
+        );
+    }
+
     /// `render_novel_paths_report` is the thing that actually gets pasted
     /// into a terminal or a PR body -- `NovelPath`'s `Debug` output is not
     /// what a reviewer reads. An empty list must still say something
