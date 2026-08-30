@@ -255,11 +255,28 @@ impl Drop for RunHandle {
         for tx in parked {
             let _ = tx.send(Vec::new());
         }
-        let parked: Vec<_> = lock(&self.pending_approvals)
-            .drain()
-            .map(|(_, p)| p.resolver)
-            .collect();
-        drop(parked);
+        // D15: forget the ids as well as the resolvers. `minted_approvals` is
+        // what `drive_run`'s authority guard checks, so an `ApprovalRequested`
+        // still in flight when this drain runs would otherwise pass the guard
+        // and fold a card nothing can answer — its resolver is already gone.
+        let drained: Vec<(String, PendingApproval)> =
+            lock(&self.pending_approvals).drain().collect();
+        forget_minted(&self.minted_approvals, drained.iter().map(|(id, _)| id));
+        drop(drained);
+    }
+}
+
+/// Drop `ids` from a run's minted set, so a late `ApprovalRequested` for one of
+/// them is rejected by `drive_run`'s authority guard rather than folded as an
+/// open card (D15).
+///
+/// **Only for ids drained WITHOUT an answer.** A session-grant sweep resolves
+/// what it removes — the card is answered and the transcript says so — and must
+/// keep its id minted so its own `ApprovalRequested` still passes the guard.
+fn forget_minted<'a>(minted: &MintedApprovals, ids: impl Iterator<Item = &'a String>) {
+    let mut minted = lock(minted);
+    for id in ids {
+        minted.remove(id);
     }
 }
 
@@ -660,10 +677,28 @@ impl SessionsEngine {
                         parked_at: Utc::now(),
                     },
                 );
-                let _ = engine_tx.send(AgentEvent::InputRequested {
-                    request_id,
-                    questions,
-                });
+                if engine_tx
+                    .send(AgentEvent::InputRequested {
+                        request_id: request_id.clone(),
+                        questions,
+                    })
+                    .is_err()
+                    && let Some(parked) = lock(&pending).remove(&request_id)
+                {
+                    // D16, and the exact twin of the approval arm below: the
+                    // run task is gone, so no panel will ever be shown for
+                    // this question and no drain will ever reach it. Unpark it
+                    // here or the harness awaits a reply that cannot arrive —
+                    // for Claude, with the CLI blocked on a tool call.
+                    //
+                    // Resolved to NO ANSWERS rather than dropped, which is the
+                    // one place this differs from the approval arm and is not
+                    // a stylistic choice: `interrupt()` and `RunHandle::drop`
+                    // both send `Vec::new()` for a parked question, and a
+                    // dropped input resolver is a different signal to the
+                    // consumer than an empty one.
+                    let _ = parked.resolver.send(Vec::new());
+                }
                 rx
             })
         };
@@ -866,9 +901,12 @@ impl SessionsEngine {
                 h.cancel.clone(),
                 h.pending_inputs.clone(),
                 h.pending_approvals.clone(),
+                h.minted_approvals.clone(),
             )
         });
-        let Some((run_id, token, cancel, pending_inputs, pending_approvals)) = target else {
+        let Some((run_id, token, cancel, pending_inputs, pending_approvals, minted_approvals)) =
+            target
+        else {
             return Ok(false);
         };
         // Unpark any blocked question FIRST (mirrors comet: harness teardown can await a
@@ -883,11 +921,10 @@ impl SessionsEngine {
         // Same reason for a parked approval. Dropping the senders resolves the
         // receivers to an error, which a run must treat as not approved — the
         // same signal every non-answering caller of this bridge produces.
-        let parked: Vec<_> = lock(&pending_approvals)
-            .drain()
-            .map(|(_, p)| p.resolver)
-            .collect();
-        drop(parked);
+        let drained: Vec<(String, PendingApproval)> = lock(&pending_approvals).drain().collect();
+        // …and forget the ids, for the reason `RunHandle::drop` does (D15).
+        forget_minted(&minted_approvals, drained.iter().map(|(id, _)| id));
+        drop(drained);
         // Harness-level interrupt (protocol + child teardown) …
         token.cancel();
         // … plus the engine-side grace deadline in the run task, so a harness that
@@ -3042,11 +3079,74 @@ mod tests {
         ));
     }
 
+    /// Break caught (D15): the drain took the resolver and left the id minted,
+    /// so an `ApprovalRequested` still in flight when a run ends passed
+    /// `drive_run`'s authority guard — which reads `minted_approvals`, not
+    /// `pending_approvals` — and folded a card whose buttons could only ever
+    /// return `Ok(false)`.
+    ///
+    /// Asserts the guard's own input rather than the card, because the guard is
+    /// the thing that changed: after the drain the id must no longer be known.
+    #[test]
+    fn a_drained_approval_is_forgotten_so_a_late_request_cannot_fold_a_card() {
+        let parked = parked_run_handle("run-1");
+        let minted = parked.minted.clone();
+        assert!(
+            lock(&minted).contains("run-1-approval"),
+            "the fixture has to start from a minted id, or this proves nothing"
+        );
+
+        let ParkedRun {
+            handle,
+            approval,
+            question,
+            ..
+        } = parked;
+        drop(handle);
+
+        assert!(
+            !lock(&minted).contains("run-1-approval"),
+            "a drained approval must stop being an id the authority guard accepts"
+        );
+        // And the drain still does what it did before: the resolver is gone
+        // (every consumer reads that as not approved) and the question is
+        // answered with no answers.
+        drop(approval);
+        drop(question);
+    }
+
+    /// The other direction, and the reason `forget_minted` is not just
+    /// `minted.clear()`: a session grant sweeps parked approvals and ANSWERS
+    /// them, so their ids must stay minted — their own `ApprovalRequested` may
+    /// still be in flight and has every right to fold a card, which the grant
+    /// then resolves.
+    #[test]
+    fn forgetting_one_drained_id_leaves_every_other_minted_id_alone() {
+        let minted: MintedApprovals = Arc::new(Mutex::new(HashSet::new()));
+        {
+            let mut set = lock(&minted);
+            set.insert("drained".to_string());
+            set.insert("answered".to_string());
+        }
+
+        forget_minted(&minted, [&"drained".to_string()].into_iter());
+
+        let set = lock(&minted);
+        assert!(!set.contains("drained"));
+        assert!(
+            set.contains("answered"),
+            "an id answered by a grant sweep must stay minted"
+        );
+    }
+
     /// A run with one question and one approval parked.
     struct ParkedRun {
         handle: RunHandle,
         approval: oneshot::Receiver<ApprovalDecision>,
         question: oneshot::Receiver<Vec<UserInputAnswer>>,
+        /// The same set the handle holds, kept so a test can read it after the
+        /// handle is dropped — D15 is about what the drain leaves behind.
+        minted: MintedApprovals,
         /// The `Arc`s the bridge closures hold — the reason a parked resolver
         /// outlives its handle at all. Without them here the maps would die
         /// with the handle and every assertion below would pass against a
@@ -3074,6 +3174,8 @@ mod tests {
                 parked_at: Utc::now(),
             },
         );
+        let minted: MintedApprovals = Arc::new(Mutex::new(HashSet::new()));
+        lock(&minted).insert(format!("{run_id}-approval"));
         let (steer_tx, _steer_rx) = mpsc::channel(1);
         let (cancel, _cancel_rx) = watch::channel(false);
         let (engine_tx, _engine_rx) = mpsc::unbounded_channel();
@@ -3087,11 +3189,12 @@ mod tests {
                 engine_tx,
                 pending_inputs: pending_inputs.clone(),
                 pending_approvals: pending_approvals.clone(),
-                minted_approvals: Arc::new(Mutex::new(HashSet::new())),
+                minted_approvals: minted.clone(),
                 session_allowed: Arc::new(Mutex::new(HashSet::new())),
             },
             approval: approval_rx,
             question: input_rx,
+            minted,
             _bridges: (pending_inputs, pending_approvals),
         }
     }

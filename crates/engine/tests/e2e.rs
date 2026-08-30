@@ -3150,6 +3150,111 @@ async fn an_approval_the_engine_can_no_longer_show_is_refused_not_parked() {
     assert_eq!(answer, Some("not approved"));
 }
 
+/// Asks a QUESTION after its run has ended — the twin of `LateAskingHarness`
+/// above, for the bridge 1.6 left alone (D16).
+struct LateQuestioningHarness {
+    ask: Arc<tokio::sync::Notify>,
+    reported: tokio::sync::mpsc::UnboundedSender<&'static str>,
+}
+
+#[async_trait]
+impl Harness for LateQuestioningHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "LateQuestioning"
+    }
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities::default()
+    }
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let request_input = controls.request_input;
+        let ask = self.ask.clone();
+        let reported = self.reported.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tokio::spawn(async move {
+            let _ = tx.send(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            });
+            ask.notified().await;
+            let word = match request_input(vec![comet_proto::UserInputQuestion {
+                id: "q-late".into(),
+                header: "Question".into(),
+                question: "Which way?".into(),
+                options: vec!["left".into(), "right".into()],
+                multi_select: false,
+            }])
+            .await
+            {
+                Ok(answers) if answers.is_empty() => "no answers",
+                Ok(_) => "answered",
+                Err(_) => "dropped",
+            };
+            let _ = reported.send(word);
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (Ok(event), rx))
+        })
+        .boxed())
+    }
+}
+
+/// Break caught (D16): the input bridge parked its resolver and sent the event
+/// blind. When the run task is gone the send fails, so no panel is ever shown
+/// and no drain reaches the resolver — the harness awaited a reply that could
+/// not arrive, which for Claude leaves the CLI blocked on a tool call.
+///
+/// The approval half of this was fixed in 1.6, four lines below the input half,
+/// and its test (`an_approval_the_engine_can_no_longer_show_is_refused_not_parked`)
+/// sits directly above. This is the same shape for questions, and it asserts
+/// the answer's CONTENT: an empty answer list is what `interrupt()` and
+/// `RunHandle::drop` both send, so the unpark has to speak that language rather
+/// than dropping the sender.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_the_engine_can_no_longer_show_is_answered_not_parked() {
+    let dir = tempfile::tempdir().unwrap();
+    let ask = Arc::new(tokio::sync::Notify::new());
+    let (reported, mut reports) = tokio::sync::mpsc::unbounded_channel();
+    let core = assemble(
+        dir.path(),
+        Arc::new(LateQuestioningHarness {
+            ask: ask.clone(),
+            reported,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-late-question",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "the run to finish",
+    )
+    .await;
+
+    ask.notify_one();
+    let answer = tokio::time::timeout(Duration::from_secs(5), reports.recv())
+        .await
+        .expect("a question nothing can show must still be answered, not parked forever");
+    assert_eq!(answer, Some("no answers"));
+}
+
 /// Asks for the SAME action twice with both requests in flight — claude's
 /// parallel tool calls. The mint-time pre-allow check ran before either was
 /// answered, so a grant only helps the twin if it also sweeps what is already
