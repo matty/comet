@@ -72,6 +72,38 @@ async fn wait_for_diff(sync: &CheckoutDiffSync) -> CheckoutDiff {
     }
 }
 
+/// Drive passes until the entry is gone, or fail naming what was still there.
+///
+/// **Replaces `sleep(grace + margin)` (D129).** Sleeping past a grace period
+/// puts the test's correctness in the margin: with a 300ms grace and a 400ms
+/// sleep, an orphan stamp landing late under load leaves less than the grace
+/// elapsed at the next pass, and the entry survives a check that was right
+/// about the code. Polling has no margin to get wrong, and the deadline is
+/// generous because it only ever bounds a FAILURE.
+///
+/// The caller keeps the other half of the property — that one pass before the
+/// grace elapses does NOT remove the entry — because a poll loop alone would
+/// pass just as happily against a grace of zero.
+async fn wait_for_eviction<F, Fut>(sync: &CheckoutDiffSync, mut pass: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        pass().await;
+        if current_diffs(sync).is_empty() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "absence outlasting the grace must evict the entry; still present: {:?}",
+            current_diffs(sync)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn current_diffs(sync: &CheckoutDiffSync) -> Vec<CheckoutDiff> {
     sync.watch_diffs().borrow().clone()
 }
@@ -264,12 +296,12 @@ async fn chat_flap_keeps_entry_and_sustained_absence_removes_it() {
     core.workspace.delete_chat("chat-1").expect("delete chat");
     wait_chat_state(&core, "chat-1", false).await;
     sync.reconcile_now().await; // marks orphaned
-    tokio::time::sleep(Duration::from_millis(400)).await; // > grace
-    sync.reconcile_now().await; // removes
-    assert!(
-        current_diffs(&sync).is_empty(),
-        "sustained absence must remove the entry and its diff"
+    assert_eq!(
+        current_diffs(&sync).len(),
+        1,
+        "the marking pass must not remove anything on its own — that is the grace"
     );
+    wait_for_eviction(&sync, || sync.reconcile_now()).await;
     core.shutdown().await;
 }
 
@@ -313,11 +345,11 @@ async fn deleted_checkout_is_evicted_after_grace() {
     // eviction is the repair tick's job: fresh resolve fails + cwd is gone =>
     // memo dropped => chat ungroupable => orphaned => removed after grace.
     sync.repair_now().await; // marks orphaned
-    tokio::time::sleep(Duration::from_millis(400)).await; // > grace
-    sync.repair_now().await; // removes
-    assert!(
-        current_diffs(&sync).is_empty(),
-        "vanished checkout must be evicted once absence outlasts the grace"
+    assert_eq!(
+        current_diffs(&sync).len(),
+        1,
+        "the marking pass must not remove anything on its own — that is the grace"
     );
+    wait_for_eviction(&sync, || sync.repair_now()).await;
     core.shutdown().await;
 }
