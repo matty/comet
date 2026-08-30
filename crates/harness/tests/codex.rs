@@ -1535,6 +1535,79 @@ async fn every_runtime_mode_reaches_the_wire_as_its_approval_policy() {
 }
 
 // ---------------------------------------------------------------------------
+// D43: the real process-launch contract (docs/debt/D43-fake-provider-launch-contract.md)
+// ---------------------------------------------------------------------------
+
+/// D43's headline Codex finding: "it never checks that the executable was
+/// invoked with `app-server`." `tests/fixtures/fake_codex.rs`'s
+/// `check_app_server_arg` now fails loudly, before the handshake, if
+/// `"app-server"` is missing from argv — so this (and every other scenario
+/// and discovery test in this file) is proof that a real run still carries
+/// it. Falsified by temporarily changing `codex::run_launch`'s
+/// `args: vec!["app-server".into()]` to `args: vec![]` and rerunning: the
+/// fixture exited before ever answering `initialize`, and the run ended
+/// `Errored`/`"Codex couldn't start. Check that Codex is signed in, then try
+/// again."` — quoted in the PR description. Restored before committing.
+#[tokio::test]
+async fn a_run_is_launched_as_codex_app_server() {
+    let (controls, _steer, _token) = controls("Yes");
+    // `resumed` runs no turn/thread param checks of its own — this test is
+    // about argv reaching the child at all, not about the parameter
+    // contract `happy_path_maps_deltas_items_usage_and_done` already covers.
+    let events = run_to_end(&harness(), request("scenario:resumed"), controls).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+}
+
+/// D43's other Codex finding: "run scenarios inspect the `cwd` field sent
+/// over JSON-RPC rather than the process's actual working directory. That is
+/// weaker than command discovery's child-side cwd echo." `happy` and
+/// `echo_policy` only ever check `thread_start_params`'s `cwd` VALUE, which
+/// is `request.cwd` echoed straight back — it cannot disagree with what
+/// Comet asked for, because both come from the same field, so neither can
+/// catch `LaunchDescriptor::command`'s `current_dir` call being dropped or
+/// broken. This instead asks the spawned child for its own real working
+/// directory (`cwd_echo` in `fake_codex.rs`).
+///
+/// Falsified by temporarily deleting the `if let Some(cwd) = &self.cwd {
+/// command.current_dir(cwd); }` block from
+/// `LaunchDescriptor::command` (`crates/harness/src/launch.rs`) and
+/// rerunning: the observed cwd fell back to this test binary's own working
+/// directory instead of the requested probe directory — quoted in the PR
+/// description. Restored before committing; the JSON-RPC `cwd` value alone
+/// would not have caught this, since `thread_start_params` reads the same
+/// `request.cwd` field regardless of whether the process spawn honors it.
+#[tokio::test]
+async fn the_real_child_process_starts_in_the_requested_directory() {
+    let dir = std::env::temp_dir().join("comet-codex-launch-cwd-probe");
+    std::fs::create_dir_all(&dir).expect("probe dir");
+    let (controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:cwd-echo");
+    req.cwd = dir.display().to_string();
+    let events = run_to_end(&harness(), req, controls).await;
+    let error = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Done { error, .. } => error.clone(),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no Done carrying the observed cwd: {events:?}"));
+    assert_eq!(
+        error,
+        format!("cwd={}", dir.display()),
+        "the child's actual working directory must match the requested one"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Live discovery (slice 2.3)
 // ---------------------------------------------------------------------------
 

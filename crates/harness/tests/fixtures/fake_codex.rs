@@ -250,6 +250,22 @@ fn model_list(stdin: &mut StdinLock<'_>, first: &str) {
     }
 }
 
+/// D43: "Codex checks the initialize payload and selected thread/turn
+/// parameters, but it never checks that the executable was invoked with
+/// `app-server`." Both `codex::run_launch` and `codex::discovery`'s launch
+/// build `args: vec!["app-server".into()]` as the CLI's only argument — this
+/// is the child-side proof that argv actually arrived, not just that Comet's
+/// own `Command` was built with it. Every scenario in `codex.rs` (run and
+/// discovery alike) now proves this for free, since it is checked before any
+/// of them get to speak.
+fn check_app_server_arg() {
+    let args: Vec<String> = std::env::args().collect();
+    if !args.iter().any(|a| a == "app-server") {
+        eprintln!("fake-codex: expected an \"app-server\" argument; got argv {args:?}");
+        exit(1);
+    }
+}
+
 fn main() {
     // D46: this fixture re-execs itself under this flag to play the
     // "grandchild" role for `wedge_with_child` below — the same binary, so
@@ -260,6 +276,7 @@ fn main() {
             std::thread::sleep(Duration::from_secs(3600));
         }
     }
+    check_app_server_arg();
     if std::env::var_os("CODEX_HOME").is_some() {
         fill_stderr();
     }
@@ -371,6 +388,8 @@ fn main() {
         auto_reviewer(&thread_line, &tid);
     } else if turn_line.contains("scenario:echo-policy") {
         echo_policy(&turn_line, &thread_line, &tid);
+    } else if turn_line.contains("scenario:cwd-echo") {
+        cwd_echo(&tid);
     } else if turn_line.contains("scenario:approve") {
         approve(&mut stdin, &turn_line, &thread_line, &tid);
     } else if turn_line.contains("scenario:decline") {
@@ -636,6 +655,26 @@ fn echo_policy(turn_line: &str, thread_line: &str, tid: &str) {
         tid,
         &format!("thread={} turn={}", seen(thread_line), seen(turn_line)),
     );
+}
+
+/// D43: "Its run scenarios inspect the `cwd` field sent over JSON-RPC rather
+/// than the process's actual working directory." `happy`'s own thread-line
+/// check and `echo_policy` above only ever read `request.cwd` echoed straight
+/// back onto the wire by `thread_start_params` — that value can never
+/// disagree with what Comet asked for, since both come from the same field,
+/// so it cannot catch `LaunchDescriptor::command`'s `current_dir` call being
+/// dropped or broken. This instead asks the one thing only the spawned
+/// process itself can answer: its own real working directory.
+fn cwd_echo(tid: &str) {
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<none>".into());
+    let escaped = cwd.replace('\\', "\\\\").replace('"', "\\\"");
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    fail_turn(tid, &format!("cwd={escaped}"));
 }
 
 fn approve(stdin: &mut StdinLock<'_>, turn_line: &str, thread_line: &str, tid: &str) {

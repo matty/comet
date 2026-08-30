@@ -637,6 +637,121 @@ async fn error_codes_map_to_readable_messages() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// D43: the real process-launch contract (docs/debt/D43-fake-provider-launch-contract.md)
+// ---------------------------------------------------------------------------
+
+/// D43's headline finding: "Claude's fake accepts every argument except an
+/// invalid `--permission-mode`." `tests/fixtures/fake_claude.rs`'s
+/// `check_run_flags` now fails loudly, before any scenario dispatch, if a
+/// run's argv is missing the streaming transport, `--verbose`,
+/// `--include-partial-messages`, or the stdio permission channel — so this
+/// (and every other run-scenario test in this file) is proof that a real
+/// `scenario:happy` invocation still carries the full floor. Falsified by
+/// temporarily removing `--verbose` from `claude::run_launch` and rerunning
+/// this test: it failed with
+/// `claude exited unexpectedly (exit code 1): fake-claude: run argv is
+/// missing required flag(s) ["--verbose"]; got [...]` — see the PR
+/// description for the full quoted line. Restored before committing.
+#[tokio::test]
+async fn a_run_carries_the_full_streaming_and_control_argv_floor() {
+    let (controls, _steer, _token) = controls("A");
+    let events = run_to_end(&harness(), request("scenario:happy"), controls).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "the fixture's own argv floor check must pass for a real run_launch: {events:?}"
+    );
+}
+
+/// D43's other headline gaps: "[nothing proves] `--model`, effort, settings
+/// or `--resume`", and the run path is "weaker than command discovery's
+/// child-side cwd echo" (which only ever proved discovery, never a run).
+/// This drives a real request carrying all four plus a non-default `cwd`,
+/// and has the fixture (`launch_record` in `fake_claude.rs`) record the argv
+/// and working directory the OS actually handed the child — the shape #197
+/// established: the fake records what it received, and the test asserts
+/// against that record instead of trusting Comet's own `Command` was built
+/// right.
+///
+/// Falsified one property at a time by commenting out the corresponding
+/// block in `claude::run_launch` and rerunning: each removal failed only its
+/// own assertion below (quoted in the PR description), never the others,
+/// before being restored.
+#[tokio::test]
+async fn model_effort_settings_resume_and_the_real_child_cwd_reach_the_child() {
+    let record_dir = std::env::temp_dir().join("comet-claude-launch-record");
+    std::fs::create_dir_all(&record_dir).expect("record dir");
+    let record_path = record_dir.join("record.json");
+    let _ = std::fs::remove_file(&record_path);
+
+    let cwd_dir = std::env::temp_dir().join("comet-claude-launch-cwd-probe");
+    std::fs::create_dir_all(&cwd_dir).expect("probe dir");
+
+    let mut req = request(&format!("scenario:launch-record|{}", record_path.display()));
+    req.model = Some("claude-test-model".into());
+    req.reasoning = Some(comet_proto::ReasoningLevel::Medium);
+    req.resume = Some("resume-token-1".into());
+    req.cwd = cwd_dir.display().to_string();
+    req.model_options
+        .insert("fastMode".into(), serde_json::Value::Bool(true));
+
+    let (controls, _steer, _token) = controls("A");
+    let events = run_to_end(&harness(), req, controls).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "launch_record must end the run cleanly: {events:?}"
+    );
+
+    let raw = std::fs::read_to_string(&record_path).expect("the fixture must write a record");
+    let record: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON record");
+    let args: Vec<String> = record["args"]
+        .as_array()
+        .expect("args array")
+        .iter()
+        .map(|v| v.as_str().expect("string arg").to_string())
+        .collect();
+
+    let value_of = |flag: &str| -> Option<&str> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|at| args.get(at + 1))
+            .map(String::as_str)
+    };
+
+    assert_eq!(
+        value_of("--model"),
+        Some("claude-test-model"),
+        "argv: {args:?}"
+    );
+    assert_eq!(value_of("--effort"), Some("medium"), "argv: {args:?}");
+    assert!(
+        args.iter().any(|a| a == "--resume=resume-token-1"),
+        "argv missing --resume=resume-token-1: {args:?}"
+    );
+    let settings = value_of("--settings").unwrap_or_else(|| panic!("argv: {args:?}"));
+    assert!(
+        settings.contains(r#""fastMode":true"#),
+        "settings argv missing fastMode: {settings}"
+    );
+    assert_eq!(
+        record["cwd"].as_str(),
+        Some(cwd_dir.display().to_string().as_str()),
+        "the real child must start in the requested directory, not merely report it on the wire"
+    );
+}
+
 #[tokio::test]
 async fn missing_binary_is_not_installed() {
     let harness = ClaudeHarness::new().with_executable("/nonexistent/claude-nowhere");
