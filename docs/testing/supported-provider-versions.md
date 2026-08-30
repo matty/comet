@@ -79,11 +79,15 @@ no floor row and is not listed as deliberately floorless. That closes the clause
 floor not being tied to its evidence.
 
 **A decode outliving its last emitting version is still only partly caught.**
-`acp_decode_coverage.rs` does it for ACP `sessionUpdate` kinds in both directions — a decoded kind
-with no capture behind it, and a captured kind nobody has ruled on — because that is the one
-surface whose vocabulary the corpus already records. Claude's tool names and Codex's methods have
-no equivalent yet; **D90** is the hand-measured version of the same question for Codex, and D69
-stays open for the rest.
+`acp_decode_coverage.rs` does it for ACP `sessionUpdate` kinds and `codex_method_coverage.rs` for
+Codex JSON-RPC methods, both in both directions — a decoded name with no capture behind it, and a
+captured name nobody has ruled on. Those are the two surfaces whose vocabulary the corpus records
+(`.params.update.sessionUpdate` and `.method`).
+
+**Tool names are the gap, and Codex's half is capture-blocked**: no promoted scenario exercises a
+Codex tool call at all, so there is no dotted path to declare as a discriminator and nothing to
+compare a decode against. Claude's `.message.content[].name` and `.event.content_block.name` are
+declared and could carry the same lint today.
 
 **Nothing checks the installed CLI against the floor**, and nothing states a coverage or
 retirement policy for corpus versions — **D70**.
