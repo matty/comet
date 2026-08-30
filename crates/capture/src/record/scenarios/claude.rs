@@ -386,6 +386,83 @@ fn claude_approval_prompt(cwd: &Path) -> String {
     )
 }
 
+/// The file `edit` seeds and asks Claude to change, and the two halves of the
+/// change.
+///
+/// **Every value is fixed and boring on purpose.** The point of the scenario is
+/// the SHAPE of an `Edit` tool_use frame — `file_path`, `old_string`,
+/// `new_string` — and a prompt that leaves the model any latitude spends a
+/// turn's tokens on a capture that may not contain the frame at all.
+const EDIT_TARGET_NAME: &str = "capture-edit-target.txt";
+const EDIT_ORIGINAL: &str = "one
+before
+three
+";
+const EDIT_OLD_STRING: &str = "before";
+const EDIT_NEW_STRING: &str = "after";
+
+/// The prompt for [`edit`], naming the tool and its exact input the same way
+/// `claude_approval_prompt` does.
+fn claude_edit_prompt(cwd: &Path) -> String {
+    let target = cwd.join(EDIT_TARGET_NAME);
+    format!(
+        "Use Edit exactly once with input {{\"file_path\":{},\"old_string\":{},\"new_string\":{}}}. Do not read the file first and do not use any other tool.",
+        serde_json::to_string(&target.display().to_string()).expect("path serializes"),
+        serde_json::to_string(EDIT_OLD_STRING).expect("static string serializes"),
+        serde_json::to_string(EDIT_NEW_STRING).expect("static string serializes"),
+    )
+}
+
+/// Same one-call-per-recording contract as `fresh_text_request` above.
+pub(in crate::record) fn edit_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
+    let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
+    Ok(cheap_claude_request(
+        &claude_edit_prompt(&cwd),
+        input,
+        RuntimeMode::AutoAcceptEdits,
+    ))
+}
+
+/// A turn that edits an existing file, for the one tool whose decode has never
+/// met a real payload.
+///
+/// **Why this scenario exists at all**: `claude_tool_coverage.rs` measures that
+/// `Edit` appears nowhere in the promoted corpus, at any path, while
+/// `ToolCall::EditFile` reads `file_path`/`old_string`/`new_string` from it —
+/// and two open rows (D17, D18) reason about Edit's approval card from typings
+/// because there is no frame to read. One capture settles all three.
+///
+/// **The target file is written HERE, not in the request builder.** A request
+/// builder that touched the filesystem would run its side effect during
+/// `--help`-shaped dry runs and argument validation, where nothing has agreed
+/// to spend anything or write anywhere. The body runs only once a session is
+/// genuinely spawned, which is also the first moment the file needs to exist.
+///
+/// `AutoAcceptEdits` rather than `ApprovalRequired`: the frame this scenario is
+/// for is the `tool_use`, and routing it through an approval round-trip would
+/// capture the approval surface `approval` already covers while adding a way
+/// for the turn to end without ever emitting the edit.
+pub(in crate::record) async fn edit(
+    session: &mut Session<ClaudeProvider>,
+    _input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    let request = session
+        .request
+        .clone()
+        .expect("edit is a Run scenario and always carries a request");
+    let target = PathBuf::from(&request.cwd).join(EDIT_TARGET_NAME);
+    std::fs::write(&target, EDIT_ORIGINAL).map_err(|error| {
+        anyhow::anyhow!(
+            "edit target {} could not be seeded: {error}",
+            target.display()
+        )
+    })?;
+
+    let line = claude_user_line(&request, false).await?;
+    session.send(&line).await?;
+    session.wait_for_turn_end().await
+}
+
 /// Same one-call-per-recording contract as `fresh_text_request` above.
 pub(in crate::record) fn approval_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
     let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
@@ -1059,6 +1136,7 @@ mod tests {
                 fresh_text_request(&plain).unwrap().runtime_mode,
             ),
             ("approval", approval_request(&plain).unwrap().runtime_mode),
+            ("edit", edit_request(&plain).unwrap().runtime_mode),
             ("resume", resume_request(&with_resume).unwrap().runtime_mode),
             (
                 "attachment",

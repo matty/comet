@@ -22,14 +22,18 @@ use comet_capture::{SCENARIOS, corpus_provider_name, corpus_root, promoted_scena
 /// stale — that second direction is what stops the exemption list itself from
 /// becoming the next place a coverage gap hides unnoticed.
 ///
-/// **Empty, and that is the state to keep it in.** Every declared scenario
-/// now has promoted evidence: the Claude/Codex rows landed in the stage-6
-/// re-capture, and Grok's three (`session-discovery-grok`, `run-grok`,
-/// `steer-grok`) landed in `grok/1.0.5/` once the promotion review D102
-/// tracked was actually done. A new row belongs here only with the reason it
-/// cannot be captured written beside it — an empty list is not an invariant
-/// this test enforces, it is just where the coverage happens to stand.
-const EXEMPT_UNCAPTURED: &[(&str, &str)] = &[];
+/// **One row, and it is a scheduling state rather than a permanent one.**
+/// `claude/edit` is declared so the capture can be taken; taking it spends
+/// tokens on a live Claude turn, which `docs/testing/provider-captures.md`
+/// makes a separate authorization from landing the code. It is the capture
+/// that closes `claude_tool_coverage.rs`'s `Edit` entry — and with it the
+/// typings-only reasoning in D17 and D18, which is why the row is worth
+/// carrying rather than deferring until someone has a spare turn.
+///
+/// Everything else has promoted evidence: the Claude/Codex rows landed in the
+/// stage-6 re-capture, Grok's three in `grok/1.0.5/`. A new row belongs here
+/// only with the reason it cannot be captured written beside it.
+const EXEMPT_UNCAPTURED: &[(&str, &str)] = &[("claude", "edit")];
 
 /// Break caught: a scenario declared in `SCENARIOS` (and rendered in
 /// `--help`) with no promoted corpus directory behind it anywhere, for any
