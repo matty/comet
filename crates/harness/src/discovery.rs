@@ -632,6 +632,66 @@ mod tests {
         );
     }
 
+    /// Break caught (D34): `program_path` existed and the RUN launches did not
+    /// call it. Discovery was fixed in 2.2 and the run path kept
+    /// `program: exe.into()`, so a relative `CLAUDE_CODE_EXECUTABLE` or
+    /// `CODEX_EXECUTABLE` — taken verbatim by `resolve_cli`, so a real user
+    /// configuration — resolved against the session cwd instead of Comet's.
+    ///
+    /// Asserts every launch builder that sets a `cwd`, not just the two that
+    /// were broken: the ACP pair already routed through `program_path`, and a
+    /// future provider that forgets belongs in this failure too.
+    #[test]
+    fn every_run_launch_resolves_a_relative_program_before_setting_a_cwd() {
+        // Two components, and it exists relative to the crate root — where
+        // cargo runs this from — so `canonicalize` has something to resolve.
+        let rel = std::path::Path::new("src/claude");
+        let request = comet_proto::RunRequest {
+            cwd: std::env::temp_dir().display().to_string(),
+            ..comet_proto::RunRequest::for_session(comet_proto::RuntimeMode::default())
+        };
+
+        for (provider, launch) in [
+            ("claude", crate::claude::run_launch(rel, &request)),
+            ("codex", crate::codex::run_launch(rel, &request)),
+            ("grok", crate::acp::grok::run_launch(rel, &request)),
+        ] {
+            assert!(
+                launch.program.is_absolute(),
+                concat!(
+                    "{}'s run launch must resolve a relative program against the PARENT's ",
+                    "cwd, or setting `cwd` moves what it means: {:?}",
+                ),
+                provider,
+                launch.program
+            );
+        }
+    }
+
+    /// The other half, so the fix above cannot become "absolutize everything":
+    /// a bare command name is a PATH lookup and every run launch must leave it
+    /// alone.
+    #[test]
+    fn every_run_launch_leaves_a_bare_command_name_alone() {
+        let bare = std::path::Path::new("claude");
+        let request = comet_proto::RunRequest {
+            cwd: std::env::temp_dir().display().to_string(),
+            ..comet_proto::RunRequest::for_session(comet_proto::RuntimeMode::default())
+        };
+
+        for (provider, launch) in [
+            ("claude", crate::claude::run_launch(bare, &request)),
+            ("codex", crate::codex::run_launch(bare, &request)),
+            ("grok", crate::acp::grok::run_launch(bare, &request)),
+        ] {
+            assert_eq!(
+                launch.program,
+                bare.to_path_buf(),
+                "{provider} must leave a PATH lookup as a PATH lookup"
+            );
+        }
+    }
+
     /// A bare name is a PATH lookup, and must stay one — absolutizing it
     /// against the parent's cwd would prefer a stray `./codex` over the
     /// installed CLI.
