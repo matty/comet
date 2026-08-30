@@ -526,6 +526,9 @@ impl AgentAccounts {
             login_id,
             url,
             mode: AgentLoginMode::PasteCode,
+            // Claude's flow never opens a browser itself — Comet builds the
+            // authorize URL here and the CLI is not involved in showing it.
+            cli_opened_browser: false,
         }
     }
 
@@ -680,6 +683,12 @@ impl AgentAccounts {
             login_id,
             url,
             mode: AgentLoginMode::Browser,
+            // The other half of the `BROWSER` no-op above (D97): where the
+            // suppression works the client owns the single open, and where it
+            // cannot the CLI has already opened one on THIS machine. Measured
+            // on Windows 2026-08-30 — `codex login` raised the browser process
+            // count and printed "If your browser did not open".
+            cli_opened_browser: cfg!(not(unix)),
         })
     }
 

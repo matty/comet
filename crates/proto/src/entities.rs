@@ -430,6 +430,23 @@ pub struct AgentLoginStart {
     pub login_id: String,
     pub url: String,
     pub mode: AgentLoginMode,
+    /// Whether the CLI opened the authorization tab ITSELF on the engine's
+    /// machine, so a client on that same machine must not open a second one
+    /// (D97).
+    ///
+    /// **Additive, and `false` is the safe absence.** An engine too old to send
+    /// it decodes as `false`, which means "the CLI did not open one" and the
+    /// client opens as it always has — today's behaviour, double tab included.
+    /// The opposite default would leave a user with no tab at all, which is
+    /// why this is not a `cli_suppressed_browser` flag.
+    ///
+    /// The engine answers it from its OWN platform: unix suppresses the CLI's
+    /// open with a no-op `BROWSER` script, and Windows cannot (the `webbrowser`
+    /// crate only consults `$BROWSER` there). Measured on 2026-08-30 rather
+    /// than assumed — `codex login` on Windows raised the browser process
+    /// count and printed "If your browser did not open".
+    #[serde(default)]
+    pub cli_opened_browser: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -495,6 +512,26 @@ pub enum TerminalEvent {
 
 #[cfg(test)]
 mod tests {
+
+    /// Break caught (D97): an engine too old to send `cliOpenedBrowser` must
+    /// decode as `false` — "the CLI did not open one" — so the client opens as
+    /// it always has. The opposite default would leave that user with no
+    /// authorization tab at all, which is strictly worse than the double tab
+    /// this closes.
+    #[test]
+    fn a_login_start_without_the_browser_flag_decodes_as_the_client_opening() {
+        let older = serde_json::json!({
+            "loginId": "l-1",
+            "url": "https://auth.openai.com/oauth/authorize?x=1",
+            "mode": "browser",
+        });
+        let start: AgentLoginStart = serde_json::from_value(older).expect("an older reply decodes");
+        assert!(
+            !start.cli_opened_browser,
+            "absence must mean the client still opens the tab"
+        );
+    }
+
     use super::*;
 
     /// A session row from a peer that predates the field. Sessions decode as a
