@@ -219,6 +219,40 @@ mod tests {
         }
     }
 
+    /// D51's exact failure, pinned rather than assumed closed. Copying a
+    /// `COMET_DATA_DIR` to a new path breaks `device-identity.pem`'s
+    /// restrictive ACL, and the gate showed
+    /// `DACL: identity I/O: C:\...\device-identity.pem does not have the
+    /// private...` — truncated mid-sentence, with no action but a Retry that
+    /// could not succeed.
+    ///
+    /// The row was filed against slice 4.1 and was already fixed by #98's
+    /// `engine_start_failure`, which nobody went back to record. This test is
+    /// what makes that true rather than probable: the identity variant reaches
+    /// the catch-all like every other assembly failure, and the anyhow CONTEXT
+    /// the real chain carried ("DACL") must not leak either.
+    #[test]
+    fn a_broken_identity_file_does_not_put_its_path_on_the_gate() {
+        let io = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            r"C:\Users\someone\comet\device-identity.pem does not have the private key",
+        );
+        let err = anyhow::Error::new(EngineError::Identity(comet_identity::IdentityError::Io(io)))
+            .context("DACL");
+        let copy = engine_start_failure(&err);
+
+        assert_eq!(copy, "Comet's engine couldn't start.");
+        for leak in [
+            "device-identity",
+            "DACL",
+            "identity I/O",
+            "private key",
+            r"C:\Users",
+        ] {
+            assert!(!copy.contains(leak), "leaked {leak:?} into: {copy}");
+        }
+    }
+
     /// The whole point: nothing from the error's message may reach the string
     /// the user reads. This is the regression that put serde's decode text in
     /// a red row.
