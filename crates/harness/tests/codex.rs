@@ -1233,6 +1233,215 @@ async fn codex_completion_delayed_past_cancellation_still_reports_interrupted() 
     );
 }
 
+// ---------------------------------------------------------------------------
+// D48: a selected slice of the event-order state space
+// (docs/debt/D48-provider-state-sequences.md)
+//
+// D45 (above) supplied reusable fault primitives; this section selects
+// orderings not already covered by a named scenario or by one of D45's
+// primitives, each tied to one of D48's own invariants (request ids resolve
+// at most once, no normal event follows a terminal result, cancellation
+// settles, pending approvals fail closed, the child is reaped). This is a
+// selection, not an enumeration — see the PR description for orderings that
+// were considered and left out, and why.
+// ---------------------------------------------------------------------------
+
+/// "The child is reaped" under a THIRD way a run can end, distinct from both
+/// a normal `Done` and an explicit `interrupt.cancel()`: the consumer simply
+/// drops the event stream mid-turn (the app closing, a dropped engine-side
+/// subscription, …). `run_session`'s main `tokio::select!` has exactly one
+/// arm for this — `_ = event_tx.closed() => break 'main` — and nothing else
+/// in this suite exercises it: every other test either drains to `Done` or
+/// cancels the interrupt token first. `shutdown_child`/`tree.terminate()` run
+/// unconditionally after the loop, for whatever reason it ended, so this
+/// proves that unconditional cleanup actually covers this exit too, not just
+/// the two already-tested ones.
+///
+/// Reuses `wedge-with-child` (D46) rather than plain `wedge`: this needs a
+/// pid to poll, and `wedge` records none of its own.
+#[tokio::test]
+async fn dropping_the_consumer_stream_still_reaps_the_child_and_its_grandchild() {
+    let harness = CodexHarness::new()
+        .with_executable(fixture_path())
+        .with_codex_home(logged_in_home())
+        .with_graces(Duration::from_millis(100), Duration::from_millis(300));
+    let (controls, _steer, _token) = controls("Yes");
+
+    let pid_file = std::env::temp_dir().join(format!(
+        "comet-d48-consumer-drop-pids-{}-{}.txt",
+        std::process::id(),
+        uuid_ish()
+    ));
+    let _ = std::fs::remove_file(&pid_file);
+
+    let mut stream = harness
+        .run(
+            request(&format!("scenario:wedge-with-child|{}", pid_file.display())),
+            controls,
+        )
+        .await
+        .expect("run starts");
+
+    // Let the turn actually reach the in-flight state (both pids recorded,
+    // per wedge_with_child's own doc comment, written before this delta) —
+    // before abandoning the stream.
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("delta arrives before the wedge sleep")
+        {
+            Some(Ok(AgentEvent::TextDelta { text })) if text == "working" => break,
+            Some(Ok(_)) => continue,
+            other => panic!("unexpected event before drop: {other:?}"),
+        }
+    }
+
+    // The abrupt-disconnect path: never read a Done, never cancel the token.
+    drop(stream);
+
+    let recorded = std::fs::read_to_string(&pid_file).expect("fixture recorded both pids");
+    let _ = std::fs::remove_file(&pid_file);
+    let mut pids = recorded.lines();
+    let child_pid: u32 = pids
+        .next()
+        .expect("direct child pid line")
+        .trim()
+        .parse()
+        .expect("direct child pid parses");
+    let grandchild_pid: u32 = pids
+        .next()
+        .expect("grandchild pid line")
+        .trim()
+        .parse()
+        .expect("grandchild pid parses");
+
+    wait_for_process_exit(child_pid, Duration::from_secs(5))
+        .await
+        .unwrap_or_else(|msg| {
+            panic!("direct child (fixture) {msg} after the consumer dropped the stream")
+        });
+    wait_for_process_exit(grandchild_pid, Duration::from_secs(5))
+        .await
+        .unwrap_or_else(|msg| {
+            panic!(
+                "provider-owned grandchild (pid {grandchild_pid}) {msg} — \
+                 dropping the consumer stream leaked it"
+            )
+        });
+}
+
+/// A JSON-RPC response and its own related notifications may arrive in
+/// either order (`TurnRouter`'s own doc comment says so,
+/// `crates/harness/src/codex/mod.rs`), and `turn_router_never_revives_completed_turns`
+/// (same file) already proves `TurnRouter` tolerates it in isolation. What
+/// that unit test cannot show is whether the surrounding plumbing does:
+/// `start_turn`'s ack is a bare `.await` BEFORE `run_session`'s
+/// `tokio::select!` loop even starts, so anything the wire sends earlier
+/// sits unread on the `incoming` mpsc channel the whole time. This proves
+/// that buffering is transparent end to end: the consumer sees the exact
+/// ordered sequence an ack-first happy path would produce — nothing lost,
+/// nothing duplicated, nothing reordered. This race is safe by construction,
+/// not accidentally so.
+#[tokio::test]
+async fn turn_events_streamed_ahead_of_their_own_ack_are_not_lost_or_reordered() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:stream-before-ack"), controls).await;
+
+    assert!(
+        matches!(events.first(), Some(AgentEvent::SessionStarted { .. })),
+        "{events:?}"
+    );
+    assert_eq!(
+        events.get(1),
+        Some(&AgentEvent::TextDelta {
+            text: "before".into()
+        }),
+        "{events:?}"
+    );
+    assert_eq!(
+        events.get(2),
+        Some(&AgentEvent::TextDelta {
+            text: "-ack".into()
+        }),
+        "{events:?}"
+    );
+    assert_eq!(
+        events.get(3),
+        Some(&AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: Some("th-1".into()),
+        }),
+        "{events:?}"
+    );
+    assert_eq!(events.len(), 4, "extra or missing events: {events:?}");
+}
+
+/// D48 known gap: `run_session`'s main loop has no gate on
+/// `router.active.is_some()` before decoding and forwarding a notification.
+/// A persistent session (steering stays open after a turn completes, per
+/// `codex/mod.rs`'s own module doc) can receive a stray event that names no
+/// turn and answers no queued steer — a genuinely orphaned notification —
+/// and it still becomes a normal `TextDelta` in the consumer's stream, AFTER
+/// the `Done` that ended the turn it has nothing to do with. This documents
+/// CURRENT behavior (a real gap against D48's own "no normal event follows a
+/// terminal result" invariant), not a fix — fixing it needs a change in
+/// `crates/harness/src/codex/mod.rs`'s notification arms, out of scope for a
+/// tests-only slice. See this PR's description for the proposed debt row.
+#[tokio::test]
+async fn codex_an_orphaned_notification_after_done_is_not_dropped_today() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(
+        &harness(),
+        request("scenario:orphan-after-completion"),
+        controls,
+    )
+    .await;
+
+    assert!(
+        matches!(events.first(), Some(AgentEvent::SessionStarted { .. })),
+        "{events:?}"
+    );
+    assert_eq!(
+        events.get(1),
+        Some(&AgentEvent::TextDelta {
+            text: "done".into()
+        }),
+        "{events:?}"
+    );
+    let done_pos = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .expect("a Done for the completed turn");
+    assert_eq!(
+        events.get(done_pos),
+        Some(&AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: Some("th-1".into()),
+        }),
+        "{events:?}"
+    );
+    // The known gap: a normal event, owned by no turn, still reaches the
+    // consumer AFTER the Done that ended the only turn this run ever had.
+    assert_eq!(
+        events.get(done_pos + 1),
+        Some(&AgentEvent::TextDelta {
+            text: "orphaned".into()
+        }),
+        "expected the orphaned delta to survive past Done (documenting the gap); \
+         if this fails because the event is now GONE, the gap may already be \
+         fixed and this test should assert the correct behavior instead: {events:?}"
+    );
+    assert_eq!(
+        events.len(),
+        done_pos + 2,
+        "extra or missing events: {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn resume_falls_back_to_fresh_thread() {
     let (controls, _steer, _token) = controls("Yes");

@@ -403,6 +403,14 @@ fn main() {
         duplicate_completion(&tid);
     } else if turn_line.contains("scenario:late-completion-after-interrupt") {
         late_completion_after_interrupt(&mut stdin, &tid);
+    // D48: a selected slice of the event-order state space
+    // (docs/debt/D48-provider-state-sequences.md) not already covered by a
+    // named scenario or by D45's primitives above — see each function's own
+    // comment for the exact race it expresses.
+    } else if turn_line.contains("scenario:stream-before-ack") {
+        stream_before_ack(&tid);
+    } else if turn_line.contains("scenario:orphan-after-completion") {
+        orphan_notification_after_completion(&tid);
     } else if turn_line.contains("scenario:fail") {
         fail(&tid);
     } else if turn_line.contains("scenario:resumed") {
@@ -964,6 +972,47 @@ fn late_completion_after_interrupt(stdin: &mut StdinLock<'_>, tid: &str) {
     emit(&format!(r#"{{"id":{iid},"result":{{}}}}"#));
     std::thread::sleep(Duration::from_millis(100));
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+}
+
+/// D48 selection: the response/notification race in the OTHER direction from
+/// every other scenario in this file. Every one of them acks `turn/start`
+/// (the JSON-RPC RESPONSE) as literally the first line of the turn, then
+/// emits `turn/started` and later notifications. Real JSON-RPC does not
+/// require that order — a server may emit its own notifications before, or
+/// interleaved with, acking the call that triggered them. `TurnRouter`'s own
+/// doc comment (`crates/harness/src/codex/mod.rs`) already says the ack and
+/// the lifecycle notifications "may arrive in either order", and a direct
+/// unit test (`turn_router_never_revives_completed_turns`, same file) proves
+/// `TurnRouter` itself tolerates it — but `start_turn`'s ack is a bare
+/// `.await` BEFORE `run_session`'s `tokio::select!` loop even starts, so
+/// nothing before this proved the surrounding plumbing (the buffered
+/// `incoming` mpsc channel) carries this correctly end to end.
+fn stream_before_ack(tid: &str) {
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"before"}}"#);
+    emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"-ack"}}"#);
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+}
+
+/// D48 selection: a notification that names no active turn and nothing
+/// queued, arriving AFTER `turn/completed`, while the session stays open for
+/// more steering (nothing failed and the mailbox is not dropped).
+/// `run_session`'s main loop has no gate on `router.active.is_some()` before
+/// decoding and forwarding a notification — see this scenario's driving
+/// test for the exact arm and why this documents CURRENT behavior, not an
+/// invariant the harness actually enforces.
+fn orphan_notification_after_completion(tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"done"}}"#);
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+    // Belongs to no turn: router.active is None here and nothing is queued.
+    emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"orphan","delta":"orphaned"}}"#);
 }
 
 fn fail(tid: &str) {
