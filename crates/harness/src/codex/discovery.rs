@@ -479,7 +479,8 @@ pub(crate) fn page_from_reply(line: &str) -> Result<ModelPage, DiscoveryFailure>
                     // having been constructed.
                     None => true,
                 }),
-            }        })
+            }
+        })
         .collect();
     Ok((models, result.next_cursor, default_id))
 }

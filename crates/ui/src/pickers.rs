@@ -5324,6 +5324,7 @@ mod tests {
                 "id": "claude-sonnet-5",
                 "label": "Sonnet 5",
                 "reasoningLevels": [],
+                "defaultReasoning": "low",
                 "options": [],
                 "deprecation": {
                     "replacement": "claude-sonnet-6",
@@ -5336,6 +5337,11 @@ mod tests {
         assert_eq!(catalog.source, CatalogSource::BuiltIn);
         assert_eq!(catalog.models.len(), 1);
         assert_eq!(catalog.models[0].id, "claude-sonnet-5");
+        assert_eq!(
+            catalog.models[0].default_reasoning,
+            Some(ReasoningLevel::Low),
+            "the literal engine reply keeps provider-default metadata"
+        );
         assert!(
             catalog.models[0].accepts_images,
             "absent acceptsImages means images work"

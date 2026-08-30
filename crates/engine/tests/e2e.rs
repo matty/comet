@@ -4785,7 +4785,7 @@ async fn a_discovered_model_reaches_the_client_and_the_list_reads_live() {
                 migration_markdown: Some("Tomorrow is retiring.".into()),
             }),
             reasoning_levels: vec![ReasoningLevel::High],
-            default_reasoning: None,
+            default_reasoning: Some(ReasoningLevel::Low),
             accepts_images: None,
         }],
     })
@@ -4829,6 +4829,16 @@ async fn a_discovered_model_reaches_the_client_and_the_list_reads_live() {
     assert_eq!(
         tomorrow["deprecation"]["migrationMarkdown"],
         "Tomorrow is retiring."
+    );
+    assert_eq!(
+        catalog
+            .models
+            .iter()
+            .find(|m| m.id == "mock-tomorrow")
+            .unwrap()
+            .default_reasoning,
+        Some(ReasoningLevel::Low),
+        "the ListModels reply keeps the live provider default"
     );
 }
 
