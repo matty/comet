@@ -812,6 +812,111 @@ impl SessionDoc {
         Ok(stamped)
     }
 
+    /// Route a late `AgentEvent::SubagentUpdated` into an entry whose segment
+    /// has ALREADY finished — see `docs/debt/README.md` D98. Claude's `Agent`
+    /// tool is not synchronous with its parent's turn: the turn can end
+    /// `Completed` while the child is still running, and by the time the
+    /// child reports its real outcome, `comet_engine::sessions::drive_run`'s
+    /// live accumulator has already been flushed and cleared for the next
+    /// segment. The run loop keeps a `task_id → entry_id` map for exactly
+    /// this and calls here when its own in-memory fold no longer holds the
+    /// matching `task_id`.
+    ///
+    /// Matched by `task_id`, the durable identity a `Subagent` part carries —
+    /// never `tool_use_id` — the same rule
+    /// `doc::parts::fold_event_into_parts`'s `SubagentUpdated` arm follows.
+    /// On disk the part's `id` field doubles as `task_id` (`to_doc_part`'s own
+    /// comment: "the task id IS the persisted part id"), so this matches on
+    /// `id` directly rather than the live fold's `sub-`-prefixed one.
+    ///
+    /// Same PARTIAL-PATCH semantics as that fold arm, not the streaming
+    /// writer's `update_part_fields`'s set-or-clear ones: `status` is always
+    /// overwritten, every other field only when the caller passes `Some` — an
+    /// absent field means "this frame said nothing about it", never "clear
+    /// what an earlier frame reported" (`.agents/rules/optional-wire-fields.md`).
+    /// `update_part_fields` cannot be reused here for that reason: it mirrors
+    /// a fully carried-forward in-memory `MessagePart`, which this caller does
+    /// not have — the part already left the accumulator that would have
+    /// carried its prior fields forward.
+    ///
+    /// Returns `false` when `entry_id` names no entry, or that entry has no
+    /// `Subagent` part for `task_id` — the caller's own bookkeeping named a
+    /// stale or wrong location. Nothing is written in that case, matching
+    /// `fold_event_into_parts`'s own drop of an update for a `task_id` it
+    /// never saw.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_late_subagent_update(
+        &self,
+        entry_id: &str,
+        task_id: &str,
+        status: comet_proto::SubagentStatus,
+        activity: Option<&str>,
+        summary: Option<&str>,
+        total_tokens: Option<u64>,
+        duration_ms: Option<u64>,
+        tool_uses: Option<u32>,
+    ) -> Result<bool, DocError> {
+        let status_value = serde_json::to_value(status)?;
+        let messages = self.doc.get_list("messages");
+        for i in 0..messages.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
+                messages.get(i)
+            else {
+                continue;
+            };
+            let id_matches = matches!(
+                entry.get("id"),
+                Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == entry_id
+            );
+            if !id_matches {
+                continue;
+            }
+            let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) =
+                entry.get("parts")
+            else {
+                return Ok(false);
+            };
+            for j in 0..parts.len() {
+                let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) =
+                    parts.get(j)
+                else {
+                    continue;
+                };
+                let is_subagent = matches!(
+                    part.get("kind"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == "subagent"
+                );
+                let id_matches = matches!(
+                    part.get("id"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == task_id
+                );
+                if !(is_subagent && id_matches) {
+                    continue;
+                }
+                part.insert("status", loro_value_from_json(&status_value))?;
+                if let Some(v) = activity {
+                    part.insert("activity", v)?;
+                }
+                if let Some(v) = summary {
+                    part.insert("summary", v)?;
+                }
+                if let Some(v) = total_tokens.and_then(checked_i64) {
+                    part.insert("totalTokens", v)?;
+                }
+                if let Some(v) = duration_ms.and_then(checked_i64) {
+                    part.insert("durationMs", v)?;
+                }
+                if let Some(v) = tool_uses {
+                    part.insert("toolUses", v as i64)?;
+                }
+                self.doc.commit();
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        Ok(false)
+    }
+
     /// Export a snapshot (persistence) — `ExportMode::Snapshot`.
     pub fn export_snapshot(&self) -> Result<Vec<u8>, DocError> {
         self.doc
@@ -2088,6 +2193,134 @@ mod tests {
         })
         .unwrap();
         assert_eq!(doc.cancel_running_subagents("m1").unwrap(), 0);
+    }
+
+    /// D98's shape at the doc layer: the run loop's live fold has already
+    /// moved on (the segment is finished), and the child's real outcome
+    /// arrives afterward, named by `entry_id`/`task_id` alone — the exact
+    /// call `comet_engine::sessions::drive_run` makes once its own
+    /// accumulator no longer holds the matching part. `activity: None` here
+    /// must NOT clear the prior reading — partial-patch semantics, not
+    /// `update_part_fields`'s set-or-clear ones.
+    #[test]
+    fn apply_late_subagent_update_patches_status_and_only_the_fields_present() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Subagent {
+                id: "sub-t1".into(),
+                task_id: "t1".into(),
+                agent_type: "general-purpose".into(),
+                description: "List current directory and count entries".into(),
+                status: comet_proto::SubagentStatus::Running,
+                activity: Some("Listing files".into()),
+                summary: None,
+                total_tokens: None,
+                duration_ms: None,
+                tool_uses: None,
+            }],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+
+        let patched = doc
+            .apply_late_subagent_update(
+                "m1",
+                "t1",
+                comet_proto::SubagentStatus::Completed,
+                None,
+                Some("Found 12 entries in the current directory."),
+                Some(1234),
+                Some(5000),
+                Some(3),
+            )
+            .unwrap();
+        assert!(patched, "a matching entry/task_id must be reported patched");
+
+        match &doc.read_entries().unwrap()[0].parts[0] {
+            MessagePart::Subagent {
+                status,
+                activity,
+                summary,
+                total_tokens,
+                duration_ms,
+                tool_uses,
+                ..
+            } => {
+                assert_eq!(*status, comet_proto::SubagentStatus::Completed);
+                assert_eq!(
+                    activity.as_deref(),
+                    Some("Listing files"),
+                    "an absent activity in the late update must not clear the prior reading"
+                );
+                assert_eq!(
+                    summary.as_deref(),
+                    Some("Found 12 entries in the current directory.")
+                );
+                assert_eq!(*total_tokens, Some(1234));
+                assert_eq!(*duration_ms, Some(5000));
+                assert_eq!(*tool_uses, Some(3));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        doc.validate_strict().unwrap();
+    }
+
+    #[test]
+    fn apply_late_subagent_update_is_false_for_a_task_id_the_entry_does_not_have() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "no subagents here".into(),
+            }],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+
+        let patched = doc
+            .apply_late_subagent_update(
+                "m1",
+                "t1",
+                comet_proto::SubagentStatus::Completed,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            !patched,
+            "the caller's own bookkeeping named a task_id this entry never had"
+        );
+    }
+
+    #[test]
+    fn apply_late_subagent_update_is_false_for_an_unknown_entry_id() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let patched = doc
+            .apply_late_subagent_update(
+                "missing-entry",
+                "t1",
+                comet_proto::SubagentStatus::Completed,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(!patched);
     }
 
     #[test]
