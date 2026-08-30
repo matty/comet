@@ -2614,6 +2614,45 @@ mod tests {
     }
 
     #[test]
+    fn claude_write_that_overwrites_existing_content_carries_the_replaced_text() {
+        // D18: `claude/2.1.251/write-overwrite` (PR #190, 2026-08-30) is a live
+        // `Write` over a file that already had different content. Frame 62 is
+        // the complete `tool_use`; frame 66 is its `tool_use_result`, which
+        // carries `originalFile` (the pre-write content) and a real
+        // `structuredPatch[]` hunk — the same shape `complete_tool_diff`
+        // already reads for `Edit`. This is the material a correct "+N -M"
+        // needs, and it is on the wire already: nothing here reads the
+        // filesystem to learn what the write replaced.
+        let frames = corpus_run("claude/2.1.251/write-overwrite", &[62, 66]);
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+        let events = drive(&mut normalizer, &frames);
+        let diff = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolResult { diff: Some(d), .. } => Some(d.clone()),
+                _ => None,
+            })
+            .expect("a Write over existing content must carry a diff");
+        // The corpus sanitizer redacts the actual source text to a numbered
+        // placeholder (D74), so the assertion rests on structure the redaction
+        // cannot hide: `old_text` must be POPULATED (not absent, which is the
+        // "no prior content" / create reading) and must differ from
+        // `new_text`, which `stat()` turns into a non-zero removed count —
+        // the "-0" this row is about.
+        assert!(
+            diff.old_text.is_some(),
+            "a Write that overwrites existing content must not read as a create: {diff:?}"
+        );
+        assert_ne!(diff.old_text.as_deref(), Some(diff.new_text.as_str()));
+        let stat = diff.stat();
+        assert!(
+            stat.deletions > 0,
+            "an overwrite must report replaced lines, not a bare +N -0: {stat:?}"
+        );
+        assert!(stat.additions > 0);
+    }
+
+    #[test]
     fn claude_edit_with_repeated_old_string_never_carries_a_diff() {
         let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"a.rs","old_string":"same","new_string":"new"}}]},"parent_tool_use_id":null}"#;
         let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"ok"}]},"parent_tool_use_id":null,"tool_use_result":{"userModified":false,"filePath":"a.rs","originalFile":"same and same"}}"#;
