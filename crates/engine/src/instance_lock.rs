@@ -62,6 +62,10 @@ impl InstanceLock {
             // keeps the flock alive for a few milliseconds after release. A
             // real second engine holds it forever; transient artifacts clear
             // well within the budget.
+            //
+            // EINTR is unbounded and un-slept: a signal landing mid-syscall
+            // is not evidence of anything, so it just retries the same
+            // attempt rather than eating into the contention budget below.
             let mut retries = 40u32; // × 25ms = 1s budget
             loop {
                 let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -103,10 +107,21 @@ impl InstanceLock {
 
     /// Best-effort liveness probe: the pid stamped by the engine currently holding
     /// this data dir's lock, `None` when no engine is running (or the platform
-    /// cannot test a lock without taking it). Used by `comet status` and the
-    /// login/logout guards; a single non-blocking try — no retry budget — so a
-    /// starting engine's transient fork-window artifacts read as "running", which
-    /// is the safe direction for those callers.
+    /// cannot test a lock without taking it). Used only for the informational
+    /// `comet status` line — the real exclusivity guard is always `acquire`,
+    /// never this — so a false "not running" costs a misleading status line,
+    /// not a double-launch.
+    ///
+    /// A single non-blocking try, no contention-retry budget: a starting
+    /// engine's transient fork-window artifact reads as "running", which is
+    /// the safe direction while a real second engine is still plausible.
+    /// But an attempt that fails for a reason that is *not* itself evidence
+    /// of a holder (a signal interrupting the syscall, an unrelated handle a
+    /// scanner or indexer left on the path, a stale byte-stamp nobody wrote)
+    /// must not be reported as one — that was D88: `holder()` read whatever
+    /// pid happened to be on disk the moment it failed to win the check,
+    /// with nothing confirming the pid named a process that was still
+    /// running. `pid_is_alive` is the confirmation step.
     pub fn holder(data_dir: &Path) -> Option<String> {
         let path = data_dir.join("engine.lock");
         #[cfg(unix)]
@@ -119,20 +134,25 @@ impl InstanceLock {
                 .truncate(false)
                 .open(&path)
                 .ok()?;
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if rc == 0 {
-                // We took it: nothing is running. Closing the fd releases it, but
-                // unlock explicitly so the window is as small as possible.
-                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-                return None;
+            loop {
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if rc == 0 {
+                    // We took it: nothing is running. Closing the fd releases it, but
+                    // unlock explicitly so the window is as small as possible.
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+                    return None;
+                }
+                match std::io::Error::last_os_error().raw_os_error() {
+                    Some(libc::EINTR) => continue, // not evidence either way: retry
+                    Some(libc::EWOULDBLOCK) => break,
+                    // Anything else is an environment problem, not confirmed
+                    // contention — do not read the pid off the back of it.
+                    _ => return None,
+                }
             }
             let pid = std::fs::read_to_string(&path).unwrap_or_default();
             let pid = pid.trim();
-            Some(if pid.is_empty() {
-                "unknown".to_string()
-            } else {
-                pid.to_string()
-            })
+            pid_is_alive(pid).then(|| pid.to_string())
         }
         #[cfg(windows)]
         {
@@ -144,11 +164,7 @@ impl InstanceLock {
                 Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => {
                     let pid = std::fs::read_to_string(&path).unwrap_or_default();
                     let pid = pid.trim();
-                    Some(if pid.is_empty() {
-                        "unknown".into()
-                    } else {
-                        pid.into()
-                    })
+                    pid_is_alive(pid).then(|| pid.to_string())
                 }
                 Err(_) => None,
             }
@@ -157,6 +173,50 @@ impl InstanceLock {
         {
             let _ = path;
             None
+        }
+    }
+}
+
+/// Best-effort check that `pid` currently names a running process on this
+/// machine, used to confirm a lock-probe failure before reporting the pid it
+/// found on disk as a live holder (see `InstanceLock::holder`'s doc comment).
+/// An unparseable or empty pid is never alive by definition.
+#[cfg(any(unix, windows))]
+fn pid_is_alive(pid: &str) -> bool {
+    let Ok(pid) = pid.parse::<u32>() else {
+        return false;
+    };
+    // Real pids never reach the top half of u32 on either platform; reject
+    // here rather than let the Unix cast below wrap into a negative
+    // `pid_t`, which `kill` reinterprets as a process-group signal.
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        // Signal 0 sends nothing; the kernel still validates the pid exists.
+        // A same-user engine process is always signalable, so any failure
+        // here (ESRCH: no such process; EPERM: exists but owned elsewhere)
+        // is treated the same way — we did not confirm it, so it is not
+        // reported as a holder.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        // SAFETY: the handle is checked for null, used only to prove it
+        // opened, then closed.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            CloseHandle(handle);
+            true
         }
     }
 }
@@ -193,5 +253,64 @@ mod tests {
         );
         drop(lock);
         InstanceLock::acquire(dir.path()).expect("acquire after release");
+    }
+
+    /// D88's post-drop race, reproduced without any timing dependency: a
+    /// `holder()` that reads a pid off disk the moment it cannot *itself*
+    /// win the exclusivity check is trusting a signal that does not
+    /// uniquely mean "another engine holds this". An unrelated handle on
+    /// the same path (an indexer, a virus scanner, or — per the debt row's
+    /// own guess — a stale handle left over from a process that never
+    /// really held `InstanceLock`) produces exactly that signal on Windows
+    /// without any `InstanceLock` involved at all, and the pid left on disk
+    /// (deliberately one no process can plausibly hold) is not verified
+    /// before being reported. On Unix this same construction does not
+    /// disturb `flock`, so the assertion holds there for a different,
+    /// already-correct reason — the point of the test is the platform where
+    /// it is not.
+    #[test]
+    fn holder_does_not_trust_a_stale_pid_it_cannot_verify_is_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine.lock");
+        // A pid outside any real process id range on either platform.
+        std::fs::write(&path, (u32::MAX - 1).to_string()).unwrap();
+        let _unrelated = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert_eq!(
+            InstanceLock::holder(dir.path()),
+            None,
+            "no InstanceLock is held, and the pid on disk cannot be confirmed alive"
+        );
+    }
+
+    #[test]
+    fn pid_is_alive_confirms_the_calling_process() {
+        assert!(pid_is_alive(&std::process::id().to_string()));
+    }
+
+    #[test]
+    fn pid_is_alive_rejects_a_pid_far_outside_any_real_range() {
+        assert!(!pid_is_alive(&(u32::MAX - 1).to_string()));
+    }
+
+    #[test]
+    fn pid_is_alive_rejects_unparseable_or_empty_input() {
+        assert!(!pid_is_alive(""));
+        assert!(!pid_is_alive("not-a-pid"));
+    }
+
+    #[test]
+    fn pid_is_alive_rejects_zero() {
+        assert!(!pid_is_alive("0"));
+    }
+
+    /// Guards the cast in the Unix arm: `pid as libc::pid_t` (an `i32`) wraps
+    /// a `u32` above `i32::MAX` into a negative value, which `kill` reads as
+    /// a process-*group* signal instead of a single-process existence check
+    /// — a different, wrong question that could return 0 (success) for
+    /// reasons unrelated to the pid we were asked about.
+    #[test]
+    fn pid_is_alive_rejects_a_pid_above_i32_max() {
+        let above_i32_max = (i32::MAX as u32) + 1;
+        assert!(!pid_is_alive(&above_i32_max.to_string()));
     }
 }
