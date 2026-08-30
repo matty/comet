@@ -307,14 +307,81 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
         requirements: Requirements::run(),
         launch: ScenarioLaunch::Run(claude::edit_request),
-        // The one Claude row that is not `no_fence`. It seeds a file in the cwd
-        // and asks the model to change it under `AutoAcceptEdits`, so there is
-        // no approval channel to protect and no grant-time recheck to lean on
-        // (`approval`'s protection). What is left worth guaranteeing is that
-        // the run does not start inside a repository somebody cares about,
+        // One of the Claude rows that is not `no_fence` (see `full_access_fence`'s own doc
+        // comment for the full list). It seeds a file in the cwd and asks the model to change
+        // it under `AutoAcceptEdits`, so there is no approval channel to protect and no
+        // grant-time recheck to lean on (`approval`'s protection). What is left worth
+        // guaranteeing is that the run does not start inside a repository somebody cares about,
         // which is exactly what this fence already checks.
         fence: super::full_access_fence,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::edit(s, i))),
+    },
+    ScenarioSpec {
+        name: "edit-create",
+        purpose: "capture what Claude's Edit tool DOES with an empty old_string against a path \
+                   that has never existed, under AutoAcceptEdits where no permission is asked \
+                   (D132); edit-create-approval is the sibling that asks whether Comet's \
+                   approval hook ever sees this input at all",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(claude::edit_create_request),
+        // Same reasoning as `edit` above: AutoAcceptEdits under this fence, not an approval
+        // round trip, is the whole guarantee available to a run with no seeded file to protect.
+        fence: super::full_access_fence,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::edit_create(s, i))),
+    },
+    ScenarioSpec {
+        name: "edit-create-approval",
+        purpose: "capture whether Claude's can_use_tool control channel raises a request at \
+                   all for the same empty-old_string Edit edit-create records, under \
+                   ApprovalRequired — the ordering question edit-create's AutoAcceptEdits run \
+                   cannot answer because it never asks permission (D132)",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::ApprovalRequired),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(claude::edit_create_approval_request),
+        // Same shape as `approval` below: the grant-time recheck in
+        // `edit_create_approval_grant` is the protection, not a pre-spawn fence — it allows
+        // only the one exact expected Edit input and declines everything else.
+        fence: no_fence,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::edit_create_approval(s, i))),
+    },
+    ScenarioSpec {
+        name: "edit-noop",
+        purpose: "capture what Claude's Edit tool DOES with old_string absent and new_string \
+                   empty, on a file that exists and has been read, under AutoAcceptEdits where \
+                   no permission is asked (D17's degenerate case); edit-noop-approval is the \
+                   sibling that asks whether Comet's approval hook ever sees this input at all",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(claude::edit_noop_request),
+        fence: super::full_access_fence,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::edit_noop(s, i))),
+    },
+    ScenarioSpec {
+        name: "edit-noop-approval",
+        purpose: "capture whether Claude's can_use_tool control channel raises a request at \
+                   all for the same degenerate Edit edit-noop records, under ApprovalRequired \
+                   — settles whether the shape is reachable from Comet's approval hook before \
+                   Claude's own tool-input validation ever runs (D17)",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::ApprovalRequired),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(claude::edit_noop_approval_request),
+        fence: no_fence,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::edit_noop_approval(s, i))),
+    },
+    ScenarioSpec {
+        name: "write-overwrite",
+        purpose: "capture a Claude Write call that overwrites an existing file's content (D18)",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(claude::write_overwrite_request),
+        fence: super::full_access_fence,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::write_overwrite(s, i))),
     },
     ScenarioSpec {
         name: "approval",
@@ -535,6 +602,11 @@ mod tests {
             ("codex", "auto"),
             ("codex", "full-access"),
             ("claude", "edit"),
+            ("claude", "edit-create"),
+            ("claude", "edit-create-approval"),
+            ("claude", "edit-noop"),
+            ("claude", "edit-noop-approval"),
+            ("claude", "write-overwrite"),
         ] {
             assert!(
                 scenario(provider, name).is_some(),
@@ -545,7 +617,7 @@ mod tests {
         assert!(scenario("codex", "model-discovery-logged-out").is_some());
         assert_eq!(
             SCENARIOS.len(),
-            26,
+            31,
             "an added or removed row must update this count too"
         );
     }

@@ -1,0 +1,40 @@
+{
+  "captured_at_unix_ms": 1788109518145,
+  "cli_version": "2.1.251 (Claude Code)",
+  "command": {
+    "args": [
+      "--print",
+      "--input-format",
+      "stream-json",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--include-partial-messages",
+      "--permission-prompt-tool",
+      "stdio",
+      "--model",
+      "claude-haiku-4-5-20251001",
+      "--effort",
+      "low",
+      "--permission-mode",
+      "default"
+    ],
+    "configured_env": {},
+    "creation_flags": 0,
+    "cwd": "<CWD>",
+    "kill_on_drop": true,
+    "program": "<HOME>\\.local\\bin\\claude.exe",
+    "stderr": "Piped",
+    "stdin": "Piped",
+    "stdout": "Piped"
+  },
+  "exit_code": 0,
+  "platform": {
+    "arch": "x86_64",
+    "os": "windows"
+  },
+  "provider": "claude",
+  "purpose": "capture whether Claude's can_use_tool control channel raises a request at all for the same empty-old_string Edit edit-create records, under ApprovalRequired — the ordering question edit-create's AutoAcceptEdits run cannot answer because it never asks permission (D132)",
+  "scenario": "edit-create-approval",
+  "schema_version": 1
+}

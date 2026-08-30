@@ -473,6 +473,360 @@ pub(in crate::record) async fn edit(
     session.wait_for_turn_end().await
 }
 
+/// D132, live: an `Edit` whose `old_string` is empty and whose `new_string` is non-empty, on a
+/// path that has never existed.
+///
+/// **Every value is fixed and boring on purpose**, same rationale as [`EDIT_TARGET_NAME`] above.
+/// This is the question D132's own row names: older Claude Code documented an `Edit` with an
+/// empty `old_string` as CREATING the file, and `claude/2.1.251/edit` — an ordinary edit on an
+/// existing, already-read file — cannot speak to it at all. This scenario targets a path nothing
+/// has ever written, so whatever the CLI does with it is the missing evidence.
+const EDIT_CREATE_TARGET_NAME: &str = "capture-edit-create-target.txt";
+const EDIT_CREATE_NEW_STRING: &str = "created by edit\n";
+
+/// The prompt for [`edit_create`]. Deliberately no `Read` step: the whole point of the scenario
+/// is a path nothing has read because nothing has ever written it, and asking for one would
+/// either fail for an unrelated reason (no file to read) or, if the CLI tolerates it, blur the
+/// case under test with `edit`'s already-answered one.
+fn claude_edit_create_prompt(cwd: &Path) -> String {
+    let target = cwd.join(EDIT_CREATE_TARGET_NAME);
+    let path = serde_json::to_string(&target.display().to_string()).expect("path serializes");
+    format!(
+        "The file {path} does not exist yet. Use Edit exactly once with input {{\"file_path\":{path},\"old_string\":\"\",\"new_string\":{}}}. Do not use Read, Write, or any other tool.",
+        serde_json::to_string(EDIT_CREATE_NEW_STRING).expect("static string serializes"),
+    )
+}
+
+/// Same one-call-per-recording contract as `fresh_text_request` above.
+pub(in crate::record) fn edit_create_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
+    let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
+    Ok(cheap_claude_request(
+        &claude_edit_create_prompt(&cwd),
+        input,
+        RuntimeMode::AutoAcceptEdits,
+    ))
+}
+
+/// D132's whole question, live: does Claude's `Edit` tool create a file when `old_string` is
+/// empty and the path does not exist, refuse the call, or something else. Whatever happens —
+/// a successful create, a `tool_use_result` error, or the model declining the exact call it was
+/// told to make — is the frame this scenario exists to record. Nothing here bends the outcome
+/// toward a nicer answer.
+///
+/// **No file is seeded.** Unlike [`edit`], the target's absence IS the scenario.
+pub(in crate::record) async fn edit_create(
+    session: &mut Session<ClaudeProvider>,
+    _input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    let request = session
+        .request
+        .clone()
+        .expect("edit-create is a Run scenario and always carries a request");
+    let target = PathBuf::from(&request.cwd).join(EDIT_CREATE_TARGET_NAME);
+    if target.exists() {
+        anyhow::bail!(
+            "edit-create target {} already exists; the scenario needs a path that has never \
+             been written",
+            target.display()
+        );
+    }
+
+    let line = claude_user_line(&request, false).await?;
+    session.send(&line).await?;
+    session.wait_for_turn_end().await
+}
+
+/// D17's degenerate case, live: `old_string` absent and `new_string` empty, on a file that DOES
+/// exist and has been read. `claude/approval.rs`'s `(None, true)` arm reads this as
+/// `FileOperation::Unknown` today — decided from the typed contract alone, never from a captured
+/// frame. This settles what Claude's own `Edit` tool does when asked for it: refuse the call as a
+/// no-op, accept it as a genuine (empty) edit, or something else.
+const EDIT_NOOP_TARGET_NAME: &str = "capture-edit-noop-target.txt";
+const EDIT_NOOP_ORIGINAL: &str = "left untouched\n";
+
+/// The prompt for [`edit_noop`]. Reads first, exactly like [`claude_edit_prompt`] — the file
+/// exists, so the same "Claude refuses to edit a file it has not read" contract applies here.
+/// The `Edit` call's input deliberately omits the `old_string` key rather than sending an empty
+/// one: it is the `(None, true)` arm this scenario is for, not `(Some(""), true)`, which
+/// `approval.rs`'s own comment says reads identically but which `edit_noop` is not testing.
+fn claude_edit_noop_prompt(cwd: &Path) -> String {
+    let target = cwd.join(EDIT_NOOP_TARGET_NAME);
+    let path = serde_json::to_string(&target.display().to_string()).expect("path serializes");
+    format!(
+        "Use Read once with input {{\"file_path\":{path}}}, then use Edit exactly once with \
+         input {{\"file_path\":{path},\"new_string\":\"\"}}. Do not include an old_string key in \
+         the Edit input. Use no other tool."
+    )
+}
+
+/// Same one-call-per-recording contract as `fresh_text_request` above.
+pub(in crate::record) fn edit_noop_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
+    let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
+    Ok(cheap_claude_request(
+        &claude_edit_noop_prompt(&cwd),
+        input,
+        RuntimeMode::AutoAcceptEdits,
+    ))
+}
+
+/// D17's degenerate case, live — see [`claude_edit_noop_prompt`] for what is being asked and why.
+pub(in crate::record) async fn edit_noop(
+    session: &mut Session<ClaudeProvider>,
+    _input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    let request = session
+        .request
+        .clone()
+        .expect("edit-noop is a Run scenario and always carries a request");
+    let target = PathBuf::from(&request.cwd).join(EDIT_NOOP_TARGET_NAME);
+    std::fs::write(&target, EDIT_NOOP_ORIGINAL).map_err(|error| {
+        anyhow::anyhow!(
+            "edit-noop target {} could not be seeded: {error}",
+            target.display()
+        )
+    })?;
+
+    let line = claude_user_line(&request, false).await?;
+    session.send(&line).await?;
+    session.wait_for_turn_end().await
+}
+
+/// D18, live: a `Write` that overwrites a file that already has different content. The row asks
+/// whether the result frame gives a fix the same `originalFile`/`structuredPatch[]` material
+/// `claude/2.1.251/edit` settled for `Edit`, or nothing of the kind — which would mean a fix has
+/// to read the replaced file itself rather than lean on the result payload.
+const WRITE_OVERWRITE_TARGET_NAME: &str = "capture-write-overwrite-target.txt";
+const WRITE_OVERWRITE_ORIGINAL: &str = "old line one\nold line two\n";
+const WRITE_OVERWRITE_NEW_CONTENT: &str = "brand new content\n";
+
+/// The prompt for [`write_overwrite`]. Reads first, on the same precedent as
+/// [`claude_edit_prompt`]: whether `Write` shares `Edit`'s "must read first" contract for a file
+/// that already exists is itself unmeasured, and the Read costs one extra tool call against the
+/// risk of burning the whole recording on a refusal the way the first `edit` attempt did.
+fn claude_write_overwrite_prompt(cwd: &Path) -> String {
+    let target = cwd.join(WRITE_OVERWRITE_TARGET_NAME);
+    let path = serde_json::to_string(&target.display().to_string()).expect("path serializes");
+    format!(
+        "Use Read once with input {{\"file_path\":{path}}}, then use Write exactly once with \
+         input {{\"file_path\":{path},\"content\":{}}}. Use no other tool.",
+        serde_json::to_string(WRITE_OVERWRITE_NEW_CONTENT).expect("static string serializes"),
+    )
+}
+
+/// Same one-call-per-recording contract as `fresh_text_request` above.
+pub(in crate::record) fn write_overwrite_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
+    let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
+    Ok(cheap_claude_request(
+        &claude_write_overwrite_prompt(&cwd),
+        input,
+        RuntimeMode::AutoAcceptEdits,
+    ))
+}
+
+/// D18, live — see [`claude_write_overwrite_prompt`] for what is being asked and why.
+pub(in crate::record) async fn write_overwrite(
+    session: &mut Session<ClaudeProvider>,
+    _input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    let request = session
+        .request
+        .clone()
+        .expect("write-overwrite is a Run scenario and always carries a request");
+    let target = PathBuf::from(&request.cwd).join(WRITE_OVERWRITE_TARGET_NAME);
+    std::fs::write(&target, WRITE_OVERWRITE_ORIGINAL).map_err(|error| {
+        anyhow::anyhow!(
+            "write-overwrite target {} could not be seeded: {error}",
+            target.display()
+        )
+    })?;
+
+    let line = claude_user_line(&request, false).await?;
+    session.send(&line).await?;
+    session.wait_for_turn_end().await
+}
+
+/// The reply for one `can_use_tool` request answered by an `edit-*-approval` scenario: allow
+/// (echoing the request's own input back unmodified, exactly as [`decision_response`] does for
+/// `approval`) when `grant` accepts it, deny with its error text otherwise.
+///
+/// A free function rather than a copy of [`decision_response`] inlined per scenario: the two
+/// `edit-*-approval` bodies below need different accept rules (Read+Edit vs. Edit alone) but the
+/// same "allow the exact expected input, decline and keep recording on anything else" shape
+/// `claude_marker_grant` established for `approval`.
+fn approval_mode_decision(request_id: &str, input: &Value, grant: anyhow::Result<()>) -> String {
+    let response = match grant {
+        Ok(()) => comet_harness::claude::wire::allow_response(input.clone()),
+        Err(err) => comet_harness::claude::wire::deny_response(err.to_string()),
+    };
+    comet_harness::claude::wire::control_response_line(request_id, response)
+}
+
+/// D132, under real permission gating: does Claude's `can_use_tool` control channel raise a
+/// request for an `Edit` whose `old_string` is empty and whose `new_string` is non-empty,
+/// against a path that has never existed — the same input [`edit_create`] recorded under
+/// `AutoAcceptEdits`, which never asks permission at all and so cannot show whether Comet's
+/// `approval.rs` decode ever meets this shape on the wire in the first place.
+///
+/// Only the exact expected `Edit` input is granted; anything else is declined and recording
+/// continues, the same defensive shape [`claude_marker_grant`] uses for `approval`.
+fn edit_create_approval_grant(tool_name: &str, input: &Value, target: &Path) -> anyhow::Result<()> {
+    if tool_name == "Edit" {
+        // `replace_all: false` rides along even though the prompt never mentions it — the SDK's
+        // Edit tool schema defaults it, and `edit_create`'s own raw capture shows the same key
+        // on the wire for identical input. Matching without it here declined a genuinely correct
+        // request twice on the first recording attempt before this fix.
+        let expected = json!({
+            "file_path": target.display().to_string(),
+            "old_string": "",
+            "new_string": EDIT_CREATE_NEW_STRING,
+            "replace_all": false,
+        });
+        if input == &expected {
+            return Ok(());
+        }
+        anyhow::bail!("edit-create-approval request was not the expected Edit input.");
+    }
+    anyhow::bail!("edit-create-approval request used an unexpected tool.");
+}
+
+/// Same one-call-per-recording contract as `fresh_text_request` above, under `ApprovalRequired`
+/// rather than `edit_create_request`'s `AutoAcceptEdits` — the whole point of this row.
+pub(in crate::record) fn edit_create_approval_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
+    let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
+    Ok(cheap_claude_request(
+        &claude_edit_create_prompt(&cwd),
+        input,
+        RuntimeMode::ApprovalRequired,
+    ))
+}
+
+/// D132's ordering question, live: send the same `edit-create` prompt, but this time under
+/// `ApprovalRequired` so a real `can_use_tool` round trip is the only way the `Edit` call can
+/// reach the filesystem at all. Whether that request ever arrives — and if it does, what its
+/// `input` looks like on the wire — is the frame this scenario exists to record.
+pub(in crate::record) async fn edit_create_approval(
+    session: &mut Session<ClaudeProvider>,
+    _input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    let request = session
+        .request
+        .clone()
+        .expect("edit-create-approval is a Run scenario and always carries a request");
+    let cwd = PathBuf::from(&request.cwd);
+    let target = cwd.join(EDIT_CREATE_TARGET_NAME);
+    if target.exists() {
+        anyhow::bail!(
+            "edit-create-approval target {} already exists; the scenario needs a path that has \
+             never been written",
+            target.display()
+        );
+    }
+
+    let line = claude_user_line(&request, false).await?;
+    session.send(&line).await?;
+    loop {
+        let Some(frame) = session.next_frame().await? else {
+            return protocol_stopped("Claude", "an approval request or a turn end");
+        };
+        if ClaudeProvider::turn_complete(&frame) {
+            return Ok(());
+        }
+        if let Some((request_id, tool_name, tool_input)) = pending_approval(&frame) {
+            let grant = edit_create_approval_grant(&tool_name, &tool_input, &target);
+            session
+                .send(&approval_mode_decision(&request_id, &tool_input, grant))
+                .await?;
+        }
+    }
+}
+
+/// D17's degenerate case, under real permission gating: does `can_use_tool` fire for an `Edit`
+/// whose `old_string` is absent and `new_string` empty at all, or does Claude's own tool-input
+/// validation reject the call before it ever reaches Comet's approval hook. [`edit_noop`]
+/// recorded what the tool does once it runs under `AutoAcceptEdits`, which never asks
+/// permission and so cannot answer this ordering question either way.
+///
+/// Grants the expected `Read` (needed to satisfy Claude's "must read before Edit" contract,
+/// same as [`edit_noop`]) and the expected degenerate `Edit`; declines anything else.
+fn edit_noop_approval_grant(tool_name: &str, input: &Value, target: &Path) -> anyhow::Result<()> {
+    match tool_name {
+        "Read" => {
+            let expected = json!({"file_path": target.display().to_string()});
+            if input == &expected {
+                return Ok(());
+            }
+            anyhow::bail!("edit-noop-approval Read request did not match the expected file.");
+        }
+        "Edit" => {
+            let expected = json!({
+                "file_path": target.display().to_string(),
+                "new_string": "",
+            });
+            if input == &expected {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "edit-noop-approval Edit request did not match the expected degenerate input."
+            );
+        }
+        _ => anyhow::bail!("edit-noop-approval request used an unexpected tool."),
+    }
+}
+
+/// Same one-call-per-recording contract as `fresh_text_request` above, under `ApprovalRequired`
+/// rather than `edit_noop_request`'s `AutoAcceptEdits` — the whole point of this row.
+pub(in crate::record) fn edit_noop_approval_request(
+    input: &ScenarioInput,
+) -> anyhow::Result<RunRequest> {
+    let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
+    Ok(cheap_claude_request(
+        &claude_edit_noop_prompt(&cwd),
+        input,
+        RuntimeMode::ApprovalRequired,
+    ))
+}
+
+/// D17's ordering question, live — see [`edit_noop_approval_grant`] for what is being asked and
+/// why. Seeds the same target [`edit_noop`] does, because the `Read` this prompt asks for first
+/// needs a real file to read.
+pub(in crate::record) async fn edit_noop_approval(
+    session: &mut Session<ClaudeProvider>,
+    _input: &ScenarioInput,
+) -> anyhow::Result<()> {
+    let request = session
+        .request
+        .clone()
+        .expect("edit-noop-approval is a Run scenario and always carries a request");
+    let target = PathBuf::from(&request.cwd).join(EDIT_NOOP_TARGET_NAME);
+    std::fs::write(&target, EDIT_NOOP_ORIGINAL).map_err(|error| {
+        anyhow::anyhow!(
+            "edit-noop-approval target {} could not be seeded: {error}",
+            target.display()
+        )
+    })?;
+
+    let line = claude_user_line(&request, false).await?;
+    session.send(&line).await?;
+    loop {
+        let Some(frame) = session.next_frame().await? else {
+            return protocol_stopped("Claude", "an approval request or a turn end");
+        };
+        if ClaudeProvider::turn_complete(&frame) {
+            return Ok(());
+        }
+        if let Some((request_id, tool_name, tool_input)) = pending_approval(&frame) {
+            let grant = edit_noop_approval_grant(&tool_name, &tool_input, &target);
+            session
+                .send(&approval_mode_decision(&request_id, &tool_input, grant))
+                .await?;
+        }
+    }
+}
+
 /// Same one-call-per-recording contract as `fresh_text_request` above.
 pub(in crate::record) fn approval_request(input: &ScenarioInput) -> anyhow::Result<RunRequest> {
     let cwd = input.cwd.clone().unwrap_or_else(std::env::temp_dir);
@@ -1147,6 +1501,23 @@ mod tests {
             ),
             ("approval", approval_request(&plain).unwrap().runtime_mode),
             ("edit", edit_request(&plain).unwrap().runtime_mode),
+            (
+                "edit-create",
+                edit_create_request(&plain).unwrap().runtime_mode,
+            ),
+            (
+                "edit-create-approval",
+                edit_create_approval_request(&plain).unwrap().runtime_mode,
+            ),
+            ("edit-noop", edit_noop_request(&plain).unwrap().runtime_mode),
+            (
+                "edit-noop-approval",
+                edit_noop_approval_request(&plain).unwrap().runtime_mode,
+            ),
+            (
+                "write-overwrite",
+                write_overwrite_request(&plain).unwrap().runtime_mode,
+            ),
             ("resume", resume_request(&with_resume).unwrap().runtime_mode),
             (
                 "attachment",

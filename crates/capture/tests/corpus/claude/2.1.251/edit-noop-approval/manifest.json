@@ -1,0 +1,40 @@
+{
+  "captured_at_unix_ms": 1788109621699,
+  "cli_version": "2.1.251 (Claude Code)",
+  "command": {
+    "args": [
+      "--print",
+      "--input-format",
+      "stream-json",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--include-partial-messages",
+      "--permission-prompt-tool",
+      "stdio",
+      "--model",
+      "claude-haiku-4-5-20251001",
+      "--effort",
+      "low",
+      "--permission-mode",
+      "default"
+    ],
+    "configured_env": {},
+    "creation_flags": 0,
+    "cwd": "<CWD>",
+    "kill_on_drop": true,
+    "program": "<HOME>\\.local\\bin\\claude.exe",
+    "stderr": "Piped",
+    "stdin": "Piped",
+    "stdout": "Piped"
+  },
+  "exit_code": 0,
+  "platform": {
+    "arch": "x86_64",
+    "os": "windows"
+  },
+  "provider": "claude",
+  "purpose": "capture whether Claude's can_use_tool control channel raises a request at all for the same degenerate Edit edit-noop records, under ApprovalRequired — settles whether the shape is reachable from Comet's approval hook before Claude's own tool-input validation ever runs (D17)",
+  "scenario": "edit-noop-approval",
+  "schema_version": 1
+}
