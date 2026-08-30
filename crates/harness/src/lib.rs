@@ -490,6 +490,18 @@ pub(crate) const NOTICE_DETAIL_MAX: usize = 480;
 /// [`NOTICE_DETAIL_MAX`] — no reason for a subagent's instructions to get a
 /// materially different allowance than any other provider prose.
 pub(crate) const SUBAGENT_PROMPT_MAX: usize = NOTICE_DETAIL_MAX;
+/// Byte budget for a subagent's `description` (D56), capped at the same
+/// boundary and for the same class of reason as `SUBAGENT_PROMPT_MAX`: the
+/// Task tool's own contract with the model is "a short (3-5 word)
+/// description of the task", but nothing on the wire enforces that, so a
+/// model that ignores it must not carry an unbounded label all the way into
+/// the persisted doc. Unlike `prompt` this is not a privacy cap — a task
+/// label is not the sensitive half of a subagent call — it exists only to
+/// bound a field the wire never bounds. `description` is a label, the same
+/// class of short text as a notice `summary`, not a body like `prompt` or
+/// `NOTICE_DETAIL_MAX`, so it shares `NOTICE_SUMMARY_MAX`'s budget rather
+/// than the longer one.
+pub(crate) const SUBAGENT_DESCRIPTION_MAX: usize = NOTICE_SUMMARY_MAX;
 
 /// Cap unbounded provider prose at the harness boundary: truncate to
 /// `max_bytes` on a char boundary and append an ellipsis. Irreversible for

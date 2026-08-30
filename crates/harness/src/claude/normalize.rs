@@ -856,7 +856,10 @@ impl Normalizer {
                     task_id: f.task_id,
                     tool_use_id: f.tool_use_id.unwrap_or_default(),
                     agent_type: f.subagent_type.unwrap_or_default(),
-                    description: f.description.unwrap_or_default(),
+                    description: crate::cap_prose(
+                        &f.description.unwrap_or_default(),
+                        crate::SUBAGENT_DESCRIPTION_MAX,
+                    ),
                     prompt: f
                         .prompt
                         .map(|p| crate::cap_prose(&p, crate::SUBAGENT_PROMPT_MAX)),
@@ -1844,6 +1847,31 @@ mod tests {
                 let prompt = prompt.as_ref().expect("prompt present");
                 assert_eq!(prompt.len(), crate::SUBAGENT_PROMPT_MAX + '…'.len_utf8());
                 assert!(prompt.ends_with('…'));
+            }
+            other => panic!("expected SubagentStarted, got {other:?}"),
+        }
+    }
+
+    /// `description` is the Task tool's own label field — the model's
+    /// contract with it is "a short (3-5 word) description of the task" —
+    /// but nothing on the wire enforces that, so a model that ignores it
+    /// must not carry an unbounded label all the way into the persisted
+    /// doc (D56). Capped the same way `prompt` is: at the harness boundary,
+    /// before the event is built. `SUBAGENT_DESCRIPTION_MAX` is 160 bytes;
+    /// the input has to exceed that for the assertion to be non-vacuous.
+    #[test]
+    fn an_oversized_description_is_capped_at_the_harness_boundary() {
+        let long_description = "x".repeat(200);
+        let raw = format!(
+            r#"{{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"tu1","description":"{long_description}","subagent_type":"general-purpose","prompt":"p"}}"#
+        );
+        match &normalize_one(&raw)[0] {
+            AgentEvent::SubagentStarted { description, .. } => {
+                assert_eq!(
+                    description.len(),
+                    crate::SUBAGENT_DESCRIPTION_MAX + '…'.len_utf8()
+                );
+                assert!(description.ends_with('…'));
             }
             other => panic!("expected SubagentStarted, got {other:?}"),
         }

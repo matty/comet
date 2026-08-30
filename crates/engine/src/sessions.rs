@@ -1746,6 +1746,23 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
             // carry something heavy has to make that decision here rather than
             // inherit it silently.
             MessagePart::Approval { .. } => part.clone(),
+            // `Subagent` DOES carry something heavy — `summary` is the
+            // child's full answer — and the decision for it was made
+            // (D56), not inherited: `summary` is the product's own
+            // displayed content, the same kind as `TextDelta` and
+            // `Done.result`, both uncapped end-to-end for the same reason.
+            // Capping it here would truncate real content before any
+            // surface decides how to present it, so it is passed through
+            // whole on purpose. Do not add a cap here.
+            //
+            // `description` is not that kind of field — it is the Task
+            // tool's own label, contracted with the model to be "a short
+            // (3-5 word) description of the task" — so it is bounded
+            // against a model that ignores that contract at the harness
+            // boundary instead (`claude::normalize`'s
+            // `SUBAGENT_DESCRIPTION_MAX`, the same place and reason
+            // `prompt` is bounded), and reaches this fold already capped.
+            MessagePart::Subagent { .. } => part.clone(),
             other => other.clone(),
         })
         .collect()
