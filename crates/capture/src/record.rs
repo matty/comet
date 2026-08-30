@@ -10,6 +10,7 @@ mod provider;
 mod providers;
 mod scenarios;
 mod session;
+pub use session::SESSION_ID_FILE;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
