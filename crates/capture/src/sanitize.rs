@@ -30,6 +30,14 @@ pub struct SanitizationReport {
     /// reproducing what was withheld. See `NovelPath` for what each entry
     /// carries and, just as importantly, what it deliberately does not.
     pub novel_paths: Vec<NovelPath>,
+    /// Every *undeclared* object this capture holds whose own keys look
+    /// data-shaped rather than field-shaped (D77's residual): a candidate
+    /// for `surface::MAP_PATHS`, found by [`surface::suspected_map`] before
+    /// any corpus is ever promoted for this provider — the moment the
+    /// capability sheet's own golden test cannot yet help, because there is
+    /// no sheet to compare against. A human still decides; this only makes
+    /// sure the question is asked. See `render_suspected_maps_report`.
+    pub suspected_maps: Vec<surface::SuspectedMap>,
 }
 
 /// One path the allowlist withheld a value for, described without
@@ -160,6 +168,12 @@ struct Redactor {
     /// exactly what the replacement withheld -- `novel` already counts
     /// that one at its `.{}` position.
     escaped: BTreeSet<String>,
+    /// One entry per *undeclared* object path whose own keys looked
+    /// data-shaped (D77's residual). Keyed by path so a path visited by many
+    /// frames (a map appearing on every `turn_completed`, say) is reported
+    /// once, not once per frame -- first occurrence wins, the same way
+    /// `record_novel`'s `or_insert_with` treats a repeated path.
+    suspected: BTreeMap<String, surface::SuspectedMap>,
 }
 
 #[derive(Clone)]
@@ -260,6 +274,7 @@ pub fn sanitize_dir(
     // of them.
     let novel_paths = redactor.novel_paths();
     let escaped_paths = redactor.escaped_paths();
+    let suspected_maps = redactor.suspected_maps();
     let manifest = json!({
         "schema_version": 1,
         "provider": capture.provider,
@@ -292,6 +307,7 @@ pub fn sanitize_dir(
         manifest_bytes,
         novel_paths,
         escaped_paths,
+        suspected_maps,
     })
 }
 
@@ -704,6 +720,19 @@ impl Redactor {
                 // `preserve_order` feature. Rebuilding in iteration order is
                 // correct whichever backend is compiled in.
                 let is_map = surface::is_map_path(path);
+                // D77's residual: an object at a path nobody declared is
+                // walked below as ordinary field names, whatever its keys
+                // actually are. This is the one place that still sees the
+                // *original* keys before any of them turn into a field path
+                // or a placeholder, so it is the only place a heuristic
+                // warning can be raised at all -- checked before the
+                // rebuild loop below consumes `object`.
+                if !is_map
+                    && let Some(found) =
+                        surface::suspected_map(path, object.keys().map(String::as_str))
+                {
+                    self.suspected.entry(found.path.clone()).or_insert(found);
+                }
                 let mut rebuilt = serde_json::Map::with_capacity(object.len());
                 for (index, (child_key, mut child)) in
                     std::mem::take(object).into_iter().enumerate()
@@ -823,6 +852,12 @@ impl Redactor {
                 shape: describe_shape(values),
             })
             .collect()
+    }
+
+    /// The suspected-map report, sorted by path (inherited from
+    /// `BTreeMap`'s iteration order).
+    fn suspected_maps(&self) -> Vec<surface::SuspectedMap> {
+        self.suspected.values().cloned().collect()
     }
 
     /// The placeholder for `value` under `key`'s named group —
@@ -1344,6 +1379,40 @@ pub fn render_escaped_paths_report(escaped_paths: &[String]) -> String {
     }
     let mut lines = vec![header.to_owned()];
     lines.extend(escaped_paths.iter().map(|path| format!("  {path}")));
+    lines.join("\n")
+}
+
+/// D77's heuristic warning, printed by `comet-provider-sanitize` alongside
+/// the novel-path and escaped-key reports so the operator reviewing a
+/// capture -- the same person and the same moment `provider-captures.md`'s
+/// "Review before promotion" section already governs -- sees a candidate
+/// undeclared map even when no corpus is promoted yet for this provider to
+/// let the capability sheet's own golden test catch it later. Never prints
+/// a key's actual spelling, only a path and a count: the object might hold
+/// exactly the account, machine or MCP-server name this mechanism exists to
+/// keep out of the archive.
+pub fn render_suspected_maps_report(suspected_maps: &[surface::SuspectedMap]) -> String {
+    let header = "Possible undeclared maps (D77): these paths hold objects whose keys mostly \
+                  don't look like field names. If a key here is an MCP server, account or \
+                  machine name, declare the path in `surface::MAP_PATHS` before this is ever \
+                  promoted -- the capability sheet cannot catch it until then:";
+    if suspected_maps.is_empty() {
+        return format!("{header}\n  (none -- every undeclared object's keys look field-shaped)");
+    }
+    let path_width = suspected_maps
+        .iter()
+        .map(|entry| entry.path.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines = vec![header.to_owned()];
+    for entry in suspected_maps {
+        lines.push(format!(
+            "  {path:<path_width$}  {non_identifier} of {total} keys look data-shaped",
+            path = entry.path,
+            non_identifier = entry.non_identifier_count,
+            total = entry.key_count,
+        ));
+    }
     lines.join("\n")
 }
 
@@ -1871,6 +1940,7 @@ mod tests {
         let events_bytes = serde_json::to_vec(&value).expect("sanitized value encodes");
         let novel_paths = redactor.novel_paths();
         let escaped_paths = redactor.escaped_paths();
+        let suspected_maps = redactor.suspected_maps();
         let manifest_bytes =
             serde_json::to_vec(&json!({ "schema_version": 1 })).expect("manifest encodes");
         SanitizationReport {
@@ -1880,6 +1950,7 @@ mod tests {
             manifest_bytes,
             novel_paths,
             escaped_paths,
+            suspected_maps,
         }
     }
 

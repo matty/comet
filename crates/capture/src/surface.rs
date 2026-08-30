@@ -232,6 +232,92 @@ pub const MAP_PATHS: &[MapPath] = &[
     },
 ];
 
+/// Whether `key` looks like a field name a developer chose, rather than a
+/// runtime identifier a provider generated at that position — the signal
+/// D77's own row asks for: "a heuristic *warning* on any object whose keys
+/// don't look like identifiers."
+///
+/// ASCII letters, digits and underscore only, and not starting with a digit
+/// — an ordinary programming identifier. Every kind of data key this row has
+/// actually recorded fails it for a different, real reason: a model id
+/// (`claude-haiku-4-5-20251001`, `grok-4.6`) carries a hyphen and a dot, a
+/// UUID or session id carries hyphens, an email address or hostname carries
+/// a dot, a bare numeric id starts with a digit. Digits elsewhere are not
+/// enough on their own to fail it — `costUSD`-style and versioned field
+/// spellings are ordinary — only the *shape* of a hand-picked name is being
+/// asked for here, not the absence of digits.
+///
+/// Deliberately does not special-case a vendor namespace like `_meta`'s own
+/// `x.ai/sessionConfig` — that one key fails this check same as any other
+/// slash-and-dot key would. [`suspected_map`] is what keeps a single such
+/// key, sitting beside ordinary siblings, from reading as a whole object of
+/// data: it counts across the object's keys rather than flagging one key in
+/// isolation.
+pub fn is_identifier_shaped(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// One dotted path where an *undeclared* object's own keys look enough like
+/// data to be a [`MAP_PATHS`] candidate — found by shape, at review time,
+/// rather than by a human noticing a capability-sheet field with a
+/// data-shaped name after promotion (D77's own backstop, and the one the
+/// row says cannot fire before a provider has any promoted corpus at all).
+///
+/// Carries counts only, never a key's actual spelling: the same
+/// never-reproduce-what-was-withheld rule [`NovelPath`] in `sanitize.rs`
+/// follows for a redacted map key applies here too, before any redaction
+/// decision has even been made — the object might turn out to hold exactly
+/// the account name or machine id this whole mechanism exists to keep out of
+/// the archive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuspectedMap {
+    pub path: String,
+    pub key_count: usize,
+    pub non_identifier_count: usize,
+}
+
+/// Judges one object's own keys — not `MAP_PATHS`-folded, so a genuinely
+/// declared map never reaches this at all; callers are expected to check
+/// [`is_map_path`] first, the same way [`Visit::walk`] already does before
+/// deciding whether to fold a child.
+///
+/// **Strict majority, not "any."** A single vendor-namespaced field sitting
+/// beside ordinary siblings (`_meta`'s `x.ai/sessionConfig` next to
+/// `claudeCode`, `steering`, `goal`, `jetbrains` — four identifier-shaped
+/// names against one) must not read as a suspected map; that path is already
+/// reviewed field-by-field on `allowlist/acp.txt`, and re-litigating it on
+/// every sanitize run is exactly the "fires on everything" failure mode that
+/// makes a heuristic useless. A map genuinely keyed by data — model ids,
+/// account names, machine ids — has *every* key non-identifier-shaped, so
+/// requiring a strict majority still catches it with room to spare,
+/// including the one-key case the row's own example describes (a one-model
+/// machine's `.modelUsage` has exactly one key, and one non-identifier key
+/// out of one is a unanimous, not a narrow, majority).
+pub fn suspected_map<'a>(path: &str, keys: impl Iterator<Item = &'a str>) -> Option<SuspectedMap> {
+    let mut key_count = 0usize;
+    let mut non_identifier_count = 0usize;
+    for key in keys {
+        key_count += 1;
+        if !is_identifier_shaped(key) {
+            non_identifier_count += 1;
+        }
+    }
+    if key_count > 0 && non_identifier_count * 2 > key_count {
+        Some(SuspectedMap {
+            path: path.to_owned(),
+            key_count,
+            non_identifier_count,
+        })
+    } else {
+        None
+    }
+}
+
 /// The declared entry for `path`, if any. The one place both this module and
 /// its two other readers (`sanitize.rs`'s key-survival check,
 /// `allowlist_property.rs`'s audit of the committed corpus) look up a
@@ -615,8 +701,86 @@ fn scalar_string(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::escape_path_segment;
+    use super::{escape_path_segment, is_identifier_shaped, suspected_map};
     use std::borrow::Cow;
+
+    /// Ordinary field spellings — camelCase, snake_case, PascalCase, a
+    /// digit-bearing but hand-picked name — all read as identifier-shaped.
+    #[test]
+    fn ordinary_field_names_are_identifier_shaped() {
+        for key in ["costUSD", "stop_reason", "ClaudeCode", "gpt4", "_meta"] {
+            assert!(
+                is_identifier_shaped(key),
+                "{key} should be identifier-shaped"
+            );
+        }
+    }
+
+    /// Every data-key shape this row has actually recorded fails for its own
+    /// reason: a model id's hyphen and dot, a UUID's hyphens, a vendor
+    /// namespace's slash and dot, a bare numeric id's leading digit.
+    #[test]
+    fn data_shaped_keys_are_not_identifier_shaped() {
+        for key in [
+            "claude-haiku-4-5-20251001",
+            "grok-4.6",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "x.ai/sessionConfig",
+            "12345",
+        ] {
+            assert!(
+                !is_identifier_shaped(key),
+                "{key} should not be identifier-shaped"
+            );
+        }
+    }
+
+    /// The majority rule directly: two data-shaped model-id keys, no
+    /// ordinary field name in sight, is a unanimous majority.
+    #[test]
+    fn suspected_map_fires_when_every_key_is_data_shaped() {
+        let found = suspected_map(
+            ".modelUsage",
+            ["claude-haiku-4-5-20251001", "claude-sonnet-5"].into_iter(),
+        );
+        assert_eq!(
+            found,
+            Some(super::SuspectedMap {
+                path: ".modelUsage".to_owned(),
+                key_count: 2,
+                non_identifier_count: 2,
+            })
+        );
+    }
+
+    /// The false-positive guard: one vendor-namespaced field beside four
+    /// ordinary ones must not read as a suspected map — `_meta`'s own real
+    /// shape, already reviewed field-by-field on `allowlist/acp.txt`.
+    #[test]
+    fn suspected_map_stays_silent_on_one_odd_key_among_ordinary_siblings() {
+        let found = suspected_map(
+            ".result._meta",
+            [
+                "x.ai/sessionConfig",
+                "claudeCode",
+                "steering",
+                "goal",
+                "jetbrains",
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            found, None,
+            "one namespaced field among four plain ones must not warn"
+        );
+    }
+
+    /// An empty object has no keys to be data-shaped, so it must not warn —
+    /// the degenerate case a `key_count > 0` guard exists for.
+    #[test]
+    fn suspected_map_stays_silent_on_an_empty_object() {
+        assert_eq!(suspected_map(".empty", std::iter::empty()), None);
+    }
 
     /// Every character the path notation reserves, escaped — including the
     /// backslash that does the escaping, which is otherwise ambiguous with a

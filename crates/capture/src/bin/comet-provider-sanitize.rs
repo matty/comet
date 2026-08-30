@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use comet_capture::{render_escaped_paths_report, render_novel_paths_report, sanitize_dir};
+use comet_capture::{
+    render_escaped_paths_report, render_novel_paths_report, render_suspected_maps_report,
+    sanitize_dir,
+};
 
 const HELP: &str = r#"Sanitize one ignored raw provider capture into ignored staging.
 
@@ -40,6 +43,8 @@ fn main() {
             println!("{}", render_novel_paths_report(&report.novel_paths));
             println!();
             println!("{}", render_escaped_paths_report(&report.escaped_paths));
+            println!();
+            println!("{}", render_suspected_maps_report(&report.suspected_maps));
         }
         Err(error) => {
             eprintln!("Sanitization failed. {error}");
