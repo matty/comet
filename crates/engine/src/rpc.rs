@@ -264,9 +264,22 @@ async fn finish_purge_after_runs(
     chat_id: String,
     token: PurgeToken,
 ) {
-    if let Err(err) = sessions.interrupt(&chat_id).await {
+    interrupt_for_purge(&sessions, &chat_id).await;
+    finish_purge_after_interrupt(sessions, doc_host, chat_id, token).await;
+}
+
+async fn interrupt_for_purge(sessions: &SessionsEngine, chat_id: &str) {
+    if let Err(err) = sessions.interrupt(chat_id).await {
         tracing::debug!(chat = %chat_id, error = %err, "chat purge interrupt skipped");
     }
+}
+
+async fn finish_purge_after_interrupt(
+    sessions: SessionsEngine,
+    doc_host: DocHost,
+    chat_id: String,
+    token: PurgeToken,
+) {
     if !sessions.wait_for_no_live_runs(&chat_id).await {
         tracing::debug!(chat = %chat_id, "chat final purge cancelled by engine shutdown");
         return;
@@ -813,9 +826,24 @@ impl EngineRpc {
                 let sessions = self.sessions.clone();
                 let doc_host = self.doc_host.clone();
                 tokio::spawn(async move {
+                    // Cancellation is a fan-out phase: a displaced owner for
+                    // one chat must not prevent a later chat's routed process
+                    // from receiving its interrupt. Only then may finalizers
+                    // wait for each chat's complete ownership census to drain.
+                    futures::future::join_all(
+                        chat_purges
+                            .iter()
+                            .map(|(chat_id, _)| interrupt_for_purge(&sessions, chat_id)),
+                    )
+                    .await;
                     for (chat_id, token) in chat_purges {
-                        finish_purge_after_runs(sessions.clone(), doc_host.clone(), chat_id, token)
-                            .await;
+                        finish_purge_after_interrupt(
+                            sessions.clone(),
+                            doc_host.clone(),
+                            chat_id,
+                            token,
+                        )
+                        .await;
                     }
                 });
                 if reconciliation_needs_retry {
@@ -1935,6 +1963,8 @@ mod tests {
     struct DisplacedStartupHarness {
         old_started: Mutex<Option<oneshot::Sender<()>>>,
         old_release: Mutex<Option<oneshot::Receiver<()>>>,
+        later_started: Mutex<Option<oneshot::Sender<()>>>,
+        later_interrupted: Mutex<Option<oneshot::Sender<()>>>,
     }
 
     #[async_trait::async_trait]
@@ -1958,7 +1988,7 @@ mod tests {
         async fn run(
             &self,
             request: comet_proto::RunRequest,
-            _controls: comet_harness::RunControls,
+            controls: comet_harness::RunControls,
         ) -> Result<
             futures::stream::BoxStream<
                 'static,
@@ -1986,6 +2016,32 @@ mod tests {
                 ));
             }
 
+            if request.prompt == "later chat" {
+                let started = self
+                    .later_started
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one later-chat startup notification");
+                let interrupted = self
+                    .later_interrupted
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one later-chat interrupt notification");
+                let _ = started.send(());
+                return Ok(Box::pin(futures::stream::once(async move {
+                    controls.interrupt.cancelled().await;
+                    let _ = interrupted.send(());
+                    Ok(comet_proto::AgentEvent::Done {
+                        status: comet_proto::DoneStatus::Interrupted,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    })
+                })));
+            }
+
             Ok(Box::pin(futures::stream::iter([Ok(
                 comet_proto::AgentEvent::Done {
                     status: comet_proto::DoneStatus::Completed,
@@ -1994,6 +2050,62 @@ mod tests {
                     session_id: None,
                 },
             )])))
+        }
+    }
+
+    /// Panics after provider startup has entered the detached run task. The
+    /// task's ownership pin must retire during unwinding.
+    struct PanickingStartupHarness {
+        started: Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl comet_harness::Harness for PanickingStartupHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+
+        fn display_name(&self) -> &str {
+            "Panicking startup"
+        }
+
+        fn capabilities(&self) -> comet_proto::HarnessCapabilities {
+            comet_proto::HarnessCapabilities::default()
+        }
+
+        async fn models(&self) -> Result<comet_proto::ModelCatalog, comet_harness::HarnessError> {
+            Ok(comet_proto::ModelCatalog::built_in(Vec::new()))
+        }
+
+        async fn run(
+            &self,
+            request: comet_proto::RunRequest,
+            _controls: comet_harness::RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<comet_proto::AgentEvent, comet_harness::HarnessError>,
+            >,
+            comet_harness::HarnessError,
+        > {
+            if request.prompt != "panic" {
+                return Ok(Box::pin(futures::stream::iter([Ok(
+                    comet_proto::AgentEvent::Done {
+                        status: comet_proto::DoneStatus::Completed,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    },
+                )])));
+            }
+            let started = self
+                .started
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one panicking startup notification");
+            let _ = started.send(());
+            panic!("intentional provider-task panic");
         }
     }
 
@@ -3452,6 +3564,8 @@ mod tests {
         registry.register(Arc::new(DisplacedStartupHarness {
             old_started: Mutex::new(Some(old_started)),
             old_release: Mutex::new(Some(old_release_rx)),
+            later_started: Mutex::new(None),
+            later_interrupted: Mutex::new(None),
         }));
         let core = crate::EngineCore::assemble(dir.path(), registry, HarnessId::Mock, None)
             .expect("engine core assembles");
@@ -3552,6 +3666,173 @@ mod tests {
             replay.is_empty(),
             "the displaced startup's late Error and Done are purged before recreation"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_space_interrupts_later_chat_before_waiting_for_displaced_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("device-id"), "dev-a").unwrap();
+        let (old_started, old_started_rx) = oneshot::channel();
+        let (old_release, old_release_rx) = oneshot::channel();
+        let (later_started, later_started_rx) = oneshot::channel();
+        let (later_interrupted, later_interrupted_rx) = oneshot::channel();
+        let registry = Arc::new(crate::registry::HarnessRegistry::new());
+        registry.register(Arc::new(DisplacedStartupHarness {
+            old_started: Mutex::new(Some(old_started)),
+            old_release: Mutex::new(Some(old_release_rx)),
+            later_started: Mutex::new(Some(later_started)),
+            later_interrupted: Mutex::new(Some(later_interrupted)),
+        }));
+        let core = crate::EngineCore::assemble(dir.path(), registry, HarnessId::Mock, None)
+            .expect("engine core assembles");
+        core.workspace
+            .create_space(
+                "space-1",
+                "dev-a",
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
+                None,
+                false,
+            )
+            .unwrap();
+        for chat_id in ["chat-a", "chat-b"] {
+            core.workspace
+                .create_chat(chat_id, "space-1", None, None)
+                .unwrap();
+        }
+
+        let (_replay, mut first_live) = core.sessions.subscribe("chat-a", 0).unwrap();
+        core.sessions
+            .dispatch(
+                "chat-a",
+                HarnessId::Mock,
+                recording_request(dir.path(), "old startup"),
+                Some("old-user".into()),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), old_started_rx)
+            .await
+            .expect("old provider startup begins")
+            .expect("startup notification remains connected");
+
+        core.sessions
+            .dispatch(
+                "chat-a",
+                HarnessId::Mock,
+                recording_request(dir.path(), "replacement"),
+                Some("replacement-user".into()),
+            )
+            .await
+            .unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), first_live.recv())
+                .await
+                .expect("replacement terminal event arrives")
+                .expect("first chat stream remains connected")
+                .event;
+            if matches!(event, comet_proto::AgentEvent::Done { .. }) {
+                break;
+            }
+        }
+        assert!(
+            core.sessions.has_live_run("chat-a"),
+            "the displaced startup keeps the first chat pinned"
+        );
+
+        core.sessions
+            .dispatch(
+                "chat-b",
+                HarnessId::Mock,
+                recording_request(dir.path(), "later chat"),
+                Some("later-user".into()),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), later_started_rx)
+            .await
+            .expect("later chat provider starts")
+            .expect("later startup notification remains connected");
+
+        let mut purge_done = core.doc_host.watch_purges();
+        core.remote_rpc_service()
+            .mutate(MutateParams::DeleteSpace {
+                space_id: "space-1".into(),
+            })
+            .expect("space deletion starts both chat purges");
+        tokio::time::timeout(Duration::from_secs(1), later_interrupted_rx)
+            .await
+            .expect("later chat is interrupted before the first owner releases")
+            .expect("later interrupt notification remains connected");
+
+        old_release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while *purge_done.borrow() < 2 {
+                purge_done
+                    .changed()
+                    .await
+                    .expect("purge watch remains connected");
+            }
+        })
+        .await
+        .expect("both chat purges finish after the displaced owner settles");
+    }
+
+    #[tokio::test]
+    async fn panicking_provider_task_releases_owner_for_delete_and_same_id_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("device-id"), "dev-a").unwrap();
+        let (started, started_rx) = oneshot::channel();
+        let registry = Arc::new(crate::registry::HarnessRegistry::new());
+        registry.register(Arc::new(PanickingStartupHarness {
+            started: Mutex::new(Some(started)),
+        }));
+        let core = crate::EngineCore::assemble(dir.path(), registry, HarnessId::Mock, None)
+            .expect("engine core assembles");
+        core.workspace
+            .create_space(
+                "space-1",
+                "dev-a",
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
+                None,
+                false,
+            )
+            .unwrap();
+        core.workspace
+            .create_chat("chat-1", "space-1", None, None)
+            .unwrap();
+
+        core.sessions
+            .dispatch(
+                "chat-1",
+                HarnessId::Mock,
+                recording_request(dir.path(), "panic"),
+                Some("panic-user".into()),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("panicking provider task starts")
+            .expect("panic notification remains connected");
+
+        let mut purge_done = core.doc_host.watch_purges();
+        let rpc = core.remote_rpc_service();
+        rpc.mutate(MutateParams::DeleteChat {
+            chat_id: "chat-1".into(),
+        })
+        .expect("delete starts after the provider panic");
+        tokio::time::timeout(Duration::from_secs(1), purge_done.changed())
+            .await
+            .expect("panic unwind releases the final ownership pin")
+            .expect("purge watch remains connected");
+        rpc.mutate(MutateParams::CreateChat {
+            chat_id: "chat-1".into(),
+            space_id: "space-1".into(),
+            config: None,
+            branch: None,
+            cwd: None,
+        })
+        .expect("same-id chat reuse is admitted after panic cleanup");
     }
 
     #[tokio::test]

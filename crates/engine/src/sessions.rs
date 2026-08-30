@@ -1992,6 +1992,21 @@ struct RunResumeState {
     resume_injected: bool,
 }
 
+/// Retires the exact lifecycle owner when a detached run task leaves for any
+/// reason, including unwinding from a provider panic. `retire_run`'s run-id
+/// check prevents an old task's drop from removing a replacement route.
+struct RunOwnerRetirementGuard {
+    inner: Arc<Inner>,
+    chat_id: String,
+    run_id: String,
+}
+
+impl Drop for RunOwnerRetirementGuard {
+    fn drop(&mut self) {
+        self.inner.retire_run(&self.chat_id, &self.run_id);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_run(
     inner: Arc<Inner>,
@@ -2005,6 +2020,14 @@ async fn drive_run(
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
 ) {
+    // This must be the first task-owned local: every later operation includes
+    // provider code and document/status writes that may unwind. Normal explicit
+    // retirement remains idempotent; this guard closes every exceptional path.
+    let _owner_retirement = RunOwnerRetirementGuard {
+        inner: inner.clone(),
+        chat_id: chat_id.clone(),
+        run_id: run_id.clone(),
+    };
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).
     let harness_id = harness.id();

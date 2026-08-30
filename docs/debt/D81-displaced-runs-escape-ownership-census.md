@@ -56,9 +56,15 @@ DeleteChat and DeleteSpace finalizers interrupt the current route as before, the
 ownership-change watch before final purge. They subscribe before checking the set, so the last
 release cannot be missed. The purge lifecycle keeps same-id registration closed for the duration,
 and engine shutdown cancels the wait without treating cancellation as proof that cleanup is safe.
+DeleteSpace fans interruption out to every affected chat before waiting on any one chat's census,
+so a displaced owner cannot leave later routes running. An exact-run-id drop guard owns retirement
+for the detached task itself, including provider panics and cancellation; its stale drop cannot
+remove a replacement route.
 
 `rpc::tests::displaced_startup_keeps_same_id_reuse_closed_until_its_late_effects_finish` exercises
 the production path: an old provider startup ignores interruption past the five-second replacement
 bound, its successor settles, deletion and same-id recreation remain blocked, and the old startup's
 late `Error`/`Done` are finally purged before reuse. Session unit tests cover both finish orders,
-the stale-finish route guard, the final-owner wakeup, and shutdown cancellation.
+the stale-finish route guard, the final-owner wakeup, and shutdown cancellation. Additional RPC
+regressions cover a two-chat DeleteSpace cancellation fan-out and panic-unwind retirement followed
+by deletion and same-id reuse.
