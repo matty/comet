@@ -16,6 +16,7 @@
 //! | `starve`        | answers nothing at all after `session/new` |
 //! | `silent-after-prompt` | identical wire shape to `starve` — named separately because it exists for a different mechanism (the prompt-stall bound, not cancel-recovery) and should not be confused with it if `starve` is ever repurposed |
 //! | `ignore-cancel` | never answers, and ignores `session/cancel` too |
+//! | `wedge-with-child\|<path>` | streams one update, spawns a real OS grandchild, records both this process's and the grandchild's pid to `<path>`, then goes silent and deaf exactly like `ignore-cancel` — D133's falsification that a cancelled ACP turn reaps the whole provider-owned tree, not just this fixture's own pid (the ACP analogue of `fake_codex.rs`'s `wedge_with_child`) |
 //! | `exit-now`      | writes to stderr and exits mid-turn |
 //! | `refusal`       | settles with `stopReason: "refusal"` |
 //! | `cancel`        | settles with `stopReason: "cancelled"` |
@@ -45,6 +46,7 @@
 
 use std::io::{BufRead, StdinLock, Write};
 use std::process::exit;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -93,6 +95,61 @@ fn initialize_result(steering: bool, load_session: bool, image_capable: bool) ->
     })
 }
 
+/// D133: strip `HANDLE_FLAG_INHERIT` from this process's own stdio handles so
+/// a child THIS fixture spawns cannot silently inherit a duplicate of the
+/// pipe connecting it to the real test harness — see the call site in
+/// `spawn_grandchild_and_record` for why that matters. Identical to
+/// `fake_codex.rs`'s own copy of this function (D46); unix needs no
+/// equivalent for the same reason that one's doc comment gives.
+#[cfg(windows)]
+fn disable_stdio_inheritance() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+    for handle in [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        // SAFETY: clears one flag on a handle this process already owns and
+        // keeps using exactly as before; this only changes what a future
+        // child of ours can inherit.
+        unsafe {
+            SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn disable_stdio_inheritance() {}
+
+/// D133: spawn a real OS grandchild and record both this process's and the
+/// grandchild's pid to `path`, newline-separated — the ACP analogue of
+/// `fake_codex.rs`'s `wedge_with_child`. Re-execs THIS binary under
+/// `--sleep-forever` rather than spawning a second helper: proving a leaked
+/// provider-owned descendant needs no second `[[bin]]` target.
+fn spawn_grandchild_and_record(path: &str) {
+    disable_stdio_inheritance();
+
+    let exe = std::env::current_exe().expect("current exe for grandchild re-exec");
+    let grandchild = std::process::Command::new(&exe)
+        .arg("--sleep-forever")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn grandchild");
+    std::fs::write(
+        path,
+        format!("{}\n{}\n", std::process::id(), grandchild.id()),
+    )
+    .expect("record parent/grandchild pids");
+    // Deliberately not waited on: an orphaned, still-running grandchild is
+    // exactly the shape a real provider's shell or MCP-server child takes
+    // when this fixture (its immediate parent) is torn down.
+    drop(grandchild);
+}
+
 /// One outstanding `session/request_permission` this fixture sent, and what
 /// to do once the client answers it: complete `prompt_id` (the
 /// `session/prompt` this request interrupted) with `end_turn`, after echoing
@@ -104,6 +161,16 @@ struct PendingPermission {
 }
 
 fn main() {
+    // D133: this fixture re-execs itself under this flag to play the
+    // "grandchild" role for `wedge-with-child` below — the same binary, so
+    // proving a leaked descendant needs no second `[[bin]]` target. It never
+    // touches stdio, so it cannot be mistaken for the real protocol child.
+    // Mirrors `fake_codex.rs`'s identical trick for the same reason (D46).
+    if std::env::args().any(|a| a == "--sleep-forever") {
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
     // Opt out of the steering extension to exercise the degraded path Hermes
     // takes: no `_session/steering`, so steering falls back to turn boundaries.
     let steering = std::env::var_os("FAKE_ACP_NO_STEERING").is_none();
@@ -495,6 +562,20 @@ fn handle_prompt(
             "params": {"sessionId": session_id, "update": payload},
         }));
     };
+
+    if let Some(path) = text.strip_prefix("wedge-with-child|") {
+        // D133: prove a provider-owned GRANDCHILD is gone after cancellation,
+        // not just this fixture's own pid — see the doc-table entry above and
+        // `spawn_grandchild_and_record`'s own comment. Silent and deaf after
+        // this, exactly like `ignore-cancel` below: the client's own bounded
+        // give-up is the only thing that can end this turn.
+        spawn_grandchild_and_record(path);
+        update(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "working"},
+        }));
+        return None;
+    }
 
     if text.contains("echo-selection") {
         // **What was actually received, not what was decoded.** Everything

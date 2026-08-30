@@ -254,6 +254,9 @@ impl Default for Timeouts {
 /// holds one open session.
 pub struct AcpSession {
     child: Child,
+    /// D133: the whole-provider-tree half of shutdown, alongside
+    /// `send_signal` — see `crate::ProcessTreeJob`.
+    tree: crate::ProcessTreeJob,
     client: RpcClient,
     incoming: mpsc::Receiver<Incoming>,
     stderr_tail: StderrTail,
@@ -298,6 +301,7 @@ impl AcpSession {
     ) -> Result<Self, HarnessError> {
         let Connected {
             mut child,
+            tree,
             client,
             incoming,
             stderr_tail,
@@ -315,6 +319,7 @@ impl AcpSession {
                     // is dropped too — reap it here instead of leaving the timing
                     // to drop order.
                     shutdown_child(&mut child, timeouts.kill_grace).await;
+                    tree.terminate();
                     // `raw` is `None` for a failure that was never a JSON-RPC
                     // error at all (`session/new` answering without a
                     // `sessionId`) — nothing for the mapper to recognize, so
@@ -352,12 +357,14 @@ impl AcpSession {
                     "the agent refused a session setting"
                 );
                 shutdown_child(&mut child, timeouts.kill_grace).await;
+                tree.terminate();
                 return Err(setting_refused(method));
             }
         }
 
         Ok(Self {
             child,
+            tree,
             client,
             incoming,
             stderr_tail,
@@ -387,6 +394,7 @@ impl AcpSession {
     ) -> Result<Discovered, HarnessError> {
         let Connected {
             mut child,
+            tree,
             client,
             initialized,
             // **`incoming` MUST stay alive across `session/new`.** Dropping the
@@ -436,6 +444,7 @@ impl AcpSession {
         // Only now: the reply is in hand, so the reader has nothing left to do.
         drop(incoming);
         shutdown_child(&mut child, timeouts.kill_grace).await;
+        tree.terminate();
         Ok(Discovered {
             initialized,
             // A failed `session/new` is NOT a failed discovery. The handshake
@@ -642,6 +651,11 @@ pub struct Discovered {
 /// disagree about how a child is started or how the handshake is checked.
 struct Connected {
     child: Child,
+    /// D133: the Windows half of D46's whole-provider-tree cleanup, which
+    /// `crate::codex`/`crate::claude` already have and this adapter did not —
+    /// see `crate::ProcessTreeJob`. Unix needs nothing here: `shutdown_child`'s
+    /// `send_signal` already reaches the whole process group.
+    tree: crate::ProcessTreeJob,
     client: RpcClient,
     incoming: mpsc::Receiver<Incoming>,
     stderr_tail: StderrTail,
@@ -656,6 +670,14 @@ async fn connect(mut command: Command, timeouts: Timeouts) -> Result<Connected, 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // D133/D46: unlike the Windows Job Object below, this MUST be set before
+    // `spawn` — a process group is a spawn-time property, not something
+    // assignable afterward the way `AssignProcessToJobObject` is. Established
+    // here, at the one spawn site every ACP caller shares, rather than relied
+    // upon from whichever `LaunchDescriptor`-routed caller built `command` —
+    // see `crate::launch::own_process_group`'s own doc for why that
+    // reliance was the actual gap CI caught, not `LaunchDescriptor` itself.
+    crate::launch::own_process_group(&mut command);
     let program = command
         .as_std()
         .get_program()
@@ -668,6 +690,13 @@ async fn connect(mut command: Command, timeouts: Timeouts) -> Result<Connected, 
             HarnessError::Io(e)
         }
     })?;
+    // D133/D46: as early as possible after spawn — see `ProcessTreeJob`'s own
+    // doc for why "as early as possible" and not "atomically" is the best
+    // this can do without `CREATE_SUSPENDED`. Held for the session's whole
+    // lifetime (in `Connected`, then `AcpSession`) rather than dropped at the
+    // end of this function: `KILL_ON_JOB_CLOSE` firing on an early drop would
+    // kill a live provider the handshake just succeeded against.
+    let tree = crate::ProcessTreeJob::attach(&child);
 
     let stdin = child
         .stdin
@@ -704,12 +733,14 @@ async fn connect(mut command: Command, timeouts: Timeouts) -> Result<Connected, 
             // A child that spawned but could not handshake is still running.
             // Reap it here rather than leaving it to drop order.
             shutdown_child(&mut child, timeouts.kill_grace).await;
+            tree.terminate();
             return Err(error);
         }
     };
 
     Ok(Connected {
         child,
+        tree,
         client,
         incoming,
         stderr_tail,
@@ -869,6 +900,7 @@ async fn run_session(
 ) {
     let AcpSession {
         mut child,
+        tree,
         client,
         mut incoming,
         stderr_tail,
@@ -909,6 +941,7 @@ async fn run_session(
     .await
     {
         shutdown_child(&mut child, timeouts.kill_grace).await;
+        tree.terminate();
         return;
     }
 
@@ -1099,6 +1132,7 @@ async fn run_session(
     }
 
     shutdown_child(&mut child, timeouts.kill_grace).await;
+    tree.terminate();
 }
 
 fn done_event(status: DoneStatus, error: Option<String>, session_id: &str) -> AgentEvent {

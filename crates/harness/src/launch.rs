@@ -60,15 +60,37 @@ impl LaunchDescriptor {
         }
         #[cfg(windows)]
         command.creation_flags(self.creation_flags);
-        // D46: put the child in its own process group so a later escalation
-        // signal can reach the whole tree it spawns (`send_signal` targets
-        // this group, not just the one pid) via `killpg`. `0` means "use the
-        // child's own pid as the group id" — set before the child's own code
-        // runs, so a grandchild it forks before ever touching stdin already
-        // inherits this group; nothing here changes what the child inherits
-        // otherwise; it only changes which pids answer a signal aimed at it.
-        #[cfg(unix)]
-        command.process_group(0);
+        own_process_group(&mut command);
         command
     }
 }
+
+/// D46: put `command`'s child in its own process group so a later escalation
+/// signal can reach the whole tree it spawns (`send_signal` targets this
+/// group, not just the one pid) via `killpg`. `0` means "use the child's own
+/// pid as the group id" — set before the child's own code runs, so a
+/// grandchild it forks before ever touching stdin already inherits this
+/// group; nothing here changes what the child inherits otherwise; it only
+/// changes which pids answer a signal aimed at it.
+///
+/// **Reused, not inlined at every spawn site (D133).** [`LaunchDescriptor::command`]
+/// calls this for every adapter that builds a `Command` from a descriptor.
+/// `acp::session::connect` calls it AGAIN, directly, on whatever `Command`
+/// its caller handed in — the ACP session loop is the one spawn site every
+/// ACP agent (and every ACP test) shares, so establishing the group THERE,
+/// not only inside `LaunchDescriptor`, means it holds even for a caller that
+/// never built one. That gap was not hypothetical: CI's Ubuntu run against
+/// this PR's own `wedge-with-child` test caught it — `acp_turn.rs` spawns
+/// `fake-acp` from a bare `tokio::process::Command`, so production's own
+/// `grok`/`hermes` `run()` methods happening to route through
+/// `LaunchDescriptor` was never a guarantee `connect()` itself enforced.
+/// Idempotent: calling it twice on the same `Command` before `spawn` (as
+/// every production ACP call site now does) is harmless — the second call
+/// just sets the same group again.
+#[cfg(unix)]
+pub(crate) fn own_process_group(command: &mut tokio::process::Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn own_process_group(_command: &mut tokio::process::Command) {}
