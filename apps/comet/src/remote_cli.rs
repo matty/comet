@@ -94,7 +94,36 @@ pub async fn status(data_dir: &Path, ipc_port: u16) -> anyhow::Result<()> {
         println!("LAN:      unavailable while the running engine IPC is unreachable");
         return Ok(());
     }
-    let _lock = acquire_offline_lock(data_dir)?;
+    // holder() could not confirm a live process, but the lock file may still
+    // be genuinely contended (a real engine it just couldn't verify, or an
+    // unrelated handle on the path — see D88). acquire() is the authoritative
+    // check; its failure is not read as proof either way, and its raw error
+    // must not reach the terminal.
+    std::fs::create_dir_all(data_dir).context("preparing data dir")?;
+    let _lock = match InstanceLock::acquire(data_dir) {
+        Ok(lock) => lock,
+        Err(error @ comet_engine::EngineError::AlreadyRunning { .. }) => {
+            tracing::debug!(
+                data_dir = %data_dir.display(),
+                error = %error,
+                "status: lock is contended but no holder could be confirmed"
+            );
+            println!(
+                "Engine:   unknown (lock file is in use, but no running engine could be confirmed)"
+            );
+            println!("IPC:      unavailable on 127.0.0.1:{ipc_port}");
+            println!("LAN:      unavailable while engine state can't be confirmed");
+            return Ok(());
+        }
+        Err(error) => {
+            tracing::debug!(
+                data_dir = %data_dir.display(),
+                error = %error,
+                "status: could not prepare the offline lock"
+            );
+            bail!("could not check whether the engine is running (see logs for detail)");
+        }
+    };
     let store = RemoteConfigStore::open(data_dir)?;
     println!("Engine:   not running");
     println!("IPC:      not listening on 127.0.0.1:{ipc_port}");
@@ -589,6 +618,29 @@ mod tests {
         assert!(OfflineRemoteAdmin::open(dir.path()).is_err());
         assert!(!dir.path().join("device-identity.pem").exists());
         assert!(!dir.path().join("remote-access.json").exists());
+    }
+
+    /// `holder()` returning `None` for a lock file it cannot verify (D88)
+    /// does not mean `acquire()` will succeed — the file may still be
+    /// genuinely contended by something `holder()` couldn't confirm. Before
+    /// this test, `status()` fell through to `acquire_offline_lock`'s raw
+    /// `anyhow!` error in exactly this state and surfaced it to the
+    /// terminal. It must instead say the state is unknown.
+    #[tokio::test]
+    async fn status_reports_unknown_rather_than_erroring_when_the_lock_is_unverifiable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine.lock");
+        std::fs::write(&path, (u32::MAX - 1).to_string()).unwrap();
+        let _unrelated = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+
+        // A port nothing is listening on, so local_client() returns None quickly.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        status(dir.path(), port)
+            .await
+            .expect("an unverifiable lock must report unknown state, not error");
     }
 
     struct HelloService(ServerHello);

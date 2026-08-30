@@ -281,4 +281,36 @@ mod tests {
             "no InstanceLock is held, and the pid on disk cannot be confirmed alive"
         );
     }
+
+    #[test]
+    fn pid_is_alive_confirms_the_calling_process() {
+        assert!(pid_is_alive(&std::process::id().to_string()));
+    }
+
+    #[test]
+    fn pid_is_alive_rejects_a_pid_far_outside_any_real_range() {
+        assert!(!pid_is_alive(&(u32::MAX - 1).to_string()));
+    }
+
+    #[test]
+    fn pid_is_alive_rejects_unparseable_or_empty_input() {
+        assert!(!pid_is_alive(""));
+        assert!(!pid_is_alive("not-a-pid"));
+    }
+
+    #[test]
+    fn pid_is_alive_rejects_zero() {
+        assert!(!pid_is_alive("0"));
+    }
+
+    /// Guards the cast in the Unix arm: `pid as libc::pid_t` (an `i32`) wraps
+    /// a `u32` above `i32::MAX` into a negative value, which `kill` reads as
+    /// a process-*group* signal instead of a single-process existence check
+    /// — a different, wrong question that could return 0 (success) for
+    /// reasons unrelated to the pid we were asked about.
+    #[test]
+    fn pid_is_alive_rejects_a_pid_above_i32_max() {
+        let above_i32_max = (i32::MAX as u32) + 1;
+        assert!(!pid_is_alive(&above_i32_max.to_string()));
+    }
 }
