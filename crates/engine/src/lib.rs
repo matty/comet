@@ -142,6 +142,10 @@ pub struct EngineCore {
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
+    /// When this installation's identity was last rebuilt from a zero-byte
+    /// `device-id`, if ever — read once at assembly and reported over
+    /// `LocalDevice` so the UI can explain why older spaces are offline (D96).
+    pub identity_rebuilt_at: Option<String>,
     device_identity: Arc<DeviceIdentity>,
     remote_config: RemoteConfigStore,
     lan_server: LanServerHandle,
@@ -173,6 +177,7 @@ impl EngineCore {
         // port binds; held (and kernel-released on crash) for the engine's life.
         let lock = InstanceLock::acquire(data_dir)?;
         let device_id = load_or_create_device_id(data_dir)?;
+        let identity_rebuilt_at = identity_rebuilt_at(data_dir);
         let device_identity = DeviceIdentity::load_or_create(data_dir)?;
         let remote_config = RemoteConfigStore::open(data_dir)?;
         let persisted_remotes = remote_config.watch_remotes().borrow().clone();
@@ -237,6 +242,7 @@ impl EngineCore {
             uploads,
             agent_accounts,
             device_id,
+            identity_rebuilt_at,
             device_identity,
             remote_config,
             lan_server,
@@ -285,7 +291,8 @@ impl EngineCore {
                     self.agent_accounts.clone(),
                     self.presence.clone(),
                 )
-                .with_server_hello(hello);
+                .with_server_hello(hello)
+                .with_identity_rebuilt_at(self.identity_rebuilt_at.clone());
                 if let Some(updater) = self.updater() {
                     rpc = rpc.with_updater(updater);
                 }
@@ -589,16 +596,26 @@ fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
     let path = data_dir.join("device-id");
     let started = std::time::Instant::now();
     let mut attempt = 0u32;
+    // Whether THIS process saw the file empty. Recorded even when another
+    // repairer wins the publish and we take their id: the machine's identity
+    // was rebuilt either way, and that is what the user needs told (D96).
+    let mut rebuilt = false;
     while started.elapsed() < DEVICE_ID_RECOVERY_BUDGET {
         let pause = device_id_retry_pause(attempt);
         attempt += 1;
         match std::fs::read_to_string(&path) {
-            Ok(id) if !id.trim().is_empty() => return Ok(id.trim().to_string()),
+            Ok(id) if !id.trim().is_empty() => {
+                if rebuilt {
+                    record_identity_rebuilt(data_dir);
+                }
+                return Ok(id.trim().to_string());
+            }
             // Empty: displace it so the create-if-absent publish below has a
             // clear path. Renaming rather than deleting keeps the failure
             // recoverable if we die here — the next start finds no file and
             // mints one, which is the same outcome by a different route.
             Ok(_) => {
+                rebuilt = true;
                 if !displace_empty_device_id(data_dir, &path)? {
                     // Another repairer holds the file open. Back off and
                     // re-read: they are most likely about to publish, and
@@ -637,7 +654,12 @@ fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
         let publish_result = std::fs::hard_link(&temp_path, &path);
         let _ = std::fs::remove_file(&temp_path);
         match publish_result {
-            Ok(()) => return Ok(id),
+            Ok(()) => {
+                if rebuilt {
+                    record_identity_rebuilt(data_dir);
+                }
+                return Ok(id);
+            }
             // Someone published first, or the empty file is still there with a
             // repairer mid-flight. Re-read on the next pass.
             Err(err)
@@ -657,6 +679,54 @@ fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
         path.display(),
         started.elapsed()
     )))
+}
+
+/// Marker for "this installation's device identity was rebuilt", written
+/// beside the id it replaced.
+///
+/// **A file rather than a boot-scoped flag, because the consequence is not
+/// boot-scoped** (D96). Spaces are keyed by `deviceId` and that field is
+/// immutable by design, so every space created under the old id renders
+/// `@ host · offline` and cannot dispatch — for good, not for one session.
+/// A notice that appeared once and vanished would leave the same silence
+/// behind the second time the user looked.
+///
+/// It cannot say WHICH spaces: the old id died with the zero-byte file, so
+/// nothing on this machine still knows it. The honest statement is that
+/// identity was rebuilt and older spaces belong to what came before.
+const DEVICE_ID_REBUILT_MARKER: &str = "device-id.rebuilt";
+
+/// When this installation's device identity was last rebuilt, if it ever was.
+///
+/// RFC 3339, read straight from [`DEVICE_ID_REBUILT_MARKER`]. Unreadable,
+/// missing or empty all answer `None` — this drives a notice, so failing to
+/// read it must never fail anything else.
+pub fn identity_rebuilt_at(data_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(data_dir.join(DEVICE_ID_REBUILT_MARKER)).ok()?;
+    let stamp = raw.trim();
+    (!stamp.is_empty()).then(|| stamp.to_owned())
+}
+
+/// Record that recovery happened, best-effort.
+///
+/// A failure here loses the explanation, never the recovery: the engine has a
+/// working identity by this point and refusing to start over an unwritable
+/// marker would reintroduce exactly the stranded installation #96 fixed.
+fn record_identity_rebuilt(data_dir: &Path) {
+    let stamp = chrono::Utc::now().to_rfc3339();
+    let path = data_dir.join(DEVICE_ID_REBUILT_MARKER);
+    if let Err(err) = std::fs::write(&path, &stamp) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "device identity was rebuilt, but the marker could not be written;              the user will not be told why older spaces are offline"
+        );
+        return;
+    }
+    tracing::warn!(
+        stamp,
+        "device identity was rebuilt from an empty device-id; spaces created          under the previous identity will read as offline"
+    );
 }
 
 /// Move a zero-byte `device-id` aside so the create-if-absent publish can run.
@@ -793,6 +863,59 @@ mod tests {
                 "attempt {attempt} slept past the cap"
             );
         }
+    }
+
+    /// Break caught (D96): recovery re-homed the machine in silence. Spaces
+    /// are keyed by `deviceId` and that field is immutable by design, so every
+    /// space made under the old id reads `@ host · offline` for good — and
+    /// nothing recorded that recovery had happened, so nothing could say why.
+    ///
+    /// The marker is the whole mechanism, so both directions are asserted: a
+    /// first-run mint must NOT claim an identity was rebuilt, or the notice
+    /// fires on every fresh install.
+    #[test]
+    fn recovering_an_empty_device_id_records_that_identity_was_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+
+        let first = load_or_create_device_id(data).expect("first run mints an id");
+        assert_eq!(
+            identity_rebuilt_at(data),
+            None,
+            "a first-run mint is not a rebuild"
+        );
+
+        std::fs::write(data.join("device-id"), "").unwrap();
+        let second = load_or_create_device_id(data).expect("an empty id is recovered");
+
+        assert_ne!(first, second, "recovery mints a new id");
+        let stamp = identity_rebuilt_at(data).expect("recovery has to be recorded");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&stamp).is_ok(),
+            "the marker holds an RFC 3339 stamp: {stamp}"
+        );
+    }
+
+    /// The marker outlives the boot that wrote it, which is the reason it is a
+    /// file: the spaces stay offline for good, so an explanation that vanished
+    /// with the process would leave the same silence behind next launch.
+    #[test]
+    fn the_rebuilt_marker_survives_a_later_ordinary_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+
+        load_or_create_device_id(data).unwrap();
+        std::fs::write(data.join("device-id"), "").unwrap();
+        let recovered = load_or_create_device_id(data).unwrap();
+        let stamp = identity_rebuilt_at(data).expect("recorded on the recovering start");
+
+        let later = load_or_create_device_id(data).unwrap();
+        assert_eq!(later, recovered, "an ordinary start reads the same id");
+        assert_eq!(
+            identity_rebuilt_at(data).as_deref(),
+            Some(stamp.as_str()),
+            "and must not clear or restamp the explanation"
+        );
     }
 
     /// The reason recovery publishes through create-if-absent rather than just

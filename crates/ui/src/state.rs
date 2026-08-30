@@ -418,6 +418,10 @@ pub struct AppState {
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
+    /// When this machine's identity was last rebuilt from a zero-byte
+    /// `device-id`, if ever (D96). `None` on every ordinary installation, and
+    /// also on an engine too old to report it — both mean "say nothing".
+    pub identity_rebuilt_at: Option<String>,
     /// Latest `UpdateStatus` frame — drives the sidebar update strip.
     pub update: Option<comet_update::UpdateStatus>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
@@ -454,6 +458,7 @@ impl AppState {
             echoes: HashMap::new(),
             diff_comments: HashMap::new(),
             local_device_id: None,
+            identity_rebuilt_at: None,
             update: None,
             data_dir: None,
             engine: None,
@@ -1340,9 +1345,18 @@ fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) ->
             .or_else(|| value.get("deviceId"))
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        if let Some(id) = id {
+        // Decoded HERE and nowhere else, per AGENTS.md's rule about reply
+        // shapes: this probe is the single reader of `LocalDevice`.
+        let rebuilt_at = value
+            .get("identityRebuiltAt")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if id.is_some() || rebuilt_at.is_some() {
             this.update(cx, |state, cx| {
-                state.local_device_id = Some(id);
+                if let Some(id) = id {
+                    state.local_device_id = Some(id);
+                }
+                state.identity_rebuilt_at = rebuilt_at;
                 cx.notify();
             })
             .ok();

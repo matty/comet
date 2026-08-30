@@ -68,6 +68,17 @@ pub struct UiSettings {
     /// Session notification chimes (done / awaiting-input). `COMET_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
+    /// The identity-rebuild stamp the user has already dismissed (D96).
+    ///
+    /// Persisted rather than in-memory like the update strip's dismissal,
+    /// because the two states differ in how long they last: an update goes
+    /// away when you install it, while a rebuilt identity is permanent — the
+    /// engine reports the same stamp on every launch forever, so a per-boot
+    /// dismissal would nag for the life of the installation. Keyed on the
+    /// stamp itself so a SECOND rebuild is announced again rather than being
+    /// swallowed by the first dismissal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_identity_rebuild: Option<String>,
     pub right_pane_width: f32,
     /// Legacy: panel *open* flags are session-scoped in-memory state now
     /// (`shell::SessionPanels`, comet `sessionPanels` parity). Kept for file
@@ -93,6 +104,7 @@ impl Default for UiSettings {
             space_order: Vec::new(),
             sidebar_scope_space: None,
             sound_enabled: true,
+            dismissed_identity_rebuild: None,
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
@@ -547,6 +559,7 @@ mod tests {
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
             sidebar_scope_space: Some("space-1".to_string()),
             sound_enabled: false,
+            dismissed_identity_rebuild: Some("2026-08-30T09:00:00Z".to_string()),
             right_pane_width: 700.0,
             right_pane_open: true,
             terminal_height: 320.0,
