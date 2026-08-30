@@ -162,6 +162,21 @@ fn windows_caption_font_for_build(build: u32) -> &'static str {
     }
 }
 
+/// Which identity-rebuild stamp, if any, still needs announcing.
+///
+/// Split out of the strip so the rule is testable without a window: `Some`
+/// only when the engine reported a rebuild the user has not already dismissed.
+/// Keyed on the stamp itself rather than a bool, so a SECOND rebuild — a rare
+/// but real thing on a machine that crashes mid-write twice — announces again
+/// instead of being swallowed by the first dismissal.
+fn identity_notice_stamp<'a>(
+    reported: Option<&'a str>,
+    dismissed: Option<&str>,
+) -> Option<&'a str> {
+    let stamp = reported?;
+    (dismissed != Some(stamp)).then_some(stamp)
+}
+
 /// (Re-)apply the whole app keymap: clears every binding, restores the composer
 /// map, then binds the customizable shortcuts from `keymap` (feature-inventory
 /// §1.4). Invalid persisted combos fall back to that shortcut's default.
@@ -2983,6 +2998,13 @@ impl Shell {
                         )
                     }),
             ))
+            // Identity-rebuild strip, above the update one: it explains why
+            // the list the user is looking at reads offline, so it belongs
+            // nearer the list than an unrelated release notice.
+            .when_some(
+                self.render_identity_rebuilt_strip(theme, cx),
+                |el, strip| el.child(strip),
+            )
             // Update strip (above the settings button; below the lists).
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
                 el.child(strip)
@@ -3023,6 +3045,65 @@ impl Shell {
     /// it drives the whole flow — click to download, then click to restart into
     /// the staged bundle. Elsewhere (managed/source installs) it is advisory
     /// (`comet update`); click dismisses it for that version.
+    /// The identity-rebuild strip's copy.
+    ///
+    /// `concat!` rather than a backslash-continued literal: rustfmt rejoins those
+    /// onto one line and the continuation indentation becomes a run of real spaces
+    /// inside the sentence, invisible in the source. That has now shipped once
+    /// (`normalize::session_update_once`'s cap copy) and been caught twice more
+    /// while writing this kind of string — `the_notice_copy_has_no_stray_runs_of_spaces`
+    /// below is what makes it a test rather than a habit.
+    const IDENTITY_REBUILT_NOTICE: &'static str = concat!(
+        "Add older spaces again to use them — this machine's identity was rebuilt, ",
+        "so spaces created before that show as offline.",
+    );
+
+    /// "This machine's identity was rebuilt" — the one thing that explains a
+    /// sidebar full of `@ host · offline` spaces (D96).
+    ///
+    /// **The action leads**, per `.agents/rules/user-facing-errors.md`: adding
+    /// the folder again is what makes a space usable, and the cause follows it.
+    /// Amber rather than red, because it is a state to resolve rather than
+    /// something that failed — the recovery itself succeeded, and refusing to
+    /// start was the alternative.
+    ///
+    /// **It cannot name the affected spaces.** The previous id died with the
+    /// zero-byte file, so nothing on this machine still knows which rows
+    /// belonged to it; "spaces created before then" is the most precise true
+    /// statement available.
+    fn render_identity_rebuilt_strip(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let stamp = identity_notice_stamp(
+            self.state.read(cx).identity_rebuilt_at.as_deref(),
+            self.settings.dismissed_identity_rebuild.as_deref(),
+        )?
+        .to_owned();
+        Some(
+            div()
+                .id("identity-rebuilt-notice")
+                .mx(px(Theme::SPACE_SM))
+                .mb(px(Theme::SPACE_SM))
+                .px(px(Theme::SPACE_SM))
+                .py(px(4.0))
+                .rounded(px(Theme::CONTROL_RADIUS))
+                .border_1()
+                .border_color(theme.warning.opacity(0.5))
+                .text_size(px(11.0))
+                .text_color(theme.warning)
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings.dismissed_identity_rebuild = Some(stamp.clone());
+                    this.schedule_save(cx);
+                    cx.notify();
+                }))
+                .child(SharedString::from(Self::IDENTITY_REBUILT_NOTICE))
+                .into_any_element(),
+        )
+    }
+
     fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let status = self.state.read(cx).update.clone()?;
         if !status.update_available {
@@ -4729,6 +4810,55 @@ impl Render for Shell {
 
 #[cfg(test)]
 mod tests {
+
+    /// The rule the strip hangs on, without needing a window to check it.
+    #[test]
+    fn an_identity_rebuild_announces_once_per_stamp() {
+        assert_eq!(identity_notice_stamp(None, None), None, "nothing to say");
+        assert_eq!(
+            identity_notice_stamp(None, Some("2026-08-30T09:00:00Z")),
+            None,
+            "a stale dismissal on an engine reporting nothing says nothing"
+        );
+        assert_eq!(
+            identity_notice_stamp(Some("2026-08-30T09:00:00Z"), None),
+            Some("2026-08-30T09:00:00Z"),
+            "an undismissed rebuild is announced"
+        );
+        assert_eq!(
+            identity_notice_stamp(Some("2026-08-30T09:00:00Z"), Some("2026-08-30T09:00:00Z")),
+            None,
+            "and stays dismissed across launches — the marker is permanent"
+        );
+        assert_eq!(
+            identity_notice_stamp(Some("2026-09-01T11:00:00Z"), Some("2026-08-30T09:00:00Z")),
+            Some("2026-09-01T11:00:00Z"),
+            "a SECOND rebuild is its own announcement"
+        );
+    }
+
+    /// Break caught twice while writing user copy, and shipped once before
+    /// that (`normalize::session_update_once`): a backslash-continued string
+    /// literal keeps its continuation indentation as REAL SPACES inside the
+    /// sentence, and rustfmt rejoins the source so the run is invisible where
+    /// it is written. Checks the shape rather than the wording, so rewording
+    /// the notice does not need this test updated.
+    #[test]
+    fn the_identity_notice_copy_has_no_stray_runs_of_spaces() {
+        let copy = Shell::IDENTITY_REBUILT_NOTICE;
+        assert!(
+            !copy.contains("  "),
+            "a run of spaces means a continued literal, not a sentence: {copy:?}"
+        );
+        assert!(
+            !copy.chars().any(char::is_control),
+            "the strip is one line: {copy:?}"
+        );
+        assert!(
+            copy.starts_with("Add older spaces"),
+            "the action leads, per the user-facing-errors rule: {copy:?}"
+        );
+    }
 
     /// Break caught (D95): `Keystroke::parse` rejects an unknown MODIFIER and
     /// nothing else, so every combo below used to pass the guard and bind a

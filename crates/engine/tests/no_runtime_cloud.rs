@@ -89,3 +89,35 @@ fn collect_violations(
         }
     }
 }
+
+/// The reply the UI's identity notice hangs on (D96), asserted against the
+/// literal JSON the engine sends rather than through a Rust type — the same
+/// reason `decode_models_reply`'s test does, per AGENTS.md: a reshaped reply
+/// that still round-trips through a struct would keep this green while the
+/// picker (or here, the notice) broke at runtime.
+#[tokio::test]
+async fn local_device_reports_no_identity_rebuild_on_an_ordinary_install() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig::for_test(dir.path());
+    let runtime = Engine::assemble_runtime(&config).await.unwrap();
+    let reply = runtime
+        .core()
+        .rpc_service()
+        .handle(methods::LOCAL_DEVICE, json!({}))
+        .await
+        .expect("LocalDevice answers");
+
+    let body = match reply {
+        comet_rpc::RpcReply::Value(value) => value,
+        comet_rpc::RpcReply::Stream(_) => panic!("LocalDevice is a unary reply"),
+    };
+    assert!(
+        body.get("deviceId").and_then(|v| v.as_str()).is_some(),
+        "the existing field must survive an additive change: {body}"
+    );
+    assert!(
+        body.get("identityRebuiltAt").is_some_and(|v| v.is_null()),
+        "a fresh install reports the key as null, never as a stamp: {body}"
+    );
+    runtime.shutdown().await;
+}

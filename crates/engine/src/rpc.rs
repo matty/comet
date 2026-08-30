@@ -466,6 +466,9 @@ pub struct EngineRpc {
     server_hello: Option<ServerHello>,
     mutation_authority: DocMutationGate,
     presence: std::sync::Arc<crate::Presence>,
+    /// When this installation's identity was last rebuilt from a zero-byte
+    /// `device-id`, if ever (D96) — reported on `LocalDevice`.
+    identity_rebuilt_at: Option<String>,
 }
 
 #[derive(Clone)]
@@ -504,7 +507,18 @@ impl EngineRpc {
             server_hello: None,
             mutation_authority,
             presence,
+            identity_rebuilt_at: None,
         }
+    }
+
+    /// Attach the identity-rebuilt stamp read at assembly (D96).
+    ///
+    /// A builder rather than a `new` argument for the same reason
+    /// [`Self::with_updater`] is one: this is boot-time context the RPC layer
+    /// reports and never owns, and `new` already carries ten arguments.
+    pub fn with_identity_rebuilt_at(mut self, stamp: Option<String>) -> Self {
+        self.identity_rebuilt_at = stamp;
+        self
     }
 
     /// Attach the release checker (UpdateStatus stream + ApplyUpdate).
@@ -1336,7 +1350,18 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(watch_stream(merged)))
             }
             methods::LOCAL_DEVICE => {
-                RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
+                // `identityRebuiltAt` is additive and absent when nothing was
+                // rebuilt, so it needs no `PROTOCOL_VERSION` bump: a peer that
+                // drops the key shows no notice, which is what every build
+                // before this one did. Read that constant's own doc comment
+                // before assuming the same of the next field — the test is
+                // whether an older peer would ACT on the absence, and here
+                // there is nothing to act on.
+                RpcReply::value(&serde_json::json!({
+                    "deviceId": self.doc_host.device_id(),
+                    "identityRebuiltAt": self.identity_rebuilt_at,
+
+                }))
             }
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
             methods::APPLY_UPDATE => {
