@@ -176,7 +176,7 @@ pub fn run_launch(exe: &Path, request: &RunRequest) -> crate::launch::LaunchDesc
         configured_env.insert("PATH".into(), path);
     }
     crate::launch::LaunchDescriptor {
-        program: exe.into(),
+        program: crate::discovery::program_path(exe),
         args,
         cwd: (!request.cwd.is_empty()).then(|| request.cwd.clone().into()),
         configured_env,
