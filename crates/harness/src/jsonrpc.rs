@@ -83,6 +83,30 @@ impl MalformedKind {
     }
 }
 
+/// Warn-log a malformed stdout line, under the shared per-discriminator budget
+/// (D10).
+///
+/// The payload is built lazily: past the budget it is never rendered at all,
+/// which matters because the thing not being rendered is provider output — a
+/// renamed high-volume method would otherwise put raw command stdout in the log
+/// once per chunk, indefinitely.
+fn log_malformed(kind: MalformedKind, payload: impl FnOnce() -> String) {
+    match crate::log_budget(kind.discriminator()) {
+        crate::LogBudget::Full => tracing::warn!(
+            target: "comet_harness::jsonrpc",
+            frame = %payload(),
+            kind = kind.discriminator(),
+            "not a JSON-RPC message (recorded as a diagnostic)"
+        ),
+        crate::LogBudget::CountOnly(seen) => tracing::warn!(
+            target: "comet_harness::jsonrpc",
+            kind = kind.discriminator(),
+            seen,
+            "not a JSON-RPC message (payload omitted past the log budget)"
+        ),
+    }
+}
+
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, RpcFailure>>>>>;
 
 #[derive(Clone)]
@@ -219,11 +243,7 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
             continue;
         }
         let Ok(msg) = serde_json::from_str::<Value>(line) else {
-            tracing::warn!(
-                target: "comet_harness::jsonrpc",
-                line,
-                "non-JSON stdout line (recorded as a diagnostic)"
-            );
+            log_malformed(MalformedKind::NotJson, || line.to_string());
             if tx
                 .send(Incoming::Malformed(MalformedKind::NotJson))
                 .await
@@ -240,11 +260,7 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
         let mut msg = match msg {
             Value::Object(map) => map,
             other => {
-                tracing::warn!(
-                    target: "comet_harness::jsonrpc",
-                    frame = %other,
-                    "not a JSON-RPC message (recorded as a diagnostic)"
-                );
+                log_malformed(MalformedKind::NotAnObject, || other.to_string());
                 if tx
                     .send(Incoming::Malformed(MalformedKind::NotAnObject))
                     .await
@@ -301,11 +317,7 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
             }
             (None, None) => {
                 let frame = Value::Object(msg);
-                tracing::warn!(
-                    target: "comet_harness::jsonrpc",
-                    %frame,
-                    "not a JSON-RPC message (recorded as a diagnostic)"
-                );
+                log_malformed(MalformedKind::NotAMessage, || frame.to_string());
                 if tx
                     .send(Incoming::Malformed(MalformedKind::NotAMessage))
                     .await
