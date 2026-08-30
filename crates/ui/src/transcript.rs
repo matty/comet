@@ -623,6 +623,17 @@ pub enum RowKind {
     ErrorChip {
         message: SharedString,
     },
+    /// D14's residual: the reason the user typed when denying the
+    /// `ApprovalCard` directly above it. Its own row rather than a field ON
+    /// the card — the card's 56px is fixed in every state precisely so a
+    /// decision landing cannot reflow the transcript (`approval_card`'s own
+    /// doc comment), and a note can be arbitrarily long. A sibling row keeps
+    /// that invariant intact while still keeping the user's own words durably
+    /// in the transcript, where the composer's decision row only ever held
+    /// them transiently.
+    DenyNote {
+        message: SharedString,
+    },
     NoticeChip {
         summary: SharedString,
         /// Hover tooltip; already suppressed when it would duplicate `summary`.
@@ -902,6 +913,22 @@ fn is_agent_spawn_chip(part: &MessagePart) -> bool {
     )
 }
 
+/// D14's residual: the text (if any) that earns its own `DenyNote` row beside
+/// a decided `ApprovalCard`. `Some` only for `Deny`, and for whatever message
+/// it carries — including the composer's own "the user declined this action"
+/// default when no note was typed. That default is still exactly what was
+/// sent to the model, so showing it is the honest answer; guessing which
+/// messages count as "a real note" would need a second source of truth this
+/// part does not carry.
+fn deny_note_text(decision: Option<&comet_proto::ApprovalDecision>) -> Option<SharedString> {
+    match decision {
+        Some(comet_proto::ApprovalDecision::Deny { message }) => {
+            Some(SharedString::from(single_line(message)))
+        }
+        _ => None,
+    }
+}
+
 pub fn rows_for_entry(
     entry: &SessionMessageEntry,
     pending: bool,
@@ -1134,6 +1161,18 @@ pub fn rows_for_entry(
                     entry_id: entry_id.clone(),
                     timestamp: None,
                 });
+                // D14's residual: the deny note is a sibling row, never a
+                // field on the card above — see `RowKind::DenyNote`.
+                if let Some(note) = deny_note_text(decision.as_ref()) {
+                    rows.push(Row {
+                        id: format!("{}#{}-deny-note", entry.id, part_id).into(),
+                        version: fnv1a(note.as_bytes()),
+                        turn_start: false,
+                        kind: RowKind::DenyNote { message: note },
+                        entry_id: entry_id.clone(),
+                        timestamp: None,
+                    });
+                }
             }
             MessagePart::Notice {
                 id: part_id,
@@ -3111,6 +3150,11 @@ impl Transcript {
                 state,
                 paint,
             } => approval_card(label, detail.clone(), state.clone(), *paint, &theme),
+            RowKind::DenyNote { message } => deny_note_chip(
+                format!("{}-deny-note", row.id).into(),
+                message.clone(),
+                &theme,
+            ),
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::SubagentCard {
                 agent_type,
@@ -3653,6 +3697,70 @@ fn user_bubble_text(
         .child(underlay)
         .child(styled)
         .into_any_element()
+}
+
+/// D14's residual, rendered: the note the user typed when denying the
+/// `ApprovalCard` above it (`RowKind::DenyNote`). Same 34px chip shape as
+/// [`error_chip`]/[`notice_chip`] — a card was the wrong shell here, because
+/// the approval card's 56px must stay fixed across every decision
+/// (`approval_card`'s doc comment) and a note has no length bound.
+///
+/// Neutral tones, not danger red: a denial is the user's own choice, not a
+/// failure (`.agents/rules/user-facing-errors.md`, and `approval_card`'s own
+/// comment makes the identical call for the card itself). A long note
+/// truncates on the row and carries the full text on hover, mirroring
+/// `notice_chip`'s tooltip rather than inventing a second pattern.
+fn deny_note_chip(chip_id: SharedString, message: SharedString, theme: &Theme) -> AnyElement {
+    let tooltip_text = message.clone();
+    let row = div()
+        .id(chip_id)
+        .h(px(34.0))
+        .w_full()
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .overflow_hidden()
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(crate::theme::hairline(0.08))
+        .bg(crate::theme::ink(0.045))
+        .px(px(8.0))
+        .text_size(px(12.0))
+        .child(
+            div()
+                .flex_none()
+                .size(px(20.0))
+                .rounded(px(6.0))
+                .bg(crate::theme::ink(0.09))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
+                        .size(px(12.0))
+                        .text_color(theme.text_muted),
+                ),
+        )
+        .child(
+            div()
+                .flex_none()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text_muted)
+                .child(SharedString::from("Deny note")),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .truncate()
+                .text_color(theme.text.opacity(0.8))
+                .child(message),
+        )
+        .tooltip(move |_, cx| {
+            let detail = tooltip_text.clone();
+            cx.new(|_| NoticeDetailTooltip { detail }).into()
+        });
+    div().py(px(4.0)).w_full().child(row).into_any_element()
 }
 
 /// The transcript ErrorChip — an exact port of comet chat-view.tsx
@@ -5343,6 +5451,53 @@ mod tests {
             Some("Allowed for this session")
         );
         assert_eq!(*paint, ApprovalPaint::Allowed);
+    }
+
+    /// D14's residual: the note goes back to the model AND stays in the
+    /// user's own transcript, as a sibling row right after the (still fixed
+    /// 56px) card — never lost, and never a field growing the card itself.
+    #[test]
+    fn a_denied_approval_with_a_note_gets_its_own_transcript_row() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![approval_part(
+                "ap-r1",
+                Some(comet_proto::ApprovalDecision::Deny {
+                    message: "not that path, use src/other.rs instead".into(),
+                }),
+            )],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 2, "the denied card plus its note row");
+        assert!(
+            matches!(rows[0].kind, RowKind::ApprovalCard { .. }),
+            "the card comes first"
+        );
+        let RowKind::DenyNote { message } = &rows[1].kind else {
+            panic!("expected a DenyNote row right after the denied card");
+        };
+        assert_eq!(message.as_ref(), "not that path, use src/other.rs instead");
+    }
+
+    /// The note row is specific to `Deny` — every other decision (including
+    /// no decision at all) must not manufacture one.
+    #[test]
+    fn only_a_denial_gets_a_deny_note_row() {
+        for decision in [
+            None,
+            Some(comet_proto::ApprovalDecision::Allow),
+            Some(comet_proto::ApprovalDecision::AllowForSession),
+            Some(comet_proto::ApprovalDecision::Expired),
+        ] {
+            let entry = assistant(
+                "m1",
+                MessageStatus::Complete,
+                vec![approval_part("ap-r1", decision)],
+            );
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            assert_eq!(rows.len(), 1, "no deny-note row for a non-denial decision");
+        }
     }
 
     /// `Expired` paints differently (amber, a state to resolve) but must NOT

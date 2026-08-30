@@ -233,6 +233,17 @@ pub fn humanize_bound(bound: Duration) -> String {
     }
 }
 
+/// The invariant half of [`unattended_note`]'s sentence — the part that never
+/// varies with the bound or which wait (`WaitKind::Approval`/`Answer`)
+/// expired. Exported so `crates/ui`'s `approvals::is_unattended_expiry_note`
+/// can recognize the note by comparing against this SAME constant rather than
+/// keeping a second hand-typed copy of it in step by a test — `comet-ui`
+/// already depends on `comet-engine` as a normal dependency (there is no
+/// wire between the two crates carrying this fact; both link directly), so
+/// one copy kept honest by the compiler is strictly better than two kept
+/// honest by a test someone could delete.
+pub const RESUME_CLAUSE: &str = "Send again to continue; the session still has its context.";
+
 /// What the user reads on reconnecting to an expired turn.
 ///
 /// Two clauses by design: what happened, then what to do. The second is true
@@ -245,7 +256,7 @@ pub fn unattended_note(bound: Duration, waited_on: WaitKind) -> String {
     };
     format!(
         "Stopped after {} — this turn needed {needed} and nothing was connected to ask. \
-         Send again to continue; the session still has its context.",
+         {RESUME_CLAUSE}",
         humanize_bound(bound)
     )
 }

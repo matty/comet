@@ -222,6 +222,66 @@ pub fn blocked_line(
     }
 }
 
+/// D28: whether `message` is copy `comet_engine::unattended_note` could have
+/// produced — the one thing that tells an unattended-turn-expiry
+/// `MessagePart::Error` apart from any other harness or provider error.
+///
+/// Matched on the invariant TAIL rather than the whole string: the sentence
+/// also embeds `humanize_bound(bound)` and which of "your approval"/"your
+/// answer" was needed, both of which vary — `comet_engine::RESUME_CLAUSE` is
+/// the part that never does. This is a shared CONSTANT, not a second
+/// hand-typed copy of the sentence: `crates/ui` already depends on
+/// `comet-engine` as a normal (non-dev) dependency, so both sides read the
+/// same `&str` and the compiler keeps them in step, not a test. The fact
+/// itself still isn't on the wire — this crate can tell a message LOOKS like
+/// an expiry note, never that the engine SAID it was one — which is worth
+/// keeping in mind for whoever wants it structural later: that needs a
+/// `MessagePart` field and the `PROTOCOL_VERSION` question that comes with
+/// it, deliberately out of scope here. The test below still calls the real
+/// generator, because it proves this fires on a message the generator
+/// actually produced, not merely that two constants are equal.
+fn is_unattended_expiry_note(message: &str) -> bool {
+    message.ends_with(comet_engine::RESUME_CLAUSE)
+}
+
+/// D28: the prompt to resend after a turn ended because nothing was
+/// connected to answer it — `None` unless the LAST assistant entry is
+/// terminal (a live stream has not expired) and carries an unattended-expiry
+/// note, in which case this is the nearest preceding user message's text.
+///
+/// Scoped to the last assistant entry for the same reason `pending_approval`
+/// is: a steer or a newer reply supersedes the expired one, and there is
+/// nothing left here to resend.
+pub fn expired_resubmit_prompt(transcript: &[SessionMessageEntry]) -> Option<String> {
+    let assistant_ix = transcript
+        .iter()
+        .rposition(|entry| entry.role == MessageRole::Assistant)?;
+    let assistant = &transcript[assistant_ix];
+    if assistant.status == Some(comet_doc::MessageStatus::Streaming) {
+        // Still running — nothing has expired yet.
+        return None;
+    }
+    let expired = assistant.parts.iter().any(|part| {
+        matches!(
+            part,
+            MessagePart::Error { message, .. } if is_unattended_expiry_note(message)
+        )
+    });
+    if !expired {
+        return None;
+    }
+    transcript[..assistant_ix]
+        .iter()
+        .rev()
+        .find(|entry| entry.role == MessageRole::User)?
+        .parts
+        .iter()
+        .find_map(|part| match part {
+            MessagePart::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,17 +328,28 @@ mod tests {
     }
 
     fn user(id: &str) -> SessionMessageEntry {
+        user_text(id, "steer")
+    }
+
+    fn user_text(id: &str, text: &str) -> SessionMessageEntry {
         SessionMessageEntry {
             id: id.into(),
             role: MessageRole::User,
             parts: vec![MessagePart::Text {
                 id: "t".into(),
-                text: "steer".into(),
+                text: text.into(),
             }],
             created_at: 1,
             device_id: "d".into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
+        }
+    }
+
+    fn error_part(id: &str, message: &str) -> MessagePart {
+        MessagePart::Error {
+            id: id.into(),
+            message: message.into(),
         }
     }
 
@@ -574,5 +645,111 @@ mod tests {
             .expect("an open approval is a blocked turn regardless of indicator");
         assert!(line.stoppable);
         assert!(line.text.contains("Waiting for approval"));
+    }
+
+    /// Both sides read the same `comet_engine::RESUME_CLAUSE` now, so this is
+    /// no longer proving two copies stayed in step — the compiler already
+    /// guarantees that. What it still proves: `unattended_note`'s `format!`
+    /// genuinely puts the clause LAST, with no trailing punctuation or
+    /// reordering, for every `bound`/`waited_on` combination — an
+    /// `ends_with` check can't tell "the clause is absent" from "the clause
+    /// moved" without a real generated string to check it against.
+    #[test]
+    fn recognizes_every_shape_the_real_unattended_note_can_take() {
+        for bound in [
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(86_400),
+        ] {
+            for kind in [
+                comet_engine::WaitKind::Approval,
+                comet_engine::WaitKind::Answer,
+            ] {
+                let note = comet_engine::unattended_note(bound, kind);
+                assert!(is_unattended_expiry_note(&note), "{note}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unrelated_error_is_not_mistaken_for_an_expiry_note() {
+        assert!(!is_unattended_expiry_note(
+            "the harness process exited unexpectedly"
+        ));
+    }
+
+    /// D28: the whole point — the prompt that went unanswered is recoverable
+    /// from the transcript once the turn has expired.
+    #[test]
+    fn expired_resubmit_prompt_returns_the_prior_users_text() {
+        let note = comet_engine::unattended_note(
+            std::time::Duration::from_secs(86_400),
+            comet_engine::WaitKind::Approval,
+        );
+        let t = vec![
+            user_text("u1", "delete the temp branch"),
+            assistant("m1", MessageStatus::Aborted, vec![error_part("e0", &note)]),
+        ];
+        assert_eq!(
+            expired_resubmit_prompt(&t).as_deref(),
+            Some("delete the temp branch")
+        );
+    }
+
+    /// An ordinary error (a harness crash, a bad tool call) must not offer to
+    /// resend — there is nothing "expired" about it, and the affordance would
+    /// be wrong.
+    #[test]
+    fn an_ordinary_error_does_not_offer_a_resubmit() {
+        let t = vec![
+            user_text("u1", "delete the temp branch"),
+            assistant(
+                "m1",
+                MessageStatus::Aborted,
+                vec![error_part("e0", "the harness process exited unexpectedly")],
+            ),
+        ];
+        assert!(expired_resubmit_prompt(&t).is_none());
+    }
+
+    /// A live stream has not expired yet, even if it later carries an error
+    /// part — resubmitting mid-stream would race the run that is still going.
+    #[test]
+    fn a_streaming_entry_does_not_offer_a_resubmit_yet() {
+        let note = comet_engine::unattended_note(
+            std::time::Duration::from_secs(30),
+            comet_engine::WaitKind::Answer,
+        );
+        let t = vec![
+            user_text("u1", "delete the temp branch"),
+            assistant(
+                "m1",
+                MessageStatus::Streaming,
+                vec![error_part("e0", &note)],
+            ),
+        ];
+        assert!(expired_resubmit_prompt(&t).is_none());
+    }
+
+    /// Same scoping trap as `pending_approval`: a newer assistant entry
+    /// supersedes the expired one, and there is nothing left here to resend.
+    #[test]
+    fn a_newer_assistant_entry_clears_the_resubmit_offer() {
+        let note = comet_engine::unattended_note(
+            std::time::Duration::from_secs(30),
+            comet_engine::WaitKind::Approval,
+        );
+        let t = vec![
+            user_text("u1", "delete the temp branch"),
+            assistant("m1", MessageStatus::Aborted, vec![error_part("e0", &note)]),
+            assistant(
+                "m2",
+                MessageStatus::Complete,
+                vec![MessagePart::Text {
+                    id: "t2".into(),
+                    text: "moved on".into(),
+                }],
+            ),
+        ];
+        assert!(expired_resubmit_prompt(&t).is_none());
     }
 }

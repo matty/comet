@@ -56,8 +56,9 @@ pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use unattended::{
-    DEFAULT_UNATTENDED_TIMEOUT_SECS, Presence, PresenceLease, UnattendedBound, WaitKind,
-    due_for_expiry, humanize_bound, sweep_interval, unattended_note, unattended_timeout_from_env,
+    DEFAULT_UNATTENDED_TIMEOUT_SECS, Presence, PresenceLease, RESUME_CLAUSE, UnattendedBound,
+    WaitKind, due_for_expiry, humanize_bound, sweep_interval, unattended_note,
+    unattended_timeout_from_env,
 };
 pub use uploads::{AttachmentChunk, Uploads};
 pub use workspace_host::{WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig};
