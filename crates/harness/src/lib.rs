@@ -54,10 +54,14 @@ pub enum HarnessError {
     /// moment `NeedsSetup` needs to reach one, without a field ever having
     /// to be parsed back out of a joined string first.
     ///
-    /// Built only by a vendor module's own `map_open_failure` (see
-    /// `acp::session::OpenFailureMapper`), never constructed directly here —
-    /// this crate does not know what "not set up yet" looks like on any
-    /// agent's wire.
+    /// Built by a vendor module's own `map_open_failure` (see
+    /// `acp::session::OpenFailureMapper`) for the wire-level cases — this crate
+    /// does not know what "not set up yet" looks like on any agent's protocol —
+    /// and by [`spawn_failure`] for the two that need no wire at all: a binary
+    /// this account cannot execute, and one that will not start. Both answer
+    /// the same user-facing question as a signed-out agent does, which is the
+    /// test `hermes::map_open_failure`'s doc comment sets for reusing this
+    /// variant rather than adding another.
     #[error("{summary}. {hint}")]
     NeedsSetup { summary: String, hint: String },
     /// The agent opened a session and then refused a SETTING sent with it —
@@ -408,6 +412,48 @@ pub(crate) fn not_installed(stem: &str, override_var: &str) -> (String, String) 
         "Not installed".to_string(),
         format!("Install {stem}, or set {override_var} to its path."),
     )
+}
+
+/// Why a resolved CLI would not spawn, as something the user can act on.
+///
+/// **D130.** Both run paths used to map `spawn()`'s error with two arms:
+/// `NotFound` to [`HarnessError::NotInstalled`], and everything else to
+/// [`HarnessError::Io`] — whose `Display` is `io: {0}`, so a `PermissionDenied`
+/// reached the user through `drive_run`'s sink as `io: Access is denied. (os
+/// error 5)`. That is rule 1 of `.agents/rules/user-facing-errors.md`, at the
+/// third site after D119 and D100.
+///
+/// Reads `io::ErrorKind`, never the error's `Display`, exactly as
+/// `probe_cli_version`'s `start_failure_hint` does for the same kinds — the two
+/// answer the same question about the same binary, one before a run and one
+/// during it.
+///
+/// **Reuses `NeedsSetup` rather than adding a third copy-carrying variant.**
+/// `hermes::map_open_failure`'s doc comment sets the test: a new variant earns
+/// its place only when the user's next action differs, not when the wording
+/// does. A CLI that cannot be executed and a CLI that is signed out both answer
+/// "this agent cannot run yet; go do one more thing to it", which is what
+/// `NeedsSetup` says.
+pub(crate) fn spawn_failure(exe: &std::path::Path, error: &std::io::Error) -> HarnessError {
+    let name = exe.display();
+    match error.kind() {
+        // Unchanged, and deliberately not routed through the summary/hint
+        // pair: `NotInstalled`'s own Display already reads as product copy in
+        // the models pane, and its message is what the rail renders.
+        std::io::ErrorKind::NotFound => HarnessError::NotInstalled(name.to_string()),
+        std::io::ErrorKind::PermissionDenied => HarnessError::NeedsSetup {
+            summary: "Not runnable".into(),
+            hint: format!(
+                "This account cannot run {name}. Check the file's permissions, or point Comet                  at a different copy."
+            ),
+        },
+        _ => HarnessError::NeedsSetup {
+            summary: "Won't start".into(),
+            hint: format!(
+                "{name} would not start. Reinstall the CLI, or point Comet at a working copy."
+            ),
+        },
+    }
 }
 
 /// The same failure as one line, for [`HarnessError::NotInstalled`] — an error
@@ -1259,6 +1305,59 @@ mod install_classification_tests {
 
 #[cfg(test)]
 mod probe_tests {
+
+    /// Break caught (D130): every spawn failure but `NotFound` became
+    /// `HarnessError::Io`, whose `Display` is `io: {0}`, and `drive_run`'s sink
+    /// renders a `HarnessError` close to as-is — so `io: Access is denied. (os
+    /// error 5)` reached the user. Rule 1 of
+    /// `.agents/rules/user-facing-errors.md`, at the third site after D119 and
+    /// D100.
+    ///
+    /// Asserts the absence AND the replacement, per the pattern the probe's own
+    /// test set: dropping the raw text is no good if what replaced it says
+    /// nothing to do.
+    #[test]
+    fn a_spawn_failure_never_reaches_the_user_as_an_os_error() {
+        let exe = std::path::Path::new("/opt/agents/claude");
+        for (kind, expected_summary) in [
+            (std::io::ErrorKind::PermissionDenied, "Not runnable"),
+            (std::io::ErrorKind::InvalidData, "Won't start"),
+            (std::io::ErrorKind::WouldBlock, "Won't start"),
+        ] {
+            let error = std::io::Error::new(kind, "Access is denied. (os error 5)");
+            match spawn_failure(exe, &error) {
+                HarnessError::NeedsSetup { summary, hint } => {
+                    assert_eq!(summary, expected_summary);
+                    assert!(
+                        hint.contains("claude"),
+                        "which binary failed is the diagnosis: {hint}"
+                    );
+                    for leak in ["os error", "Access is denied", "io:"] {
+                        assert!(
+                            !format!("{summary}. {hint}").contains(leak),
+                            "{kind:?} leaked raw OS detail: {hint}"
+                        );
+                    }
+                }
+                other => panic!("{kind:?} must become actionable copy, got {other:?}"),
+            }
+        }
+    }
+
+    /// The one arm that must NOT change: a missing binary keeps
+    /// `NotInstalled`, whose Display already reads as product copy in the
+    /// models pane ("Agent CLI not found: …") and which the harness rail
+    /// renders directly.
+    #[test]
+    fn a_missing_binary_still_reports_as_not_installed() {
+        let exe = std::path::Path::new("/opt/agents/claude");
+        let error = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        match spawn_failure(exe, &error) {
+            HarnessError::NotInstalled(named) => assert!(named.contains("claude"), "{named}"),
+            other => panic!("a missing binary must stay NotInstalled, got {other:?}"),
+        }
+    }
+
     use super::*;
 
     /// The two CLIs put the version in different positions — Claude leads with
