@@ -271,6 +271,66 @@ fn a_named_map_child_reaches_the_sheet_while_an_unnamed_sibling_still_folds() {
     );
 }
 
+/// Break caught (D77, second live instance, 2026-08-29): ACP's
+/// `session/request_permission` carries the same tool-argument map at
+/// `.params.toolCall.rawInput` that `.params.update.rawInput` already
+/// declares — `acp::approval::command` (`crates/harness/src/acp/approval.rs`)
+/// reads `command` and `cwd` off it — but nothing had declared this second
+/// path, so a tool's own argument keys would have published as field names
+/// the day an approval scenario is promoted. Mirrors
+/// `a_named_map_child_reaches_the_sheet_while_an_unnamed_sibling_still_folds`
+/// above, at the sibling path.
+#[test]
+fn a_named_map_child_reaches_the_sheet_for_tool_call_raw_input_too() {
+    let root = tempfile::tempdir().unwrap();
+    write_scenario(
+        root.path(),
+        "claude-agent-acp",
+        "0.70.0",
+        "approve-command",
+        &[(
+            1,
+            "stdout",
+            json!({
+                "params": {
+                    "toolCall": {
+                        "kind": "execute",
+                        "rawInput": {
+                            "command": "rm -rf /tmp/x",
+                            "cwd": "C:\\Users\\coding\\AppData\\Local\\Temp\\cwd",
+                            // An unnamed sibling this build does not decode —
+                            // must still fold, the same probe
+                            // `attachment`/`mimeType` runs above for
+                            // `.params.update.rawInput`.
+                            "timeout": {"seconds": 30},
+                        }
+                    }
+                }
+            }),
+        )],
+    );
+
+    let observations = observe_surface(root.path()).unwrap().0;
+    let seen = paths(&observations);
+
+    assert!(
+        seen.contains(".params.toolCall.rawInput.command"),
+        "a named child must be recorded under its own field name: {seen:?}"
+    );
+    assert!(
+        seen.contains(".params.toolCall.rawInput.cwd"),
+        "a named child must be recorded under its own field name: {seen:?}"
+    );
+    assert!(
+        !seen.contains(".params.toolCall.rawInput.timeout"),
+        "an unnamed sibling's own key must not publish as a field: {seen:?}"
+    );
+    assert!(
+        seen.contains(".params.toolCall.rawInput.{}.seconds"),
+        "an unnamed sibling must still fold to `{{}}`, not disappear or leak its key: {seen:?}"
+    );
+}
+
 /// Break caught: the same key at two different places folds into one row, so
 /// `content` in a tool input and `content` in an assistant message become
 /// indistinguishable.
