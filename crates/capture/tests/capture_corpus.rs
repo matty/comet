@@ -2,6 +2,7 @@ mod capture_corpus {
     mod acp_decode_coverage;
     mod allowlist_property;
     mod capability_sheets;
+    mod claude_tool_coverage;
     mod codex_method_coverage;
     mod corpus_frames;
     mod fixture_provenance;

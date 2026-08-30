@@ -84,10 +84,14 @@ Codex JSON-RPC methods, both in both directions — a decoded name with no captu
 captured name nobody has ruled on. Those are the two surfaces whose vocabulary the corpus records
 (`.params.update.sessionUpdate` and `.method`).
 
-**Tool names are the gap, and Codex's half is capture-blocked**: no promoted scenario exercises a
-Codex tool call at all, so there is no dotted path to declare as a discriminator and nothing to
-compare a decode against. Claude's `.message.content[].name` and `.event.content_block.name` are
-declared and could carry the same lint today.
+`claude_tool_coverage.rs` does the same for Claude tool names, across all three paths one can
+appear at — including `.request.tool_name`, declared 2026-08-30 because an approval-gated call
+names itself there and nowhere else, so the `approval` scenarios' own `Write` was invisible to the
+sheet until then.
+
+**Codex tool names are the one surface still uncovered, and it is capture-blocked**: no promoted
+scenario exercises a Codex tool call at all, so there is no dotted path to declare as a
+discriminator and nothing to compare a decode against.
 
 **Nothing checks the installed CLI against the floor**, and nothing states a coverage or
 retirement policy for corpus versions — **D70**.

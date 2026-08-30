@@ -333,6 +333,14 @@ pub fn escape_path_segment(key: &str) -> Cow<'_, str> {
 /// - `.event.content_block.name` — the same tool name, streamed: it appears
 ///   on the `content_block_start` event that precedes the buffered form
 ///   above, with the identical vocabulary.
+/// - `.request.tool_name` — the same tool name a THIRD time, on the
+///   `can_use_tool` control request. Declared 2026-08-30, when a lint asked
+///   "which tool names has the corpus ever seen" and got a false answer: the
+///   two paths above only see a tool the model announced in a message, while
+///   an approval-gated call names itself here and nowhere else. The
+///   `approval` scenarios' `Write`/`TaskCreate`/`TaskUpdate` were invisible
+///   to the sheet until this was added. Same vocabulary, different frame —
+///   a name is evidence wherever it appears.
 /// - `.method` — **not a Claude-shaped discriminator; added 2026-08-16.**
 ///   Codex is JSON-RPC and carries no root `.type`/`.subtype`/`.event.type`
 ///   at all, so without this path Codex's vocabulary was entirely empty
@@ -374,6 +382,7 @@ pub const VOCABULARY_PATHS: &[&str] = &[
     ".method",
     ".message.content[].name",
     ".event.content_block.name",
+    ".request.tool_name",
     ".params.update.sessionUpdate",
 ];
 
