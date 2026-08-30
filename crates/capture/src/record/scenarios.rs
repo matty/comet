@@ -317,6 +317,40 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::edit(s, i))),
     },
     ScenarioSpec {
+        name: "edit-create",
+        purpose: "capture a Claude Edit call with an empty old_string against a path that has \
+                   never existed (D132)",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(claude::edit_create_request),
+        // Same reasoning as `edit` above: AutoAcceptEdits under this fence, not an approval
+        // round trip, is the whole guarantee available to a run with no seeded file to protect.
+        fence: super::full_access_fence,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::edit_create(s, i))),
+    },
+    ScenarioSpec {
+        name: "edit-noop",
+        purpose: "capture a Claude Edit call with old_string absent and new_string empty, \
+                   on a file that exists and has been read (D17's degenerate case)",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(claude::edit_noop_request),
+        fence: super::full_access_fence,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::edit_noop(s, i))),
+    },
+    ScenarioSpec {
+        name: "write-overwrite",
+        purpose: "capture a Claude Write call that overwrites an existing file's content (D18)",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(claude::write_overwrite_request),
+        fence: super::full_access_fence,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::write_overwrite(s, i))),
+    },
+    ScenarioSpec {
         name: "approval",
         purpose: "capture a Claude run that answers Bash and Write approval requests",
         provider: Provider::Claude,
@@ -535,6 +569,9 @@ mod tests {
             ("codex", "auto"),
             ("codex", "full-access"),
             ("claude", "edit"),
+            ("claude", "edit-create"),
+            ("claude", "edit-noop"),
+            ("claude", "write-overwrite"),
         ] {
             assert!(
                 scenario(provider, name).is_some(),
@@ -545,7 +582,7 @@ mod tests {
         assert!(scenario("codex", "model-discovery-logged-out").is_some());
         assert_eq!(
             SCENARIOS.len(),
-            26,
+            29,
             "an added or removed row must update this count too"
         );
     }

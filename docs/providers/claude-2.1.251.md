@@ -37,260 +37,363 @@ low
 acceptEdits
 ```
 
+### edit-create
+
+capture a Claude Edit call with an empty old_string against a path that has never existed (D132)
+
+cwd: `<CWD>`
+env: (none set)
+tools: 65
+
+```
+<HOME>\.local\bin\claude.exe
+--print
+--input-format
+stream-json
+--output-format
+stream-json
+--verbose
+--include-partial-messages
+--permission-prompt-tool
+stdio
+--model
+claude-haiku-4-5-20251001
+--effort
+low
+--permission-mode
+acceptEdits
+```
+
+### edit-noop
+
+capture a Claude Edit call with old_string absent and new_string empty, on a file that exists and has been read (D17's degenerate case)
+
+cwd: `<CWD>`
+env: (none set)
+tools: 65
+
+```
+<HOME>\.local\bin\claude.exe
+--print
+--input-format
+stream-json
+--output-format
+stream-json
+--verbose
+--include-partial-messages
+--permission-prompt-tool
+stdio
+--model
+claude-haiku-4-5-20251001
+--effort
+low
+--permission-mode
+acceptEdits
+```
+
+### write-overwrite
+
+capture a Claude Write call that overwrites an existing file's content (D18)
+
+cwd: `<CWD>`
+env: (none set)
+tools: 65
+
+```
+<HOME>\.local\bin\claude.exe
+--print
+--input-format
+stream-json
+--output-format
+stream-json
+--verbose
+--include-partial-messages
+--permission-prompt-tool
+stdio
+--model
+claude-haiku-4-5-20251001
+--effort
+low
+--permission-mode
+acceptEdits
+```
+
 ## Fields
 
 Every dotted path observed on the wire for this provider and version, split by the direction it travelled — `To provider` is what Comet sends, `From provider` is what the provider sends back — one path per line, sorted, each tagged with the scenario group (below) that produced it. A field missing from this version's list is only evidence the CLI dropped it if the scenarios that group names are also present in the other version's own Scenarios section — a group made only of scenarios this version's Scenarios section doesn't have means the field was simply never exercised here, not removed.
 
 ### Scenario groups
 
-- `G1`: edit
+- `G1`: edit, edit-create
+- `G2`: edit, edit-create, edit-noop
+- `G3`: edit, edit-create, edit-noop, write-overwrite
+- `G4`: edit, edit-create, write-overwrite
+- `G5`: edit, edit-noop, write-overwrite
+- `G6`: edit-create, edit-noop, write-overwrite
+- `G7`: edit-noop
+- `G8`: write-overwrite
 
 ### To provider
 
-- `.message` `G1`
-- `.message.content` `G1`
-- `.message.role` `G1`
-- `.parent_tool_use_id` `G1`
-- `.type` `G1`
+- `.message` `G3`
+- `.message.content` `G3`
+- `.message.role` `G3`
+- `.parent_tool_use_id` `G3`
+- `.type` `G3`
 
 ### From provider
 
-- `.agents` `G1`
-- `.analytics_disabled` `G1`
-- `.apiKeySource` `G1`
-- `.api_error_status` `G1`
-- `.capabilities` `G1`
-- `.claude_code_version` `G1`
-- `.cwd` `G1`
-- `.duration_api_ms` `G1`
-- `.duration_ms` `G1`
-- `.estimated_tokens` `G1`
-- `.estimated_tokens_delta` `G1`
-- `.event` `G1`
-- `.event.content_block` `G1`
-- `.event.content_block.caller` `G1`
-- `.event.content_block.caller.type` `G1`
-- `.event.content_block.id` `G1`
-- `.event.content_block.input` `G1`
-- `.event.content_block.name` `G1`
-- `.event.content_block.signature` `G1`
-- `.event.content_block.text` `G1`
-- `.event.content_block.thinking` `G1`
-- `.event.content_block.type` `G1`
-- `.event.context_management` `G1`
-- `.event.context_management.applied_edits` `G1`
-- `.event.delta` `G1`
-- `.event.delta.estimated_tokens` `G1`
-- `.event.delta.partial_json` `G1`
-- `.event.delta.signature` `G1`
-- `.event.delta.stop_details` `G1`
-- `.event.delta.stop_reason` `G1`
-- `.event.delta.stop_sequence` `G1`
-- `.event.delta.text` `G1`
-- `.event.delta.thinking` `G1`
-- `.event.delta.type` `G1`
-- `.event.index` `G1`
-- `.event.message` `G1`
-- `.event.message.content` `G1`
-- `.event.message.diagnostics` `G1`
-- `.event.message.id` `G1`
-- `.event.message.model` `G1`
-- `.event.message.role` `G1`
-- `.event.message.stop_details` `G1`
-- `.event.message.stop_reason` `G1`
-- `.event.message.stop_sequence` `G1`
-- `.event.message.type` `G1`
-- `.event.message.usage` `G1`
-- `.event.message.usage.cache_creation` `G1`
-- `.event.message.usage.cache_creation.ephemeral_1h_input_tokens` `G1`
-- `.event.message.usage.cache_creation.ephemeral_5m_input_tokens` `G1`
-- `.event.message.usage.cache_creation_input_tokens` `G1`
-- `.event.message.usage.cache_read_input_tokens` `G1`
-- `.event.message.usage.inference_geo` `G1`
-- `.event.message.usage.input_tokens` `G1`
-- `.event.message.usage.output_tokens` `G1`
-- `.event.message.usage.service_tier` `G1`
-- `.event.type` `G1`
-- `.event.usage` `G1`
-- `.event.usage.cache_creation_input_tokens` `G1`
-- `.event.usage.cache_read_input_tokens` `G1`
-- `.event.usage.input_tokens` `G1`
-- `.event.usage.iterations` `G1`
-- `.event.usage.iterations[].cache_creation` `G1`
-- `.event.usage.iterations[].cache_creation.ephemeral_1h_input_tokens` `G1`
-- `.event.usage.iterations[].cache_creation.ephemeral_5m_input_tokens` `G1`
-- `.event.usage.iterations[].cache_creation_input_tokens` `G1`
-- `.event.usage.iterations[].cache_read_input_tokens` `G1`
-- `.event.usage.iterations[].input_tokens` `G1`
-- `.event.usage.iterations[].output_tokens` `G1`
-- `.event.usage.iterations[].type` `G1`
-- `.event.usage.output_tokens` `G1`
-- `.event.usage.output_tokens_details` `G1`
-- `.event.usage.output_tokens_details.thinking_tokens` `G1`
-- `.fast_mode_disabled_reason` `G1`
-- `.fast_mode_state` `G1`
-- `.is_error` `G1`
-- `.mcp_servers` `G1`
-- `.mcp_servers[].name` `G1`
-- `.mcp_servers[].status` `G1`
-- `.memory_paths` `G1`
-- `.memory_paths.auto` `G1`
-- `.message` `G1`
-- `.message.content` `G1`
-- `.message.content[].caller` `G1`
-- `.message.content[].caller.type` `G1`
-- `.message.content[].content` `G1`
-- `.message.content[].id` `G1`
-- `.message.content[].input` `G1`
-- `.message.content[].input.file_path` `G1`
-- `.message.content[].input.new_string` `G1`
+- `.agents` `G3`
+- `.analytics_disabled` `G3`
+- `.apiKeySource` `G3`
+- `.api_error_status` `G3`
+- `.capabilities` `G3`
+- `.claude_code_version` `G3`
+- `.cwd` `G3`
+- `.duration_api_ms` `G3`
+- `.duration_ms` `G3`
+- `.estimated_tokens` `G3`
+- `.estimated_tokens_delta` `G3`
+- `.event` `G3`
+- `.event.content_block` `G3`
+- `.event.content_block.caller` `G3`
+- `.event.content_block.caller.type` `G3`
+- `.event.content_block.id` `G3`
+- `.event.content_block.input` `G3`
+- `.event.content_block.name` `G3`
+- `.event.content_block.signature` `G3`
+- `.event.content_block.text` `G3`
+- `.event.content_block.thinking` `G3`
+- `.event.content_block.type` `G3`
+- `.event.context_management` `G3`
+- `.event.context_management.applied_edits` `G3`
+- `.event.delta` `G3`
+- `.event.delta.estimated_tokens` `G3`
+- `.event.delta.partial_json` `G3`
+- `.event.delta.signature` `G3`
+- `.event.delta.stop_details` `G3`
+- `.event.delta.stop_reason` `G3`
+- `.event.delta.stop_sequence` `G3`
+- `.event.delta.text` `G3`
+- `.event.delta.thinking` `G3`
+- `.event.delta.type` `G3`
+- `.event.index` `G3`
+- `.event.message` `G3`
+- `.event.message.content` `G3`
+- `.event.message.diagnostics` `G3`
+- `.event.message.id` `G3`
+- `.event.message.model` `G3`
+- `.event.message.role` `G3`
+- `.event.message.stop_details` `G3`
+- `.event.message.stop_reason` `G3`
+- `.event.message.stop_sequence` `G3`
+- `.event.message.type` `G3`
+- `.event.message.usage` `G3`
+- `.event.message.usage.cache_creation` `G3`
+- `.event.message.usage.cache_creation.ephemeral_1h_input_tokens` `G3`
+- `.event.message.usage.cache_creation.ephemeral_5m_input_tokens` `G3`
+- `.event.message.usage.cache_creation_input_tokens` `G3`
+- `.event.message.usage.cache_read_input_tokens` `G3`
+- `.event.message.usage.inference_geo` `G3`
+- `.event.message.usage.input_tokens` `G3`
+- `.event.message.usage.output_tokens` `G3`
+- `.event.message.usage.service_tier` `G3`
+- `.event.type` `G3`
+- `.event.usage` `G3`
+- `.event.usage.cache_creation_input_tokens` `G3`
+- `.event.usage.cache_read_input_tokens` `G3`
+- `.event.usage.input_tokens` `G3`
+- `.event.usage.iterations` `G3`
+- `.event.usage.iterations[].cache_creation` `G3`
+- `.event.usage.iterations[].cache_creation.ephemeral_1h_input_tokens` `G3`
+- `.event.usage.iterations[].cache_creation.ephemeral_5m_input_tokens` `G3`
+- `.event.usage.iterations[].cache_creation_input_tokens` `G3`
+- `.event.usage.iterations[].cache_read_input_tokens` `G3`
+- `.event.usage.iterations[].input_tokens` `G3`
+- `.event.usage.iterations[].output_tokens` `G3`
+- `.event.usage.iterations[].type` `G3`
+- `.event.usage.output_tokens` `G3`
+- `.event.usage.output_tokens_details` `G3`
+- `.event.usage.output_tokens_details.thinking_tokens` `G3`
+- `.exit_code` `G6`
+- `.fast_mode_disabled_reason` `G3`
+- `.fast_mode_state` `G3`
+- `.hook_event` `G6`
+- `.hook_id` `G6`
+- `.hook_name` `G6`
+- `.is_error` `G3`
+- `.mcp_servers` `G3`
+- `.mcp_servers[].name` `G3`
+- `.mcp_servers[].status` `G3`
+- `.memory_paths` `G3`
+- `.memory_paths.auto` `G3`
+- `.message` `G3`
+- `.message.content` `G3`
+- `.message.content[].caller` `G3`
+- `.message.content[].caller.type` `G3`
+- `.message.content[].content` `G3`
+- `.message.content[].id` `G3`
+- `.message.content[].input` `G3`
+- `.message.content[].input.content` `G8`
+- `.message.content[].input.file_path` `G3`
+- `.message.content[].input.new_string` `G2`
 - `.message.content[].input.old_string` `G1`
 - `.message.content[].input.replace_all` `G1`
-- `.message.content[].name` `G1`
-- `.message.content[].signature` `G1`
-- `.message.content[].text` `G1`
-- `.message.content[].thinking` `G1`
-- `.message.content[].tool_use_id` `G1`
-- `.message.content[].type` `G1`
-- `.message.context_management` `G1`
-- `.message.diagnostics` `G1`
-- `.message.id` `G1`
-- `.message.model` `G1`
-- `.message.role` `G1`
-- `.message.stop_details` `G1`
-- `.message.stop_reason` `G1`
-- `.message.stop_sequence` `G1`
-- `.message.type` `G1`
-- `.message.usage` `G1`
-- `.message.usage.cache_creation` `G1`
-- `.message.usage.cache_creation.ephemeral_1h_input_tokens` `G1`
-- `.message.usage.cache_creation.ephemeral_5m_input_tokens` `G1`
-- `.message.usage.cache_creation_input_tokens` `G1`
-- `.message.usage.cache_read_input_tokens` `G1`
-- `.message.usage.inference_geo` `G1`
-- `.message.usage.input_tokens` `G1`
-- `.message.usage.output_tokens` `G1`
-- `.message.usage.service_tier` `G1`
-- `.messaging_socket_path` `G1`
-- `.model` `G1`
-- `.modelUsage` `G1`
-- `.modelUsage.{}.cacheCreationInputTokens` `G1`
-- `.modelUsage.{}.cacheReadInputTokens` `G1`
-- `.modelUsage.{}.canonicalModel` `G1`
-- `.modelUsage.{}.contextWindow` `G1`
-- `.modelUsage.{}.costBasis` `G1`
-- `.modelUsage.{}.costUSD` `G1`
-- `.modelUsage.{}.inputTokens` `G1`
-- `.modelUsage.{}.maxOutputTokens` `G1`
-- `.modelUsage.{}.outputTokens` `G1`
-- `.modelUsage.{}.provider` `G1`
-- `.modelUsage.{}.webSearchRequests` `G1`
-- `.num_turns` `G1`
-- `.output_style` `G1`
-- `.parent_tool_use_id` `G1`
-- `.permissionMode` `G1`
-- `.permission_denials` `G1`
-- `.plugins` `G1`
-- `.powershell_path` `G1`
-- `.product_feedback_disabled` `G1`
-- `.queued_turn_count` `G1`
-- `.rate_limit_info` `G1`
-- `.rate_limit_info.isUsingOverage` `G1`
-- `.rate_limit_info.overageDisabledReason` `G1`
-- `.rate_limit_info.overageStatus` `G1`
-- `.rate_limit_info.rateLimitType` `G1`
-- `.rate_limit_info.resetsAt` `G1`
-- `.rate_limit_info.status` `G1`
-- `.rate_limit_info.unifiedWindows` `G1`
-- `.rate_limit_info.unifiedWindows.five_hour` `G1`
-- `.rate_limit_info.unifiedWindows.five_hour.resetsAt` `G1`
-- `.rate_limit_info.unifiedWindows.five_hour.utilization` `G1`
-- `.rate_limit_info.unifiedWindows.seven_day` `G1`
-- `.rate_limit_info.unifiedWindows.seven_day.resetsAt` `G1`
-- `.rate_limit_info.unifiedWindows.seven_day.utilization` `G1`
-- `.request_id` `G1`
-- `.result` `G1`
-- `.session_id` `G1`
-- `.skills` `G1`
-- `.slash_commands` `G1`
-- `.status` `G1`
-- `.stop_reason` `G1`
-- `.subagent_stats` `G1`
-- `.subagent_stats.by_type` `G1`
-- `.subagent_stats.completed` `G1`
-- `.subagent_stats.failed` `G1`
-- `.subagent_stats.killed` `G1`
-- `.subagent_stats.killed.parent` `G1`
-- `.subagent_stats.killed.system` `G1`
-- `.subagent_stats.killed.user` `G1`
-- `.subagent_stats.max_depth` `G1`
-- `.subagent_stats.refused` `G1`
-- `.subagent_stats.refused.budget` `G1`
-- `.subagent_stats.refused.concurrency_limit` `G1`
-- `.subagent_stats.refused.depth_limit` `G1`
-- `.subagent_stats.requested` `G1`
-- `.subagent_stats.requested.background` `G1`
-- `.subagent_stats.requested.foreground` `G1`
-- `.subagent_stats.requested.unset` `G1`
-- `.subagent_stats.spawned` `G1`
-- `.subagent_stats.spawned_by_subagents` `G1`
-- `.subagent_stats.started_in_background` `G1`
-- `.subtype` `G1`
-- `.terminal_reason` `G1`
-- `.terminal_slash_commands` `G1`
-- `.time_to_request_ms` `G1`
-- `.timestamp` `G1`
-- `.tool_use_result` `G1`
-- `.tool_use_result.file` `G1`
-- `.tool_use_result.file.content` `G1`
-- `.tool_use_result.file.filePath` `G1`
-- `.tool_use_result.file.numLines` `G1`
-- `.tool_use_result.file.startLine` `G1`
-- `.tool_use_result.file.totalLines` `G1`
-- `.tool_use_result.filePath` `G1`
+- `.message.content[].is_error` `G7`
+- `.message.content[].name` `G3`
+- `.message.content[].signature` `G3`
+- `.message.content[].text` `G3`
+- `.message.content[].thinking` `G3`
+- `.message.content[].tool_use_id` `G3`
+- `.message.content[].type` `G3`
+- `.message.context_management` `G3`
+- `.message.diagnostics` `G3`
+- `.message.id` `G3`
+- `.message.model` `G3`
+- `.message.role` `G3`
+- `.message.stop_details` `G3`
+- `.message.stop_reason` `G3`
+- `.message.stop_sequence` `G3`
+- `.message.type` `G3`
+- `.message.usage` `G3`
+- `.message.usage.cache_creation` `G3`
+- `.message.usage.cache_creation.ephemeral_1h_input_tokens` `G3`
+- `.message.usage.cache_creation.ephemeral_5m_input_tokens` `G3`
+- `.message.usage.cache_creation_input_tokens` `G3`
+- `.message.usage.cache_read_input_tokens` `G3`
+- `.message.usage.inference_geo` `G3`
+- `.message.usage.input_tokens` `G3`
+- `.message.usage.output_tokens` `G3`
+- `.message.usage.service_tier` `G3`
+- `.messaging_socket_path` `G3`
+- `.model` `G3`
+- `.modelUsage` `G3`
+- `.modelUsage.{}.cacheCreationInputTokens` `G3`
+- `.modelUsage.{}.cacheReadInputTokens` `G3`
+- `.modelUsage.{}.canonicalModel` `G3`
+- `.modelUsage.{}.contextWindow` `G3`
+- `.modelUsage.{}.costBasis` `G3`
+- `.modelUsage.{}.costUSD` `G3`
+- `.modelUsage.{}.inputTokens` `G3`
+- `.modelUsage.{}.maxOutputTokens` `G3`
+- `.modelUsage.{}.outputTokens` `G3`
+- `.modelUsage.{}.provider` `G3`
+- `.modelUsage.{}.webSearchRequests` `G3`
+- `.num_turns` `G3`
+- `.outcome` `G6`
+- `.output` `G6`
+- `.output_style` `G3`
+- `.parent_tool_use_id` `G3`
+- `.permissionMode` `G3`
+- `.permission_denials` `G3`
+- `.plugins` `G3`
+- `.plugins[].name` `G6`
+- `.plugins[].path` `G6`
+- `.plugins[].source` `G6`
+- `.plugins[].version` `G6`
+- `.powershell_path` `G3`
+- `.product_feedback_disabled` `G3`
+- `.queued_turn_count` `G3`
+- `.rate_limit_info` `G3`
+- `.rate_limit_info.isUsingOverage` `G3`
+- `.rate_limit_info.overageDisabledReason` `G3`
+- `.rate_limit_info.overageStatus` `G3`
+- `.rate_limit_info.rateLimitType` `G3`
+- `.rate_limit_info.resetsAt` `G3`
+- `.rate_limit_info.status` `G3`
+- `.rate_limit_info.unifiedWindows` `G3`
+- `.rate_limit_info.unifiedWindows.five_hour` `G3`
+- `.rate_limit_info.unifiedWindows.five_hour.resetsAt` `G3`
+- `.rate_limit_info.unifiedWindows.five_hour.utilization` `G3`
+- `.rate_limit_info.unifiedWindows.seven_day` `G3`
+- `.rate_limit_info.unifiedWindows.seven_day.resetsAt` `G3`
+- `.rate_limit_info.unifiedWindows.seven_day.utilization` `G3`
+- `.request_id` `G3`
+- `.result` `G3`
+- `.session_id` `G3`
+- `.skills` `G3`
+- `.slash_commands` `G3`
+- `.status` `G3`
+- `.stderr` `G6`
+- `.stdout` `G6`
+- `.stop_reason` `G3`
+- `.subagent_stats` `G3`
+- `.subagent_stats.by_type` `G3`
+- `.subagent_stats.completed` `G3`
+- `.subagent_stats.failed` `G3`
+- `.subagent_stats.killed` `G3`
+- `.subagent_stats.killed.parent` `G3`
+- `.subagent_stats.killed.system` `G3`
+- `.subagent_stats.killed.user` `G3`
+- `.subagent_stats.max_depth` `G3`
+- `.subagent_stats.refused` `G3`
+- `.subagent_stats.refused.budget` `G3`
+- `.subagent_stats.refused.concurrency_limit` `G3`
+- `.subagent_stats.refused.depth_limit` `G3`
+- `.subagent_stats.requested` `G3`
+- `.subagent_stats.requested.background` `G3`
+- `.subagent_stats.requested.foreground` `G3`
+- `.subagent_stats.requested.unset` `G3`
+- `.subagent_stats.spawned` `G3`
+- `.subagent_stats.spawned_by_subagents` `G3`
+- `.subagent_stats.started_in_background` `G3`
+- `.subtype` `G3`
+- `.terminal_reason` `G3`
+- `.terminal_slash_commands` `G3`
+- `.time_to_request_ms` `G3`
+- `.timestamp` `G3`
+- `.tool_use_result` `G3`
+- `.tool_use_result.content` `G8`
+- `.tool_use_result.file` `G5`
+- `.tool_use_result.file.content` `G5`
+- `.tool_use_result.file.filePath` `G5`
+- `.tool_use_result.file.numLines` `G5`
+- `.tool_use_result.file.startLine` `G5`
+- `.tool_use_result.file.totalLines` `G5`
+- `.tool_use_result.filePath` `G4`
 - `.tool_use_result.newString` `G1`
 - `.tool_use_result.oldString` `G1`
-- `.tool_use_result.originalFile` `G1`
+- `.tool_use_result.originalFile` `G4`
 - `.tool_use_result.replaceAll` `G1`
-- `.tool_use_result.structuredPatch` `G1`
-- `.tool_use_result.structuredPatch[].lines` `G1`
-- `.tool_use_result.structuredPatch[].newLines` `G1`
-- `.tool_use_result.structuredPatch[].newStart` `G1`
-- `.tool_use_result.structuredPatch[].oldLines` `G1`
-- `.tool_use_result.structuredPatch[].oldStart` `G1`
-- `.tool_use_result.type` `G1`
-- `.tool_use_result.userModified` `G1`
-- `.tools` `G1`
-- `.total_cost_usd` `G1`
-- `.ttft_ms` `G1`
-- `.ttft_stream_ms` `G1`
-- `.type` `G1`
-- `.usage` `G1`
-- `.usage.cache_creation` `G1`
-- `.usage.cache_creation.ephemeral_1h_input_tokens` `G1`
-- `.usage.cache_creation.ephemeral_5m_input_tokens` `G1`
-- `.usage.cache_creation_input_tokens` `G1`
-- `.usage.cache_read_input_tokens` `G1`
-- `.usage.inference_geo` `G1`
-- `.usage.input_tokens` `G1`
-- `.usage.iterations` `G1`
-- `.usage.iterations[].cache_creation` `G1`
-- `.usage.iterations[].cache_creation.ephemeral_1h_input_tokens` `G1`
-- `.usage.iterations[].cache_creation.ephemeral_5m_input_tokens` `G1`
-- `.usage.iterations[].cache_creation_input_tokens` `G1`
-- `.usage.iterations[].cache_read_input_tokens` `G1`
-- `.usage.iterations[].input_tokens` `G1`
-- `.usage.iterations[].output_tokens` `G1`
-- `.usage.iterations[].type` `G1`
-- `.usage.output_tokens` `G1`
-- `.usage.output_tokens_details` `G1`
-- `.usage.output_tokens_details.thinking_tokens` `G1`
-- `.usage.server_tool_use` `G1`
-- `.usage.server_tool_use.web_fetch_requests` `G1`
-- `.usage.server_tool_use.web_search_requests` `G1`
-- `.usage.service_tier` `G1`
-- `.usage.speed` `G1`
-- `.uuid` `G1`
+- `.tool_use_result.structuredPatch` `G4`
+- `.tool_use_result.structuredPatch[].lines` `G4`
+- `.tool_use_result.structuredPatch[].newLines` `G4`
+- `.tool_use_result.structuredPatch[].newStart` `G4`
+- `.tool_use_result.structuredPatch[].oldLines` `G4`
+- `.tool_use_result.structuredPatch[].oldStart` `G4`
+- `.tool_use_result.type` `G5`
+- `.tool_use_result.userModified` `G4`
+- `.tools` `G3`
+- `.total_cost_usd` `G3`
+- `.ttft_ms` `G3`
+- `.ttft_stream_ms` `G3`
+- `.type` `G3`
+- `.usage` `G3`
+- `.usage.cache_creation` `G3`
+- `.usage.cache_creation.ephemeral_1h_input_tokens` `G3`
+- `.usage.cache_creation.ephemeral_5m_input_tokens` `G3`
+- `.usage.cache_creation_input_tokens` `G3`
+- `.usage.cache_read_input_tokens` `G3`
+- `.usage.inference_geo` `G3`
+- `.usage.input_tokens` `G3`
+- `.usage.iterations` `G3`
+- `.usage.iterations[].cache_creation` `G3`
+- `.usage.iterations[].cache_creation.ephemeral_1h_input_tokens` `G3`
+- `.usage.iterations[].cache_creation.ephemeral_5m_input_tokens` `G3`
+- `.usage.iterations[].cache_creation_input_tokens` `G3`
+- `.usage.iterations[].cache_read_input_tokens` `G3`
+- `.usage.iterations[].input_tokens` `G3`
+- `.usage.iterations[].output_tokens` `G3`
+- `.usage.iterations[].type` `G3`
+- `.usage.output_tokens` `G3`
+- `.usage.output_tokens_details` `G3`
+- `.usage.output_tokens_details.thinking_tokens` `G3`
+- `.usage.server_tool_use` `G3`
+- `.usage.server_tool_use.web_fetch_requests` `G3`
+- `.usage.server_tool_use.web_search_requests` `G3`
+- `.usage.service_tier` `G3`
+- `.usage.speed` `G3`
+- `.uuid` `G3`
 
 ## Vocabulary
 
@@ -344,6 +447,7 @@ The observed value set for a small declared list of discriminator paths — not 
 
 - `Edit`
 - `Read`
+- `Write`
 
 #### `.event.type`
 
@@ -358,6 +462,7 @@ The observed value set for a small declared list of discriminator paths — not 
 
 - `Edit`
 - `Read`
+- `Write`
 
 #### `.method`
 
@@ -381,6 +486,8 @@ The observed value set for a small declared list of discriminator paths — not 
 
 #### `.subtype`
 
+- `hook_response`
+- `hook_started`
 - `init`
 - `status`
 - `success`

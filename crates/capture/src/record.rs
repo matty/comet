@@ -228,11 +228,12 @@ fn codex_fence(
     })
 }
 
-/// The pre-spawn fence for both providers' `full-access` row and Claude's `edit` row — the
-/// full-access pair because `bypassPermissions` and `danger-full-access` remove the sandbox, and
-/// `edit` because it asks the model to change a file under `AutoAcceptEdits`, where there is no
-/// approval channel to protect and no grant-time recheck to lean on. The guarantee is the same in
-/// all three: don't start in a repository somebody cares about.
+/// The pre-spawn fence for both providers' `full-access` row and Claude's `edit`,
+/// `edit-create`, `edit-noop` and `write-overwrite` rows — the full-access pair because
+/// `bypassPermissions` and `danger-full-access` remove the sandbox, and the four Claude rows
+/// because each asks the model to change a file under `AutoAcceptEdits`, where there is no
+/// approval channel to protect and no grant-time recheck to lean on. The guarantee is the same
+/// across all six: don't start in a repository somebody cares about.
 ///
 /// Claude's `bypassPermissions` and
 /// Codex's `danger-full-access` both remove the sandbox entirely, so there is no approval
@@ -1209,6 +1210,24 @@ mod tests {
             ),
             (
                 Provider::Claude,
+                "edit-create",
+                Some(scenarios::claude::edit_create_request),
+                FenceKind::FullAccess,
+            ),
+            (
+                Provider::Claude,
+                "edit-noop",
+                Some(scenarios::claude::edit_noop_request),
+                FenceKind::FullAccess,
+            ),
+            (
+                Provider::Claude,
+                "write-overwrite",
+                Some(scenarios::claude::write_overwrite_request),
+                FenceKind::FullAccess,
+            ),
+            (
+                Provider::Claude,
                 "resume",
                 Some(scenarios::claude::resume_request),
                 FenceKind::None,
@@ -1577,9 +1596,9 @@ mod tests {
         // env var while this section runs.
         unsafe { std::env::set_var("COMET_ACP_ADAPTER_ROOT", adapter_root.path()) };
 
-        // Empty again: `claude/edit` was recorded against 2.1.251 the day it
-        // was declared, which is the whole shape this list is for — a row
-        // lands here with its reason, and leaves when the capture does.
+        // Empty again: `edit-create`, `edit-noop` and `write-overwrite` were recorded against
+        // 2.1.251 in the same change that declared them, which is the whole shape this list is
+        // for — a row lands here with its reason, and leaves when the capture does.
         const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[];
 
         let root = crate::corpus_root();
@@ -1728,9 +1747,10 @@ mod tests {
             Vec::<String>::new(),
             "exactly the rows in EXEMPT_UNCAPTURED may land in unevidenced — a row losing \
              corpus evidence must update this assertion deliberately, not pass through silently. \
-             Both sides are empty now that Grok's three rows are promoted, and they move \
-             together: this list is the second copy of EXEMPT_UNCAPTURED, kept so a row \
-             vanishing from the corpus cannot be absorbed by editing the exemption alone."
+             Both sides are empty now that edit-create, edit-noop and write-overwrite are \
+             promoted, and they move together: this list is the second copy of \
+             EXEMPT_UNCAPTURED, kept so a row vanishing from the corpus cannot be absorbed by \
+             editing the exemption alone."
         );
 
         assert!(
