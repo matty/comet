@@ -1845,6 +1845,20 @@ impl Pickers {
             .unwrap_or(false)
     }
 
+    /// Whether the chat's provider can deny a pending approval and interrupt
+    /// its turn atomically. Missing descriptors and older peers degrade to
+    /// false, so the UI never offers a control the host may not honor.
+    pub fn supports_approval_interrupt(&self, cx: &App) -> bool {
+        self.effective_harness(cx)
+            .and_then(|h| {
+                self.harnesses
+                    .ready()
+                    .and_then(|list| list.iter().find(|d| d.id == h))
+                    .map(|d| d.capabilities.supports_approval_interrupt)
+            })
+            .unwrap_or(false)
+    }
+
     /// The viewed harness's model list, when loaded (keyboard nav rows).
     fn model_rows_len(&self, cx: &App) -> usize {
         self.effective_harness(cx)

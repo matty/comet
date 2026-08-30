@@ -639,6 +639,7 @@ impl GrokHarness {
             // a note to either way, since the mode that would carry one is
             // not declared.
             carries_deny_note: false,
+            supports_approval_interrupt: false,
             // Grok pushes `session_info_update` with its own title during the
             // turn — see `AgentEvent::SessionTitled`'s doc for the captured
             // wire evidence. The engine skips its upfront titling call on
@@ -1204,6 +1205,7 @@ mod tests {
     fn only_the_mode_the_harness_can_actually_keep_is_declared() {
         let capabilities = GrokHarness::capabilities();
         assert_eq!(capabilities.runtime_modes, vec![RuntimeMode::FullAccess]);
+        assert!(!capabilities.supports_approval_interrupt);
         assert_eq!(
             capabilities.steering_mode,
             SteeringMode::TurnBoundary,

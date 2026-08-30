@@ -2410,6 +2410,7 @@ impl Harness for ApprovingHarness {
                     "applied the edit"
                 }
                 Ok(ApprovalDecision::Deny { .. }) => "left the file untouched",
+                Ok(ApprovalDecision::DenyAndInterrupt { .. }) => "stopped without the edit",
                 Ok(ApprovalDecision::Expired) | Err(_) => "stopped without the edit",
             };
             let _ = tx.send(AgentEvent::TextDelta {
@@ -2637,6 +2638,7 @@ impl Harness for SteeredWhileAskingHarness {
             let word = match pending.await {
                 Ok(ApprovalDecision::Allow) | Ok(ApprovalDecision::AllowForSession) => "allowed",
                 Ok(ApprovalDecision::Deny { .. }) => "denied",
+                Ok(ApprovalDecision::DenyAndInterrupt { .. }) => "interrupted",
                 Ok(ApprovalDecision::Expired) | Err(_) => "abandoned",
             };
             let _ = tx.send(AgentEvent::TextDelta {
@@ -3303,6 +3305,7 @@ impl Harness for LateAskingHarness {
             {
                 Ok(ApprovalDecision::Allow) | Ok(ApprovalDecision::AllowForSession) => "allowed",
                 Ok(ApprovalDecision::Deny { .. }) => "denied",
+                Ok(ApprovalDecision::DenyAndInterrupt { .. }) => "not approved",
                 Ok(ApprovalDecision::Expired) | Err(_) => "not approved",
             };
             let _ = reported.send(word);

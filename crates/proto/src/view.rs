@@ -367,6 +367,7 @@ pub fn approval_decision_label(decision: &crate::ApprovalDecision) -> &'static s
         ApprovalDecision::Allow => "Allowed",
         ApprovalDecision::AllowForSession => "Allowed for this session",
         ApprovalDecision::Deny { .. } => "Denied",
+        ApprovalDecision::DenyAndInterrupt { .. } => "Denied and stopped",
         // Host-stamped when the run ended with this still open. The only
         // decision the user did not make, so it is the only one that has to
         // say why it is there.
@@ -709,6 +710,12 @@ mod tests {
                 message: "not that path".into()
             }),
             "Denied"
+        );
+        assert_eq!(
+            approval_decision_label(&ApprovalDecision::DenyAndInterrupt {
+                message: "stop this turn".into()
+            }),
+            "Denied and stopped"
         );
         let expired = approval_decision_label(&ApprovalDecision::Expired);
         assert!(

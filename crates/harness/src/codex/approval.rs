@@ -246,22 +246,25 @@ fn unknown_command() -> ApprovalRequest {
 
 /// The decision literal the app-server takes for this answer.
 ///
-/// **`acceptForSession` is never produced, and neither is `cancel`.** Both are
-/// real and both work; see the module-level reasoning in the slice plan and
-/// `docs/debt/README.md` D20/D21. In short: Codex's session grant is keyed on the path
-/// alone and spans the operation kind, which is broader than
-/// `approval_signature`, so delegating would leave two grant caches with
-/// different scopes; and `cancel` denies *and interrupts the turn*, which no
-/// button in Comet's decision triple means.
+/// **`acceptForSession` is never produced.** It is real and works, but Codex's
+/// session grant is keyed on the path alone and spans the operation kind,
+/// which is broader than `approval_signature`; delegating would leave two
+/// grant caches with different scopes (`docs/debt/README.md` D20).
 pub fn decision_literal(decision: &ApprovalDecision) -> &'static str {
     match decision {
         // Comet's engine owns the session grant and answers the repeat itself,
         // so the wire only ever hears about this one call.
         ApprovalDecision::Allow | ApprovalDecision::AllowForSession => "accept",
         ApprovalDecision::Deny { .. } => "decline",
+        ApprovalDecision::DenyAndInterrupt { .. } => "cancel",
         // The user never answered and never will. Not approved.
         ApprovalDecision::Expired => "decline",
     }
+}
+
+/// The complete JSON-RPC result object sent for a Codex approval request.
+pub(crate) fn decision_response(decision: &ApprovalDecision) -> Value {
+    json!({ "decision": decision_literal(decision) })
 }
 
 #[cfg(test)]
@@ -489,28 +492,50 @@ mod tests {
     }
 
     #[test]
-    fn no_decision_is_ever_accept_for_session_or_cancel() {
-        // Both are real wire values that work, and both are deliberately
-        // unused — docs/debt/README.md D20 and D21. A later reader "completing" the
-        // mapping fails here rather than silently changing who owns the grant.
+    fn no_decision_is_ever_accept_for_session() {
+        // `acceptForSession` works but remains deliberately unused
+        // (docs/debt/README.md D20): Comet's engine owns the session grant.
         for decision in [
             ApprovalDecision::Allow,
             ApprovalDecision::AllowForSession,
             ApprovalDecision::Deny {
                 message: "no".into(),
             },
+            ApprovalDecision::DenyAndInterrupt {
+                message: "stop".into(),
+            },
             ApprovalDecision::Expired,
         ] {
             let literal = decision_literal(&decision);
             assert!(
-                matches!(literal, "accept" | "decline"),
+                matches!(literal, "accept" | "decline" | "cancel"),
                 "{decision:?} produced {literal}"
             );
+            assert_ne!(literal, "acceptForSession");
         }
         assert_eq!(
             decision_literal(&ApprovalDecision::AllowForSession),
             "accept"
         );
         assert_eq!(decision_literal(&ApprovalDecision::Expired), "decline");
+    }
+
+    /// This is the literal JSON-RPC result body sent to Codex app-server, not
+    /// a round-trip through Comet's own wire types. Ordinary Deny must keep
+    /// allowing the turn to continue; only the new action emits `cancel`.
+    #[test]
+    fn deny_and_interrupt_has_the_native_cancel_response() {
+        assert_eq!(
+            decision_response(&ApprovalDecision::Deny {
+                message: "try something else".into(),
+            }),
+            json!({"decision": "decline"})
+        );
+        assert_eq!(
+            decision_response(&ApprovalDecision::DenyAndInterrupt {
+                message: "stop this turn".into(),
+            }),
+            json!({"decision": "cancel"})
+        );
     }
 }

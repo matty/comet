@@ -374,6 +374,9 @@ impl CodexHarness {
             // are bare literals — the wire carries `"decline"` and nothing
             // else, so a note has no field to travel in (`docs/debt/README.md` D24).
             carries_deny_note: false,
+            // Both approval decision enums accept `"cancel"`, which denies
+            // the action and interrupts the requesting turn.
+            supports_approval_interrupt: true,
             // codex app-server names no chat on its wire; Comet titles it.
             self_titles: false,
         }
@@ -1438,10 +1441,7 @@ fn handle_server_request(
         let decision = (request_approval)(request)
             .await
             .unwrap_or(ApprovalDecision::Expired);
-        client.respond(
-            &id,
-            json!({ "decision": approval::decision_literal(&decision) }),
-        );
+        client.respond(&id, approval::decision_response(&decision));
     });
     None
 }
@@ -1595,5 +1595,10 @@ mod tests {
     #[test]
     fn codex_cannot_carry_a_deny_note() {
         assert!(!CodexHarness::capabilities().carries_deny_note);
+    }
+
+    #[test]
+    fn codex_declares_native_approval_interrupt_support() {
+        assert!(CodexHarness::capabilities().supports_approval_interrupt);
     }
 }

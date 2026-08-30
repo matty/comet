@@ -95,6 +95,7 @@ impl MockHarness {
             // The mock scripts Claude-flavoured runs, so the approval surface
             // it drives for a rendered check has to read as Claude's does.
             carries_deny_note: true,
+            supports_approval_interrupt: false,
             // The mock scripts a Claude-flavoured run, which titles nothing
             // itself — a rendered check should exercise Comet's own titling.
             self_titles: false,
@@ -287,20 +288,27 @@ impl Harness for MockHarness {
                 tokio::time::sleep(pause).await;
                 let decision = request_approval(approval).await;
                 tokio::time::sleep(pause).await;
-                let closing = match decision {
+                let (closing, status) = match decision {
                     Ok(ApprovalDecision::Allow) | Ok(ApprovalDecision::AllowForSession) => {
-                        "Applied the edit."
+                        ("Applied the edit.", DoneStatus::Completed)
                     }
-                    Ok(ApprovalDecision::Deny { .. }) => "Left the file untouched.",
+                    Ok(ApprovalDecision::Deny { .. }) => {
+                        ("Left the file untouched.", DoneStatus::Completed)
+                    }
+                    Ok(ApprovalDecision::DenyAndInterrupt { .. }) => {
+                        ("Stopped without the edit.", DoneStatus::Interrupted)
+                    }
                     // The run outlived its decision channel: expired, or the
                     // resolver was dropped with the run.
-                    Ok(ApprovalDecision::Expired) | Err(_) => "Stopped without the edit.",
+                    Ok(ApprovalDecision::Expired) | Err(_) => {
+                        ("Stopped without the edit.", DoneStatus::Completed)
+                    }
                 };
                 let _ = tx.send(AgentEvent::TextDelta {
                     text: closing.into(),
                 });
                 let _ = tx.send(AgentEvent::Done {
-                    status: DoneStatus::Completed,
+                    status,
                     result: None,
                     error: None,
                     session_id: None,

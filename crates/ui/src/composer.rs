@@ -515,6 +515,50 @@ pub fn deny_note_placeholder(carries_deny_note: bool) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalDenyAction {
+    Deny,
+    DenyAndStop,
+}
+
+impl ApprovalDenyAction {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Deny => "approval-deny",
+            Self::DenyAndStop => "approval-deny-stop",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Deny => "Deny",
+            Self::DenyAndStop => "Deny & stop",
+        }
+    }
+
+    fn decision(self, message: String) -> comet_proto::ApprovalDecision {
+        match self {
+            Self::Deny => comet_proto::ApprovalDecision::Deny { message },
+            Self::DenyAndStop => comet_proto::ApprovalDecision::DenyAndInterrupt { message },
+        }
+    }
+}
+
+const DENY_ACTIONS: &[ApprovalDenyAction] = &[ApprovalDenyAction::Deny];
+const DENY_AND_STOP_ACTIONS: &[ApprovalDenyAction] =
+    &[ApprovalDenyAction::Deny, ApprovalDenyAction::DenyAndStop];
+
+/// The left-side approval actions. Unsupported providers omit the atomic
+/// interrupt entirely; a disabled button would imply the action might become
+/// available within this already-blocked decision.
+fn approval_denial_actions(supports_approval_interrupt: bool) -> &'static [ApprovalDenyAction] {
+    if supports_approval_interrupt {
+        DENY_AND_STOP_ACTIONS
+    } else {
+        DENY_ACTIONS
+    }
+}
+
 /// Whether the transcript shows `request_id` explicitly resolved (here or on
 /// another device) — the wizard latch's release condition.
 pub fn input_request_resolved(transcript: &[SessionMessageEntry], request_id: &str) -> bool {
@@ -5712,7 +5756,7 @@ impl Composer {
         let (label, _detail) = comet_proto::view::approval_chip_content(&approval);
         let note = self.input.read(cx).text().trim().to_string();
 
-        // One button shape for all three decisions: only the tint differs, so
+        // One button shape for every decision: only the tint differs, so
         // the row's height cannot vary with which decision is emphasised.
         let button = |id: &'static str,
                       text: &'static str,
@@ -5749,6 +5793,28 @@ impl Composer {
                     cx.listener(move |this, _, _, cx| this.respond_approval(decision.clone(), cx)),
                 )
         };
+
+        let denial_message = if note.is_empty() {
+            // Comet copy, not an empty string: the message remains durable in
+            // the chat even when the provider has no note field on its wire.
+            "The user declined this action.".to_string()
+        } else {
+            note.clone()
+        };
+        let supports_approval_interrupt = self.pickers.read(cx).supports_approval_interrupt(cx);
+        let denial_buttons = approval_denial_actions(supports_approval_interrupt)
+            .iter()
+            .map(|action| {
+                button(
+                    action.id(),
+                    action.label(),
+                    false,
+                    &theme,
+                    cx,
+                    action.decision(denial_message.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
 
         div()
             .id("approval-panel")
@@ -5791,23 +5857,7 @@ impl Composer {
                     .flex_row()
                     .items_center()
                     .gap(px(8.0))
-                    .child(button(
-                        "approval-deny",
-                        "Deny",
-                        false,
-                        &theme,
-                        cx,
-                        comet_proto::ApprovalDecision::Deny {
-                            message: if note.is_empty() {
-                                // Comet copy, not an empty string: the message
-                                // goes back to the model, and "" tells it
-                                // nothing about what to do instead.
-                                "The user declined this action.".to_string()
-                            } else {
-                                note.clone()
-                            },
-                        },
-                    ))
+                    .children(denial_buttons)
                     .child(div().flex_1())
                     .child(button(
                         "approval-allow-session",
@@ -6649,6 +6699,21 @@ mod tests {
             deny_note_placeholder(false),
             "Add a note for this chat — the agent won't receive it"
         );
+    }
+
+    /// The denial group is the left side of the approval row. A provider that
+    /// cannot honor the atomic interrupt must not get a disabled or inert
+    /// button; Codex inserts the action directly after ordinary Deny.
+    #[test]
+    fn approval_denial_actions_expose_interrupt_only_when_supported() {
+        let labels = |supported| {
+            approval_denial_actions(supported)
+                .iter()
+                .map(|action| action.label())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(false), vec!["Deny"]);
+        assert_eq!(labels(true), vec!["Deny", "Deny & stop"]);
     }
 
     #[test]

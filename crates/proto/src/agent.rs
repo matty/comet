@@ -133,6 +133,12 @@ pub struct HarnessCapabilities {
     /// a promise the provider cannot keep is worse than copy admitting the
     /// limit, which is why the conservative default is "cannot carry it".
     pub carries_deny_note: bool,
+    /// Whether an approval can be denied while also interrupting its turn.
+    /// Codex exposes this as the native `cancel` decision; the other adapters
+    /// do not promise equivalent behavior. An older peer omits the field, so
+    /// the conservative default is `false`: hiding one supported action is
+    /// safer than showing a control whose host cannot honor it.
+    pub supports_approval_interrupt: bool,
     /// Whether the agent reports its own chat title on the wire, as Grok does
     /// with `session_info_update`. When it does, the engine's upfront titling
     /// run is skipped: the title arrives during the turn for free, and a model
@@ -911,6 +917,15 @@ mod capability_tests {
         let caps: HarnessCapabilities = serde_json::from_str("{}").unwrap();
         assert!(!caps.carries_deny_note);
     }
+
+    /// A peer predating D21 sends no field. That cannot be read as support:
+    /// exposing an action the host cannot honor would retire the decision row
+    /// while leaving the provider blocked on the approval.
+    #[test]
+    fn absent_approval_interrupt_capability_reads_as_unsupported() {
+        let caps: HarnessCapabilities = serde_json::from_str("{}").unwrap();
+        assert!(!caps.supports_approval_interrupt);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1195,7 +1210,15 @@ pub enum FileOperation {
 pub enum ApprovalDecision {
     Allow,
     AllowForSession,
-    Deny { message: String },
+    Deny {
+        message: String,
+    },
+    /// Deny the pending action and interrupt the turn that requested it.
+    /// `message` remains durable chat context even when the provider's bare
+    /// decision literal has no channel for delivering it to the model.
+    DenyAndInterrupt {
+        message: String,
+    },
     Expired,
 }
 
@@ -1815,6 +1838,9 @@ mod tests {
             ApprovalDecision::Deny {
                 message: "not this path".into(),
             },
+            ApprovalDecision::DenyAndInterrupt {
+                message: "stop this turn".into(),
+            },
             ApprovalDecision::Expired,
         ] {
             let json = serde_json::to_value(&case).unwrap();
@@ -1823,6 +1849,23 @@ mod tests {
                 case
             );
         }
+    }
+
+    /// Literal JSON, not a Rust round-trip: this is the value a paired client
+    /// writes into `SessionCommandPayload::RespondApproval` and the host later
+    /// persists inside `MessagePart::Approval`.
+    #[test]
+    fn deny_and_interrupt_decision_has_stable_literal_json() {
+        assert_eq!(
+            serde_json::to_value(ApprovalDecision::DenyAndInterrupt {
+                message: "stop this turn".into(),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "decision": "denyAndInterrupt",
+                "message": "stop this turn"
+            })
+        );
     }
 
     #[test]
