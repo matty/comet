@@ -664,9 +664,84 @@ pub(crate) struct Normalizer {
     /// Write/Edit calls with complete source inputs, awaiting the one sibling
     /// `tool_use_result` that can prove their complete old/new pair.
     pending_file_calls: HashMap<String, PendingFileCall>,
+    /// Inner kinds already reported once this run — see [`INNER_IGNORED`] and
+    /// `inner_diagnostic`. Capped like every other set on this path.
+    seen_inner: std::collections::HashSet<String>,
 }
 
+/// Inner kinds Comet recognizes and deliberately drops — the same middle tier
+/// `wire::IGNORED_FRAMES` gives whole frames, one level down (D8).
+///
+/// **The outer classifier calls these frames fully Claimed**, so nothing below
+/// them produced a diagnostic, a warn, or anything at all: an unrecognized
+/// `delta.kind` and an unrecognized content-block kind both fell off the end of
+/// a `match` inside a frame the tiers had already accounted for. Delta kinds
+/// are exactly where Anthropic has shipped change — `thinking_delta`,
+/// `signature_delta`, `input_json_delta`, `citations_delta` all arrived over
+/// time — so a new one being invisible is the precise failure 0b.2 exists to
+/// remove, surviving inside the slice that removed it.
+///
+/// Reasons follow `IGNORED_FRAMES`' convention: what the entry is, not a slice
+/// that will claim it, unless one genuinely will.
+const INNER_IGNORED: &[(&str, &str)] = &[
+    // Structural: the open/close around a block whose deltas are the content.
+    ("stream_event/content_block_start", "structural"),
+    ("stream_event/content_block_stop", "structural"),
+    ("stream_event/message_start", "structural"),
+    ("stream_event/message_delta", "structural"),
+    ("stream_event/message_stop", "structural"),
+    ("stream_event/ping", "transport-ping"),
+    // The thinking block's cryptographic signature. Carried for the API's own
+    // verification, and there is nothing a user surface would do with it.
+    ("delta/signature_delta", "opaque"),
+    // Buffered content blocks whose streamed halves are already claimed above.
+    ("block/text", "streamed"),
+    ("block/thinking", "streamed"),
+    ("block/tool_result", "claimed-elsewhere"),
+];
+
+fn inner_ignored(discriminator: &str) -> Option<&'static str> {
+    INNER_IGNORED
+        .iter()
+        .find(|(name, _)| *name == discriminator)
+        .map(|(_, reason)| *reason)
+}
+
+/// How many distinct inner kinds one run reports before it stops.
+///
+/// The same reasoning as `acp::normalize`'s `MAX_TRACKED_UPDATE_KINDS`: the key
+/// is provider-chosen, so an agent that embedded an id in a delta kind could
+/// otherwise mint entries without limit. A real vocabulary is a handful.
+const MAX_TRACKED_INNER_KINDS: usize = 32;
+
 impl Normalizer {
+    /// One diagnostic the first time an unrecognized inner kind appears, and
+    /// nothing on any later occurrence (D8).
+    ///
+    /// Once per RUN rather than once per frame, because these arrive inside
+    /// streamed deltas: an unrecognized delta kind on a long tool input would
+    /// otherwise journal and broadcast one event per chunk. The set is capped
+    /// for the reason `MAX_TRACKED_INNER_KINDS` gives.
+    fn inner_diagnostic(&mut self, discriminator: String) -> Vec<AgentEvent> {
+        if inner_ignored(&discriminator).is_some() {
+            return Vec::new();
+        }
+        if self.seen_inner.len() >= MAX_TRACKED_INNER_KINDS
+            || !self.seen_inner.insert(discriminator.clone())
+        {
+            tracing::trace!(
+                target: "comet_harness::claude",
+                discriminator = %discriminator,
+                "inner kind already reported (or past the cap) this run"
+            );
+            return Vec::new();
+        }
+        vec![crate::diagnostic(
+            &discriminator,
+            comet_proto::DiagnosticSeverity::Unknown,
+        )]
+    }
+
     pub fn new(runtime_mode: RuntimeMode) -> Self {
         Self {
             saw_init: false,
@@ -676,6 +751,7 @@ impl Normalizer {
             subagent_progress: HashMap::new(),
             pending_task_calls: HashMap::new(),
             pending_file_calls: HashMap::new(),
+            seen_inner: std::collections::HashSet::new(),
         }
     }
 
@@ -874,8 +950,14 @@ impl Normalizer {
             // text block around a phantom tool call. Only null-parent frames
             // are this turn's own content.
             Frame::StreamEvent(f) => {
-                if f.parent_tool_use_id.is_some() || f.event.kind != "content_block_delta" {
+                if f.parent_tool_use_id.is_some() {
                     return Vec::new();
+                }
+                if f.event.kind != "content_block_delta" {
+                    // Not a delta at all: structural framing, a ping, or
+                    // something new. The first two are on `INNER_IGNORED`; the
+                    // third is what this reports (D8).
+                    return self.inner_diagnostic(format!("stream_event/{}", f.event.kind));
                 }
                 match f.event.delta.kind.as_str() {
                     "text_delta" => vec![AgentEvent::TextDelta {
@@ -892,7 +974,13 @@ impl Normalizer {
                     "input_json_delta" => vec![AgentEvent::ReasoningDelta {
                         text: String::new(),
                     }],
-                    _ => Vec::new(),
+                    // The sink 0b.2 gave Codex and not Claude: an unrecognized
+                    // delta kind inside a frame the classifier calls fully
+                    // Claimed (D8).
+                    other => {
+                        let discriminator = format!("delta/{other}");
+                        self.inner_diagnostic(discriminator)
+                    }
                 }
             }
 
@@ -942,6 +1030,19 @@ impl Normalizer {
                         call: decode_tool_use(&b.name, &b.input),
                     })
                     .collect();
+                // The other half of D8: this frame keeps `tool_use` and drops
+                // every other block kind. `text`/`thinking` are on
+                // `INNER_IGNORED` because their streamed halves are already
+                // claimed; anything else is a block kind nobody has seen.
+                let unknown_blocks: Vec<String> = f
+                    .message
+                    .blocks()
+                    .filter(|b: &ContentBlock| b.kind != "tool_use")
+                    .map(|b| format!("block/{}", b.kind))
+                    .collect();
+                for discriminator in unknown_blocks {
+                    out.extend(self.inner_diagnostic(discriminator));
+                }
                 // A failed turn (usage limit, billing, auth, overloaded, …)
                 // carries a terse `error` code here — often with empty content
                 // and no `result` error — so surface it visibly.
@@ -1196,6 +1297,60 @@ impl Normalizer {
 
 #[cfg(test)]
 mod tests {
+
+    /// Break caught (D8): an unrecognized `delta.kind` fell off the end of a
+    /// match inside a frame the classifier calls fully Claimed, so it produced
+    /// no diagnostic, no warn, and nothing at all. Delta kinds are exactly
+    /// where Anthropic has shipped change — `thinking_delta`,
+    /// `signature_delta`, `input_json_delta` all arrived over time.
+    #[test]
+    fn an_unknown_delta_kind_reports_once_per_run() {
+        let mut norm = Normalizer::new(RuntimeMode::default());
+        let frame = || {
+            serde_json::from_str::<Value>(
+                r#"{"type":"stream_event","event":{"type":"content_block_delta",
+                    "delta":{"type":"citations_delta","citation":{}}}}"#,
+            )
+            .unwrap()
+        };
+        let first = norm.normalize(
+            crate::claude::wire::parse_frame(&frame().to_string()).unwrap(),
+            false,
+        );
+        assert!(
+            matches!(
+                first.as_slice(),
+                [AgentEvent::Diagnostic { discriminator, .. }] if discriminator == "delta/citations_delta"
+            ),
+            "the first occurrence names the kind: {first:?}"
+        );
+
+        // Once per RUN, not per frame: these arrive inside streamed deltas, so
+        // a long tool input would otherwise journal one event per chunk.
+        let second = norm.normalize(
+            crate::claude::wire::parse_frame(&frame().to_string()).unwrap(),
+            false,
+        );
+        assert!(second.is_empty(), "the second must be silent: {second:?}");
+    }
+
+    /// The Ignored half: structural framing and the opaque signature delta are
+    /// recognized and dropped, exactly as `wire::IGNORED_FRAMES` does one level
+    /// up. Without this list every stream would report them on frame one.
+    #[test]
+    fn structural_inner_kinds_are_ignored_rather_than_reported() {
+        let mut norm = Normalizer::new(RuntimeMode::default());
+        for raw in [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","delta":{}}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_stop","delta":{}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta",
+                "delta":{"type":"signature_delta","signature":"x"}}}"#,
+        ] {
+            let events = norm.normalize(crate::claude::wire::parse_frame(raw).unwrap(), false);
+            assert!(events.is_empty(), "{raw} must stay ignored, got {events:?}");
+        }
+    }
+
     use super::*;
     use serde_json::json;
 
