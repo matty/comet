@@ -5,6 +5,7 @@ mod capture_corpus {
     mod claude_tool_coverage;
     mod codex_method_coverage;
     mod corpus_frames;
+    mod counter_placeholder_regression;
     mod coverage_policy;
     mod fixture_provenance;
     mod mode_coverage;
