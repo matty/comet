@@ -11,12 +11,13 @@
 //! `GROK_EXECUTABLE` overrides resolution — needed on a machine where the CLI
 //! was installed after the shell started, since its PATH entry is not yet live.
 
+mod support;
+
 use std::time::Duration;
 
 use comet_harness::acp::grok::GrokHarness;
 use comet_harness::{CancellationToken, Harness, RunControls};
 use comet_proto::{AgentEvent, DoneStatus, RunRequest, RuntimeMode};
-use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 /// Deliberately trivial and tool-free: this test exists to watch the turn
@@ -31,9 +32,10 @@ async fn a_real_turn_streams_and_settles() {
 
     let harness = GrokHarness::new();
     let (_steer_tx, steer_rx) = mpsc::channel(1);
+    let (request_approval, approval_watch) = support::recording_decliner();
     let controls = RunControls {
         request_input: Box::new(|_| oneshot::channel().1),
-        request_approval: Box::new(|_| oneshot::channel().1),
+        request_approval,
         steering: steer_rx,
         interrupt: CancellationToken::new(),
     };
@@ -44,7 +46,7 @@ async fn a_real_turn_streams_and_settles() {
         ..RunRequest::for_session(RuntimeMode::default())
     };
 
-    let mut stream = harness
+    let stream = harness
         .run(request, controls)
         .await
         .expect("the agent starts");
@@ -56,27 +58,21 @@ async fn a_real_turn_streams_and_settles() {
     // when it was this test holding the steer sender alive.
     //
     // Generous: a real model call on a VM with no GPU. Short enough that a turn
-    // which never settles fails instead of hanging the suite.
-    let mut events: Vec<AgentEvent> = Vec::new();
-    tokio::time::timeout(Duration::from_secs(180), async {
-        while let Some(event) = stream.next().await {
-            let event = event.expect("no transport error");
-            match &event {
+    // which never settles fails instead of hanging the suite. If it never
+    // settles BECAUSE the run escalated to an approval nothing here answers,
+    // `settle_or_report` fails immediately naming it rather than waiting out
+    // this whole budget with no explanation (D71 (2)).
+    let events =
+        support::settle_or_report(stream, Duration::from_secs(180), &approval_watch, |event| {
+            match event {
                 AgentEvent::TextDelta { text } => print!("{text}"),
                 AgentEvent::Done { status, error, .. } => {
                     println!("\n[done: {status:?} {error:?}]")
                 }
                 _ => {}
             }
-            let settled = matches!(event, AgentEvent::Done { .. });
-            events.push(event);
-            if settled {
-                break;
-            }
-        }
-    })
-    .await
-    .expect("the turn settles rather than hanging");
+        })
+        .await;
 
     let text: String = events
         .iter()
@@ -180,9 +176,10 @@ async fn a_tool_using_turn_shows_its_tools() {
 
     let harness = GrokHarness::new();
     let (steer_tx, steer_rx) = mpsc::channel(1);
+    let (request_approval, approval_watch) = support::recording_decliner();
     let controls = RunControls {
         request_input: Box::new(|_| oneshot::channel().1),
-        request_approval: Box::new(|_| oneshot::channel().1),
+        request_approval,
         steering: steer_rx,
         interrupt: CancellationToken::new(),
     };
@@ -193,18 +190,15 @@ async fn a_tool_using_turn_shows_its_tools() {
         ..RunRequest::for_session(RuntimeMode::default())
     };
 
-    let mut stream = harness
+    let stream = harness
         .run(request, controls)
         .await
         .expect("the agent starts");
     drop(steer_tx);
 
-    let mut events: Vec<AgentEvent> = Vec::new();
-    tokio::time::timeout(Duration::from_secs(180), async {
-        while let Some(event) = stream.next().await {
-            let event = event.expect("no transport error");
-            let settled = matches!(event, AgentEvent::Done { .. });
-            match &event {
+    let events =
+        support::settle_or_report(stream, Duration::from_secs(180), &approval_watch, |event| {
+            match event {
                 AgentEvent::ToolCall { id, call } => println!("[tool {id}] {call:?}"),
                 AgentEvent::ToolResult { id, is_error, .. } => {
                     println!("[result {id}] is_error={is_error}")
@@ -212,14 +206,8 @@ async fn a_tool_using_turn_shows_its_tools() {
                 AgentEvent::TextDelta { text } => print!("{text}"),
                 _ => {}
             }
-            events.push(event);
-            if settled {
-                break;
-            }
-        }
-    })
-    .await
-    .expect("the turn settles rather than hanging");
+        })
+        .await;
     println!();
 
     let call_at = events

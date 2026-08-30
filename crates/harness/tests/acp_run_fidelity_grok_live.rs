@@ -35,13 +35,15 @@
 //! actually recalls earlier context. Re-run this file once the rolling
 //! window clears to close that gap; do not delete it in the meantime.
 
+mod support;
+
 use std::time::Duration;
 
 use comet_harness::acp::grok::{GROK_ARGS, GrokHarness, resolve_grok_executable};
 use comet_harness::acp::session::{AcpSession, Timeouts};
 use comet_harness::{CancellationToken, Harness, RunControls};
 use comet_proto::{AgentEvent, ReasoningLevel, RunRequest, RuntimeMode};
-use futures::StreamExt;
+use support::ApprovalWatch;
 use tokio::sync::{mpsc, oneshot};
 
 /// Token-free: `initialize` + `session/new`, no `session/prompt`. Answers
@@ -69,47 +71,51 @@ async fn grok_supports_image_attachments() -> bool {
         == Some(true)
 }
 
-fn controls() -> RunControls {
+fn controls() -> (RunControls, ApprovalWatch) {
     let (_steer_tx, steer_rx) = mpsc::channel(1);
-    RunControls {
-        request_input: Box::new(|_| oneshot::channel().1),
-        request_approval: Box::new(|_| oneshot::channel().1),
-        steering: steer_rx,
-        interrupt: CancellationToken::new(),
-    }
+    let (request_approval, approval_watch) = support::recording_decliner();
+    (
+        RunControls {
+            request_input: Box::new(|_| oneshot::channel().1),
+            request_approval,
+            steering: steer_rx,
+            interrupt: CancellationToken::new(),
+        },
+        approval_watch,
+    )
 }
 
 async fn run_to_done(harness: &GrokHarness, request: RunRequest) -> (String, String) {
-    let mut stream = harness
-        .run(request, controls())
+    let (controls, approval_watch) = controls();
+    let stream = harness
+        .run(request, controls)
         .await
         .expect("the agent starts");
     let mut text = String::new();
     let mut session_id = String::new();
-    tokio::time::timeout(Duration::from_secs(180), async {
-        while let Some(event) = stream.next().await {
-            let event = event.expect("no transport error");
-            match &event {
-                AgentEvent::SessionStarted { session_id: id, .. } => session_id = id.clone(),
-                AgentEvent::TextDelta { text: delta } => {
-                    print!("{delta}");
-                    text.push_str(delta);
-                }
-                AgentEvent::ReasoningDelta { text: delta } => {
-                    print!("[reasoning]{delta}");
-                }
-                AgentEvent::Done { status, error, .. } => {
-                    println!("\n[done: {status:?} {error:?}]")
-                }
-                other => println!("[other event] {other:?}"),
+    // If the run never settles BECAUSE it escalated to an approval nothing
+    // here answers, `settle_or_report` fails immediately naming it rather
+    // than waiting out this whole budget with no explanation (D71 (2)).
+    support::settle_or_report(
+        stream,
+        Duration::from_secs(180),
+        &approval_watch,
+        |event| match event {
+            AgentEvent::SessionStarted { session_id: id, .. } => session_id = id.clone(),
+            AgentEvent::TextDelta { text: delta } => {
+                print!("{delta}");
+                text.push_str(delta);
             }
-            if matches!(event, AgentEvent::Done { .. }) {
-                break;
+            AgentEvent::ReasoningDelta { text: delta } => {
+                print!("[reasoning]{delta}");
             }
-        }
-    })
-    .await
-    .expect("the turn settles rather than hanging");
+            AgentEvent::Done { status, error, .. } => {
+                println!("\n[done: {status:?} {error:?}]")
+            }
+            other => println!("[other event] {other:?}"),
+        },
+    )
+    .await;
     (session_id, text)
 }
 
