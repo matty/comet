@@ -511,6 +511,7 @@ mod tests {
             description: None,
             deprecation: None,
             reasoning_levels: vec![],
+            default_reasoning: None,
             options: vec![],
             accepts_images: true,
         }

@@ -944,6 +944,12 @@ pub struct Model {
     pub deprecation: Option<ModelDeprecation>,
     #[serde(default)]
     pub reasoning_levels: Vec<ReasoningLevel>,
+    /// The effort the provider uses when the user has not selected one.
+    ///
+    /// Absent means the provider did not report a default. The picker keeps
+    /// its established ladder heuristic in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning: Option<ReasoningLevel>,
     #[serde(default)]
     pub options: Vec<ModelOption>,
     /// Whether this model accepts image input.
@@ -972,6 +978,25 @@ pub struct ModelDeprecation {
 
 fn accepts_images_default() -> bool {
     true
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    #[test]
+    fn model_default_reasoning_is_optional_on_the_wire() {
+        let absent: Model = serde_json::from_str(
+            r#"{"id":"model","label":"Model","reasoningLevels":["low","medium"]}"#,
+        )
+        .unwrap();
+        assert_eq!(absent.default_reasoning, None);
+
+        let present: Model =
+            serde_json::from_str(r#"{"id":"model","label":"Model","defaultReasoning":"low"}"#)
+                .unwrap();
+        assert_eq!(present.default_reasoning, Some(ReasoningLevel::Low));
+    }
 }
 
 /// One slash command a provider offers in a given directory.

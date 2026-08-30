@@ -181,6 +181,23 @@ pub fn clamp_reasoning(
     }
 }
 
+/// Resolve reasoning after respecting every user-owned choice. Provider
+/// metadata changes only the no-choice case; absent or unusable metadata keeps
+/// the established ladder heuristic.
+pub fn resolve_reasoning(
+    explicit: Option<ReasoningLevel>,
+    provider_default: Option<ReasoningLevel>,
+    ladder: &[ReasoningLevel],
+) -> Option<ReasoningLevel> {
+    match explicit {
+        Some(level) if ladder.contains(&level) => Some(level),
+        Some(_) => default_reasoning(ladder),
+        None => provider_default
+            .filter(|level| ladder.contains(level))
+            .or_else(|| default_reasoning(ladder)),
+    }
+}
+
 /// Shown under the model list while discovery has failed. Amber
 /// `warning_muted`, not red: a state to resolve, not an error the user
 /// caused (0.2a's rail caption is the worked example). No Retry button of
@@ -875,7 +892,10 @@ impl Pickers {
             // to clamp against); it resolves to a concrete level on load.
             return explicit;
         }
-        clamp_reasoning(explicit, &self.trait_ladder(cx))
+        let provider_default = self
+            .selected_model(cx)
+            .and_then(|model| model.default_reasoning);
+        resolve_reasoning(explicit, provider_default, &self.trait_ladder(cx))
     }
 
     /// The selected model — concrete from the moment the list loads: the
@@ -1886,11 +1906,12 @@ impl Pickers {
         // same ladder resolution as [`Self::trait_ladder`] (model levels, else
         // the harness's advertised ladder).
         if let Some(catalog) = self.models.get(&config.harness).and_then(|l| l.ready()) {
-            let mut ladder = config
+            let selected_model = config
                 .model
                 .as_deref()
-                .and_then(|id| catalog.models.iter().find(|m| m.id == id))
-                .map(|m| m.reasoning_levels.clone())
+                .and_then(|id| catalog.models.iter().find(|m| m.id == id));
+            let mut ladder = selected_model
+                .map(|model| model.reasoning_levels.clone())
                 .unwrap_or_default();
             if ladder.is_empty()
                 && let Some(descriptor) = self
@@ -1901,7 +1922,11 @@ impl Pickers {
                 ladder = descriptor.capabilities.reasoning_levels.clone();
             }
             if !ladder.is_empty() {
-                config.reasoning = clamp_reasoning(config.reasoning, &ladder);
+                config.reasoning = resolve_reasoning(
+                    config.reasoning,
+                    selected_model.and_then(|model| model.default_reasoning),
+                    &ladder,
+                );
             }
         }
         self.state.update(cx, |state, cx| {
@@ -4406,6 +4431,7 @@ mod tests {
             description: None,
             deprecation: None,
             reasoning_levels: vec![ReasoningLevel::Medium, ReasoningLevel::High],
+            default_reasoning: None,
             options: vec![
                 ModelOption {
                     id: "context".into(),
@@ -4674,6 +4700,7 @@ mod tests {
             description: None,
             deprecation: None,
             reasoning_levels: vec![],
+            default_reasoning: None,
             options: vec![],
             accepts_images: true,
         };
@@ -4695,6 +4722,7 @@ mod tests {
                 description: None,
                 deprecation: None,
                 reasoning_levels: vec![],
+                default_reasoning: None,
                 options: vec![],
                 accepts_images: true,
             },
@@ -4704,6 +4732,7 @@ mod tests {
                 description: None,
                 deprecation: None,
                 reasoning_levels: vec![],
+                default_reasoning: None,
                 options: vec![],
                 accepts_images: true,
             },
@@ -4740,6 +4769,30 @@ mod tests {
         // No pick at all resolves to the concrete default too.
         assert_eq!(clamp_reasoning(None, &ladder), Some(High));
         assert_eq!(clamp_reasoning(Some(High), &[]), None);
+    }
+
+    #[test]
+    fn provider_default_reasoning_applies_only_without_a_user_selection() {
+        use ReasoningLevel::*;
+        let ladder = [Low, Medium, High];
+        assert_eq!(
+            resolve_reasoning(None, Some(Low), &ladder),
+            Some(Low),
+            "provider metadata replaces the old heuristic only when no user selected a level"
+        );
+        assert_eq!(
+            resolve_reasoning(Some(High), Some(Low), &ladder),
+            Some(High),
+            "an explicit draft, chat, or sticky choice wins"
+        );
+    }
+
+    #[test]
+    fn absent_or_unoffered_provider_default_keeps_the_existing_heuristic() {
+        use ReasoningLevel::*;
+        let ladder = [Low, Medium, High];
+        assert_eq!(resolve_reasoning(None, None, &ladder), Some(High));
+        assert_eq!(resolve_reasoning(None, Some(Max), &ladder), Some(High));
     }
 
     /// The catalog the UI caches on its first render is taken before the

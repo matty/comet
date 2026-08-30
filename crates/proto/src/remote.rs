@@ -71,6 +71,11 @@ use serde::{Deserialize, Serialize};
 ///     release but does not itself require the bump: a new server defaults a
 ///     missing hello to supervising, while an old server ignoring an
 ///     administrative declaration preserves the old safe behavior.
+///
+/// D36: `Model.defaultReasoning` is additive provider metadata and does NOT
+/// require a bump. A new peer decoding an older model list gets `None` and
+/// retains the existing ladder heuristic; an older peer ignores the unknown
+/// key and retains that same heuristic. It never overrides a user selection.
 pub const PROTOCOL_VERSION: u32 = 13;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

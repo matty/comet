@@ -180,6 +180,7 @@ fn static_models() -> Vec<Model> {
         description: Some("SpaceXAI's latest frontier model".into()),
         deprecation: None,
         reasoning_levels: REASONING_LEVELS.to_vec(),
+        default_reasoning: None,
         options: Vec::new(),
         // Grok's `promptCapabilities.image` reads false on this build, and
         // unlike an absent field that is the provider saying so.
@@ -292,6 +293,7 @@ fn models_from_discovery(discovered: &Discovered) -> Discovery {
             } else {
                 per_model
             },
+            default_reasoning: None,
             accepts_images: image_support,
             id,
         }

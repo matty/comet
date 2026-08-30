@@ -4785,6 +4785,7 @@ async fn a_discovered_model_reaches_the_client_and_the_list_reads_live() {
                 migration_markdown: Some("Tomorrow is retiring.".into()),
             }),
             reasoning_levels: vec![ReasoningLevel::High],
+            default_reasoning: None,
             accepts_images: None,
         }],
     })

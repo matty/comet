@@ -150,6 +150,7 @@ fn static_models() -> Vec<Model> {
         description: Some("OpenAI's compact model, routed through Hermes".into()),
         deprecation: None,
         reasoning_levels: Vec::new(),
+        default_reasoning: None,
         options: Vec::new(),
         accepts_images: true,
     }]
@@ -207,6 +208,7 @@ fn models_from_discovery(discovered: &Discovered) -> Discovery {
                     // Hermes offers no effort ladder anywhere in its ACP
                     // surface -- see `HermesHarness::capabilities()`.
                     reasoning_levels: Vec::new(),
+                    default_reasoning: None,
                     accepts_images: image_support,
                     id,
                 })

@@ -330,9 +330,9 @@ struct ModelListResult {
 }
 
 /// Only the fields Comet consumes. The reply carries several more —
-/// `defaultReasoningEffort`, `serviceTiers`, `supportsPersonality`,
-/// `availabilityNux`, `modelSpecialty` and the rest — still deliberately
-/// unmodelled; see their debt rows.
+/// `serviceTiers`, `supportsPersonality`, `availabilityNux`,
+/// `modelSpecialty` and the rest — still deliberately unmodelled;
+/// see their debt rows.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListedModel {
@@ -353,6 +353,10 @@ struct ListedModel {
     hidden: bool,
     #[serde(default)]
     supported_reasoning_efforts: Vec<ReasoningEffortOption>,
+    /// An unknown provider value stays unknown rather than becoming a guessed
+    /// Comet level. The picker falls back to its established heuristic.
+    #[serde(default)]
+    default_reasoning_effort: Option<String>,
     /// Absent means `["text","image"]`, not "unknown" — the schema documents
     /// the default (`schema.gen.ts:22253`). See
     /// `.agents/rules/optional-wire-fields.md`.
@@ -467,6 +471,7 @@ pub(crate) fn page_from_reply(line: &str) -> Result<ModelPage, DiscoveryFailure>
                     .iter()
                     .filter_map(|effort| to_level(&effort.reasoning_effort))
                     .collect(),
+                default_reasoning: model.default_reasoning_effort.as_deref().and_then(to_level),
                 accepts_images: Some(match model.input_modalities {
                     Some(modalities) => modalities.iter().any(|m| m == "image"),
                     // The documented default, written by hand because no live model
@@ -474,8 +479,7 @@ pub(crate) fn page_from_reply(line: &str) -> Result<ModelPage, DiscoveryFailure>
                     // having been constructed.
                     None => true,
                 }),
-            }
-        })
+            }        })
         .collect();
     Ok((models, result.next_cursor, default_id))
 }
@@ -625,6 +629,22 @@ mod tests {
                 ReasoningLevel::Ultra,
             ]
         );
+    }
+
+    #[test]
+    fn captured_default_reasoning_effort_is_preserved_and_unknown_values_are_ignored() {
+        let payload = corpus_frame(MODEL_DISCOVERY, 6).payload;
+        let (models, _, _) = page_from_reply(&payload).expect("decodes");
+        assert_eq!(
+            models[0].default_reasoning,
+            Some(ReasoningLevel::Low),
+            "the literal Codex reply says Sol defaults to low"
+        );
+
+        let line = r#"{"id":2,"result":{"data":[{"id":"future","displayName":"Future","hidden":false,"defaultReasoningEffort":"future","supportedReasoningEfforts":[]}],"nextCursor":null}}"#;
+        let (models, _, _) =
+            page_from_reply(line).expect("unknown values do not invalidate discovery");
+        assert_eq!(models[0].default_reasoning, None);
     }
 
     /// The field 2.4's modality gate reads, and the one place the live answer

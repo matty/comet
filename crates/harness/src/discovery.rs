@@ -27,6 +27,9 @@ pub struct DiscoveredModel {
     /// Efforts the provider reported. Only consulted for a model with no
     /// curated entry.
     pub reasoning_levels: Vec<ReasoningLevel>,
+    /// The provider's own default within `reasoning_levels`, if it reported
+    /// one. `None` is unknown, never an inferred level.
+    pub default_reasoning: Option<ReasoningLevel>,
     /// `None` = the provider did not say. NOT "no images" — see
     /// `.agents/rules/optional-wire-fields.md`.
     pub accepts_images: Option<bool>,
@@ -107,6 +110,7 @@ pub fn merge(curated: Vec<Model>, discovery: &Discovery) -> Vec<Model> {
                     model.accepts_images = accepts;
                 }
                 model.deprecation = live.deprecation.clone();
+                model.default_reasoning = live.default_reasoning;
             }
             model
         })
@@ -127,6 +131,7 @@ pub fn merge(curated: Vec<Model>, discovery: &Discovery) -> Vec<Model> {
                 .copied()
                 .filter(|l| !is_comet_special(*l))
                 .collect(),
+            default_reasoning: live.default_reasoning,
             options: Vec::new(),
             accepts_images: live.accepts_images.unwrap_or(true),
         });
@@ -313,6 +318,7 @@ mod tests {
             description: Some("curated".into()),
             deprecation: None,
             reasoning_levels: levels.to_vec(),
+            default_reasoning: None,
             options: vec![ModelOption {
                 id: "contextWindow".into(),
                 label: "Context Window".into(),
@@ -333,8 +339,31 @@ mod tests {
             description: Some("live".into()),
             deprecation: None,
             reasoning_levels: vec![ReasoningLevel::Low, ReasoningLevel::High],
+            default_reasoning: None,
             accepts_images: None,
         }
+    }
+
+    #[test]
+    fn merge_preserves_the_provider_reasoning_default_for_live_and_curated_models() {
+        let mut matched = discovered("m-1", "Live");
+        matched.default_reasoning = Some(ReasoningLevel::Low);
+        let mut live_only = discovered("m-new", "New");
+        live_only.default_reasoning = Some(ReasoningLevel::High);
+
+        let merged = merge(
+            vec![curated(
+                "m-1",
+                "Curated",
+                &[ReasoningLevel::Low, ReasoningLevel::High],
+            )],
+            &Discovery {
+                models: vec![matched, live_only],
+            },
+        );
+
+        assert_eq!(merged[0].default_reasoning, Some(ReasoningLevel::Low));
+        assert_eq!(merged[1].default_reasoning, Some(ReasoningLevel::High));
     }
 
     /// The provider knows what exists; the catalog knows what it can do. A
@@ -756,6 +785,7 @@ mod tests {
                     ReasoningLevel::Ultracode,
                     ReasoningLevel::Ultrathink,
                 ],
+                default_reasoning: None,
                 accepts_images: Some(true),
             }],
         };
