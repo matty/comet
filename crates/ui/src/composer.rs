@@ -3568,6 +3568,12 @@ pub struct Composer {
     /// Approvals answered locally, suppressing the row until the doc frame
     /// carries the decision back.
     answered_approvals: HashSet<String>,
+    /// D28: the prompt to offer resending, when the last assistant entry
+    /// ended because nothing was connected to answer it
+    /// (`approvals::expired_resubmit_prompt`). Recomputed on every state
+    /// change like `approval` above, and for the same reason: an entry
+    /// superseded by a newer reply has nothing left to resend.
+    expired_resubmit: Option<SharedString>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
@@ -3659,6 +3665,7 @@ impl Composer {
             answered_requests: HashSet::new(),
             approval: None,
             answered_approvals: HashSet::new(),
+            expired_resubmit: None,
             advance_task: None,
             send_task: None,
             expanded_mode: true,
@@ -4692,6 +4699,21 @@ impl Composer {
                 }
             }
         }
+
+        // D28: offer to resend the prompt an unattended-expired turn never
+        // answered. No latch, same reasoning as `approval` above: recomputed
+        // from the transcript every pass, so a newer reply (this device or a
+        // paired one) or the user's own click retires it on the next state
+        // change with nothing to release explicitly. Suppressed while the
+        // approval or question panel is up — both replace the composer
+        // outright, and resending under either would race a decision that is
+        // still live.
+        self.expired_resubmit = if self.approval.is_none() && self.wizard.is_none() {
+            crate::approvals::expired_resubmit_prompt(&self.state.read(cx).transcript)
+                .map(SharedString::from)
+        } else {
+            None
+        };
         cx.notify();
     }
 
@@ -6041,6 +6063,69 @@ impl Render for Composer {
                                 .text_color(text_c),
                         )
                         .child(div().min_w_0().child(message)),
+                )
+            })
+            // D28: the affordance the transcript's expiry note (crates/ui's
+            // own `error_chip`, from `unattended_note`'s copy) promises but
+            // never wired up — a button that resends the prompt no one was
+            // there to answer, right where the composer already is. `None`
+            // whenever the approval/question panel is up (set in
+            // `on_state_changed`), so this and the two `return`s just below
+            // never race.
+            .when_some(self.expired_resubmit.clone(), |el, prompt| {
+                el.child(
+                    div()
+                        .id("composer-resubmit")
+                        .mx(px(4.0))
+                        .mt(px(6.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .rounded(px(12.0))
+                        .border_1()
+                        .border_color(theme.warning.opacity(0.16))
+                        .bg(theme.warning.opacity(0.05))
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .text_size(px(12.0))
+                        .line_height(px(16.0))
+                        .child(
+                            crate::icons::icon(crate::icons::RESTART)
+                                .size(px(14.0))
+                                .text_color(theme.warning_muted.opacity(0.9)),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .text_color(theme.warning_muted.opacity(0.9))
+                                .child(SharedString::from(
+                                    "This turn ended before it could finish.",
+                                )),
+                        )
+                        .child(
+                            div()
+                                .id("composer-resubmit-send")
+                                .flex_none()
+                                .px(px(10.0))
+                                .py(px(4.0))
+                                .rounded(px(8.0))
+                                .border_1()
+                                .border_color(crate::theme::hairline(0.16))
+                                .bg(motion::hover_blend(
+                                    "composer-resubmit-send",
+                                    crate::theme::ink(0.025),
+                                    crate::theme::ink(0.06),
+                                ))
+                                .on_hover(motion::hover_listener("composer-resubmit-send"))
+                                .cursor_pointer()
+                                .text_color(theme.text)
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .child(SharedString::from("Send again"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.send(prompt.to_string(), false, cx);
+                                })),
+                        ),
                 )
             });
 
