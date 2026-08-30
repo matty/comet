@@ -25,6 +25,7 @@
 //! | `complete-race-drain` | the notification, then an extra `agent_message_chunk` 50ms later, then the reply 10ms after that — so the chunk lands from the reader task strictly BETWEEN the two settle signals, during the harvest's own wait rather than before it. Poses the window D121 covers: only a drain placed AFTER the harvest, not the ones before it, can pick this up on the turn it belongs to. Unlike `complete-both-usage` the reply carries no token counts; this scenario is about frame ordering, not usage |
 //! | `complete-response-only` | the ordinary RPC reply alone, no notification — this is the plain `end_turn` path below; named here because it is the deliberate MIRROR of `complete-notification-only`: an agent without the extension, which must still settle |
 //! | `replay-stale` | replays the PREVIOUS turn's already-consumed promptId as a bogus early completion (`stopReason: "refusal"`) of THIS turn, before streaming this turn's own real content and completing for real — poses the cross-turn staleness the consumed-promptId dedup exists to reject |
+//! | `complete-foreign-session` | sends the completion notification naming a DIFFERENT `sessionId` (`stopReason: "refusal"`, no promptId), before streaming this turn's own real content and completing for real, correctly scoped — poses the foreign-session mismatch D114 covers: a completion signal about a different session is not evidence about this one |
 //! | `request-permission` | sends `session/request_permission` mid-turn with all four ACP option kinds, then — once answered — echoes `"chosen:<optionId or cancelled>"` as a text chunk and settles `end_turn`. Lets a test observe which option the client picked without reading raw wire bytes. |
 //! | `request-permission-unrecognized` | identical, but the options carry no kind this build recognizes (`vendor_custom` only) — poses the protocol-drift case, which a correct client answers `cancelled` on its own, never touching the approval bridge |
 //! | `request-permission-edit` | identical, but `toolCall.kind` is `"edit"` with a `diff` content block and the options are Hermes' real two-option edit shape (`allow_once`/`reject_once`, no `allow_always` at all) — poses the shape `AllowForSession`'s narrow-to-`allow_once` fallback exists for |
@@ -672,6 +673,39 @@ fn handle_prompt(
             "result": {"stopReason": "end_turn", "_meta": {"promptId": prompt_id}},
         }));
         return None;
+    }
+
+    if text.contains("complete-foreign-session") {
+        // D114: the completion notification's `sessionId` naming a DIFFERENT
+        // session is not evidence about THIS turn — the guard in
+        // `acp/session.rs` must reject it before it ever looks at the
+        // promptId. Posed the same way `replay-stale` poses cross-turn
+        // staleness: a notification that, if the guard were missing, would
+        // settle this turn immediately and WRONGLY (`stopReason: "refusal"`,
+        // no promptId to dedup on so `is_none_or` alone would let it
+        // through), followed after a delay by this turn's own real content
+        // and its own correctly-scoped completion. A client that checks the
+        // guard waits past the foreign notification for that real
+        // completion; one that doesn't settles instantly, `Errored`, with
+        // "second" never streamed.
+        emit(&json!({
+            "jsonrpc": "2.0",
+            "method": PROMPT_COMPLETE_METHOD,
+            "params": {
+                "sessionId": format!("{session_id}-foreign"),
+                "promptId": Value::Null,
+                "stopReason": "refusal",
+                "agentResult": Value::Null,
+            },
+        }));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        update(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "second"},
+        }));
+        complete("end_turn");
+        *last_prompt_id = Some(prompt_id);
+        return Some(id.clone());
     }
 
     if text.contains("replay-stale") {

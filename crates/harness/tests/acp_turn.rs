@@ -611,6 +611,58 @@ async fn both_signals_arriving_produce_exactly_one_done() {
     }
 }
 
+/// D114: the completion notification's session-match guard
+/// (`acp/session.rs`'s `PROMPT_COMPLETE_METHOD` arm) is checked BEFORE the
+/// promptId staleness check, and is real, load-bearing logic in its own
+/// right — a foreign `sessionId` naming a different session is not evidence
+/// about this turn, whatever its promptId says. Nothing before this test
+/// drove that comparison down a mismatching path; `both_signals_arriving_
+/// produce_exactly_one_done` above exercises the promptId dedup with a
+/// SESSION-matching replay, which is a different half of the same guard.
+#[tokio::test]
+async fn a_foreign_session_completion_notification_is_not_evidence_about_this_turn() {
+    let (controls, steer, _token) = controls();
+    let stream = comet_harness::acp::session::run(
+        open(false).await,
+        HarnessId::Mock,
+        // The fixture's `complete-foreign-session`: an immediate completion
+        // notification naming a DIFFERENT session, with `stopReason:
+        // "refusal"` and no promptId — nothing for the promptId dedup to
+        // catch on its own — followed after a delay by this turn's own real
+        // content and its own correctly-scoped completion.
+        request("please complete-foreign-session"),
+        controls,
+        no_usage,
+    );
+    drop(steer);
+    let events = drain(stream).await;
+
+    assert_eq!(
+        text_of(&events),
+        "workingsecond",
+        "the foreign notification must never settle this turn — \"second\" \
+         (streamed only after the real, correctly-scoped completion fires) \
+         must still appear: {events:#?}"
+    );
+    match only_done(&events) {
+        AgentEvent::Done { status, error, .. } => {
+            assert_eq!(
+                *status,
+                DoneStatus::Completed,
+                "the foreign notification's stopReason is \"refusal\" \
+                 (DoneStatus::Errored) — a Completed status here proves it \
+                 was rejected on the sessionId mismatch rather than settling \
+                 this turn: {events:#?}"
+            );
+            assert!(
+                error.is_none(),
+                "a clean end_turn carries no error: {error:?}"
+            );
+        }
+        other => unreachable!("{other:?}"),
+    }
+}
+
 /// Grok's own reader, mirrored here rather than reused: `grok::usage` is
 /// `pub(crate)` inside `comet-harness` and unreachable from this integration-
 /// test crate (`no_usage`'s own doc comment above explains why every other
