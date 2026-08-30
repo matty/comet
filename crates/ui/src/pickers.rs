@@ -5243,6 +5243,7 @@ mod tests {
                 ),
             }),
             reasoning_levels: vec![],
+            default_reasoning: None,
             options: vec![],
             accepts_images: true,
         };
@@ -5252,6 +5253,7 @@ mod tests {
             description: None,
             deprecation: None,
             reasoning_levels: vec![],
+            default_reasoning: None,
             options: vec![],
             accepts_images: true,
         };
@@ -5280,6 +5282,7 @@ mod tests {
                 migration_markdown: None,
             }),
             reasoning_levels: vec![],
+            default_reasoning: None,
             options: vec![],
             accepts_images: true,
         };
@@ -5301,6 +5304,7 @@ mod tests {
                 migration_markdown: Some("Old retires soon.".into()),
             }),
             reasoning_levels: vec![],
+            default_reasoning: None,
             options: vec![],
             accepts_images: true,
         };
@@ -5321,9 +5325,9 @@ mod tests {
     fn the_picker_decodes_the_reply_the_engine_actually_sends() {
         let reply = serde_json::json!({
             "models": [{
-                "id": "claude-sonnet-5",
-                "label": "Sonnet 5",
-                "reasoningLevels": [],
+                "id": "gpt-5.6-sol",
+                "label": "GPT-5.6 Sol",
+                "reasoningLevels": ["low", "medium", "high"],
                 "defaultReasoning": "low",
                 "options": [],
                 "deprecation": {
@@ -5331,12 +5335,12 @@ mod tests {
                     "migrationMarkdown": "Sonnet 5 retires soon. Switch to Sonnet 6."
                 }
             }],
-            "source": "builtIn"
+            "source": "live"
         });
         let catalog = decode_models_reply(reply).expect("decode");
-        assert_eq!(catalog.source, CatalogSource::BuiltIn);
+        assert_eq!(catalog.source, CatalogSource::Live);
         assert_eq!(catalog.models.len(), 1);
-        assert_eq!(catalog.models[0].id, "claude-sonnet-5");
+        assert_eq!(catalog.models[0].id, "gpt-5.6-sol");
         assert_eq!(
             catalog.models[0].default_reasoning,
             Some(ReasoningLevel::Low),
