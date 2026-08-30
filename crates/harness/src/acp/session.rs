@@ -136,6 +136,13 @@ pub(crate) type ConfigRequests = fn(&RunRequest, &str) -> Vec<(&'static str, Val
 /// to sign in" on a guess.
 pub(crate) type OpenFailureMapper = fn(&crate::jsonrpc::RpcFailure) -> Option<HarnessError>;
 
+/// A provider-specific decoder for out-of-band notifications.
+///
+/// ACP reserves `session/update` for its shared stream, but providers also
+/// send their own notifications. The shared loop only delivers what the
+/// provider explicitly claims; `None` keeps every vendor notification inert.
+pub(crate) type NotificationHandler = fn(&str, &Value) -> Vec<AgentEvent>;
+
 /// A vendor's own out-of-band turn-completion notification — one that can
 /// end a turn ahead of, or entirely without, the ordinary `session/prompt`
 /// RPC reply.
@@ -266,6 +273,7 @@ pub struct AcpSession {
     /// "the agent did not say", never "no limit".
     context_window: Option<u64>,
     timeouts: Timeouts,
+    notification_handler: Option<NotificationHandler>,
 }
 
 impl AcpSession {
@@ -298,6 +306,7 @@ impl AcpSession {
         request: &RunRequest,
         config_requests: ConfigRequests,
         map_open_failure: OpenFailureMapper,
+        notification_handler: Option<NotificationHandler>,
     ) -> Result<Self, HarnessError> {
         let Connected {
             mut child,
@@ -372,6 +381,7 @@ impl AcpSession {
             session_id,
             context_window: normalize::context_window(&opened),
             timeouts,
+            notification_handler,
         })
     }
 
@@ -908,6 +918,7 @@ async fn run_session(
         session_id,
         context_window,
         timeouts,
+        notification_handler,
     } = session;
     let RunControls {
         // Unclaimed here. ACP has no input-request method of its own —
@@ -1009,6 +1020,7 @@ async fn run_session(
                 context_window,
                 usage_reader,
                 settle,
+                notification_handler,
                 prompt_completions: &mut prompt_completions,
                 request_approval: &request_approval,
             },
@@ -1206,6 +1218,7 @@ struct Turn<'a> {
     /// This agent's own out-of-band turn-completion notification, if it has
     /// one — see [`SettleSignal`].
     settle: Option<SettleSignal>,
+    notification_handler: Option<NotificationHandler>,
     /// Every promptId that has already settled a turn this session. Outlives
     /// the turn for the same reason `diagnostics` does: a [`SettleSignal`]'s
     /// notification, arriving late after ITS OWN turn already settled off the
@@ -1216,6 +1229,17 @@ struct Turn<'a> {
     /// reference, because [`handle_incoming`]'s approval arm spawns a task
     /// that outlives the borrow of this `Turn` — see [`RequestApprovalFn`].
     request_approval: &'a Arc<RequestApprovalFn>,
+}
+
+/// Borrowed state shared by both paths that consume an incoming frame.
+struct IncomingContext<'a> {
+    client: &'a RpcClient,
+    event_tx: &'a mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    tools: &'a mut normalize::ToolTracker,
+    diagnostics: &'a mut HashSet<String>,
+    streamed: &'a mut bool,
+    request_approval: &'a Arc<RequestApprovalFn>,
+    notification_handler: Option<NotificationHandler>,
 }
 
 /// Bound on [`PromptCompletions`] (`docs/debt/README.md`'s D124) — the same
@@ -1329,6 +1353,7 @@ async fn drive_turn(
         context_window,
         usage_reader,
         settle,
+        notification_handler,
         prompt_completions,
         request_approval,
     } = turn;
@@ -1337,7 +1362,17 @@ async fn drive_turn(
     let context_window = *context_window;
     let usage_reader = *usage_reader;
     let settle = *settle;
+    let notification_handler = *notification_handler;
     let session_id: &str = session_id;
+    let mut incoming_context = IncomingContext {
+        client,
+        event_tx,
+        tools,
+        diagnostics,
+        streamed,
+        request_approval,
+        notification_handler,
+    };
 
     // **Drain any backlog BEFORE sending, not after.** The reader task can
     // have already buffered a frame that has nothing to do with THIS prompt —
@@ -1350,17 +1385,7 @@ async fn drive_turn(
     // after the send it is actually bound to. Processed normally through
     // `handle_incoming` rather than discarded: it is still real content,
     // just not evidence for the stall clock below.
-    match drain_buffered(
-        incoming,
-        client,
-        event_tx,
-        tools,
-        diagnostics,
-        streamed,
-        request_approval,
-    )
-    .await
-    {
+    match drain_buffered(incoming, &mut incoming_context).await {
         Handled::Continue => {}
         Handled::ConsumerGone => return TurnEnd::ConsumerGone,
         Handled::AgentExited => return TurnEnd::AgentExited,
@@ -1400,16 +1425,7 @@ async fn drive_turn(
                         // An EOF mid-drain is just the agent shutting down
                         // after a settled turn; the turn itself succeeded, so
                         // only a gone consumer ends things here.
-                        if let Handled::ConsumerGone = drain_buffered(
-                            incoming,
-                            client,
-                            event_tx,
-                            tools,
-                            diagnostics,
-                            streamed,
-                            request_approval,
-                        )
-                        .await
+                        if let Handled::ConsumerGone = drain_buffered(incoming, &mut incoming_context).await
                         {
                             return TurnEnd::ConsumerGone;
                         }
@@ -1494,16 +1510,7 @@ async fn drive_turn(
                         // Same drain rationale as the reply arm above: deltas
                         // queued ahead of this notification on the wire must
                         // not be truncated by returning immediately.
-                        if let Handled::ConsumerGone = drain_buffered(
-                            incoming,
-                            client,
-                            event_tx,
-                            tools,
-                            diagnostics,
-                            streamed,
-                            request_approval,
-                        )
-                        .await
+                        if let Handled::ConsumerGone = drain_buffered(incoming, &mut incoming_context).await
                         {
                             return TurnEnd::ConsumerGone;
                         }
@@ -1583,16 +1590,7 @@ async fn drive_turn(
                         // Same ConsumerGone-only handling as the drain above:
                         // an EOF here is the agent shutting down after a
                         // settled turn, not a reason to fail it.
-                        if let Handled::ConsumerGone = drain_buffered(
-                            incoming,
-                            client,
-                            event_tx,
-                            tools,
-                            diagnostics,
-                            streamed,
-                            request_approval,
-                        )
-                        .await
+                        if let Handled::ConsumerGone = drain_buffered(incoming, &mut incoming_context).await
                         {
                             return TurnEnd::ConsumerGone;
                         }
@@ -1604,16 +1602,7 @@ async fn drive_turn(
                         let reason = params["stopReason"].as_str().unwrap_or_default();
                         return TurnEnd::Settled(normalize::done_status(reason));
                     }
-                    Some(message) => match handle_incoming(
-                        message,
-                        client,
-                        event_tx,
-                        tools,
-                        diagnostics,
-                        streamed,
-                        request_approval,
-                    )
-                    .await
+                    Some(message) => match handle_incoming(message, &mut incoming_context).await
                     {
                         Handled::Continue => {}
                         Handled::ConsumerGone => return TurnEnd::ConsumerGone,
@@ -1763,25 +1752,10 @@ fn handle_permission_request(
 /// succeeded — so that stays with the caller.
 async fn drain_buffered(
     incoming: &mut mpsc::Receiver<Incoming>,
-    client: &RpcClient,
-    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
-    tools: &mut normalize::ToolTracker,
-    diagnostics: &mut HashSet<String>,
-    streamed: &mut bool,
-    request_approval: &Arc<RequestApprovalFn>,
+    context: &mut IncomingContext<'_>,
 ) -> Handled {
     while let Ok(message) = incoming.try_recv() {
-        match handle_incoming(
-            message,
-            client,
-            event_tx,
-            tools,
-            diagnostics,
-            streamed,
-            request_approval,
-        )
-        .await
-        {
+        match handle_incoming(message, context).await {
             Handled::Continue => {}
             other => return other,
         }
@@ -1793,15 +1767,16 @@ async fn drain_buffered(
 /// post-settle drain, so a frame is treated identically whichever of the two
 /// picks it up — the alternative is two copies that quietly disagree about, say,
 /// whether an unsupported request still gets its `-32601`.
-async fn handle_incoming(
-    message: Incoming,
-    client: &RpcClient,
-    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
-    tools: &mut normalize::ToolTracker,
-    diagnostics: &mut HashSet<String>,
-    streamed: &mut bool,
-    request_approval: &Arc<RequestApprovalFn>,
-) -> Handled {
+async fn handle_incoming(message: Incoming, context: &mut IncomingContext<'_>) -> Handled {
+    let IncomingContext {
+        client,
+        event_tx,
+        tools,
+        diagnostics,
+        streamed,
+        request_approval,
+        notification_handler,
+    } = context;
     match message {
         Incoming::Notification { method, params } => {
             if method == "session/update" {
@@ -1822,16 +1797,24 @@ async fn handle_incoming(
                         event,
                         AgentEvent::TextDelta { .. } | AgentEvent::ReasoningDelta { .. }
                     ) {
-                        *streamed = true;
+                        **streamed = true;
                     }
                     if !send(event_tx, event).await {
                         return Handled::ConsumerGone;
                     }
                 }
             } else {
-                // Vendor and lifecycle chatter -- `_x.ai/*` and friends.
-                // Dropped on purpose; see this module's header.
-                tracing::trace!(target: "comet_harness::acp", method, "unconsumed notification");
+                let events = notification_handler
+                    .map(|handler| handler(&method, &params))
+                    .unwrap_or_default();
+                if events.is_empty() {
+                    tracing::trace!(target: "comet_harness::acp", method, "unconsumed notification");
+                }
+                for event in events {
+                    if !send(event_tx, event).await {
+                        return Handled::ConsumerGone;
+                    }
+                }
             }
             Handled::Continue
         }

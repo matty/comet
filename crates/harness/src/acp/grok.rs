@@ -59,7 +59,8 @@ use serde_json::{Value, json};
 
 use comet_proto::{
     AgentCommand, AgentEvent, HarnessCapabilities, HarnessId, HarnessProbe, InstallMethod, Model,
-    ModelCatalog, ReasoningLevel, RunRequest, RuntimeMode, SteeringMode,
+    ModelCatalog, NoticeKind, NoticeSeverity, ReasoningLevel, RunRequest, RuntimeMode,
+    SteeringMode,
 };
 
 use super::AgentDescription;
@@ -362,6 +363,50 @@ pub(crate) fn usage(result: &Value, context_window: Option<u64>) -> Option<Agent
         // `None` is "the agent did not say", never "no limit".
         context_window,
     })
+}
+
+const ANNOUNCEMENT_UPDATE_METHOD: &str = "_x.ai/announcements/update";
+const SETTINGS_UPDATE_METHOD: &str = "_x.ai/settings/update";
+
+/// Decode the two Grok-only announcement pushes observed in the 1.0.5 corpus.
+///
+/// Repeated ids become the same trailing transcript notice; missing ids stay
+/// keyless so the document does not merge unrelated announcements.
+fn announcement_notices(method: &str, params: &Value) -> Vec<AgentEvent> {
+    if !matches!(method, ANNOUNCEMENT_UPDATE_METHOD | SETTINGS_UPDATE_METHOD) {
+        return Vec::new();
+    }
+
+    params["announcements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|announcement| {
+            let title = announcement["title"]
+                .as_str()
+                .filter(|title| !title.is_empty());
+            let message = announcement["message"]
+                .as_str()
+                .filter(|message| !message.is_empty());
+            let summary = title.or(message)?;
+            let detail = title
+                .zip(message)
+                .map(|(_, message)| crate::cap_prose(message, crate::NOTICE_DETAIL_MAX));
+            Some(AgentEvent::Notice {
+                kind: NoticeKind::Info,
+                severity: match announcement["severity"].as_str() {
+                    Some("warning") => NoticeSeverity::Warning,
+                    _ => NoticeSeverity::Info,
+                },
+                summary: crate::cap_prose(summary, crate::NOTICE_SUMMARY_MAX),
+                detail,
+                key: announcement["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| format!("grok-announcement:{id}")),
+            })
+        })
+        .collect()
 }
 
 /// Grok's vendor extension: the AUTHORITATIVE turn-end signal. **Measured
@@ -766,6 +811,7 @@ impl Harness for GrokHarness {
             &request,
             config_requests,
             map_open_failure,
+            Some(announcement_notices),
         )
         .await?;
         Ok(super::session::run(
@@ -784,6 +830,93 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn announcements_become_bounded_deduplicated_notices() {
+        let long = "x".repeat(crate::NOTICE_DETAIL_MAX + 120);
+        let notices = announcement_notices(
+            "_x.ai/announcements/update",
+            &json!({
+                "announcements": [
+                    {
+                        "id": "release-1",
+                        "title": "Important update",
+                        "message": long,
+                        "severity": "warning"
+                    },
+                    {
+                        "title": "A promotion",
+                        "message": "Try the new feature",
+                        "severity": "promo"
+                    }
+                ]
+            }),
+        );
+
+        assert_eq!(notices.len(), 2);
+        assert_eq!(
+            notices[0],
+            AgentEvent::Notice {
+                kind: comet_proto::NoticeKind::Info,
+                severity: comet_proto::NoticeSeverity::Warning,
+                summary: "Important update".into(),
+                detail: Some(crate::cap_prose(&long, crate::NOTICE_DETAIL_MAX)),
+                key: Some("grok-announcement:release-1".into()),
+            }
+        );
+        assert_eq!(
+            notices[1],
+            AgentEvent::Notice {
+                kind: comet_proto::NoticeKind::Info,
+                severity: comet_proto::NoticeSeverity::Info,
+                summary: "A promotion".into(),
+                detail: Some("Try the new feature".into()),
+                key: None,
+            }
+        );
+    }
+
+    #[test]
+    fn announcements_tolerate_absent_fields_and_keep_repeat_ids_stable() {
+        let notices = announcement_notices(
+            SETTINGS_UPDATE_METHOD,
+            &json!({
+                "announcements": [
+                    {"id": "same", "message": "First"},
+                    {"id": "same", "message": "Second"},
+                    {"id": "ignored"},
+                    {"title": "Title only"},
+                    {"message": "Message only", "severity": "anything-else"}
+                ]
+            }),
+        );
+
+        assert_eq!(notices.len(), 4, "an announcement without prose is skipped");
+        let keys: Vec<_> = notices
+            .iter()
+            .map(|event| match event {
+                AgentEvent::Notice { key, .. } => key.as_deref(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                Some("grok-announcement:same"),
+                Some("grok-announcement:same"),
+                None,
+                None
+            ]
+        );
+        assert!(matches!(
+            notices.last(),
+            Some(AgentEvent::Notice {
+                severity: NoticeSeverity::Info,
+                ..
+            })
+        ));
+        assert!(announcement_notices("_x.ai/models/update", &json!({})).is_empty());
+    }
 
     /// Break caught: reordering Grok's launch tokens. `--no-auto-update` is
     /// top-level, `--no-leader` belongs to `agent`, and `stdio` is under
