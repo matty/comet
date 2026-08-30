@@ -182,6 +182,32 @@ pub const MAP_PATHS: &[MapPath] = &[
         ],
     },
     MapPath {
+        path: ".params.toolCall.rawInput",
+        named_children: &[
+            // D77, second live instance (found reviewing PR #142,
+            // 2026-08-29). The same tool-argument map as
+            // `.params.update.rawInput` above, on ACP's
+            // `session/request_permission` instead of a
+            // `session/update` notification: `acp::approval::command`
+            // (`crates/harness/src/acp/approval.rs`) reads
+            // `tool_call["rawInput"]["command"]` and
+            // `tool_call["rawInput"]["cwd"]` off exactly this map, off the
+            // request's `params.toolCall` value (`acp::session`, the
+            // `approval::approval_request(&params["toolCall"])` call site).
+            // Nothing has published yet only because no ACP approval
+            // scenario is promoted, the same latency
+            // `.params.update.rawInput`'s own comment records for
+            // `pattern`/`path` — this declaration takes effect the day one
+            // is. Every other key this map can carry for any tool
+            // (`target_file`, `content`, `glob`, `pattern`, `path`, ...)
+            // still folds to `.{}`; naming `command` and `cwd` only decides
+            // what their *keys* are called, not what their *values* earn —
+            // see `MapPath`'s own doc comment. Their values are not on
+            // `allowlist/acp.txt` by this change and must not be.
+            "command", "cwd",
+        ],
+    },
+    MapPath {
         path: ".result._meta.usage.modelUsage",
         // ACP, same slice. `session/prompt`'s usage breakdown, keyed by
         // model id — the ACP analog of Claude's `.modelUsage` above, at a
