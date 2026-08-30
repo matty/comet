@@ -30,8 +30,8 @@ mod types;
 
 pub use allowlist::{allows, allows_prefix, named_kind};
 pub use corpus::{
-    FoundFrame, Frame, PromotedScenario, corpus_frame, corpus_frame_where, corpus_root, frame,
-    frames, promoted_scenarios,
+    EXPLORATORY_MARKER_FILENAME, FoundFrame, Frame, PromotedScenario, corpus_frame,
+    corpus_frame_where, corpus_root, exploratory_root, frame, frames, promoted_scenarios,
 };
 pub use record::SESSION_ID_FILE;
 pub use record::{Requirements, SCENARIOS, ScenarioSpec, record, scenario};
