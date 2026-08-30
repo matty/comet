@@ -1,0 +1,42 @@
+{
+  "captured_at_unix_ms": 1788057770235,
+  "cli_version": "2.1.251 (Claude Code)",
+  "command": {
+    "args": [
+      "--print",
+      "--input-format",
+      "stream-json",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--include-partial-messages",
+      "--permission-prompt-tool",
+      "stdio",
+      "--model",
+      "claude-haiku-4-5-20251001",
+      "--effort",
+      "low",
+      "--permission-mode",
+      "acceptEdits"
+    ],
+    "configured_env": {
+      "CLAUDE_CONFIG_DIR": "<CLAUDE_CONFIG_DIR>"
+    },
+    "creation_flags": 0,
+    "cwd": "<CWD>",
+    "kill_on_drop": true,
+    "program": "<HOME>\\.local\\bin\\claude.exe",
+    "stderr": "Piped",
+    "stdin": "Piped",
+    "stdout": "Piped"
+  },
+  "exit_code": 0,
+  "platform": {
+    "arch": "x86_64",
+    "os": "windows"
+  },
+  "provider": "claude",
+  "purpose": "capture a Claude run that edits an existing file with Edit",
+  "scenario": "edit",
+  "schema_version": 1
+}

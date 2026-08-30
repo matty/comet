@@ -37,14 +37,6 @@ const TOOL_NAME_PATHS: &[&str] = &[
 /// field-shape assumptions inside these arms have never met a real payload.
 const DECODED_WITHOUT_EVIDENCE: &[(&str, &str)] = &[
     (
-        "Edit",
-        "The uncomfortable one. `ToolCall::EditFile` reads `file_path`/`old_string`/\
-         `new_string` from a payload no capture holds, and D17 and D18 both reason \
-         about Edit's approval card — degenerate edits, and a `Write` that \
-         overwrites — from typings rather than from a frame. A capture that edits a \
-         file would settle three rows at once.",
-    ),
-    (
         "Grep",
         "Reads `pattern`/`path`. No promoted scenario searches; the ACP corpus has \
          Grok's own grep, which is a different tool on a different wire.",
@@ -297,7 +289,7 @@ fn a_declared_claude_tool_that_changes_state_is_pruned() {
 fn the_unevidenced_claude_tool_count_is_pinned() {
     assert_eq!(
         DECODED_WITHOUT_EVIDENCE.len(),
-        6,
+        5,
         "the number of Claude tool decodes with no capture behind them changed"
     );
     assert_eq!(

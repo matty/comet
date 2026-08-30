@@ -489,6 +489,12 @@ pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
             path: str_field(input, "file_path"),
             content: opt_str_field(input, "content"),
         },
+        // `replace_all` is a fourth input field, deliberately unread: the card
+        // shows what a call touched, not how the CLI searched for it, and
+        // `ToolCall::EditFile` has nowhere to put it. Observed for the first
+        // time in the 2.1.251 `edit` capture (2026-08-30) — before that this
+        // arm had never met a real payload at all, which is what
+        // `claude_tool_coverage.rs` exists to keep visible.
         "Edit" => ToolCall::EditFile {
             path: str_field(input, "file_path"),
             old_string: opt_str_field(input, "old_string"),
