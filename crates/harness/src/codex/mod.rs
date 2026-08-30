@@ -970,7 +970,21 @@ async fn run_session(session: Session) {
                             break 'main;
                         }
                         let error = turn_error_message(&params);
-                        let status = if interrupted {
+                        // `cancel` is an approval RESPONSE, not Comet's
+                        // `turn/interrupt` request, so it never trips the
+                        // local interrupt token. D44 records that Codex can
+                        // report an interrupted turn as a completed
+                        // notification whose own status is `interrupted`, so
+                        // the provider's terminal state is authoritative no
+                        // matter which interrupt route produced it. Ignoring
+                        // that state turns "Deny & stop" into a clean
+                        // completion.
+                        let provider_interrupted = params
+                            .get("turn")
+                            .and_then(|turn| turn.get("status"))
+                            .and_then(Value::as_str)
+                            == Some("interrupted");
+                        let status = if interrupted || provider_interrupted {
                             DoneStatus::Interrupted
                         } else if error.is_some() {
                             DoneStatus::Errored

@@ -717,6 +717,44 @@ async fn approval_no_answer_becomes_decline() {
     );
 }
 
+/// A native approval `cancel` is not a clean completion. Unlike the Stop
+/// control, it does not trip Comet's interrupt token; the adapter has to read
+/// Codex's own `turn.status: "interrupted"` from the terminal notification.
+#[tokio::test]
+async fn approval_cancel_maps_the_provider_interrupted_status() {
+    let (steer_tx, steer_rx) = mpsc::channel(1);
+    drop(steer_tx);
+    let controls = RunControls {
+        request_input: Box::new(|_questions| {
+            let (_tx, rx) = oneshot::channel::<Vec<UserInputAnswer>>();
+            rx
+        }),
+        request_approval: Box::new(|_approval| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(ApprovalDecision::DenyAndInterrupt {
+                message: "stop this turn".into(),
+            });
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+    };
+    let mut req = request("scenario:cancel-approval");
+    req.runtime_mode = RuntimeMode::ApprovalRequired;
+    let events = run_to_end(&harness(), req, controls).await;
+
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            result: None,
+            error: None,
+            session_id: Some("th-1".into()),
+        }),
+        "the provider's interrupted terminal must not become a clean completion: {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn interrupt_sends_turn_interrupt_and_maps_aborted() {
     let (controls, _steer, token) = controls("Yes");

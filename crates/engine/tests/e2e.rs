@@ -2385,7 +2385,10 @@ impl Harness for ApprovingHarness {
         "Approving"
     }
     fn capabilities(&self) -> HarnessCapabilities {
-        HarnessCapabilities::default()
+        HarnessCapabilities {
+            supports_approval_interrupt: true,
+            ..HarnessCapabilities::default()
+        }
     }
     async fn models(&self) -> Result<ModelCatalog, HarnessError> {
         Ok(ModelCatalog::built_in(vec![]))
@@ -2405,19 +2408,25 @@ impl Harness for ApprovingHarness {
                 removed_lines: 6,
             })
             .await;
-            let closing = match decision {
+            let (closing, status) = match decision {
                 Ok(ApprovalDecision::Allow) | Ok(ApprovalDecision::AllowForSession) => {
-                    "applied the edit"
+                    ("applied the edit", DoneStatus::Completed)
                 }
-                Ok(ApprovalDecision::Deny { .. }) => "left the file untouched",
-                Ok(ApprovalDecision::DenyAndInterrupt { .. }) => "stopped without the edit",
-                Ok(ApprovalDecision::Expired) | Err(_) => "stopped without the edit",
+                Ok(ApprovalDecision::Deny { .. }) => {
+                    ("left the file untouched", DoneStatus::Completed)
+                }
+                Ok(ApprovalDecision::DenyAndInterrupt { .. }) => {
+                    ("stopped without the edit", DoneStatus::Interrupted)
+                }
+                Ok(ApprovalDecision::Expired) | Err(_) => {
+                    ("stopped without the edit", DoneStatus::Completed)
+                }
             };
             let _ = tx.send(AgentEvent::TextDelta {
                 text: closing.into(),
             });
             let _ = tx.send(AgentEvent::Done {
-                status: DoneStatus::Completed,
+                status,
                 result: None,
                 error: None,
                 session_id: None,
@@ -3665,6 +3674,51 @@ async fn a_denied_approval_reaches_the_harness_with_its_message() {
             )
         })
     }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deny_and_interrupt_reaches_a_supported_harness_and_aborts_the_document_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ApprovingHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let request_id = drive_to_open_approval(&core, &handle, "cmd-run-deny-stop").await;
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-deny-stop-1",
+        SessionCommandPayload::RespondApproval {
+            request_id,
+            decision: ApprovalDecision::DenyAndInterrupt {
+                message: "stop before touching that file".into(),
+            },
+        },
+    );
+
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry.status == Some(MessageStatus::Aborted)
+                    && entry.parts.iter().any(|part| {
+                        matches!(
+                            part,
+                            MessagePart::Approval {
+                                decision: Some(ApprovalDecision::DenyAndInterrupt { message }),
+                                ..
+                            } if message == "stop before touching that file"
+                        )
+                    })
+                    && entry.parts.iter().any(|part| {
+                        matches!(part, MessagePart::Text { text, .. } if text == "stopped without the edit")
+                    })
+            })
+        },
+        "supported deny-and-interrupt decision to abort its document entry",
+    )
+    .await;
+    assert_eq!(
+        command_status(&core, "cmd-deny-stop-1"),
+        Some((SessionCommandStatus::Applied, None))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

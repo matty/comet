@@ -6714,6 +6714,13 @@ mod tests {
         };
         assert_eq!(labels(false), vec!["Deny"]);
         assert_eq!(labels(true), vec!["Deny", "Deny & stop"]);
+        assert_eq!(
+            approval_denial_actions(true)[1].decision("stop this turn".into()),
+            comet_proto::ApprovalDecision::DenyAndInterrupt {
+                message: "stop this turn".into(),
+            },
+            "the fourth button's label must stay bound to the interrupting decision"
+        );
     }
 
     #[test]
