@@ -6307,14 +6307,13 @@ impl Render for Composer {
         let container = container.child(motion::fade_quick("composer-input", body));
         // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
-        // labels once the session exists. Git spaces only.
+        // labels once the session exists. Reserved at a fixed height even
+        // for a non-git space (D42), so the composer's resting height never
+        // depends on which kind of space is selected.
         let footer = self
             .pickers
             .update(cx, |pickers, cx| pickers.render_footer(cx));
-        let container = match footer {
-            Some(footer) => container.child(footer),
-            None => container,
-        };
+        let container = container.child(footer);
         // Full-size preview of a staged thumbnail (AttachmentPreviewDialog).
         if let Some(preview) = self.preview.clone() {
             let weak = cx.weak_entity();

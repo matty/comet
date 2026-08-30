@@ -454,6 +454,14 @@ impl Theme {
     /// Reserved status strip under the content outlet (comet `h-6`) — the
     /// WorkingIndicator row; reserving it keeps the composer from shifting.
     pub const STATUS_STRIP_HEIGHT: f32 = 24.0;
+    /// Reserved height of the composer's branch/worktree footer row (D42):
+    /// checkout-kind chip on the left, ref chip on the right. Reserved
+    /// whether or not the row has anything in it — a non-git space (or one
+    /// whose row hasn't loaded yet) renders the same empty row rather than
+    /// skipping it — so the composer's resting height never depends on
+    /// which kind of space is selected. Same idea as
+    /// [`Self::STATUS_STRIP_HEIGHT`], one level down.
+    pub const COMPOSER_FOOTER_HEIGHT: f32 = 20.0;
     /// Height of the gradient that fades the transcript into the panel
     /// background at its bottom edge. The transcript's last row must pad
     /// itself past this band so settled content (message text, the
@@ -1648,6 +1656,7 @@ mod tests {
     fn layout_numbers_match_comet() {
         assert_eq!(Theme::HEADER_HEIGHT, 44.0); // h-11
         assert_eq!(Theme::STATUS_STRIP_HEIGHT, 24.0); // h-6
+        assert_eq!(Theme::COMPOSER_FOOTER_HEIGHT, 20.0);
         assert_eq!(Theme::BUBBLE_RADIUS, 16.0);
     }
 }

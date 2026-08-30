@@ -2238,11 +2238,41 @@ impl Pickers {
             .child(div().min_w_0().truncate().child(label))
     }
 
+    /// Height the branch/worktree footer row reserves in the composer,
+    /// regardless of whether it has a git space's chips to show (D42). A
+    /// non-git space still occupies this — that's what keeps the composer's
+    /// resting height identical whether the selected space is git-detected
+    /// or not.
+    pub(crate) fn footer_reserved_height(_has_content: bool) -> f32 {
+        Theme::COMPOSER_FOOTER_HEIGHT
+    }
+
+    /// The footer row's fixed geometry (D42): built identically whether or
+    /// not there is a git space's content to put in it — an empty row for a
+    /// non-git space (or one that hasn't loaded yet), chips for a git one —
+    /// so the composer's resting height never depends on which kind of
+    /// space is selected. Symmetric spacing: the container's 8px gap sits
+    /// above the toolbar; bleeding 8 of the container's 16px bottom padding
+    /// (mb -8) leaves 8 below — equal air on both sides of the row.
+    fn footer_row(has_content: bool) -> gpui::Div {
+        div()
+            .h(px(Self::footer_reserved_height(has_content)))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .px(px(10.0))
+            .mb(px(-8.0))
+    }
+
     /// The composer footer row (t3code BranchToolbar): checkout-kind on the
-    /// left, the ref selector right-aligned. `None` for non-git spaces. On an
-    /// existing session both sides are read-only labels ("Worktree" /
+    /// left, the ref selector right-aligned. Reserved at a fixed height (see
+    /// [`Self::footer_row`]) whether or not there's a git space to fill it —
+    /// `Theme::STATUS_STRIP_HEIGHT` reserves the status strip the same way.
+    /// On an existing session both sides are read-only labels ("Worktree" /
     /// "Local checkout" + the chat's branch).
-    pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub fn render_footer(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         // A selected chat whose workspace row hasn't synced yet (the moment
         // right after send mints it) still renders the DRAFT footer — the
@@ -2250,33 +2280,26 @@ impl Pickers {
         // half-empty locked state.
         let (space, session) = {
             let state = self.state.read(cx);
-            let space = state.selected_space_row().cloned()?;
+            let space = state.selected_space_row().cloned();
             let session = state
                 .selected_chat
                 .as_ref()
                 .and_then(|_| state.selected_chat_row().cloned());
             (space, session)
         };
-        if !space.git_detected {
-            return None;
-        }
+        let space = space.filter(|space| space.git_detected);
+        let Some(space) = space else {
+            // No space yet, or a non-git one: the row still occupies its
+            // reserved height, just with nothing in it.
+            return Self::footer_row(false).into_any_element();
+        };
         let new_chat = session.is_none();
 
         // Refs feed both modes (draft labels, mid-session switch list) —
         // eager + idempotent.
         self.ensure_refs(false, cx);
 
-        // Symmetric: the container's 8px gap sits above the toolbar; bleeding
-        // 8 of the container's 16px bottom padding (mb -8) leaves 8 below —
-        // equal air on both sides of the row.
-        let row = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap(px(8.0))
-            .px(px(10.0))
-            .mb(px(-8.0));
+        let row = Self::footer_row(true);
 
         // The ref side is LIVE in both modes: draft pick on a new chat,
         // checkout switch on an existing session (t3code keeps its branch
@@ -2321,7 +2344,7 @@ impl Pickers {
                 (crate::icons::FOLDER, "Local checkout")
             };
             let left = Self::footer_label(icon_path, SharedString::from(label), &theme);
-            return Some(row.child(left).child(ref_side).into_any_element());
+            return row.child(left).child(ref_side).into_any_element();
         }
 
         let kind_icon = match (self.config.checkout, self.selected_ref_worktree().is_some()) {
@@ -2336,16 +2359,14 @@ impl Pickers {
             &theme,
             cx,
         );
-        Some(
-            row.child(attach_overlay(
-                kind_chip,
-                &mut overlay,
-                PickerKind::Checkout,
-                "checkout-popover",
-            ))
-            .child(ref_side)
-            .into_any_element(),
-        )
+        row.child(attach_overlay(
+            kind_chip,
+            &mut overlay,
+            PickerKind::Checkout,
+            "checkout-popover",
+        ))
+        .child(ref_side)
+        .into_any_element()
     }
 
     fn popover_frame(&self, width: f32, content: AnyElement, cx: &mut Context<Self>) -> AnyElement {
@@ -3956,6 +3977,21 @@ mod tests {
         // Untinted, so `theme.text` supplies xAI's black-on-light /
         // white-on-dark pair. A tint here would invent a brand colour.
         assert!(tint.is_none(), "the Grok mark must take the text colour");
+    }
+
+    /// D42: the composer's resting height must not depend on whether the
+    /// selected space is git-detected. Before the fix, a non-git space
+    /// skipped the footer row (and its surrounding gap/margin) entirely
+    /// while a git space's row occupied `Theme::COMPOSER_FOOTER_HEIGHT`, so
+    /// the two rested at different heights.
+    #[test]
+    fn footer_reserved_height_does_not_depend_on_content() {
+        assert_eq!(
+            Pickers::footer_reserved_height(true),
+            Pickers::footer_reserved_height(false),
+            "the composer's resting height must be the same whether the \
+             footer has content (a git space) or not (D42)"
+        );
     }
 
     /// Both failures reach the same empty label and they are not the same
