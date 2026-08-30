@@ -2238,15 +2238,6 @@ impl Pickers {
             .child(div().min_w_0().truncate().child(label))
     }
 
-    /// Height the branch/worktree footer row reserves in the composer,
-    /// regardless of whether it has a git space's chips to show (D42). A
-    /// non-git space still occupies this — that's what keeps the composer's
-    /// resting height identical whether the selected space is git-detected
-    /// or not.
-    pub(crate) fn footer_reserved_height(_has_content: bool) -> f32 {
-        Theme::COMPOSER_FOOTER_HEIGHT
-    }
-
     /// The footer row's fixed geometry (D42): built identically whether or
     /// not there is a git space's content to put in it — an empty row for a
     /// non-git space (or one that hasn't loaded yet), chips for a git one —
@@ -2254,9 +2245,13 @@ impl Pickers {
     /// space is selected. Symmetric spacing: the container's 8px gap sits
     /// above the toolbar; bleeding 8 of the container's 16px bottom padding
     /// (mb -8) leaves 8 below — equal air on both sides of the row.
-    fn footer_row(has_content: bool) -> gpui::Div {
+    /// Total reserved block, in both branches: 8 (the composer container's
+    /// gap) + 20 (`Theme::COMPOSER_FOOTER_HEIGHT`) + 8 (padding left after
+    /// the -8 margin eats into it) = 36px, matching what a git space has
+    /// always rendered.
+    fn footer_row() -> gpui::Div {
         div()
-            .h(px(Self::footer_reserved_height(has_content)))
+            .h(px(Theme::COMPOSER_FOOTER_HEIGHT))
             .flex()
             .flex_row()
             .items_center()
@@ -2291,7 +2286,7 @@ impl Pickers {
         let Some(space) = space else {
             // No space yet, or a non-git one: the row still occupies its
             // reserved height, just with nothing in it.
-            return Self::footer_row(false).into_any_element();
+            return Self::footer_row().into_any_element();
         };
         let new_chat = session.is_none();
 
@@ -2299,7 +2294,7 @@ impl Pickers {
         // eager + idempotent.
         self.ensure_refs(false, cx);
 
-        let row = Self::footer_row(true);
+        let row = Self::footer_row();
 
         // The ref side is LIVE in both modes: draft pick on a new chat,
         // checkout switch on an existing session (t3code keeps its branch
@@ -3977,21 +3972,6 @@ mod tests {
         // Untinted, so `theme.text` supplies xAI's black-on-light /
         // white-on-dark pair. A tint here would invent a brand colour.
         assert!(tint.is_none(), "the Grok mark must take the text colour");
-    }
-
-    /// D42: the composer's resting height must not depend on whether the
-    /// selected space is git-detected. Before the fix, a non-git space
-    /// skipped the footer row (and its surrounding gap/margin) entirely
-    /// while a git space's row occupied `Theme::COMPOSER_FOOTER_HEIGHT`, so
-    /// the two rested at different heights.
-    #[test]
-    fn footer_reserved_height_does_not_depend_on_content() {
-        assert_eq!(
-            Pickers::footer_reserved_height(true),
-            Pickers::footer_reserved_height(false),
-            "the composer's resting height must be the same whether the \
-             footer has content (a git space) or not (D42)"
-        );
     }
 
     /// Both failures reach the same empty label and they are not the same
