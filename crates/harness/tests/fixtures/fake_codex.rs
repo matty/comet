@@ -390,6 +390,19 @@ fn main() {
         wedge_with_child(&turn_line, &tid);
     } else if turn_line.contains("scenario:wedge") {
         wedge(&tid);
+    // D45: reusable lifecycle-fault primitives — see each function's own
+    // comment for which fault on docs/debt/D45-provider-lifecycle-fault-matrix.md
+    // it expresses.
+    } else if turn_line.contains("scenario:crash-mid-turn") {
+        crash_mid_turn(&tid);
+    } else if turn_line.contains("scenario:partial-frame") {
+        partial_frame_then_exit(&tid);
+    } else if turn_line.contains("scenario:die-after-approval") {
+        die_after_approval(&tid);
+    } else if turn_line.contains("scenario:duplicate-completion") {
+        duplicate_completion(&tid);
+    } else if turn_line.contains("scenario:late-completion-after-interrupt") {
+        late_completion_after_interrupt(&mut stdin, &tid);
     } else if turn_line.contains("scenario:fail") {
         fail(&tid);
     } else if turn_line.contains("scenario:resumed") {
@@ -796,6 +809,155 @@ fn wedge_with_child(turn_line: &str, tid: &str) {
     // Ignore turn/interrupt entirely, like `wedge` — forces the kill
     // escalation path.
     std::thread::sleep(Duration::from_secs(30));
+}
+
+/// D45 primitive: **stderr_then_exit, mid-turn.** `fake_codex_init_crash.rs`
+/// already proves the harness keeps a crash's stderr fully private when it
+/// happens during the handshake (`STARTUP_FAILURE_MESSAGE` is a canned
+/// sentence that never reads `stderr_tail` at all). Once a turn is active,
+/// `run_session`'s teardown takes a DIFFERENT arm — an unexpected exit calls
+/// `crate::crash_message`, which deliberately surfaces `describe_exit`'s exit
+/// code and a bounded `StderrTail` excerpt (`.agents/rules/user-facing-errors.md`'s
+/// "one cleaned line of a failing CLI's own stderr is deliberately kept").
+/// Nothing exercised that second call site before this.
+///
+/// The 100ms sleep after flushing stderr — and before actually exiting — is
+/// deliberate, not padding: the harness reads this process's stdout and
+/// stderr on two independent tasks, and closing stdout (by exiting) is what
+/// the main loop treats as terminal. Without the sleep, the process could
+/// exit and close stdout before the OTHER task has drained and stored the
+/// stderr line it just wrote, racing `stderr_tail`'s content against the
+/// `Eof` that reads it. Giving the stderr reader a bounded head start makes
+/// the fault deterministic instead of occasionally losing its own evidence.
+fn crash_mid_turn(tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"working"}}"#);
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "boom: fake codex crashed mid-turn");
+    let _ = stderr.flush();
+    drop(stderr);
+    std::thread::sleep(Duration::from_millis(100));
+    exit(66);
+}
+
+/// D45 primitive: **partial_line.** "stdout closes halfway through a frame":
+/// half a JSON object, no trailing newline, then exit. `BufReader::lines()`
+/// (`crates/harness/src/jsonrpc.rs`'s `read_loop`) still yields whatever was
+/// buffered as one final "line" once it hits EOF with no delimiter, so this
+/// proves that truncated tail becomes `Incoming::Malformed(NotJson)` —
+/// exactly one diagnostic — rather than being silently swallowed, and that
+/// the exit right behind it still produces a bounded, private `Done` through
+/// the same mid-turn crash arm `crash_mid_turn` above exercises.
+///
+/// The same settle delay as `crash_mid_turn`, for the same reason: give the
+/// reader a bounded head start on the half-frame before the pipe closes for
+/// real, rather than racing "is there more coming" against "the child died".
+fn partial_frame_then_exit(tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    let mut out = std::io::stdout();
+    let _ = write!(
+        out,
+        r#"{{"method":"item/agentMessage/delta","params":{{"itemId":"m1","delta":"cu"#
+    );
+    let _ = out.flush();
+    std::thread::sleep(Duration::from_millis(100));
+    exit(0);
+}
+
+/// D45 primitive: **stdin breaks while Comet writes a decision.** Raises a
+/// command-approval request, then exits immediately without ever reading a
+/// reply. `crates/harness/src/jsonrpc.rs` documents that a write to a dead
+/// child's stdin (EPIPE) is "tolerated and logged, matching the TS harness's
+/// swallowed-EPIPE behavior" — this is what actually drives that write onto a
+/// closed pipe instead of merely asserting the comment is true. Which side of
+/// the race the write lands on (before or after this process actually exits)
+/// is not pinned down — the OS may deliver either order — so what this proves
+/// is the invariant that has to hold either way: the run still ends in one
+/// bounded, non-panicking `Done`, never a hang.
+fn die_after_approval(tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(
+        r#"{"id":301,"method":"item/commandExecution/requestApproval","params":{"itemId":"c1","command":"echo hi"}}"#,
+    );
+    exit(0);
+}
+
+/// D45 primitive: **duplicate.** The same terminal notification twice for the
+/// same turn id, with an unrelated notification in between (also covering "a
+/// response ... arrives among unrelated notifications" from the same list).
+///
+/// This is NOT a test that the harness ignores the duplicate — it does not.
+/// `TurnRouter::note_completed` only tracks which ids are already finished;
+/// nothing in `run_session`'s `"turn/completed"` arm reads that fact before
+/// repeating its full send-Done sequence. The test this scenario drives
+/// documents that as-observed behavior (a second `Done` reaches the stream)
+/// rather than asserting the stronger "exactly one terminal outcome" D45's
+/// own page says the suite has no invariant for yet — closing that gap needs
+/// a change in `crates/harness/src/codex/mod.rs`, out of scope here.
+fn duplicate_completion(tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"done"}}"#);
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+    emit(
+        r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":10}}}}"#,
+    );
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+}
+
+/// D45 primitive: **late_reply, specifically "delayed until after
+/// cancellation".** Acknowledges `turn/interrupt` like `interrupt()` above,
+/// but then — instead of the expected `turn/aborted` — waits past the point
+/// the harness has already committed to `interrupted = true` and sends a
+/// plain `turn/completed`, as if the provider's own completion notification
+/// won its race with the abort. `run_session`'s `"turn/completed"` arm reads
+/// `interrupted` when it computes `status`, so the reply arriving late must
+/// still resolve to `DoneStatus::Interrupted`, not `Completed`.
+///
+/// The delay is bounded well inside the test's own `interrupt_grace`, so the
+/// kill escalation timer this races against never fires — this is the
+/// "arrives before escalation" side of the race, on purpose. Escalation
+/// firing anyway (a hard kill during a merely-slow-not-wedged process) is a
+/// different fault, already covered by `wedge`.
+///
+/// The delay itself turned out NOT to be what the assertion depends on:
+/// `interrupted` is set synchronously the moment the harness's own interrupt
+/// token fires, independent of anything this process does, so an immediate
+/// `turn/completed` right after `turn/interrupt`'s ack resolves to
+/// `Interrupted` just as reliably. What the test actually falsifies on is
+/// whether `interrupted` was ever true in the first place — see the driving
+/// test's own comment for how that was proven.
+fn late_completion_after_interrupt(stdin: &mut StdinLock<'_>, tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"working"}}"#);
+    let int_line = read_line(stdin);
+    let iid = rid(&int_line);
+    if !(int_line.contains(r#""method":"turn/interrupt""#)
+        && int_line.contains(r#""turnId":"t-1""#))
+    {
+        emit(&format!(r#"{{"id":{iid},"result":{{}}}}"#));
+        emit(
+            r#"{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"expected turn/interrupt"}}}}"#,
+        );
+        return;
+    }
+    emit(&format!(r#"{{"id":{iid},"result":{{}}}}"#));
+    std::thread::sleep(Duration::from_millis(100));
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
 }
 
 fn fail(tid: &str) {
