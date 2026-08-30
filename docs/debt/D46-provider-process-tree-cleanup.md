@@ -1,5 +1,7 @@
 # D46 — cancellation proves only the direct child is gone
 
+**Status: closed for the Claude and Codex adapters on both shipped platforms** ([PR #197](https://github.com/matty/comet/pull/197), 2026-08-30). The policy this page asked for was decided first and is stated in the row: reach the tree through an OS-native grouping established *at spawn* (a Unix process group signalled with `killpg`; a Windows Job Object with `KILL_ON_JOB_CLOSE`), never by scanning for processes afterwards — which is the hazard the last paragraph below warns about, and it stands. Two residuals: the Windows spawn-to-assign window is not atomic, and the ACP adapter still has no Job Object, which is now **D133**. Everything below is the original page, kept because it is the reasoning the fix was measured against.
+
 The Claude and Codex wedge fixtures have no descendants. Their tests prove that
 the fake executable is reaped, but a real provider owns longer-lived children:
 shells, command-safety helpers and MCP servers.
