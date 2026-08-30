@@ -181,9 +181,9 @@ fn normalize_run_request_with_context(mut request: RunRequest) -> NormalizedRunR
         // forced. On a full-access request the pair stays coherent by
         // coincidence; on any other mode it does not — the request now
         // runs with a danger-full-access sandbox under a mode that did
-        // not ask for one. Whoever next derives Codex's approval *policy*
-        // from `runtime_mode` still has to decide whether escalating the
-        // sandbox here should escalate the policy too.
+        // not ask for one. Approval policy and reviewer remain derived
+        // from `runtime_mode` at thread and turn start; only the sandbox
+        // is widened by this compatibility workaround.
         request.sandbox = comet_proto::SandboxLevel::DangerFullAccess;
     }
     NormalizedRunRequest {
