@@ -56,8 +56,8 @@ pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use unattended::{
-    DEFAULT_UNATTENDED_TIMEOUT_SECS, Presence, PresenceLease, WaitKind, due_for_expiry,
-    humanize_bound, sweep_interval, unattended_note, unattended_timeout_from_env,
+    DEFAULT_UNATTENDED_TIMEOUT_SECS, Presence, PresenceLease, UnattendedBound, WaitKind,
+    due_for_expiry, humanize_bound, sweep_interval, unattended_note, unattended_timeout_from_env,
 };
 pub use uploads::{AttachmentChunk, Uploads};
 pub use workspace_host::{WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig};
@@ -421,7 +421,7 @@ impl Engine {
         let sweeper = spawn_unattended_sweeper(
             core.sessions.clone(),
             core.presence(),
-            config.unattended_timeout,
+            UnattendedBound(config.unattended_timeout),
         );
 
         tracing::info!(device_id = %core.device_id, "engine core assembled");
@@ -483,7 +483,7 @@ async fn shutdown_signal() -> std::io::Result<()> {
 pub fn spawn_unattended_sweeper(
     sessions: SessionsEngine,
     presence: Arc<Presence>,
-    bound: std::time::Duration,
+    bound: UnattendedBound,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(sweep_interval(bound));
@@ -491,7 +491,7 @@ pub fn spawn_unattended_sweeper(
         loop {
             ticker.tick().await;
             sessions
-                .expire_unattended(&presence, chrono::Utc::now(), bound)
+                .expire_unattended(&presence, chrono::Utc::now(), bound.get())
                 .await;
         }
     })

@@ -1,5 +1,17 @@
 # D27 — the sweeper's production call site is untested
 
+**Half closed 2026-08-30: the transposition is now a type error.** This page's own
+"How to apply" recommended a newtype rather than a tighter test, and that is what landed —
+`UnattendedBound(Duration)` in `unattended.rs`, taken by `spawn_unattended_sweeper` and by
+`sweep_interval`, which still returns a plain `Duration`. Passing the cadence where the bound
+belongs no longer type-checks; verified by writing the transposition and watching the build
+fail at `lib.rs:424`. Nothing about the timing assertion this page rejected was needed.
+
+**The deletion half stands open, and the ruling below stands with it.** Nothing type-checks a
+call that is not there, and reaching it still needs `assemble_runtime` to accept an injected
+registry — a production signature widened for test reachability, which is the cost the ruling
+declined. Do not read the half-close as licence to reopen that one.
+
 **Controller ruling during 1.9's Task 5 review: do not reopen.** The gap is
 real, understood, and left open on purpose because closing it costs more than
 it buys — recorded here so a later reader doesn't reopen it expecting a quick
