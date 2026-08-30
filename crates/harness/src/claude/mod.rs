@@ -42,7 +42,7 @@ use comet_proto::{
     RunRequest, RuntimeMode, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
-use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
+use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 use catalog::{apply_ultrathink, static_models, to_effort};
 use normalize::Normalizer;
 use wire::{
@@ -373,6 +373,12 @@ impl Harness for ClaudeHarness {
         let mut child = cmd
             .spawn()
             .map_err(|error| crate::spawn_failure(&exe, &error))?;
+        // D46: as early as possible after spawn — see `ProcessTreeJob`'s own
+        // doc for why "as early as possible" and not "atomically" is the best
+        // this can do without `CREATE_SUSPENDED`. `Arc` because both the
+        // interrupt-escalation task below and the final `shutdown_child` need
+        // to reach it, and only one of them may own the eventual close.
+        let tree = Arc::new(crate::ProcessTreeJob::attach(&child));
 
         let stdin = child
             .stdin
@@ -413,6 +419,7 @@ impl Harness for ClaudeHarness {
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
             child,
+            tree,
             stdout_lines: BufReader::new(stdout).lines(),
             stdin_tx,
             event_tx,
@@ -537,6 +544,9 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Std
 
 struct Session {
     child: Child,
+    /// D46: the whole-provider-tree half of shutdown, alongside `send_signal`
+    /// — see `crate::ProcessTreeJob`.
+    tree: Arc<crate::ProcessTreeJob>,
     stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     stdin_tx: mpsc::UnboundedSender<StdinMsg>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
@@ -556,6 +566,7 @@ struct Session {
 async fn run_session(session: Session) {
     let Session {
         mut child,
+        tree,
         mut stdout_lines,
         stdin_tx,
         event_tx,
@@ -687,12 +698,16 @@ async fn run_session(session: Session) {
                 let _ = stdin_tx.send(StdinMsg::Line(wire::interrupt_request_line("int_1")));
                 // Escalate if the CLI doesn't wind down within the grace
                 // periods: SIGTERM (kills bash trees, runs SessionEnd hooks),
-                // then SIGKILL. Aborted once the child is reaped.
+                // then SIGKILL — plus the whole-tree kill (D46), which unix
+                // already gets through `send_signal`'s group-kill but Windows
+                // only gets through `tree`. Aborted once the child is reaped.
                 if let Some(pid) = child.id() {
+                    let tree = tree.clone();
                     escalation = Some(tokio::spawn(async move {
                         tokio::time::sleep(interrupt_grace).await;
                         send_signal(pid, Signal::Term);
                         tokio::time::sleep(kill_grace).await;
+                        tree.terminate();
                         send_signal(pid, Signal::Kill);
                     }));
                 }
@@ -728,25 +743,10 @@ async fn run_session(session: Session) {
     }
 
     shutdown_child(&mut child, kill_grace).await;
+    tree.terminate();
     if let Some(handle) = escalation {
         handle.abort();
     }
-}
-
-/// Reap the child: graceful SIGTERM first, SIGKILL after `kill_grace`.
-/// (`kill_on_drop` remains the last-resort backstop.)
-async fn shutdown_child(child: &mut Child, kill_grace: Duration) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
-    }
-    if let Some(pid) = child.id() {
-        send_signal(pid, Signal::Term);
-        if tokio::time::timeout(kill_grace, child.wait()).await.is_ok() {
-            return;
-        }
-    }
-    let _ = child.start_kill();
-    let _ = child.wait().await;
 }
 
 type RequestInputFn = Box<

@@ -524,6 +524,12 @@ impl Harness for CodexHarness {
         let mut child = cmd
             .spawn()
             .map_err(|error| crate::spawn_failure(&exe, &error))?;
+        // D46: as early as possible after spawn — see `ProcessTreeJob`'s own
+        // doc for why "as early as possible" and not "atomically" is the best
+        // this can do without `CREATE_SUSPENDED`. `Arc` because both the
+        // interrupt-escalation task below and the final `shutdown_child` need
+        // to reach it, and only one of them may own the eventual close.
+        let tree = Arc::new(crate::ProcessTreeJob::attach(&child));
 
         let stdin = child
             .stdin
@@ -549,6 +555,7 @@ impl Harness for CodexHarness {
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
             child,
+            tree,
             client,
             incoming,
             event_tx,
@@ -573,6 +580,9 @@ impl Harness for CodexHarness {
 
 struct Session {
     child: Child,
+    /// D46: the whole-provider-tree half of shutdown, alongside `send_signal`
+    /// — see `crate::ProcessTreeJob`.
+    tree: Arc<crate::ProcessTreeJob>,
     client: RpcClient,
     incoming: mpsc::Receiver<Incoming>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
@@ -664,6 +674,7 @@ async fn start_turn(client: &RpcClient, params: Value) -> Result<String, Harness
 async fn run_session(session: Session) {
     let Session {
         mut child,
+        tree,
         client,
         mut incoming,
         event_tx,
@@ -753,6 +764,7 @@ async fn run_session(session: Session) {
                     }))
                     .await;
                 shutdown_child(&mut child, kill_grace).await;
+                tree.terminate();
                 return;
             }
             Err(_) => {
@@ -772,6 +784,7 @@ async fn run_session(session: Session) {
                     }))
                     .await;
                 shutdown_child(&mut child, kill_grace).await;
+                tree.terminate();
                 return;
             }
         },
@@ -785,6 +798,7 @@ async fn run_session(session: Session) {
                 }))
                 .await;
             shutdown_child(&mut child, kill_grace).await;
+            tree.terminate();
             return;
         }
     };
@@ -805,6 +819,7 @@ async fn run_session(session: Session) {
     .await
     {
         shutdown_child(&mut child, kill_grace).await;
+        tree.terminate();
         return;
     }
 
@@ -826,6 +841,7 @@ async fn run_session(session: Session) {
                 }))
                 .await;
             shutdown_child(&mut child, kill_grace).await;
+            tree.terminate();
             return;
         }
     }
@@ -1222,12 +1238,17 @@ async fn run_session(session: Session) {
                         }
                     });
                     // Escalate if the app server doesn't wind down (turn/aborted)
-                    // within the grace periods: SIGTERM, then SIGKILL.
+                    // within the grace periods: SIGTERM, then SIGKILL — plus
+                    // the whole-tree kill (D46), which unix already gets
+                    // through `send_signal`'s group-kill but Windows only
+                    // gets through `tree`.
                     if let Some(pid) = child.id() {
+                        let tree = tree.clone();
                         escalation = Some(tokio::spawn(async move {
                             tokio::time::sleep(interrupt_grace).await;
                             send_signal(pid, Signal::Term);
                             tokio::time::sleep(kill_grace).await;
+                            tree.terminate();
                             send_signal(pid, Signal::Kill);
                         }));
                     }
@@ -1275,6 +1296,7 @@ async fn run_session(session: Session) {
     }
 
     shutdown_child(&mut child, kill_grace).await;
+    tree.terminate();
     if let Some(handle) = escalation {
         handle.abort();
     }

@@ -42,6 +42,35 @@ fn read_line(stdin: &mut StdinLock<'_>) -> String {
     }
 }
 
+/// D46: strip `HANDLE_FLAG_INHERIT` from this process's own stdio handles so
+/// a child THIS fixture spawns cannot silently inherit a duplicate of the
+/// pipe connecting it to the real test harness — see the call site in
+/// `wedge_with_child` for why that matters. Unix needs no equivalent:
+/// `dup2`-based stdio redirection (what every `Stdio::null()`/`piped()` child
+/// gets) overwrites fd 0/1/2 outright rather than leaving a spare inheritable
+/// copy sitting in the handle table the way Windows does.
+#[cfg(windows)]
+fn disable_stdio_inheritance() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+    for handle in [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        // SAFETY: clears one flag on a handle this process already owns and
+        // keeps using exactly as before; this only changes what a future
+        // child of ours can inherit.
+        unsafe {
+            SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn disable_stdio_inheritance() {}
+
 /// The request id: the last `"id":<digits>` on the line, mirroring the greedy
 /// sed the shell fixture used.
 fn rid(line: &str) -> String {
@@ -222,6 +251,15 @@ fn model_list(stdin: &mut StdinLock<'_>, first: &str) {
 }
 
 fn main() {
+    // D46: this fixture re-execs itself under this flag to play the
+    // "grandchild" role for `wedge_with_child` below — the same binary, so
+    // proving a leaked descendant needs no second `[[bin]]` target. It never
+    // touches stdio, so it cannot be mistaken for the real protocol child.
+    if std::env::args().any(|a| a == "--sleep-forever") {
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
     if std::env::var_os("CODEX_HOME").is_some() {
         fill_stderr();
     }
@@ -344,6 +382,12 @@ fn main() {
         || turn_line.contains("Count upward slowly and keep working until interrupted.")
     {
         interrupt(&mut stdin, &tid);
+    // D46: before the plain "scenario:wedge" check below — that check is a
+    // `.contains`, and "scenario:wedge-with-child" contains "scenario:wedge"
+    // as a substring, same ordering hazard `steer-race`/`steer` above solves
+    // the same way.
+    } else if turn_line.contains("scenario:wedge-with-child") {
+        wedge_with_child(&turn_line, &tid);
     } else if turn_line.contains("scenario:wedge") {
         wedge(&tid);
     } else if turn_line.contains("scenario:fail") {
@@ -682,6 +726,75 @@ fn wedge(tid: &str) {
     emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
     emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"working"}}"#);
     // Ignore turn/interrupt entirely — forces the kill escalation path.
+    std::thread::sleep(Duration::from_secs(30));
+}
+
+/// D46's fixture: `wedge`, plus a real OS grandchild recorded before the hang.
+///
+/// `wedge` alone only proves this fixture's own pid gets reaped — it has no
+/// descendants, so it cannot tell a real cleanup from a leak. This spawns one
+/// (this same binary, re-invoked with `--sleep-forever`, so no new fixture
+/// binary is needed) and records both this process's pid and the
+/// grandchild's to the file path carried in the turn's prompt text, so the
+/// test can check the grandchild's fate — not just this fixture's — once
+/// cancellation has run.
+///
+/// The prompt is parsed as JSON rather than substring-matched like the other
+/// scenario markers: the path after the marker can itself contain a `:` or a
+/// backslash on Windows, and this needs the exact string, not a lossy scan.
+fn wedge_with_child(turn_line: &str, tid: &str) {
+    const MARKER: &str = "scenario:wedge-with-child|";
+    let request: Value = match serde_json::from_str(turn_line) {
+        Ok(request) => request,
+        Err(_) => exit(1),
+    };
+    let text = match request["params"]["input"][0]["text"].as_str() {
+        Some(text) => text,
+        None => exit(1),
+    };
+    let path = match text.strip_prefix(MARKER) {
+        Some(path) => path,
+        None => exit(1),
+    };
+
+    // Windows only: `CreateProcess` inherits every *inheritable* handle open
+    // in this process once any stdio redirection makes it pass
+    // `bInheritHandles=TRUE` — not just the three handles named in
+    // `Stdio::null()` below. Left alone, the grandchild would pick up a
+    // duplicate of the pipe THIS fixture was handed to talk to the real
+    // harness, and that duplicate — sitting unused in a process that never
+    // exits — keeps the pipe from ever reaching EOF for the harness's
+    // reader, even after this fixture is killed. That is a real Windows
+    // hazard a careless provider subprocess could hit too, not just a test
+    // artifact; stripping it here keeps this test isolated to the one claim
+    // it means to prove (the grandchild itself outliving cancellation).
+    disable_stdio_inheritance();
+
+    let exe = std::env::current_exe().expect("current exe for grandchild re-exec");
+    let grandchild = std::process::Command::new(&exe)
+        .arg("--sleep-forever")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn grandchild");
+    std::fs::write(
+        path,
+        format!("{}\n{}\n", std::process::id(), grandchild.id()),
+    )
+    .expect("record parent/grandchild pids");
+    // Deliberately not waited on: an orphaned, still-running grandchild is
+    // exactly the shape a real provider's shell or MCP-server child takes
+    // when this fixture (its immediate parent) is torn down.
+    drop(grandchild);
+
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"working"}}"#);
+    // Ignore turn/interrupt entirely, like `wedge` — forces the kill
+    // escalation path.
     std::thread::sleep(Duration::from_secs(30));
 }
 
