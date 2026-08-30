@@ -2712,7 +2712,13 @@ impl Shell {
             Ok(engine) => engine,
             Err(err) => {
                 if let Some(flow) = self.add_space.as_mut() {
-                    flow.error = Some(format!("{err}").into());
+                    flow.error = Some(
+                        crate::errors::mutation_failure(
+                            crate::errors::Mutating::OwnerReachable,
+                            &err,
+                        )
+                        .into(),
+                    );
                 }
                 cx.notify();
                 return;
@@ -2814,7 +2820,13 @@ impl Shell {
                         });
                         if let Some(flow) = shell.add_space.as_mut() {
                             flow.submit_busy = false;
-                            flow.error = Some(format!("{err}").into());
+                            flow.error = Some(
+                                crate::errors::mutation_failure(
+                                    crate::errors::Mutating::Space,
+                                    &err,
+                                )
+                                .into(),
+                            );
                         }
                     }
                 }

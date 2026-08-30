@@ -171,6 +171,102 @@ pub fn approval_failure(err: &RpcError) -> String {
     }
 }
 
+/// What the user just tried to change. Same shape as [`Loading`], and for the
+/// same reason: copy comes from the caller's context plus the error VARIANT,
+/// never from the error's message.
+///
+/// D4's inventory called this thirteen sites rendering `format!("{err}")`;
+/// measured on 2026-08-30 it was eleven — seven bare and four behind a
+/// hand-written prefix like `"Stop failed: {err}"`, which the inventory's own
+/// grep shape would have missed. The count is corrected where it was recorded
+/// rather than repeated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mutating {
+    /// The sidebar's generic `Mutate` op — rename, archive, delete, reorder.
+    /// Deliberately unnamed: one call site carries every op and does not know
+    /// which one it is queueing.
+    Document,
+    /// Resolving the client for the server that owns the target, before any
+    /// mutation is sent.
+    OwnerReachable,
+    Space,
+    Account,
+    LoginCode,
+    Stop,
+    Answer,
+    DeviceName,
+    Unarchive,
+}
+
+impl Mutating {
+    /// What the user sees when the engine is unreachable or mismatched — the
+    /// two arms where the remedy is about Comet rather than the action.
+    fn summary(self) -> &'static str {
+        match self {
+            Self::Document => "That change didn't go through",
+            Self::OwnerReachable => "Couldn't reach that machine",
+            Self::Space => "Couldn't add the space",
+            Self::Account => "Nothing changed",
+            Self::LoginCode => "Couldn't finish signing in",
+            Self::Stop => "Couldn't stop the run",
+            Self::Answer => "Couldn't send your answer",
+            Self::DeviceName => "Couldn't rename the device",
+            Self::Unarchive => "Couldn't unarchive that session",
+        }
+    }
+
+    /// What the user sees when the engine ANSWERED and refused. This is where
+    /// the actions genuinely differ, which is why they are one enum and not one
+    /// generic sentence: "try again" is wrong advice for half of them.
+    fn refused(self) -> &'static str {
+        match self {
+            Self::Document => "That change didn't go through.",
+            Self::OwnerReachable => {
+                "That machine isn't connected right now. Reconnect it, then try again."
+            }
+            Self::Space => {
+                "Couldn't add the space. Check the folder still exists and Comet can read it."
+            }
+            Self::Account => "Nothing changed. The agent's CLI may need signing in again.",
+            Self::LoginCode => {
+                "That code wasn't accepted. Check you copied all of it, or start the sign-in again."
+            }
+            Self::Stop => "Couldn't stop the run. It may have already finished.",
+            Self::Answer => "Couldn't send your answer. The run may have moved on without it.",
+            Self::DeviceName => "Couldn't rename the device.",
+            Self::Unarchive => "Couldn't unarchive that session.",
+        }
+    }
+}
+
+/// User-facing copy for a failed mutation, and the raw error into the log.
+///
+/// The mutation half of [`load_failure`], and the last of D4's sites. A load
+/// renders beside a Retry control that supplies the action; a mutation usually
+/// does not, which is why [`Mutating::refused`] names a remedy per action
+/// instead of one shared sentence.
+pub fn mutation_failure(what: Mutating, err: &RpcError) -> String {
+    tracing::warn!(error = %err, action = ?what, "mutation failed");
+    match err {
+        RpcError::Closed | RpcError::Transport(_) => {
+            format!("{} — Comet's engine isn't responding.", what.summary())
+        }
+        // `concat!` rather than a backslash-continued literal: rustfmt rejoins
+        // those and the continuation indentation becomes a run of real spaces
+        // inside the sentence. Invisible in the source, and caught here by
+        // `no_mutation_copy_leaks_the_error_it_came_from`'s own check — which
+        // is the fourth time that trap has appeared in this codebase.
+        RpcError::UnknownMethod(_) | RpcError::BadParams(_) => format!(
+            concat!(
+                "{} — this copy of Comet doesn't match its engine. Restart Comet, and update ",
+                "the paired machine if you're connected to one.",
+            ),
+            what.summary()
+        ),
+        RpcError::Failed(_) => what.refused().to_string(),
+    }
+}
+
 /// A reply that arrived but would not decode.
 ///
 /// Same cause as [`RpcError::BadParams`] — this build and the engine disagree
@@ -182,6 +278,73 @@ pub fn decode_failure(what: Loading, err: &serde_json::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Break caught (D4): eleven mutation sites rendered `format!("{err}")`, so
+    /// `RpcError`'s Display reached the screen — including `BadParams`, which
+    /// wraps a serde message. Every `Mutating` arm is checked, not a sample:
+    /// the enum exists so each action can name its own remedy, and an arm
+    /// nobody wrote copy for would otherwise pass by inheriting a neighbour's.
+    #[test]
+    fn no_mutation_copy_leaks_the_error_it_came_from() {
+        let leaky = "bad params: missing field `capabilities` at line 1 column 87";
+        for what in [
+            Mutating::Document,
+            Mutating::OwnerReachable,
+            Mutating::Space,
+            Mutating::Account,
+            Mutating::LoginCode,
+            Mutating::Stop,
+            Mutating::Answer,
+            Mutating::DeviceName,
+            Mutating::Unarchive,
+        ] {
+            for err in [
+                RpcError::Closed,
+                RpcError::Transport(leaky.into()),
+                RpcError::BadParams(leaky.into()),
+                RpcError::UnknownMethod(leaky.into()),
+                RpcError::Failed(leaky.into()),
+            ] {
+                let copy = mutation_failure(what, &err);
+                for leak in ["capabilities", "bad params", "column 87", "RpcError"] {
+                    assert!(
+                        !copy.contains(leak),
+                        "{what:?} leaked {leak:?} into: {copy}"
+                    );
+                }
+                assert!(
+                    copy.ends_with('.'),
+                    "{what:?} must read as a sentence: {copy}"
+                );
+                assert!(
+                    !copy.contains("  "),
+                    "{what:?} carries a continuation run: {copy}"
+                );
+            }
+        }
+    }
+
+    /// The reason `Mutating` is an enum rather than one generic sentence: when
+    /// the engine ANSWERED and refused, "try again" is wrong advice for half of
+    /// these, so the arms must not collapse to the same string.
+    #[test]
+    fn a_refused_mutation_says_something_different_per_action() {
+        let refused: std::collections::BTreeSet<String> = [
+            Mutating::Space,
+            Mutating::Account,
+            Mutating::LoginCode,
+            Mutating::Stop,
+            Mutating::Answer,
+        ]
+        .into_iter()
+        .map(|what| mutation_failure(what, &RpcError::Failed("store: nope".into())))
+        .collect();
+        assert_eq!(
+            refused.len(),
+            5,
+            "each action's refusal has to name its own remedy: {refused:?}"
+        );
+    }
     use super::*;
 
     /// The startup gate is the whole screen when it shows, and it used to show

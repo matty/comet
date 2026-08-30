@@ -144,15 +144,16 @@ from the fact of an error, it has to know which kind it has.
   blanket timeout breaks legitimately slow calls (a large `git diff`, a cold
   repo scan), so the candidates are a per-method budget or a "still working —
   cancel?" state that never hard-fails.
-- **Mutations still render raw errors.** Rule 1 holds for loads and not for the
-  rest: `format!("{err}")` on an `RpcError` reaches the user from
-  `settings/accounts.rs` (switch/forget, login start, poll),
-  `shell/spaces.rs` (space create, delete), `shell.rs` (sidebar notices),
-  `composer.rs` (stop, answer), `settings/devices.rs` (rename) and
-  `settings/archived.rs` (unarchive) — thirteen sites. `errors.rs` is where the
-  copy goes; each needs its own context the way `switch_failure` and
-  `session_move_failure` did, because "try again" is wrong advice for some of
-  them.
+- ~~**Mutations still render raw errors.**~~ Closed 2026-08-30 (D4). `errors.rs`
+  has a `Mutating` enum beside `Loading`, and `mutation_failure` serves every
+  site: `settings/accounts.rs`, `shell/spaces.rs`, `shell.rs`, `composer.rs`,
+  `settings/devices.rs`, `settings/archived.rs`. Each action names its own
+  refusal, because "try again" is wrong advice for half of them — the enum
+  exists for that, and a test asserts the arms do not collapse to one string.
+  **The count was wrong**: thirteen was recorded, eleven was measured — seven
+  bare `format!("{err}")` and four behind a hand-written prefix
+  (`"Stop failed: {err}"`), which the shape the inventory grepped for would
+  have missed.
 
 - **The harness side is the other half, and it is not `RpcError`.** A
   `HarnessError` reaches the user through `drive_run`'s sink in

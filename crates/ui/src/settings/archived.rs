@@ -57,7 +57,10 @@ impl ArchivedPage {
             this.update(cx, |page, cx| {
                 page.busy = None;
                 if let Err(err) = result {
-                    page.error = Some(format!("Unarchive failed: {err}").into());
+                    page.error = Some(
+                        crate::errors::mutation_failure(crate::errors::Mutating::Unarchive, &err)
+                            .into(),
+                    );
                 }
                 cx.notify();
             })
