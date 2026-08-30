@@ -370,13 +370,9 @@ impl Harness for ClaudeHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = build_run_command(&exe, &request);
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(exe.display().to_string())
-            } else {
-                HarnessError::Io(e)
-            }
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|error| crate::spawn_failure(&exe, &error))?;
 
         let stdin = child
             .stdin

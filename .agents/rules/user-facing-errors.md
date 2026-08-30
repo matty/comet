@@ -162,7 +162,10 @@ from the fact of an error, it has to know which kind it has.
   ("go do one more thing in the agent's own CLI") and `SettingRefused` ("pick
   something else in the picker"). `acp::session`'s `setting_refused` is the
   worked example, keyed on Comet's own method string rather than on anything
-  the agent wrote. The version probe's `hint` was the other raw site here and
+  the agent wrote. `spawn_failure` (D130) is the second: a run spawn that fails
+  for anything but `NotFound` used to become `HarnessError::Io`, whose Display
+  is `io: {0}`, so `io: Access is denied. (os error 5)` reached the pane. Both
+  read a KIND rather than an error's Display, which is the shape to copy. The version probe's `hint` was the other raw site here and
   is closed (D100): it reads `io::ErrorKind` rather than the error's Display,
   so no OS error code reaches the pane. **One cleaned line of a failing CLI's
   own stderr is deliberately kept** — `readable_detail` trims it, strips
