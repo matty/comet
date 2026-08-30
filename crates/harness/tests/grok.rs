@@ -7,7 +7,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use comet_doc::{MessagePart, fold_event_into_parts};
 use comet_harness::acp::grok::GrokHarness;
+use comet_harness::acp::hermes::HermesHarness;
 use comet_harness::acp::session::Timeouts;
 use comet_harness::{CancellationToken, Harness, RunControls};
 use comet_proto::{AgentEvent, CatalogSource, HarnessId, ReasoningLevel, RunRequest, RuntimeMode};
@@ -39,6 +41,107 @@ fn against_fixture() -> GrokHarness {
 /// A path that resolves (so the override is honored) but cannot be spawned.
 fn missing_binary() -> PathBuf {
     std::env::temp_dir().join("comet-grok-does-not-exist")
+}
+
+fn controls() -> RunControls {
+    let (_steer_tx, steer_rx) = mpsc::channel(1);
+    RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        request_approval: Box::new(|_| oneshot::channel().1),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+    }
+}
+
+async fn events_for(harness: impl Harness, cwd: String, prompt: &str) -> Vec<AgentEvent> {
+    let mut stream = harness
+        .run(
+            RunRequest {
+                prompt: prompt.into(),
+                cwd,
+                ..RunRequest::for_session(RuntimeMode::default())
+            },
+            controls(),
+        )
+        .await
+        .expect("the fixture starts");
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(event) = stream.next().await {
+            let event = event.expect("no transport error");
+            let settled = matches!(event, AgentEvent::Done { .. });
+            events.push(event);
+            if settled {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the turn settles rather than hanging");
+    events
+}
+
+#[tokio::test]
+async fn grok_announcements_reach_the_transcript_and_collapse_by_id() {
+    let cwd = std::env::temp_dir().join("comet-grok-announcement-notices");
+    std::fs::create_dir_all(&cwd).expect("disposable cwd");
+
+    let events = events_for(
+        against_fixture(),
+        cwd.to_string_lossy().into_owned(),
+        "announcement-notices",
+    )
+    .await;
+    let notice_indices: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| matches!(event, AgentEvent::Notice { .. }).then_some(index))
+        .collect();
+    assert_eq!(
+        notice_indices.len(),
+        2,
+        "the fixture sends two occurrences: {events:#?}"
+    );
+    let first_text = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::TextDelta { .. }))
+        .expect("the fixture streamed its normal response");
+    assert!(notice_indices.iter().all(|&index| index < first_text));
+
+    let mut parts = Vec::new();
+    for event in events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::Notice { .. }))
+    {
+        fold_event_into_parts(&mut parts, event);
+    }
+    assert!(matches!(
+        parts.as_slice(),
+        [MessagePart::Notice { occurrences: 2, key: Some(key), .. }]
+            if key == "grok-announcement:fixture-release"
+    ));
+}
+
+#[tokio::test]
+async fn a_no_handler_acp_harness_keeps_grok_announcements_inert() {
+    let cwd = std::env::temp_dir().join("comet-hermes-announcement-notices");
+    std::fs::create_dir_all(&cwd).expect("disposable cwd");
+    let harness = HermesHarness::new()
+        .with_executable(env!("CARGO_BIN_EXE_fake-acp"))
+        .with_timeouts(TEST_TIMEOUTS);
+
+    let events = events_for(
+        harness,
+        cwd.to_string_lossy().into_owned(),
+        "announcement-notices",
+    )
+    .await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Notice { .. })),
+        "a harness that injects no notification callback must ignore the vendor push: {events:#?}"
+    );
 }
 
 #[tokio::test]

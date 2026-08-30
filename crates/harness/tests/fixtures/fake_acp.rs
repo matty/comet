@@ -577,6 +577,24 @@ fn handle_prompt(
         return None;
     }
 
+    if text.contains("announcement-notices") {
+        for (method, message) in [
+            ("_x.ai/settings/update", "First fixture announcement"),
+            ("_x.ai/announcements/update", "Updated fixture announcement"),
+        ] {
+            emit(&json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": {"announcements": [{
+                    "id": "fixture-release",
+                    "title": "Fixture release",
+                    "message": message,
+                    "severity": "warning",
+                }]},
+            }));
+        }
+    }
+
     if text.contains("echo-selection") {
         // **What was actually received, not what was decoded.** Everything
         // here was set by a REAL `session/set_model` / `session/set_config_

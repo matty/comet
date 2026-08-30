@@ -1339,6 +1339,7 @@ dependencies = [
  "async-trait",
  "base64",
  "comet-capture",
+ "comet-doc",
  "comet-proto",
  "futures",
  "libc",

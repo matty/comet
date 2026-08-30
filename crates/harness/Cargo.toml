@@ -38,6 +38,7 @@ tempfile.workspace = true
 # tests/fixtures/fake_claude.rs cannot `use comet_capture` and reads its one
 # frame through a local copy of the convention instead. See that file.
 comet-capture.workspace = true
+comet-doc.workspace = true
 
 # Scripted fake CLIs for the adapter integration suites, spawned through
 # `CARGO_BIN_EXE_*`. Rust rather than shell scripts so they are spawnable on
