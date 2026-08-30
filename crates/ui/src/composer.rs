@@ -5152,8 +5152,10 @@ impl Composer {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
-                    composer.failure =
-                        Some((format!("Stop failed: {err}").into(), NoticeTone::Failure));
+                    composer.failure = Some((
+                        crate::errors::mutation_failure(crate::errors::Mutating::Stop, &err).into(),
+                        NoticeTone::Failure,
+                    ));
                     cx.notify();
                 })
                 .ok();
@@ -5255,8 +5257,11 @@ impl Composer {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
-                    composer.failure =
-                        Some((format!("Answer failed: {err}").into(), NoticeTone::Failure));
+                    composer.failure = Some((
+                        crate::errors::mutation_failure(crate::errors::Mutating::Answer, &err)
+                            .into(),
+                        NoticeTone::Failure,
+                    ));
                     // The answer never left this device — put the panel back.
                     composer.answered_requests.remove(&request_id);
                     cx.notify();

@@ -111,7 +111,10 @@ impl DevicesPage {
             let result = engine.client().call(methods::MUTATE, params).await;
             this.update(cx, |page, cx| {
                 if let Err(err) = result {
-                    page.error = Some(format!("Rename failed: {err}").into());
+                    page.error = Some(
+                        crate::errors::mutation_failure(crate::errors::Mutating::DeviceName, &err)
+                            .into(),
+                    );
                 }
                 cx.notify();
             })

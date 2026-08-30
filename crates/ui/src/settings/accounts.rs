@@ -845,7 +845,12 @@ impl AccountsPage {
                 page.busy_account = None;
                 match result {
                     Ok(_) => page.load(force_usage_for(LoadTrigger::PostAction), cx),
-                    Err(err) => page.error = Some(format!("{err}").into()),
+                    Err(err) => {
+                        page.error = Some(
+                            crate::errors::mutation_failure(crate::errors::Mutating::Account, &err)
+                                .into(),
+                        )
+                    }
                 }
                 cx.notify();
             })
@@ -946,7 +951,13 @@ impl AccountsPage {
                         }) = &mut page.login
                         {
                             *submitting = false;
-                            *error = Some(format!("{err}").into());
+                            *error = Some(
+                                crate::errors::mutation_failure(
+                                    crate::errors::Mutating::LoginCode,
+                                    &err,
+                                )
+                                .into(),
+                            );
                         }
                     }
                 }

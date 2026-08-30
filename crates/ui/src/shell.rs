@@ -1826,7 +1826,10 @@ impl Shell {
         self.mutate_task = Some(cx.spawn(async move |this, cx| {
             if let Err(err) = engine.client().call(methods::MUTATE, params).await {
                 this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(format!("{err}").into());
+                    shell.sidebar_notice = Some(
+                        crate::errors::mutation_failure(crate::errors::Mutating::Document, &err)
+                            .into(),
+                    );
                     cx.notify();
                 })
                 .ok();
@@ -1846,7 +1849,10 @@ impl Shell {
         let engine = match self.state.read(cx).mutation_client_for(&owner) {
             Ok(engine) => engine,
             Err(err) => {
-                self.sidebar_notice = Some(format!("{err}").into());
+                self.sidebar_notice = Some(
+                    crate::errors::mutation_failure(crate::errors::Mutating::OwnerReachable, &err)
+                        .into(),
+                );
                 cx.notify();
                 return;
             }
@@ -1854,7 +1860,10 @@ impl Shell {
         self.mutate_task = Some(cx.spawn(async move |this, cx| {
             if let Err(err) = engine.client().call(methods::MUTATE, params).await {
                 this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(format!("{err}").into());
+                    shell.sidebar_notice = Some(
+                        crate::errors::mutation_failure(crate::errors::Mutating::Document, &err)
+                            .into(),
+                    );
                     cx.notify();
                 })
                 .ok();
