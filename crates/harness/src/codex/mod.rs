@@ -196,7 +196,7 @@ fn normalize_run_request_with_context(mut request: RunRequest) -> NormalizedRunR
 pub fn thread_start_params(request: &RunRequest) -> Value {
     // Approval policy is derived, not pinned. ApprovalRequired intentionally
     // maps to `untrusted`; AutoAcceptEdits and Auto map to `on-request` now
-    // that provider approvals reach Comet's approval surface (D13).
+    // that provider approvals reach Comet's approval surface.
     let mut params = serde_json::Map::new();
     params.insert("cwd".into(), request.cwd.clone().into());
     params.insert(
@@ -846,7 +846,7 @@ async fn run_session(session: Session) {
                 severity: NoticeSeverity::Warning,
                 summary: "Sandbox access widened".into(),
                 detail: Some(
-                    "Use a branch name without a slash to keep workspace-only write access.".into(),
+                    "This run can write anywhere on this machine, outside the workspace. Use a branch name without a slash to keep workspace-only write access.".into(),
                 ),
                 key: Some("codex-sandbox-escalated".into()),
             },

@@ -73,13 +73,15 @@ it, so a user who selected workspace-only access could not see the wider access.
 
 **The fix.** Normalization retains whether it widened the sandbox and the run
 emits exactly one warning immediately after `SessionStarted`. The notice is
-Comet-authored, avoids the local path and provider internals, and tells the user
-that naming the branch without a slash avoids the workaround. The original
-runtime mode and approval policy remain untouched. The linked-worktree
-integration test proves the event order and exact-once behavior. The existing
-filesystem test keeps main checkouts, plain branch names and unreadable metadata
-outside the condition; the `WorkspaceWrite` comparison keeps every other
-requested sandbox unchanged.
+Comet-authored, avoids the local path and provider internals, explicitly says
+the run can write anywhere on the machine outside the workspace, and tells the
+user that naming the branch without a slash avoids the workaround. The original
+runtime mode and approval policy remain untouched. A real linked-worktree
+integration test proves the event order, exact-once behavior, widened sandbox,
+and preserved policy. Its companion test keeps main checkouts, non-worktree
+directories, plain branch names, and other requested sandboxes outside the
+condition. Unreadable worktree metadata remains fail-closed in the predicate;
+it is not claimed as portable permission-test coverage.
 
 ## D60 — the scenario name lived in three unsynchronized places
 
