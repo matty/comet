@@ -670,6 +670,14 @@ async fn connect(mut command: Command, timeouts: Timeouts) -> Result<Connected, 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // D133/D46: unlike the Windows Job Object below, this MUST be set before
+    // `spawn` — a process group is a spawn-time property, not something
+    // assignable afterward the way `AssignProcessToJobObject` is. Established
+    // here, at the one spawn site every ACP caller shares, rather than relied
+    // upon from whichever `LaunchDescriptor`-routed caller built `command` —
+    // see `crate::launch::own_process_group`'s own doc for why that
+    // reliance was the actual gap CI caught, not `LaunchDescriptor` itself.
+    crate::launch::own_process_group(&mut command);
     let program = command
         .as_std()
         .get_program()
