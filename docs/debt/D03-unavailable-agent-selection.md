@@ -24,5 +24,18 @@ only way out is install-or-override — which the post-send error already names.
 So this is signal *timing*, not a dead end. Worth a composer hint if it ever
 bites someone; not worth scheduling.
 
+## Closed 2026-08-30
+
+The composer now reads the same landed availability state as the agent picker.
+When an existing chat is locked to an unavailable agent, a passive warning
+appears above the prompt before the user sends. It preserves the session lock
+and the send path, and reuses the probe's short summary and actionable hint so
+the pre-send and picker guidance cannot drift.
+
+`Unknown` remains silent: an unfinished probe is not evidence that the agent
+cannot run. New chats, available agents, missing descriptors, and catalogs that
+have not loaded also render no warning. The original correction still stands —
+the selection was never the defect; only the timing of the signal changed.
+
 (The post-send behaviour is read from the module contract and the error copy,
 not from a rendered run. Confirm by rendering before acting on it.)

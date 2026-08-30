@@ -6145,6 +6145,49 @@ impl Render for Composer {
             return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
         }
 
+        // Existing chats cannot switch agents, so a completed availability
+        // failure is useful only as an early install/update signal. Reuse the
+        // catalog's own copy; the send path remains live and retains its normal
+        // failure as the final guard.
+        let locked_harness_notice = self.pickers.read(cx).locked_harness_notice(cx);
+        let locked_harness_notice = locked_harness_notice.map(|notice| {
+            let amber = theme.warning;
+            let text = theme.warning_muted.opacity(0.9);
+            div()
+                .id("composer-agent-unavailable")
+                .mx(px(4.0))
+                .flex()
+                .items_start()
+                .gap(px(8.0))
+                .rounded(px(12.0))
+                .border_1()
+                .border_color(amber.opacity(0.16))
+                .bg(amber.opacity(0.05))
+                .px(px(12.0))
+                .py(px(8.0))
+                .text_size(px(12.0))
+                .line_height(px(16.0))
+                .text_color(text)
+                .child(
+                    crate::icons::icon(crate::icons::DANGER_TRIANGLE)
+                        .size(px(14.0))
+                        .mt(px(2.0))
+                        .text_color(text),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .child(notice.summary),
+                        )
+                        .when_some(notice.hint, |el, hint| el.child(div().child(hint))),
+                )
+        });
+
         // New chats always use the expanded layout: the repo/branch pickers
         // need the full-width actions row (comet composer-actions.tsx
         // `mustExpand = isNew || …`).
@@ -6389,7 +6432,9 @@ impl Render for Composer {
         // The file dropzone lives in the shell (the whole conversation column,
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.
-        let container = container.child(motion::fade_quick("composer-input", body));
+        let container = container
+            .children(locked_harness_notice)
+            .child(motion::fade_quick("composer-input", body));
         // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
         // labels once the session exists. Reserved at a fixed height even
