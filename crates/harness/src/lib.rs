@@ -1056,17 +1056,26 @@ pub(crate) enum Signal {
     Kill,
 }
 
-/// Signal a child by pid. Safe against pid reuse only while the caller still
-/// holds the unreaped `Child` — every call site does.
+/// Signal a child by pid — or rather, by the process GROUP `launch::LaunchDescriptor::command`
+/// places it in (D46). A negative pid is `kill(2)`'s "whole group" form, and
+/// the group id equals the child's own pid because that command sets
+/// `process_group(0)`. A real provider CLI owns longer-lived children of its
+/// own — shells, command-safety helpers, MCP servers — that inherit this same
+/// group unless they call `setsid`/`setpgid` themselves; those are reached
+/// too, which is the point. Safe against pid reuse only while the caller
+/// still holds the unreaped `Child` — every call site does — and reaches only
+/// this group, never a process that left it or one that coincidentally
+/// shares the numeric id on a different group.
 #[cfg(unix)]
 pub(crate) fn send_signal(pid: u32, signal: Signal) {
     let sig = match signal {
         Signal::Term => libc::SIGTERM,
         Signal::Kill => libc::SIGKILL,
     };
-    // SAFETY: plain kill(2) on a pid we spawned and have not yet reaped.
+    // SAFETY: plain kill(2) on a process group we created for a pid we
+    // spawned and have not yet reaped.
     unsafe {
-        libc::kill(pid as libc::pid_t, sig);
+        libc::kill(-(pid as libc::pid_t), sig);
     }
 }
 
@@ -1075,8 +1084,11 @@ pub(crate) fn send_signal(pid: u32, signal: Signal) {
 /// inert off unix: an unresponsive CLI was never reaped, and the run loop —
 /// which only ends on stdout EOF — hung until the child chose to exit.
 ///
-/// Only the process itself dies, not the tree it spawned; that is the same
-/// caveat `start_kill`/`kill_on_drop` already carry.
+/// Only the process itself dies here, not the tree it spawned — same caveat
+/// `start_kill`/`kill_on_drop` carry. Reaching the tree on Windows is
+/// `ProcessTreeJob`'s job (D46): unlike unix there is no "signal this whole
+/// group" primitive, so that half of the fix is a Job Object established at
+/// spawn instead of anything `send_signal` can do with just a pid.
 #[cfg(windows)]
 pub(crate) fn send_signal(pid: u32, signal: Signal) {
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -1101,13 +1113,150 @@ pub(crate) fn send_signal(_pid: u32, _signal: Signal) {
     // `start_kill`/`kill_on_drop` are the only lever on other platforms.
 }
 
+/// D46's Windows half of "reach the whole provider-owned tree, not just the
+/// pid we spawned".
+///
+/// Unix gets there through `send_signal` alone, because a POSIX process
+/// group is nothing more than a number every descendant already carries
+/// unless it opts out (`setsid`/`setpgid`) — `killpg` needs no handle kept
+/// alive between spawn and shutdown. Windows has no such number: the only
+/// way to reach a tree is a kernel object created at spawn and held onto
+/// until shutdown, which is what this type is for.
+///
+/// **Deliberately scoped, not swept.** This kills only processes assigned to
+/// the one job created for this one child — never a system-wide scan by
+/// name, parent pid, or cwd, which is exactly the "reaches a process the
+/// provider did not create" hazard `docs/debt/D46-provider-process-tree-cleanup.md`
+/// warns about. A process the child launches with `CREATE_BREAKAWAY_FROM_JOB`
+/// (when the job's own policy allows it, which this one does not request) is
+/// not reached — that process asked to leave, the same way a unix child
+/// calling `setsid` again leaves the group `send_signal` targets.
+///
+/// **Best-effort by construction.** Job creation, `SetInformationJobObject`,
+/// or `AssignProcessToJobObject` can each fail (a denied nesting policy, a
+/// handle-table limit, …), and none of that may fail the run — a failed
+/// attach just falls back to the pre-existing direct-pid-only behavior via
+/// `send_signal`. There is also an inherent race: a grandchild the child
+/// forks before `attach` completes (called immediately after `spawn`, but not
+/// atomically with it — Windows offers no `CREATE_SUSPENDED` plumbing through
+/// `tokio::process`) is never assigned to the job. Accepting that race is the
+/// documented tradeoff of this pattern without `CREATE_SUSPENDED`, not an
+/// oversight; closing it fully would mean spawning suspended and resuming by
+/// hand, which is a materially bigger and riskier change than this row asks
+/// for.
+#[cfg(windows)]
+pub(crate) struct ProcessTreeJob(Option<windows_sys::Win32::Foundation::HANDLE>);
+
+#[cfg(windows)]
+impl ProcessTreeJob {
+    /// Create a job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and assign
+    /// `child` to it. Call this as soon as possible after `spawn` — see the
+    /// race note on the type itself.
+    pub(crate) fn attach(child: &tokio::process::Child) -> Self {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        let Some(process_handle) = child.raw_handle() else {
+            return Self(None);
+        };
+        // SAFETY: `CreateJobObjectW(null, null)` creates an unnamed job with
+        // no security attributes, a documented plain use of the API; the
+        // handle is closed on every path that does not store it in `Self`.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return Self(None);
+            }
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let configured = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if configured == 0 || AssignProcessToJobObject(job, process_handle) == 0 {
+                CloseHandle(job);
+                return Self(None);
+            }
+            Self(Some(job))
+        }
+    }
+
+    /// Kill everything still assigned to the job — the whole tree, unlike
+    /// `send_signal`'s direct-pid `TerminateProcess`. A no-op when `attach`
+    /// could not set one up.
+    pub(crate) fn terminate(&self) {
+        let Some(job) = self.0 else { return };
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        // SAFETY: `job` is a handle this instance created and still owns.
+        unsafe {
+            TerminateJobObject(job, 1);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessTreeJob {
+    fn drop(&mut self) {
+        if let Some(job) = self.0 {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            // SAFETY: closes exactly the handle `attach` created for this
+            // instance, once. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` means this
+            // also reaps anything still in the job on an ordinary drop — the
+            // same backstop role `kill_on_drop` plays for the direct child.
+            unsafe {
+                CloseHandle(job);
+            }
+        }
+    }
+}
+
+// SAFETY: the wrapped `HANDLE` is a kernel job-object handle, not a pointer
+// into process-local memory — Windows documents cross-thread use of a handle
+// as safe as long as calls are not literally concurrent on it, and every use
+// here (`terminate`, the final `CloseHandle`) is a single atomic API call, so
+// there is no shared mutable state to race.
+#[cfg(windows)]
+unsafe impl Send for ProcessTreeJob {}
+#[cfg(windows)]
+unsafe impl Sync for ProcessTreeJob {}
+
+/// Unix already reaches the whole tree through `send_signal`'s group-targeted
+/// `kill`, so there is nothing for this type to hold there — it exists only
+/// so call sites stay platform-generic instead of growing their own
+/// `#[cfg(windows)]`.
+#[cfg(not(windows))]
+pub(crate) struct ProcessTreeJob;
+
+#[cfg(not(windows))]
+impl ProcessTreeJob {
+    pub(crate) fn attach(_child: &tokio::process::Child) -> Self {
+        Self
+    }
+
+    pub(crate) fn terminate(&self) {}
+}
+
 /// Reap the child: graceful SIGTERM first, SIGKILL after `kill_grace`.
 /// (`kill_on_drop` remains the last-resort backstop.)
 ///
 /// Lives here rather than in one adapter because every adapter that spawns a
 /// child ends the same way, and a second copy would be a second place for the
-/// escalation order to drift. `send_signal` directly above it is the part that
-/// varies by platform.
+/// escalation order to drift. `send_signal` above is the direct-pid half of
+/// D46's fix, and on unix it is the whole fix: the group-targeted `kill`
+/// already reaches every descendant. **This function stays two-pid-only on
+/// purpose — no `ProcessTreeJob` parameter** — because it is also the shared
+/// call `acp::session` (a third adapter this row's fix does not reach yet;
+/// see the row's own wording) already makes; adding a required tree argument
+/// here would force that caller to attach one too, outside this change's
+/// scope. Claude and Codex instead call `ProcessTreeJob::terminate` directly,
+/// right alongside their own calls to this function — see either adapter's
+/// `run_session`.
 pub(crate) async fn shutdown_child(child: &mut tokio::process::Child, kill_grace: Duration) {
     if matches!(child.try_wait(), Ok(Some(_))) {
         return;

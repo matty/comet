@@ -60,6 +60,15 @@ impl LaunchDescriptor {
         }
         #[cfg(windows)]
         command.creation_flags(self.creation_flags);
+        // D46: put the child in its own process group so a later escalation
+        // signal can reach the whole tree it spawns (`send_signal` targets
+        // this group, not just the one pid) via `killpg`. `0` means "use the
+        // child's own pid as the group id" — set before the child's own code
+        // runs, so a grandchild it forks before ever touching stdin already
+        // inherits this group; nothing here changes what the child inherits
+        // otherwise; it only changes which pids answer a signal aimed at it.
+        #[cfg(unix)]
+        command.process_group(0);
         command
     }
 }

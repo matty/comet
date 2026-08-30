@@ -786,6 +786,154 @@ async fn unresponsive_child_is_reaped_with_interrupted_done() {
     );
 }
 
+/// Whether a pid still names a live process. Existence-only: neither branch
+/// sends a real signal, and both treat "cannot even ask" as "gone" — the
+/// conservative direction for a test that means to prove absence.
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 is `kill(2)`'s documented existence probe — it delivers
+    // nothing, it only reports whether the pid (or, negative, the process
+    // group) could be signaled.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+    // SAFETY: plain read-only handle open plus a zero-timeout wait, both
+    // documented, non-mutating queries; the handle is closed on every path.
+    unsafe {
+        let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let status = WaitForSingleObject(handle, 0);
+        CloseHandle(handle);
+        status == WAIT_TIMEOUT
+    }
+}
+
+/// Poll rather than sleep-then-check: reaping a process tree can race the
+/// escalation task's own teardown, and a bare sleep either flakes under load
+/// or (D89) has its budget quietly outgrown by one. This gives a real
+/// failure message instead of a timeout with no evidence attached.
+async fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !process_is_alive(pid) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "pid {pid} was still alive after {}ms",
+                timeout.as_millis()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// D46: the direct fake exiting proves nothing about a grandchild the
+/// provider itself spawned — `unresponsive_child_is_reaped_with_interrupted_done`
+/// above only ever had one process to reap. This fixture (`wedge_with_child`
+/// in `fake_codex.rs`) spawns a real OS grandchild, records both pids to a
+/// file, then hangs exactly like `wedge`. After cancellation, both pids must
+/// be gone — not just the harness's own Done event, which today fires the
+/// moment the direct child is reaped regardless of what it left behind.
+#[tokio::test]
+async fn cancellation_reaps_a_provider_owned_grandchild() {
+    let harness = CodexHarness::new()
+        .with_executable(fixture_path())
+        .with_graces(Duration::from_millis(100), Duration::from_millis(500));
+    let (controls, _steer, token) = controls("Yes");
+
+    let pid_file = std::env::temp_dir().join(format!(
+        "comet-d46-grandchild-pids-{}-{}.txt",
+        std::process::id(),
+        uuid_ish()
+    ));
+    let _ = std::fs::remove_file(&pid_file);
+
+    let mut stream = harness
+        .run(
+            request(&format!("scenario:wedge-with-child|{}", pid_file.display())),
+            controls,
+        )
+        .await
+        .expect("run starts");
+
+    let events = tokio::time::timeout(Duration::from_secs(10), async move {
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(&ev, AgentEvent::TextDelta { text } if text == "working") {
+                token.cancel();
+            }
+            events.push(ev);
+        }
+        events
+    })
+    .await
+    .expect("escalation completed in time");
+
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            result: None,
+            error: None,
+            session_id: Some("th-1".into()),
+        }),
+        "{events:?}"
+    );
+
+    // Written before the fixture ever emits the "working" delta that
+    // triggers cancellation above, so it is guaranteed present by now.
+    let recorded = std::fs::read_to_string(&pid_file).expect("fixture recorded both pids");
+    let _ = std::fs::remove_file(&pid_file);
+    let mut pids = recorded.lines();
+    let child_pid: u32 = pids
+        .next()
+        .expect("direct child pid line")
+        .trim()
+        .parse()
+        .expect("direct child pid parses");
+    let grandchild_pid: u32 = pids
+        .next()
+        .expect("grandchild pid line")
+        .trim()
+        .parse()
+        .expect("grandchild pid parses");
+
+    wait_for_process_exit(child_pid, Duration::from_secs(5))
+        .await
+        .unwrap_or_else(|msg| panic!("direct child (fixture) {msg}"));
+
+    // The actual claim this row exists to prove: a provider-owned descendant
+    // does not outlive the cancelled run just because the direct child did.
+    wait_for_process_exit(grandchild_pid, Duration::from_secs(5))
+        .await
+        .unwrap_or_else(|msg| {
+            panic!(
+                "provider-owned grandchild (pid {grandchild_pid}) {msg} — \
+                 cancellation reaped the fixture but leaked its child"
+            )
+        });
+}
+
+/// A cheap, dependency-free per-process disambiguator for the pid-file path —
+/// parallel `cargo nextest` runs already separate by `std::process::id()`,
+/// this only needs to also separate repeated runs within one process (a
+/// retried test).
+fn uuid_ish() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 #[tokio::test]
 async fn turn_failed_maps_to_errored_done() {
     let (controls, _steer, _token) = controls("Yes");
