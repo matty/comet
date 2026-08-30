@@ -258,6 +258,22 @@ async fn finish_purge_with_retries(doc_host: DocHost, chat_id: String, token: Pu
     }
 }
 
+async fn finish_purge_after_runs(
+    sessions: SessionsEngine,
+    doc_host: DocHost,
+    chat_id: String,
+    token: PurgeToken,
+) {
+    if let Err(err) = sessions.interrupt(&chat_id).await {
+        tracing::debug!(chat = %chat_id, error = %err, "chat purge interrupt skipped");
+    }
+    if !sessions.wait_for_no_live_runs(&chat_id).await {
+        tracing::debug!(chat = %chat_id, "chat final purge cancelled by engine shutdown");
+        return;
+    }
+    finish_purge_with_retries(doc_host, chat_id, token).await;
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OpenTerminalParams {
@@ -798,10 +814,8 @@ impl EngineRpc {
                 let doc_host = self.doc_host.clone();
                 tokio::spawn(async move {
                     for (chat_id, token) in chat_purges {
-                        if let Err(err) = sessions.interrupt(&chat_id).await {
-                            tracing::debug!(chat = %chat_id, error = %err, "deleteSpace interrupt skipped");
-                        }
-                        finish_purge_with_retries(doc_host.clone(), chat_id, token).await;
+                        finish_purge_after_runs(sessions.clone(), doc_host.clone(), chat_id, token)
+                            .await;
                     }
                 });
                 if reconciliation_needs_retry {
@@ -862,10 +876,7 @@ impl EngineRpc {
                 let sessions = self.sessions.clone();
                 let doc_host = self.doc_host.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = sessions.interrupt(&chat_id).await {
-                        tracing::debug!(chat = %chat_id, error = %err, "deleteChat interrupt skipped");
-                    }
-                    finish_purge_with_retries(doc_host, chat_id, token).await;
+                    finish_purge_after_runs(sessions, doc_host, chat_id, token).await;
                 });
                 initial_cleanup.map_err(failed)
             }
@@ -1904,6 +1915,74 @@ mod tests {
                 let _ = release.await;
                 return Err(comet_harness::HarnessError::Protocol(
                     "startup failure for terminal-handoff test".into(),
+                ));
+            }
+
+            Ok(Box::pin(futures::stream::iter([Ok(
+                comet_proto::AgentEvent::Done {
+                    status: comet_proto::DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                },
+            )])))
+        }
+    }
+
+    /// The first run remains inside provider startup after its routing handle
+    /// is displaced. The successor finishes immediately, leaving the first
+    /// task as the only owner capable of writing under the chat id.
+    struct DisplacedStartupHarness {
+        old_started: Mutex<Option<oneshot::Sender<()>>>,
+        old_release: Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl comet_harness::Harness for DisplacedStartupHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+
+        fn display_name(&self) -> &str {
+            "Displaced startup"
+        }
+
+        fn capabilities(&self) -> comet_proto::HarnessCapabilities {
+            comet_proto::HarnessCapabilities::default()
+        }
+
+        async fn models(&self) -> Result<comet_proto::ModelCatalog, comet_harness::HarnessError> {
+            Ok(comet_proto::ModelCatalog::built_in(Vec::new()))
+        }
+
+        async fn run(
+            &self,
+            request: comet_proto::RunRequest,
+            _controls: comet_harness::RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<comet_proto::AgentEvent, comet_harness::HarnessError>,
+            >,
+            comet_harness::HarnessError,
+        > {
+            if request.prompt == "old startup" {
+                let started = self
+                    .old_started
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one old startup notification");
+                let release = self
+                    .old_release
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one old startup run");
+                let _ = started.send(());
+                let _ = release.await;
+                return Err(comet_harness::HarnessError::Protocol(
+                    "late displaced startup failure".into(),
                 ));
             }
 
@@ -3360,6 +3439,118 @@ mod tests {
                 .unwrap(),
             None,
             "final purge removes the straggler sidecar"
+        );
+    }
+
+    #[tokio::test]
+    async fn displaced_startup_keeps_same_id_reuse_closed_until_its_late_effects_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("device-id"), "dev-a").unwrap();
+        let (old_started, old_started_rx) = oneshot::channel();
+        let (old_release, old_release_rx) = oneshot::channel();
+        let registry = Arc::new(crate::registry::HarnessRegistry::new());
+        registry.register(Arc::new(DisplacedStartupHarness {
+            old_started: Mutex::new(Some(old_started)),
+            old_release: Mutex::new(Some(old_release_rx)),
+        }));
+        let core = crate::EngineCore::assemble(dir.path(), registry, HarnessId::Mock, None)
+            .expect("engine core assembles");
+        core.workspace
+            .create_space(
+                "space-1",
+                "dev-a",
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
+                None,
+                false,
+            )
+            .unwrap();
+        core.workspace
+            .create_chat("chat-1", "space-1", None, None)
+            .unwrap();
+        let (_replay, mut live) = core.sessions.subscribe("chat-1", 0).unwrap();
+
+        let old_run = core
+            .sessions
+            .dispatch(
+                "chat-1",
+                HarnessId::Mock,
+                recording_request(dir.path(), "old startup"),
+                Some("old-user".into()),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), old_started_rx)
+            .await
+            .expect("old provider startup begins")
+            .expect("startup notification remains connected");
+
+        let replacement_run = core
+            .sessions
+            .dispatch(
+                "chat-1",
+                HarnessId::Mock,
+                recording_request(dir.path(), "replacement"),
+                Some("replacement-user".into()),
+            )
+            .await
+            .unwrap();
+        assert_ne!(old_run, replacement_run);
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), live.recv())
+                .await
+                .expect("replacement terminal event arrives")
+                .expect("live stream remains connected")
+                .event;
+            if matches!(event, comet_proto::AgentEvent::Done { .. }) {
+                break;
+            }
+        }
+        assert!(
+            core.sessions.has_live_run("chat-1"),
+            "the displaced startup still owns late journal, status, and document effects"
+        );
+
+        let mut purge_done = core.doc_host.watch_purges();
+        let rpc = core.remote_rpc_service();
+        rpc.mutate(MutateParams::DeleteChat {
+            chat_id: "chat-1".into(),
+        })
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), purge_done.changed())
+                .await
+                .is_err(),
+            "final purge must remain pending while the displaced startup can still publish"
+        );
+        assert!(
+            rpc.mutate(MutateParams::CreateChat {
+                chat_id: "chat-1".into(),
+                space_id: "space-1".into(),
+                config: None,
+                branch: None,
+                cwd: None,
+            })
+            .is_err(),
+            "same-id recreation stays closed until every old run-id pin settles"
+        );
+
+        old_release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), purge_done.changed())
+            .await
+            .expect("the final old pin release wakes final purge")
+            .expect("purge watch remains connected");
+        rpc.mutate(MutateParams::CreateChat {
+            chat_id: "chat-1".into(),
+            space_id: "space-1".into(),
+            config: None,
+            branch: None,
+            cwd: None,
+        })
+        .expect("clean same-id recreation is admitted after every old owner settles");
+        let (replay, _live) = core.sessions.subscribe("chat-1", 0).unwrap();
+        assert!(
+            replay.is_empty(),
+            "the displaced startup's late Error and Done are purged before recreation"
         );
     }
 
