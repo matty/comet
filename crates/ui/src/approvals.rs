@@ -228,14 +228,20 @@ pub fn blocked_line(
 ///
 /// Matched on the invariant TAIL rather than the whole string: the sentence
 /// also embeds `humanize_bound(bound)` and which of "your approval"/"your
-/// answer" was needed, both of which vary — the closing clause is the only
-/// part that never does. `crates/ui` has no dependency the wire could carry
-/// this fact over (adding one would be the proto/engine change this slice is
-/// scoped away from), so this is deliberately a copy check, not a decode —
-/// see the test below, which asserts against the real generator rather than
-/// a second hand-typed copy of its sentence.
+/// answer" was needed, both of which vary — `comet_engine::RESUME_CLAUSE` is
+/// the part that never does. This is a shared CONSTANT, not a second
+/// hand-typed copy of the sentence: `crates/ui` already depends on
+/// `comet-engine` as a normal (non-dev) dependency, so both sides read the
+/// same `&str` and the compiler keeps them in step, not a test. The fact
+/// itself still isn't on the wire — this crate can tell a message LOOKS like
+/// an expiry note, never that the engine SAID it was one — which is worth
+/// keeping in mind for whoever wants it structural later: that needs a
+/// `MessagePart` field and the `PROTOCOL_VERSION` question that comes with
+/// it, deliberately out of scope here. The test below still calls the real
+/// generator, because it proves this fires on a message the generator
+/// actually produced, not merely that two constants are equal.
 fn is_unattended_expiry_note(message: &str) -> bool {
-    message.ends_with("Send again to continue; the session still has its context.")
+    message.ends_with(comet_engine::RESUME_CLAUSE)
 }
 
 /// D28: the prompt to resend after a turn ended because nothing was
@@ -641,9 +647,13 @@ mod tests {
         assert!(line.text.contains("Waiting for approval"));
     }
 
-    /// Pinned against the real generator, not a second hand-typed copy of its
-    /// sentence — if `comet_engine::unattended_note`'s invariant tail ever
-    /// changes, this fails instead of the recognizer silently going stale.
+    /// Both sides read the same `comet_engine::RESUME_CLAUSE` now, so this is
+    /// no longer proving two copies stayed in step — the compiler already
+    /// guarantees that. What it still proves: `unattended_note`'s `format!`
+    /// genuinely puts the clause LAST, with no trailing punctuation or
+    /// reordering, for every `bound`/`waited_on` combination — an
+    /// `ends_with` check can't tell "the clause is absent" from "the clause
+    /// moved" without a real generated string to check it against.
     #[test]
     fn recognizes_every_shape_the_real_unattended_note_can_take() {
         for bound in [
