@@ -1,6 +1,11 @@
 # D52 — no way to see a UI state without producing it for real
 
-**Origin:** 4.1's rendered check, 2026-08-12. **State:** open, unowned.
+**Origin:** 4.1's rendered check, 2026-08-12. **State:** closed — answered by slice 4.4
+([PR #115](https://github.com/matty/comet/pull/115)) with option 3 below: the `COMET_MOCK_*` knob
+family, its register at `docs/testing/mock-states.md`, and the two-directional
+`every_mock_knob_is_documented` test. The page stays for the option comparison and for the limit
+the chosen route carries — a knob scripts a provider, so a state no provider is the source of is
+still out of reach.
 
 ## What happened
 
