@@ -22,11 +22,13 @@ use comet_capture::{SCENARIOS, corpus_provider_name, corpus_root, promoted_scena
 /// stale — that second direction is what stops the exemption list itself from
 /// becoming the next place a coverage gap hides unnoticed.
 ///
-/// **Empty, and the last three rows to leave show what the list is for.** `claude/edit` sat
-/// here for the length of one commit: declared so the capture could be taken, recorded against
-/// 2.1.251, then deleted with the promotion. `claude/edit-create` (D132), `claude/edit-noop`
-/// (D17's degenerate case) and `claude/write-overwrite` (D18) did the same in this change. A row
-/// belongs here with the reason it cannot be captured YET, never as a permanent home.
+/// **Empty, and the five rows that passed through it show what the list is for.** `claude/edit`
+/// sat here for the length of one commit: declared so the capture could be taken, recorded
+/// against 2.1.251, then deleted with the promotion. `claude/edit-create` (D132),
+/// `claude/edit-noop` (D17's degenerate case), `claude/write-overwrite` (D18) and their
+/// `ApprovalRequired` siblings `claude/edit-create-approval`/`claude/edit-noop-approval` all did
+/// the same in this change. A row belongs here with the reason it cannot be captured YET, never
+/// as a permanent home.
 const EXEMPT_UNCAPTURED: &[(&str, &str)] = &[];
 
 /// Break caught: a scenario declared in `SCENARIOS` (and rendered in

@@ -1216,9 +1216,21 @@ mod tests {
             ),
             (
                 Provider::Claude,
+                "edit-create-approval",
+                Some(scenarios::claude::edit_create_approval_request),
+                FenceKind::None,
+            ),
+            (
+                Provider::Claude,
                 "edit-noop",
                 Some(scenarios::claude::edit_noop_request),
                 FenceKind::FullAccess,
+            ),
+            (
+                Provider::Claude,
+                "edit-noop-approval",
+                Some(scenarios::claude::edit_noop_approval_request),
+                FenceKind::None,
             ),
             (
                 Provider::Claude,
@@ -1596,9 +1608,9 @@ mod tests {
         // env var while this section runs.
         unsafe { std::env::set_var("COMET_ACP_ADAPTER_ROOT", adapter_root.path()) };
 
-        // Empty again: `edit-create`, `edit-noop` and `write-overwrite` were recorded against
-        // 2.1.251 in the same change that declared them, which is the whole shape this list is
-        // for — a row lands here with its reason, and leaves when the capture does.
+        // Empty again: `edit-create-approval` and `edit-noop-approval` were recorded against
+        // 2.1.251 in the same change that declared them, the same shape `edit-create`,
+        // `edit-noop` and `write-overwrite` used before them.
         const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[];
 
         let root = crate::corpus_root();
@@ -1747,7 +1759,7 @@ mod tests {
             Vec::<String>::new(),
             "exactly the rows in EXEMPT_UNCAPTURED may land in unevidenced — a row losing \
              corpus evidence must update this assertion deliberately, not pass through silently. \
-             Both sides are empty now that edit-create, edit-noop and write-overwrite are \
+             Both sides are empty now that edit-create-approval and edit-noop-approval are \
              promoted, and they move together: this list is the second copy of \
              EXEMPT_UNCAPTURED, kept so a row vanishing from the corpus cannot be absorbed by \
              editing the exemption alone."

@@ -64,6 +64,33 @@ low
 acceptEdits
 ```
 
+### edit-create-approval
+
+capture whether Claude's can_use_tool control channel raises a request at all for the same empty-old_string Edit edit-create records, under ApprovalRequired — the ordering question edit-create's AutoAcceptEdits run cannot answer because it never asks permission (D132)
+
+cwd: `<CWD>`
+env: (none set)
+tools: 65
+
+```
+<HOME>\.local\bin\claude.exe
+--print
+--input-format
+stream-json
+--output-format
+stream-json
+--verbose
+--include-partial-messages
+--permission-prompt-tool
+stdio
+--model
+claude-haiku-4-5-20251001
+--effort
+low
+--permission-mode
+default
+```
+
 ### edit-noop
 
 capture a Claude Edit call with old_string absent and new_string empty, on a file that exists and has been read (D17's degenerate case)
@@ -89,6 +116,33 @@ claude-haiku-4-5-20251001
 low
 --permission-mode
 acceptEdits
+```
+
+### edit-noop-approval
+
+capture whether Claude's can_use_tool control channel raises a request at all for the same degenerate Edit edit-noop records, under ApprovalRequired — settles whether the shape is reachable from Comet's approval hook before Claude's own tool-input validation ever runs (D17)
+
+cwd: `<CWD>`
+env: (none set)
+tools: 65
+
+```
+<HOME>\.local\bin\claude.exe
+--print
+--input-format
+stream-json
+--output-format
+stream-json
+--verbose
+--include-partial-messages
+--permission-prompt-tool
+stdio
+--model
+claude-haiku-4-5-20251001
+--effort
+low
+--permission-mode
+default
 ```
 
 ### write-overwrite
@@ -124,14 +178,15 @@ Every dotted path observed on the wire for this provider and version, split by t
 
 ### Scenario groups
 
-- `G1`: edit, edit-create
-- `G2`: edit, edit-create, edit-noop
-- `G3`: edit, edit-create, edit-noop, write-overwrite
-- `G4`: edit, edit-create, write-overwrite
-- `G5`: edit, edit-noop, write-overwrite
-- `G6`: edit-create, edit-noop, write-overwrite
-- `G7`: edit-noop
-- `G8`: write-overwrite
+- `G1`: edit, edit-create, edit-create-approval
+- `G2`: edit, edit-create, edit-create-approval, edit-noop, edit-noop-approval
+- `G3`: edit, edit-create, edit-create-approval, edit-noop, edit-noop-approval, write-overwrite
+- `G4`: edit, edit-create, edit-create-approval, write-overwrite
+- `G5`: edit, edit-noop, edit-noop-approval, write-overwrite
+- `G6`: edit-create, edit-create-approval, edit-noop, edit-noop-approval, write-overwrite
+- `G7`: edit-create-approval
+- `G8`: edit-noop, edit-noop-approval
+- `G9`: write-overwrite
 
 ### To provider
 
@@ -139,6 +194,16 @@ Every dotted path observed on the wire for this provider and version, split by t
 - `.message.content` `G3`
 - `.message.role` `G3`
 - `.parent_tool_use_id` `G3`
+- `.response` `G7`
+- `.response.request_id` `G7`
+- `.response.response` `G7`
+- `.response.response.behavior` `G7`
+- `.response.response.updatedInput` `G7`
+- `.response.response.updatedInput.file_path` `G7`
+- `.response.response.updatedInput.new_string` `G7`
+- `.response.response.updatedInput.old_string` `G7`
+- `.response.response.updatedInput.replace_all` `G7`
+- `.response.subtype` `G7`
 - `.type` `G3`
 
 ### From provider
@@ -234,12 +299,12 @@ Every dotted path observed on the wire for this provider and version, split by t
 - `.message.content[].content` `G3`
 - `.message.content[].id` `G3`
 - `.message.content[].input` `G3`
-- `.message.content[].input.content` `G8`
+- `.message.content[].input.content` `G9`
 - `.message.content[].input.file_path` `G3`
 - `.message.content[].input.new_string` `G2`
 - `.message.content[].input.old_string` `G1`
 - `.message.content[].input.replace_all` `G1`
-- `.message.content[].is_error` `G7`
+- `.message.content[].is_error` `G8`
 - `.message.content[].name` `G3`
 - `.message.content[].signature` `G3`
 - `.message.content[].text` `G3`
@@ -308,6 +373,21 @@ Every dotted path observed on the wire for this provider and version, split by t
 - `.rate_limit_info.unifiedWindows.seven_day` `G3`
 - `.rate_limit_info.unifiedWindows.seven_day.resetsAt` `G3`
 - `.rate_limit_info.unifiedWindows.seven_day.utilization` `G3`
+- `.request` `G7`
+- `.request.description` `G7`
+- `.request.display_name` `G7`
+- `.request.input` `G7`
+- `.request.input.file_path` `G7`
+- `.request.input.new_string` `G7`
+- `.request.input.old_string` `G7`
+- `.request.input.replace_all` `G7`
+- `.request.permission_suggestions` `G7`
+- `.request.permission_suggestions[].destination` `G7`
+- `.request.permission_suggestions[].mode` `G7`
+- `.request.permission_suggestions[].type` `G7`
+- `.request.subtype` `G7`
+- `.request.tool_name` `G7`
+- `.request.tool_use_id` `G7`
 - `.request_id` `G3`
 - `.result` `G3`
 - `.session_id` `G3`
@@ -343,7 +423,7 @@ Every dotted path observed on the wire for this provider and version, split by t
 - `.time_to_request_ms` `G3`
 - `.timestamp` `G3`
 - `.tool_use_result` `G3`
-- `.tool_use_result.content` `G8`
+- `.tool_use_result.content` `G9`
 - `.tool_use_result.file` `G5`
 - `.tool_use_result.file.content` `G5`
 - `.tool_use_result.file.filePath` `G5`
@@ -431,7 +511,7 @@ The observed value set for a small declared list of discriminator paths — not 
 
 #### `.response.subtype`
 
-(none observed)
+- `success`
 
 #### `.subtype`
 
@@ -439,6 +519,7 @@ The observed value set for a small declared list of discriminator paths — not 
 
 #### `.type`
 
+- `control_response`
 - `user`
 
 ### From provider
@@ -474,11 +555,11 @@ The observed value set for a small declared list of discriminator paths — not 
 
 #### `.request.subtype`
 
-(none observed)
+- `can_use_tool`
 
 #### `.request.tool_name`
 
-(none observed)
+- `Edit`
 
 #### `.response.subtype`
 
@@ -496,6 +577,7 @@ The observed value set for a small declared list of discriminator paths — not 
 #### `.type`
 
 - `assistant`
+- `control_request`
 - `rate_limit_event`
 - `result`
 - `stream_event`
