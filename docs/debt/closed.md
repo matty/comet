@@ -64,6 +64,23 @@ capture never saw fire (zero `control_request`s even with
 and it was out of 0b.2's scope. The count sits on the return path and never
 delays an answer, so adding the reply later is additive.
 
+## D13 — linked-worktree sandbox escalation was invisible
+
+**The bug.** Codex's compatibility workaround widens a `workspace-write`
+request to `danger-full-access` for a linked worktree whose branch name contains
+a slash. The escalation kept the session runnable, but only `tracing` recorded
+it, so a user who selected workspace-only access could not see the wider access.
+
+**The fix.** Normalization retains whether it widened the sandbox and the run
+emits exactly one warning immediately after `SessionStarted`. The notice is
+Comet-authored, avoids the local path and provider internals, and tells the user
+that naming the branch without a slash avoids the workaround. The original
+runtime mode and approval policy remain untouched. The linked-worktree
+integration test proves the event order and exact-once behavior. The existing
+filesystem test keeps main checkouts, plain branch names and unreadable metadata
+outside the condition; the `WorkspaceWrite` comparison keeps every other
+requested sandbox unchanged.
+
 ## D60 — the scenario name lived in three unsynchronized places
 
 **The bug.** `comet-provider-capture`'s `--help` text, its `supported_pair()`

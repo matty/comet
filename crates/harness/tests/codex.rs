@@ -118,6 +118,60 @@ async fn run_to_end(
     .expect("run finished in time")
 }
 
+/// Break caught: dropping the linked-worktree workaround's transcript event
+/// would leave a user unaware that the requested workspace-only sandbox ran
+/// with wider access.
+#[tokio::test]
+async fn slashed_linked_worktree_sandbox_escalation_is_announced_after_session_start() {
+    let temp = tempfile::tempdir().expect("temporary linked worktree");
+    let worktree = temp.path().join("feature-branch");
+    let admin = temp.path().join("worktree-admin");
+    std::fs::create_dir_all(&worktree).expect("worktree directory");
+    std::fs::create_dir_all(&admin).expect("worktree admin directory");
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", admin.display()),
+    )
+    .expect("worktree gitdir");
+    std::fs::write(
+        admin.join("HEAD"),
+        "ref: refs/heads/feature/visible-sandbox\n",
+    )
+    .expect("worktree branch");
+
+    let (controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:capture-fresh");
+    req.cwd = worktree.display().to_string();
+    req.runtime_mode = RuntimeMode::AutoAcceptEdits;
+    let events = run_to_end(&harness(), req, controls).await;
+
+    assert!(matches!(
+        events.first(),
+        Some(AgentEvent::SessionStarted { .. })
+    ));
+    assert_eq!(
+        events.get(1),
+        Some(&AgentEvent::Notice {
+            kind: NoticeKind::Info,
+            severity: NoticeSeverity::Warning,
+            summary: "Sandbox access widened".into(),
+            detail: Some(
+                "Use a branch name without a slash to keep workspace-only write access.".into(),
+            ),
+            key: Some("codex-sandbox-escalated".into()),
+        }),
+        "the widening notice must follow SessionStarted: {events:#?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Notice { .. }))
+            .count(),
+        1,
+        "the widening notice must be emitted exactly once: {events:#?}"
+    );
+}
+
 /// Break caught: dropping the setup timeout leaves this collection waiting on
 /// the fixture's live stdout forever. Collecting to EOF also proves the child
 /// was reaped rather than merely sending `Done` before cleanup.
