@@ -33,6 +33,7 @@ pub use corpus::{
     FoundFrame, Frame, PromotedScenario, corpus_frame, corpus_frame_where, corpus_root, frame,
     frames, promoted_scenarios,
 };
+pub use record::SESSION_ID_FILE;
 pub use record::{Requirements, SCENARIOS, ScenarioSpec, record, scenario};
 pub use sanitize::{
     NovelPath, PATH_ROOT_PLACEHOLDERS, SanitizationError, SanitizationReport, is_placeholder_token,

@@ -456,6 +456,7 @@ impl<P: CaptureProvider> Session<P> {
                 self.finish_readers().await;
                 let capture = self.raw_capture(exit_code);
                 persist_raw_capture(&capture).await?;
+                persist_session_id(&capture).await;
                 Ok(capture)
             }
             Err(ExitWait::TimedOut) => {
@@ -650,6 +651,58 @@ async fn persist_raw_capture(capture: &RawCapture) -> anyhow::Result<()> {
     })
 }
 
+/// The file name a recorded session id is written to, beside `capture.json`.
+pub const SESSION_ID_FILE: &str = "session-id.txt";
+
+/// Write the provider session this capture opened, so a later `--resume-id` can
+/// name the capture instead of a copied string (D62).
+///
+/// **Best-effort on purpose.** A discovery scenario opens no session and a
+/// provider may spell it somewhere this does not look; neither is a reason to
+/// fail a capture that already succeeded. What the file buys is that the
+/// pairing between a resume and the session it resumes stops being a hand
+/// copy — nothing downstream requires it to exist.
+async fn persist_session_id(capture: &RawCapture) {
+    let Some(id) = recorded_session_id(&capture.events) else {
+        return;
+    };
+    let path = capture.directory.join(SESSION_ID_FILE);
+    if let Err(err) = tokio::fs::write(&path, &id).await {
+        tracing::debug!(path = %path.display(), %err, "session id could not be written");
+    }
+}
+
+/// The first session identifier any recorded frame carries.
+///
+/// **A union of the providers' spellings rather than a trait member.** Claude
+/// says `session_id`, Codex and ACP say `sessionId`, Codex's thread frames say
+/// `threadId`. Reading all three here keeps the knowledge in one short function
+/// instead of widening `CaptureProvider`'s seam, which `AGENTS.md` is explicit
+/// about after spawn had to be moved back off it.
+fn recorded_session_id(events: &[crate::types::CaptureEvent]) -> Option<String> {
+    fn find(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::Object(map) => {
+                for key in ["session_id", "sessionId", "threadId"] {
+                    if let Some(serde_json::Value::String(id)) = map.get(key)
+                        && !id.is_empty()
+                    {
+                        return Some(id.clone());
+                    }
+                }
+                map.values().find_map(find)
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(find),
+            _ => None,
+        }
+    }
+
+    events
+        .iter()
+        .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.payload).ok())
+        .find_map(|value| find(&value))
+}
+
 async fn persist_partial_raw_capture(capture: &PartialRawCapture) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec_pretty(capture)
         .map_err(|_| anyhow!("partial raw evidence could not be prepared"))?;
@@ -682,6 +735,54 @@ pub(super) fn persist_immutable_bytes(directory: &Path, bytes: &[u8]) -> std::io
 
 #[cfg(test)]
 mod tests {
+
+    /// Break caught (D62): the resume id had to be regexed out of the previous
+    /// run's `capture.json` by eye, and nothing checked it came from a
+    /// compatible scenario. Writing it beside the capture is what makes the
+    /// pairing mechanical.
+    #[test]
+    fn a_recorded_session_id_is_found_whatever_the_provider_calls_it() {
+        for (payload, expected) in [
+            (r#"{"type":"system","session_id":"claude-1"}"#, "claude-1"),
+            (r#"{"params":{"sessionId":"acp-1"}}"#, "acp-1"),
+            (r#"{"params":{"thread":{"threadId":"codex-1"}}}"#, "codex-1"),
+        ] {
+            assert_eq!(
+                recorded_session_id(&events_of(&[payload])).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    /// A discovery capture opens no session, and that is not a failure — the
+    /// file is simply absent and `--resume-id` still takes a bare id.
+    #[test]
+    fn a_capture_with_no_session_records_none() {
+        let events = events_of(&[r#"{"type":"system","subtype":"init"}"#]);
+        assert_eq!(recorded_session_id(&events), None);
+    }
+
+    /// An empty id is not an id. A provider that sent the key with `""` would
+    /// otherwise produce a file that fails the resume later, further from the
+    /// cause.
+    #[test]
+    fn an_empty_session_id_is_not_recorded() {
+        let events = events_of(&[r#"{"session_id":"","sessionId":"real-1"}"#]);
+        assert_eq!(recorded_session_id(&events).as_deref(), Some("real-1"));
+    }
+
+    fn events_of(payloads: &[&str]) -> Vec<crate::types::CaptureEvent> {
+        payloads
+            .iter()
+            .enumerate()
+            .map(|(i, payload)| crate::types::CaptureEvent {
+                sequence: i as u64 + 1,
+                channel: crate::types::Channel::Stdout,
+                payload: (*payload).to_string(),
+            })
+            .collect()
+    }
+
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use comet_proto::{RunRequest, RuntimeMode};

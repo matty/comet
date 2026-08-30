@@ -70,7 +70,8 @@ Options:
   --raw-root <PATH>                Raw output root [default: .comet-provider-captures/raw]
   --timeout-seconds <SECONDS>      Hard timeout, from 1 through 300
   --acknowledge-token-spend        Required for scenarios that can call a model
-  --resume-id <ID>                 Provider session/thread id required by resume
+  --resume-id <ID|DIR>             Session/thread id required by resume, or the raw
+                                   capture directory of the run to resume
   --attachment <PATH>              Image path required by Claude attachment
   -h, --help                       Print help without looking up a provider
 "#,
@@ -92,6 +93,46 @@ struct Args {
     acknowledge_token_spend: bool,
     resume_id: Option<String>,
     attachment: Option<PathBuf>,
+}
+
+/// A `--resume-id` value: either the id itself, or the raw capture directory of
+/// the run to resume.
+///
+/// **The point is that the pairing stops being a hand copy** (D62). The id had
+/// to be regexed out of the previous run's `capture.json` by eye, and nothing
+/// checked that the id came from a compatible scenario — pointing
+/// `checklist-resume` at a `fresh-text` session was accepted, spawned the
+/// provider, spent tokens, and produced a successful capture mislabeled as a
+/// resume of a session it never touched. Naming the directory instead makes the
+/// pairing mechanical: the recorder writes the session it opened beside the
+/// capture, and this reads it back.
+///
+/// A bare id still works, because a session recorded before this existed has no
+/// file to point at.
+fn resolve_resume_id(given: &str) -> Result<String, String> {
+    let path = std::path::Path::new(given);
+    if !path.exists() {
+        return Ok(given.to_owned());
+    }
+    let file = if path.is_dir() {
+        path.join(comet_capture::SESSION_ID_FILE)
+    } else {
+        path.to_path_buf()
+    };
+    let id = std::fs::read_to_string(&file).map_err(|err| {
+        format!(
+            "--resume-id names {} but its session id could not be read ({err}). The capture may              predate the recorder writing one; pass the id itself.",
+            path.display()
+        )
+    })?;
+    let id = id.trim();
+    if id.is_empty() {
+        return Err(format!(
+            "--resume-id names {}, whose recorded session id is empty.",
+            path.display()
+        ));
+    }
+    Ok(id.to_owned())
 }
 
 #[tokio::main]
@@ -297,12 +338,13 @@ fn capture_config_with_env(
     }
 
     let resume_id = if requirements.needs_resume_id {
-        Some(args.resume_id.clone().ok_or_else(|| {
+        let given = args.resume_id.clone().ok_or_else(|| {
             format!(
-                "The {} scenario needs --resume-id with a provider session/thread id.",
+                "The {} scenario needs --resume-id with a provider session/thread id, or the raw                  capture directory of the run to resume.",
                 spec.name
             )
-        })?)
+        })?;
+        Some(resolve_resume_id(&given)?)
     } else {
         None
     };

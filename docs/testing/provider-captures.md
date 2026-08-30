@@ -65,8 +65,14 @@ cargo run -p comet-capture --bin comet-provider-capture -- claude model-discover
 cargo run -p comet-capture --bin comet-provider-capture -- codex model-discovery --cwd <DISPOSABLE_DIR> --codex-home <CODEX_HOME> --raw-root .comet-provider-captures\raw\<RUN> --timeout-seconds 30
 ```
 
-Turn scenarios add the acknowledgment only after separate authorization. Resume additionally needs
-the exact prior `--resume-id`; Claude attachment needs `--attachment`; Codex
+Turn scenarios add the acknowledgment only after separate authorization. **Resume takes the raw
+capture directory of the run it resumes** — `--resume-id <RAW_ROOT>\<capture-dir>` —
+and reads the session id the recorder wrote beside that capture (`session-id.txt`). A bare id is
+still accepted, for a capture recorded before the recorder wrote one. Naming the directory is what
+makes the pairing mechanical: the id used to be regexed out of the previous `capture.json` by eye,
+and pointing `checklist-resume` at a `fresh-text` session was accepted, spent tokens, and produced
+a successful capture mislabeled as a resume of a session it never touched (D62). Claude attachment
+needs `--attachment`; Codex
 `approval-on-request` needs an empty external `--approval-target`. Never improvise a substitute
 scenario when preflight or the protocol rejects the requested one.
 
