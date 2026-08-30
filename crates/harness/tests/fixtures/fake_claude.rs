@@ -60,11 +60,10 @@ fn last_content(line: &str) -> String {
 /// The values the installed Claude Code 2.1.226 accepts for
 /// `--permission-mode`: the six choices its own `--help` advertises, plus the
 /// unadvertised `default` alias comet keeps for older CLIs (see
-/// `crates/harness/src/claude/mod.rs`). Every other argument is ignored —
-/// this fixture checks only that the one flag the adapter derives from
-/// `RunRequest.runtime_mode` is a value a real `claude` binary would accept,
-/// so every scenario that spawns this binary gets that check for free
-/// instead of no scenario checking it at all.
+/// `crates/harness/src/claude/mod.rs`). This fixture checks that the one flag
+/// the adapter derives from `RunRequest.runtime_mode` is a value a real
+/// `claude` binary would accept, so every scenario that spawns this binary
+/// gets that check for free instead of no scenario checking it at all.
 const VALID_PERMISSION_MODES: &[&str] = &[
     "acceptEdits",
     "auto",
@@ -90,6 +89,92 @@ fn check_permission_mode() {
         );
         exit(1);
     }
+}
+
+/// D43: every flag a real Claude run always carries on argv, independent of
+/// runtime mode, model, or resume — everything `claude::run_launch` puts
+/// there besides the permission mode `check_permission_mode` above already
+/// checks. Before this existed, the fixture "accept[ed] every argument
+/// except an invalid `--permission-mode`" (D43): dropping the
+/// streaming transport, `--verbose`, `--include-partial-messages`, or the
+/// stdio permission channel from `run_launch` still left every scenario in
+/// this subprocess suite green, because nothing here ever looked past
+/// `--permission-mode`. Each entry is matched as a contiguous window so a
+/// flag/value pair (`--input-format stream-json`) cannot be satisfied by the
+/// flag appearing with a different, unrelated value ahead of or behind it.
+const REQUIRED_RUN_FLAGS: &[&[&str]] = &[
+    &["--print"],
+    &["--input-format", "stream-json"],
+    &["--output-format", "stream-json"],
+    &["--verbose"],
+    &["--include-partial-messages"],
+    &["--permission-prompt-tool", "stdio"],
+];
+
+/// Called only once argv shows this is a real run (`--permission-mode` is
+/// present) — a discovery spawn (`claude/discovery.rs`'s `DISCOVERY_ARGS`)
+/// deliberately omits `--permission-prompt-tool` and
+/// `--include-partial-messages`, so checking this unconditionally would fail
+/// every discovery test instead of proving anything about runs.
+fn check_run_flags() {
+    let args: Vec<String> = std::env::args().collect();
+    for seq in REQUIRED_RUN_FLAGS {
+        if !args.windows(seq.len()).any(|w| w == *seq) {
+            eprintln!("fake-claude: run argv is missing required flag(s) {seq:?}; got {args:?}");
+            exit(1);
+        }
+    }
+}
+
+/// The plain prompt text of a stream-json user turn, whichever shape
+/// `content` takes: a bare string (`wire::user_message_line`) or an array of
+/// blocks with the text block last (`wire::user_message_line_with_images`).
+/// Parsed properly with `serde_json` rather than substring-scanned like
+/// `last_content` above — `launch_record`'s own marker below carries a
+/// filesystem path, which on Windows contains backslashes a greedy
+/// quote-to-quote scan would hand back still JSON-escaped.
+fn user_text(line: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let content = &value["message"]["content"];
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    content.as_array()?.iter().find_map(|block| {
+        if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+            block
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        } else {
+            None
+        }
+    })
+}
+
+/// D43: records the full argv this invocation actually received (minus
+/// argv[0], the fixture's own path, which varies per build) and this
+/// process's own actual working directory to the file named in the marker —
+/// not the values Comet believes it sent, the values the OS actually handed
+/// this child. `check_run_flags` above already fails loudly when a required
+/// flag is MISSING; this is for the flags whose VALUE varies per request
+/// (`--model`, `--effort`, `--settings`, `--resume=`) and for `cwd`, which
+/// `LaunchDescriptor::command`'s `current_dir` call sets on the `Command` but
+/// which nothing previously checked actually took effect on the spawned
+/// process — the gap D43 names as "weaker than command discovery's
+/// child-side cwd echo".
+fn launch_record(path: &str) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<none>".into());
+    let record = serde_json::json!({ "args": args, "cwd": cwd });
+    std::fs::write(path, record.to_string()).expect("write launch record");
+    emit(
+        r#"{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-launch-record"}"#,
+    );
+    emit(
+        r#"{"type":"result","subtype":"success","result":"recorded","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-launch-record"}"#,
+    );
 }
 
 /// The genuine captured initialize reply,
@@ -177,7 +262,12 @@ fn command_reply() -> String {
 
 fn main() {
     check_permission_mode();
-    if !std::env::args().any(|arg| arg == "--permission-mode") {
+    let is_run = std::env::args().any(|arg| arg == "--permission-mode");
+    if is_run {
+        // D43: a run's argv floor. Discovery (below) never sets
+        // `--permission-mode`, so this never fires for it.
+        check_run_flags();
+    } else {
         fill_stderr();
     }
     let stdin = std::io::stdin();
@@ -199,6 +289,17 @@ fn main() {
         }
         // The adapter closes stdin to end the session; a real CLI exits 0.
         exit(0);
+    }
+
+    // D43: checked before every other scenario branch below, on the properly
+    // parsed prompt text rather than the raw line, so a Windows path's
+    // backslashes reach `launch_record` unescaped.
+    if let Some(path) = user_text(&first)
+        .as_deref()
+        .and_then(|text| text.strip_prefix("scenario:launch-record|"))
+    {
+        launch_record(path);
+        return;
     }
 
     if first.contains("scenario:attachment") {
