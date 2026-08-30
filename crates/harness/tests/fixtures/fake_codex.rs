@@ -115,15 +115,21 @@ fn model_entry(
 ///   login check reads `auth.json` from a home the parent resolved, and only
 ///   the child can say which home the CLI was actually handed; a test that
 ///   cannot see this cannot tell the two apart.
+/// - `gpt-5.5` is flagged `isDefault: true` (D72, `docs/debt/README.md`) even
+///   though it is neither the first curated row nor the first row this fixture
+///   serves: the merged catalog must still come back led by it, not by
+///   whatever `gpt-5.6-sol`'s curated-order coincidence used to paper over.
 fn discovery_models() -> Vec<Value> {
     const ULTRA: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
     const XHIGH: &[&str] = &["low", "medium", "high", "xhigh"];
     const IMAGE: Option<&[&str]> = Some(&["text", "image"]);
     const TEXT: Option<&[&str]> = Some(&["text"]);
     let home = std::env::var("CODEX_HOME").unwrap_or_else(|_| "unset".into());
+    let mut gpt_5_5 = model_entry("gpt-5.5", "gpt-5.5 label", false, XHIGH, IMAGE);
+    gpt_5_5["isDefault"] = json!(true);
     vec![
         model_entry("gpt-5.6-sol", "gpt-5.6-sol label", false, ULTRA, IMAGE),
-        model_entry("gpt-5.5", "gpt-5.5 label", false, XHIGH, IMAGE),
+        gpt_5_5,
         model_entry(
             "gpt-5.3-codex-spark",
             "gpt-5.3-codex-spark label",

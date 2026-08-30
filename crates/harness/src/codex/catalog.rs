@@ -8,7 +8,7 @@
 //! spliced in (same call t3code's Codex provider makes).
 
 use comet_proto::{
-    Model, ModelOption, ModelOptionChoice, ReasoningLevel, RuntimeMode, SandboxLevel,
+    Model, ModelCatalog, ModelOption, ModelOptionChoice, ReasoningLevel, RuntimeMode, SandboxLevel,
 };
 
 /// The unified reasoning ladder Codex accepts (`minimal` is offered but clamped
@@ -214,6 +214,34 @@ pub(crate) fn static_models() -> Vec<Model> {
     ]
 }
 
+/// Lead the merged catalog with the model the live `model/list` reply itself
+/// called default, rather than leaving `pickers::default_model` (which just
+/// returns `models.first()`) reading catalog order — coincidentally correct
+/// only because the curated list happens to lead with the same flagship the
+/// server does today (D72, `docs/debt/README.md`).
+///
+/// `default_id: None` — no discovery ran, or none of its rows claimed
+/// `isDefault` — is a no-op: catalog order is exactly what today ships, and an
+/// absent claim must not be read as "the first row is the pick"
+/// (`.agents/rules/optional-wire-fields.md`). An id that names no model in
+/// `catalog` (hidden, or dropped some other way) is also a no-op rather than
+/// a panic — the picker still gets a complete, merely unreordered, list.
+pub(crate) fn order_by_live_default(
+    mut catalog: ModelCatalog,
+    default_id: Option<&str>,
+) -> ModelCatalog {
+    let Some(default_id) = default_id else {
+        return catalog;
+    };
+    if let Some(pos) = catalog.models.iter().position(|m| m.id == default_id)
+        && pos != 0
+    {
+        let model = catalog.models.remove(pos);
+        catalog.models.insert(0, model);
+    }
+    catalog
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +281,57 @@ mod tests {
             let tier = m.options.iter().find(|o| o.id == "serviceTier");
             assert!(tier.is_some(), "{} missing serviceTier", m.id);
         }
+    }
+
+    /// The behaviour D72 exists to fix: a live default that is not the
+    /// curated flagship must lead the merged catalog, so
+    /// `pickers::default_model`'s `models.first()` picks it up.
+    #[test]
+    fn a_live_default_that_is_not_first_is_promoted() {
+        let catalog = ModelCatalog::live(static_models());
+        assert_eq!(
+            catalog.models[0].id, "gpt-5.6-sol",
+            "curated order, unreordered"
+        );
+        let reordered = order_by_live_default(catalog, Some("gpt-5.5"));
+        assert_eq!(reordered.models[0].id, "gpt-5.5");
+        let ids: std::collections::HashSet<&str> =
+            reordered.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids.len(), 7, "reordering must not drop or duplicate a row");
+    }
+
+    /// No row claimed the default: today's whole behaviour, catalog order,
+    /// must be exactly preserved. Reading the absence as "the first row is
+    /// the pick" is the trap `.agents/rules/optional-wire-fields.md` names.
+    #[test]
+    fn no_live_default_leaves_catalog_order_untouched() {
+        let catalog = ModelCatalog::live(static_models());
+        let ids_before: Vec<String> = catalog.models.iter().map(|m| m.id.clone()).collect();
+        let untouched = order_by_live_default(catalog, None);
+        let ids_after: Vec<String> = untouched.models.iter().map(|m| m.id.clone()).collect();
+        assert_eq!(ids_before, ids_after);
+    }
+
+    /// An id that names no row in the merged catalog (e.g. the default was a
+    /// hidden model, dropped before merging) must not panic or drop rows —
+    /// it is a no-op, not an error.
+    #[test]
+    fn an_unmatched_default_id_is_a_no_op() {
+        let catalog = ModelCatalog::live(static_models());
+        let ids_before: Vec<String> = catalog.models.iter().map(|m| m.id.clone()).collect();
+        let untouched = order_by_live_default(catalog, Some("no-such-model"));
+        let ids_after: Vec<String> = untouched.models.iter().map(|m| m.id.clone()).collect();
+        assert_eq!(ids_before, ids_after);
+    }
+
+    /// A live default that already leads the catalog (today's coincidence) is
+    /// also a no-op, not a needless remove-and-reinsert.
+    #[test]
+    fn a_live_default_already_first_is_a_no_op() {
+        let catalog = ModelCatalog::live(static_models());
+        let reordered = order_by_live_default(catalog, Some("gpt-5.6-sol"));
+        assert_eq!(reordered.models[0].id, "gpt-5.6-sol");
+        assert_eq!(reordered.models.len(), 7);
     }
 
     /// Every mode maps to a reviewer the app-server's schema accepts. `Auto` is

@@ -1145,6 +1145,31 @@ async fn models_come_back_live_and_merged() {
     );
 }
 
+/// D72 (`docs/debt/README.md`): `pickers::default_model` just returns
+/// `models.first()`, so whoever leads the merged catalog IS the default the
+/// picker offers. The fixture flags `gpt-5.5` `isDefault: true` — a model that
+/// is neither the curated flagship nor the first row the fake server serves —
+/// so a merged catalog still led by `gpt-5.6-sol` would mean the live answer
+/// was decoded and then ignored.
+#[tokio::test]
+async fn a_live_default_leads_the_merged_catalog_even_when_not_first() {
+    let catalog = harness().models().await.expect("models");
+    assert_eq!(catalog.source, comet_proto::CatalogSource::Live);
+    assert_eq!(
+        catalog.models.first().map(|m| m.id.as_str()),
+        Some("gpt-5.5"),
+        "the live isDefault row must lead the catalog, got {:?}",
+        catalog.models.iter().map(|m| &m.id).collect::<Vec<_>>()
+    );
+    let ids: std::collections::HashSet<&str> =
+        catalog.models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        ids.len(),
+        catalog.models.len(),
+        "reordering must not drop or duplicate a row"
+    );
+}
+
 /// Paging is only ever exercised by the fixture, so it is worth asserting the
 /// loop reassembled every page rather than stopping at the first: the models
 /// the fake serves last are the ones a broken loop drops.

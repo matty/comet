@@ -309,6 +309,13 @@ pub struct CodexHarness {
     /// uncached discovery would spawn an app-server on a path the user never
     /// sees.
     discovery_cache: crate::discovery::DiscoveryCache,
+    /// The live reply's `isDefault` row, if the last successful discovery
+    /// named one (D72, `docs/debt/README.md`). Written once, alongside
+    /// `discovery_cache`'s own cached answer, by the same `discovery::discover`
+    /// closure — see that function's doc comment for why this rides beside
+    /// the cache rather than inside it. `None` means either "not asked yet"
+    /// or "asked and no row claimed it"; both leave catalog order alone.
+    live_default_model: Arc<std::sync::Mutex<Option<String>>>,
     /// Overrides `$CODEX_HOME`/`~/.codex` for the login check; tests set it.
     codex_home: Option<PathBuf>,
 }
@@ -321,6 +328,7 @@ impl Default for CodexHarness {
             kill_grace: Duration::from_secs(3),
             startup_timeout: Duration::from_secs(120),
             discovery_cache: crate::discovery::DiscoveryCache::default(),
+            live_default_model: Arc::new(std::sync::Mutex::new(None)),
             codex_home: None,
         }
     }
@@ -464,7 +472,9 @@ impl Harness for CodexHarness {
     }
 
     /// The curated catalog (see [`catalog`]) unioned with whatever a
-    /// short-lived `codex app-server` reported. An absent CLI still surfaces as
+    /// short-lived `codex app-server` reported, then led by the live
+    /// `isDefault` row when the reply named one (D72, `docs/debt/README.md`) —
+    /// see `catalog::order_by_live_default`. An absent CLI still surfaces as
     /// [`HarnessError::NotInstalled`] rather than as a failed discovery: the
     /// user's action is different, and the picker's caption is not the place to
     /// say "no CLI".
@@ -472,15 +482,31 @@ impl Harness for CodexHarness {
         let exe = self.resolve_executable()?;
         let home = self.codex_home();
         let curated = static_models();
+        let live_default = self.live_default_model.clone();
         let discovery = self
             .discovery_cache
-            .get(move || discovery::discover(exe, home))
+            .get(move || discovery::discover(exe, home, live_default))
             .await;
-        Ok(self.discovery_cache.catalog(curated, discovery))
+        let default_id = self
+            .live_default_model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let catalog = self.discovery_cache.catalog(curated, discovery);
+        Ok(catalog::order_by_live_default(
+            catalog,
+            default_id.as_deref(),
+        ))
     }
 
     fn clear_discovery(&self) {
         self.discovery_cache.clear();
+        // A retry may land on a different provider answer (or none); a stale
+        // default from the attempt being discarded must not survive it.
+        *self
+            .live_default_model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     fn take_unreported_discovery_failure(&self) -> Option<crate::discovery::DiscoveryFailure> {
