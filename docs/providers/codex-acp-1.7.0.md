@@ -157,6 +157,10 @@ The observed value set for a small declared list of discriminator paths — not 
 
 (none observed)
 
+#### `.request.tool_name`
+
+(none observed)
+
 #### `.response.subtype`
 
 (none observed)
@@ -192,6 +196,10 @@ The observed value set for a small declared list of discriminator paths — not 
 (none observed)
 
 #### `.request.subtype`
+
+(none observed)
+
+#### `.request.tool_name`
 
 (none observed)
 

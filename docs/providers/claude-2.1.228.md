@@ -432,6 +432,10 @@ The observed value set for a small declared list of discriminator paths — not 
 
 - `initialize`
 
+#### `.request.tool_name`
+
+(none observed)
+
 #### `.response.subtype`
 
 - `success`
@@ -480,6 +484,10 @@ The observed value set for a small declared list of discriminator paths — not 
 #### `.request.subtype`
 
 - `can_use_tool`
+
+#### `.request.tool_name`
+
+- `Write`
 
 #### `.response.subtype`
 
