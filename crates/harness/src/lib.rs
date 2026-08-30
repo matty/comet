@@ -353,11 +353,53 @@ pub(crate) async fn probe_installed_cli(
         method: classify_install(&exe, override_is_set, &known_dirs),
     };
     HarnessProbe {
-        availability: probe_cli_version(&exe).await,
+        availability: enforce_version_floor(stem, probe_cli_version(&exe).await),
         install: Some(install),
         // Filled by the per-provider update readers; a provider that publishes
         // no state leaves this `None` and simply renders one line less.
         update: None,
+    }
+}
+
+struct VersionFloor {
+    minimum: &'static str,
+    update_hint: &'static str,
+}
+
+fn version_floor(stem: &str) -> Option<VersionFloor> {
+    match stem {
+        "claude" => Some(VersionFloor {
+            minimum: "2.1.228",
+            update_hint: "Run `claude update` to install version 2.1.228 or newer.",
+        }),
+        "codex" => Some(VersionFloor {
+            minimum: "0.147.0",
+            update_hint: "Run `codex update` to install version 0.147.0 or newer.",
+        }),
+        "grok" => Some(VersionFloor {
+            minimum: "1.0.5",
+            update_hint: "Install Grok 1.0.5 or newer, or set GROK_EXECUTABLE to its path.",
+        }),
+        // Hermes has no promoted capture, and D110 deliberately leaves it
+        // floorless rather than pretending a version is supported.
+        _ => None,
+    }
+}
+
+fn enforce_version_floor(stem: &str, availability: HarnessAvailability) -> HarnessAvailability {
+    let HarnessAvailability::Available {
+        version: Some(installed),
+    } = &availability
+    else {
+        return availability;
+    };
+    let Some(floor) = version_floor(stem) else {
+        return availability;
+    };
+    if compare_versions(installed, floor.minimum) == Some(std::cmp::Ordering::Less) {
+        HarnessAvailability::unavailable("Update required", Some(floor.update_hint.to_string()))
+    } else {
+        availability
     }
 }
 
@@ -1751,6 +1793,167 @@ mod probe_tests {
             },
             "a .cmd shim must probe like any other executable"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_codex_version_below_its_supported_floor_requires_an_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("old-codex.cmd");
+        std::fs::write(&shim, "@echo off\r\necho codex-cli 0.146.0\r\n").unwrap();
+
+        let probe =
+            probe_installed_cli(Ok(shim), "codex", "NO_SUCH_OVERRIDE_VAR", Vec::new()).await;
+
+        assert_eq!(
+            probe.availability.unavailable_summary(),
+            Some("Update required")
+        );
+        assert_eq!(
+            probe.availability.unavailable_hint(),
+            Some("Run `codex update` to install version 0.147.0 or newer.")
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_outdated_codex_probe_keeps_its_install_and_update_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("old-codex.cmd");
+        std::fs::write(&shim, "@echo off\r\necho codex-cli 0.146.0\r\n").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("version.json"),
+            r#"{"latest_version":"0.148.0"}"#,
+        )
+        .unwrap();
+
+        let harness = CodexHarness::new()
+            .with_executable(&shim)
+            .with_codex_home(home.path());
+        let probe = harness.probe().await;
+
+        assert_eq!(
+            probe.availability.unavailable_summary(),
+            Some("Update required")
+        );
+        assert_eq!(
+            probe.install.expect("the resolved binary stays named").path,
+            shim.display().to_string()
+        );
+        assert_eq!(
+            probe
+                .update
+                .expect("the updater cache stays visible")
+                .latest
+                .as_deref(),
+            Some("0.148.0")
+        );
+    }
+
+    #[test]
+    fn an_unorderable_or_missing_version_stays_available() {
+        for version in [None, Some("0.147.0-rc1"), Some("nightly"), Some("1..2")] {
+            let availability = enforce_version_floor(
+                "codex",
+                HarnessAvailability::Available {
+                    version: version.map(str::to_owned),
+                },
+            );
+            assert_eq!(
+                availability,
+                HarnessAvailability::Available {
+                    version: version.map(str::to_owned),
+                },
+                "{version:?} cannot honestly be ranked against the Codex floor"
+            );
+        }
+    }
+
+    #[test]
+    fn an_equal_or_newer_version_stays_available() {
+        for version in ["0.147.0", "0.147.1", "0.148.0"] {
+            assert_eq!(
+                enforce_version_floor(
+                    "codex",
+                    HarnessAvailability::Available {
+                        version: Some(version.into()),
+                    },
+                ),
+                HarnessAvailability::Available {
+                    version: Some(version.into()),
+                },
+                "{version} meets the Codex floor"
+            );
+        }
+    }
+
+    #[test]
+    fn each_documented_provider_uses_its_own_floor_and_hermes_remains_floorless() {
+        for (stem, installed, minimum, hint) in [
+            (
+                "claude",
+                "2.1.227",
+                "2.1.228",
+                "Run `claude update` to install version 2.1.228 or newer.",
+            ),
+            (
+                "codex",
+                "0.146.0",
+                "0.147.0",
+                "Run `codex update` to install version 0.147.0 or newer.",
+            ),
+            (
+                "grok",
+                "1.0.4",
+                "1.0.5",
+                "Install Grok 1.0.5 or newer, or set GROK_EXECUTABLE to its path.",
+            ),
+        ] {
+            let availability = enforce_version_floor(
+                stem,
+                HarnessAvailability::Available {
+                    version: Some(installed.into()),
+                },
+            );
+            assert_eq!(availability.unavailable_summary(), Some("Update required"));
+            assert_eq!(availability.unavailable_hint(), Some(hint));
+            assert!(
+                hint.contains(minimum),
+                "{stem}'s hint names its minimum version"
+            );
+        }
+
+        assert_eq!(
+            enforce_version_floor(
+                "hermes",
+                HarnessAvailability::Available {
+                    version: Some("0.0.1".into()),
+                },
+            ),
+            HarnessAvailability::Available {
+                version: Some("0.0.1".into()),
+            },
+            "Hermes stays floorless until D110 has corpus evidence"
+        );
+    }
+
+    #[test]
+    fn probe_floors_match_the_supported_provider_versions_document() {
+        const DOCUMENT: &str = include_str!("../../../docs/testing/supported-provider-versions.md");
+
+        for (stem, provider, minimum) in [
+            ("claude", "Claude Code", "2.1.228"),
+            ("codex", "codex-cli", "0.147.0"),
+            ("grok", "Grok", "1.0.5"),
+        ] {
+            let floor = version_floor(stem).expect("documented provider has a probe floor");
+            assert_eq!(floor.minimum, minimum);
+            assert!(
+                DOCUMENT.contains(&format!("| {provider} | **{minimum}**")),
+                "the production floor for {provider} must stay tied to the documented floor"
+            );
+        }
     }
 
     /// The claim the whole sibling design rests on: a CLI that resolved and
