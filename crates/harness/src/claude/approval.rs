@@ -61,6 +61,23 @@ pub(crate) fn approval_request(
                 (Some(text), true) if body.tool_name == "Write" => {
                     (write_operation(&path, &file_exists), line_count(text), 0)
                 }
+                // Reachable only for Edit (the Write case above already
+                // claimed every `old.is_empty()` input for that tool). An
+                // empty `new_string` alone reads as a real deletion — see the
+                // `(Some(text), _)` arm below — but only because `old_string`
+                // names the text being deleted. With `old_string` absent (or
+                // itself empty; both read as `old.is_empty()`) there is
+                // nothing to delete either: no target and no replacement, so
+                // this is unreadable input, not a zero-line edit. Read
+                // literally it used to produce FileChange{Modify, +0, -0} — a
+                // signature indistinguishable from a REAL modify to the same
+                // path, since approval_signature deliberately drops line
+                // counts (a genuine repeat edit must still match). Allowing
+                // that no-op card for the session silently auto-allowed every
+                // later real edit to the file (D17). Same treatment as
+                // `(None, true)` below, its sibling with an absent
+                // `new_string` key instead of an empty one.
+                (Some(text), true) if text.is_empty() => (FileOperation::Unknown, 0, 0),
                 (Some(text), _) => (FileOperation::Modify, line_count(text), line_count(&old)),
                 // An empty replacement removes text.
                 (None, false) => (FileOperation::Modify, 0, line_count(&old)),
@@ -408,6 +425,56 @@ mod tests {
     fn an_edit_with_neither_string_populated_is_an_unknown_operation() {
         // (None, true) arm: no old_string and no new replacement text at all.
         let got = approval_request(&body("Edit", json!({"file_path": "a.txt"})), nothing_exists);
+        assert_eq!(
+            got,
+            ApprovalRequest::FileChange {
+                path: "a.txt".into(),
+                operation: FileOperation::Unknown,
+                added_lines: 0,
+                removed_lines: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn an_edit_with_an_empty_new_string_and_no_old_string_is_also_unknown() {
+        // D17: this used to fall into the general `(Some(text), _) => Modify`
+        // arm — an empty `new_string` normally means "replace with nothing"
+        // (a real deletion, see the pure-deletion test below), but that
+        // reading only holds when `old_string` names something to delete.
+        // With no `old_string` at all, nothing was specified in either
+        // direction: not a deletion, just unreadable input. The old behavior
+        // produced FileChange{Modify, +0, -0} — a signature indistinguishable
+        // from a REAL modify to the same path, because approval_signature
+        // deliberately drops line counts. Allowing this no-op card for the
+        // session would silently auto-allow every later real edit to the file.
+        let got = approval_request(
+            &body("Edit", json!({"file_path": "a.txt", "new_string": ""})),
+            nothing_exists,
+        );
+        assert_eq!(
+            got,
+            ApprovalRequest::FileChange {
+                path: "a.txt".into(),
+                operation: FileOperation::Unknown,
+                added_lines: 0,
+                removed_lines: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn an_edit_with_an_explicitly_empty_old_string_and_empty_new_string_is_unknown_too() {
+        // Same defect, the other door: an `old_string` key present but empty
+        // reads identically to an absent one (`old.is_empty()`), so it must
+        // route the same way as the absent case above.
+        let got = approval_request(
+            &body(
+                "Edit",
+                json!({"file_path": "a.txt", "old_string": "", "new_string": ""}),
+            ),
+            nothing_exists,
+        );
         assert_eq!(
             got,
             ApprovalRequest::FileChange {

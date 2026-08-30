@@ -235,6 +235,39 @@ mod tests {
     }
 
     #[test]
+    fn a_degenerate_edit_never_shares_a_signature_with_a_real_edit_to_the_same_path() {
+        // D17: a degenerate `Edit` (no target text and no replacement) used to
+        // decode as FileChange{Modify, +0, -0} in
+        // `comet_harness::claude::approval::approval_request` — identical in
+        // shape to a real modify to that path, because this signature
+        // deliberately drops line counts (see the doc comment above and
+        // `the_same_edit_to_the_same_file_matches_across_different_line_counts`).
+        // The adapter now reads that input as `FileOperation::Unknown`
+        // instead (same door `an_edit_comet_could_not_read_is_never_allowlistable`
+        // already covers). Both sides must be checked explicitly — asserting
+        // only `!=` would pass for the wrong reason if one side were `Some`
+        // and the other `None` by accident of a typo, not by design.
+        let degenerate = ApprovalRequest::FileChange {
+            path: "src/main.rs".into(),
+            operation: FileOperation::Unknown,
+            added_lines: 0,
+            removed_lines: 0,
+        };
+        let real_edit = ApprovalRequest::FileChange {
+            path: "src/main.rs".into(),
+            operation: FileOperation::Modify,
+            added_lines: 5,
+            removed_lines: 2,
+        };
+        assert_eq!(approval_signature(&degenerate), None);
+        assert!(approval_signature(&real_edit).is_some());
+        assert_ne!(
+            approval_signature(&degenerate),
+            approval_signature(&real_edit)
+        );
+    }
+
+    #[test]
     fn an_mcp_tool_is_never_allowlistable() {
         // `Mcp` names a capability, not an action: it carries no arguments, so
         // `create_issue` against one project and `create_issue` against another
