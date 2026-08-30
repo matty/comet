@@ -282,11 +282,40 @@ async fn a_queued_steer_runs_as_the_next_prompt_on_the_same_session() {
     drop(steer);
 
     let events = drain(stream).await;
+    // Break caught (D111): both ids were hardcoded `None`, so a consumer
+    // wanting to correlate a steer against the message it cut short had
+    // nothing to read. The two must be present AND different — post-steer
+    // output folds into a fresh message, which is what makes the two segments
+    // distinguishable at all.
+    let steered = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Steered {
+                assistant_message_id,
+                next_assistant_message_id,
+            } => Some((
+                assistant_message_id.clone(),
+                next_assistant_message_id.clone(),
+            )),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the steer is announced: {events:#?}"));
+    let (interrupted, next) = steered;
+    let interrupted = interrupted.expect("the steer names the message it interrupted");
+    let next = next.expect("the steer names the message its answer folds into");
+    assert_ne!(
+        interrupted, next,
+        "post-steer output must fold into a DIFFERENT message"
+    );
+    // And the id it names is the one the completed message actually carried,
+    // not a fresh value invented at the steer.
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Steered { .. })),
-        "the steer is announced: {events:#?}"
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::AssistantMessageCompleted { assistant_message_id }
+                if *assistant_message_id == interrupted
+        )),
+        "the interrupted id must match a message that was actually completed: {events:#?}"
     );
     // Two turns ran, so the fixture streamed its text twice.
     assert_eq!(text_of(&events), "working doneworking done");

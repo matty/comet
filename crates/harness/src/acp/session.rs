@@ -985,6 +985,10 @@ async fn run_session(
         // item; ACP gives this build only the turn boundary to hang it on
         // (see the `streamed_this_turn` comment above), so one turn is one
         // message here.
+        // The id this turn's output folded into, captured before the boundary
+        // can rotate it — `Steered` below needs to name the message it
+        // interrupted, and by then the rotation has already happened (D111).
+        let completed_message_id = assistant_message_id.clone();
         if streamed_this_turn
             && done.is_some()
             && !send(
@@ -1013,11 +1017,24 @@ async fn run_session(
         // Between turns: deliver a queued steer as the next prompt, or end.
         match steering.recv().await {
             Some(steer) => {
+                // A turn that streamed nothing never reached the boundary
+                // rotation above, so rotate here instead: `Steered`'s contract
+                // is that post-steer output folds into a FRESH message, and a
+                // consumer correlating the two ids would otherwise be handed
+                // the same one twice.
+                if completed_message_id == assistant_message_id {
+                    assistant_message_id = uuid::Uuid::new_v4().to_string();
+                }
                 if !send(
                     &event_tx,
+                    // Both halves named (D111): the message this steer
+                    // interrupted, and the one its answer will fold into.
+                    // Hardcoded `None` before, so a consumer wanting to
+                    // correlate a steer against the message it cut short had
+                    // nothing to read.
                     AgentEvent::Steered {
-                        assistant_message_id: None,
-                        next_assistant_message_id: None,
+                        assistant_message_id: Some(completed_message_id.clone()),
+                        next_assistant_message_id: Some(assistant_message_id.clone()),
                     },
                 )
                 .await
