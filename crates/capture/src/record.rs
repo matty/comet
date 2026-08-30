@@ -1576,13 +1576,10 @@ mod tests {
         // env var while this section runs.
         unsafe { std::env::set_var("COMET_ACP_ADAPTER_ROOT", adapter_root.path()) };
 
-        // `claude/edit` is declared and not yet recorded: the row exists so
-        // that the capture CAN be taken, and taking it spends tokens on a live
-        // Claude turn, which is a separate authorization from landing the code
-        // (`docs/testing/provider-captures.md`). It closes the `Edit` entry in
-        // `claude_tool_coverage.rs` and, with it, the typings-only reasoning in
-        // D17 and D18. Delete this row when the capture is promoted.
-        const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[(Provider::Claude, "edit")];
+        // Empty again: `claude/edit` was recorded against 2.1.251 the day it
+        // was declared, which is the whole shape this list is for — a row
+        // lands here with its reason, and leaves when the capture does.
+        const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[];
 
         let root = crate::corpus_root();
         let promoted = crate::promoted_scenarios(&root)
@@ -1727,7 +1724,7 @@ mod tests {
         unevidenced_sorted.sort();
         assert_eq!(
             unevidenced_sorted,
-            vec!["claude/edit".to_owned()],
+            Vec::<String>::new(),
             "exactly the rows in EXEMPT_UNCAPTURED may land in unevidenced — a row losing \
              corpus evidence must update this assertion deliberately, not pass through silently. \
              Both sides are empty now that Grok's three rows are promoted, and they move \

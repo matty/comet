@@ -401,13 +401,23 @@ three
 const EDIT_OLD_STRING: &str = "before";
 const EDIT_NEW_STRING: &str = "after";
 
-/// The prompt for [`edit`], naming the tool and its exact input the same way
+/// The prompt for [`edit`], naming the tools and their exact inputs the same way
 /// `claude_approval_prompt` does.
+///
+/// **The Read is not padding — Claude Code refuses to edit a file it has not
+/// read.** Measured, not assumed: the first recording of this scenario
+/// (2026-08-30, 2.1.251) said "do not read the file first", and the CLI's own
+/// Edit tool answered that the file had to be read before writing to it. The
+/// turn still produced a real `Edit` tool_use frame — which is what the corpus
+/// is for — but its result was that error and the file was never changed, so
+/// nothing downstream of a SUCCESSFUL edit (the result payload, the diff a card
+/// renders) was recorded. Asking for the Read costs one extra tool call and
+/// buys the whole path.
 fn claude_edit_prompt(cwd: &Path) -> String {
     let target = cwd.join(EDIT_TARGET_NAME);
+    let path = serde_json::to_string(&target.display().to_string()).expect("path serializes");
     format!(
-        "Use Edit exactly once with input {{\"file_path\":{},\"old_string\":{},\"new_string\":{}}}. Do not read the file first and do not use any other tool.",
-        serde_json::to_string(&target.display().to_string()).expect("path serializes"),
+        "Use Read once with input {{\"file_path\":{path}}}, then use Edit exactly once with input {{\"file_path\":{path},\"old_string\":{},\"new_string\":{}}}. Use no other tool.",
         serde_json::to_string(EDIT_OLD_STRING).expect("static string serializes"),
         serde_json::to_string(EDIT_NEW_STRING).expect("static string serializes"),
     )
