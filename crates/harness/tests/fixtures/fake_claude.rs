@@ -95,7 +95,7 @@ fn check_permission_mode() {
 /// runtime mode, model, or resume — everything `claude::run_launch` puts
 /// there besides the permission mode `check_permission_mode` above already
 /// checks. Before this existed, the fixture "accept[ed] every argument
-/// except an invalid `--permission-mode`" (docs/debt/D43): dropping the
+/// except an invalid `--permission-mode`" (D43): dropping the
 /// streaming transport, `--verbose`, `--include-partial-messages`, or the
 /// stdio permission channel from `run_launch` still left every scenario in
 /// this subprocess suite green, because nothing here ever looked past
