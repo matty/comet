@@ -879,7 +879,17 @@ impl AccountsPage {
                         .map_err(|e| comet_rpc::RpcError::Failed(e.to_string()))
                 }) {
                     Ok(start) => {
-                        cx.open_url(&start.url);
+                        // Skip the open only when the CLI already made one on
+                        // THIS machine (D97). A remote engine's tab opens on
+                        // the remote desktop and is no use here, so a login
+                        // aimed at another device always opens locally — the
+                        // flag is about the engine's platform, and the
+                        // targeting is about whose screen the tab lands on.
+                        let local_engine = page.selected_device.is_none()
+                            || page.selected_device == page.state.read(cx).local_device_id;
+                        if !(start.cli_opened_browser && local_engine) {
+                            cx.open_url(&start.url);
+                        }
                         match start.mode {
                             AgentLoginMode::PasteCode => {
                                 page.code_input
