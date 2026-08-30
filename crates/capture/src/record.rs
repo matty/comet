@@ -227,7 +227,13 @@ fn codex_fence(
     })
 }
 
-/// The pre-spawn fence for both providers' `full-access` row — Claude's `bypassPermissions` and
+/// The pre-spawn fence for both providers' `full-access` row and Claude's `edit` row — the
+/// full-access pair because `bypassPermissions` and `danger-full-access` remove the sandbox, and
+/// `edit` because it asks the model to change a file under `AutoAcceptEdits`, where there is no
+/// approval channel to protect and no grant-time recheck to lean on. The guarantee is the same in
+/// all three: don't start in a repository somebody cares about.
+///
+/// Claude's `bypassPermissions` and
 /// Codex's `danger-full-access` both remove the sandbox entirely, so there is no approval
 /// channel to protect and nothing to recheck at grant time. The only guarantee left to give is
 /// that the process doesn't start inside a repository this project's operator cares about
@@ -1196,6 +1202,12 @@ mod tests {
             ),
             (
                 Provider::Claude,
+                "edit",
+                Some(scenarios::claude::edit_request),
+                FenceKind::FullAccess,
+            ),
+            (
+                Provider::Claude,
                 "resume",
                 Some(scenarios::claude::resume_request),
                 FenceKind::None,
@@ -1564,13 +1576,13 @@ mod tests {
         // env var while this section runs.
         unsafe { std::env::set_var("COMET_ACP_ADAPTER_ROOT", adapter_root.path()) };
 
-        // Empty: every ACP row is promoted now. codex-acp and
-        // claude-agent-acp discovery landed with the adapters
-        // (`tests/corpus/{codex-acp,claude-agent-acp}/`), and Grok's three
-        // rows landed in `grok/1.0.5/` when D102's promotion review was
-        // done. Keep the mechanism: a scenario that genuinely cannot be
-        // captured gets a row here plus the reason, never a silent skip.
-        const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[];
+        // `claude/edit` is declared and not yet recorded: the row exists so
+        // that the capture CAN be taken, and taking it spends tokens on a live
+        // Claude turn, which is a separate authorization from landing the code
+        // (`docs/testing/provider-captures.md`). It closes the `Edit` entry in
+        // `claude_tool_coverage.rs` and, with it, the typings-only reasoning in
+        // D17 and D18. Delete this row when the capture is promoted.
+        const EXEMPT_UNCAPTURED: &[(Provider, &str)] = &[(Provider::Claude, "edit")];
 
         let root = crate::corpus_root();
         let promoted = crate::promoted_scenarios(&root)
@@ -1715,7 +1727,7 @@ mod tests {
         unevidenced_sorted.sort();
         assert_eq!(
             unevidenced_sorted,
-            Vec::<String>::new(),
+            vec!["claude/edit".to_owned()],
             "exactly the rows in EXEMPT_UNCAPTURED may land in unevidenced — a row losing \
              corpus evidence must update this assertion deliberately, not pass through silently. \
              Both sides are empty now that Grok's three rows are promoted, and they move \

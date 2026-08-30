@@ -123,8 +123,10 @@ pub struct ScenarioSpec {
     /// `spec.runtime_mode == Some(RuntimeMode::ApprovalRequired)`, so a future Codex row wanting
     /// `ApprovalRequired` for an unrelated reason would have silently inherited the Windows-only
     /// trusted-PowerShell fence. Every row now names its own fence: [`no_fence`] by default, the
-    /// two Codex approval rows point at `super::codex_fence`, and both providers' `full-access`
-    /// row points at `super::full_access_fence`.
+    /// two Codex approval rows point at `super::codex_fence`, both providers' `full-access`
+    /// row points at `super::full_access_fence`, and so does Claude's `edit` — it changes a
+    /// file with no approval channel in front of it, so the repository check is the guarantee
+    /// left to give.
     pub(super) fence:
         fn(&ScenarioSpec, &CaptureConfig, &LaunchDescriptor) -> anyhow::Result<FenceOutcome>,
     pub(super) body: ScenarioBody,
@@ -297,6 +299,22 @@ pub const SCENARIOS: &[ScenarioSpec] = &[
         launch: ScenarioLaunch::Run(claude::fresh_text_request),
         fence: no_fence,
         body: ScenarioBody::Claude(|s, i| Box::pin(claude::fresh_text(s, i))),
+    },
+    ScenarioSpec {
+        name: "edit",
+        purpose: "capture a Claude run that edits an existing file with Edit",
+        provider: Provider::Claude,
+        runtime_mode: Some(RuntimeMode::AutoAcceptEdits),
+        requirements: Requirements::run(),
+        launch: ScenarioLaunch::Run(claude::edit_request),
+        // The one Claude row that is not `no_fence`. It seeds a file in the cwd
+        // and asks the model to change it under `AutoAcceptEdits`, so there is
+        // no approval channel to protect and no grant-time recheck to lean on
+        // (`approval`'s protection). What is left worth guaranteeing is that
+        // the run does not start inside a repository somebody cares about,
+        // which is exactly what this fence already checks.
+        fence: super::full_access_fence,
+        body: ScenarioBody::Claude(|s, i| Box::pin(claude::edit(s, i))),
     },
     ScenarioSpec {
         name: "approval",
@@ -516,6 +534,7 @@ mod tests {
             ("codex", "interruption"),
             ("codex", "auto"),
             ("codex", "full-access"),
+            ("claude", "edit"),
         ] {
             assert!(
                 scenario(provider, name).is_some(),
@@ -526,7 +545,7 @@ mod tests {
         assert!(scenario("codex", "model-discovery-logged-out").is_some());
         assert_eq!(
             SCENARIOS.len(),
-            25,
+            26,
             "an added or removed row must update this count too"
         );
     }
