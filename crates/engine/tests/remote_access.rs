@@ -734,27 +734,79 @@ fn assert_failed_exact(result: Result<RpcReply, RpcError>, expected: &str) {
     }
 }
 
+/// The methods a paired LAN client must never reach, named one by one.
+///
+/// A list rather than the loop's inline array so
+/// `every_declared_rpc_method_is_allowed_or_denied_on_purpose` can compare it
+/// against what `comet_rpc::methods` actually declares — D7: before that, a
+/// method in NEITHER list defaulted to denied with no test failure, which is
+/// fail-closed and invisible. `ListHarnessDiagnostics` slipped through exactly
+/// that way in 0b.2 and was caught only because a reviewer went looking.
+const DENIED: &[&str] = &[
+    methods::WATCH_REMOTES,
+    methods::PUT_REMOTE,
+    methods::RENAME_REMOTE,
+    methods::REMOVE_REMOTE,
+    methods::REPORT_REMOTE_STATUS,
+    methods::GET_LAN_SETTINGS,
+    methods::SET_LAN_SETTINGS,
+    methods::BEGIN_PAIRING,
+    methods::WATCH_TRUSTED_CLIENTS,
+    methods::REVOKE_TRUSTED_CLIENT,
+    methods::APPLY_UPDATE,
+    methods::START_AGENT_LOGIN,
+    methods::COMPLETE_AGENT_LOGIN,
+    methods::FORGET_AGENT_ACCOUNT,
+    methods::POLL_AGENT_LOGIN,
+    methods::CANCEL_AGENT_LOGIN,
+    methods::UPDATE_STATUS,
+];
+
+/// The operational surface a paired LAN client may reach. Same reason for being
+/// a named list as [`DENIED`].
+const ALLOWED: &[&str] = &[
+    methods::SERVER_HELLO,
+    methods::LOCAL_DEVICE,
+    methods::LIST_HARNESSES,
+    methods::LIST_HARNESS_DIAGNOSTICS,
+    methods::LIST_MODELS,
+    methods::LIST_COMMANDS,
+    methods::QUEUE_COMMAND,
+    methods::WATCH_DOC_MESSAGES,
+    methods::WATCH_CHATS,
+    methods::WATCH_DEVICES,
+    methods::WATCH_SPACES,
+    methods::WATCH_SESSIONS,
+    methods::MUTATE,
+    methods::LIST_REPOS,
+    methods::ADD_REPO,
+    methods::CLONE_REPO,
+    methods::CREATE_REPO,
+    methods::LIST_BRANCHES,
+    methods::LIST_REFS,
+    methods::SWITCH_REF,
+    methods::LIST_FOLDERS,
+    methods::SEARCH_FILES,
+    methods::CREATE_WORKTREE,
+    methods::DELETE_WORKTREE,
+    methods::OPEN_TERMINAL,
+    methods::SUBSCRIBE_TERMINAL,
+    methods::WRITE_TERMINAL,
+    methods::RESIZE_TERMINAL,
+    methods::CLOSE_TERMINAL,
+    methods::WATCH_CHECKOUT_DIFFS,
+    methods::GET_CHECKOUT_FILE_DIFF_TEXT,
+    methods::LIST_AGENT_ACCOUNTS,
+    methods::ACTIVATE_AGENT_ACCOUNT,
+    methods::UPLOAD_CHUNK,
+    methods::UPLOAD_COMMIT,
+    methods::READ_ATTACHMENT_CHUNK,
+    methods::READ_TOOL_DIFF,
+];
+
 #[test]
 fn administrative_and_proxy_methods_are_denied() {
-    for method in [
-        methods::WATCH_REMOTES,
-        methods::PUT_REMOTE,
-        methods::RENAME_REMOTE,
-        methods::REMOVE_REMOTE,
-        methods::REPORT_REMOTE_STATUS,
-        methods::GET_LAN_SETTINGS,
-        methods::SET_LAN_SETTINGS,
-        methods::BEGIN_PAIRING,
-        methods::WATCH_TRUSTED_CLIENTS,
-        methods::REVOKE_TRUSTED_CLIENT,
-        methods::APPLY_UPDATE,
-        methods::START_AGENT_LOGIN,
-        methods::COMPLETE_AGENT_LOGIN,
-        methods::FORGET_AGENT_ACCOUNT,
-        methods::POLL_AGENT_LOGIN,
-        methods::CANCEL_AGENT_LOGIN,
-        methods::UPDATE_STATUS,
-    ] {
+    for method in DENIED {
         assert!(
             !remote_method_allowed(method),
             "{method} escaped the LAN denylist"
@@ -764,48 +816,98 @@ fn administrative_and_proxy_methods_are_denied() {
 
 #[test]
 fn operational_surface_is_explicitly_allowed() {
-    for method in [
-        methods::SERVER_HELLO,
-        methods::LOCAL_DEVICE,
-        methods::LIST_HARNESSES,
-        methods::LIST_HARNESS_DIAGNOSTICS,
-        methods::LIST_MODELS,
-        methods::LIST_COMMANDS,
-        methods::QUEUE_COMMAND,
-        methods::WATCH_DOC_MESSAGES,
-        methods::WATCH_CHATS,
-        methods::WATCH_DEVICES,
-        methods::WATCH_SPACES,
-        methods::WATCH_SESSIONS,
-        methods::MUTATE,
-        methods::LIST_REPOS,
-        methods::ADD_REPO,
-        methods::CLONE_REPO,
-        methods::CREATE_REPO,
-        methods::LIST_BRANCHES,
-        methods::LIST_REFS,
-        methods::SWITCH_REF,
-        methods::LIST_FOLDERS,
-        methods::SEARCH_FILES,
-        methods::CREATE_WORKTREE,
-        methods::DELETE_WORKTREE,
-        methods::OPEN_TERMINAL,
-        methods::SUBSCRIBE_TERMINAL,
-        methods::WRITE_TERMINAL,
-        methods::RESIZE_TERMINAL,
-        methods::CLOSE_TERMINAL,
-        methods::WATCH_CHECKOUT_DIFFS,
-        methods::GET_CHECKOUT_FILE_DIFF_TEXT,
-        methods::LIST_AGENT_ACCOUNTS,
-        methods::ACTIVATE_AGENT_ACCOUNT,
-        methods::UPLOAD_CHUNK,
-        methods::UPLOAD_COMMIT,
-        methods::READ_ATTACHMENT_CHUNK,
-        methods::READ_TOOL_DIFF,
-    ] {
+    for method in ALLOWED {
         assert!(remote_method_allowed(method), "{method} was not allowed");
     }
     assert!(!remote_method_allowed("FutureOperationalMethod"));
+}
+
+/// Every method `comet_rpc::methods` declares is on exactly one side of the LAN
+/// partition, and each side agrees with `remote_method_allowed`.
+///
+/// **Break caught (D7): the partition was conventional, not mechanical.** The
+/// two lists above are hand-written, so a method added to NEITHER defaulted to
+/// denied with no test failure — fail-closed, and invisible.
+/// `ListHarnessDiagnostics` slipped through that way in 0b.2 and was found only
+/// because a reviewer went looking. Nothing had exercised it since.
+///
+/// The declared set is read out of `comet_rpc`'s source, for the same reason
+/// `debt_citations.rs` and the decode-coverage lints read source: what is under
+/// test is which constants EXIST, and no runtime call can enumerate a module of
+/// `pub const &str`. A `methods::ALL` array would move the problem up one level
+/// — it would be the thing nobody updates.
+#[test]
+fn every_declared_rpc_method_is_allowed_or_denied_on_purpose() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rpc/src/lib.rs"),
+    )
+    .expect("comet_rpc's source");
+
+    let declared: std::collections::BTreeSet<String> = source
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line.strip_prefix("pub const ")?;
+            // `pub const NAME: &str = "Method";` — the value, not the constant
+            // name, because that is what the partition and the wire both use.
+            let (_, value) = rest.split_once("= \"")?;
+            value.split('"').next().map(str::to_owned)
+        })
+        .collect();
+    assert!(
+        declared.len() > 40,
+        concat!(
+            "the scan found only {} method(s) — `comet_rpc`'s shape changed and this test ",
+            "would otherwise pass by checking almost nothing",
+        ),
+        declared.len()
+    );
+
+    let allowed: std::collections::BTreeSet<&str> = ALLOWED.iter().copied().collect();
+    let denied: std::collections::BTreeSet<&str> = DENIED.iter().copied().collect();
+
+    let both: Vec<&&str> = allowed.intersection(&denied).collect();
+    assert!(both.is_empty(), "on both sides of the partition: {both:?}");
+
+    let undecided: Vec<&String> = declared
+        .iter()
+        .filter(|m| !allowed.contains(m.as_str()) && !denied.contains(m.as_str()))
+        .collect();
+    assert!(
+        undecided.is_empty(),
+        concat!(
+            "{} declared RPC method(s) are on neither side of the LAN partition: {:?}. ",
+            "They default to DENIED, which is safe and silent — add each to ALLOWED or ",
+            "DENIED so the decision is a decision.",
+        ),
+        undecided.len(),
+        undecided
+    );
+
+    let vanished: Vec<&&str> = allowed
+        .union(&denied)
+        .filter(|m| !declared.contains(**m))
+        .collect();
+    assert!(
+        vanished.is_empty(),
+        "{} partitioned method(s) are no longer declared by `comet_rpc`: {vanished:?}",
+        vanished.len()
+    );
+
+    // And the lists are not merely complete but true: each side matches what
+    // production actually answers.
+    for method in &allowed {
+        assert!(
+            remote_method_allowed(method),
+            "{method} is listed allowed and is not"
+        );
+    }
+    for method in &denied {
+        assert!(
+            !remote_method_allowed(method),
+            "{method} is listed denied and is not"
+        );
+    }
 }
 
 #[tokio::test]
