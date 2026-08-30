@@ -4,11 +4,20 @@ Comet drives provider CLIs it does not ship. This file records the **oldest vers
 is written against**, so a decode can be deleted when no supported version can produce it
 instead of being carried forever on "someone might have an older one".
 
-| Provider | Floor | Corpus evidence |
-| --- | --- | --- |
-| Claude Code | **2.1.228** | `crates/capture/tests/corpus/claude/2.1.228/`, `…/2.1.229/`, `…/2.1.233/`, `…/2.1.241/` |
-| codex-cli | **0.147.0** | `crates/capture/tests/corpus/codex/0.147.0/` |
-| Grok | **1.0.5** | `crates/capture/tests/corpus/grok/1.0.5/` |
+| Provider | Floor | Corpus evidence | Latest promoted |
+| --- | --- | --- | --- |
+| Claude Code | **2.1.228** | `crates/capture/tests/corpus/claude/2.1.228/`, `…/2.1.229/`, `…/2.1.233/`, `…/2.1.241/`, `…/2.1.251/` | **2.1.251** |
+| codex-cli | **0.147.0** | `crates/capture/tests/corpus/codex/0.147.0/` | **0.147.0** |
+| Grok | **1.0.5** | `crates/capture/tests/corpus/grok/1.0.5/` | **1.0.5** |
+
+**"Latest promoted" is the coverage half of D70, not a second floor.** It names the newest
+version this provider's corpus holds evidence for — kept current in the same PR that promotes a
+new capture. `crates/capture/tests/capture_corpus/coverage_policy.rs` checks it against the
+corpus on disk, the same way `version_floor.rs` checks the Floor column: this column is what
+caught 2.1.251 landing in the corpus (`claude/2.1.251/`, [PR #190](https://github.com/matty/comet/pull/190))
+four commits before anything here named it. See `provider-captures.md`'s "Corpus coverage and
+retirement" section for the full rule, what "kept" and "retired" mean, and how this ties to a
+Comet release.
 
 **Grok's row is the whole evidence, not the oldest of several.** 1.0.5 is the only version any
 Grok capture has ever been taken at, so the floor states what the adapter is written against
@@ -93,5 +102,10 @@ sheet until then.
 scenario exercises a Codex tool call at all, so there is no dotted path to declare as a
 discriminator and nothing to compare a decode against.
 
-**Nothing checks the installed CLI against the floor**, and nothing states a coverage or
-retirement policy for corpus versions — **D70**.
+**A coverage rule for corpus versions now exists and is checked.** The "Latest promoted" column
+above and `coverage_policy.rs` close the first half of D70: which versions the corpus is
+expected to hold (floor and latest, at minimum) and a test that fails when a promotion outruns
+the documentation. See `provider-captures.md` for the rule in full, including retirement and the
+release link, and which parts of it stay prose.
+
+**Nothing checks the installed CLI against the floor.** That clause of D69 is still open.

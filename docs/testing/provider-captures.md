@@ -195,6 +195,65 @@ decodes stays folded.
 Before committing, deliberately break each new contract once, observe a meaningful named failure,
 restore it, and rerun green. Finish with the repository gate from `AGENTS.md`.
 
+## Corpus coverage and retirement
+
+The corpus is evidence, and evidence with no policy on what belongs in it just accumulates —
+`claude/2.1.228/` through `claude/2.1.251/` today, with no rule saying which of those five
+directories the corpus is expected to hold or when one may go away ([D70](../debt/README.md)).
+This section is that rule.
+
+**Kept: the floor and the latest, at minimum.** `docs/testing/supported-provider-versions.md`
+names both per provider — the **Floor** column is the oldest version an adapter is written
+against (unchanged by this section; see that file's "Raising the floor"), and the **Latest
+promoted** column is the newest version the corpus holds evidence for. Both are required to cite
+a real corpus directory, and both are checked against disk:
+`crates/capture/tests/capture_corpus/version_floor.rs` for the floor,
+`crates/capture/tests/capture_corpus/coverage_policy.rs` for the latest. Everything the corpus holds between
+floor and latest stays — this policy does not ask for it to be pruned — it is simply not the
+part with a name and a test.
+
+**Promoting a new version updates "Latest promoted" in the same PR.** That is the mechanical
+half of coverage: `coverage_policy.rs` computes the newest version on disk per provider from
+`promoted_scenarios()` and fails the build when it disagrees with the documented column, so a
+promotion that forgets the doc update fails loudly instead of leaving the corpus and the record
+of it disagreeing. This is the exact drift the row was opened over: `claude/2.1.251/` was
+promoted ([PR #190](https://github.com/matty/comet/pull/190)) four commits before this section
+existed to name it as latest.
+
+**Retiring a version is a separate, deliberate PR, not a consequence of this one.** A version
+that is neither the floor nor the current latest MAY be retired — its corpus directory and its
+capability sheet deleted together, so `capability_sheets.rs`'s golden test stays coherent — only
+when:
+
+1. at least one newer promoted version already covers the same provider, and
+2. the existing decode-coverage lints for that surface (`claude_tool_coverage.rs`,
+   `codex_method_coverage.rs`, `acp_decode_coverage.rs`, per provider) show no decode whose only
+   evidence anywhere in the corpus is a frame unique to the version being retired.
+
+Re-run those lints as part of deciding, not just after: they already answer "does a decode
+depend on this version's evidence," which is the question retirement turns on. The retiring PR
+states which decodes were checked and why none rests solely on the departing version. This part
+is **not** enforced by a test — deciding whether a decode's *only* evidence sits in one specific
+version, rather than merely being *demonstrated* there, is the D69 "decode outliving its last
+emitting version" problem in the harder direction (per-version, not per-provider), and nothing
+here or in D69 computes that automatically yet. Read the two lints' output by hand until it does.
+
+**The link to a Comet release is the commit, not a changelog.** Comet ships only nightly builds,
+each tagged `v<version>-nightly.<date>.<run>.g<source_sha>` straight off the `main` commit it was
+cut from (`.github/workflows/release.yml`'s `prepare` job). This document, the floor table, and
+`crates/capture/tests/corpus/` all live in that same commit history, so "which provider versions
+had a given Comet build been tested against" is answered by checking out — or diffing —
+`docs/testing/supported-provider-versions.md` and the corpus at that tag's `source_sha`, not by a
+separate release note that could drift from the code:
+
+```powershell
+git show <source_sha>:docs/testing/supported-provider-versions.md
+```
+
+There is nothing to keep in sync here beyond keeping the table itself accurate, because
+`coverage_policy.rs` is what keeps it accurate — a nightly tagged at a commit where the table was
+wrong could not exist, since that commit would have failed the gate before it could be tagged.
+
 ## The capability sheet
 
 `docs/providers/<provider>-<version>.md` is a generated **capability sheet**, one per corpus
