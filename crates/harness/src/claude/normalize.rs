@@ -864,10 +864,18 @@ impl Normalizer {
             }
             "task_progress" => {
                 let usage = f.usage.unwrap_or_default();
+                // `task_progress` has never had a `status` field on the
+                // wire, but that is no reason to hardcode `Running`: a tick
+                // arriving after a terminal reading must carry that reading
+                // forward (D59 route B) exactly like `task_updated` and
+                // `task_notification` do for their own status-less frames —
+                // otherwise a finished card reopens as `Running` the moment
+                // one more progress tick straggles in.
+                let status = self.status_or_carry_forward(&f.task_id, f.status.as_deref());
                 self.emit_subagent_update(
                     f.task_id,
                     SubagentSnapshot {
-                        status: SubagentStatus::Running,
+                        status,
                         activity: f.description,
                         summary: None,
                         total_tokens: usage.total_tokens,
@@ -1977,6 +1985,45 @@ mod tests {
             "a status-less notification after Completed must carry Completed forward \
              (and the terminal guard then silences it), not regress to Running: {second:?}"
         );
+    }
+
+    /// A `task_progress` tick landing after a terminal reading must not
+    /// reopen the card either — same rule as the status-less
+    /// `task_notification` above, but for the subtype that has never had a
+    /// `status` field on the wire at all (D59 route B: the `"task_progress"`
+    /// arm used to hardcode `SubagentStatus::Running` unconditionally,
+    /// ignoring any stored terminal reading).
+    #[test]
+    fn task_progress_after_a_terminal_reading_does_not_reopen_the_card() {
+        let mut normalizer = Normalizer::new(RuntimeMode::default());
+
+        let notification = r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"completed","summary":"done"}"#;
+        let frame = crate::claude::wire::parse_frame(notification).unwrap();
+        let first = normalizer.normalize(frame, false);
+        assert!(matches!(
+            &first[0],
+            AgentEvent::SubagentUpdated {
+                status: SubagentStatus::Completed,
+                ..
+            }
+        ));
+
+        // A late `task_progress` tick for the same task — carries usage and
+        // activity, but (as always) no status field.
+        let progress = r#"{"type":"system","subtype":"task_progress","task_id":"t1","tool_use_id":"tu1","description":"Reading README.md","usage":{"total_tokens":100,"tool_uses":1,"duration_ms":500}}"#;
+        let frame = crate::claude::wire::parse_frame(progress).unwrap();
+        let second = normalizer.normalize(frame, false);
+        match second
+            .iter()
+            .find(|e| matches!(e, AgentEvent::SubagentUpdated { .. }))
+        {
+            Some(AgentEvent::SubagentUpdated { status, .. }) => {
+                assert_eq!(*status, SubagentStatus::Completed, "{second:?}");
+            }
+            _ => {
+                panic!("expected a SubagentUpdated carrying the carried-forward status: {second:?}")
+            }
+        }
     }
 
     /// A status-less `Agent` tool `tool_use_result` must carry forward too —
