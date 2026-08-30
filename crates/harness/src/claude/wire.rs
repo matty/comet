@@ -130,11 +130,22 @@ fn classify_unclaimed(discriminator: String, value: &Value) -> Frame {
     if let Some(reason) = ignored_reason(&discriminator) {
         return Frame::Ignored(reason);
     }
-    tracing::warn!(
-        target: "comet_harness::claude",
-        frame = %value,
-        "unrecognized frame (recorded as a diagnostic)"
-    );
+    // Budgeted (D10): the first few carry the frame, the rest carry only how
+    // many there have been. A renamed high-volume method would otherwise
+    // warn-log its full payload once per chunk, forever.
+    match crate::log_budget(&discriminator) {
+        crate::LogBudget::Full => tracing::warn!(
+            target: "comet_harness::claude",
+            frame = %value,
+            "unrecognized frame (recorded as a diagnostic)"
+        ),
+        crate::LogBudget::CountOnly(seen) => tracing::warn!(
+            target: "comet_harness::claude",
+            discriminator = %discriminator,
+            seen,
+            "unrecognized frame (payload omitted past the log budget)"
+        ),
+    }
     Frame::Unknown { discriminator }
 }
 

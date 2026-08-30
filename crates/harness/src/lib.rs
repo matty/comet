@@ -558,6 +558,68 @@ pub(crate) const UNPARSEABLE: &str = "unparseable";
 /// warn-logged the full frame at the drop site — this carries only the
 /// sanitized name and Comet copy, never provider text (redaction is
 /// structural: the payload is absent, not truncated).
+/// How many times one discriminator's full payload may be logged before the
+/// budget stops carrying it.
+const FULL_FIDELITY_LOGS: u64 = 5;
+
+/// Distinct discriminators the budget tracks. Matches the diagnostic registry's
+/// own cap deliberately: the two answer the same question about the same
+/// stream, and a budget that tracked more keys than the registry would be
+/// bounding the cheap half.
+const MAX_TRACKED_LOG_KEYS: usize = 64;
+
+/// What the budget says about logging one occurrence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LogBudget {
+    /// Log the frame or line in full — one of the first [`FULL_FIDELITY_LOGS`].
+    Full,
+    /// Log the count and the discriminator, never the payload. The nth
+    /// occurrence, where n is past the budget.
+    CountOnly(u64),
+}
+
+/// Per-discriminator log budget for the diagnostic drop sites (D10).
+///
+/// **The registry bounds memory and nothing bounded the producers.** A future
+/// CLI renaming a high-volume method — `item/commandExecution/outputDelta` is
+/// the worked example — moves it from Ignored to Unknown, and every output
+/// chunk becomes a warn-level line CARRYING RAW COMMAND STDOUT, indefinitely.
+/// The registry row saturating at one entry does nothing to slow that: the
+/// count stays correct while the log does not stay bounded.
+///
+/// So the first few occurrences of each discriminator log in full — which is
+/// what makes a new frame diagnosable — and every one after that logs the count
+/// alone. The payload is the half that is both unbounded and sensitive.
+///
+/// **Process-global on purpose.** Log volume is a property of the process, not
+/// of a session, and the alternative is threading a budget through
+/// `parse_frame` and three reader loops to bound something none of them own. It
+/// is only reached on the unknown/unparseable path, which is rare except in
+/// exactly the scenario this exists for.
+pub(crate) fn log_budget(discriminator: &str) -> LogBudget {
+    use std::sync::{LazyLock, Mutex};
+    static SEEN: LazyLock<Mutex<std::collections::HashMap<String, u64>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+    let mut seen = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Past the key cap an unseen discriminator is counted as one past the
+    // budget rather than inserted: bounding the table is the point, and
+    // `CountOnly` still logs it — the discriminator itself is short and fixed,
+    // and losing the payload is what the cap is for.
+    if !seen.contains_key(discriminator) && seen.len() >= MAX_TRACKED_LOG_KEYS {
+        return LogBudget::CountOnly(FULL_FIDELITY_LOGS + 1);
+    }
+    let count = seen.entry(discriminator.to_owned()).or_insert(0);
+    *count = count.saturating_add(1);
+    if *count <= FULL_FIDELITY_LOGS {
+        LogBudget::Full
+    } else {
+        LogBudget::CountOnly(*count)
+    }
+}
+
 pub(crate) fn diagnostic(
     discriminator: &str,
     severity: comet_proto::DiagnosticSeverity,
@@ -1305,6 +1367,51 @@ mod install_classification_tests {
 
 #[cfg(test)]
 mod probe_tests {
+
+    /// Break caught (D10): the registry bounds memory, and nothing bounded the
+    /// producers. A CLI renaming a high-volume method moves it from Ignored to
+    /// Unknown, and every chunk warn-logs its full payload — raw command
+    /// stdout — indefinitely. The registry row saturating at one entry does
+    /// not slow that down at all.
+    ///
+    /// Asserts the shape rather than the numbers: the first few carry the
+    /// payload, everything after carries a count, and the count keeps rising
+    /// so an operator can still see the volume.
+    #[test]
+    fn a_repeated_discriminator_stops_carrying_its_payload() {
+        let key = "test/one-loud-frame";
+        for expected in 1..=FULL_FIDELITY_LOGS {
+            assert_eq!(
+                log_budget(key),
+                LogBudget::Full,
+                "occurrence {expected} is still diagnosable in full"
+            );
+        }
+        assert_eq!(
+            log_budget(key),
+            LogBudget::CountOnly(FULL_FIDELITY_LOGS + 1)
+        );
+        assert_eq!(
+            log_budget(key),
+            LogBudget::CountOnly(FULL_FIDELITY_LOGS + 2)
+        );
+    }
+
+    /// The key table is bounded too, and a discriminator past the cap is still
+    /// LOGGED — just never with its payload. Losing the payload is what the cap
+    /// is for; losing the fact would hide the drift the diagnostic exists to
+    /// raise.
+    #[test]
+    fn a_discriminator_past_the_key_cap_still_logs_without_its_payload() {
+        for i in 0..MAX_TRACKED_LOG_KEYS {
+            let _ = log_budget(&format!("test/fill-{i}"));
+        }
+        assert_eq!(
+            log_budget("test/one-too-many"),
+            LogBudget::CountOnly(FULL_FIDELITY_LOGS + 1),
+            "past the cap nothing new is tracked, and nothing new is silent"
+        );
+    }
 
     /// Break caught (D130): every spawn failure but `NotFound` became
     /// `HarnessError::Io`, whose `Display` is `io: {0}`, and `drive_run`'s sink

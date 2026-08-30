@@ -597,13 +597,25 @@ async fn run_session(session: Session) {
                             // Sink 5 — the only producer of `Malformed`. The
                             // raw line stays HERE, in tracing; the event
                             // carries only the fixed sentinel.
-                            tracing::warn!(
-                                target: "comet_harness::claude",
-                                line,
-                                "unparseable frame (recorded as a diagnostic): {e}"
-                            );
+                            let discriminator = e.discriminator();
+                            match crate::log_budget(&discriminator) {
+                                crate::LogBudget::Full => tracing::warn!(
+                                    target: "comet_harness::claude",
+                                    line,
+                                    "unparseable frame (recorded as a diagnostic): {e}"
+                                ),
+                                // The raw line is the unbounded half, and on
+                                // this path it is provider output rather than
+                                // a known shape (D10).
+                                crate::LogBudget::CountOnly(seen) => tracing::warn!(
+                                    target: "comet_harness::claude",
+                                    discriminator,
+                                    seen,
+                                    "unparseable frame (line omitted past the log budget): {e}"
+                                ),
+                            }
                             let ev = crate::diagnostic(
-                                &e.discriminator(),
+                                &discriminator,
                                 DiagnosticSeverity::Malformed,
                             );
                             if event_tx.send(Ok(ev)).await.is_err() {
