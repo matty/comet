@@ -78,6 +78,24 @@ pub(crate) fn approval_request(
                 // `(None, true)` below, its sibling with an absent
                 // `new_string` key instead of an empty one.
                 (Some(text), true) if text.is_empty() => (FileOperation::Unknown, 0, 0),
+                // D132: still Edit-only (Write already claimed every
+                // `old.is_empty()` input above), and `text` is non-empty
+                // here (the empty case is the D17 arm just above). Read
+                // literally this used to fall into the general Modify arm
+                // below, giving it that arm's `approval_signature` — shared
+                // with every REAL edit to the same path, since that
+                // signature drops line counts on purpose. `claude/2.1.251/
+                // edit-create` settles what an empty-`old_string` Edit
+                // actually does live, against a path that had never
+                // existed: the CLI CREATES the file — `tool_use_result.
+                // originalFile` is `""`, `structuredPatch[]` is a pure
+                // addition, no error. Unlike Write, this needs no
+                // filesystem consultation to pick Create over Modify: the
+                // only evidence available is this one shape, and no capture
+                // shows an empty `old_string` reused against a path that
+                // DID already exist, so nothing here guesses at that case
+                // either — it decodes the shape the wire is known to send.
+                (Some(text), true) => (FileOperation::Create, line_count(text), 0),
                 (Some(text), _) => (FileOperation::Modify, line_count(text), line_count(&old)),
                 // An empty replacement removes text.
                 (None, false) => (FileOperation::Modify, 0, line_count(&old)),
@@ -481,6 +499,59 @@ mod tests {
                 path: "a.txt".into(),
                 operation: FileOperation::Unknown,
                 added_lines: 0,
+                removed_lines: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn an_edit_with_an_empty_old_string_and_a_real_replacement_creates_the_file() {
+        // D132: `claude/2.1.251/edit-create-approval` frame 45 (PR #190,
+        // 2026-08-30) is the literal `can_use_tool` request Claude sends for
+        // an `Edit` with an empty `old_string` and a non-empty `new_string`
+        // against a path that has never existed. The sibling scenario,
+        // `claude/2.1.251/edit-create` (run under `acceptEdits`, so it skips
+        // the approval hook but reaches the same tool), shows what this
+        // input actually does live: the CLI CREATES the file —
+        // `tool_use_result.originalFile` is `""`, `structuredPatch[]` is a
+        // pure addition, and there is no error. Decoding this shape as
+        // `Modify` gives it the same `approval_signature` as every real edit
+        // to the same path (`approval_signature` drops line counts on
+        // purpose), so allowing this card for the session would silently
+        // auto-allow every later real edit — the second door D17 left open.
+        //
+        // The corpus sanitizer redacts EVERY string value on an allowlisted
+        // path to a numbered placeholder token (D74) — including an empty
+        // one, which becomes a non-empty `<Vn>` token indistinguishable from
+        // any other redacted string. So frame 45's `old_string` cannot be
+        // read back as `""` from the archive directly: the corpus proves the
+        // request's real shape (tool name, that `can_use_tool` fires at all,
+        // a genuine `file_path`), and the empty-`old_string` fact comes from
+        // the manifest's own recorded purpose plus the sibling `edit-create`
+        // run's live result, not from re-deriving it out of a redacted value.
+        // `old_string`/`new_string` are overwritten below to state that fact
+        // directly rather than pretend the placeholder tokens say it.
+        let payload = comet_capture::corpus_frame("claude/2.1.251/edit-create-approval", 45)
+            .payload
+            .clone();
+        let frame = super::super::wire::parse_frame(&payload).unwrap();
+        let super::super::wire::Frame::ControlRequest(mut req) = frame else {
+            panic!("frame 45 is not a control_request: {frame:?}");
+        };
+        assert_eq!(req.request.tool_name, "Edit");
+        let path = req.request.input["file_path"]
+            .as_str()
+            .expect("captured Edit input always carries file_path")
+            .to_owned();
+        req.request.input["old_string"] = json!("");
+        req.request.input["new_string"] = json!("created\n");
+        let got = approval_request(&req.request, nothing_exists);
+        assert_eq!(
+            got,
+            ApprovalRequest::FileChange {
+                path,
+                operation: FileOperation::Create,
+                added_lines: 1,
                 removed_lines: 0,
             }
         );

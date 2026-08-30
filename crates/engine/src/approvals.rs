@@ -90,6 +90,31 @@ mod tests {
     }
 
     #[test]
+    fn a_create_and_a_modify_to_the_same_path_are_different_actions() {
+        // D132: `claude/approval.rs` now decodes an Edit with an
+        // empty-or-absent `old_string` and a non-empty `new_string` as
+        // `Create`, precisely so it lands here as a different signature from
+        // a real `Modify` on the same path. Before that decode existed, both
+        // shared the `Modify` signature above — allowing that no-op-shaped
+        // card for the session silently auto-allowed every later real edit
+        // to the file, since this function drops line counts on purpose.
+        let create = ApprovalRequest::FileChange {
+            path: "src/main.rs".into(),
+            operation: FileOperation::Create,
+            added_lines: 1,
+            removed_lines: 0,
+        };
+        let modify = ApprovalRequest::FileChange {
+            path: "src/main.rs".into(),
+            operation: FileOperation::Modify,
+            added_lines: 1,
+            removed_lines: 0,
+        };
+        assert_ne!(approval_signature(&create), approval_signature(&modify));
+        assert!(approval_signature(&create).is_some());
+    }
+
+    #[test]
     fn a_different_path_or_operation_is_a_different_action() {
         let modify = ApprovalRequest::FileChange {
             path: "src/main.rs".into(),
