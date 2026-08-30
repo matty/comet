@@ -340,11 +340,14 @@ pub(crate) async fn probe_installed_cli(
     stem: &str,
     override_var: &str,
     known_dirs: Vec<KnownDir>,
-) -> HarnessProbe {
+) -> (HarnessProbe, Option<String>) {
     let exe = match resolved {
         Ok(exe) => exe,
         Err(err) => {
-            return HarnessProbe::unresolved(unavailable_from_resolve(&err, stem, override_var));
+            return (
+                HarnessProbe::unresolved(unavailable_from_resolve(&err, stem, override_var)),
+                None,
+            );
         }
     };
     let override_is_set = std::env::var_os(override_var).is_some_and(|v| !v.is_empty());
@@ -352,13 +355,21 @@ pub(crate) async fn probe_installed_cli(
         path: exe.display().to_string(),
         method: classify_install(&exe, override_is_set, &known_dirs),
     };
-    HarnessProbe {
-        availability: enforce_version_floor(stem, probe_cli_version(&exe).await),
-        install: Some(install),
-        // Filled by the per-provider update readers; a provider that publishes
-        // no state leaves this `None` and simply renders one line less.
-        update: None,
-    }
+    let availability = probe_cli_version(&exe).await;
+    let version = match &availability {
+        HarnessAvailability::Available { version } => version.clone(),
+        _ => None,
+    };
+    (
+        HarnessProbe {
+            availability: enforce_version_floor(stem, availability),
+            install: Some(install),
+            // Filled by the per-provider update readers; a provider that publishes
+            // no state leaves this `None` and simply renders one line less.
+            update: None,
+        },
+        version,
+    )
 }
 
 struct VersionFloor {
@@ -1802,8 +1813,9 @@ mod probe_tests {
         let shim = dir.path().join("old-codex.cmd");
         std::fs::write(&shim, "@echo off\r\necho codex-cli 0.146.0\r\n").unwrap();
 
-        let probe =
-            probe_installed_cli(Ok(shim), "codex", "NO_SUCH_OVERRIDE_VAR", Vec::new()).await;
+        let probe = probe_installed_cli(Ok(shim), "codex", "NO_SUCH_OVERRIDE_VAR", Vec::new())
+            .await
+            .0;
 
         assert_eq!(
             probe.availability.unavailable_summary(),
@@ -1841,13 +1853,12 @@ mod probe_tests {
             probe.install.expect("the resolved binary stays named").path,
             shim.display().to_string()
         );
+        let update = probe.update.expect("the updater cache stays visible");
+        assert_eq!(update.latest.as_deref(), Some("0.148.0"));
         assert_eq!(
-            probe
-                .update
-                .expect("the updater cache stays visible")
-                .latest
-                .as_deref(),
-            Some("0.148.0")
+            update.state,
+            comet_proto::UpdateState::Available,
+            "the update cache must compare against the probed outdated version"
         );
     }
 
@@ -1977,7 +1988,8 @@ mod probe_tests {
             "NO_SUCH_OVERRIDE_VAR",
             vec![(dir.path().to_path_buf(), InstallMethod::Npm)],
         )
-        .await;
+        .await
+        .0;
 
         assert!(
             probe.availability.is_unavailable(),
@@ -2001,7 +2013,8 @@ mod probe_tests {
             "GHOST_EXECUTABLE",
             Vec::new(),
         )
-        .await;
+        .await
+        .0;
         assert_eq!(
             probe.availability.unavailable_summary(),
             Some("Not installed")

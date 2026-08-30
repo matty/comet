@@ -108,4 +108,8 @@ expected to hold (floor and latest, at minimum) and a test that fails when a pro
 the documentation. See `provider-captures.md` for the rule in full, including retirement and the
 release link, and which parts of it stay prose.
 
-**Nothing checks the installed CLI against the floor.** That clause of D69 is still open.
+**The background probe checks an installed CLI against the floor.** A strictly dotted-numeric
+version below the documented floor becomes unavailable with provider-specific update/install
+guidance; equal, newer, missing, prerelease and malformed versions stay available because Comet
+cannot honestly rank the latter group. The probe's behavioural test ties its production values to
+this table without reading the document at runtime.
