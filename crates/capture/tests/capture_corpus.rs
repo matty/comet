@@ -1,4 +1,5 @@
 mod capture_corpus {
+    mod acp_decode_coverage;
     mod allowlist_property;
     mod capability_sheets;
     mod corpus_frames;
@@ -9,4 +10,5 @@ mod capture_corpus {
     mod scenario_coverage;
     mod support;
     mod surface_map;
+    mod version_floor;
 }

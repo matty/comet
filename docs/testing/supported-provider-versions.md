@@ -70,6 +70,20 @@ Raising it is a deliberate change, not a consequence of upgrading a local CLI:
 The corpus is what makes this safe: it holds real frames per version, so "does any supported
 version still send X" is a question with an answer on disk rather than a guess.
 
-**This is not enforced by anything.** The floor is prose, and nothing fails when the installed
-CLI drifts below it or when a decode outlives its last emitting version — see `docs/debt/`
-**D69** and **D70**.
+## What is enforced, and what is still prose
+
+**The table and the corpus can no longer disagree.**
+`crates/capture/tests/capture_corpus/version_floor.rs` fails when a floor cites a corpus
+directory that holds no promoted scenario, and when a promoted provider Comet actually drives has
+no floor row and is not listed as deliberately floorless. That closes the clause of D69 about the
+floor not being tied to its evidence.
+
+**A decode outliving its last emitting version is still only partly caught.**
+`acp_decode_coverage.rs` does it for ACP `sessionUpdate` kinds in both directions — a decoded kind
+with no capture behind it, and a captured kind nobody has ruled on — because that is the one
+surface whose vocabulary the corpus already records. Claude's tool names and Codex's methods have
+no equivalent yet; **D90** is the hand-measured version of the same question for Codex, and D69
+stays open for the rest.
+
+**Nothing checks the installed CLI against the floor**, and nothing states a coverage or
+retirement policy for corpus versions — **D70**.
